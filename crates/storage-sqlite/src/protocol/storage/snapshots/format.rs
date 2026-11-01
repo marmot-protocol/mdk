@@ -1,12 +1,11 @@
 use super::rows::{
-    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
-    OrderedQueuedOutbound, Snapshot,
+    GroupStateCheckpoint, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound, Snapshot,
 };
 use crate::base::codec::{SensitiveBytes, serialize_sensitive};
 use crate::{deserialize, i64_to_u64, message_state_from_i64, message_state_to_i64, serialize};
 use cgka_traits::message::MessageRecord;
 use cgka_traits::storage::{StorageError, StorageResult};
-use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 use serde::de::DeserializeOwned;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"MDKS";
@@ -36,10 +35,8 @@ pub(super) fn encode(snapshot: &Snapshot) -> StorageResult<SensitiveBytes> {
             encoder.var(prepared.queued[index].as_slice())
         },
     )?;
-    encoder.list(&snapshot.member_caps, |caps, index, encoder| {
-        encoder.var(caps.member_id.as_slice())?;
-        encoder.var(&prepared.member_caps[index])
-    })?;
+    // Retired member-capability list: always an empty body.
+    encoder.var(&[])?;
     encoder.option_bytes(snapshot.convergence_policy.as_deref())?;
     encoder.option_bytes(snapshot.validated_tree_marker.as_deref())?;
     encoder.list(&snapshot.openmls_values, |value, _, encoder| {
@@ -90,12 +87,9 @@ pub(super) fn decode(bytes: &[u8]) -> StorageResult<Snapshot> {
             record: decoder.json("queued outbound record")?,
         })
     })?;
-    let member_caps = decoder.list("member capabilities", |decoder| {
-        Ok(MemberCapabilitiesSnapshot {
-            member_id: MemberId::new(decoder.var("member id")?.to_vec()),
-            capabilities: decoder.json("member capabilities")?,
-        })
-    })?;
+    // Snapshots written before the member-capability cache was retired carry
+    // its rows here; the engine now reads capabilities from the tree.
+    decoder.var("retired member capabilities")?;
     let convergence_policy = decoder.option_bytes("convergence policy")?;
     let validated_tree_marker = decoder.option_bytes("validated tree marker")?;
     let openmls_values = decoder.list("OpenMLS values", |decoder| {
@@ -111,7 +105,6 @@ pub(super) fn decode(bytes: &[u8]) -> StorageResult<Snapshot> {
         group,
         messages,
         queued_outbound,
-        member_caps,
         convergence_policy,
         validated_tree_marker,
         openmls_values,
@@ -125,14 +118,6 @@ pub(super) fn encode_checkpoint(
         group: checkpoint.group.clone(),
         messages: None,
         queued_outbound: None,
-        member_caps: checkpoint
-            .member_caps
-            .iter()
-            .map(|caps| MemberCapabilitiesSnapshot {
-                member_id: caps.member_id.clone(),
-                capabilities: caps.capabilities.clone(),
-            })
-            .collect(),
         convergence_policy: None,
         validated_tree_marker: checkpoint.validated_tree_marker.clone(),
         openmls_values: checkpoint
@@ -163,7 +148,6 @@ pub(super) fn decode_checkpoint(bytes: &[u8]) -> StorageResult<GroupStateCheckpo
     }
     Ok(GroupStateCheckpoint {
         group: snapshot.group,
-        member_caps: snapshot.member_caps,
         validated_tree_marker: snapshot.validated_tree_marker,
         openmls_values: snapshot.openmls_values,
     })
@@ -173,7 +157,6 @@ struct PreparedSnapshot {
     group: Vec<u8>,
     message_deferred: Vec<Option<Vec<u8>>>,
     queued: Vec<SensitiveBytes>,
-    member_caps: Vec<Vec<u8>>,
 }
 
 impl PreparedSnapshot {
@@ -200,11 +183,6 @@ impl PreparedSnapshot {
                 .unwrap_or_default()
                 .iter()
                 .map(|queued| serialize_sensitive(&queued.record))
-                .collect::<StorageResult<Vec<_>>>()?,
-            member_caps: snapshot
-                .member_caps
-                .iter()
-                .map(|caps| serialize(&caps.capabilities))
                 .collect::<StorageResult<Vec<_>>>()?,
         })
     }
@@ -248,12 +226,7 @@ fn snapshot_encoded_len(snapshot: &Snapshot, prepared: &PreparedSnapshot) -> Sto
         }
         len = checked_add(len, var_len(body)?)?;
     }
-    let mut caps_body = 0;
-    for (index, caps) in snapshot.member_caps.iter().enumerate() {
-        caps_body = checked_add(caps_body, var_len(caps.member_id.as_slice().len())?)?;
-        caps_body = checked_add(caps_body, var_len(prepared.member_caps[index].len())?)?;
-    }
-    len = checked_add(len, var_len(caps_body)?)?;
+    len = checked_add(len, var_len(0)?)?;
     len = checked_add(len, option_len(snapshot.convergence_policy.as_deref())?)?;
     len = checked_add(len, option_len(snapshot.validated_tree_marker.as_deref())?)?;
     let mut openmls_body = 0;
@@ -538,7 +511,6 @@ mod tests {
             group: sample_group(gid(1), 0, 0),
             messages: None,
             queued_outbound: None,
-            member_caps: Vec::new(),
             convergence_policy: None,
             validated_tree_marker: None,
             openmls_values: Vec::new(),
@@ -547,6 +519,114 @@ mod tests {
         assert_eq!(
             hex::encode(encoded.as_slice()),
             "4d444b530002410f7b226964223a5b312c312c312c315d2c226e616d65223a2273616d706c65222c226465736372697074696f6e223a2264657363222c2265706f6368223a302c226d656d62657273223a5b5d2c2272657175697265645f6361706162696c6974696573223a7b2270726f706f73616c73223a5b5d2c22657874656e73696f6e73223a5b5d2c226170705f636f6d706f6e656e7473223a7b22696473223a5b5d7d7d2c2270726f746f636f6c5f70726f66696c65223a226c6567616379222c2272656d6f766564223a66616c73652c22756e7265636f76657261626c65223a66616c73652c226a6f696e5f65706f6368223a302c226c6f63616c5f636f70795f696e7374616c6c5f65706f6368223a307d000000000000"
+        );
+    }
+
+    #[test]
+    fn v2_snapshot_with_retired_member_capabilities_still_decodes() {
+        let snapshot = Snapshot {
+            group: sample_group(gid(1), 0, 0),
+            messages: None,
+            queued_outbound: None,
+            convergence_policy: None,
+            validated_tree_marker: Some(b"marker".to_vec()),
+            openmls_values: Vec::new(),
+        };
+        let encoded = encode(&snapshot).unwrap();
+        // Splice in one row of the retired member-capability list, as a
+        // snapshot captured before its removal carries it: the body sits
+        // after the two empty option lists and before the convergence policy.
+        let var = |bytes: &[u8], out: &mut Vec<u8>| {
+            cgka_traits::app_components::encode_quic_varint(bytes.len() as u64, out);
+            out.extend_from_slice(bytes);
+        };
+        let mut caps_body = Vec::new();
+        var(&[7; 32], &mut caps_body);
+        var(
+            br#"{"proposals":[10],"extensions":[],"app_components":{"ids":[]}}"#,
+            &mut caps_body,
+        );
+        let mut old_field = Vec::new();
+        var(&caps_body, &mut old_field);
+        // No policy (1 byte), the marker (1 + 1 + 6) and no OpenMLS values (1).
+        let after_caps = 1 + 8 + 1;
+        let bytes = encoded.as_slice();
+        let caps_at = bytes.len() - after_caps - 1;
+        assert_eq!(&bytes[caps_at - 2..caps_at + 1], &[0, 0, 0]);
+        let mut legacy = bytes[..caps_at].to_vec();
+        legacy.extend_from_slice(&old_field);
+        legacy.extend_from_slice(&bytes[caps_at + 1..]);
+
+        let decoded = decode(&legacy).unwrap();
+        assert_eq!(decoded.group, snapshot.group);
+        assert_eq!(
+            decoded.validated_tree_marker,
+            snapshot.validated_tree_marker
+        );
+        assert_eq!(
+            encode(&decoded).unwrap().as_slice(),
+            encoded.as_slice(),
+            "re-encoding drops the retired rows"
+        );
+        let checkpoint = decode_checkpoint(&legacy).unwrap();
+        assert_eq!(checkpoint.group, snapshot.group);
+    }
+
+    /// A stored snapshot that is cut short, has bytes left over or carries a
+    /// bad option tag must fail to decode rather than restore something else,
+    /// and a rollback snapshot must not pass as a group-state checkpoint.
+    #[test]
+    fn damaged_snapshot_bytes_fail_to_decode() {
+        let mut snapshot = Snapshot {
+            group: sample_group(gid(1), 0, 0),
+            messages: None,
+            queued_outbound: None,
+            convergence_policy: None,
+            validated_tree_marker: None,
+            openmls_values: Vec::new(),
+        };
+        // The group, then six one-byte fields: the message and queued option
+        // tags, the retired list, the policy and marker option tags, the
+        // values list. The offsets below count back from the end.
+        let good = encode(&snapshot).unwrap().as_slice().to_vec();
+        let mut layout = [SNAPSHOT_MAGIC.as_slice(), &SNAPSHOT_VERSION.to_be_bytes()].concat();
+        let group = serialize(&snapshot.group).unwrap();
+        cgka_traits::app_components::encode_quic_varint(group.len() as u64, &mut layout);
+        layout.extend_from_slice(&group);
+        layout.extend_from_slice(&[0; 6]);
+        assert_eq!(good, layout, "tail layout moved");
+        let at = |offset: usize, tag: u8| {
+            let mut bytes = good.clone();
+            let index = bytes.len() - offset;
+            bytes[index] = tag;
+            bytes
+        };
+        let cases = [
+            (
+                [good.as_slice(), &[0]].concat(),
+                "group snapshot has trailing bytes",
+            ),
+            (
+                good[..good.len() - 2].to_vec(),
+                "truncated option discriminant",
+            ),
+            (at(3, 2), "invalid option discriminant 2"),
+            (at(6, 2), "invalid option discriminant 2"),
+        ];
+        for (bytes, expected) in cases {
+            let error = decode(&bytes).err();
+            assert!(
+                matches!(&error, Some(StorageError::Serialization(message)) if message == expected),
+                "{expected}: {error:?}"
+            );
+        }
+
+        snapshot.messages = Some(Vec::new());
+        let error = decode_checkpoint(encode(&snapshot).unwrap().as_slice()).err();
+        assert!(
+            matches!(&error, Some(StorageError::Serialization(message))
+                if message == "group-state checkpoint contains rollback-only fields"),
+            "{error:?}"
         );
     }
 }

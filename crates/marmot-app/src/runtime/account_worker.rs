@@ -5,7 +5,7 @@ mod attachments;
 pub(crate) mod recovery_credits;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use marmot_observability::{Observation, Outcome as TelemetryOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -33,8 +33,8 @@ use super::{
     RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
-use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
+use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
@@ -54,6 +54,7 @@ use crate::{
     RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
+use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 
 enum ComparisonRecoveryOrigin {
     PeriodicMaintenance,
@@ -76,7 +77,7 @@ struct ComparisonRecoveryJob {
     /// The process credit the network task released, held through admission
     /// and checkpoint.
     credit: Option<Arc<OwnedSemaphorePermit>>,
-    observation: Option<crate::product_analytics::ProductObservation>,
+    observation: Option<marmot_observability::product_analytics::ProductObservation>,
     backfill_armed: bool,
     phase: Option<Observation>,
     origin: ComparisonRecoveryOrigin,
@@ -91,7 +92,7 @@ impl ComparisonRecoveryJob {
         grant: AttemptGrant,
         execution: ComparisonExecution,
         network: ComparisonNetworkJob,
-        observation: Option<crate::product_analytics::ProductObservation>,
+        observation: Option<marmot_observability::product_analytics::ProductObservation>,
         backfill_armed: bool,
         phase: Option<Observation>,
         origin: ComparisonRecoveryOrigin,
@@ -241,7 +242,7 @@ impl AccountStartupStage {
 /// worker keeps its stage in flight until the open itself moves on.
 #[derive(Clone, Debug)]
 pub(crate) struct AccountStartupProgress {
-    telemetry: crate::AppPerformanceTelemetry,
+    telemetry: marmot_observability::PerformanceRecorder,
     state: Arc<Mutex<StartupStageState>>,
 }
 
@@ -279,7 +280,7 @@ impl Drop for StageSpan {
 
 impl AccountStartupProgress {
     /// Open the `Spawned` span of a worker about to be spawned.
-    pub(crate) fn new(telemetry: crate::AppPerformanceTelemetry) -> Self {
+    pub(crate) fn new(telemetry: marmot_observability::PerformanceRecorder) -> Self {
         let stage = AccountStartupStage::Spawned;
         let span = StageSpan {
             observation: Some(telemetry.observe(stage.operation())),
@@ -334,6 +335,9 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) events: broadcast::Sender<MarmotAppEvent>,
     pub(crate) lifecycle: RuntimeLifecycle,
     pub(crate) shared: RuntimeSharedServices,
+    /// Fired once when the device group unlinks this device and the worker
+    /// stops, so the runtime deactivates the account (mdk#2628 D67).
+    pub(crate) unlinked: oneshot::Sender<()>,
 }
 
 pub(crate) enum AccountWorkerCommand {
@@ -409,6 +413,14 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    AccountDevicesActivation {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::AppAccountDevicesActivation, AppError>>,
+    },
+    EnableAccountDevices {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     DisbandGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppDisbandRequest, AppError>>,
@@ -474,6 +486,66 @@ pub(crate) enum AccountWorkerCommand {
     },
     HistoryNotices {
         respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
+    },
+    AccountRecoveryStatus {
+        respond: oneshot::Sender<Result<crate::AccountRecoveryStatus, AppError>>,
+    },
+    LinkedDevices {
+        respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
+    },
+    KeyPackageRefreshOverdue {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    UnrecognizedSignIns {
+        respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+    },
+    AnswerSignIn {
+        slot_id_hex: String,
+        response: crate::SignInResponse,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CheckSignIns {
+        respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
+    },
+    StartFresh {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    StartedFresh {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    CompromiseWarning {
+        respond: oneshot::Sender<Result<Vec<crate::CompromiseWarningItem>, AppError>>,
+    },
+    DismissCompromiseWarning {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RenameLinkedDevice {
+        slot_id_hex: String,
+        label: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RemoveLinkedDevice {
+        slot_id_hex: String,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    RemovedDeviceLeftoverChats {
+        respond: oneshot::Sender<Result<u32, AppError>>,
+    },
+    BeginRecoveryWords {
+        respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
+    },
+    ConfirmRecoveryWords {
+        answers: Vec<String>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CancelRecoveryWords {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    TurnOffBackups {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    BackupSettings {
+        respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
     },
     DismissHistoryNotice {
         notice_id: String,
@@ -645,6 +717,11 @@ pub(crate) enum AccountWorkerCommand {
     PublishKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    /// Linking a new device of this account (mdk#2628 item 3.3b).
+    DeviceLink {
+        op: crate::DeviceLinkOp,
+        respond: oneshot::Sender<Result<crate::DeviceLinkSnapshot, AppError>>,
+    },
     /// Complete the exact KeyPackage publication authorized by the durable
     /// account-setup journal. This is deliberately distinct from the general
     /// publication command so no other mutation can enter the startup lane.
@@ -652,6 +729,11 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     RotateKeyPackage {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
+    /// Delete this device's KeyPackage slot before sign-out tears the worker
+    /// down. Answers with the number of relays that accepted.
+    WithdrawKeyPackageSlot {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     KeyPackageMaintenanceStatus {
@@ -705,6 +787,10 @@ pub(crate) enum AccountWorkerCommand {
         registration: PushRegistration,
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    GroupPushDebugInfo {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::GroupPushDebugInfo, AppError>>,
+    },
     RetryPushRegistration {
         respond: oneshot::Sender<bool>,
     },
@@ -748,6 +834,18 @@ pub(crate) enum AccountWorkerCommand {
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
     },
+    /// Unlink this device as the device group's removal would.
+    #[cfg(test)]
+    UnlinkDeviceForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    /// Whether the worker runs a recovery runner, and if so one explicit pass
+    /// of it, awaited off the worker. `None` without a runner.
+    #[cfg(test)]
+    RecoveryRunnerPassForTest {
+        budget: Duration,
+        respond: oneshot::Sender<Option<crate::client::recovery_runner::PassReport>>,
+    },
 }
 
 impl AccountWorkerCommand {
@@ -771,7 +869,10 @@ impl AccountWorkerCommand {
                 | Self::QuarantinedGroups { .. }
                 | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
+                | Self::AccountRecoveryStatus { .. }
                 | Self::GroupCommitDelivery { .. }
+                | Self::GroupPushDebugInfo { .. }
+                | Self::AccountDevicesActivation { .. }
         )
     }
 
@@ -932,7 +1033,10 @@ impl Drop for WelcomeRecoveryTask {
     }
 }
 
-fn install_storage_telemetry(client: &AppClient, telemetry: &crate::AppPerformanceTelemetry) {
+fn install_storage_telemetry(
+    client: &AppClient,
+    telemetry: &marmot_observability::PerformanceRecorder,
+) {
     if let Ok(storage) = client.app.account_storage(&client.state.label) {
         let telemetry = telemetry.clone();
         storage.set_timing_observer(Some(Arc::new(move |operation, duration, success| {
@@ -974,6 +1078,21 @@ pub(crate) fn spawn_app_runtime_account_worker(
     ))
 }
 
+/// Stop the worker's recovery runner, if it runs one, while `client` is
+/// still the account's: a quantum in flight settles on it
+/// ([`SpawnedRunner::stop`]). Boxed like a command's future, so each of the
+/// loop's exits adds a pointer to its stack, not the stop.
+fn stop_recovery_runner<'a>(
+    runner: &'a mut Option<SpawnedRunner>,
+    client: &'a mut AppClient,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(runner) = runner.take() {
+            runner.stop(client).await;
+        }
+    })
+}
+
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
@@ -992,6 +1111,7 @@ async fn run_app_runtime_account_worker(
         events,
         lifecycle,
         shared,
+        unlinked,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
@@ -1001,7 +1121,8 @@ async fn run_app_runtime_account_worker(
         Some(&startup_progress),
     ));
     let startup = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::AccountStartup);
     let opened = tokio::select! {
         _ = &mut shutdown => {
@@ -1045,8 +1166,8 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
-    install_storage_telemetry(&client, &shared.app_performance_telemetry());
-    client.runtime_telemetry = Some(shared.app_performance_telemetry());
+    install_storage_telemetry(&client, shared.observer.performance());
+    client.runtime_telemetry = Some(shared.observer.performance().clone());
     client.recovery_credits = shared.recovery_credit_pool();
     #[cfg(test)]
     {
@@ -1081,8 +1202,8 @@ async fn run_app_runtime_account_worker(
     // separately below).
 
     {
-        let open_timings = client.runtime.session().open_timings();
-        let telemetry = shared.app_performance_telemetry();
+        let open_timings = client.runtime.open_timings();
+        let telemetry = shared.observer.performance().clone();
         telemetry.record(
             AppPerformanceOperation::AccountSessionOpen,
             open_timings.total,
@@ -1110,7 +1231,7 @@ async fn run_app_runtime_account_worker(
         );
     }
     if let Some(ready) = ready.take() {
-        shared.app_performance_telemetry().record(
+        shared.observer.performance().record(
             AppPerformanceOperation::AccountWorkerReadiness,
             worker_started_at.elapsed(),
             true,
@@ -1132,7 +1253,7 @@ async fn run_app_runtime_account_worker(
                 Ok(key_package.bytes().len())
             }
             .await;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -1141,7 +1262,7 @@ async fn run_app_runtime_account_worker(
             // an explicit zero rather than omitting the sample so hosts can
             // distinguish "publication finished before sync" from "overlap
             // was not observed".
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialSyncOverlap,
                 Duration::ZERO,
                 result.is_ok(),
@@ -1183,6 +1304,14 @@ async fn run_app_runtime_account_worker(
             return;
         }
     }
+    // A removal from the device group applied on an earlier run, which then
+    // ended before it was followed, stops the account before catch-up sends
+    // anything (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
 
     // The snapshot answers read commands while the initial sync holds
     // `&mut client`; its only failure is the shared profile load. Readiness
@@ -1195,8 +1324,8 @@ async fn run_app_runtime_account_worker(
     let snapshot_started = Instant::now();
     let read_snapshot = {
         let capture =
-            client.group_read_snapshot_with_stage_telemetry(&shared.app_performance_telemetry());
-        shared.app_performance_telemetry().record(
+            client.group_read_snapshot_with_stage_telemetry(shared.observer.performance());
+        shared.observer.performance().record(
             AppPerformanceOperation::AccountGroupReadSnapshot,
             snapshot_started.elapsed(),
             capture.is_ok(),
@@ -1229,7 +1358,7 @@ async fn run_app_runtime_account_worker(
     let mut local_submission_due = true;
     let mut local_submission_retry_at = TokioInstant::now();
     let sync_started_at = Instant::now();
-    let startup_stage_telemetry = shared.app_performance_telemetry();
+    let startup_stage_telemetry = shared.observer.performance().clone();
     let mut startup_explicit_shutdown = false;
     let publish_startup_summary = |client: &AppClient, summary: &SyncSummary| {
         publish_app_runtime_summary_with_v5(
@@ -1332,8 +1461,10 @@ async fn run_app_runtime_account_worker(
             let summary = client
                 .finish_deferred_comparison_sync(Some(&publish_startup_progress))
                 .await?;
-            app.finish_client_open_network_maintenance(&mut client)
-                .await;
+            if !client.device_unlinked() {
+                app.finish_client_open_network_maintenance(&mut client)
+                    .await;
+            }
             Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
         });
         loop {
@@ -1440,12 +1571,14 @@ async fn run_app_runtime_account_worker(
                                         // Once claimed, finish engine ingest and projection
                                         // without cancellation by the network completion.
                                         let delivery_started = Instant::now();
-                                        let receive_observation = shared.app_performance_telemetry()
+                                        let receive_observation = shared.observer.performance()
                                             .observe(RuntimeOp::WorkerReceive);
-                                        match client.ingest_received_delivery_with_partial(*delivery).await {
+                                        let ingested = client.ingest_received_delivery_with_partial(*delivery).await;
+                                        client.drive_device_pairing().await;
+                                        match ingested {
                                             Ok(summary) => {
                                                 receive_observation.finish(TelemetryOutcome::Success);
-                                                shared.app_performance_telemetry().record(
+                                                shared.observer.performance().record(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), true,
                                                 );
@@ -1455,6 +1588,13 @@ async fn run_app_runtime_account_worker(
                                                 publish_client_pending_projection_updates(
                                                     &mut client, &events, &account_id_hex, &account_label,
                                                 );
+                                                if client.device_unlinked() {
+                                                    // Nothing more goes out: the
+                                                    // comparison ends and the worker
+                                                    // stops (D67).
+                                                    network.abort_and_wait().await;
+                                                    return None;
+                                                }
                                                 start_post_join_history_after_visibility(
                                                     &mut client, &summary, &events,
                                                     &account_id_hex, &account_label,
@@ -1482,7 +1622,7 @@ async fn run_app_runtime_account_worker(
                                             }
                                             Err(failure) => {
                                                 receive_observation.finish(TelemetryOutcome::Failure);
-                                                shared.app_performance_telemetry().record(
+                                                shared.observer.performance().record(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), false,
                                                 );
@@ -1526,13 +1666,17 @@ async fn run_app_runtime_account_worker(
                                         if deferred.is_empty() => {
                                         let _ = respond.send(client.history_notices());
                                     }
+                                    AccountWorkerCommand::AccountRecoveryStatus { respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(client.account_recovery_status());
+                                    }
                                     AccountWorkerCommand::SendMessage {
                                         enqueued_at, queued, group_id, payload, respond,
-                                    } if deferred.is_empty() => {
+                                    } if deferred.is_empty() && !client.device_unlinked() => {
                                         send_message_on_worker(
                                             &mut client, enqueued_at, queued, group_id, payload, respond,
                                             &events, &account_id_hex, &account_label, &shared,
-                                            shared.product_analytics.permit(),
+                                            shared.observer.product().permit(),
                                         ).await;
                                         publish_client_pending_applied_summary(
                                             &mut client, &events, &account_id_hex, &account_label,
@@ -1558,7 +1702,8 @@ async fn run_app_runtime_account_worker(
                             }
                             () = tokio::task::yield_now(), if native_progress => {}
                             _ = tokio::time::sleep_until(local_submission_retry_at),
-                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
+                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping()
+                                    && !client.device_unlinked() => {
                                 let retry = publish_next_local_submission(
                                     &mut client, &app, &shared, &events,
                                     &account_id_hex, &account_label,
@@ -1597,6 +1742,9 @@ async fn run_app_runtime_account_worker(
                             Err(failure)
                         }
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     // Startup is a sync: whatever the comparison admitted, it
                     // still drains the live replay its activation started.
                     let result = match result {
@@ -1619,6 +1767,9 @@ async fn run_app_runtime_account_worker(
                         }
                         Err(failure) => Err(failure),
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     app.finish_client_open_network_maintenance(&mut client)
                         .await;
                     result
@@ -1627,17 +1778,25 @@ async fn run_app_runtime_account_worker(
             })
         });
         let Some(result) = continuation.await else {
-            if startup_explicit_shutdown {
+            if client.device_unlinked() {
+                stop_unlinked_worker(&mut client, unlinked).await;
+            } else if startup_explicit_shutdown {
                 client.finish_audit_recording();
             }
             return;
         };
         result
     };
+    // A removal the catch-up applied stops the account before anything
+    // else goes out (mdk#2628 D67).
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
     if let Err(failure) = &mut startup_sync_result {
         client.drain_epoch_stall_escalations(&mut failure.partial_summary);
     }
-    shared.app_performance_telemetry().record_classified_result(
+    shared.observer.performance().record_classified_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
         startup_sync_result
@@ -1737,6 +1896,13 @@ async fn run_app_runtime_account_worker(
             ))
         }
     };
+    // A removal from the device group that the catch-up applied stops the
+    // account before the deferred commands replay (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result. Replay uses the live command queue so
@@ -1745,12 +1911,21 @@ async fn run_app_runtime_account_worker(
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
-        product: shared.product_analytics.clone(),
+        product: shared.observer.product().clone(),
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+        history_blobs: HistoryBlobFlights::default(),
         worker_lifetime: media_http_worker_lifetime,
     };
+    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
+    // Spawned before the deferred commands replay, so a repair among them
+    // goes through it; its turns wait until a repair or the loop below
+    // serves them.
+    let mut recovery_runner = client.spawn_recovery_runner().await;
+    // What the runner's survey finds catching up; only a runner changes it.
+    // Each client has its own, so a reconnect subscribes again.
+    let mut recovery_catching_up = client.routing.subscribe_recovery_runner_catching_up();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
@@ -1811,6 +1986,7 @@ async fn run_app_runtime_account_worker(
                         shared: &shared,
                         media_http: &media_http,
                         scheduled_convergence: &mut scheduled_convergence,
+                        recovery_runner: recovery_runner.as_mut(),
                     },
                 )
                 .await;
@@ -1838,7 +2014,7 @@ async fn run_app_runtime_account_worker(
     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
-    let product_backlog = shared.product_analytics.backlog_source();
+    let product_backlog = shared.observer.product().backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
@@ -1872,6 +2048,15 @@ async fn run_app_runtime_account_worker(
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
     'worker: loop {
+        // An unlinked device stops: no sends, commits, publications or
+        // pairing answers once its device group removed it. The account is
+        // already marked unlinked; the runtime deactivates it once this
+        // worker has exited (mdk#2628 D67).
+        if client.device_unlinked() {
+            stop_recovery_runner(&mut recovery_runner, &mut client).await;
+            stop_unlinked_worker(&mut client, unlinked).await;
+            break 'worker;
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {
@@ -1903,6 +2088,10 @@ async fn run_app_runtime_account_worker(
                 false
             }
         };
+        // Admission can apply this device's removal; the loop top stops.
+        if client.device_unlinked() {
+            continue 'worker;
+        }
         // A pass whose network wait ended admits its owned batch a few events
         // per turn. The select below then serves commands and live input
         // before the next turn.
@@ -1918,6 +2107,11 @@ async fn run_app_runtime_account_worker(
                 }
                 None => Ok(true),
             };
+            // The turn can apply this device's removal: stop before the
+            // pass settles and runs maintenance.
+            if client.device_unlinked() {
+                continue 'worker;
+            }
             if turn.is_ok()
                 && let Some(admission) = job.admission.as_mut()
             {
@@ -1985,7 +2179,7 @@ async fn run_app_runtime_account_worker(
                 )
                 .await;
                 // A settled pass is where recovery parks or completes.
-                publish_history_notice_changes(
+                publish_account_level_changes(
                     &mut client,
                     &events,
                     &account_id_hex,
@@ -2003,6 +2197,7 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                         )
                         .await;
+                        dispatch_history_blobs(&mut client, &media_http);
                     }
                     ComparisonRecoveryOrigin::PostConvergence {
                         audit_tracker_update,
@@ -2036,6 +2231,15 @@ async fn run_app_runtime_account_worker(
                 }
                 continue 'worker;
             }
+        }
+        // One recovery runner turn per pass of the loop, as comparison
+        // admission gets one above, so ready commands and live input never
+        // starve the runner (or a credit its quantum holds). What it admits
+        // publishes below.
+        if !client.has_pending_effect_projections()
+            && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
+        {
+            turn.serve(&mut client).await;
         }
         // Unified admission may have advanced native frames as well as the
         // comparison prefix. Publish their committed effects before live input.
@@ -2100,7 +2304,18 @@ async fn run_app_runtime_account_worker(
             client.has_pending_runtime_group_subscription_refresh(),
             &command_tx,
         );
+        schedule_push_work_after_turn(&mut client, &mut scheduled_push_retry, &command_tx);
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+        // Whichever seam parked or woke a convergence pass (mdk#2684), its
+        // schedule read above queued the notice.
+        for group_id in client.take_convergence_park_notices() {
+            publish_app_runtime_group_state_updated(
+                &events,
+                &account_id_hex,
+                &account_label,
+                &group_id,
+            );
+        }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         #[cfg(test)]
@@ -2114,12 +2329,14 @@ async fn run_app_runtime_account_worker(
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                 client.finish_audit_recording();
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
                     client.finish_audit_recording();
                 }
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             completed = async {
@@ -2204,6 +2421,14 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // A fetched history imports messages; show them now,
+                        // not at the next maintenance pass.
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
                         avatar_due = true;
                         attachment_due = true;
                         schedule_pending_convergence_groups(
@@ -2211,7 +2436,10 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                         );
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // Alternate a command and a ready recovery quantum. A permanently
@@ -2245,6 +2473,21 @@ async fn run_app_runtime_account_worker(
                                     recovery.drain_waiters.push(respond);
                                 } else {
                                     let _ = respond.send(());
+                                }
+                                continue;
+                            }
+                            #[cfg(test)]
+                            AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                match &recovery_runner {
+                                    Some(runner) => {
+                                        let handle = runner.handle().clone();
+                                        tokio::spawn(async move {
+                                            let _ = respond.send(handle.run_pass(budget).await);
+                                        });
+                                    }
+                                    None => {
+                                        let _ = respond.send(None);
+                                    }
                                 }
                                 continue;
                             }
@@ -2290,6 +2533,7 @@ async fn run_app_runtime_account_worker(
                                         shared: &shared,
                                         media_http: &media_http,
                                         scheduled_convergence: &mut scheduled_convergence,
+                                        recovery_runner: recovery_runner.as_mut(),
                                     },
                                 )
                                 .await;
@@ -2310,7 +2554,10 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // A completed optional retry owes durable admission one turn once
@@ -2345,7 +2592,7 @@ async fn run_app_runtime_account_worker(
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
                 let yield_observation = secondary_retry_yield.clone();
-                let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
+                let mut phase = Some(shared.observer.performance().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -2427,7 +2674,7 @@ async fn run_app_runtime_account_worker(
                                         // complete and let that job settle the
                                         // still-durable recovery debt.
                                         let backfill_armed = client.has_pending_epoch_backfill();
-                                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                                        let observation = backfill_armed.then(|| shared.observer.product().begin(
                                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                                         )).flatten();
                                         let backfill_result = if comparison_recovery.is_some() {
@@ -2483,6 +2730,12 @@ async fn run_app_runtime_account_worker(
                                             &account_label,
                                             account_error_message("scheduled convergence failed", &err),
                                         );
+                                        // A failure that spent the pass's budget
+                                        // parks it (mdk#2684); the next turn
+                                        // tells hosts to re-read the group.
+                                        if let Ok(parked) = client.convergence_pass_parked(&group_id) {
+                                            client.note_convergence_park(&group_id, parked);
+                                        }
                                     }
                                 }
                             }
@@ -2532,7 +2785,7 @@ async fn run_app_runtime_account_worker(
                         account_error_message("native replay synchronization failed", &error),
                     );
                 }
-                publish_history_notice_changes(
+                publish_account_level_changes(
                     &mut client, &events, &account_id_hex, &account_label,
                 );
             }
@@ -2565,10 +2818,14 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
-                let receive_observation = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReceive);
+                let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
-                        client.ingest_received_delivery(*delivery).await
+                        let ingested = client.ingest_received_delivery(*delivery).await;
+                        // Pairing messages arrive among the account's gift
+                        // wraps; answer them while the other device waits.
+                        client.drive_device_pairing().await;
+                        ingested
                     }
                     // receive_next_delivery persisted the loss. The owned
                     // comparison job dispatched below recovers it off the
@@ -2579,7 +2836,7 @@ async fn run_app_runtime_account_worker(
                     Err(err) => Err(err),
                 };
                 if result.is_err() && let Some(started) = delivery_started {
-                    shared.app_performance_telemetry().record(
+                    shared.observer.performance().record(
                         AppPerformanceOperation::InboundDeliveryProjection,
                         started.elapsed(),
                         false,
@@ -2601,11 +2858,15 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                         );
                         if let Some(started) = delivery_started {
-                            shared.app_performance_telemetry().record(
+                            shared.observer.performance().record(
                                 AppPerformanceOperation::InboundDeliveryProjection,
                                 started.elapsed(),
                                 true,
                             );
+                        }
+                        if client.device_unlinked() {
+                            // Nothing more goes out; the next turn stops the worker.
+                            continue 'worker;
                         }
                         start_post_join_history_after_visibility(
                             &mut client,
@@ -2673,9 +2934,12 @@ async fn run_app_runtime_account_worker(
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
                         let transport_account = client.adapter.account_id().clone();
+                        // Its turns need this client; the reopened one gets
+                        // a runner of its own.
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
                         drop(client);
                         client = loop {
-                            let reconnect_wait = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReconnectWait);
+                            let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
                             let retry_started_at = Instant::now();
                             let mut retry_delay =
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
@@ -2709,7 +2973,7 @@ async fn run_app_runtime_account_worker(
                                                             let _ = respond.send(Err(ConversationWindowError::NotReady));
                                                         }
                                                         command => {
-                                                            shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                             drop(command);
                                                         },
                                                     }
@@ -2739,7 +3003,7 @@ async fn run_app_runtime_account_worker(
                                             // instead of letting the queue fill
                                             // until host-side timeouts fire.
                                             Some(command) => {
-                                                shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                 drop(command);
                                             },
                                             None => break 'worker,
@@ -2748,7 +3012,7 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                             reconnect_wait.finish(TelemetryOutcome::Success);
-                            let reopen = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReopen);
+                            let reopen = shared.observer.performance().observe(RuntimeOp::WorkerReopen);
                             let reopened_result = tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
                                 _ = &mut shutdown => break 'worker,
@@ -2762,8 +3026,8 @@ async fn run_app_runtime_account_worker(
                             reopen.finish_app(&reopened_result);
                             match reopened_result {
                                 Ok(mut reopened) => {
-                                    install_storage_telemetry(&reopened, &shared.app_performance_telemetry());
-                                    reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
+                                    install_storage_telemetry(&reopened, shared.observer.performance());
+                                    reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.recovery_credits = shared.recovery_credit_pool();
                                     #[cfg(test)]
                                     {
@@ -2803,7 +3067,7 @@ async fn run_app_runtime_account_worker(
                                     // loop on a full catch-up; the maintenance
                                     // path performs bounded repair syncs when
                                     // required.
-                                    let telemetry = shared.app_performance_telemetry();
+                                    let telemetry = shared.observer.performance().clone();
                                     let prepare_transport = tokio::select! {
                                         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                                             reopened.finish_audit_recording();
@@ -2885,6 +3149,9 @@ async fn run_app_runtime_account_worker(
                             }
                         };
                         replay_changes = client.adapter.replay_changes().await;
+                        recovery_runner = client.spawn_recovery_runner().await;
+                        recovery_catching_up =
+                            client.routing.subscribe_recovery_runner_catching_up();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2892,6 +3159,15 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                 }
+            }
+            // An idle worker waits for the runner's next turn here; the
+            // loop's top serves one per pass while other work is ready.
+            turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                turn.serve(&mut client).await;
+            }
+            Ok(()) = recovery_catching_up.changed() => {
+                client.recovery_status_owed = true;
+                publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
                 avatar_due = false;
@@ -2971,7 +3247,7 @@ async fn run_app_runtime_account_worker(
                 if comparison_recovery.is_some() {
                     continue 'worker;
                 }
-                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
+                let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
                         target: "marmot_app::account_worker",
@@ -2983,6 +3259,13 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                // Pairing timers, KeyPackage retries and link settlement.
+                client.drive_device_pairing().await;
+                if client.device_unlinked() {
+                    // Nothing more goes out; the next turn stops the worker.
+                    phase.finish(TelemetryOutcome::Success);
+                    continue 'worker;
+                }
                 attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                 attachments::spawn_legacy_migration(
                     &client,
@@ -2990,7 +3273,7 @@ async fn run_app_runtime_account_worker(
                     &mut attachment_admission,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    let observation = shared.product_analytics.begin(
+                    let observation = shared.observer.product().begin(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
                     let catch_up = timeout(
@@ -3003,6 +3286,12 @@ async fn run_app_runtime_account_worker(
                     };
                     if let Some(observation) = observation {
                         observation.finish(outcome.as_str());
+                    }
+                    if client.device_unlinked() {
+                        // The catch-up applied this device's removal:
+                        // nothing more goes out (D67).
+                        phase.finish(TelemetryOutcome::Success);
+                        continue 'worker;
                     }
                     match catch_up {
                         Ok(Ok(summary)) => {
@@ -3067,12 +3356,20 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                // A join window ends once T has been counted since its join
+                // completed, which only time passing shows; the tick counts
+                // it and notices joins that completed. Repair asks wait for
+                // the same clock, and replies for their rank's slots.
+                client.advance_push_join_windows().await;
+                if client.has_due_push_announce() || client.has_due_push_repair() {
+                    scheduled_push_retry.observe_pending(true, &command_tx);
+                }
                 scheduled_runtime_group_subscription_refresh.observe_pending(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
                 let backfill_armed = client.has_pending_epoch_backfill();
-                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                let observation = backfill_armed.then(|| shared.observer.product().begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
                 let backfill_result = match start_pending_recovery_job(
@@ -3121,11 +3418,16 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
+                dispatch_history_blobs(&mut client, &media_http);
 
                 phase.finish(TelemetryOutcome::Success);
             }
         }
     }
+    // Each exit that still held the client stopped the runner on it; any
+    // other exit's drop aborts the task and refunds the attempts it left
+    // open. What a quantum staged stays durable.
+    drop(recovery_runner);
     // An admission in progress keeps its durable prefix; its debt waits for
     // the next session.
     if let Some(network) = comparison_recovery.and_then(|job| job.network) {
@@ -3249,7 +3551,7 @@ async fn start_receive_recovery(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            context.shared.product_analytics.begin(
+            context.shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,
@@ -3305,7 +3607,7 @@ async fn finish_periodic_maintenance_after_recovery(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    product_backlog: &crate::product_analytics::ProductBacklogSource,
+    product_backlog: &marmot_observability::ProductBacklogSource,
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
@@ -3316,7 +3618,7 @@ async fn finish_periodic_maintenance_after_recovery(
             account_error_message("post-join maintenance subscription failed", &err),
         );
     }
-    let backlog_permit = shared.product_analytics.permit();
+    let backlog_permit = shared.observer.product().permit();
     match client.run_due_maintenance().await {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
@@ -3387,7 +3689,7 @@ async fn handle_account_worker_catch_up(
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
-    let telemetry = context.shared.app_performance_telemetry();
+    let telemetry = context.shared.observer.performance().clone();
     let catch_up_observation = telemetry.observe(RuntimeOp::WorkerCatchUp);
     let snapshot_observation = telemetry.observe(RuntimeOp::WorkerSnapshot);
     let snapshot_result = client.group_read_snapshot();
@@ -3413,7 +3715,7 @@ async fn handle_account_worker_catch_up(
     let mut deferred = VecDeque::new();
     let mut commands_open = true;
     let sync_started_at = Instant::now();
-    let stage_telemetry = context.shared.app_performance_telemetry();
+    let stage_telemetry = context.shared.observer.performance().clone();
     let sync_result = {
         let mut sync = std::pin::pin!(async {
             #[cfg(any(test, feature = "test-policy-overrides"))]
@@ -3585,7 +3887,8 @@ async fn handle_account_worker_catch_up(
     };
     context
         .shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .record_classified_result(
             AppPerformanceOperation::AccountSync,
             sync_started_at.elapsed(),
@@ -3602,7 +3905,7 @@ async fn handle_account_worker_catch_up(
     });
     // A job that parked or reopened recovery debt announces it before the
     // caller, who may re-read the notices at once, gets its answer.
-    publish_history_notice_changes(
+    publish_account_level_changes(
         client,
         context.events,
         context.account_id_hex,
@@ -3677,7 +3980,10 @@ fn run_legacy_message_promotion_batch(
     schedule: &mut LegacyMessagePromotionSchedule,
 ) {
     run_legacy_message_promotion_batch_with(schedule, |limit| {
-        client.runtime.session().promote_legacy_message_rows(limit)
+        client
+            .engine_storage
+            .promote_legacy_message_rows(limit)
+            .map_err(marmot_session::SessionError::from)
     });
 }
 
@@ -3685,8 +3991,9 @@ fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
     promote: impl FnOnce(
         usize,
-    )
-        -> cgka_session::SessionResult<storage_sqlite::MessageFormatPromotionProgress>,
+    ) -> marmot_session::SessionResult<
+        storage_sqlite::MessageFormatPromotionProgress,
+    >,
 ) {
     if schedule.status != LegacyMessagePromotionStatus::Pending {
         return;
@@ -3766,12 +4073,13 @@ async fn run_startup_hydration_pipeline(
     shutdown: &mut oneshot::Receiver<()>,
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
-    if client.runtime.session().unhydrated_group_ids().is_empty() {
+    if client.runtime.unhydrated_group_ids().is_empty() {
         finish_deferred_hydration_reconciliation(client);
         return StartupHydrationOutcome::Completed;
     }
     let hydration_observation = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::WorkerHydration);
     let pipeline_started = Instant::now();
     // Chat-list recency order from the durable projection: the groups the
@@ -3861,7 +4169,6 @@ async fn run_startup_hydration_pipeline(
         }
         let progress = match client
             .runtime
-            .session_mut()
             .hydrate_next_groups(&hydration_order, STARTUP_HYDRATION_BATCH_SIZE)
         {
             Ok(progress) => progress,
@@ -3897,7 +4204,7 @@ async fn run_startup_hydration_pipeline(
     } else {
         TelemetryOutcome::Failure
     });
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::AccountGroupHydration,
         pipeline_started.elapsed(),
         pipeline_ok,
@@ -3926,7 +4233,6 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
     loop {
         let progress = client
             .runtime
-            .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
             client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
@@ -3985,10 +4291,7 @@ async fn handle_startup_hydration_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.members(&group_id));
         }
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
@@ -4023,14 +4326,19 @@ async fn handle_startup_hydration_command(
             }
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
             let _ = respond.send(group_roster_after_hydration(client, &group_id));
+        }
+        AccountWorkerCommand::GroupPushDebugInfo { group_id, respond } => {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.group_push_debug_info(&group_id));
+        }
+        AccountWorkerCommand::AccountDevicesActivation { group_id, respond } => {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.account_devices_activation(&group_id));
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
@@ -4075,6 +4383,10 @@ async fn handle_startup_hydration_command(
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
         }
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => {
+            let _ = respond.send(client.mark_device_unlinked());
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
@@ -4095,16 +4407,86 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
-    product: crate::product_analytics::ProductAnalytics,
+    product: marmot_observability::ProductRecorder,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
     /// more than once. This state is deliberately ephemeral: after a worker
     /// restart, the durable staged/failed record remains retryable.
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
+    /// The history upload and fetch running, at most one of each.
+    history_blobs: HistoryBlobFlights,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
+}
+
+/// Whether a history upload and a history fetch (mdk#2628 4.2c) are running.
+/// Ephemeral, like the uploads above: the history stays owed, or the
+/// delivery parked, until one completes.
+#[derive(Default)]
+struct HistoryBlobFlights {
+    upload: std::sync::atomic::AtomicBool,
+    fetch: std::sync::atomic::AtomicBool,
+}
+
+/// Starts the next due history upload and history fetch on the media
+/// executor, unless one of that kind is running, keeping a slot free for
+/// commands as avatar acquisition does. Each runs off the worker; its
+/// completion sends or imports here, then starts the next.
+fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    let permit = || {
+        (media_http.permits.available_permits() > 1)
+            .then(|| media_http.permits.clone().try_acquire_owned().ok())
+            .flatten()
+    };
+    if !media_http.history_blobs.upload.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_upload() {
+            Ok(Some(upload)) => {
+                media_http
+                    .history_blobs
+                    .upload
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    upload.run(),
+                    MediaHttpCompletion::HistoryUpload,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history upload deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.fetch.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_fetch() {
+            Ok(Some(fetch)) => {
+                media_http
+                    .history_blobs
+                    .fetch
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    fetch.run(),
+                    MediaHttpCompletion::HistoryFetch,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history fetch deferred")
+            }
+        }
+    }
 }
 
 struct MediaHttpDone {
@@ -4113,7 +4495,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
-    cancellation: Option<crate::ProductObservation>,
+    cancellation: Option<marmot_observability::ProductOperation>,
 }
 
 /// Stores a fetched avatar image as a cache file and settles its attempt.
@@ -4205,6 +4587,8 @@ enum MediaHttpCompletion {
         respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
         started_at: Instant,
     },
+    HistoryUpload(crate::client::HistoryUploadOutcome),
+    HistoryFetch(crate::client::HistoryFetchOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4287,7 +4671,7 @@ fn spawn_media_http<T>(
     work: impl std::future::Future<Output = T> + Send + 'static,
     into_done: impl FnOnce(T) -> MediaHttpCompletion + Send + 'static,
 ) {
-    let cancellation = media_http.product.begin(
+    let cancellation = media_http.product.operation(
         crate::ProductFamily::Media,
         "cancel",
         crate::ProductUnit::Attempt,
@@ -4388,6 +4772,34 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::HistoryUpload(outcome) => {
+            let settled = client.finish_history_upload(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .upload
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
+            return;
+        }
+        MediaHttpCompletion::HistoryFetch(outcome) => {
+            let settled = client.finish_history_fetch(outcome);
+            drop(permit);
+            media_http
+                .history_blobs
+                .fetch
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
+            return;
+        }
         MediaHttpCompletion::Attachment {
             job,
             result,
@@ -4435,7 +4847,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The attempt ended without a body: failed, retrying, cancelled or parked.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::AttachmentRetained {
@@ -4446,7 +4859,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The body was published (Ready) or the attempt ended without it.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::Avatar { job, result } => {
@@ -4526,7 +4940,7 @@ async fn complete_media_http(
                         .map(|item| item.reference.media_type.as_str())
                 })
                 .unwrap_or("");
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::MediaUpload,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -4545,7 +4959,7 @@ async fn complete_media_http(
             respond,
             started_at,
         } => {
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::MediaDownload,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -4572,7 +4986,7 @@ async fn complete_media_http(
                     Err(persistence_error) => Err(persistence_error),
                 },
             };
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::GroupCreateImageUpload,
                 started_at.elapsed(),
                 succeeded,
@@ -4732,6 +5146,9 @@ struct AccountWorkerCommandContext<'a> {
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
     scheduled_convergence: &'a mut ScheduledConvergence,
+    /// The account's recovery runner, behind the internal `runner_owns_debt`
+    /// gate: explicit repair serves its turns while it waits on it.
+    recovery_runner: Option<&'a mut SpawnedRunner>,
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -4744,7 +5161,7 @@ fn respond_diagnosed<T>(
     result: Result<T, AppError>,
 ) -> Result<(), Result<T, AppError>> {
     if let Err(error) = &result {
-        shared.product_analytics.storage_failure(permit, error);
+        shared.observer.product().storage_failure(permit, error);
     }
     respond.send(result)
 }
@@ -4774,7 +5191,7 @@ async fn handle_account_worker_command(
         // One publication seam covers all successful dispatch completions. Early
         // admission failures and cancelled commands retain their previous behavior.
         publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
-        publish_history_notice_changes(client, events, account_id_hex, account_label);
+        publish_account_level_changes(client, events, account_id_hex, account_label);
     }
 }
 
@@ -4796,8 +5213,9 @@ fn account_worker_command_future<'a>(
         shared,
         media_http,
         scheduled_convergence,
+        recovery_runner,
     } = context;
-    let storage_permit = shared.product_analytics.permit();
+    let storage_permit = shared.observer.product().permit();
     match command {
         AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
             let result = client.note_connectivity_restored().map(|_| ());
@@ -4888,6 +5306,17 @@ fn account_worker_command_future<'a>(
             let _ = respond.send(count);
             true
         }),
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => Box::pin(async move {
+            let _ = respond.send(client.mark_device_unlinked());
+            true
+        }),
+        // The worker loop answers it from its runner before dispatch.
+        #[cfg(test)]
+        AccountWorkerCommand::RecoveryRunnerPassForTest { respond, .. } => Box::pin(async move {
+            let _ = respond.send(None);
+            true
+        }),
         AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
             let result = match client
@@ -4936,7 +5365,7 @@ fn account_worker_command_future<'a>(
                     ))
                 }
             };
-            shared.app_performance_telemetry().record_classified_result(
+            shared.observer.performance().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result
@@ -4967,7 +5396,7 @@ fn account_worker_command_future<'a>(
             let cancelled = || respond.is_closed() || shared.lifecycle().is_stopping();
             let repaired = Box::pin(serve_snapshot_reads_until(
                 read_snapshot,
-                client.repair_full_history_cancellable(&cancelled),
+                client.repair_full_history_cancellable(&cancelled, recovery_runner),
                 commands,
                 pending,
                 app,
@@ -5015,7 +5444,7 @@ fn account_worker_command_future<'a>(
                     Err(AccountCatchUpFailure::from_sync_failure(message, &failure))
                 }
             };
-            shared.app_performance_telemetry().record_classified_result(
+            shared.observer.performance().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result
@@ -5025,7 +5454,7 @@ fn account_worker_command_future<'a>(
             );
             // Announce a parked or reopened obligation before the caller
             // re-reads the notices.
-            publish_history_notice_changes(client, events, account_id_hex, account_label);
+            publish_account_level_changes(client, events, account_id_hex, account_label);
             let _ = respond.send(result);
             true
         }),
@@ -5037,7 +5466,7 @@ fn account_worker_command_future<'a>(
             prepared_image_upload_id,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateQueueWait,
                 queued_at.elapsed(),
@@ -5109,7 +5538,9 @@ fn account_worker_command_future<'a>(
                 Box::pin(serve_snapshot_reads_until(
                     read_snapshot,
                     async {
-                        client
+                        // An undelivered Welcome stays owed; the events below
+                        // report it.
+                        let _ = client
                             .drive_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
@@ -5138,7 +5569,7 @@ fn account_worker_command_future<'a>(
         } => Box::pin(async move {
             let started_at = Instant::now();
             let result = client.stage_prepared_initial_group_image(&plaintext, &media_type);
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::GroupCreateImagePreprocess,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -5216,10 +5647,7 @@ fn account_worker_command_future<'a>(
             // pipeline hydrated everything), but if the pipeline aborted on a
             // storage error the leftover groups must still promote on first
             // read instead of surfacing GroupHydrationPending forever.
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -5267,10 +5695,7 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {
             // See the Members arm: on-demand promotion for pipeline-abort
             // leftovers.
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -5282,6 +5707,27 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => Box::pin(async move {
             let result = client.enable_group_disbanding(&group_id).await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::AccountDevicesActivation { group_id, respond } => {
+            Box::pin(async move {
+                let _ = client.runtime.ensure_group_hydrated(&group_id);
+                let result = client.account_devices_activation(&group_id);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
+        AccountWorkerCommand::EnableAccountDevices { group_id, respond } => Box::pin(async move {
+            let result = client.enable_account_devices(&group_id).await;
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
                     events,
@@ -5369,10 +5815,7 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = (|| {
-                client
-                    .runtime
-                    .session_mut()
-                    .ensure_group_hydrated(&group_id)?;
+                client.runtime.ensure_group_hydrated(&group_id)?;
                 client.group_app_component(&group_id, component_id)
             })();
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
@@ -5510,7 +5953,7 @@ fn account_worker_command_future<'a>(
             initial_admins,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
                 let admin_refs = initial_admins
@@ -5555,7 +5998,9 @@ fn account_worker_command_future<'a>(
                 Box::pin(serve_snapshot_reads_until(
                     read_snapshot,
                     async {
-                        client
+                        // An undelivered Welcome stays owed; the events below
+                        // report it.
+                        let _ = client
                             .drive_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
                         publish_pending_welcome_delivery_events(
@@ -5671,6 +6116,146 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::AccountRecoveryStatus { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.account_recovery_status(),
+            );
+            true
+        }),
+        AccountWorkerCommand::LinkedDevices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.linked_devices(),
+            );
+            true
+        }),
+        AccountWorkerCommand::KeyPackageRefreshOverdue { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.key_package_refresh_overdue(),
+            );
+            true
+        }),
+        AccountWorkerCommand::UnrecognizedSignIns { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.unrecognized_sign_ins(),
+            );
+            true
+        }),
+        AccountWorkerCommand::AnswerSignIn {
+            slot_id_hex,
+            response,
+            respond,
+        } => Box::pin(async move {
+            let result = client.answer_sign_in(&slot_id_hex, response).await;
+            // Announce the answer before the caller re-reads the list.
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CheckSignIns { respond } => Box::pin(async move {
+            let result = client.check_sign_ins_now().await;
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::StartFresh { respond } => Box::pin(async move {
+            let result = client.start_fresh();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::StartedFresh { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.started_fresh(),
+            );
+            true
+        }),
+        AccountWorkerCommand::CompromiseWarning { respond } => Box::pin(async move {
+            let result = client.compromise_warning();
+            // A read that gathered announces what it found.
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DismissCompromiseWarning { respond } => Box::pin(async move {
+            let result = client.dismiss_compromise_warning();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RenameLinkedDevice {
+            slot_id_hex,
+            label,
+            respond,
+        } => Box::pin(async move {
+            let result = client.rename_linked_device(&slot_id_hex, &label).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RemoveLinkedDevice {
+            slot_id_hex,
+            respond,
+        } => Box::pin(async move {
+            let result = client.remove_linked_device(&slot_id_hex).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::RemovedDeviceLeftoverChats { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::BeginRecoveryWords { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.begin_recovery_words(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ConfirmRecoveryWords { answers, respond } => Box::pin(async move {
+            let result = client.confirm_recovery_words(&answers).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CancelRecoveryWords { respond } => Box::pin(async move {
+            client.cancel_recovery_words();
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(()));
+            true
+        }),
+        AccountWorkerCommand::TurnOffBackups { respond } => Box::pin(async move {
+            let result = client.turn_off_backups().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.backup_settings(),
+            );
+            true
+        }),
         AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
             Box::pin(async move {
                 let _ = respond_diagnosed(
@@ -5706,7 +6291,7 @@ fn account_worker_command_future<'a>(
             Box::pin(async move {
                 let result = client.dismiss_history_notice(&notice_id);
                 // Announce the removal before the caller re-reads anything.
-                publish_history_notice_changes(client, events, account_id_hex, account_label);
+                publish_account_level_changes(client, events, account_id_hex, account_label);
                 let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
                 true
             })
@@ -5942,7 +6527,7 @@ fn account_worker_command_future<'a>(
             if let Some(queued) = queued {
                 queued.finish(TelemetryOutcome::Success);
             }
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             let execution = telemetry.observe(RuntimeOp::SendExecution);
             let send_started_at = Instant::now();
             telemetry.record(
@@ -6015,13 +6600,13 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let send_started_at = Instant::now();
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::OutboundMessageQueueWait,
                 enqueued_at.elapsed(),
                 true,
             );
             let mut first_projection = true;
-            client.send_telemetry = Some(shared.app_performance_telemetry());
+            client.send_telemetry = Some(shared.observer.performance().clone());
             let result = match intent {
                 AppMessageIntent::Reaction {
                     target_message_id,
@@ -6038,7 +6623,7 @@ fn account_worker_command_future<'a>(
                             attachments,
                             |update| {
                                 if first_projection {
-                                    shared.app_performance_telemetry().record(
+                                    shared.observer.performance().record(
                                         AppPerformanceOperation::OutboundMessageLocalProjection,
                                         enqueued_at.elapsed(),
                                         true,
@@ -6058,7 +6643,7 @@ fn account_worker_command_future<'a>(
                 intent => client
                     .send_app_event_with_local_projection(&group_id, intent, |update| {
                         if first_projection {
-                            shared.app_performance_telemetry().record(
+                            shared.observer.performance().record(
                                 AppPerformanceOperation::OutboundMessageLocalProjection,
                                 enqueued_at.elapsed(),
                                 true,
@@ -6076,7 +6661,7 @@ fn account_worker_command_future<'a>(
                     .map(|(_event, summary)| summary),
             };
             client.send_telemetry = None;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
                 result.is_ok(),
@@ -6117,7 +6702,7 @@ fn account_worker_command_future<'a>(
                     })
                 }
                 Err(err) => {
-                    shared.app_performance_telemetry().record(
+                    shared.observer.performance().record(
                         AppPerformanceOperation::MediaUpload,
                         started_at.elapsed(),
                         false,
@@ -6134,7 +6719,7 @@ fn account_worker_command_future<'a>(
             enqueued_at,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             telemetry.record(
                 AppPerformanceOperation::MediaDownloadQueueWait,
                 enqueued_at.elapsed(),
@@ -6268,6 +6853,11 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::DeviceLink { op, respond } => Box::pin(async move {
+            let result = client.device_link(op).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::PublishKeyPackage { respond } => Box::pin(async move {
             let result = async {
                 let key_package = client.publish_key_package().await?;
@@ -6284,7 +6874,7 @@ fn account_worker_command_future<'a>(
                 Ok(key_package.bytes().len())
             }
             .await;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -6298,6 +6888,11 @@ fn account_worker_command_future<'a>(
                 Ok(key_package.bytes().len())
             }
             .await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::WithdrawKeyPackageSlot { respond } => Box::pin(async move {
+            let result = client.withdraw_key_package_slot().await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
@@ -6378,6 +6973,9 @@ fn account_worker_command_future<'a>(
                     account_id_hex,
                     account_label,
                 );
+                // A host that drives maintenance itself starts the history
+                // blobs it made due, as the periodic pass does.
+                dispatch_history_blobs(client, media_http);
             }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -6431,6 +7029,14 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::GroupPushDebugInfo { group_id, respond } => Box::pin(async move {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let result = client.group_push_debug_info(&group_id);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RetryPushRegistration { respond } => Box::pin(async move {
             let pending = client
                 .retry_pending_push_registration_shares_best_effort()
@@ -6455,10 +7061,7 @@ fn group_recovery_after_hydration(
     client: &mut AppClient,
     group_id: &GroupId,
 ) -> Result<crate::GroupRecoveryStatus, AppError> {
-    client
-        .runtime
-        .session_mut()
-        .ensure_group_hydrated(group_id)?;
+    client.runtime.ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
 }
 
@@ -6538,13 +7141,14 @@ async fn publish_next_local_submission(
         (submission, queued)
     };
     if let Some(queued) = queued {
-        queued.finish(&shared.app_performance_telemetry());
+        queued.finish(shared.observer.performance());
     }
     let execution = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::SendExecution);
     let started = Instant::now();
-    client.send_telemetry = Some(shared.app_performance_telemetry());
+    client.send_telemetry = Some(shared.observer.performance().clone());
     let result = client
         .publish_local_submission(&submission, |update| {
             publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
@@ -6552,7 +7156,7 @@ async fn publish_next_local_submission(
         .await;
     client.send_telemetry = None;
     execution.finish_app(&result);
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageSend,
         started.elapsed(),
         result.is_ok(),
@@ -6591,20 +7195,21 @@ async fn send_message_on_worker(
         queued.finish(TelemetryOutcome::Success);
     }
     let execution = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::SendExecution);
     let send_started_at = Instant::now();
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageQueueWait,
         enqueued_at.elapsed(),
         true,
     );
     let mut first_projection = true;
-    client.send_telemetry = Some(shared.app_performance_telemetry());
+    client.send_telemetry = Some(shared.observer.performance().clone());
     let result = client
         .send_with_local_projection(&group_id, &payload, |update| {
             if first_projection {
-                shared.app_performance_telemetry().record(
+                shared.observer.performance().record(
                     AppPerformanceOperation::OutboundMessageLocalProjection,
                     enqueued_at.elapsed(),
                     true,
@@ -6616,7 +7221,7 @@ async fn send_message_on_worker(
         .await;
     client.send_telemetry = None;
     execution.finish_app(&result);
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageSend,
         send_started_at.elapsed(),
         result.is_ok(),
@@ -6628,10 +7233,7 @@ pub(super) fn group_roster_after_hydration(
     client: &mut AppClient,
     group_id: &GroupId,
 ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
-    client
-        .runtime
-        .session_mut()
-        .ensure_group_hydrated(group_id)?;
+    client.runtime.ensure_group_hydrated(group_id)?;
     client.group_roster_session(group_id)
 }
 
@@ -6644,10 +7246,7 @@ fn member_ids_page_after_hydration(
     // UnknownGroup. Build the response only after all requested rosters pass
     // that gate so callers never receive a partial page.
     for group_id in group_ids {
-        let _live = client
-            .runtime
-            .session_mut()
-            .ensure_group_hydrated(group_id)?;
+        let _live = client.runtime.ensure_group_hydrated(group_id)?;
     }
     client.member_ids_page(group_ids)
 }
@@ -6735,6 +7334,30 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
     push_registration_retry_base_delay()
         .saturating_mul(multiplier)
         .min(push_registration_retry_max_delay())
+}
+
+/// Arm the push retry for the work a worker turn left: a member add on any
+/// ingest or send path that queued a share or owed a snapshot, a sent message
+/// that owes the periodic announce, a received announce or request to decide
+/// a repair reply for, or an owed snapshot, announce or repair reply that its
+/// group's state no longer holds back. What holds one back (hydration, a
+/// queued invite, a disband, a block) changes only through account work, so
+/// checking after every turn notices it without polling. A join window
+/// ending, and a repair reply's slots passing, are noticed by the maintenance
+/// tick.
+fn schedule_push_work_after_turn(
+    client: &mut AppClient,
+    scheduled: &mut ScheduledPushRegistrationRetry,
+    commands: &mpsc::Sender<AccountWorkerCommand>,
+) {
+    client.retry_pending_member_add_push_shares();
+    if client.take_queued_push_registration_share()
+        || client.has_due_push_snapshot()
+        || client.has_due_push_announce()
+        || client.has_due_push_repair()
+    {
+        scheduled.observe_pending(true, commands);
+    }
 }
 
 /// A bounded backoff timer that exists only while durable push outbox rows
@@ -7170,14 +7793,10 @@ fn schedule_pending_convergence_groups(
 fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     // Normal builds always schedule against the pinned v1 quiescence window
     // (mdk#970); the override exists only in explicit test-policy builds.
-    let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
-        app.config
-            .dev_settlement_quiescence_ms
-            .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS)
-    } else {
-        cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
-    };
-    Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
+    Duration::from_millis(
+        app.settlement_quiescence_ms()
+            .saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+    )
 }
 
 fn startup_hydration_batch_test_delay(app: &MarmotApp) -> Duration {
@@ -7276,6 +7895,17 @@ struct ReceiveTailContext<'a> {
     shared: &'a RuntimeSharedServices,
     scheduled_push_retry: &'a mut ScheduledPushRegistrationRetry,
     command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
+}
+
+/// Forget the device-group copy and ask the runtime to deactivate the
+/// account, which then tells hosts the device group unlinked this device;
+/// the caller ends the worker. Once the account is marked unlinked, a crash
+/// from here on still leaves it signed out; a mark that failed keeps the
+/// copy, so the next start finds the removal and marks it (mdk#2628 D67).
+async fn stop_unlinked_worker(client: &mut AppClient, unlinked: oneshot::Sender<()>) {
+    client.follow_device_group_removal().await;
+    client.finish_audit_recording();
+    let _ = unlinked.send(());
 }
 
 async fn finish_receive_after_recovery(
@@ -7414,7 +8044,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            shared.product_analytics.begin(
+            shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,
@@ -7449,7 +8079,7 @@ async fn report_pending_epoch_backfill_result(
     client: &mut AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
-    observation: Option<crate::product_analytics::ProductObservation>,
+    observation: Option<marmot_observability::product_analytics::ProductObservation>,
     context: EpochBackfillReportContext<'_>,
 ) -> Result<(), AccountCatchUpFailure> {
     let EpochBackfillReportContext {
@@ -7662,7 +8292,8 @@ fn record_runtime_publication(
     if publication.attempted == 0 || !client.audit_v5_enabled() {
         return;
     }
-    client.runtime.session().record_v5_event(
+    marmot_forensics::ForensicRecorder::record_v5_event(
+        &client.audit,
         None,
         marmot_forensics::v5::Event::RuntimePublicationOutcome(
             marmot_forensics::v5::RuntimePublicationOutcome {
@@ -7729,10 +8360,13 @@ fn publish_client_pending_projection_updates(
         None,
         publication,
     );
-    publish_history_notice_changes(client, events, account_id_hex, account_label);
+    publish_account_level_changes(client, events, account_id_hex, account_label);
     for group_id in client.pending_recovery_status_updates.drain() {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
     }
+    // Welcomes a publish could not deliver ride the same drain, whichever
+    // path published them (mdk#2628 3.5a).
+    publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
     // Superseded own commits ride the same drain: every worker seam that can
     // observe convergence effects already flushes projection updates here.
     for report in client.take_pending_superseded_change_events() {
@@ -7762,15 +8396,23 @@ fn publish_client_pending_applied_summary(
 ) {
     let summary = client.take_pending_applied_sync_summary();
     publish_app_runtime_summary_with_v5(client, events, account_id_hex, account_label, &summary);
+    // Startup and reconnect reconcile device-group trust before reaching
+    // here, and no account-level seam follows them until the next command.
+    publish_device_group_changes(client, events, account_id_hex, account_label);
+    publish_sign_in_changes(client, events, account_id_hex, account_label);
 }
 
-/// Announce a change in the parked recovery set ("history may be incomplete"):
-/// one account-level `HistoryNoticesChanged`, plus `GroupStateUpdated` for each
-/// group whose own notices appeared or disappeared, so hosts re-read that
-/// group's `GroupRecoveryStatus`. Parking, un-parking by new evidence and
-/// dismissal all surface at the next seam that calls this; each call is one
-/// indexed read of the parked set.
-fn publish_history_notice_changes(
+/// Announce account-level changes. A change in the parked recovery set
+/// ("history may be incomplete") is one `HistoryNoticesChanged`, plus
+/// `GroupStateUpdated` for each group whose own notices appeared or
+/// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
+/// un-parking by new evidence and dismissal all surface at the next seam that
+/// calls this; each call is one indexed read of the parked set. Behind the
+/// internal `runner_owns_debt` gate a change in what the recovery runner
+/// catches up, or in the notices, is one `RecoveryStatusChanged`. It also
+/// announces device-group and sign-in changes
+/// ([`publish_device_group_changes`], [`publish_sign_in_changes`]).
+fn publish_account_level_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7778,7 +8420,16 @@ fn publish_history_notice_changes(
 ) {
     // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
-    let Some(groups) = client.take_history_notice_changes() else {
+    publish_device_group_changes(client, events, account_id_hex, account_label);
+    publish_sign_in_changes(client, events, account_id_hex, account_label);
+    let notice_changes = client.take_history_notice_changes();
+    if client.take_recovery_status_changed(notice_changes.is_some()) {
+        let _ = events.send(MarmotAppEvent::RecoveryStatusChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    let Some(groups) = notice_changes else {
         return;
     };
     let _ = events.send(MarmotAppEvent::HistoryNoticesChanged {
@@ -7787,6 +8438,63 @@ fn publish_history_notice_changes(
     });
     for group_id in groups {
         publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
+}
+
+/// One `LinkedDevicesChanged` for a hidden device-group event or a change of
+/// device-group trust since the last call, one
+/// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
+/// overdue-refresh answer, and one `DeviceLinkChanged` for a change in
+/// linking a new device. Both the account-level seam and the applied-summary
+/// seam drain them, so startup, reconnect, maintenance and every command and
+/// delivery announce them.
+fn publish_device_group_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if client.take_linked_devices_changed() {
+        let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_key_package_refresh_overdue_changed() {
+        let _ = events.send(MarmotAppEvent::KeyPackageRefreshOverdueChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_device_link_changed() {
+        let _ = events.send(MarmotAppEvent::DeviceLinkChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+}
+
+/// One `UnrecognizedSignInsChanged` for a check or answer that changed the
+/// unrecognized sign-ins, or a roster change, since the last call, and one
+/// `CompromiseWarningChanged` when the compromise warning changed. Drained
+/// at the same seams as [`publish_device_group_changes`].
+fn publish_sign_in_changes(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if client.take_unrecognized_sign_ins_changed() {
+        let _ = events.send(MarmotAppEvent::UnrecognizedSignInsChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_compromise_warning_changed() {
+        let _ = events.send(MarmotAppEvent::CompromiseWarningChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
     }
 }
 
@@ -7803,9 +8511,9 @@ pub(crate) fn publish_app_runtime_group_state_updated(
     });
 }
 
-/// Broadcast a `WelcomeDeliveryPending` event for each welcome a just-completed
-/// create/invite queued for re-delivery (mdk#352), so subscribers learn a member
-/// is unjoinable without polling the durable queue.
+/// Broadcast a `WelcomeDeliveryPending` event for each Welcome a publish
+/// queued for re-delivery (mdk#352), so subscribers learn a member is
+/// unjoinable without polling the durable queue.
 fn publish_pending_welcome_delivery_events(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7915,6 +8623,7 @@ mod tests {
     mod publication_progress_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
+    mod recovery_runner_host_tests;
     mod refused_subscription_send_tests;
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
@@ -7977,6 +8686,45 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    /// mdk#2628 3.5a: the drain every worker seam runs broadcasts the Welcome
+    /// failures its client noted, so one a maintenance or convergence pass
+    /// published reaches the host without waiting for the next create or
+    /// invite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projection_drain_broadcasts_noted_welcome_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = GroupId::new(vec![1; 16]);
+        client
+            .pending_welcome_delivery_events
+            .push(crate::PendingWelcomeDelivery {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                message_id_hex: "ab".repeat(32),
+                recipient_hex: "cd".repeat(32),
+                recorded_at: 1,
+            });
+        let (events, mut received) = broadcast::channel(16);
+        publish_client_pending_projection_updates(&mut client, &events, "alice-id", "alice");
+        let mut announced = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let MarmotAppEvent::WelcomeDeliveryPending {
+                group_id,
+                message_id_hex,
+                ..
+            } = event
+            {
+                announced.push((group_id, message_id_hex));
+            }
+        }
+        assert_eq!(announced, [(group_id, "ab".repeat(32))]);
+        assert!(client.take_pending_welcome_delivery_events().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8375,7 +9123,7 @@ mod tests {
         client
             .finish_scheduled_convergence_effects(
                 &group_id,
-                &marmot_account::AccountDeviceEffects::default(),
+                &marmot_session::AccountDeviceEffects::default(),
             )
             .await
             .unwrap();
@@ -8408,7 +9156,7 @@ mod tests {
             received.try_recv().is_err(),
             "a status transition is broadcast once"
         );
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
@@ -8501,7 +9249,7 @@ mod tests {
         // Dismissal disappears once, from the command's own publication.
         let notice = client.history_notices().unwrap().remove(0);
         assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
-        publish_history_notice_changes(&mut client, &events, &account.account_id_hex, "alice");
+        publish_account_level_changes(&mut client, &events, &account.account_id_hex, "alice");
         expect_change(&mut received);
 
         // New evidence reopens the retired gap as pending debt, which is not
@@ -8662,6 +9410,7 @@ mod tests {
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             },
             rx,
@@ -8670,7 +9419,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_dispatch_shares_media_capacity_and_holds_it_through_publication() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         for n in 0..5 {
@@ -8732,7 +9481,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn avatar_shutdown_cancels_io_and_leaves_resumable_intent() {
-        let store = storage_sqlite::SqliteAccountStorage::in_memory()
+        let store = storage_sqlite::SqliteAccountStorage::in_memory_for_test()
             .unwrap()
             .app_storage();
         let reference = store
@@ -8924,11 +9673,12 @@ mod tests {
                 events,
                 lifecycle: shared.lifecycle(),
                 shared: shared.clone(),
+                unlinked: oneshot::channel().0,
             },
             commands.clone(),
             receiver,
             ready,
-            AccountStartupProgress::new(shared.app_performance_telemetry()),
+            AccountStartupProgress::new(shared.observer.performance().clone()),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
@@ -9265,7 +10015,7 @@ mod tests {
         let mut schedule = LegacyMessagePromotionSchedule::new();
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
-            Err(cgka_session::SessionError::from(
+            Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Busy("test contention".into()),
             ))
         });
@@ -9281,7 +10031,7 @@ mod tests {
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
-            Err(cgka_session::SessionError::from(
+            Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Serialization("malformed legacy row".into()),
             ))
         });
@@ -9576,7 +10326,7 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         client
             .sync_with_stage_telemetry(
-                Some(&shared.app_performance_telemetry()),
+                Some(shared.observer.performance()),
                 crate::client::SyncMode::Startup,
             )
             .await
@@ -9901,6 +10651,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -9918,6 +10669,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             )
             .await;
@@ -10266,6 +11018,7 @@ mod tests {
                 group_id,
                 message_id: message_id.clone(),
                 sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                sender_leaf_index: None,
                 epoch: cgka_traits::EpochId(1),
                 payload: Vec::new(),
                 retention: None,
@@ -10322,6 +11075,105 @@ mod tests {
 
         scheduled.schedule_after_attempt(false, &commands);
         assert!(!scheduled.is_armed());
+    }
+
+    /// An owed push snapshot held back by its group's state arms no retry, and
+    /// the first turn after the hold clears arms one, with no command or
+    /// member add of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_push_snapshot_is_scheduled_once_its_group_lets_it_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client.create_group("held snapshot", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let epoch = client.runtime.epoch_state(&group).unwrap().epoch().0;
+        // Owed once the group's epoch passes the current one.
+        assert!(
+            app.record_group_push_snapshot_owed(&account.label, &group_hex, epoch)
+                .unwrap()
+        );
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(!scheduled.is_armed());
+
+        client
+            .update_group_profile(&group, Some("held snapshot, renamed"), None)
+            .await
+            .unwrap();
+        let _ = client.take_queued_push_registration_share();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(scheduled.is_armed());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("a due snapshot must enqueue a push retry")
+        };
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        assert!(!pending);
+        let _ = respond.send(pending);
+        assert_eq!(
+            app.group_push_snapshot_owed(&account.label, &group_hex)
+                .unwrap(),
+            None
+        );
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        tokio::task::yield_now().await;
+        assert!(!client.has_due_push_snapshot());
+    }
+
+    /// A group message sent where this device has never announced owes the
+    /// periodic announce once the device can fetch, and the turn that sent it
+    /// arms the push retry that sends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sent_message_owing_the_periodic_announce_arms_the_push_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client.create_group("periodic announce", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // The scripted relay sends no EOSE.
+        client.test_push_device_can_fetch = Some(true);
+        client.push_announce_timing.catch_up_settle = Duration::ZERO;
+        client.advance_push_join_windows().await;
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(!scheduled.is_armed(), "nothing is owed before a send");
+
+        client.send(&group, b"first message").await.unwrap();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(scheduled.is_armed());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("an owed announce must enqueue a push retry")
+        };
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        assert!(!pending);
+        let _ = respond.send(pending);
+        assert!(
+            app.group_push_gossip_state(&account.label, &group_hex)
+                .unwrap()
+                .and_then(|state| state.last_announced_at_ms)
+                .is_some()
+        );
+        assert!(!client.has_due_push_announce());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10457,6 +11309,47 @@ mod tests {
             .may_change_push_registration_work(),
             "unrelated convergence commands must not arm push maintenance"
         );
+    }
+
+    /// A frozen batch that failed reports its retry delay as a collecting wait
+    /// (mdk#2684). Other groups take the worker's turns meanwhile, and a parked
+    /// batch leaves no deadline at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_convergence_pass_waits_out_its_retry_behind_other_groups() {
+        let failing = test_group_id(43);
+        let other = test_group_id(44);
+        let retry_after = Duration::from_secs(16);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+
+        // The failed attempt arms the worker's error backoff; the wake it
+        // gives finds the batch still waiting and re-arms at its retry time.
+        scheduled.schedule_retry_groups([failing.clone()]);
+        tokio::time::advance(retry_delay_for_attempt(1)).await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        scheduled.schedule_after_pass(
+            &failing,
+            ConvergenceScheduleState::Collecting {
+                remaining_ms: retry_after.as_millis() as u64,
+            },
+        );
+        for _ in 0..3 {
+            scheduled.schedule_after_pass(&other, ConvergenceScheduleState::Ready);
+            tokio::time::advance(MIN_CONVERGENCE_SETTLEMENT_DELAY).await;
+            assert!(scheduled.has_ready());
+            assert_eq!(scheduled.take_ready(), Some(other.clone()));
+        }
+        assert!(!scheduled.has_ready());
+        assert!(!scheduled.retry_attempts.contains_key(&failing));
+
+        tokio::time::advance(
+            retry_after + Duration::from_millis(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+        )
+        .await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        // Out of budget: the parked batch reports no work and keeps no timer.
+        scheduled.schedule_after_pass(&failing, ConvergenceScheduleState::Idle);
+        assert!(scheduled.deadlines.is_empty());
+        assert_eq!(scheduled.take_ready(), None);
     }
 
     /// A runnable retained replay wakes once; failures use bounded error
@@ -10806,6 +11699,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);
@@ -10824,6 +11718,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             );
             let observer = async {

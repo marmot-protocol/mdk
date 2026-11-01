@@ -23,6 +23,8 @@ use std::collections::BTreeSet;
 mod avatar_url;
 mod blossom_image;
 mod codec;
+mod device_roster;
+mod device_tag;
 mod encrypted_media;
 mod encrypted_media_v2;
 mod host_safety;
@@ -45,6 +47,19 @@ pub use codec::{
     decode_components_list, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_quic_varint,
 };
+pub use device_roster::{
+    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN,
+    DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
+    DeviceRenameId, DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1,
+    DeviceSettingsV1, DeviceSlotId, DeviceStatusV1, RejectedSlotReasonV1, RejectedSlotV1,
+    apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1,
+};
+pub use device_tag::{
+    DEVICE_TAG_NONCE_LEN, DEVICE_TAG_VECTOR_MAX_LEN, DeviceTagClaim, DeviceTagContentV1,
+    DeviceTagV1, decode_device_tag_content_v1, decode_device_tag_v1, encode_device_tag_content_v1,
+    encode_device_tag_signed_content_v1, encode_device_tag_v1,
+};
 pub use encrypted_media::{
     BlobStoreEndpointV1, EncryptedMediaPolicyV1, decode_encrypted_media_policy_v1,
     encode_encrypted_media_policy_v1, validate_and_normalize_blob_endpoint_url,
@@ -64,7 +79,7 @@ pub use profile::{
 };
 pub use routing::{
     NOSTR_RELAY_URL_MAX_LEN, NOSTR_ROUTING_MAX_RELAYS, NostrRoutingV1, decode_nostr_routing_v1,
-    encode_nostr_routing_v1,
+    encode_nostr_routing_v1, validate_nostr_relay_url,
 };
 
 /// MLS ComponentID.
@@ -104,17 +119,39 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
 /// `app_data_dictionary`; GroupContext dictionaries only require the id via
 /// `app_components`.
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
-/// Draft multi-device join authorization. Carried only as an MLS
-/// `AppEphemeral` proposal in a multi-device External Commit: the registry
-/// makes it invalid as GroupContext, LeafNode, KeyPackage, GroupInfo or
-/// SafeAAD component data, so it never becomes persistent group state.
-pub const MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID: AppComponentId = 0x800a;
+// 0x800a was the draft multi-device join authorization. The registry
+// withdrew it (marmot#427), so MDK treats it like any id the registry does
+// not assign.
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
+/// `marmot.group.account-devices.v1`: lets a member add and remove leaves of
+/// its own account without admin authority once a group requires it. It has
+/// no data at any location; its id appears only in `app_components` support
+/// and required lists.
+pub const ACCOUNT_DEVICES_COMPONENT_ID: AppComponentId = 0x800d;
+
+/// `max_leaves_per_account` of `marmot.group.account-devices.v1`: while a
+/// group requires the component, no account holds more current leaves than
+/// this. Fixed for the component id; a different cap needs a new id.
+pub const MAX_LEAVES_PER_ACCOUNT: usize = 20;
+
+/// `marmot.account.device-roster.v1`: the roster of an account's device
+/// group (mdk#2628 D16). Requiring it marks a group as a device group; the
+/// marker alone never makes a group trusted. Its update is a diff of keyed
+/// entries ([`DeviceRosterUpdateV1`]). The wire format is unreleased until
+/// its spec lands, so the engine advertises it only in test-policy builds.
+pub const DEVICE_ROSTER_COMPONENT_ID: AppComponentId = 0x800e;
+
+/// `marmot.member.device-tag.v1`: a LeafNode entry that says which of the
+/// account's linked devices holds the leaf (mdk#2628 D32). It is sealed under
+/// the device roster's `leaf_tag_key`, so only the account's devices can read
+/// it. No group may require it, and an entry under its id anywhere but a
+/// LeafNode is unknown data.
+pub const DEVICE_TAG_COMPONENT_ID: AppComponentId = 0x800f;
 
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800c`
+/// The protocol registry allocates upward from `0x8001` and is at `0x800f`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -134,8 +171,8 @@ pub const APP_COMPONENT_DATA_MAX_LEN: usize = 4096;
 
 /// Every component id the protocol owns, in registry assignment order.
 ///
-/// Add every new protocol component constant here, including draft and
-/// ephemeral-only ones: the engine's GroupContext format validation reads
+/// Add every new protocol component constant here, including draft ones: the
+/// engine's GroupContext format validation reads
 /// this list, so an id left out is never format-checked. Applications are
 /// kept away from all of these by the separate
 /// [`APP_OWNED_APP_COMPONENT_ID_START`] boundary rather than by this list, so
@@ -152,9 +189,11 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
-    MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
+    ACCOUNT_DEVICES_COMPONENT_ID,
+    DEVICE_ROSTER_COMPONENT_ID,
+    DEVICE_TAG_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the
@@ -178,6 +217,8 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = GROUP_ENCRYPTED_MEDIA_V1_COMPO
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
 pub const GROUP_LIFECYCLE_COMPONENT: &str = "marmot.group.lifecycle.v1";
+pub const ACCOUNT_DEVICES_COMPONENT: &str = "marmot.group.account-devices.v1";
+pub const DEVICE_ROSTER_COMPONENT: &str = "marmot.account.device-roster.v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";

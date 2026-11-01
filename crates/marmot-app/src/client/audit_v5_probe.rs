@@ -6,12 +6,11 @@
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
 //! also records the returned retained artifact and recipient engine join.
 //! Publication receipts are captured at the account owner boundary.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, ProtocolProfile};
@@ -22,6 +21,9 @@ use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
 use marmot_forensics::v5::*;
+use marmot_session::{PublishWork, SessionEffects};
+#[cfg(feature = "unreleased-device-pairing")]
+use transport_nostr_peeler::AccountGiftWrap;
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;
@@ -38,7 +40,9 @@ pub(crate) struct FoundingSelection {
 }
 
 pub(crate) struct PendingFounding {
-    selected: BTreeMap<Vec<u8>, (LocalId, [u8; 32])>,
+    /// Each recipient's selected KeyPackages, in the order the engine wraps
+    /// their Welcomes.
+    selected: BTreeMap<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>,
 }
 
 /// One selected AppClient delivery episode. The app arms it before engine
@@ -70,11 +74,35 @@ impl PeelSlot {
     }
 }
 
-/// The only selected test peeler. It delegates product behavior, and observes
-/// the same concrete Welcome peel the engine uses without a second decode.
+/// App-owned inbox boundary: apply invitation policy only after the one
+/// authenticated inner decode, and observe that same peel without repeating it.
 pub(crate) struct ProbePeeler {
     pub inner: NostrMlsPeeler,
     pub slot: Arc<Mutex<PeelSlot>>,
+    pub storage: storage_sqlite::SqliteAppStorage,
+    /// Takes the pairing messages among the gift wraps to the account.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pub pairing: Option<super::device_pairing::PairingInbox>,
+}
+
+impl ProbePeeler {
+    /// Open a gift wrap to the account once: a Welcome peels as before, and
+    /// a pairing message goes to the pairing inbox. Anything not a Welcome
+    /// is still refused, so the engine ignores it.
+    async fn open_welcome(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        #[cfg(feature = "unreleased-device-pairing")]
+        if let Some(pairing) = &self.pairing {
+            let opened = self.inner.peel_account_gift_wrap(msg).await?;
+            if let AccountGiftWrap::Other(unwrapped) = &opened {
+                pairing.offer(unwrapped);
+            }
+            return opened.into_welcome();
+        }
+        self.inner.peel_welcome_with_provenance(msg).await
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -90,7 +118,34 @@ impl TransportPeeler for ProbePeeler {
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         let started = Instant::now();
-        let result = self.inner.peel_welcome_with_provenance(msg).await;
+        let result = self
+            .open_welcome(msg)
+            .await
+            .and_then(|(peeled, provenance)| {
+                // The caller holds the account policy lock through admission and
+                // projection. Only an authenticated Welcome is an invitation.
+                if matches!(&peeled.content, cgka_traits::PeeledContent::Welcome { .. }) {
+                    let sender = peeled
+                        .sender
+                        .as_ref()
+                        .ok_or(PeelerError::InvalidSignature)?;
+                    let blocked = self
+                        .storage
+                        .is_user_blocked(&hex::encode(sender.as_slice()))
+                        .map_err(|_| {
+                            PeelerError::Backend("Welcome policy storage failed".into())
+                        })?;
+                    if blocked {
+                        self.storage
+                            .dismiss_blocked_welcome(&hex::encode(msg.id.as_slice()))
+                            .map_err(|_| {
+                                PeelerError::Backend("Welcome dismissal storage failed".into())
+                            })?;
+                        return Err(PeelerError::WrongRecipient);
+                    }
+                }
+                Ok((peeled, provenance))
+            });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut slot = self.slot.lock().unwrap();
         if let Some((id, receive_id, outer)) = slot.armed.take()
@@ -327,7 +382,7 @@ impl WelcomeProbe {
             self.dropped += selections.len();
             return None;
         }
-        let mut selected = BTreeMap::new();
+        let mut selected = BTreeMap::<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>::new();
         for selection in selections {
             let Ok(recipient) = hex::decode(selection.recipient_hex) else {
                 self.invalid += 1;
@@ -345,18 +400,20 @@ impl WelcomeProbe {
                 self.invalid += 1;
                 return None;
             };
-            let op_id = self.local_id();
-            if selected.insert(recipient, (op_id, event_id)).is_some() {
+            let packages = selected.entry(recipient).or_default();
+            if packages.iter().any(|(_, selected)| *selected == event_id) {
                 self.invalid += 1;
                 return None;
             }
+            packages.push_back((self.local_id(), event_id));
         }
         Some(PendingFounding { selected })
     }
 
     /// The returned FoundingGroupCreated artifact comes after the engine's
     /// canonical transaction retained these exact Welcome messages as Sent.
-    /// Match by validated recipient identity, never by incidental vec order.
+    /// Match by validated recipient identity. One account's several
+    /// KeyPackages match in the order the engine wrapped their Welcomes.
     pub(crate) fn founding_prepared(
         &mut self,
         mut pending: PendingFounding,
@@ -385,8 +442,10 @@ impl WelcomeProbe {
                     self.invalid += 1;
                     return;
                 };
-                let Some((op_id, key_package_event_id)) =
-                    pending.selected.remove(recipient.as_slice())
+                let Some((op_id, key_package_event_id)) = pending
+                    .selected
+                    .get_mut(recipient.as_slice())
+                    .and_then(VecDeque::pop_front)
                 else {
                     self.invalid += 1;
                     return;
@@ -413,7 +472,12 @@ impl WelcomeProbe {
                 rows.push((op_id, recipient_ref, key_package_event_id, outer_event_id));
             }
         }
-        if !found_work || !pending.selected.is_empty() {
+        if !found_work
+            || pending
+                .selected
+                .values()
+                .any(|packages| !packages.is_empty())
+        {
             self.invalid += 1;
             return;
         }
@@ -581,12 +645,13 @@ impl WelcomeProbe {
                 Some(BaselineMember { member_ref, admin })
             })
             .collect::<Vec<_>>();
+        // One entry per account: an account with several devices holds
+        // several leaves, which is not an identity fault.
         members.sort_by(|a, b| a.member_ref.cmp(&b.member_ref));
-        let before_dedup = members.len();
         members.dedup_by(|a, b| a.member_ref == b.member_ref);
-        let member_count = u32::try_from(group.members.len()).ok();
+        let member_count = u32::try_from(crate::groups::member_account_count(&group.members)).ok();
         let mut limitations = Vec::new();
-        if invalid_member_identity || members.len() != before_dedup {
+        if invalid_member_identity {
             limitations.push(Limitation::MemberIdentityInvalid);
         }
         if members.len() > MAX_MEMBERS {

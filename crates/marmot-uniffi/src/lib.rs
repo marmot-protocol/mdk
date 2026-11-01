@@ -84,9 +84,9 @@ pub use commands::{
     PublicEventPreviewStateFfi, parse_media_imeta_tag, verify_public_nostr_event_json,
 };
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
-    AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, AuditLogDeleteResultFfi,
-    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
+    AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi,
+    AppGroupMemberIdsFfi, AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi,
+    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
     AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
     AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi, AuditOtlpTrackerResultV5Ffi,
     BackgroundNotificationCollectionFfi, CachedIdentityProjectionFfi, ChatConversationKindFfi,
@@ -122,8 +122,9 @@ pub use conversions::{
     PushRegistrationSyncResultFfi, RelayEndpointClassificationFfi, RelayEndpointPolicyFfi,
     RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
     RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
-    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi,
+    StickerImportResultFfi, StickerPackFfi, StickerRefFfi, StickerSyncResultFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
@@ -211,6 +212,11 @@ pub struct MarmotOptions {
     pub cursor_persistence: Option<CursorPersistenceFfi>,
     #[uniffi(default = None)]
     pub client_name: Option<String>,
+    /// Short name of the platform this device runs on, such as `iOS`. With
+    /// `client_name`, it fills this device's entry on the account's Devices
+    /// screen (mdk#2628 3.6). Blank, or over 64 bytes once trimmed, is left out.
+    #[uniffi(default = None)]
+    pub device_platform: Option<String>,
     #[uniffi(default = None)]
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
@@ -221,8 +227,8 @@ pub struct MarmotOptions {
     #[uniffi(default = None)]
     pub moderation_report_config: Option<ModerationReportConfigFfi>,
     /// Deployment services: recovery relays, discovery indexers, media and
-    /// image servers, Open Ranking, KeyPackage client preference, moderation
-    /// label namespace and keychain service. Required, with no default, so a
+    /// image servers, Open Ranking, moderation label namespace and keychain
+    /// service. Required, with no default, so a
     /// host can't silently open a different keychain service: White Noise
     /// apps pass `marmot_deployment_white_noise()`.
     pub deployment: MarmotDeploymentFfi,
@@ -235,6 +241,7 @@ impl MarmotOptions {
             relay_policy: None,
             cursor_persistence: None,
             client_name: None,
+            device_platform: None,
             secret_store: None,
             attachment_acquisition_mode: None,
             moderation_report_config: None,
@@ -262,6 +269,7 @@ impl MarmotOptions {
                     .into(),
             )
             .with_key_package_client_name(self.client_name.clone())
+            .with_device_platform(self.device_platform.clone())
             .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into))
             .with_deployment(self.deployment.clone().into())
     }
@@ -399,7 +407,8 @@ impl Marmot {
     }
 
     /// Open with an optional public client label for new KeyPackage publications.
-    /// Existing constructors remain untagged. Whitespace-only labels are omitted.
+    /// Existing constructors remain untagged. Whitespace-only labels, and labels
+    /// longer than 64 bytes once trimmed, are omitted rather than truncated.
     /// Hosts must supply this on every foreground/background runtime construction.
     #[uniffi::constructor]
     pub fn new_with_client_name(
@@ -559,6 +568,18 @@ pub use commands::AttachmentTransferSubscription;
 mod tests {
     use super::*;
 
+    /// Crate-root re-exports are public API for Rust consumers. Each type
+    /// named here must stay importable from the root, not only through
+    /// `conversions`, so an additive export list change cannot drop one.
+    #[test]
+    fn crate_root_keeps_pre_existing_public_exports() {
+        fn importable<T>() {}
+        importable::<crate::RuntimeProjectionUpdateFfi>();
+        importable::<crate::TimelineProjectionUpdateFfi>();
+        importable::<crate::TimelineSubscriptionUpdateFfi>();
+        importable::<crate::StickerPackFfi>();
+    }
+
     #[test]
     fn runtime_options_defaults_and_combined_policies() {
         let defaults = MarmotOptions::for_deployment(marmot_deployment_neutral()).app_config();
@@ -569,6 +590,7 @@ mod tests {
             marmot_app::CursorPersistence::Advance
         );
         assert_eq!(defaults.key_package_client_name, None);
+        assert_eq!(defaults.device_platform, None);
         assert_eq!(
             defaults.attachment_acquisition_mode,
             marmot_app::AttachmentAcquisitionMode::NativeAutomatic
@@ -591,6 +613,7 @@ mod tests {
                 relay_policy: Some(policy),
                 cursor_persistence: Some(CursorPersistenceFfi::Frozen),
                 client_name: Some(" whitenoise ".into()),
+                device_platform: Some("iOS".into()),
                 ..MarmotOptions::for_deployment(marmot_deployment_neutral())
             }
             .app_config();
@@ -604,6 +627,7 @@ mod tests {
                 config.key_package_client_name.as_deref(),
                 Some(" whitenoise ")
             );
+            assert_eq!(config.device_platform.as_deref(), Some("iOS"));
         }
     }
 

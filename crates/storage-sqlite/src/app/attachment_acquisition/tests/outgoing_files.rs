@@ -394,7 +394,7 @@ fn cancelled_staging_releases_committed_chunks_without_blocking_account_commands
 fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("chunked.sqlite");
-    let key = SqlCipherKey::new("synthetic-chunk-reopen").unwrap();
+    let key = SqlCipherKey::raw([0x38; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     seed(&store, "chunked");
@@ -495,13 +495,14 @@ fn shared_file_promotion_keeps_one_body_and_charges_each_source() {
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
     assert_eq!(count(&store, "retained_attachment_chunks"), 1);
     assert_eq!(count(&store, "attachment_chunk_bodies"), 1);
+    let rewrite = store
+        .lock()
+        .unwrap()
+        .execute("UPDATE retained_attachment_chunks SET bytes=bytes", [])
+        .map_err(|error| error.to_string());
     assert!(
-        store
-            .lock()
-            .unwrap()
-            .execute("UPDATE retained_attachment_chunks SET bytes=bytes", [])
-            .is_err(),
-        "verified chunks are immutable"
+        matches!(&rewrite, Err(message) if message.contains("verified file chunks are immutable")),
+        "{rewrite:?}"
     );
     app.remove_local_attachment(GROUP, "file-a", 0).unwrap();
     assert_eq!(usage(&store), BODY.len() as u64);
@@ -534,7 +535,7 @@ fn promotion_snapshot_control(interleave: PromotionInterleave) {
     let expires = matches!(interleave, PromotionInterleave::Expiry);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("promotion.sqlite");
-    let key = SqlCipherKey::new("synthetic-late-binding").unwrap();
+    let key = SqlCipherKey::raw([0x1b; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     sent(&store, "late-binding");
     let mut tokens = stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap();
@@ -824,6 +825,7 @@ fn file_staging_rolls_back_short_growing_mismatched_cancelled_and_over_quota_sou
 #[test]
 #[ignore = "opt-in 758 MB SQLCipher retention measurement; generated bounded input"]
 fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
+    crate::base::connection::use_production_storage_for_test_process();
     const LEN: u64 = 758_000_000;
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::open_encrypted(

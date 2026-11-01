@@ -100,6 +100,52 @@ pub(crate) fn media_nonce_from_reference(
         .map_err(|_| AppError::InvalidEncryptedMedia("media nonce must be 12 bytes".into()))
 }
 
+/// What opens a downloaded attachment.
+#[derive(Clone, Copy)]
+pub(crate) enum MediaKey<'a> {
+    /// The source epoch's media secret, from which each file's key is derived.
+    EpochSecret(&'a [u8]),
+    /// One file's key itself, imported with a sibling's history (mdk#2628
+    /// 4.2a) by a device that was never in the source epoch.
+    File(&'a [u8; 32]),
+}
+
+impl MediaKey<'_> {
+    pub(crate) fn file_key(
+        self,
+        version: EncryptedMediaVersion,
+        file_hash: &[u8; 32],
+        media_type: &str,
+        file_name: &str,
+    ) -> Result<[u8; 32], AppError> {
+        match self {
+            Self::EpochSecret(secret) => {
+                derive_media_file_key(secret, version, file_hash, media_type, file_name)
+            }
+            Self::File(key) => Ok(*key),
+        }
+    }
+}
+
+/// `reference`'s file key, derived from its source epoch's media secret.
+pub(crate) fn media_file_key_for_reference(
+    media_secret: &[u8],
+    reference: &MediaAttachmentReference,
+) -> Result<[u8; 32], AppError> {
+    let version = EncryptedMediaVersion::parse(&reference.version)?;
+    let media_type = match version {
+        EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,
+        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)?,
+    };
+    derive_media_file_key(
+        media_secret,
+        version,
+        &media_hash_from_reference(reference)?,
+        &media_type,
+        &reference.file_name,
+    )
+}
+
 pub(crate) fn derive_media_file_key(
     media_secret: &[u8],
     version: EncryptedMediaVersion,

@@ -2,8 +2,9 @@
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
 //! transport-cursor row (`transport_cursor_advanced`) and historical wire-reissue row
-//! (`subscription_eose_repaired`). These kinds exist only
-//! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
+//! (`subscription_eose_repaired`), and the recovery runner's account breaker
+//! row (`recovery_runner_paused`). These kinds exist only in audit v5; a v4
+//! recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
 //! grep from a row value to its producer.
@@ -17,7 +18,8 @@ pub const RECOVERY_AUDIT_MAX_OBLIGATIONS: usize = 16;
 /// endpoint list bound; a longer list sets `endpoints_truncated`.
 pub const RECOVERY_AUDIT_MAX_ENDPOINTS: usize = 16;
 
-/// Why an obligation exists: `storage_sqlite::RecoveryCause`, one to one.
+/// Why an obligation exists: `storage_sqlite::RecoveryCause`, one to one,
+/// plus [`Self::UnprovenHistory`] for a coverage-ledger route's notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryObligationCause {
@@ -38,6 +40,10 @@ pub enum RecoveryObligationCause {
     /// Complete-range admission of an issued native subscription window.
     /// This is not exhaustive history or acknowledgment of delivery loss.
     SubscriptionReplay,
+    /// A coverage-ledger route the recovery runner parked or could not
+    /// prove. It has no obligation: its rows carry the route's one-way tag
+    /// as `obligation_id` and the route's park revision, and charge nothing.
+    UnprovenHistory,
 }
 
 /// A meaningful change to recovery need. Unchanged scheduler evaluations
@@ -270,6 +276,17 @@ pub enum EoseRepairTrigger {
     NotificationLag,
     /// An earlier pass left recovery pending and scheduled this one.
     FollowUp,
+}
+
+/// Which of the account's rolling-hour recovery caps paused the recovery
+/// runner (`RecoveryUnitPolicy::max_attempts_per_hour` and
+/// `max_event_bytes_per_hour`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRunnerCap {
+    Attempts,
+    EventBytes,
+    Both,
 }
 
 #[cfg(test)]
@@ -666,7 +683,8 @@ mod tests {
                 C::ExplicitHistory,
                 C::KnownEvent,
                 C::IncrementalHistory,
-                C::SubscriptionReplay
+                C::SubscriptionReplay,
+                C::UnprovenHistory
             ]),
             defined("Operational_recoveryObligationCause")
         );

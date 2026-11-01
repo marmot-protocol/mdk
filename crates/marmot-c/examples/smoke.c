@@ -39,6 +39,11 @@ _Static_assert(MARMOT_MODERATION_REPORT_ORIGIN_REPORT == 0, "moderation origin A
 _Static_assert(MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT == 1, "moderation origin ABI value");
 _Static_assert(MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED == 96, "moderation status ABI value");
 _Static_assert(MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED == 100, "moderation status ABI value");
+_Static_assert(MARMOT_SIGN_IN_RESPONSE_NOT_NOW == 0, "sign-in response ABI value");
+_Static_assert(MARMOT_SIGN_IN_RESPONSE_REJECT == 1, "sign-in response ABI value");
+_Static_assert(MARMOT_SIGN_IN_RESPONSE_DISMISS == 2, "sign-in response ABI value");
+_Static_assert(MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN == 0, "compromise warning reason ABI value");
+_Static_assert(MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE == 1, "compromise warning reason ABI value");
 
 static int failures = 0;
 

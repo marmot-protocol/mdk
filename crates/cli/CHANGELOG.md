@@ -11,6 +11,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
+  (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
+
+- `self_membership` in `groups show`, `chats list` and their feeds can read `device_removed` (mdk#2628 item 3.6b):
+  this device's leaf was removed while the account stays in the group through another of its devices. It is not a
+  removal of the account from the group.
+- A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
+  verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
+  confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
+  the existing device's leaf in it, the only sender whose Welcome the new device accepts. It ends in a verified link
+  and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
+  the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
   check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
   many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
@@ -18,9 +31,228 @@ versioning through the workspace version in the root `Cargo.toml`.
   `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
   public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
   that messages are delivered.
+- The engine implements `marmot.account.device-roster.v1` (0x800e), the roster of an account's device group
+  (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
+  requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
+  device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, or a rejected slot (a removed
+  device's keeps that key). Every member applies the operations to the parent's roster. A roster may
+  hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
+  at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
+  create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
+  format.
+- The engine reads device tags (`marmot.member.device-tag.v1`, 0x800f; mdk#2628 item 3.1d), which say which of an
+  account's devices holds a leaf. A tag names the device's roster slot, is signed with that device's tag signature key
+  and is sealed under the roster's tag key, so only the account's devices can read it. Read against the roster, a leaf
+  belongs to a device, to a removed slot, or to no one. A tag that doesn't decode, open or verify reads as no tag and
+  never makes anything invalid. `AccountDeviceRuntime::member_device_tag_claim` reads a member's leaf in the group's
+  current epoch. No group may require 0x800f: a Commit, standalone proposal or Welcome that would is rejected. A
+  GroupContext entry under it is unknown data, which MDK accepts but never writes.
+- The engine puts device tags in this device's KeyPackages and leaves (mdk#2628 item 3.1d). The host names the device
+  group it trusts with `AccountDeviceRuntime::set_device_tag_group`, which hydrates it. A group that isn't live tags
+  nothing; it stays named, and the call returns an error while that holds. A device signs its tags with its MLS
+  signature key (`own_signature_key`), which it sets as its roster entry's tag signature key in an ordinary roster
+  update; that Commit's own leaf already carries a tag. From then on every KeyPackage it builds carries a fresh tag, a
+  KeyPackage whose tag doesn't read as its own is due for replacement, and every own Commit or self-update that replaces
+  a leaf without such a tag adds one. A founder whose entry in a new device group's roster carries its key tags its
+  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. Only test-policy builds hold a device
+  group, so release builds tag nothing.
+- `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
+  group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
+  KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
+  confirmed link waits for. The new device records what that link expects (the group id, the signature key of the
+  existing device's leaf, and the end of a 10-minute wait) before it confirms, and the engine joins a device group
+  only through a Welcome that matches it, consuming the expectation in the join. Every other device-group Welcome,
+  and any Welcome into a waiting link's group id, is refused before the join with the new
+  `EngineError::UnexpectedDeviceGroupWelcome`, so a group someone else founded under the id can't take it.
+  Storage providers implement the new `DeviceGroupWelcomeStorage` trait for these expectations.
+  No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
+  relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
+  `MarmotAppConfig::dev_device_groups` and two hidden hooks.
+- Hosts can list the account's own devices from its device group's roster (mdk#2628 item 3.1):
+  `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
+  re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
+  spec lands.
+- Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
+  item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
+  event to re-read it. It is false in release builds until the roster's spec lands.
+- A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
+  open, every six hours, and soon after one of the account's KeyPackages arrives live or a Welcome names one this device
+  did not publish, and keeps what an inviter would add: each slot's newest publication, not deleted, valid and fresh,
+  with no cap on how many. A slot that is neither this device's nor in its device group's roster is an unrecognized
+  sign-in. Slots this device's first check returned, fresh or not, are devices that were there before it; other slots
+  are new sign-ins, whatever their publication times say. Malformed input and client tags never raise one. Rejecting a
+  sign-in records its slot as rejected in the device group's roster in one commit, or keeps it on the device until it
+  has a device group; a device that later creates one founds the roster with it. Each device keeps its rejections until
+  the roster holds the slot as a device, a link the user confirmed, and commits one again whenever the roster has no
+  entry for the slot; it never replaces an entry. The runtime writes them (`AccountDeviceRuntime::reject_device_slots`)
+  behind the gate its other roster updates wait behind. A rejection names the slot alone, never its KeyPackage, which
+  may be a copy of a real device's. A sign-in another
+  device answered keeps its prompt, saying so, until dismissed, and is listed again if the roster loses that answer; one
+  whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
+  signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
+  with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
+  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+- Hosts can warn the user that someone holding the account's signing key published where the account's devices did
+  not (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected
+  sign-in, from this device or its device group's roster, and each KeyPackage this device found in its own slot that it
+  did not make, that the user has not seen on this device, with a `CompromiseWarningChanged` event to re-read it. A
+  device made a KeyPackage when its LeafNode carries the device's signature key, so only a foreign key warns, and only
+  on the device that found it, before it replaces the publication. Existing development device groups must be
+  recreated: the roster dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them seen on this device only;
+  a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
+  as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
+  now without rejecting it, and `started_fresh` says whether it did. Only test-policy builds run any of it.
+- Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
+  `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
+  device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
+  event to re-read it. A link shows as made only once the new device's first change in the device group arrives; one
+  with none within an hour is removed again. Every call is refused in release builds until the pairing and
+  device-group specs land.
+- `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
+  one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
+  pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster
+  update that sets exactly one device entry. Any Commit a device makes in its device group that adds a member now adds
+  exactly one, by value, and sets that device's roster entry for a new slot, announcing it. So an Invite, a
+  same-account Add or an Add proposal from the store never adds a device there. A link is never queued: while the
+  device group is settling, it is refused with the new `EngineError::LinkDeviceUnsettled`, and the caller retries
+  while the new device still waits for its Welcome. The device gets its Welcome as an invited device does. Like the
+  roster, it is reachable only in test-policy builds until the device group's spec is adopted.
+- New `SendIntent::ReplaceDeviceEntry` replaces one entry of a device group's roster while the roster still holds
+  the entry it was computed from (mdk#2628). The engine compares the entry each time it prepares the commit: on the
+  send after it settles convergence input, when a queued copy drains, and when it re-issues the edit after a lost
+  fork. Otherwise the new `EngineError::DeviceEntryChanged` refuses it and nothing is staged; a drained copy is
+  retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
+  changed others. The device roster's write path uses it, so an entry read before a sibling's change never
+  overwrites it.
+- New `SendIntent::ReplaceAccountEntry` replaces the account entry of a device group's roster (its backup writer and
+  recovery key) while the roster still holds the entry it was computed from (mdk#2628 item 4.4a), compared as
+  `ReplaceDeviceEntry` compares a device entry; otherwise the new `EngineError::AccountEntryChanged` refuses it. It is
+  never queued: while the device group settles, the new `EngineError::AccountEntryUnsettled` refuses it.
+  `Engine::recovery_public_key`, `seal_to_recovery_key` and `open_with_recovery_key` derive the X25519 recovery key
+  pair from the 128 bits of entropy 12 recovery words carry and seal to it under the label "Marmot Backup". Like the
+  roster, reachable only behind `dev_device_groups` until the backup spec is adopted.
+  `Engine::owes_superseded_own_commit_reissue` says whether an own commit a fork dropped is still owed a re-issue that
+  maintenance has not re-derived, as after a lost announcement; the device group's commit gate waits for it.
+- `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
+  (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
+  device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
+  Welcome. It removes the leaf only if the group's tree still has it, and the roster entry either way. Like a link,
+  it is never queued: while the device group is settling it is refused with `EngineError::LinkDeviceUnsettled`, and
+  the caller retries. It is reachable only in test-policy builds.
+- A retained outbound Welcome now keeps the `KeyPackageRef` of the KeyPackage it answers, staged, owed and after
+  withdrawal (mdk#2628 item 3.3b). `Engine::sent_welcomes_for_key_package`, forwarded as the runtime's
+  `welcomes_for_key_package`, finds a group's Welcomes by it, so a device link that failed can withdraw its Welcome
+  even when a crash lost the Welcome's id. `StoredMessagePayload::OutboundWelcome` becomes a struct variant carrying
+  `key_package_ref`, as `StagedInviteWelcome` now also does; two new stored-payload variants hold it, a Welcome
+  stored without one keeps its original bytes, and legacy JSON rows still decode.
+- The engine can create a group under a group id the host chose before the group exists
+  (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
+  An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
+  written.
+- A device link's Welcome now carries a delivery deadline, the end of the new device's wait for it, and is never
+  published from then on (mdk#2628 item 3.3b, D40). `SendIntent::LinkDevice` takes `deliver_until`, and
+  `create_group_with_chosen_id_and_audit_context` takes `welcome_deliver_until` for the founding Welcome, in the
+  engine, the session and the runtime (`prepare_create_group_with_chosen_id_and_audit_context`). The stored Welcome
+  keeps it through promotion, in two new stored-payload variants; every other Welcome keeps its bytes.
+  `Engine::sent_welcome_deliver_until` reads it, and `Engine::outbound_welcome_status` now takes the current time
+  and reports an expired Welcome as settled. The runtime's publish check refuses an expired Welcome on every path,
+  and a batch checks the deadline again before each relay attempt. With that, a failed link whose Welcome may still be
+  deliverable is recorded only after its Welcome is withdrawn, and opening a client no longer withdraws link Welcomes
+  first. A chosen-id create is refused on the legacy profile, which keeps no delivery deadline. Reachable only in
+  test-policy builds.
+- A device group is now founded with only its creator in the roster, plus its sign-in rejections, and the founding
+  Add sets the linked device's entry as every later link's Commit does (mdk#2628 item 3.3b, D41).
+  `create_group_with_chosen_id_and_audit_context` takes that roster update, in the engine, the session and the runtime.
+  A device group founded with a member adds exactly one KeyPackage, the update sets that device's entry for a slot the
+  founding roster does not list, announcing the KeyPackage, and the founding Add meets the same sender rule as a link.
+  Any other device-group founding with a member, and a roster update on any other create, is refused and leaves no
+  group state behind. Reachable only in test-policy builds.
+- A new device now joins its device group only through a Welcome that adds it by the KeyPackage the link confirmed
+  (mdk#2628 item 3.3b, D41). `DeviceGroupWelcomeExpectation` gains `key_package_ref`, which `marmot-app` fills from
+  the confirmed link; an expectation stored without it matches no Welcome. While an expectation is unexpired, the
+  engine also refuses, with `EngineError::UnexpectedDeviceGroupWelcome`, a Welcome into any other group, a chat
+  included, that adds this device by that KeyPackage, so no other invite uses it up. Storage providers implement the
+  new `DeviceGroupWelcomeStorage::device_group_welcome_expectations`. Reachable only in test-policy builds.
+- The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
+  IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
+  vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
+  state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
+  invite of a member without support, with each side winning once.
+- `SendIntent::EnableAccountDevices` turns on `marmot.group.account-devices.v1` (0x800d) in an existing group, in one
+  admin Commit that adds it to the required list and removes any GroupContext entry left under its id (mdk#2628). The
+  engine never sends it by itself. It is refused before anything is staged with
+  `EngineError::AccountDevicesActivationRefused` and an aggregate `AccountDevicesActivationRefusal` when the group
+  already requires the component, is on the legacy profile, has a leaf that does not advertise it or carries data
+  under its id, or has an account over the leaf limit; a non-admin gets `NotGroupAdmin`.
+  `Engine::account_devices_activation_refusal` gives the same answer to a host deciding whether to offer it. A send
+  that has to wait for convergence is checked before it is queued; if the settled state then refuses it, the drain
+  retires it instead of failing every later drain. The
+  conformance simulator's `require_account_devices` now sends this intent, so the activation vectors that expect a
+  refusal name `account_devices_activation_refused` instead of `other`.
+- The engine gains two send intents for a device's own account in a group that requires
+  `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
+  sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.
+  `SendIntent::RemoveOwnAccountDevices` removes other devices of the account, named by leaf signature key. Each sends
+  a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
+  anything is published or changed, including every request in a group that does not require 0x800d. A queued one
+  gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
+  marmot-app does not expose them, so hosts cannot send them yet. The simulator's `remove_own_account_devices` now
+  sends the Remove intent.
 
 ### Changed
 
+- `messages send-event` refuses the device-group kinds 457, 459, 460, 461, 473, 475 and 476 with
+  `reserved_app_event_kind`, and one received in a chat makes no timeline row or message (mdk#2628). They are read only
+  in the account's device group.
+- Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
+  component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
+  (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec
+  forbids; the engine alone decides whether a group requires the component. Optional state for other components is
+  unchanged.
+- A new group now requires `marmot.group.account-devices.v1` (0x800d) when the creating device and every device added
+  at creation advertise it, so each member's devices can add and remove their own account's devices from the start
+  (mdk#2628). The host doesn't ask for it. A group whose founding devices don't all advertise it is created as before.
+  A group that requires 0x800d does so for good: a client that doesn't advertise 0x800d can't be invited into it, and
+  no account may hold more than 20 devices in it, so creating one with more is refused before anything is published.
+  Creating a group still refuses the creator's own account, so it never adds the creator's other devices. The
+  simulator's account-devices vectors follow: the activation vectors give one founder support only after creation, the
+  removal race runs in a group that requires 0x800d from its founding, and `account-devices-founding/v1` covers
+  creation.
+- Inviting now refuses the inviter's own account, under any alias, with `GroupInviteIncludesInviter` before anything
+  is staged or published, as creating a group already did (mdk#2628). An admin never adds its own account's other
+  devices from published KeyPackages. Receivers still accept such an Add from another client.
+- Creating a group or inviting adds every device of each recipient account (mdk#2628, mdk#1696): every valid,
+  compatible KeyPackage published in the last 30 days, at most 20, or the single best one when none is that recent.
+  `key-package` lookup returns the best of the same selection and no longer prefers a package by its `client` tag.
+- `groups members`, `groups show` and `groups management` list each member account once, even when it has several
+  devices in the group, and each `members` entry gains `device_count` (mdk#2628). Member counts, admin counts and the
+  last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
+- MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628). New KeyPackages list it, a device replaces
+  a published KeyPackage that does not, and its leaf in each existing group gains it through the randomized refresh of
+  stale leaves, each group at its own time within five days. So a group founded only by upgraded devices now requires
+  it, and a device on an older build can't be invited into that group. An existing group keeps its requirements, and a
+  device that doesn't advertise 0x800d can still be invited into any group that doesn't require it. The engine builder
+  now accepts 0x800d, and the test-only `allow_account_devices_advertising_for_tests` builder flags are gone.
+- MDK now enforces `marmot.group.account-devices.v1` (0x800d) in groups that require it (mdk#2628). In such a group
+  nothing carries data for it (GroupContext, leaves, added KeyPackages) and no AppDataUpdate targets it, every leaf
+  supports it, no account holds more than 20 leaves, and the group never stops requiring it. A Commit or standalone
+  proposal that breaks a rule is rejected. Groups that don't require it behave as before, and data under 0x800d there
+  is still unknown data. The engine builder now refuses to advertise a protocol component id the engine does not
+  implement, such as SafeAAD (0x0002).
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device now joins through a Welcome from
+  another device of its own account, as it does through an admin's (mdk#2628). The joiner applies the component's
+  state rules to the group it joins, as members do to every Commit, and rejects a Welcome whose GroupInfo carries data
+  under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing in marmot-app sends such a Welcome
+  yet.
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device may now commit adds and removes of its
+  own account's devices without being an admin (mdk#2628). The Commit must carry them by value and nothing else, and a
+  Commit that also touches another account, carries a proposal by reference or changes group state still needs an
+  admin. Such a Commit has ordinary branch priority whoever commits it, so an admin's Remove beats an admin's add of
+  their own device. One classifier now decides authorization and priority at replay, on every send path and in the
+  publish stamp. Groups that don't require 0x800d behave exactly as before.
+  Scenario IR v3 gains `remove_own_account_devices`, and a vector races two devices of one account: an admin's
+  Remove of another member beats the other device's same-account Remove on every client.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
   A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
   reported `command_failed`. An external-signer rejection now reports `command_failed`, with
@@ -33,6 +265,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- SQLite `delete_group` now joins a caller's transaction instead of failing inside one. A current-profile group
+  creation that failed after writing its MLS state used to leave that state behind, because its cleanup ran
+  `delete_group` inside a transaction and only logged the failure; the group id stayed taken.
+- A device whose link failed can link again into the same device group (mdk#2628 item 3.3b). It forgets its removed
+  copy, and the engine refused the next link's Welcome into a forgotten group unless the existing device's clock dated
+  it after the forget. A Welcome a device link waits for is now held to that link alone: the existing device's leaf key
+  and the confirmed `KeyPackageRef`. A new device no longer starts a link by a KeyPackage it already joined by; it
+  waits for the replacement's publication. Only test-policy builds reach device groups.
+- `groups management` and the TUI group detail screen offer no member actions on a device that was removed while another
+  device of its account stays in the group (mdk#2628). Both used to read that account's roster entry as this device, so
+  the TUI could mark it "(you)" and refuse to leave as the group's only admin.
 - `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
   cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
   reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and
@@ -42,6 +285,24 @@ versioning through the workspace version in the root `Cargo.toml`.
   message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
   place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
   paths, account ids or relay URLs.
+- `wnd` answers `wn daemon status`, `wn daemon stop` and pings while it is still opening its accounts, which the
+  runtime allows 45 seconds (part of mdk#2696). It used to bind its socket and accept nothing until then, so those
+  commands connected and waited with no reply. `wn daemon status` and the TUI status line now say `daemon starting`
+  in that window, and `--json` carries a new `starting` field. Other commands wait for the accounts as before. A stop during startup
+  cancels the start and shuts down what it had opened.
+- `wn daemon start` no longer reports a failed start while the daemon it launched keeps starting (mdk#2696). It gave
+  up after five seconds with `daemon_start_failed`, but the first launch of a newly built `wnd` on a loaded macOS
+  machine can wait longer than that before it runs, and the daemon then came up behind the error. The command now
+  watches the `wnd` it launched: it reports `daemon started` once that daemon reports its accounts open, fails at
+  once with `daemon_start_failed` and the log's last lines if it exits, and stops it and fails with
+  `daemon_start_timeout` if it is not ready after 60 seconds, which covers the runtime's own 45-second wait for
+  accounts to open. Ctrl-C stops it as well and fails with `daemon_start_interrupted`; the daemon runs in its own
+  process group, so it used to keep starting behind the interrupted command. When another start wins the socket, it
+  stops its own `wnd` and reports `daemon already running`.
+- `wn daemon stop` no longer reports `daemon stopped` while the daemon is still running (mdk#2696). It reported
+  success as soon as the daemon accepted the request, before the daemon shut down its runtime and exited, so a slow
+  or stuck shutdown left a daemon behind a successful stop. It now waits for the process to exit, and fails with
+  `daemon_stop_timeout` if it is still running after 30 seconds.
 
 ## [0.14.0] - 2026-10-23
 

@@ -1,6 +1,7 @@
 mod attention;
 mod pages;
 mod selection;
+mod small_state;
 mod window;
 use crate::app::account_projection::chat_mute_is_effective;
 use crate::base::connection::CachedSql;
@@ -20,7 +21,7 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{StorageError, StorageResult};
 pub use pages::{
     ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
     ChatListView,
@@ -28,6 +29,11 @@ pub use pages::{
 use rusqlite::{Connection, OptionalExtension, Params, params};
 pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
+pub use small_state::{
+    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateBroadcast, SmallStateItem,
+    SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync, SmallStateValue,
+    SmallStateVersion,
+};
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};
 
@@ -142,7 +148,7 @@ pub struct ExistingDirectConversation {
 /// Select the reusable direct conversation with `peer_account_id_hex`, if any.
 ///
 /// A row is a **direct** conversation when its group name is empty and the
-/// projected roster size is exactly two (`ChatConversationKind::Direct`).
+/// projected roster has exactly two member accounts (`ChatConversationKind::Direct`).
 /// It is **reusable** with that peer when all of the following hold:
 ///
 /// - `self_membership` is [`SelfMembership::Member`]
@@ -285,6 +291,8 @@ pub struct ChatListMessagePreview {
     pub sender_display_name: Option<String>,
     pub plaintext: String,
     pub kind: u64,
+    #[serde(default)]
+    pub tags: Vec<Vec<String>>,
     pub timeline_at: u64,
     /// This message's pinned source-epoch retention. `None` is unknown (safe
     /// retain); `Some(0)` means retention was explicitly disabled.
@@ -510,7 +518,7 @@ impl SqliteAppStorage {
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
     /// Returns only rows whose durable projection is currently classified as
-    /// [`ChatConversationKind::Direct`] (empty group name and roster size 2)
+    /// [`ChatConversationKind::Direct`] (empty group name and two member accounts)
     /// and whose persisted member index contains `peer_account_id_hex`.
     /// Named chats, 3+ member chats, and Direct chats with a different peer
     /// are excluded in SQL so lookup work does not grow with those rows.
@@ -530,28 +538,6 @@ impl SqliteAppStorage {
     ) -> StorageResult<Vec<ChatListRow>> {
         let conn = self.lock()?;
         direct_conversation_candidate_rows_tx(&conn, peer_account_id_hex)
-    }
-
-    /// `EXPLAIN QUERY PLAN` for the peer-keyed candidate read.
-    ///
-    /// Used by the regression that requires
-    /// `idx_direct_conversation_members_member` as the driving index.
-    pub fn direct_conversation_candidate_query_plan(
-        &self,
-        peer_account_id_hex: &str,
-    ) -> StorageResult<Vec<String>> {
-        let peer_account_id_hex = peer_account_id_hex.trim().to_ascii_lowercase();
-        if peer_account_id_hex.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock()?;
-        let sql = format!("EXPLAIN QUERY PLAN {}", direct_conversation_candidate_sql());
-        let mut statement = conn.prepare_cached(&sql).storage()?;
-        statement
-            .query_map(params![peer_account_id_hex], |row| row.get::<_, String>(3))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()
     }
 
     /// Direct groups that still have no peer-index rows.
@@ -1195,6 +1181,8 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
     // Walk newest insertions first; the first eligible row is the high water.
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
+    // A row imported from a sibling's history is older history, not new
+    // activity, so it never displaces a pending send (mdk#2628 4.2a).
     format!(
         "SELECT accepted_source.insert_order
          FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
@@ -1208,6 +1196,11 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
            AND NOT (
                accepted.direction = 'sent'
                AND accepted.source_message_id_hex IS NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM app_event_imports AS imported
+               WHERE imported.group_id_hex = accepted_source.group_id_hex
+                 AND imported.message_id_hex = accepted_source.message_id_hex
            )
          ORDER BY accepted_source.insert_order DESC
          LIMIT 1"
@@ -1443,6 +1436,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                    OR row.self_membership IS NOT CASE ag.self_membership
                         WHEN 'left' THEN 'left'
                         WHEN 'removed' THEN 'removed'
+                        WHEN 'device_removed' THEN 'device_removed'
                         ELSE 'member'
                       END
                    OR row.conversation_created_at IS NOT ag.conversation_created_at
@@ -1450,6 +1444,21 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                    OR row.updated_at < ag.updated_at
              )",
         params![GROUP_AVATAR_URL_COMPONENT_ID],
+    )? {
+        return Ok(false);
+    }
+    // Migration 0141 added `last_message_tags_json` as nullable. Existing
+    // rows with a last message have NULL tags until rebuilt, so detect them
+    // here and force a rebuild.
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM chat_list_rows AS row
+                WHERE row.last_message_id_hex IS NOT NULL
+                   AND row.last_message_tags_json IS NULL
+             )",
+        [],
     )? {
         return Ok(false);
     }
@@ -1488,10 +1497,19 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                         row.last_message_preview,
                         row.last_message_kind,
                         row.last_message_timeline_at,
-                        row.last_message_media_json
+                        row.last_message_media_json,
+                        row.last_message_tags_json
                      ) IS NOT (
+                        -- Tags are compared as the writers store them: `[]`
+                        -- for a deleted or unreadable row, otherwise the
+                        -- timeline's own serialization.
                         SELECT mt.message_id_hex, mt.sender, mt.plaintext,
-                               mt.kind, mt.timeline_at, mt.media_json
+                               mt.kind, mt.timeline_at, mt.media_json,
+                               CASE
+                                   WHEN mt.deleted != 0 OR json_valid(mt.tags_json) = 0
+                                       THEN '[]'
+                                   ELSE mt.tags_json
+                               END
                         FROM message_timeline AS mt NOT INDEXED
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND {activity_filter}
@@ -1594,6 +1612,10 @@ fn write_chat_list_row_for_group_tx(
 ) -> StorageResult<()> {
     let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
     let latest_message = latest.as_ref().map(|latest| &latest.preview);
+    let latest_tags_json = latest_message
+        .map(|message| serde_json::to_string(&message.tags))
+        .transpose()
+        .map_err(|err| StorageError::Serialization(err.to_string()))?;
     let accepted_activity_insert_order =
         latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
@@ -1614,8 +1636,8 @@ fn write_chat_list_row_for_group_tx(
             avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
-            last_message_kind, last_message_timeline_at, last_message_deleted,
-            last_message_media_json, last_message_delivery_state,
+            last_message_kind, last_message_tags_json, last_message_timeline_at,
+            last_message_deleted, last_message_media_json, last_message_delivery_state,
             unread_count, manually_marked_unread, unread_mention_count,
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
@@ -1625,7 +1647,7 @@ fn write_chat_list_row_for_group_tx(
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30, ?31
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, 0, ?29, ?30, ?31, ?32
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1642,6 +1664,7 @@ fn write_chat_list_row_for_group_tx(
             last_message_sender = excluded.last_message_sender,
             last_message_preview = excluded.last_message_preview,
             last_message_kind = excluded.last_message_kind,
+            last_message_tags_json = excluded.last_message_tags_json,
             last_message_timeline_at = excluded.last_message_timeline_at,
             last_message_deleted = excluded.last_message_deleted,
             last_message_media_json = excluded.last_message_media_json,
@@ -1700,6 +1723,7 @@ fn write_chat_list_row_for_group_tx(
             latest_message.map(|message| message.sender.as_str()),
             latest_message.map(|message| message.plaintext.as_str()),
             optional_u64_to_i64(latest_message.map(|message| message.kind))?,
+            latest_tags_json.as_deref(),
             optional_u64_to_i64(latest_message.map(|message| message.timeline_at))?,
             latest_message
                 .map(|message| bool_i64(message.deleted))
@@ -1864,6 +1888,10 @@ fn reconcile_unread_messages_tx(
 
 // Edits affect presentation, while mention eligibility stays on the original message.
 const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext)";
+/// A row imported from a sibling's history never counts as unread (mdk#2628
+/// 4.2a). The read marker stays this device's own read, so an import never
+/// moves it.
+const NOT_IMPORTED_SQL: &str = "NOT EXISTS (SELECT 1 FROM app_event_imports AS imported WHERE imported.group_id_hex=message_timeline.group_id_hex AND imported.message_id_hex=message_timeline.message_id_hex)";
 
 /// WHERE clause + parameters selecting rows that sort after a conversation's
 /// read cursor: the single definition of "unread" shared by the projection
@@ -1938,7 +1966,7 @@ fn unread_membership_for_message_tx(
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
-           AND invalidation_status IS NULL AND {where_sql}"
+           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL} AND {where_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
@@ -2006,6 +2034,7 @@ fn rebuild_unread_membership_tx(
            AND deleted = 0
            AND invalidation_status IS NULL
            AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
+           AND {NOT_IMPORTED_SQL}
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2120,6 +2149,7 @@ fn retention_expiry_scan_tx(
                     AND invalidation_status IS NULL
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
+                    AND {NOT_IMPORTED_SQL}
                     AND message_id_hex IN (
                         SELECT message_id_hex FROM app_events
                         WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
@@ -2135,13 +2165,17 @@ fn retention_expiry_scan_tx(
         }
         // No read cursor yet: stay conservative, as the replaced page scan
         // did, and treat every expired received row as unread rather than
-        // guessing what the account has seen.
+        // guessing what the account has seen. An imported row is never
+        // unread, so it expires on time.
         _ => timeline_exists_tx(
             tx,
             "SELECT EXISTS(SELECT 1 FROM app_events
                       WHERE group_id_hex = ?1
                         AND direction = 'received'
-                        AND retention_expires_at <= ?2)",
+                        AND retention_expires_at <= ?2
+                        AND NOT EXISTS (SELECT 1 FROM app_event_imports AS imported
+                            WHERE imported.group_id_hex = app_events.group_id_hex
+                              AND imported.message_id_hex = app_events.message_id_hex))",
             &[group, now],
         )?,
     };
@@ -2279,7 +2313,7 @@ fn latest_chat_list_activity_tx(
     let preview_eligibility = chat_list_preview_eligibility_sql("preview.", "?1");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
-                preview.kind, preview.timeline_at, preview.deleted,
+                preview.kind, preview.tags_json, preview.timeline_at, preview.deleted,
                 preview.media_json, preview.direction,
                 preview.source_message_id_hex, preview.invalidation_status,
                 preview.timeline_order_class, preview.timeline_order_primary,
@@ -2305,10 +2339,10 @@ fn latest_chat_list_activity_tx(
         Ok(LatestChatListMessage {
             preview: chat_list_message_from_row(row)?,
             canonical_order_prefix: (
-                row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+                row.get::<_, i64>(14)?.try_into().unwrap_or_default(),
             ),
         })
     })
@@ -2363,9 +2397,19 @@ fn timeline_message_for_read_marker_tx(
 }
 
 fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListMessagePreview> {
-    let direction = row.get::<_, String>(7)?;
-    let source_message_id_hex = row.get::<_, Option<String>>(8)?;
-    let invalidation_status = row.get::<_, Option<String>>(9)?;
+    let deleted = row.get::<_, i64>(6)? != 0;
+    // Decode like unread membership: one unreadable timeline tag list must
+    // not abort a chat-list rebuild, so it previews with no tags.
+    let tags = if deleted {
+        Vec::new()
+    } else {
+        row.get::<_, Option<String>>(4)?
+            .and_then(|json| crate::tags_from_json(json).ok())
+            .unwrap_or_default()
+    };
+    let direction = row.get::<_, String>(8)?;
+    let source_message_id_hex = row.get::<_, Option<String>>(9)?;
+    let invalidation_status = row.get::<_, Option<String>>(10)?;
     let delivery_state = if direction != "sent" {
         ChatListMessageDeliveryState::NotApplicable
     } else if invalidation_status.as_deref() == Some("local_publish_failed") {
@@ -2382,19 +2426,20 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         sender_display_name: None,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+        tags,
+        timeline_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
         retention_seconds: row
             .get::<_, Option<i64>>("retention_seconds")?
             .and_then(|value| value.try_into().ok()),
         retention_expires_at: row
             .get::<_, Option<i64>>("retention_expires_at")?
             .and_then(|value| value.try_into().ok()),
-        deleted: row.get::<_, i64>(5)? != 0,
-        deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(14)?),
+        deleted,
+        deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(15)?),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state,
-        media_json: row.get(6)?,
+        media_json: row.get(7)?,
     })
 }
 
@@ -2630,7 +2675,7 @@ macro_rules! chat_list_columns {
             row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
             row.avatar_media_type, CASE WHEN row.last_message_sender IN (SELECT public_key FROM user_blocks) THEN NULL ELSE row.last_message_id_hex END,
             row.last_message_sender, row.last_message_preview,
-            row.last_message_kind, row.last_message_timeline_at,
+            row.last_message_kind, row.last_message_tags_json, row.last_message_timeline_at,
             row.last_message_deleted, row.last_message_media_json,
             row.last_message_delivery_state, row.unread_count,
             row.manually_marked_unread, row.unread_mention_count,
@@ -2710,7 +2755,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .unwrap_or_default(),
         &row.get::<_, Option<String>>(13)?.unwrap_or_default(),
         row.get("authenticated_group_system")?,
-        row.get::<_, bool>(16)?,
+        row.get::<_, bool>(17)?,
     );
     let deletion_source =
         crate::DeletionSource::from_storage(row.get_ref("deletion_source")?.as_str()?);
@@ -2720,6 +2765,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let retention_expires_at = row
         .get::<_, Option<i64>>("retention_expires_at")?
         .and_then(|value| value.try_into().ok());
+    let deleted = row.get::<_, i64>(17).unwrap_or_default() != 0;
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
         retention_seconds,
         retention_expires_at,
@@ -2733,41 +2779,49 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
+        tags: if deleted {
+            Vec::new()
+        } else {
+            row.get::<_, Option<String>>("last_message_tags_json")
+                .unwrap_or_default()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default()
+        },
         timeline_at: row
-            .get::<_, Option<i64>>(15)
+            .get::<_, Option<i64>>(16)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        deleted: row.get::<_, i64>(16).unwrap_or_default() != 0,
+        deleted,
         deletion_source,
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: ChatListMessageDeliveryState::from_storage(
-            &row.get::<_, String>(18).unwrap_or_default(),
+            &row.get::<_, String>(19).unwrap_or_default(),
         ),
-        media_json: row.get(17).unwrap_or_default(),
+        media_json: row.get(18).unwrap_or_default(),
     });
-    let raw_unread_count = row.get::<_, i64>(19)?;
+    let raw_unread_count = row.get::<_, i64>(20)?;
     let unread_count = raw_unread_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(19, raw_unread_count))?;
-    let manually_marked_unread = row.get::<_, i64>(20)? != 0;
-    let raw_unread_mention_count = row.get::<_, i64>(21)?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(20, raw_unread_count))?;
+    let manually_marked_unread = row.get::<_, i64>(21)? != 0;
+    let raw_unread_mention_count = row.get::<_, i64>(22)?;
     let unread_mention_count = raw_unread_mention_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, raw_unread_mention_count))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, raw_unread_mention_count))?;
     let member_count = row
-        .get::<_, Option<i64>>(29)?
+        .get::<_, Option<i64>>(30)?
         .and_then(|value| u64::try_from(value).ok());
-    let mute_row_exists = row.get::<_, i64>(30)? != 0;
-    let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
-    let lifecycle_state = if row.get::<_, i64>(32)? != 0 {
+    let mute_row_exists = row.get::<_, i64>(31)? != 0;
+    let stored_muted_until_ms = row.get::<_, Option<i64>>(32)?;
+    let lifecycle_state = if row.get::<_, i64>(33)? != 0 {
         cgka_traits::GroupLifecycleState::Disbanded
     } else {
         cgka_traits::GroupLifecycleState::Stable
     };
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
-    let pinned = row.get::<_, i64>(33)? != 0;
+    let pinned = row.get::<_, i64>(34)? != 0;
     let pinned_position = row
         .get::<_, Option<i64>>("pinned_position")?
         .and_then(|value| u32::try_from(value).ok());
@@ -2796,15 +2850,15 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         manually_marked_unread,
         unread_mention_count,
         has_unread_mention: unread_mention_count > 0,
-        first_unread_message_id_hex: row.get(22)?,
-        last_read_message_id_hex: row.get(23)?,
+        first_unread_message_id_hex: row.get(23)?,
+        last_read_message_id_hex: row.get(24)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(24)?
+            .get::<_, Option<i64>>(25)?
             .and_then(|value| value.try_into().ok()),
-        conversation_created_at: row.get::<_, i64>(25)?.try_into().unwrap_or_default(),
-        activity_sort_at: row.get::<_, i64>(26)?.try_into().unwrap_or_default(),
-        updated_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
-        self_membership: SelfMembership::from_storage(&row.get::<_, String>(28)?),
+        conversation_created_at: row.get::<_, i64>(26)?.try_into().unwrap_or_default(),
+        activity_sort_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(28)?.try_into().unwrap_or_default(),
+        self_membership: SelfMembership::from_storage(&row.get::<_, String>(29)?),
         conversation_kind: conversation_kind(&group_name, member_count),
         muted,
         muted_until_ms: muted.then_some(stored_muted_until_ms).flatten(),
@@ -2815,6 +2869,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
 }
 
 /// Classify a conversation from the same inputs used by chat-list projection.
+/// `member_count` counts member accounts, so a chat stays Direct however many
+/// devices either person has in it.
 pub fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
     if !group_name.trim().is_empty() {
         return ChatConversationKind::Group;

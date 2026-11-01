@@ -94,6 +94,9 @@ release and client adoption remain separate. See the [native handoff](../further
 Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
 conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
+A merged Commit that adds a member, or a Commit that branch selection re-adopts, queues the current revision for that
+group again, so a new member receives every existing member's token; migration 0117 queued every joined group once for
+installs that predate this (mdk#2604).
 Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
 alternating queued commands with due recovery passes so neither queue starves the other. Each pass retries group
 subscriptions only when a refresh is pending; an unchanged group set needs no account-wide refresh. A running
@@ -248,8 +251,11 @@ outside its scope, and browser execution still requires downstream acceptance co
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
 every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
-update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
-the custom send path, so apps cannot forge protocol events.
+update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token, and the
+device-group kinds 457, 459, 460, 461, 473, 475 and 476) are rejected on the custom send path, so apps cannot forge
+protocol events.
+A device-group kind received in any group other than the account's device group is ignored: no row, message or
+notification.
 
 The Claude Code, Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
 `autonomous`, and `unrestricted` execution intent while retaining
@@ -280,10 +286,11 @@ This repository now has the main engine candidate:
 - `crates/fs-private` — restrictive-by-construction helpers for local files, directories, and Unix sockets.
 - `crates/traits` — cross-boundary value types and traits, including the account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
-- `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`.
-- `crates/marmot-account` — account/session orchestration over a session and transport adapter. It activates the transport
-  account, uses static transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary,
-  and confirms or rolls back pending session work from adapter publish reports.
+- `crates/marmot-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`, and
+  the account-device runtime over it and a transport adapter. The runtime activates the transport account, uses static
+  transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary, and confirms or rolls
+  back pending session work from adapter publish reports.
+- `crates/marmot-account` — account identity, files and secrets: account homes, setup journals, and signing-key storage.
 - `crates/marmot-app` — first multi-account app runtime over account home, per-account projections, shared
   relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
   group/message/member methods. Detailed group creation returns the exact chat-list row committed with the local
@@ -351,7 +358,7 @@ explicit recovery flow.
 ## Known gaps
 
 - **Production persistence hardening** — `storage-sqlite` provides encrypted persistence, atomic group snapshots,
-  retained-anchor pruning, and privacy-oriented SQLite defaults. `cgka-session` opens one encrypted database per
+  retained-anchor pruning, and privacy-oriented SQLite defaults. `marmot-session` opens one encrypted database per
   account-device identity. App key-management integration, packaging, and longer-term rekey/vacuum/checkpoint policy
   still need production wiring.
 - **App-core hardening** — `marmot-app` and `wn` now exercise real account setup, key storage, relay-list repair,
@@ -389,7 +396,7 @@ runtime QUIC agent previews are unavailable in this mode.
   `convergence-chaos/v1` is the first convergence-focused generated family with built-in semantic expectations, 20+
   client stress cases, mixed message/commit storms, and conservative generated-failure minimization. The byte-level
   vector plan is still thin beyond the first app-component encoding fixtures.
-- **whitenoise-rs integration map** — the first integration path is likely a shim over `cgka-session` /
+- **whitenoise-rs integration map** — the first integration path is likely a shim over `marmot-session` /
   `marmot-account`, with whitenoise-rs keeping account setup, Nostr directory state, relay-list repair, and shared relay
   plane ownership. The current friction points are tracked in
   [`whitenoise-integration-map.md`](./whitenoise-integration-map.md).

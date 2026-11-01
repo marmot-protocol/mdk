@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use marmot_app::{
-    AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
-    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppAccountDevicesActivation, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
+    AppGroupAdminPolicyComponent, AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
     AppGroupHydrationQuarantineReason, AppGroupLifecycleState, AppGroupMemberIds,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
@@ -160,6 +160,43 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
     }
 }
 
+/// Whether this account can turn on account-devices in a group now, so its own
+/// devices can later add and remove each other there without an admin. A host
+/// asks before offering the action. Every answer is about the whole group: it
+/// never says which members or devices hold it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AccountDevicesActivationFfi {
+    /// The account is an admin and every device in the group is ready.
+    Eligible,
+    /// Only an admin can turn it on.
+    NotAdmin,
+    /// The group already has it, for good.
+    AlreadyEnabled,
+    /// The group is on the legacy protocol profile and never gets it.
+    LegacyGroup,
+    /// At least one device in the group runs a client without support yet.
+    MembersNeedUpdate,
+    /// At least one device's leaf carries data under the component's id that
+    /// another client wrote; that device has to replace its leaf or rejoin.
+    DevicesNeedReplacement,
+    /// At least one account has more devices in the group than the limit.
+    DeviceLimitExceeded,
+}
+
+impl From<AppAccountDevicesActivation> for AccountDevicesActivationFfi {
+    fn from(value: AppAccountDevicesActivation) -> Self {
+        match value {
+            AppAccountDevicesActivation::Eligible => Self::Eligible,
+            AppAccountDevicesActivation::NotAdmin => Self::NotAdmin,
+            AppAccountDevicesActivation::AlreadyEnabled => Self::AlreadyEnabled,
+            AppAccountDevicesActivation::LegacyGroup => Self::LegacyGroup,
+            AppAccountDevicesActivation::MembersNeedUpdate => Self::MembersNeedUpdate,
+            AppAccountDevicesActivation::DevicesNeedReplacement => Self::DevicesNeedReplacement,
+            AppAccountDevicesActivation::DeviceLimitExceeded => Self::DeviceLimitExceeded,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum AppProtocolProfileFfi {
     Legacy,
@@ -241,11 +278,16 @@ impl From<AppGroupEncryptedMediaComponent> for AppGroupEncryptedMediaComponentFf
     }
 }
 
+/// One member account. An account with several devices in the group is one
+/// record.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupMemberRecordFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// How many of this account's devices are in the group.
+    #[uniffi(default = 1)]
+    pub device_count: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -271,6 +313,7 @@ impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
             member_id_hex: value.member_id_hex,
             account: value.account,
             local: value.local,
+            device_count: value.device_count,
         }
     }
 }
@@ -282,6 +325,8 @@ pub struct MemberRefFfi {
     pub npub: String,
 }
 
+/// One member account. An account with several devices in the group is one
+/// entry.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GroupMemberDetailsFfi {
     pub member_id_hex: String,
@@ -291,6 +336,9 @@ pub struct GroupMemberDetailsFfi {
     pub is_self: bool,
     pub npub: String,
     pub display_name: Option<String>,
+    /// How many of this account's devices are in the group.
+    #[uniffi(default = 1)]
+    pub device_count: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -437,6 +485,7 @@ pub(crate) fn group_details_ffi(
                 member_id_hex: member.member_id_hex,
                 account: member.account,
                 local: member.local,
+                device_count: member.device_count,
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
@@ -491,6 +540,7 @@ pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi,
                 is_self: member.is_self,
                 npub,
                 display_name: member.display_name,
+                device_count: member.device_count,
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
@@ -524,6 +574,7 @@ pub(crate) fn group_management_state_ffi(
             SelfMembershipFfi::Member => marmot_app::SelfMembership::Member,
             SelfMembershipFfi::Left => marmot_app::SelfMembership::Left,
             SelfMembershipFfi::Removed => marmot_app::SelfMembership::Removed,
+            SelfMembershipFfi::DeviceRemoved => marmot_app::SelfMembership::DeviceRemoved,
         },
         is_admin: self_member.is_some_and(|member| member.is_admin),
         admin_count,
@@ -674,6 +725,11 @@ pub struct AppGroupMlsStateFfi {
     pub disbanding: bool,
     pub disbanding_blockers: Vec<String>,
     pub disband_request: Option<DisbandRequestFfi>,
+    /// Convergence stopped retrying a batch that kept failing. New input from
+    /// another member or `retry_group_convergence` resumes it; sends stay
+    /// queued meanwhile.
+    #[uniffi(default = false)]
+    pub convergence_parked: bool,
 }
 
 impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
@@ -690,6 +746,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
             disbanding: value.disbanding,
             disbanding_blockers: value.disbanding_blockers,
             disband_request: value.disband_request.map(Into::into),
+            convergence_parked: value.convergence_parked,
         }
     }
 }
@@ -767,6 +824,7 @@ mod group_roster_tests {
                 is_admin: true,
                 is_self: true,
                 display_name: Some("Alice".to_owned()),
+                device_count: 2,
             }],
             epoch: 12,
             roster_revision: 12,
@@ -780,6 +838,7 @@ mod group_roster_tests {
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
+        assert_eq!(ffi.members[0].device_count, 2);
     }
 }
 

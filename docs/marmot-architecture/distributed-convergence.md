@@ -170,8 +170,9 @@ longer matches the record it was admitted from is an integrity failure, and that
 
 The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier
 cutoff. After a completed pass, one persisted, already-queued admin group-state intent receives one preparation attempt
-before an inbound-only follow-up generation. App messages, leave work, and automatic maintenance do not consume that
-slot; a failed preparation cannot hold it indefinitely.
+before an inbound-only follow-up generation. In a group that requires `marmot.group.account-devices.v1`, a queued
+same-account intent (adding or removing the sender's own devices) receives the same attempt. App messages, leave work,
+self-updates, and automatic maintenance do not consume that slot; a failed preparation cannot hold it indefinitely.
 
 ## Branch Selection
 
@@ -208,6 +209,10 @@ Branches are compared in this order:
 4. Prefer a `Privileged` tip commit over an `Ordinary` one.
 5. Lower authenticated tip committer account id.
 6. Lower tip commit digest.
+
+A tip is `Privileged` exactly when its Commit needs an admin committer (`cgka_engine::commit_class`). Self-updates,
+SelfRemove-only Commits and, in a group that requires `marmot.group.account-devices.v1`, Commits that only add or remove
+the committer's own account's leaves are `Ordinary`, whoever commits them.
 
 `valid_commit_depth` remains a score diagnostic and an input to effective depth. It has no separate comparison step:
 when effective depth and quorum status tie, raw depth is necessarily tied as well.

@@ -100,6 +100,8 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
 - Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes, not Nostr `nostr_group_id` route handles.
   Accept non-empty opaque MLS group ids, including the 16-byte ids OpenMLS generates for MDK today, and do not validate
   them with the 32-byte route-id/pubkey/message-id rule.
+- Name lower-stack types through `marmot_app`: the account and session errors and the identity-proof signer types.
+  This crate does not depend on `cgka-engine` (mdk#2602).
 - Keep binding changes in lockstep with `marmot-app` public API changes, but do not bump the workspace version as part
   of feature, fix, binding, or review-feedback work. Workspace versions are bumped only as an explicit, user-directed
   release operation; UniFFI records, enums, object methods, and error variants may change while the current workspace

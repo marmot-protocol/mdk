@@ -5,6 +5,7 @@
 use super::*;
 use crate::AccountMediaStore;
 use crate::media::AttachmentDownloadFailure;
+use crate::runtime::attachment_controls::AttachmentUpdates;
 use media_store::{Category, MediaError};
 use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{
@@ -99,12 +100,12 @@ fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_
 /// Starts one page of outgoing upload promotion on the blocking pool unless
 /// one is still running. Each run resumes after the last, so uploads that
 /// cannot promote yet never starve the rest; a promotion wakes attachment
-/// observers.
+/// observers with a state change.
 fn spawn_upload_promotion(
     admission: &mut Admission,
     storage: SqliteAccountStorage,
     media: AccountMediaStore,
-    updates: tokio::sync::watch::Sender<()>,
+    updates: AttachmentUpdates,
 ) {
     if admission
         .upload_promotion
@@ -130,7 +131,7 @@ fn spawn_upload_promotion(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
                 if promoted {
-                    updates.send_modify(|_| {});
+                    updates.state_changed();
                 }
             }
             Err(_) => {
@@ -219,7 +220,8 @@ pub(super) fn spawn_legacy_migration(
                         tracing::info!(target: "marmot_app::storage_maintenance",
                             method = "keep_media_sweep", removed, more,
                             "attachments past the keep media window removed");
-                        updates.send_modify(|_| {});
+                        // Rows leave Ready for CleanedBySetting.
+                        updates.state_changed();
                     }
                 }
                 Err(_) => {
@@ -238,7 +240,8 @@ pub(super) fn spawn_legacy_migration(
             &progress,
         );
         if changed {
-            updates.send_modify(|_| {});
+            // A moved, paused or dropped body: a dropped one leaves Ready.
+            updates.state_changed();
         }
         // Then images still held in the database move into cache files
         // (mdk#2314 step 9), so compaction can return their pages.
@@ -308,7 +311,9 @@ pub(super) async fn compact_if_due(
             reserve,
             &|| crate::media::attachment_resume::available_space(&account_dir),
             &app.legacy_media_migration(&label),
-            &|| updates.send_modify(|_| {}),
+            // Rare, twice per compaction: reported as a state change, which
+            // costs observers one read each.
+            &|| updates.state_changed(),
         ))
     })
     .await;
@@ -628,7 +633,8 @@ pub(super) fn schedule(
         None => 0,
     };
     if readmitted > 0 {
-        shared.attachment_updates.send_modify(|_| {});
+        // Parked jobs leave StorageBlocked.
+        shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
     let free = free.unwrap_or(0);
@@ -721,7 +727,8 @@ pub(super) fn schedule(
                 .account_media_store(&client.state.label, &storage)?;
             let storage = storage.clone();
             let updates = shared.attachment_updates.clone();
-            updates.send_modify(|_| {});
+            // Claimed: the row leaves Queued.
+            updates.state_changed();
             spawn_media_http(
                 http,
                 permit,
@@ -741,7 +748,8 @@ pub(super) fn schedule(
                             "retained attachment copy unavailable".to_owned(),
                         )))
                     };
-                    updates.send_modify(|_| {});
+                    // The twin is attached (Ready) or the job retries.
+                    updates.state_changed();
                     MediaHttpCompletion::Attachment {
                         job,
                         result,
@@ -790,14 +798,18 @@ pub(super) fn schedule(
         // Queued explicit work (Retry, download again) derives a missing
         // source-epoch key from the retained anchor; automatic work reads only
         // what projection and sync cached.
+        let message = Some(source.message_id_hex.as_str());
         let prepared = if explicit {
             client
-                .cache_attachment_source_epoch_secret(&group, &reference)
+                .cache_attachment_source_epoch_secret(&group, &source.message_id_hex, &reference)
                 .and_then(|()| {
-                    client.prepare_background_attachment_download(&group, reference, max)
+                    client.prepare_background_attachment_download_for_message(
+                        &group, message, reference, max,
+                    )
                 })
         } else {
-            client.prepare_background_attachment_download(&group, reference, max)
+            client
+                .prepare_background_attachment_download_for_message(&group, message, reference, max)
         };
         let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
@@ -858,7 +870,8 @@ pub(super) fn schedule(
             permission,
         );
         let updates = shared.attachment_updates.clone();
-        updates.send_modify(|_| {});
+        // Claimed: the row leaves Queued.
+        updates.state_changed();
         spawn_media_http(
             http,
             permit,
@@ -877,7 +890,8 @@ pub(super) fn schedule(
                 } else {
                     finish_or_cancel(prepared.run_acquisition(resume), cancel, finishing).await
                 };
-                updates.send_modify(|_| {});
+                // The attempt ended, with or without a body.
+                updates.state_changed();
                 MediaHttpCompletion::Attachment {
                     job,
                     result,

@@ -133,18 +133,21 @@ impl AccountDeliverySpill {
                 batch
             };
             let count = batch.len() as u64;
-            let created_at: Vec<u64> = batch.iter().map(|d| d.message.timestamp.0).collect();
+            let lost: Vec<_> = batch
+                .iter()
+                .map(|d| (d.message.timestamp.0, super::DeliveryRoute::of(d)))
+                .collect();
             let dispositions = self.store_with_retry(batch).await;
             let stored = count_of(&dispositions, DeliverySpillDisposition::Stored);
             let seen = count_of(&dispositions, DeliverySpillDisposition::AlreadySeen);
             // Record loss before releasing the spill fence, so the cursor
             // stays fenced throughout. An empty result lost the whole batch.
-            for (index, created_at) in created_at.into_iter().enumerate() {
+            for (index, (created_at, route)) in lost.into_iter().enumerate() {
                 if dispositions
                     .get(index)
                     .is_none_or(|d| *d == DeliverySpillDisposition::Full)
                 {
-                    self.omit(Some(created_at));
+                    self.omit(Some(created_at), route);
                 }
             }
             self.overflow.finish_spill(count, stored, seen);
@@ -191,16 +194,17 @@ impl AccountDeliverySpill {
         })
     }
 
-    fn omit(&self, created_at: Option<u64>) {
+    fn omit(&self, created_at: Option<u64>, delivery_route: Option<super::DeliveryRoute>) {
         match self.current_route() {
-            Some(route) => omit_account_delivery(&route, created_at),
+            Some(route) => omit_account_delivery(&route, created_at, delivery_route),
             // The route was retired while this batch was in flight. The loss
             // still fences any replacement, which shares this overflow state,
             // and becomes durable through the retired route's marker. A
             // replacement that registers later is signalled when it reuses
             // the state; one that registered meanwhile is signalled here.
             None => {
-                self.overflow.record_retired_drop(created_at);
+                self.overflow
+                    .record_retired_drop(created_at, delivery_route);
                 if let Some(marker) = self.marker.clone() {
                     persist_retired_queue_loss(&self.overflow, marker);
                 }

@@ -41,136 +41,126 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Stream,
             "watch",
             crate::ProductUnit::Action,
         );
-        let result = self
-            .watch_agent_text_stream_unobserved(account_ref, group_id, options)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn watch_agent_text_stream_unobserved(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        options: AgentStreamWatchOptions,
-    ) -> Result<RuntimeAgentStreamWatch, AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        crate::network_proxy::require_direct_transport()?;
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let app = self.accounts.app.clone();
-        let account_ref_for_query = account_ref.to_owned();
-        let group_id_hex_for_query = group_id_hex.clone();
-        let messages = blocking_app_task(move || {
-            app.messages_with_query(
-                &account_ref_for_query,
-                AppMessageQuery {
-                    group_id_hex: Some(group_id_hex_for_query),
-                    kinds: None,
-                    limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
-                },
-            )
-        })
-        .await?;
-        let normalized_stream_id_hex = options
-            .stream_id_hex
-            .as_deref()
-            .map(normalize_hex_app)
-            .transpose()?;
-        let (start_message_id_hex, start, sender_hex) =
-            latest_agent_stream_start(messages, normalized_stream_id_hex.as_deref())?;
-        if start_message_id_hex.is_empty() {
-            // The latest start hasn't been echoed back with a message id yet, so
-            // we can't reference it to the broker; surface that rather than
-            // forwarding a zero-length MessageId.
-            return Err(AppError::AgentStreamStartNotConfirmed);
-        }
-        if start.route != STREAM_ROUTE_QUIC {
-            return Err(AppError::AgentStreamUnsupportedRoute);
-        }
-        let candidates = parse_quic_candidates(&start.quic_candidates)?;
-        let server_cert_der = options.server_cert_der;
-        let insecure_local = options.insecure_local;
-        let stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
-        let crypto_context = self
-            .agent_text_stream_crypto_for_start_event(
-                Some(account_ref),
-                Some(&group_id_hex),
-                Some(&stream_id_hex),
-                &start_message_id_hex,
-            )
+        let work = async move {
+            self.shared.lifecycle().ensure_running()?;
+            crate::network_proxy::require_direct_transport()?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let app = self.accounts.app.clone();
+            let account_ref_for_query = account_ref.to_owned();
+            let group_id_hex_for_query = group_id_hex.clone();
+            let messages = blocking_app_task(move || {
+                app.messages_with_query(
+                    &account_ref_for_query,
+                    AppMessageQuery {
+                        group_id_hex: Some(group_id_hex_for_query),
+                        kinds: None,
+                        limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
+                    },
+                )
+            })
             .await?;
-        let policy_max_plaintext_frame_len = crypto_context.policy_max_plaintext_frame_len;
+            let normalized_stream_id_hex = options
+                .stream_id_hex
+                .as_deref()
+                .map(normalize_hex_app)
+                .transpose()?;
+            let (start_message_id_hex, start, sender_hex) =
+                latest_agent_stream_start(messages, normalized_stream_id_hex.as_deref())?;
+            if start_message_id_hex.is_empty() {
+                // The latest start hasn't been echoed back with a message id yet, so
+                // we can't reference it to the broker; surface that rather than
+                // forwarding a zero-length MessageId.
+                return Err(AppError::AgentStreamStartNotConfirmed);
+            }
+            if start.route != STREAM_ROUTE_QUIC {
+                return Err(AppError::AgentStreamUnsupportedRoute);
+            }
+            let candidates = parse_quic_candidates(&start.quic_candidates)?;
+            let server_cert_der = options.server_cert_der;
+            let insecure_local = options.insecure_local;
+            let stream_id_hex = normalize_hex_app(&start.stream_id_hex)?;
+            let crypto_context = self
+                .agent_text_stream_crypto_for_start_event(
+                    Some(account_ref),
+                    Some(&group_id_hex),
+                    Some(&stream_id_hex),
+                    &start_message_id_hex,
+                )
+                .await?;
+            let policy_max_plaintext_frame_len = crypto_context.policy_max_plaintext_frame_len;
 
-        let (updates_tx, updates_rx) = mpsc::channel(1024);
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let mut runtime_events = self.subscribe();
-        let invalidation_group_id = group_id.clone();
-        let invalidation_start_id = start_message_id_hex.clone();
-        let product = self.shared.product_analytics.clone();
-        let mut block_changes = self.accounts.app.block_list_updates.subscribe();
-        let policy_account = self.accounts.resolve(account_ref)?;
-        let policy_storage = self.accounts.app.account_storage(&policy_account.label)?;
-        if policy_storage.app_storage().is_user_blocked(&sender_hex)? {
-            return Err(AppError::UserBlocked);
-        }
-        let handle = tokio::spawn(async move {
-            let watch = watch_broker_candidates(
-                BrokerWatch {
-                    candidates,
-                    server_cert_der,
-                    insecure_local,
-                    stream_id: crypto_context.stream_id,
-                    start_event_id: crypto_context.start_event_id,
-                    crypto: Some(crypto_context.crypto),
-                    policy_max_plaintext_frame_len,
-                },
-                updates_tx.clone(),
-                product,
-            );
-            tokio::pin!(watch);
-            let final_update = tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                update = &mut watch => update,
-                reason = async {
-                    loop {
-                        if block_changes.changed().await.is_err() {
-                            return None;
+            let (updates_tx, updates_rx) = mpsc::channel(1024);
+            let (terminal_tx, terminal_rx) = oneshot::channel();
+            let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+            let mut runtime_events = self.subscribe();
+            let invalidation_group_id = group_id.clone();
+            let invalidation_start_id = start_message_id_hex.clone();
+            let product = self.shared.observer.product().clone();
+            let mut block_changes = self.accounts.app.block_list_updates.subscribe();
+            let policy_account = self.accounts.resolve(account_ref)?;
+            let policy_storage = self.accounts.app.account_storage(&policy_account.label)?;
+            if policy_storage.app_storage().is_user_blocked(&sender_hex)? {
+                return Err(AppError::UserBlocked);
+            }
+            let handle = tokio::spawn(async move {
+                let watch = watch_broker_candidates(
+                    BrokerWatch {
+                        candidates,
+                        server_cert_der,
+                        insecure_local,
+                        stream_id: crypto_context.stream_id,
+                        start_event_id: crypto_context.start_event_id,
+                        crypto: Some(crypto_context.crypto),
+                        policy_max_plaintext_frame_len,
+                    },
+                    updates_tx.clone(),
+                    product,
+                );
+                tokio::pin!(watch);
+                let final_update = tokio::select! {
+                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    update = &mut watch => update,
+                    reason = async {
+                        loop {
+                            if block_changes.changed().await.is_err() {
+                                return None;
+                            }
+                            let storage = policy_storage.clone();
+                            let sender = sender_hex.clone();
+                            match blocking_app_task(move || Ok(storage.app_storage().is_user_blocked(&sender)?)).await {
+                                Ok(false) => continue,
+                                Ok(true) => return Some("agent stream preview withdrawn by block policy"),
+                                Err(_) => return Some("agent stream preview policy check unavailable"),
+                            }
                         }
-                        let storage = policy_storage.clone();
-                        let sender = sender_hex.clone();
-                        match blocking_app_task(move || Ok(storage.app_storage().is_user_blocked(&sender)?)).await {
-                            Ok(false) => continue,
-                            Ok(true) => return Some("agent stream preview withdrawn by block policy"),
-                            Err(_) => return Some("agent stream preview policy check unavailable"),
-                        }
-                    }
-                } => match reason {
-                    Some(message) => RuntimeAgentStreamUpdate::Failed { message: message.into() },
-                    None => return,
-                },
-                reason = wait_for_preview_invalidation(
-                    &mut runtime_events,
-                    &invalidation_group_id,
-                    &invalidation_start_id,
-                ) => RuntimeAgentStreamUpdate::Failed { message: reason },
-            };
-            let _ = terminal_tx.send(final_update);
-        });
-        Ok(RuntimeAgentStreamWatch {
-            stream_id_hex,
-            updates: updates_rx,
-            terminal: Some(terminal_rx),
-            abort: handle.abort_handle(),
-            stopping: self.shared.lifecycle().subscribe_shutdown(),
-        })
+                    } => match reason {
+                        Some(message) => RuntimeAgentStreamUpdate::Failed { message: message.into() },
+                        None => return,
+                    },
+                    reason = wait_for_preview_invalidation(
+                        &mut runtime_events,
+                        &invalidation_group_id,
+                        &invalidation_start_id,
+                    ) => RuntimeAgentStreamUpdate::Failed { message: reason },
+                };
+                let _ = terminal_tx.send(final_update);
+            });
+            Ok(RuntimeAgentStreamWatch {
+                stream_id_hex,
+                updates: updates_rx,
+                terminal: Some(terminal_rx),
+                abort: handle.abort_handle(),
+                stopping: self.shared.lifecycle().subscribe_shutdown(),
+            })
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
     pub async fn agent_text_stream_crypto_for_start_event(
@@ -426,7 +416,7 @@ struct BrokerWatch {
 async fn watch_broker_candidates(
     watch: BrokerWatch,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
-    product: crate::product_analytics::ProductAnalytics,
+    product: marmot_observability::ProductRecorder,
 ) -> RuntimeAgentStreamUpdate {
     let mut first_preview = product.begin(
         crate::ProductFamily::Stream,

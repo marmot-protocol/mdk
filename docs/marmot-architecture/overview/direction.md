@@ -107,7 +107,7 @@ Each small enough to actually do, each produces an artifact that makes bigger de
 1. **Build the CGKA engine vector plan.** Write a vector manifest, define the byte-level fixture schema, and promote the
    best chaos cases into portable scenario vectors where the OpenMLS randomness model allows it.
 2. **Map the whitenoise-rs integration boundary.** Decide whether the first path is a direct interface change or a shim,
-   and list the exact methods the app core needs from `cgka-session` / `marmot-account`.
+   and list the exact methods the app core needs from `marmot-session` / `marmot-account`.
 3. **Draft a spec-structure reorganization proposal.** Walk one existing feature (MIP-03 SelfRemove or MIP-06
    multi-device) through a component-based structure. Decide whether to pilot.
 4. **Investigate OpenMLS + Marmot-TS Safe framework support.** Gate for §1.4 above.

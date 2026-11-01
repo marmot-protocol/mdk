@@ -144,6 +144,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -460,7 +461,7 @@ fn selfremove_registry() -> FeatureRegistry {
 
 fn build_client(id: &[u8]) -> Engine<SqliteAccountStorage> {
     build_client_with_storage_and_peeler(
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         id,
         Box::new(MockPeeler),
     )
@@ -470,7 +471,11 @@ fn build_client_with_peeler(
     id: &[u8],
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
-    build_client_with_storage_and_peeler(SqliteAccountStorage::in_memory().unwrap(), id, peeler)
+    build_client_with_storage_and_peeler(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        id,
+        peeler,
+    )
 }
 
 fn build_client_with_storage(
@@ -520,7 +525,7 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
     let seen_metadata = Arc::new(Mutex::new(Vec::new()));
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
-    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
@@ -675,7 +680,7 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
 
 #[tokio::test]
 async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut engine = build_client_with_storage(storage.clone(), b"malformed-welcome");
     let message_id = MessageId::new(vec![0x67; 32]);
     let msg = TransportMessage {
@@ -827,7 +832,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
 #[tokio::test]
 async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
     let mut alice = build_client(b"alice");
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_storage_and_peeler(
         storage.clone(),
         b"bob",
@@ -1172,7 +1177,7 @@ async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
 #[tokio::test]
 async fn post_peel_invalid_mls_inputs_are_terminal_and_restart_deduplicated() {
     let mut alice = build_client(b"alice-post-peel");
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_storage(storage.clone(), b"bob-post-peel");
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -1584,7 +1589,7 @@ async fn ingest_own_created_message_returns_own_echo() {
 /// fallback must retire the raw retry row instead of leaving it replayable.
 #[tokio::test]
 async fn buffered_legacy_own_echo_retires_raw_retry_row() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
     let mut bob = build_client(b"bob-legacy-own-echo");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -1934,7 +1939,7 @@ async fn send_app_message_round_trips_to_another_client() {
 #[tokio::test]
 async fn pending_application_delivery_replays_after_restart_until_acknowledged() {
     let mut alice = build_client(b"alice-outbox");
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -2020,7 +2025,7 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
 #[tokio::test]
 async fn pending_group_join_replays_after_restart_until_acknowledged() {
     let mut alice = build_client(b"alice-join-outbox");
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_storage(bob_storage.clone(), b"bob-join-outbox");
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -2166,7 +2171,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
 #[tokio::test]
 async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
     let peels = Arc::new(Mutex::new(0usize));
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let alice_storage = storage.clone();
     let mut alice = build_client_with_storage_and_peeler(
         storage,

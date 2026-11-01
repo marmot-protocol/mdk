@@ -7,8 +7,8 @@
 //! tracking rather than by OpenMLS alone.
 
 use async_trait::async_trait;
-use cgka_engine::app_components::staged_commit_requires_admin;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, DroppedMessageReason};
+use cgka_engine::commit_class::classify_staged_commit;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
@@ -112,6 +112,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -164,7 +165,7 @@ fn registry() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -175,7 +176,7 @@ fn build(id: &[u8]) -> impl CgkaEngine {
 }
 
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -188,7 +189,7 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
 }
 
 fn build_current_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -364,7 +365,10 @@ fn requires_admin_for_proposals(
         .stage_commit(&provider)
         .expect("stage commit");
     let staged = mls_group.pending_commit().expect("pending commit staged");
-    let requires_admin = staged_commit_requires_admin(staged);
+    let requires_admin =
+        classify_staged_commit(mls_group, staged, Some(mls_group.own_leaf_index()))
+            .expect("classify the staged commit")
+            .requires_admin();
     mls_group
         .clear_pending_commit(provider.storage())
         .expect("clear pending commit");
@@ -898,7 +902,7 @@ async fn standalone_proposal_gate_distinguishes_authorization_encoding_support_a
     let audit_dir = tempfile::TempDir::new().unwrap();
     let audit_path = audit_dir.path().join("proposal-rejections.jsonl");
     let recorder = JsonlRecorder::open(&audit_path, "proposal-gate-test".to_string()).unwrap();
-    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(alice_storage.clone())
         .identity(pad32(b"alice-proposal-gate"))
         .account_identity_proof_signer(proof_signer(b"alice-proposal-gate"))
@@ -1456,7 +1460,9 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
         "the staged commit should consume only SelfRemove proposals"
     );
     assert!(
-        !staged_commit_requires_admin(staged),
+        !classify_staged_commit(&mls_group, staged, Some(mls_group.own_leaf_index()))
+            .expect("classify the staged commit")
+            .requires_admin(),
         "a SelfRemove-only commit must be allowed for non-admins"
     );
 }

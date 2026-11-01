@@ -458,7 +458,7 @@ async fn missing_diagnostics_executor_keeps_exporters_stopped() {
             }),
             ..RelayTelemetryExportConfig::enabled("https://collector.example/v1/metrics")
         };
-        assert!(config.export_allowed());
+        assert!(transport_nostr::RelayExportGate::export_allowed(&config));
         runtime.shared.configure_relay_telemetry_exporter(config);
         assert!(
             runtime
@@ -629,6 +629,182 @@ async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts()
     assert!(matches!(stopped, AppError::RuntimeStopping));
 }
 
+/// Once the device group unlinks this device, its worker stops and the
+/// runtime deactivates the account: hosts hear `DeviceUnlinked`, the account
+/// lists as unlinked and signed out, neither signing in nor reconciling starts
+/// it again, and wiping it skips the leave and slot stages (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_device_stops_its_account_for_good() {
+    let root = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(root.path(), "wss://unlink.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap().remove(0);
+    assert!(managed().running && !managed().unlinked);
+
+    // Hosts hear the unlink only once the account is signed out, so one that
+    // wipes and signs in again on hearing it never meets the deactivation.
+    // While the lifecycle lock is held the deactivation waits, and the event
+    // with it.
+    let worker_transactions = runtime.accounts().worker_transactions.clone();
+    let held = worker_transactions.lock().await;
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+    async fn device_unlinked(events: &mut broadcast::Receiver<MarmotAppEvent>, account_id: &str) {
+        loop {
+            if let Ok(MarmotAppEvent::DeviceUnlinked { account_id_hex, .. }) = events.recv().await
+                && account_id_hex == account_id
+            {
+                break;
+            }
+        }
+    }
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            device_unlinked(&mut events, &account.account_id_hex)
+        )
+        .await
+        .is_err(),
+        "no host hears the unlink before the account is signed out"
+    );
+    drop(held);
+
+    timeout(
+        Duration::from_secs(10),
+        device_unlinked(&mut events, &account.account_id_hex),
+    )
+    .await
+    .expect("hosts hear the unlink");
+    let unlinked = managed();
+    assert!(!unlinked.running && unlinked.unlinked && unlinked.signed_out);
+
+    assert!(matches!(
+        runtime.sign_in_account("alice").await,
+        Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+    ));
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(!managed().running);
+
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let attempted = relay.attempted_events().len();
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert_eq!(outcome.groups_left, 0);
+    assert!(outcome.group_leave_failures.is_empty());
+    assert_eq!(outcome.key_packages_deleted, 0);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "an unlinked wipe sends nothing"
+    );
+    assert!(app.account_home().accounts().unwrap().is_empty());
+
+    // The account's publish stop went with it: linked again here, it
+    // publishes.
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
+    runtime.shutdown().await;
+}
+
+/// The wipe of an unlinked account commits its removal, then fails to remove
+/// its secret. The account is gone all the same, so its publish stop goes
+/// with it: the same account linked again here publishes (mdk#2628 D67).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_wipe_that_keeps_its_secret_still_lets_a_new_link_publish() {
+    use marmot_account::{
+        AccountHomeResult, AccountSecretStore, AccountSummary, LocalFileSecretStore,
+    };
+
+    struct FailSecretRemoval(LocalFileSecretStore);
+    impl AccountSecretStore for FailSecretRemoval {
+        fn has_secret_for_label(&self, label: &str) -> AccountHomeResult<bool> {
+            self.0.has_secret_for_label(label)
+        }
+        fn write_secret(
+            &self,
+            account: &AccountSummary,
+            keys: &nostr::prelude::Keys,
+        ) -> AccountHomeResult<()> {
+            self.0.write_secret(account, keys)
+        }
+        fn load_secret(&self, account: &AccountSummary) -> AccountHomeResult<nostr::prelude::Keys> {
+            self.0.load_secret(account)
+        }
+        fn remove_secret(&self, _account: &AccountSummary) -> AccountHomeResult<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let home = AccountHome::open_with_secret_store(
+        root.path(),
+        Arc::new(FailSecretRemoval(LocalFileSecretStore::new(root.path()))),
+    );
+    home.create_account("alice").unwrap();
+    let keys = home.load_signing_keys("alice").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_account_home_and_config(
+        root.path(),
+        vec!["wss://unlink.example".to_owned()],
+        home,
+        crate::MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
+    )
+    .with_test_relay_client(relay.clone());
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = || runtime.accounts().managed_accounts().unwrap();
+    runtime
+        .accounts()
+        .unlink_device_for_test("alice")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while managed()[0].running {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime deactivates the account");
+
+    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    assert!(!outcome.local_cleanup.completed, "the secret is kept");
+    assert!(app.account_home().accounts().unwrap().is_empty());
+
+    let attempted = relay.attempted_events().len();
+    app.account_home()
+        .import_nostr_account_idempotent(&keys.secret_key().to_secret_hex())
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while relay.attempted_events().len() == attempted {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the account linked again publishes");
+    runtime.shutdown().await;
+}
+
 #[test]
 fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() {
     let request = AccountSetupRequest {
@@ -648,28 +824,6 @@ fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() 
     let legacy: GeneratedAccountSetupContext = serde_json::from_value(legacy).unwrap();
     assert!(legacy.request().inbox_relays.is_empty());
     assert_eq!(legacy.request().default_relays, request.default_relays);
-}
-
-#[test]
-fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
-    let runtime = MarmotAppRuntime::new(app.clone());
-
-    let (account, private_key_import) = runtime
-        .accounts
-        .create_nostr_account_from_setup(&AccountSetupRequest::default())
-        .unwrap();
-
-    assert!(private_key_import.is_none());
-    assert!(app.key_package_cutover_scan_complete(&account.label));
-    assert!(
-        !app.account_home()
-            .account_dir(&account.label)
-            .join(crate::SESSION_DB_FILE)
-            .exists(),
-        "the scan marker must be durable before any session can open"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -956,7 +1110,7 @@ async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
     let lifecycle = RuntimeLifecycle::new();
     let (updates_tx, updates) = mpsc::channel(1);
     let mut subscription = RuntimeMessagesSubscription {
-        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
         snapshot: Vec::new(),
         updates,
         stopping: lifecycle.subscribe_shutdown(),
@@ -1177,7 +1331,7 @@ fn timeline_subscription_with(
 ) -> RuntimeTimelineMessagesSubscription {
     RuntimeTimelineMessagesSubscription {
         policy_window_size: window.messages.len().max(1),
-        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        policy_storage: storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
         window: timeline_window_handle(store, window, window_limit),
         updates,
         stopping,
@@ -1951,6 +2105,7 @@ fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
         sender: "sender".to_owned(),
         sender_display_name: None,
         plaintext: "hello".to_owned(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 1,
         deleted: false,
@@ -3689,8 +3844,6 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
 
 #[test]
 fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
-    use crate::KeyPackageDeletionResult;
-
     let hostile_summary = "publish failed: https://evil.example/nip42";
     let hostile_reason = "blocked: attacker-controlled suffix at wss://leak.example";
     let transport_error =
@@ -3716,18 +3869,8 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
     let wipe_reason = wipe_failure_reason(&err);
     assert_eq!(wipe_reason, "relay rejected event (blocked)");
     assert!(!wipe_reason.contains("evil.example"));
-
-    let (deleted, failures) =
-        relay_failures_from_key_package_deletion_results(vec![KeyPackageDeletionResult {
-            event_id_hex: "11".repeat(32),
-            result: Err(err),
-        }]);
-    assert_eq!(deleted, 0);
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].reason, "relay rejected event (blocked)");
-    assert!(!failures[0].reason.contains("evil.example"));
-    assert!(!failures[0].reason.contains("leak.example"));
-    assert!(!failures[0].reason.contains("attacker-controlled"));
+    assert!(!wipe_reason.contains("leak.example"));
+    assert!(!wipe_reason.contains("attacker-controlled"));
 }
 
 // Overflows the event broadcast without yielding so the timeline forwarder
@@ -4218,6 +4361,7 @@ async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
         sender: "author".into(),
         sender_display_name: None,
         plaintext: String::new(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 1,
         deleted: true,
@@ -4264,6 +4408,7 @@ async fn chat_preview_retention_only_change_wakes_subscribers() {
         sender: "author".to_owned(),
         sender_display_name: None,
         plaintext: "hello".to_owned(),
+        tags: Vec::new(),
         kind: 9,
         timeline_at: 10,
         retention_seconds: None,

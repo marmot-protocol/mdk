@@ -198,26 +198,26 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
 async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
     let overflow = AccountDeliveryOverflowState::default();
     let generation = overflow
-        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
         .unwrap();
     overflow.consume_signal(generation);
     let first = overflow.start_recovery(1);
     assert!(overflow.start_marker_persistence());
     overflow
-        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
+        .persist_marker_before_drop(Arc::new(|_, _, _, _| Ok(())))
         .await;
     let elapsed_ms = overflow.finish_recovery(first).unwrap();
     overflow.record_recovery_success(elapsed_ms);
 
     let generation = overflow
-        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
         .unwrap();
     overflow.consume_signal(generation);
     let second = overflow.start_recovery(2);
     // A new omission during the replay invalidates this attempt.
     assert!(
         overflow
-            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
             .is_some()
     );
     assert!(overflow.finish_recovery(second).is_none());
@@ -238,12 +238,66 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
     assert_eq!(overflow.metrics.dropped.load(Ordering::Relaxed), 3);
 }
 
+/// An adopted durable marker counted its drops in another process or an
+/// acknowledged attempt, so the first new drop takes a fresh token whose count
+/// starts from zero, and an attempt against the adopted marker cannot settle.
+#[tokio::test]
+async fn an_adopted_marker_gives_new_drops_a_fresh_token() {
+    let overflow = AccountDeliveryOverflowState::default();
+    let written = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = written.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped, _, routes| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((token, dropped, routes.map(<[_]>::to_vec)));
+        Ok(())
+    });
+    let drop_on_inbox = |at| {
+        if let Some(generation) = overflow.record_drop(
+            ACCOUNT_DELIVERY_BUFFER,
+            Some(at),
+            Some(DeliveryRoute::Inbox),
+        ) {
+            overflow.consume_signal(generation);
+        }
+    };
+
+    // Reopened after a restart.
+    let attempt = overflow.start_recovery(7);
+    assert_eq!((attempt.marker_token, attempt.dropped), (7, 0));
+    drop_on_inbox(500);
+    drop_on_inbox(400);
+    assert!(overflow.start_marker_persistence());
+    overflow.persist_marker_before_drop(marker.clone()).await;
+    let (fresh, dropped, routes) = written.lock().unwrap().pop().unwrap();
+    assert_ne!(fresh, 7);
+    assert_eq!(
+        (dropped, routes),
+        (2, Some(vec![(DeliveryRoute::Inbox, 400)]))
+    );
+    assert!(overflow.finish_recovery(attempt).is_none());
+
+    // Settled, then restored when its acknowledgment failed.
+    let attempt = overflow.start_recovery(fresh);
+    assert_eq!(attempt.marker_token, fresh);
+    assert!(overflow.finish_recovery(attempt).is_some());
+    overflow.restore_recovery_guard(fresh);
+    drop_on_inbox(600);
+    assert!(overflow.start_marker_persistence());
+    overflow.persist_marker_before_drop(marker).await;
+    let (again, dropped, _) = written.lock().unwrap().pop().unwrap();
+    assert!(again != fresh && again != 7);
+    assert_eq!(dropped, 1);
+    assert_eq!(overflow.pending_generation().unwrap().marker_token, again);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
     let overflow = AccountDeliveryOverflowState::default();
     assert!(
         overflow
-            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+            .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
             .is_some()
     );
     assert!(overflow.start_marker_persistence());
@@ -254,7 +308,7 @@ async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed_attempts = attempts.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
         observed_attempts.fetch_add(1, Ordering::SeqCst);
         Err(AccountDeliveryRecoveryMarkerError::Closed)
     });
@@ -278,7 +332,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
 ) {
     let overflow = Arc::new(AccountDeliveryOverflowState::default());
     let old_generation = overflow
-        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
         .unwrap();
     overflow.consume_signal(old_generation);
     assert!(overflow.start_marker_persistence());
@@ -289,7 +343,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     let marker: AccountDeliveryRecoveryMarker = {
         let entered = entered.clone();
         let release = release.clone();
-        Arc::new(move |_, _, _| {
+        Arc::new(move |_, _, _, _| {
             entered.store(true, Ordering::SeqCst);
             while !release.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -317,7 +371,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     // handoff, which now forbids this transition while a writer is in flight.
     overflow.inner.lock().unwrap().pending = false;
     let new_generation = overflow
-        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1))
+        .record_drop(ACCOUNT_DELIVERY_BUFFER, Some(1), None)
         .unwrap();
     overflow.consume_signal(new_generation);
     assert!(overflow.start_marker_persistence());
@@ -434,8 +488,8 @@ async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
         abandoned_notification_lane(Box::pin(futures::stream::empty()), &pending, &source);
     assert_eq!(outcome.exit, RelayNotificationConsumerExit::Lagged(3));
     assert_eq!(
-        outcome.lag_floor,
-        NostrNotificationLossFloor::Unbounded,
+        outcome.lag_bounds,
+        NostrNotificationLossBounds::account_wide(NostrNotificationLossFloor::Unbounded),
         "an account context with no REQ has no floor"
     );
     assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
@@ -448,7 +502,7 @@ async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
     recover_relay_notification_forwarder_scoped(
         &plane.inner.transport,
         outcome.exit,
-        outcome.lag_floor,
+        outcome.lag_bounds,
         Some(&alice),
     );
     assert_eq!(
@@ -515,9 +569,9 @@ impl RelayNotificationSource for QueuedWorkerFailureSource {
         false
     }
 
-    fn record_loss(&self, skipped: u64) -> NostrNotificationLossFloor {
+    fn record_loss(&self, skipped: u64) -> NostrNotificationLossBounds {
         self.loss.record_notification_gap(skipped);
-        self.loss.notification_loss_floor()
+        self.loss.notification_loss_bounds()
     }
 
     fn receiver_replaced(&self) {
@@ -814,7 +868,7 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
         recover_relay_notification_forwarder_scoped(
             transport,
             RelayNotificationConsumerExit::Lagged(skipped),
-            floor,
+            NostrNotificationLossBounds::account_wide(floor),
             Some(&account),
         )
     };
@@ -875,6 +929,81 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
     );
     assert_eq!(health.unexpected_exits, 0);
     relay_plane.shutdown().await;
+}
+
+/// Each lag carries its SDK context's floor per route. The generation keeps
+/// the lowest floor per route across its lags, until a loss whose routes are
+/// unknown (a shared receiver, staged replay) makes it loss on every route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notification_lag_keeps_each_routes_lowest_floor_for_its_generation() {
+    use NostrNotificationLossFloor::{Since, Unbounded};
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![endpoint],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(1_000)),
+        })
+        .await
+        .unwrap();
+    let group = DeliveryRoute::Group([0xD4; 32]);
+    let lag = |routes: Option<&[(DeliveryRoute, u64)]>, floor| {
+        relay_plane.simulate_routed_notification_lag_for_test(
+            &account,
+            1,
+            NostrNotificationLossBounds {
+                floor,
+                routes: routes.map(|routes| routes.iter().copied().collect()),
+            },
+        );
+    };
+
+    lag(
+        Some(&[(DeliveryRoute::Inbox, 900), (group, 1_200)]),
+        Since(900),
+    );
+    lag(Some(&[(group, 1_100)]), Since(1_100));
+    let overflow = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(overflow.notification_floor, Some(900));
+    assert_eq!(
+        adapter.notification_loss_routes(&overflow),
+        Some(vec![(DeliveryRoute::Inbox, 900), (group, 1_100)])
+    );
+    // Another generation's routes say nothing about this one.
+    let earlier = AccountDeliveryOverflow {
+        generation: overflow.generation.wrapping_sub(1),
+        ..overflow
+    };
+    assert_eq!(adapter.notification_loss_routes(&earlier), None);
+
+    lag(None, Since(1_300));
+    assert_eq!(adapter.notification_loss_routes(&overflow), None);
+    lag(Some(&[(group, 1_000)]), Since(1_000));
+    assert_eq!(
+        adapter.notification_loss_routes(&overflow),
+        None,
+        "unknown routes stay unknown for the generation"
+    );
+
+    // An unbounded lag reaches every route from the start.
+    lag(None, Unbounded);
+    assert_eq!(
+        adapter
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_floor,
+        None
+    );
 }
 
 /// The worker drops its client, and with it the account queue, before it
@@ -1797,8 +1926,8 @@ impl RelayNotificationSource for TestNotificationSource {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
-        self.lag_floor
+    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossBounds {
+        NostrNotificationLossBounds::account_wide(self.lag_floor)
     }
 }
 
@@ -3275,8 +3404,11 @@ async fn router_drops_record_the_earliest_created_at_they_lost() {
     let alice = MemberId::new(vec![0xA1; 32]);
     let marked = Arc::new(StdMutex::new(Vec::new()));
     let recorded = marked.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest| {
-        recorded.lock().unwrap().push((dropped, earliest));
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest, routes| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((dropped, earliest, routes.map(<[_]>::to_vec)));
         Ok(())
     });
     let adapter = relay_plane.account_adapter_with_recovery_marker(
@@ -3288,23 +3420,61 @@ async fn router_drops_record_the_earliest_created_at_they_lost() {
     // Without a spill the three deliveries past the queue are dropped. They
     // are the oldest in the fill, and the last is the earliest.
     fill_account_queue(&relay_plane, &adapter, &alice, 3).await;
-    timeout(Duration::from_secs(5), async {
-        while marked
-            .lock()
-            .unwrap()
-            .last()
-            .is_none_or(|(dropped, _)| *dropped < 3)
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let wait_for = |count: u64| {
+        let marked = marked.clone();
+        async move {
+            timeout(Duration::from_secs(5), async {
+                while marked
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_none_or(|(dropped, _, _)| *dropped < count)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the dropped deliveries become a durable marker");
         }
-    })
-    .await
-    .expect("the dropped deliveries become a durable marker");
+    };
+    wait_for(3).await;
     let earliest_fill = 1_700_100_000 - (ACCOUNT_DELIVERY_BUFFER as u64 + 2);
+    // They all arrived on the fill's group route.
+    let routes = vec![(DeliveryRoute::Group([0xD3; 32]), earliest_fill)];
     assert_eq!(
-        marked.lock().unwrap().last().copied(),
-        Some((3, Some(earliest_fill)))
+        marked.lock().unwrap().last().cloned(),
+        Some((3, Some(earliest_fill), Some(routes.clone())))
     );
+    // The worker reads the same routes for the generation it observed, and
+    // none for another generation or token.
+    let observed = adapter.pending_delivery_overflow().unwrap();
+    assert_eq!(adapter.delivery_loss_routes(&observed), Some(routes));
+    for other in [
+        AccountDeliveryOverflow {
+            generation: observed.generation.wrapping_sub(1),
+            ..observed
+        },
+        AccountDeliveryOverflow {
+            marker_token: observed.marker_token.wrapping_add(1),
+            ..observed
+        },
+    ] {
+        assert_eq!(adapter.delivery_loss_routes(&other), None);
+    }
+
+    // A dropped delivery recovery cannot place loses the generation's routes.
+    let mut event = group_event("unplaced", &[0xD3; 32]);
+    event.created_at = 1_700_200_000;
+    event.id = event.computed_id();
+    let mut unplaced = router_group_delivery(&alice, GroupId::new(vec![0xC3; 32]), event);
+    unplaced.group_id_hint = None;
+    relay_plane.route_account_delivery_for_test(unplaced);
+    wait_for(4).await;
+    assert_eq!(
+        marked.lock().unwrap().last().cloned(),
+        Some((4, Some(earliest_fill), None))
+    );
+    assert_eq!(adapter.delivery_loss_routes(&observed), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3433,7 +3603,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
         });
         let marked = Arc::new(StdMutex::new(Vec::new()));
         let recorded = marked.clone();
-        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped, _| {
+        let marker: AccountDeliveryRecoveryMarker = Arc::new(move |token, dropped, _, _| {
             recorded.lock().unwrap().push((token, dropped));
             Ok(())
         });
@@ -4086,6 +4256,187 @@ async fn replay_handoff_fences_cursor() {
     plane.shutdown().await;
 }
 
+/// A frame the adapter's fence holds is in no queue, yet a restart past it
+/// would never fetch it again: it caps the commit like a queued delivery,
+/// and stops capping once the owner's plan releases it.
+#[tokio::test]
+async fn fence_held_frame_caps_cursor() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    adapter.enable_replay_fencing().await;
+    let endpoint = TransportEndpoint("wss://relay.example/".into());
+    let transport_group_id = vec![0xD3; 32];
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let group = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let created_at = OPENED_CURSOR + 500;
+    let mut event = group_event("fence-held-history", &transport_group_id);
+    event.created_at = created_at;
+    sign_group_event(&mut event);
+    // The relay's stored copy counts before its EOSE, as the notification
+    // consumer reports it.
+    plane
+        .inner
+        .transport
+        .adapter
+        .observe_relay_event(
+            &hex::decode(&event.id).unwrap(),
+            &endpoint,
+            Some(&group),
+            created_at,
+        )
+        .await;
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(group),
+            event,
+        })
+        .await
+        .unwrap();
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(adapter.try_receive_account_delivery().is_none(), "held");
+    let ticket = {
+        let status = adapter.replay_admission().await;
+        assert!(!status.pending, "a held frame is not pending admission");
+        assert_eq!(status.fence_held_since(0), Some(created_at));
+        status.fence_ticket()
+    };
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        Some(created_at + CURSOR_LOOKBACK),
+        "the held frame caps the commit"
+    );
+
+    adapter
+        .fence_replay(&ReplayFencePlan {
+            ticket,
+            fences: Vec::new(),
+        })
+        .await;
+    let Some(AccountDeliveryReceive::Delivery(delivery)) =
+        timeout(Duration::from_secs(1), adapter.receive_account_delivery())
+            .await
+            .expect("the plan releases the held frame")
+            .unwrap()
+    else {
+        panic!("the held frame arrives once");
+    };
+    assert_eq!(delivery.message.timestamp.0, created_at);
+    adapter.release_account_delivery(&delivery.message.id);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate, |_| true),
+        candidate
+    );
+    plane.shutdown().await;
+}
+
+/// A held frame below the restart floor is the restart's already, and must
+/// not hide one above it: the commit stops at the oldest held frame the
+/// floor does not cover.
+#[tokio::test]
+async fn fence_held_frames_on_both_sides_of_the_floor_cap_at_the_upper() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    adapter.enable_replay_fencing().await;
+    let endpoint = TransportEndpoint("wss://relay.example/".into());
+    let transport_group_id = vec![0xD3; 32];
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 16]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let group = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let floor = OPENED_CURSOR - CURSOR_LOOKBACK;
+    let below = floor - 500;
+    let above = OPENED_CURSOR + 500;
+    for (name, created_at) in [("fence-held-below", below), ("fence-held-above", above)] {
+        let mut event = group_event(name, &transport_group_id);
+        event.created_at = created_at;
+        sign_group_event(&mut event);
+        plane
+            .inner
+            .transport
+            .adapter
+            .observe_relay_event(
+                &hex::decode(&event.id).unwrap(),
+                &endpoint,
+                Some(&group),
+                created_at,
+            )
+            .await;
+        plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some(group.clone()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(adapter.try_receive_account_delivery().is_none(), "held");
+    {
+        let status = adapter.replay_admission().await;
+        assert_eq!(status.fence_held_since(0), Some(below));
+        assert_eq!(status.fence_held_since(floor), Some(above));
+    }
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000), |_| true),
+        Some(above + CURSOR_LOOKBACK),
+        "the held frame above the floor caps the commit"
+    );
+    plane.shutdown().await;
+}
+
 /// Replacing an activation can discard ciphertext before its EOSE. The next
 /// activation's complete coverage does not discharge that earlier loss, even
 /// when the router has not yet consumed the coalesced loss notification.
@@ -4582,7 +4933,7 @@ async fn a_settled_commit_spills_only_what_arrives_during_its_save() {
 async fn without_a_spill_a_delivery_below_the_live_floor_becomes_bounded_loss() {
     let marked = Arc::new(StdMutex::new(Vec::new()));
     let recorded = marked.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, dropped, earliest, _| {
         recorded.lock().unwrap().push((dropped, earliest));
         Ok(())
     });
@@ -4818,7 +5169,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     let marker_attempts = Arc::new(AtomicUsize::new(0));
     let marker_flag = marker_persisted.clone();
     let attempts = marker_attempts.clone();
-    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
@@ -5942,7 +6293,9 @@ fn publish_report_preserves_fallback_message_id() {
 #[test]
 fn loss_authority_notification_cannot_claim_the_queue_writer() {
     let overflow = AccountDeliveryOverflowState::default();
-    overflow.record_notification_loss(NostrNotificationLossFloor::Unbounded);
+    overflow.record_notification_loss(&NostrNotificationLossBounds::account_wide(
+        NostrNotificationLossFloor::Unbounded,
+    ));
     assert!(
         !overflow.start_marker_persistence(),
         "notification incidents must be persisted by the account worker"
@@ -5952,13 +6305,13 @@ fn loss_authority_notification_cannot_claim_the_queue_writer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     let overflow = AccountDeliveryOverflowState::default();
-    overflow.record_drop(1, Some(1));
+    overflow.record_drop(1, Some(1), None);
     assert!(overflow.start_marker_persistence());
     overflow
-        .persist_marker_before_drop(Arc::new(|_, _, _| Ok(())))
+        .persist_marker_before_drop(Arc::new(|_, _, _, _| Ok(())))
         .await;
     let original = overflow.pending_snapshot().unwrap();
-    overflow.record_drop(1, Some(1));
+    overflow.record_drop(1, Some(1), None);
     assert!(
         overflow.start_marker_persistence(),
         "new count must reach durable evidence"
@@ -5966,7 +6319,7 @@ async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     let observed = Arc::new(AtomicUsize::new(0));
     let count = observed.clone();
     overflow
-        .persist_marker_before_drop(Arc::new(move |token, dropped, _| {
+        .persist_marker_before_drop(Arc::new(move |token, dropped, _, _| {
             assert_eq!(token, original.marker_token);
             count.store(dropped as usize, Ordering::SeqCst);
             Ok(())
@@ -5999,11 +6352,11 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     let (sender, mut receiver) = mpsc::channel(2);
     let latest = Arc::new(AtomicUsize::new(0));
     let observed = latest.clone();
-    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count, _| {
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, count, _, _| {
         observed.store(count as usize, Ordering::SeqCst);
         Ok(())
     });
-    let signal = overflow.record_drop(1, Some(1));
+    let signal = overflow.record_drop(1, Some(1), None);
     persist_queue_loss(&sender, &overflow, marker.clone(), signal);
     timeout(Duration::from_secs(2), async {
         while sender.capacity() == 2 {
@@ -6012,7 +6365,7 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
     })
     .await
     .unwrap();
-    let signal = overflow.record_drop(1, Some(1));
+    let signal = overflow.record_drop(1, Some(1), None);
     assert!(signal.is_none(), "existing control record remains queued");
     persist_queue_loss(&sender, &overflow, marker, signal);
     timeout(Duration::from_secs(2), async {

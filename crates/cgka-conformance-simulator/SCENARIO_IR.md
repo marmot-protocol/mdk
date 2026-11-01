@@ -4,7 +4,8 @@ The simulator has two deliberately separate inputs:
 
 - `ScenarioSpec` v2 and v3 are canonical adapter-neutral JSON IRs. Both contain only a linear sequence of executable
   atomic actions. V2 remains replayable through `schemas/scenario-ir.v2.schema.json`; v3 adds the full
-  `update_group_profile` action and expected tick-error observation through `schemas/scenario-ir.v3.schema.json`.
+  `update_group_profile` action, expected tick-error observation and account-devices actions through
+  `schemas/scenario-ir.v3.schema.json`.
 - `ScenarioAuthoringSpec` v1 is human-oriented structure. It may be represented as JSON or YAML, but it is never passed
   to an adapter. The repository compiler deterministically lowers it to canonical JSON first, emitting v2 unless an
   expanded action requires v3. Its schema is `schemas/scenario-authoring.v1.schema.json`.
@@ -38,6 +39,20 @@ adapter must advertise both transport delivery and expected-transport-error obse
 That split is intentional because canonical JSON is persisted in vectors and failure capsules and exchanged with
 external campaign runners; adding fields to an existing action version would change the meaning accepted by a v2
 consumer even when this repository's current fixtures omit them.
+
+V3 also models `marmot.group.account-devices.v1` (0x800d) support per client. Clients start without it.
+`set_account_devices_support` sets one client's support and restarts it, so its next KeyPackage advertises the new set;
+a member's leaf picks up the change with its next `self_update`. `require_account_devices` sends a Commit from the
+client's current group that adds 0x800d to the required component list and records `pending` like the other commit
+actions. `expect_require_account_devices_error` makes the same attempt, records the normalized error when it matches,
+and lets the scenario continue. All three need the adapter's `account_devices` capability, and the two activation
+actions are group-scoped and admin-gated like `update_admin_policy`. The `account_devices_state` vector expectation
+reads a client's latest `observe_exact` state: it checks whether that state requires 0x800d and, if it does, that every
+leaf advertises it, the GroupContext carries no data for it and no account holds more than 20 leaves.
+`remove_own_account_devices` sends a same-account Commit: `client` removes the current leaves of `devices`, other
+devices of its own account, by value, and records `pending`. In a group that requires 0x800d it needs no admin and has
+`ordinary` branch priority. It is group-scoped, needs the `account_devices` capability, and sends the engine's
+same-account Remove intent.
 
 ## Deterministic expansion
 

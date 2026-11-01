@@ -101,6 +101,74 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: same-epoch invite commit race.
 - Expected: one invite branch wins branch selection, the other is parked off the canonical branch, and active clients converge on the same member set with a settled convergence decision recorded.
 
+### `account-devices-founding/v1`
+
+- File: `vectors/account-devices-founding.v1.json`
+- Setup: an explicit topology gives Bob two devices (`bob-phone`, `bob-laptop`) and Alice one, all supporting
+  `marmot.group.account-devices.v1` (0x800d). Alice creates the group with both of Bob's devices; nothing asks for
+  0x800d. Bob's laptop, which is not an admin, then removes his phone (`remove_own_account_devices`).
+- Pressure: the creator's rule that a new group requires 0x800d when every founding leaf supports it, the joiners'
+  acceptance of that state, and a same-account Commit in the first epoch after founding.
+- Expected: Alice and Bob's laptop reach the same exact state at epoch 2 with two leaves, a state that requires 0x800d
+  and satisfies its rules, and nothing is left pending.
+
+### `account-devices-activation/v1`
+
+- File: `vectors/account-devices-activation.v1.json`
+- Setup: an explicit topology gives Alice two devices (`alice-phone`, `alice-laptop`) and Bob one. Alice's devices
+  support `marmot.group.account-devices.v1` (0x800d) from the start and Bob's only after Alice's phone creates the
+  group, so the group does not require it. Bob gains support and self-updates, and Alice's phone sends the Commit that
+  makes the group require 0x800d.
+- Pressure: the activation Commit through the normal publication, transport and apply path, with two leaves of one
+  account in the group.
+- Expected: all three clients reach the same exact state at epoch 3, that state requires 0x800d and satisfies its
+  state rules, and nothing is left pending.
+
+### `account-devices-activation-needs-support/v1`
+
+- File: `vectors/account-devices-activation-needs-support.v1.json`
+- Setup: Alice and Bob support 0x800d and Carol doesn't. Alice's first activation attempt is refused. Carol then gains
+  support and self-updates, and Alice activates again.
+- Pressure: the rule that every leaf must advertise a required component, and the upgrade path through a leaf refresh.
+- Expected: the first attempt is refused before staging with `account_devices_activation_refused` and changes nothing;
+  after Carol's self-update the activation lands, and all three clients reach the same exact state at epoch 3, which
+  requires 0x800d and satisfies its rules.
+
+### `account-devices-activation-loses-to-unsupported-invite/v1`
+
+- File: `vectors/account-devices-activation-loses-to-unsupported-invite.v1.json`
+- Setup: Alice and Bob are both admins. Bob gains support for 0x800d after the group is created and self-updates, so
+  the group doesn't require it. From the same epoch, Alice activates 0x800d while Bob invites Carol, who doesn't
+  support it.
+- Pressure: activation racing a branch that adds a leaf that doesn't advertise the component. Both commits are
+  privileged, so the authenticated committer bytes decide the race; here Bob's invite wins.
+- Expected: Alice, Bob and Carol reach the same exact state at epoch 3 with three members, a state that doesn't require
+  0x800d; Alice and Bob record a settled `tip_committer` decision, Alice's losing activation leaves no pending work, and
+  a fresh activation attempt is refused while Carol lacks support.
+
+### `account-devices-activation-wins-over-unsupported-invite/v1`
+
+- File: `vectors/account-devices-activation-wins-over-unsupported-invite.v1.json`
+- Setup: the same race with the roles swapped: Bob activates 0x800d while Alice invites Carol.
+- Pressure: the same race, with the activation branch winning branch selection.
+- Expected: Alice and Bob reach the same exact state at epoch 3 with two members, a state that requires 0x800d and
+  satisfies its rules, with a settled `tip_committer` decision. Alice's losing invite is not retried and leaves no
+  pending work. As in `concurrent-invite-fork-recovery/v1`, Carol's Welcome belongs to the losing branch and Carol is
+  not run.
+
+### `account-devices-own-device-removal-loses-to-admin-remove/v1`
+
+- File: `vectors/account-devices-own-device-removal-loses-to-admin-remove.v1.json`
+- Setup: Alice's phone and laptop and Bob are in a group that requires 0x800d from its founding, with Alice an admin.
+  From the same parent, the phone removes Bob, a Commit that needs an admin, while the laptop removes the phone, a
+  same-account Commit (`remove_own_account_devices`).
+- Pressure: two devices of one account race. Both Commits share a committer, so only their priority classes separate
+  them: the Remove of Bob is `privileged` and the same-account Remove is `ordinary`, whoever commits it.
+- Expected: both of Alice's devices select the Remove of Bob with a settled `tip_priority` decision and reach the same
+  exact state at epoch 2 with two leaves, a state that requires 0x800d and satisfies its rules, and no pending work.
+  Bob is removed and not observed. A rule that gave the same-account Commit the admin class would leave the digest to
+  decide.
+
 ### `cross-route-own-commit-recovery/v1`
 
 - File: `vectors/cross-route-own-commit-recovery.v1.json`
@@ -595,6 +663,23 @@ These are real simulator scenarios that are still tied to Rust harness details.
   harness reports publication acceptance.
 - Reason: this is production-shaped Nostr-wrapper and multi-client coverage; the 250ms blocked-peeler timing boundary
   remains a deterministic engine integration test rather than a portable protocol assertion.
+
+### Asymmetric relay release (`tests/asymmetric_relay_release.rs`)
+
+- Setup: Carol is offline while Alice and Bob produce history. Relay A holds every event except a chosen set that only
+  relay B holds. Carol is released on A's coverage, ingesting A's events oldest first, and B's events arrive afterwards.
+- Pressure: B's late events are an older application message, an older sender generation, a run from one sender, a
+  commit A lacks, a rival commit at the same epoch, or the longer branch of a partition fork.
+- Expected: a late application message opens up to five epochs back and not six; a late sender message opens up to 99
+  generations behind that sender's last decrypted message and not 100; every A event behind a commit only B holds is
+  deferred and opens once the commit arrives (the test defers eight, marmot-app's stall-backfill threshold when written;
+  the app layer itself is not exercised); a late rival commit,
+  and a fork whose losing branch is five commits deep, are adjudicated as the online members did.
+- Sweeps: ignored tests walk each window and assert where it flips, including the sender ratchet's 1,000-generation
+  forward distance, the deferred-peel row cap (with `test-policy-overrides`), and chain recovery stranding events 32
+  epochs above a gap commit. Run them with
+  `cargo test -p cgka-conformance-simulator --features test-policy-overrides --test asymmetric_relay_release -- --ignored`.
+- Reason: these windows decide whether the recovery runner can release a held group on one relay's coverage (#2660).
 
 ## Generated Scenario Families
 
@@ -1147,7 +1232,8 @@ It records unsupported cases explicitly; it does not rewrite scenarios, remove a
 ## Byte Fixtures
 
 The `vectors/byte-fixtures/` files are conformance artifacts, but they are not simulator scenarios. They check byte
-encoding and validation for app-component data such as Nostr routing component state and updates.
+encoding and validation for app-component data such as Nostr routing component state and updates, and transport wire
+formats such as a gift-wrapped Welcome whose NIP-44 layers need the extended length prefix.
 
 Keep those in the vector manifest. Add them here only if they become runnable `ScenarioSpec` fixtures.
 

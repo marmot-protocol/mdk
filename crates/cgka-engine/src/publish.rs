@@ -6,9 +6,9 @@
 //!
 //! ### Confirm flow
 //! 1. Load `MlsGroup`. The pending commit is still attached.
-//! 2. If a pending commit exists: cache invitee capabilities from the
-//!    staged commit's `add_proposals`, then `merge_pending_commit`.
-//! 3. Refresh own-leaf capability cache + Marmot record (epoch + members
+//! 2. If a pending commit exists: check the profile of each leaf the staged
+//!    commit's `add_proposals` add, then `merge_pending_commit`.
+//! 3. Check the own leaf and refresh the Marmot record (epoch + members
 //!    + RequiredCapabilities derived from post-merge group context).
 //! 4. Hand off to `EpochManager::confirm_publish` for the state-machine
 //!    bookkeeping. Emit the event.
@@ -16,7 +16,7 @@
 //! ### Fail flow
 //! 1. Load `MlsGroup`. The pending commit is still attached.
 //! 2. If a pending commit exists: `clear_pending_commit` discards it.
-//! 3. Marmot record + capability cache: nothing to rewind, because the
+//! 3. Marmot record: nothing to rewind, because the
 //!    send paths defer all such writes to confirm.
 //! 4. Hand off to `EpochManager::rollback_publish` for the state-machine
 //!    bookkeeping.
@@ -119,8 +119,8 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         // One durable transaction for the plain-row writes this confirm performs
-        // — merge the staged commit, mirror the Marmot record, refresh the
-        // capability caches, and mark the origin commit `Processed`. If the
+        // — merge the staged commit, mirror the Marmot record, and mark the
+        // origin commit `Processed`. If the
         // backend is locked (`SQLITE_BUSY`) anywhere in here, the whole unit
         // rolls back and the typed transient error propagates *before* the
         // in-memory state-machine transition below. The pending entry is left
@@ -133,6 +133,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let mut own_commit_stamp = None;
+                let mut sibling_slots = Vec::new();
                 if has_pending_commit {
                     // `staged` borrows `mls_group`; scope it so the subsequent
                     // `merge_pending_commit` can take `&mut mls_group`.
@@ -140,15 +141,19 @@ impl<S: StorageProvider> Engine<S> {
                         let staged = mls_group
                             .pending_commit()
                             .expect("pending commit presence checked above");
-                        crate::capability_manager::cache_from_staged_commit(
+                        crate::capability_manager::check_added_leaf_profiles(
                             storage, &group_id, staged,
                         )?;
+                        if kind == crate::epoch_manager::PendingKind::GroupEvolution {
+                            sibling_slots = self.sibling_slots_added(storage, &group_id, staged);
+                        }
                         // Capture the convergence ordering stamp while the
                         // staged commit is still attached: stored convergence
                         // cannot re-derive priority or consumed proposal refs
                         // from the wire bytes later (MLS refuses to process
                         // own commits), so this is the only durable source.
                         own_commit_stamp = Some(crate::openmls_projection::own_commit_stamp(
+                            &mls_group,
                             staged,
                             self.identity.self_id().clone(),
                         )?);
@@ -194,6 +199,24 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
+                    crate::announced_key_packages::record_roster_announcements(
+                        storage,
+                        &group_id,
+                        &mls_group,
+                        self.wall_clock.now(),
+                    )?;
+                    // This device owes each sibling the Commit added the
+                    // group's history (mdk#2628 D76), recorded with the
+                    // membership that owes it.
+                    if !sibling_slots.is_empty()
+                        && let Some(sibling_adds) = storage.sibling_add_storage()
+                    {
+                        sibling_adds.record_sibling_adds(
+                            &group_id,
+                            &sibling_slots,
+                            self.wall_clock.now().0,
+                        )?;
+                    }
                     if let Some(stamp) = own_commit_stamp.as_mut() {
                         stamp.resulting_epoch_authenticator = Some(
                             crate::openmls_projection::own_commit_post_merge_epoch_authenticator(
@@ -219,9 +242,7 @@ impl<S: StorageProvider> Engine<S> {
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
                 storage.put_group(&g)?;
-                crate::capability_manager::cache_self_capabilities(
-                    storage,
-                    &group_id,
+                crate::capability_manager::check_own_leaf(
                     &mls_group,
                     self.identity.self_id(),
                     self.ciphersuite,

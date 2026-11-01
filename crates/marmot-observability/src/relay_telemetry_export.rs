@@ -1,0 +1,2969 @@
+//! Opt-in relay-telemetry exporter.
+//!
+//! This is the final stage of the export pipeline in
+//! `docs/marmot-architecture/relay-observability.md`: only when the user has
+//! opted in, it polls the relay-plane [`RelayTelemetryRollup`], resolves opaque
+//! relay indices to relay-URL labels at the export boundary, maps the result to
+//! a privacy-safe OTLP metric batch, and pushes it to a first-party
+//! Marmot-operated collector over TLS.
+//!
+//! ## Privacy contract, enforced structurally here
+//!
+//! - **Opt-in, off by default (req. 1).** [`RelayTelemetryExporter::new`]
+//!   is the single construction gate: it returns `None` unless export is
+//!   enabled and a full metrics URL, bearer token, and resource metadata are
+//!   configured. No exporter, no resolution, no push.
+//! - **Labels are structurally bounded.** The export batch is a flat list of
+//!   [`ExportMetricPoint`]s. Relay points can carry only `relay`; account
+//!   sync/catch-up and invite-acceptance failures carry only closed `failure_stage`
+//!   and `error_class` enums. There is deliberately no field for an
+//!   account, member, device, group, subscription, pubkey, message, event, or
+//!   IP value, so a forbidden label cannot be attached.
+//! - **Aggregate only (req. 4).** Point values are monotonic counters, gauges,
+//!   or fixed-bucket cumulative histograms — never per-event or per-timestamp
+//!   rows.
+//!
+//! The OTLP wire encoding and HTTP push live behind the `otlp-export` cargo
+//! feature so the heavy `opentelemetry-proto`/`prost` dependencies stay out of
+//! the default build. The privacy-critical mapping ([`build_export_batch`]) and
+//! the opt-in gate are in the default build and fully tested.
+
+use transport_nostr_adapter::{DurationHistogramSnapshot, RelayIndex, RelayLabelResolution};
+
+use crate::app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncFailureClassification,
+};
+use crate::export_config::RelayTelemetryExportConfig;
+use transport_nostr::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
+
+#[cfg(feature = "otlp-export")]
+use crate::app_telemetry::AppPerformanceTelemetry;
+#[cfg(feature = "otlp-export")]
+use rand::{RngCore, rngs::OsRng};
+#[cfg(feature = "otlp-export")]
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "otlp-export")]
+const EXPORT_MAX_ATTEMPTS: usize = 4;
+#[cfg(feature = "otlp-export")]
+const EXPORT_MAX_RETRY_BASE_DELAY_MS: u128 = 1_000;
+#[cfg(feature = "otlp-export")]
+const EXPORT_MIN_RETRY_BASE_DELAY_MS: u128 = 50;
+#[cfg(feature = "otlp-export")]
+const EXPORT_JITTER_MAX_MS: u128 = 10_000;
+
+/// Metric names, matching the catalogue in `relay-observability.md`.
+pub mod metric_names {
+    /// Per-relay first-event latency histogram.
+    pub const FIRST_EVENT_LATENCY: &str = "relay_first_event_latency_ms";
+    /// Per-relay EOSE latency histogram.
+    pub const EOSE_LATENCY: &str = "relay_eose_latency_ms";
+    /// Per-relay total delivered copies (monotonic).
+    pub const DELIVERY_COUNT: &str = "relay_delivery_count";
+    /// Per-relay corroborating (non-first) copies (monotonic).
+    pub const REDUNDANT_COUNT: &str = "relay_redundant_count";
+    /// Per-relay fraction of copies that arrived first (gauge).
+    pub const FIRST_DELIVERER_RATE: &str = "relay_first_deliverer_rate";
+    /// Population-level cross-relay arrival spread histogram (no relay label).
+    pub const CROSS_RELAY_SPREAD: &str = "cross_relay_spread_ms";
+    /// Device-wide relay connection attempts (monotonic).
+    pub const CONNECTION_ATTEMPTS: &str = "relay_connection_attempts";
+    /// Device-wide successful relay connections (monotonic).
+    pub const CONNECTION_SUCCESSES: &str = "relay_connection_successes";
+    /// Device-wide publish attempts (monotonic).
+    pub const PUBLISH_ATTEMPTS: &str = "relay_publish_attempts";
+    /// Device-wide accepted publishes (monotonic).
+    pub const PUBLISH_SUCCESSES: &str = "relay_publish_successes";
+    /// Device-wide failed publishes (monotonic).
+    pub const PUBLISH_FAILURES: &str = "relay_publish_failures";
+    /// Device-wide publishes dropped by their caller in flight (monotonic).
+    pub const PUBLISH_CANCELLATIONS: &str = "relay_publish_cancellations";
+    /// Device-wide NIP-77 reconciliation passes, inbox and group (monotonic).
+    pub const RECONCILIATION_ATTEMPTS: &str = "relay_reconciliation_attempts";
+    /// Device-wide group reconciliation passes that returned nothing because
+    /// no time order covered the missing history (monotonic).
+    pub const RECONCILIATION_ORDER_UNPROVEN_PASSES: &str =
+        "relay_reconciliation_order_unproven_passes";
+    /// Device-wide account activations whose every REQ reached every relay
+    /// (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_FULL: &str = "relay_account_activations_full";
+    /// Device-wide account activations that succeeded while some relay owed
+    /// or refused a REQ (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_DEGRADED: &str = "relay_account_activations_degraded";
+    /// Device-wide account activations that failed and rolled back (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_FAILED: &str = "relay_account_activations_failed";
+    /// Device-wide group syncs whose REQs all reached every relay (monotonic).
+    pub const GROUP_SYNCS_FULL: &str = "relay_group_syncs_full";
+    /// Device-wide group syncs that succeeded while some relay owed or refused
+    /// a REQ (monotonic).
+    pub const GROUP_SYNCS_DEGRADED: &str = "relay_group_syncs_degraded";
+    /// Device-wide group syncs whose REQs failed (monotonic).
+    pub const GROUP_SYNCS_FAILED: &str = "relay_group_syncs_failed";
+    /// Engine settle episodes (monotonic).
+    pub const SETTLES: &str = "relay_settles";
+    /// Engine post-settle reorgs (monotonic).
+    pub const POST_SETTLE_REORGS: &str = "relay_post_settle_reorgs";
+    /// Engine derived reorg rate (gauge).
+    pub const OBSERVED_REORG_RATE: &str = "relay_observed_reorg_rate";
+    /// Engine reorg-lateness histogram (ms).
+    pub const REORG_LATENESS: &str = "relay_reorg_lateness_ms";
+    /// Population-level distinct messages observed.
+    pub const MESSAGE_OBSERVED: &str = "message_observed";
+    /// Population-level messages corroborated by at least two relays.
+    pub const MESSAGE_CORROBORATED: &str = "message_corroborated";
+    /// Population-level messages seen on exactly one relay.
+    pub const MESSAGE_SINGLE_SOURCE: &str = "message_single_source";
+    /// App startup duration histogram.
+    pub const APP_START_DURATION: &str = "app_start_duration_ms";
+    /// App startup attempts.
+    pub const APP_START_ATTEMPTS: &str = "app_start_attempts";
+    /// Successful app startups.
+    pub const APP_START_SUCCESSES: &str = "app_start_successes";
+    /// Failed app startups.
+    pub const APP_START_FAILURES: &str = "app_start_failures";
+    /// Directory subscription sync duration histogram.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_DURATION: &str =
+        "app_directory_subscription_sync_duration_ms";
+    /// Directory subscription sync attempts.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_ATTEMPTS: &str =
+        "app_directory_subscription_sync_attempts";
+    /// Successful directory subscription syncs.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_SUCCESSES: &str =
+        "app_directory_subscription_sync_successes";
+    /// Failed directory subscription syncs.
+    pub const APP_DIRECTORY_SUBSCRIPTION_SYNC_FAILURES: &str =
+        "app_directory_subscription_sync_failures";
+    /// Account reconcile duration histogram.
+    pub const APP_ACCOUNT_RECONCILE_DURATION: &str = "app_account_reconcile_duration_ms";
+    /// Account reconcile attempts.
+    pub const APP_ACCOUNT_RECONCILE_ATTEMPTS: &str = "app_account_reconcile_attempts";
+    /// Successful account reconciles.
+    pub const APP_ACCOUNT_RECONCILE_SUCCESSES: &str = "app_account_reconcile_successes";
+    /// Failed account reconciles.
+    pub const APP_ACCOUNT_RECONCILE_FAILURES: &str = "app_account_reconcile_failures";
+    /// Per-account open duration histogram.
+    pub const APP_ACCOUNT_OPEN_DURATION: &str = "app_account_open_duration_ms";
+    /// Per-account open attempts.
+    pub const APP_ACCOUNT_OPEN_ATTEMPTS: &str = "app_account_open_attempts";
+    /// Successful account opens.
+    pub const APP_ACCOUNT_OPEN_SUCCESSES: &str = "app_account_open_successes";
+    /// Failed account opens.
+    pub const APP_ACCOUNT_OPEN_FAILURES: &str = "app_account_open_failures";
+    pub const APP_ACCOUNT_WORKER_READINESS_DURATION: &str =
+        "app_account_worker_readiness_duration_ms";
+    pub const APP_ACCOUNT_WORKER_READINESS_ATTEMPTS: &str = "app_account_worker_readiness_attempts";
+    pub const APP_ACCOUNT_WORKER_READINESS_SUCCESSES: &str =
+        "app_account_worker_readiness_successes";
+    pub const APP_ACCOUNT_WORKER_READINESS_FAILURES: &str = "app_account_worker_readiness_failures";
+    /// Engine session open (storage + engine build + hydration) duration histogram.
+    pub const APP_ACCOUNT_SESSION_OPEN_DURATION: &str = "app_account_session_open_duration_ms";
+    pub const APP_ACCOUNT_SESSION_OPEN_ATTEMPTS: &str = "app_account_session_open_attempts";
+    pub const APP_ACCOUNT_SESSION_OPEN_SUCCESSES: &str = "app_account_session_open_successes";
+    pub const APP_ACCOUNT_SESSION_OPEN_FAILURES: &str = "app_account_session_open_failures";
+    /// Stored-group hydration duration histogram (inside session open).
+    pub const APP_ACCOUNT_GROUP_HYDRATION_DURATION: &str =
+        "app_account_group_hydration_duration_ms";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_ATTEMPTS: &str = "app_account_group_hydration_attempts";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_SUCCESSES: &str = "app_account_group_hydration_successes";
+    pub const APP_ACCOUNT_GROUP_HYDRATION_FAILURES: &str = "app_account_group_hydration_failures";
+    /// Shared startup profile load duration histogram.
+    pub const APP_ACCOUNT_PROFILE_LOAD_DURATION: &str = "app_account_profile_load_duration_ms";
+    pub const APP_ACCOUNT_PROFILE_LOAD_ATTEMPTS: &str = "app_account_profile_load_attempts";
+    pub const APP_ACCOUNT_PROFILE_LOAD_SUCCESSES: &str = "app_account_profile_load_successes";
+    pub const APP_ACCOUNT_PROFILE_LOAD_FAILURES: &str = "app_account_profile_load_failures";
+    /// Startup group-read-snapshot capture duration histogram.
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_DURATION: &str =
+        "app_account_group_read_snapshot_duration_ms";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_ATTEMPTS: &str =
+        "app_account_group_read_snapshot_attempts";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_SUCCESSES: &str =
+        "app_account_group_read_snapshot_successes";
+    pub const APP_ACCOUNT_GROUP_READ_SNAPSHOT_FAILURES: &str =
+        "app_account_group_read_snapshot_failures";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION: &str =
+        "app_account_transport_activation_duration_ms";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS: &str =
+        "app_account_transport_activation_attempts";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES: &str =
+        "app_account_transport_activation_successes";
+    pub const APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES: &str =
+        "app_account_transport_activation_failures";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION: &str =
+        "app_account_subscription_registration_duration_ms";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS: &str =
+        "app_account_subscription_registration_attempts";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES: &str =
+        "app_account_subscription_registration_successes";
+    pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES: &str =
+        "app_account_subscription_registration_failures";
+    /// Multi-account catch-up duration histogram.
+    pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
+    /// Multi-account catch-up attempts.
+    pub const APP_ACCOUNT_CATCH_UP_ATTEMPTS: &str = "app_account_catch_up_attempts";
+    /// Successful multi-account catch-ups.
+    pub const APP_ACCOUNT_CATCH_UP_SUCCESSES: &str = "app_account_catch_up_successes";
+    /// Failed multi-account catch-ups.
+    pub const APP_ACCOUNT_CATCH_UP_FAILURES: &str = "app_account_catch_up_failures";
+    /// Per-account sync duration histogram.
+    pub const APP_ACCOUNT_SYNC_DURATION: &str = "app_account_sync_duration_ms";
+    /// Per-account sync attempts.
+    pub const APP_ACCOUNT_SYNC_ATTEMPTS: &str = "app_account_sync_attempts";
+    /// Successful per-account syncs.
+    pub const APP_ACCOUNT_SYNC_SUCCESSES: &str = "app_account_sync_successes";
+    /// Failed per-account syncs.
+    pub const APP_ACCOUNT_SYNC_FAILURES: &str = "app_account_sync_failures";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_DURATION: &str =
+        "app_account_setup_advisory_step_duration_ms";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_ATTEMPTS: &str =
+        "app_account_setup_advisory_step_attempts";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_SUCCESSES: &str =
+        "app_account_setup_advisory_step_successes";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES: &str =
+        "app_account_setup_advisory_step_failures";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_DURATION: &str =
+        "app_account_bootstrap_relay_and_follow_publish_duration_ms";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_ATTEMPTS: &str =
+        "app_account_bootstrap_relay_and_follow_publish_attempts";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_SUCCESSES: &str =
+        "app_account_bootstrap_relay_and_follow_publish_successes";
+    pub const APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_FAILURES: &str =
+        "app_account_bootstrap_relay_and_follow_publish_failures";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_DURATION: &str =
+        "app_account_default_profile_publish_duration_ms";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_ATTEMPTS: &str =
+        "app_account_default_profile_publish_attempts";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_SUCCESSES: &str =
+        "app_account_default_profile_publish_successes";
+    pub const APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_FAILURES: &str =
+        "app_account_default_profile_publish_failures";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_DURATION: &str =
+        "app_account_initial_key_package_publish_duration_ms";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_ATTEMPTS: &str =
+        "app_account_initial_key_package_publish_attempts";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_SUCCESSES: &str =
+        "app_account_initial_key_package_publish_successes";
+    pub const APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_FAILURES: &str =
+        "app_account_initial_key_package_publish_failures";
+    /// Overlap between initial KeyPackage publication and initial sync. The
+    /// setup-priority path emits a successful zero-duration sample to state
+    /// that publication completed before sync began.
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_DURATION: &str =
+        "app_account_initial_sync_overlap_duration_ms";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS: &str =
+        "app_account_initial_sync_overlap_attempts";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_SUCCESSES: &str =
+        "app_account_initial_sync_overlap_successes";
+    pub const APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES: &str =
+        "app_account_initial_sync_overlap_failures";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_DURATION: &str =
+        "app_account_setup_identity_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_identity_local_attempts";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_SUCCESSES: &str =
+        "app_account_setup_identity_local_successes";
+    pub const APP_ACCOUNT_SETUP_IDENTITY_LOCAL_FAILURES: &str =
+        "app_account_setup_identity_local_failures";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_DURATION: &str =
+        "app_account_setup_storage_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_storage_local_attempts";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_storage_local_successes";
+    pub const APP_ACCOUNT_SETUP_STORAGE_LOCAL_FAILURES: &str =
+        "app_account_setup_storage_local_failures";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_DURATION: &str =
+        "app_account_setup_profile_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_profile_local_attempts";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_profile_local_successes";
+    pub const APP_ACCOUNT_SETUP_PROFILE_LOCAL_FAILURES: &str =
+        "app_account_setup_profile_local_failures";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_DURATION: &str =
+        "app_account_setup_key_package_local_duration_ms";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_ATTEMPTS: &str =
+        "app_account_setup_key_package_local_attempts";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_SUCCESSES: &str =
+        "app_account_setup_key_package_local_successes";
+    pub const APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_FAILURES: &str =
+        "app_account_setup_key_package_local_failures";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_DURATION: &str =
+        "app_account_setup_local_ready_handoff_duration_ms";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_ATTEMPTS: &str =
+        "app_account_setup_local_ready_handoff_attempts";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_SUCCESSES: &str =
+        "app_account_setup_local_ready_handoff_successes";
+    pub const APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_FAILURES: &str =
+        "app_account_setup_local_ready_handoff_failures";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_DURATION: &str =
+        "app_account_setup_network_ready_duration_ms";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_ATTEMPTS: &str =
+        "app_account_setup_network_ready_attempts";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_SUCCESSES: &str =
+        "app_account_setup_network_ready_successes";
+    pub const APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES: &str =
+        "app_account_setup_network_ready_failures";
+    /// Interrupted-migration recovery probes executed (each is one full keyed
+    /// raw-key SQLCipher open, mdk#1439).
+    pub const APP_SQLCIPHER_MIGRATION_PROBE_RUNS: &str = "app_sqlcipher_migration_probe_runs";
+    /// Existing-database opens that skipped the recovery probe via a cached
+    /// v2-open verdict (each avoided one extra raw-key open, mdk#1439).
+    pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
+    /// Send command admission and worker queue wait.
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION: &str =
+        "app_outbound_message_queue_wait_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_outbound_message_queue_wait_attempts";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES: &str =
+        "app_outbound_message_queue_wait_successes";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES: &str =
+        "app_outbound_message_queue_wait_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION: &str =
+        "app_outbound_message_local_projection_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS: &str =
+        "app_outbound_message_local_projection_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES: &str =
+        "app_outbound_message_local_projection_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES: &str =
+        "app_outbound_message_local_projection_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION: &str =
+        "app_outbound_message_local_accept_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS: &str =
+        "app_outbound_message_local_accept_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES: &str =
+        "app_outbound_message_local_accept_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES: &str =
+        "app_outbound_message_local_accept_failures";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_DURATION: &str =
+        "app_outbound_message_publish_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS: &str = "app_outbound_message_publish_attempts";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES: &str =
+        "app_outbound_message_publish_successes";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES: &str = "app_outbound_message_publish_failures";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_DURATION: &str =
+        "app_outbound_message_response_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS: &str =
+        "app_outbound_message_response_attempts";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES: &str =
+        "app_outbound_message_response_successes";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES: &str =
+        "app_outbound_message_response_failures";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_outbound_message_visible_duration_ms";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_outbound_message_visible_attempts";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_outbound_message_visible_successes";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_outbound_message_visible_failures";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_inbound_message_visible_duration_ms";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_inbound_message_visible_attempts";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_inbound_message_visible_successes";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_inbound_message_visible_failures";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_DURATION: &str =
+        "app_inbound_delivery_projection_duration_ms";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS: &str =
+        "app_inbound_delivery_projection_attempts";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES: &str =
+        "app_inbound_delivery_projection_successes";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_FAILURES: &str =
+        "app_inbound_delivery_projection_failures";
+    /// One-sided outbound message send duration histogram.
+    pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
+    /// One-sided outbound message send attempts.
+    pub const APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS: &str = "app_outbound_message_send_attempts";
+    /// Successful one-sided outbound message sends.
+    pub const APP_OUTBOUND_MESSAGE_SEND_SUCCESSES: &str = "app_outbound_message_send_successes";
+    /// Failed one-sided outbound message sends.
+    pub const APP_OUTBOUND_MESSAGE_SEND_FAILURES: &str = "app_outbound_message_send_failures";
+    /// Group-create queue wait metrics.
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_DURATION: &str =
+        "app_group_create_queue_wait_duration_ms";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_ATTEMPTS: &str = "app_group_create_queue_wait_attempts";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_SUCCESSES: &str = "app_group_create_queue_wait_successes";
+    pub const APP_GROUP_CREATE_QUEUE_WAIT_FAILURES: &str = "app_group_create_queue_wait_failures";
+    /// Group-create KeyPackage lookup metrics.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION: &str =
+        "app_group_create_key_package_lookup_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS: &str =
+        "app_group_create_key_package_lookup_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES: &str =
+        "app_group_create_key_package_lookup_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES: &str =
+        "app_group_create_key_package_lookup_failures";
+    /// Composition-time member KeyPackage prewarm metrics.
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_DURATION: &str =
+        "app_group_member_key_package_prewarm_duration_ms";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_ATTEMPTS: &str =
+        "app_group_member_key_package_prewarm_attempts";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_SUCCESSES: &str =
+        "app_group_member_key_package_prewarm_successes";
+    pub const APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_FAILURES: &str =
+        "app_group_member_key_package_prewarm_failures";
+    /// Cache-only create-time KeyPackage validation/reuse metrics.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_DURATION: &str =
+        "app_group_create_key_package_cache_reuse_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_ATTEMPTS: &str =
+        "app_group_create_key_package_cache_reuse_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_SUCCESSES: &str =
+        "app_group_create_key_package_cache_reuse_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_FAILURES: &str =
+        "app_group_create_key_package_cache_reuse_failures";
+    /// Create-time KeyPackage resolution that required relay work.
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_DURATION: &str =
+        "app_group_create_key_package_network_resolution_duration_ms";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_ATTEMPTS: &str =
+        "app_group_create_key_package_network_resolution_attempts";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_SUCCESSES: &str =
+        "app_group_create_key_package_network_resolution_successes";
+    pub const APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES: &str =
+        "app_group_create_key_package_network_resolution_failures";
+    /// Group-create image validation/encryption/staging metrics.
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_DURATION: &str =
+        "app_group_create_image_preprocess_duration_ms";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_ATTEMPTS: &str =
+        "app_group_create_image_preprocess_attempts";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_SUCCESSES: &str =
+        "app_group_create_image_preprocess_successes";
+    pub const APP_GROUP_CREATE_IMAGE_PREPROCESS_FAILURES: &str =
+        "app_group_create_image_preprocess_failures";
+    /// Group-create image upload metrics.
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION: &str =
+        "app_group_create_image_upload_duration_ms";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_ATTEMPTS: &str =
+        "app_group_create_image_upload_attempts";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_SUCCESSES: &str =
+        "app_group_create_image_upload_successes";
+    pub const APP_GROUP_CREATE_IMAGE_UPLOAD_FAILURES: &str =
+        "app_group_create_image_upload_failures";
+    /// Group-create MLS prepare/persist metrics.
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION: &str =
+        "app_group_create_mls_prepare_persist_duration_ms";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_ATTEMPTS: &str =
+        "app_group_create_mls_prepare_persist_attempts";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_SUCCESSES: &str =
+        "app_group_create_mls_prepare_persist_successes";
+    pub const APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES: &str =
+        "app_group_create_mls_prepare_persist_failures";
+    /// Group-create derived pending-Welcome index preparation metrics.
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_DURATION: &str =
+        "app_group_create_pending_welcome_index_duration_ms";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_ATTEMPTS: &str =
+        "app_group_create_pending_welcome_index_attempts";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_SUCCESSES: &str =
+        "app_group_create_pending_welcome_index_successes";
+    pub const APP_GROUP_CREATE_PENDING_WELCOME_INDEX_FAILURES: &str =
+        "app_group_create_pending_welcome_index_failures";
+    /// Group-create Welcome publish metrics.
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION: &str =
+        "app_group_create_welcome_publish_duration_ms";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS: &str =
+        "app_group_create_welcome_publish_attempts";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_SUCCESSES: &str =
+        "app_group_create_welcome_publish_successes";
+    pub const APP_GROUP_CREATE_WELCOME_PUBLISH_FAILURES: &str =
+        "app_group_create_welcome_publish_failures";
+    /// Group-create local projection save metrics.
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION: &str =
+        "app_group_create_local_projection_save_duration_ms";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS: &str =
+        "app_group_create_local_projection_save_attempts";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES: &str =
+        "app_group_create_local_projection_save_successes";
+    pub const APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES: &str =
+        "app_group_create_local_projection_save_failures";
+    /// Group-create worker response conversion/event handoff metrics.
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_DURATION: &str =
+        "app_group_create_response_handoff_duration_ms";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_ATTEMPTS: &str =
+        "app_group_create_response_handoff_attempts";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_SUCCESSES: &str =
+        "app_group_create_response_handoff_successes";
+    pub const APP_GROUP_CREATE_RESPONSE_HANDOFF_FAILURES: &str =
+        "app_group_create_response_handoff_failures";
+    /// Group-create subscription refresh metrics.
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION: &str =
+        "app_group_create_subscription_refresh_duration_ms";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_ATTEMPTS: &str =
+        "app_group_create_subscription_refresh_attempts";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_SUCCESSES: &str =
+        "app_group_create_subscription_refresh_successes";
+    pub const APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_FAILURES: &str =
+        "app_group_create_subscription_refresh_failures";
+    /// Group-create post-mutation catch-up metrics.
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION: &str =
+        "app_group_create_post_mutation_catch_up_duration_ms";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_ATTEMPTS: &str =
+        "app_group_create_post_mutation_catch_up_attempts";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_SUCCESSES: &str =
+        "app_group_create_post_mutation_catch_up_successes";
+    pub const APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_FAILURES: &str =
+        "app_group_create_post_mutation_catch_up_failures";
+    /// End-to-end group-create caller latency metrics.
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION: &str =
+        "app_group_create_total_caller_latency_duration_ms";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_ATTEMPTS: &str =
+        "app_group_create_total_caller_latency_attempts";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_SUCCESSES: &str =
+        "app_group_create_total_caller_latency_successes";
+    pub const APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_FAILURES: &str =
+        "app_group_create_total_caller_latency_failures";
+    /// Group invite-member runtime duration histogram.
+    pub const APP_GROUP_INVITE_MEMBERS_DURATION: &str = "app_group_invite_members_duration_ms";
+    /// Group invite-member attempts.
+    pub const APP_GROUP_INVITE_MEMBERS_ATTEMPTS: &str = "app_group_invite_members_attempts";
+    /// Successful group invite-member operations.
+    pub const APP_GROUP_INVITE_MEMBERS_SUCCESSES: &str = "app_group_invite_members_successes";
+    /// Failed group invite-member operations.
+    pub const APP_GROUP_INVITE_MEMBERS_FAILURES: &str = "app_group_invite_members_failures";
+    /// Group invite KeyPackage lookup duration histogram.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_DURATION: &str =
+        "app_group_invite_key_package_lookup_duration_ms";
+    /// Group invite KeyPackage lookup attempts.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_ATTEMPTS: &str =
+        "app_group_invite_key_package_lookup_attempts";
+    /// Successful group invite KeyPackage lookups.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_SUCCESSES: &str =
+        "app_group_invite_key_package_lookup_successes";
+    /// Failed group invite KeyPackage lookups.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_FAILURES: &str =
+        "app_group_invite_key_package_lookup_failures";
+    /// Group invite routing refresh duration histogram.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_DURATION: &str =
+        "app_group_invite_routing_refresh_duration_ms";
+    /// Group invite routing refresh attempts.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_ATTEMPTS: &str =
+        "app_group_invite_routing_refresh_attempts";
+    /// Successful group invite routing refreshes.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_SUCCESSES: &str =
+        "app_group_invite_routing_refresh_successes";
+    /// Failed group invite routing refreshes.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_FAILURES: &str =
+        "app_group_invite_routing_refresh_failures";
+    /// Group invite pre-send sync duration histogram.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_DURATION: &str =
+        "app_group_invite_pre_send_sync_duration_ms";
+    /// Group invite pre-send sync attempts.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_ATTEMPTS: &str =
+        "app_group_invite_pre_send_sync_attempts";
+    /// Successful group invite pre-send syncs.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_SUCCESSES: &str =
+        "app_group_invite_pre_send_sync_successes";
+    /// Failed group invite pre-send syncs.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_FAILURES: &str =
+        "app_group_invite_pre_send_sync_failures";
+    /// Group invite engine send/publish duration histogram.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_DURATION: &str =
+        "app_group_invite_engine_publish_duration_ms";
+    /// Group invite engine send/publish attempts.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS: &str =
+        "app_group_invite_engine_publish_attempts";
+    /// Successful group invite engine send/publish operations.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_SUCCESSES: &str =
+        "app_group_invite_engine_publish_successes";
+    /// Failed group invite engine send/publish operations.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_FAILURES: &str =
+        "app_group_invite_engine_publish_failures";
+    /// Group invite local refresh duration histogram.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_DURATION: &str =
+        "app_group_invite_local_refresh_duration_ms";
+    /// Group invite local refresh attempts.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_ATTEMPTS: &str =
+        "app_group_invite_local_refresh_attempts";
+    /// Successful group invite local refreshes.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_SUCCESSES: &str =
+        "app_group_invite_local_refresh_successes";
+    /// Failed group invite local refreshes.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_FAILURES: &str =
+        "app_group_invite_local_refresh_failures";
+    /// Group invite notification trigger duration histogram.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_DURATION: &str =
+        "app_group_invite_notification_trigger_duration_ms";
+    /// Group invite notification trigger attempts.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_ATTEMPTS: &str =
+        "app_group_invite_notification_trigger_attempts";
+    /// Successful group invite notification triggers.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_SUCCESSES: &str =
+        "app_group_invite_notification_trigger_successes";
+    /// Failed group invite notification triggers.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES: &str =
+        "app_group_invite_notification_trigger_failures";
+    /// Group invite Welcome fanout duration histogram.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_DURATION: &str =
+        "app_group_invite_welcome_publish_duration_ms";
+    /// Group invite Welcome fanout attempts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_ATTEMPTS: &str =
+        "app_group_invite_welcome_publish_attempts";
+    /// Successful group invite Welcome fanouts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_SUCCESSES: &str =
+        "app_group_invite_welcome_publish_successes";
+    /// Failed group invite Welcome fanouts.
+    pub const APP_GROUP_INVITE_WELCOME_PUBLISH_FAILURES: &str =
+        "app_group_invite_welcome_publish_failures";
+    /// Group invite post-mutation catch-up duration histogram.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_DURATION: &str =
+        "app_group_invite_post_mutation_catch_up_duration_ms";
+    /// Group invite post-mutation catch-up attempts.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_ATTEMPTS: &str =
+        "app_group_invite_post_mutation_catch_up_attempts";
+    /// Successful group invite post-mutation catch-ups.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_SUCCESSES: &str =
+        "app_group_invite_post_mutation_catch_up_successes";
+    /// Failed group invite post-mutation catch-ups.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_FAILURES: &str =
+        "app_group_invite_post_mutation_catch_up_failures";
+    /// Group promote-admin runtime duration histogram.
+    pub const APP_GROUP_PROMOTE_ADMIN_DURATION: &str = "app_group_promote_admin_duration_ms";
+    /// Group promote-admin attempts.
+    pub const APP_GROUP_PROMOTE_ADMIN_ATTEMPTS: &str = "app_group_promote_admin_attempts";
+    /// Successful group promote-admin operations.
+    pub const APP_GROUP_PROMOTE_ADMIN_SUCCESSES: &str = "app_group_promote_admin_successes";
+    /// Failed group promote-admin operations.
+    pub const APP_GROUP_PROMOTE_ADMIN_FAILURES: &str = "app_group_promote_admin_failures";
+    /// Group details read duration histogram.
+    pub const APP_GROUP_DETAILS_READ_DURATION: &str = "app_group_details_read_duration_ms";
+    /// Group details read attempts.
+    pub const APP_GROUP_DETAILS_READ_ATTEMPTS: &str = "app_group_details_read_attempts";
+    /// Successful group details reads.
+    pub const APP_GROUP_DETAILS_READ_SUCCESSES: &str = "app_group_details_read_successes";
+    /// Failed group details reads.
+    pub const APP_GROUP_DETAILS_READ_FAILURES: &str = "app_group_details_read_failures";
+    /// Combined conversation snapshot read duration histogram.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_DURATION: &str =
+        "app_group_conversation_snapshot_read_duration_ms";
+    /// Combined conversation snapshot read attempts.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS: &str =
+        "app_group_conversation_snapshot_read_attempts";
+    /// Successful combined conversation snapshot reads.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_SUCCESSES: &str =
+        "app_group_conversation_snapshot_read_successes";
+    /// Failed combined conversation snapshot reads.
+    pub const APP_GROUP_CONVERSATION_SNAPSHOT_READ_FAILURES: &str =
+        "app_group_conversation_snapshot_read_failures";
+    /// Single chat-list row read duration histogram.
+    pub const APP_CHAT_LIST_ROW_READ_DURATION: &str = "app_chat_list_row_read_duration_ms";
+    /// Single chat-list row read attempts.
+    pub const APP_CHAT_LIST_ROW_READ_ATTEMPTS: &str = "app_chat_list_row_read_attempts";
+    /// Successful single chat-list row reads.
+    pub const APP_CHAT_LIST_ROW_READ_SUCCESSES: &str = "app_chat_list_row_read_successes";
+    /// Failed single chat-list row reads.
+    pub const APP_CHAT_LIST_ROW_READ_FAILURES: &str = "app_chat_list_row_read_failures";
+    /// Existing direct-conversation lookup duration histogram.
+    pub const APP_EXISTING_DIRECT_CONVERSATION_READ_DURATION: &str =
+        "app_existing_direct_conversation_read_duration_ms";
+    /// Existing direct-conversation lookup attempts.
+    pub const APP_EXISTING_DIRECT_CONVERSATION_READ_ATTEMPTS: &str =
+        "app_existing_direct_conversation_read_attempts";
+    /// Successful existing direct-conversation lookups.
+    pub const APP_EXISTING_DIRECT_CONVERSATION_READ_SUCCESSES: &str =
+        "app_existing_direct_conversation_read_successes";
+    /// Failed existing direct-conversation lookups.
+    pub const APP_EXISTING_DIRECT_CONVERSATION_READ_FAILURES: &str =
+        "app_existing_direct_conversation_read_failures";
+    /// Group MLS state read duration histogram.
+    pub const APP_GROUP_MLS_STATE_READ_DURATION: &str = "app_group_mls_state_read_duration_ms";
+    /// Group MLS state read attempts.
+    pub const APP_GROUP_MLS_STATE_READ_ATTEMPTS: &str = "app_group_mls_state_read_attempts";
+    /// Successful group MLS state reads.
+    pub const APP_GROUP_MLS_STATE_READ_SUCCESSES: &str = "app_group_mls_state_read_successes";
+    /// Failed group MLS state reads.
+    pub const APP_GROUP_MLS_STATE_READ_FAILURES: &str = "app_group_mls_state_read_failures";
+    /// Group roster read duration histogram.
+    pub const APP_GROUP_ROSTER_READ_DURATION: &str = "app_group_roster_read_duration_ms";
+    /// Group roster read attempts.
+    pub const APP_GROUP_ROSTER_READ_ATTEMPTS: &str = "app_group_roster_read_attempts";
+    /// Successful group roster reads.
+    pub const APP_GROUP_ROSTER_READ_SUCCESSES: &str = "app_group_roster_read_successes";
+    /// Failed group roster reads.
+    pub const APP_GROUP_ROSTER_READ_FAILURES: &str = "app_group_roster_read_failures";
+    /// Group invite accept duration histogram (caller-visible accept latency).
+    pub const APP_GROUP_ACCEPT_INVITE_DURATION: &str = "app_group_accept_invite_duration_ms";
+    /// Group invite accept attempts.
+    pub const APP_GROUP_ACCEPT_INVITE_ATTEMPTS: &str = "app_group_accept_invite_attempts";
+    /// Successful group invite accepts.
+    pub const APP_GROUP_ACCEPT_INVITE_SUCCESSES: &str = "app_group_accept_invite_successes";
+    /// Failed group invite accepts.
+    pub const APP_GROUP_ACCEPT_INVITE_FAILURES: &str = "app_group_accept_invite_failures";
+    /// Media upload duration histogram.
+    pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
+    /// Media upload attempts.
+    pub const APP_MEDIA_UPLOAD_ATTEMPTS: &str = "app_media_upload_attempts";
+    /// Successful media uploads.
+    pub const APP_MEDIA_UPLOAD_SUCCESSES: &str = "app_media_upload_successes";
+    /// Failed media uploads.
+    pub const APP_MEDIA_UPLOAD_FAILURES: &str = "app_media_upload_failures";
+    /// Media download duration histogram.
+    pub const APP_MEDIA_DOWNLOAD_DURATION: &str = "app_media_download_duration_ms";
+    /// Media download attempts.
+    pub const APP_MEDIA_DOWNLOAD_ATTEMPTS: &str = "app_media_download_attempts";
+    /// Successful media downloads.
+    pub const APP_MEDIA_DOWNLOAD_SUCCESSES: &str = "app_media_download_successes";
+    /// Failed media downloads.
+    pub const APP_MEDIA_DOWNLOAD_FAILURES: &str = "app_media_download_failures";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION: &str =
+        "app_media_download_queue_wait_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_media_download_queue_wait_attempts";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES: &str =
+        "app_media_download_queue_wait_successes";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES: &str =
+        "app_media_download_queue_wait_failures";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_DURATION: &str =
+        "app_media_download_preparation_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS: &str =
+        "app_media_download_preparation_attempts";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES: &str =
+        "app_media_download_preparation_successes";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES: &str =
+        "app_media_download_preparation_failures";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION: &str =
+        "app_media_download_host_setup_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS: &str =
+        "app_media_download_host_setup_attempts";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES: &str =
+        "app_media_download_host_setup_successes";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES: &str =
+        "app_media_download_host_setup_failures";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION: &str =
+        "app_media_download_response_headers_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS: &str =
+        "app_media_download_response_headers_attempts";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES: &str =
+        "app_media_download_response_headers_successes";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES: &str =
+        "app_media_download_response_headers_failures";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION: &str =
+        "app_media_download_first_byte_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS: &str =
+        "app_media_download_first_byte_attempts";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES: &str =
+        "app_media_download_first_byte_successes";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES: &str =
+        "app_media_download_first_byte_failures";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION: &str =
+        "app_media_download_body_transfer_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS: &str =
+        "app_media_download_body_transfer_attempts";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES: &str =
+        "app_media_download_body_transfer_successes";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES: &str =
+        "app_media_download_body_transfer_failures";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION: &str =
+        "app_media_download_locator_failover_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS: &str =
+        "app_media_download_locator_failover_attempts";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES: &str =
+        "app_media_download_locator_failover_successes";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES: &str =
+        "app_media_download_locator_failover_failures";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION: &str =
+        "app_media_download_ciphertext_verify_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS: &str =
+        "app_media_download_ciphertext_verify_attempts";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES: &str =
+        "app_media_download_ciphertext_verify_successes";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES: &str =
+        "app_media_download_ciphertext_verify_failures";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_DURATION: &str = "app_media_download_decrypt_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS: &str = "app_media_download_decrypt_attempts";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES: &str = "app_media_download_decrypt_successes";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES: &str = "app_media_download_decrypt_failures";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION: &str =
+        "app_media_download_plaintext_verify_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS: &str =
+        "app_media_download_plaintext_verify_attempts";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES: &str =
+        "app_media_download_plaintext_verify_successes";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES: &str =
+        "app_media_download_plaintext_verify_failures";
+    pub const APP_HOST_SPLASH_READY_DURATION: &str = "app_host_splash_ready_duration_ms";
+    pub const APP_HOST_SPLASH_READY_ATTEMPTS: &str = "app_host_splash_ready_attempts";
+    pub const APP_HOST_SPLASH_READY_SUCCESSES: &str = "app_host_splash_ready_successes";
+    pub const APP_HOST_SPLASH_READY_FAILURES: &str = "app_host_splash_ready_failures";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_DURATION: &str =
+        "app_host_foreground_local_ready_duration_ms";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS: &str =
+        "app_host_foreground_local_ready_attempts";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES: &str =
+        "app_host_foreground_local_ready_successes";
+    pub const APP_HOST_FOREGROUND_LOCAL_READY_FAILURES: &str =
+        "app_host_foreground_local_ready_failures";
+}
+
+/// A fixed-bucket cumulative histogram in the export batch.
+///
+/// Mirrors the device-local [`DurationHistogramSnapshot`] bucket edges, which
+/// the exporter forwards unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExportHistogram {
+    /// Inclusive upper bounds of each bucket, ascending (milliseconds).
+    pub bounds_ms: Vec<u64>,
+    /// Count per bucket; same length as `bounds_ms`.
+    pub bucket_counts: Vec<u64>,
+    /// Samples above the largest bound.
+    pub overflow_count: u64,
+    /// Saturating sum of all observed durations, in milliseconds.
+    pub sum_ms: u64,
+}
+
+impl ExportHistogram {
+    fn from_snapshot(snapshot: &DurationHistogramSnapshot) -> Self {
+        Self {
+            bounds_ms: snapshot
+                .buckets
+                .iter()
+                .map(|bucket| bucket.upper_bound_ms)
+                .collect(),
+            bucket_counts: snapshot.buckets.iter().map(|bucket| bucket.count).collect(),
+            overflow_count: snapshot.overflow_count,
+            sum_ms: snapshot.sum_ms,
+        }
+    }
+
+    /// Total samples across all buckets and the overflow.
+    pub fn total(&self) -> u64 {
+        self.bucket_counts.iter().sum::<u64>() + self.overflow_count
+    }
+}
+
+/// The value of one export metric point.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportMetricValue {
+    /// Monotonic, cumulative-since-process-start counter.
+    Counter(u64),
+    /// Point-in-time ratio or rate.
+    Gauge(f64),
+    /// Cumulative fixed-bucket histogram.
+    Histogram(ExportHistogram),
+}
+
+/// One exported metric point.
+///
+/// The `relay` field is the **only** label any export point may carry. There is
+/// deliberately no field for any client-, account-, group-, or
+/// subscription-derived value, so the "relay identity is the sole label" rule of
+/// the privacy contract is structural, not conventional.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportMetricPoint {
+    /// Metric name from [`metric_names`].
+    pub name: &'static str,
+    /// Relay-identity label (a relay URL), or `None` for population-level and
+    /// classified app failure metrics.
+    pub relay: Option<String>,
+    /// Closed sync/catch-up failure attributes, or `None` for every other
+    /// metric point.
+    pub failure: Option<SyncFailureClassification>,
+    /// The aggregate value.
+    pub value: ExportMetricValue,
+}
+
+/// A privacy-safe batch of export metric points, ready for OTLP encoding.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RelayTelemetryExportBatch {
+    /// Flat list of metric points.
+    pub points: Vec<ExportMetricPoint>,
+}
+
+impl RelayTelemetryExportBatch {
+    /// Number of metric points in the batch.
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Whether the batch carries no points.
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Distinct relay labels present in the batch (for inspection and tests).
+    pub fn relay_labels(&self) -> Vec<&str> {
+        let mut labels: Vec<&str> = self
+            .points
+            .iter()
+            .filter_map(|point| point.relay.as_deref())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        labels
+    }
+}
+
+#[cfg(feature = "otlp-export")]
+fn duration_from_millis_u128(millis: u128) -> Duration {
+    Duration::from_millis(millis.min(u64::MAX as u128) as u64)
+}
+
+#[cfg(feature = "otlp-export")]
+fn retry_delay(interval: Duration, retry_index: usize) -> Duration {
+    let base_ms = (interval.as_millis() / 10).clamp(
+        EXPORT_MIN_RETRY_BASE_DELAY_MS,
+        EXPORT_MAX_RETRY_BASE_DELAY_MS,
+    );
+    duration_from_millis_u128(base_ms.saturating_mul(1_u128 << retry_index.min(10)))
+}
+
+#[cfg(feature = "otlp-export")]
+fn jittered_export_interval(interval: Duration) -> Duration {
+    let interval_ms = interval.as_millis();
+    let max_jitter_ms = (interval_ms / 2).min(EXPORT_JITTER_MAX_MS);
+    if max_jitter_ms == 0 {
+        return interval;
+    }
+    let offset_ms = (OsRng.next_u64() as u128) % (max_jitter_ms * 2 + 1);
+    if offset_ms <= max_jitter_ms {
+        duration_from_millis_u128(interval_ms.saturating_sub(max_jitter_ms - offset_ms))
+    } else {
+        duration_from_millis_u128(interval_ms.saturating_add(offset_ms - max_jitter_ms))
+    }
+}
+
+/// Map a rollup plus resolved relay labels into the privacy-safe export batch.
+///
+/// Per-relay points are emitted only for relays whose opaque index resolves to
+/// a relay URL; an unresolved index is skipped rather than exported with an
+/// opaque or empty label, so nothing but a real relay identity ever appears.
+/// Population-level points carry no label.
+pub fn build_export_batch(
+    rollup: &RelayTelemetryRollup,
+    resolution: &RelayLabelResolution,
+) -> RelayTelemetryExportBatch {
+    let mut points = Vec::new();
+
+    for entry in &rollup.relays {
+        let Some(label) = resolution.label_for(RelayIndex(entry.relay_index)) else {
+            continue;
+        };
+        let relay = label.as_str().to_owned();
+        points.push(ExportMetricPoint {
+            name: metric_names::FIRST_EVENT_LATENCY,
+            relay: Some(relay.clone()),
+            failure: None,
+            value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+                &entry.first_event_latency,
+            )),
+        });
+        points.push(ExportMetricPoint {
+            name: metric_names::EOSE_LATENCY,
+            relay: Some(relay.clone()),
+            failure: None,
+            value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+                &entry.eose_latency,
+            )),
+        });
+        points.push(ExportMetricPoint {
+            name: metric_names::DELIVERY_COUNT,
+            relay: Some(relay.clone()),
+            failure: None,
+            value: ExportMetricValue::Counter(entry.delivery_count()),
+        });
+        points.push(ExportMetricPoint {
+            name: metric_names::REDUNDANT_COUNT,
+            relay: Some(relay.clone()),
+            failure: None,
+            value: ExportMetricValue::Counter(entry.redundant_count()),
+        });
+        if let Some(rate) = entry.first_deliverer_rate() {
+            points.push(ExportMetricPoint {
+                name: metric_names::FIRST_DELIVERER_RATE,
+                relay: Some(relay),
+                failure: None,
+                value: ExportMetricValue::Gauge(rate),
+            });
+        }
+    }
+
+    // Population-level points carry no relay label.
+    points.push(ExportMetricPoint {
+        name: metric_names::CROSS_RELAY_SPREAD,
+        relay: None,
+        failure: None,
+        value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+            &rollup.cross_relay_spread,
+        )),
+    });
+    for (name, value) in [
+        (
+            metric_names::CONNECTION_ATTEMPTS,
+            rollup.connection_attempts,
+        ),
+        (
+            metric_names::CONNECTION_SUCCESSES,
+            rollup.connection_successes,
+        ),
+        (metric_names::PUBLISH_ATTEMPTS, rollup.publish_attempts),
+        (metric_names::PUBLISH_SUCCESSES, rollup.publish_successes),
+        (metric_names::PUBLISH_FAILURES, rollup.publish_failures),
+        (
+            metric_names::PUBLISH_CANCELLATIONS,
+            rollup.publish_cancellations,
+        ),
+        (
+            metric_names::RECONCILIATION_ATTEMPTS,
+            rollup.reconciliation_attempts,
+        ),
+        (
+            metric_names::RECONCILIATION_ORDER_UNPROVEN_PASSES,
+            rollup.reconciliation_order_unproven_passes,
+        ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_FULL,
+            rollup.activations_full,
+        ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_DEGRADED,
+            rollup.activations_degraded,
+        ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_FAILED,
+            rollup.activations_failed,
+        ),
+        (metric_names::GROUP_SYNCS_FULL, rollup.group_syncs_full),
+        (
+            metric_names::GROUP_SYNCS_DEGRADED,
+            rollup.group_syncs_degraded,
+        ),
+        (metric_names::GROUP_SYNCS_FAILED, rollup.group_syncs_failed),
+        (metric_names::MESSAGE_OBSERVED, rollup.messages_observed),
+        (
+            metric_names::MESSAGE_CORROBORATED,
+            rollup.messages_corroborated,
+        ),
+        (
+            metric_names::MESSAGE_SINGLE_SOURCE,
+            rollup.messages_single_source,
+        ),
+    ] {
+        points.push(ExportMetricPoint {
+            name,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(value),
+        });
+    }
+
+    if let Some(engine) = &rollup.engine {
+        points.push(ExportMetricPoint {
+            name: metric_names::SETTLES,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(engine.settles),
+        });
+        points.push(ExportMetricPoint {
+            name: metric_names::POST_SETTLE_REORGS,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(engine.post_settle_reorgs),
+        });
+        if let Some(rate) = rollup.observed_reorg_rate() {
+            points.push(ExportMetricPoint {
+                name: metric_names::OBSERVED_REORG_RATE,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(rate),
+            });
+        }
+        points.push(ExportMetricPoint {
+            name: metric_names::REORG_LATENESS,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+                &engine.reorg_lateness_ms,
+            )),
+        });
+    }
+
+    RelayTelemetryExportBatch { points }
+}
+
+/// Map relay and app-performance rollups into one privacy-safe export batch.
+///
+/// App-performance points are population-level only: no relay label and no
+/// account, group, message, URL, or payload-derived label.
+pub fn build_export_batch_with_app_performance(
+    rollup: &RelayTelemetryRollup,
+    resolution: &RelayLabelResolution,
+    app_performance: Option<&AppPerformanceSnapshot>,
+) -> RelayTelemetryExportBatch {
+    let mut batch = build_export_batch(rollup, resolution);
+    if let Some(app_performance) = app_performance {
+        append_app_performance_points(&mut batch.points, app_performance);
+    }
+    batch
+}
+
+/// Append the fixed app-performance schema as unlabeled aggregate points.
+fn append_app_performance_points(
+    points: &mut Vec<ExportMetricPoint>,
+    app_performance: &AppPerformanceSnapshot,
+) {
+    append_app_operation_points(
+        points,
+        &app_performance.app_start,
+        metric_names::APP_START_DURATION,
+        metric_names::APP_START_ATTEMPTS,
+        metric_names::APP_START_SUCCESSES,
+        metric_names::APP_START_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.directory_subscription_sync,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_DURATION,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_ATTEMPTS,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_SUCCESSES,
+        metric_names::APP_DIRECTORY_SUBSCRIPTION_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_reconcile,
+        metric_names::APP_ACCOUNT_RECONCILE_DURATION,
+        metric_names::APP_ACCOUNT_RECONCILE_ATTEMPTS,
+        metric_names::APP_ACCOUNT_RECONCILE_SUCCESSES,
+        metric_names::APP_ACCOUNT_RECONCILE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_open,
+        metric_names::APP_ACCOUNT_OPEN_DURATION,
+        metric_names::APP_ACCOUNT_OPEN_ATTEMPTS,
+        metric_names::APP_ACCOUNT_OPEN_SUCCESSES,
+        metric_names::APP_ACCOUNT_OPEN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_worker_readiness,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_DURATION,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_ATTEMPTS,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_SUCCESSES,
+        metric_names::APP_ACCOUNT_WORKER_READINESS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_session_open,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_DURATION,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_SUCCESSES,
+        metric_names::APP_ACCOUNT_SESSION_OPEN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_group_hydration,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_DURATION,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_GROUP_HYDRATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_profile_load,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_DURATION,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_ATTEMPTS,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_SUCCESSES,
+        metric_names::APP_ACCOUNT_PROFILE_LOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_group_read_snapshot,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_DURATION,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_ATTEMPTS,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_SUCCESSES,
+        metric_names::APP_ACCOUNT_GROUP_READ_SNAPSHOT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_transport_activation,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_DURATION,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_subscription_registration,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_DURATION,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_SUCCESSES,
+        metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_catch_up,
+        metric_names::APP_ACCOUNT_CATCH_UP_DURATION,
+        metric_names::APP_ACCOUNT_CATCH_UP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_CATCH_UP_SUCCESSES,
+        metric_names::APP_ACCOUNT_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_sync,
+        metric_names::APP_ACCOUNT_SYNC_DURATION,
+        metric_names::APP_ACCOUNT_SYNC_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SYNC_SUCCESSES,
+        metric_names::APP_ACCOUNT_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_advisory_step,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_bootstrap_relay_and_follow_publish,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_BOOTSTRAP_RELAY_AND_FOLLOW_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_default_profile_publish,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_DEFAULT_PROFILE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_initial_key_package_publish,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_DURATION,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_ATTEMPTS,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_SUCCESSES,
+        metric_names::APP_ACCOUNT_INITIAL_KEY_PACKAGE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_initial_sync_overlap,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_DURATION,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_SUCCESSES,
+        metric_names::APP_ACCOUNT_INITIAL_SYNC_OVERLAP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_identity_local,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_IDENTITY_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_storage_local,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_STORAGE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_profile_local,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_PROFILE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_key_package_local,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_KEY_PACKAGE_LOCAL_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_local_ready_handoff,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_LOCAL_READY_HANDOFF_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_network_ready,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_queue_wait,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_projection,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_accept,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_publish,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_response,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_outbound_message_visible,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_inbound_message_visible,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.inbound_delivery_projection,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_DURATION,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_send,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_SEND_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_queue_wait,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_lookup,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_member_key_package_prewarm,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_DURATION,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_ATTEMPTS,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_SUCCESSES,
+        metric_names::APP_GROUP_MEMBER_KEY_PACKAGE_PREWARM_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_cache_reuse,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_CACHE_REUSE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_key_package_network_resolution,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_NETWORK_RESOLUTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_image_preprocess,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_IMAGE_PREPROCESS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_image_upload,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_mls_prepare_persist,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_pending_welcome_index,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_DURATION,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_PENDING_WELCOME_INDEX_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_welcome_publish,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_local_projection_save,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_response_handoff,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_DURATION,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_RESPONSE_HANDOFF_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_subscription_refresh,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_post_mutation_catch_up,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_create_total_caller_latency,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_ATTEMPTS,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_SUCCESSES,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_members,
+        metric_names::APP_GROUP_INVITE_MEMBERS_DURATION,
+        metric_names::APP_GROUP_INVITE_MEMBERS_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_MEMBERS_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_MEMBERS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_key_package_lookup,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_routing_refresh,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_DURATION,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_pre_send_sync,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_DURATION,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_engine_publish,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_DURATION,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_local_refresh,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_DURATION,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_notification_trigger,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_DURATION,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_welcome_publish,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_WELCOME_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_post_mutation_catch_up,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_promote_admin,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_DURATION,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_ATTEMPTS,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_SUCCESSES,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_details_read,
+        metric_names::APP_GROUP_DETAILS_READ_DURATION,
+        metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS,
+        metric_names::APP_GROUP_DETAILS_READ_SUCCESSES,
+        metric_names::APP_GROUP_DETAILS_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_conversation_snapshot_read,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_DURATION,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_SUCCESSES,
+        metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.chat_list_row_read,
+        metric_names::APP_CHAT_LIST_ROW_READ_DURATION,
+        metric_names::APP_CHAT_LIST_ROW_READ_ATTEMPTS,
+        metric_names::APP_CHAT_LIST_ROW_READ_SUCCESSES,
+        metric_names::APP_CHAT_LIST_ROW_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.existing_direct_conversation_read,
+        metric_names::APP_EXISTING_DIRECT_CONVERSATION_READ_DURATION,
+        metric_names::APP_EXISTING_DIRECT_CONVERSATION_READ_ATTEMPTS,
+        metric_names::APP_EXISTING_DIRECT_CONVERSATION_READ_SUCCESSES,
+        metric_names::APP_EXISTING_DIRECT_CONVERSATION_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_mls_state_read,
+        metric_names::APP_GROUP_MLS_STATE_READ_DURATION,
+        metric_names::APP_GROUP_MLS_STATE_READ_ATTEMPTS,
+        metric_names::APP_GROUP_MLS_STATE_READ_SUCCESSES,
+        metric_names::APP_GROUP_MLS_STATE_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_roster_read,
+        metric_names::APP_GROUP_ROSTER_READ_DURATION,
+        metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS,
+        metric_names::APP_GROUP_ROSTER_READ_SUCCESSES,
+        metric_names::APP_GROUP_ROSTER_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_accept_invite,
+        metric_names::APP_GROUP_ACCEPT_INVITE_DURATION,
+        metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS,
+        metric_names::APP_GROUP_ACCEPT_INVITE_SUCCESSES,
+        metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_upload,
+        metric_names::APP_MEDIA_UPLOAD_DURATION,
+        metric_names::APP_MEDIA_UPLOAD_ATTEMPTS,
+        metric_names::APP_MEDIA_UPLOAD_SUCCESSES,
+        metric_names::APP_MEDIA_UPLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download,
+        metric_names::APP_MEDIA_DOWNLOAD_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_queue_wait,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_preparation,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_host_setup,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_response_headers,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_first_byte,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_body_transfer,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_locator_failover,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_ciphertext_verify,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_decrypt,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_plaintext_verify,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_splash_ready,
+        metric_names::APP_HOST_SPLASH_READY_DURATION,
+        metric_names::APP_HOST_SPLASH_READY_ATTEMPTS,
+        metric_names::APP_HOST_SPLASH_READY_SUCCESSES,
+        metric_names::APP_HOST_SPLASH_READY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_foreground_local_ready,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_DURATION,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_ATTEMPTS,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_SUCCESSES,
+        metric_names::APP_HOST_FOREGROUND_LOCAL_READY_FAILURES,
+    );
+    for operation in &app_performance.runtime_operations {
+        let names = operation.operation.metric_names();
+        for (name, value) in names[..7].iter().zip([
+            operation.started,
+            operation.completed,
+            operation.successes,
+            operation.failures,
+            operation.cancelled,
+            operation.timeouts,
+            operation.not_ready,
+        ]) {
+            points.push(ExportMetricPoint {
+                name,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(value),
+            });
+        }
+        points.push(ExportMetricPoint {
+            name: names[7],
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(
+                &operation.duration_ms,
+            )),
+        });
+        for (name, value) in names[8..].iter().zip([
+            operation.in_flight,
+            operation.oldest_tracked_in_flight_ms,
+            operation.untracked_in_flight,
+        ]) {
+            points.push(ExportMetricPoint {
+                name,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(value as f64),
+            });
+        }
+    }
+    // Process-wide SQLCipher probe counters (mdk#1439): raw-key recovery opens
+    // and opens avoided via cached verdicts. Population-level only, no labels.
+    for (name, value) in [
+        (
+            metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS,
+            app_performance.sqlcipher_migration_probe_runs,
+        ),
+        (
+            metric_names::APP_SQLCIPHER_MIGRATION_PROBE_SKIPS,
+            app_performance.sqlcipher_migration_probe_skips,
+        ),
+    ] {
+        points.push(ExportMetricPoint {
+            name,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(value),
+        });
+    }
+}
+
+/// Encode one aggregate operation without allowing the caller to supply any
+/// label name or value.
+fn append_app_operation_points(
+    points: &mut Vec<ExportMetricPoint>,
+    operation: &AppPerformanceOperationSnapshot,
+    duration_name: &'static str,
+    attempts_name: &'static str,
+    successes_name: &'static str,
+    failures_name: &'static str,
+) {
+    points.push(ExportMetricPoint {
+        name: duration_name,
+        relay: None,
+        failure: None,
+        value: ExportMetricValue::Histogram(ExportHistogram::from_snapshot(&operation.duration_ms)),
+    });
+    for (name, value) in [
+        (attempts_name, operation.attempts),
+        (successes_name, operation.successes),
+    ] {
+        points.push(ExportMetricPoint {
+            name,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(value),
+        });
+    }
+    if operation.failure_classifications.is_empty() {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: None,
+            value: ExportMetricValue::Counter(operation.failures),
+        });
+        return;
+    }
+    let classified_failures = operation
+        .failure_classifications
+        .iter()
+        .map(|entry| entry.count)
+        .sum::<u64>();
+    for entry in &operation.failure_classifications {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: Some(entry.classification),
+            value: ExportMetricValue::Counter(entry.count),
+        });
+    }
+    // Preserve any count not represented by the supplied classification
+    // entries as the bounded fallback instead of dropping it.
+    if classified_failures < operation.failures {
+        points.push(ExportMetricPoint {
+            name: failures_name,
+            relay: None,
+            failure: Some(SyncFailureClassification::UNKNOWN),
+            value: ExportMetricValue::Counter(operation.failures - classified_failures),
+        });
+    }
+}
+
+/// Error surfaced by the opt-in OTLP exporter.
+///
+/// Messages are deliberately free of the endpoint URL and any relay identity so
+/// they remain safe to log.
+#[derive(Debug, thiserror::Error)]
+pub enum RelayExportError {
+    /// Export is enabled but no endpoint is configured.
+    #[error("relay telemetry export endpoint is not configured")]
+    MissingEndpoint,
+    /// Export is enabled but runtime resource attributes are missing.
+    #[cfg(feature = "otlp-export")]
+    #[error("relay telemetry export resource is not configured")]
+    MissingResource,
+    /// Export is enabled but the bearer token is missing.
+    #[cfg(feature = "otlp-export")]
+    #[error("relay telemetry export authorization token is not configured")]
+    MissingAuthorizationToken,
+    /// The collector request could not be sent.
+    #[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
+    #[error("relay telemetry export request failed to send")]
+    Request,
+    /// The collector returned a non-success status.
+    #[cfg(feature = "otlp-export")]
+    #[error("relay telemetry export endpoint returned status {0}")]
+    Status(u16),
+}
+
+impl RelayTelemetryExporter {
+    /// Build an opt-in relay-telemetry exporter over `relay_plane` — the
+    /// single construction gate.
+    ///
+    /// Returns `None` unless [`RelayTelemetryExportConfig::export_allowed`]
+    /// holds — opted in, an endpoint is configured, and that endpoint is TLS
+    /// (`https`, or loopback `http` for local testing), and runtime auth/resource
+    /// metadata is present. Off-by-default opt-in is structurally enforced: with
+    /// no exporter there is no resolution and no push, and relay identities are
+    /// never sent over a non-TLS transport.
+    pub fn new(
+        relay_plane: &MarmotRelayPlane,
+        mut config: RelayTelemetryExportConfig,
+        permit: crate::DiagnosticsPermit,
+    ) -> Option<Self> {
+        if let Some(resource) = &mut config.resource {
+            resource.service_instance_id = permit.diagnostic_id.clone();
+        }
+        if !permit.valid() {
+            return None;
+        }
+        if !config.export_allowed() {
+            if config.enabled {
+                // Opted in but the URL/auth/resource gate is incomplete: fail
+                // closed rather than push relay identities without the collector
+                // contract.
+                tracing::warn!(
+                    target: "marmot_observability::relay_telemetry_export",
+                    method = "new",
+                    "relay telemetry export disabled: url, authorization, or resource metadata missing",
+                );
+            }
+            return None;
+        }
+        Some(RelayTelemetryExporter {
+            relay_plane: relay_plane.clone(),
+            config,
+            permit,
+            baseline: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+struct ExportCollectionPeriod {
+    started: std::time::SystemTime,
+    baseline: RelayTelemetryExportBatch,
+    previous: RelayTelemetryExportBatch,
+}
+
+/// Opt-in exporter that pushes relay telemetry to a first-party OTLP collector.
+///
+/// Only constructed by [`RelayTelemetryExporter::new`] when opted in.
+#[derive(Clone)]
+pub struct RelayTelemetryExporter {
+    permit: crate::DiagnosticsPermit,
+    #[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+    baseline: std::sync::Arc<std::sync::Mutex<Option<ExportCollectionPeriod>>>,
+    relay_plane: MarmotRelayPlane,
+    config: RelayTelemetryExportConfig,
+}
+
+impl RelayTelemetryExporter {
+    /// The configured poll/push interval.
+    pub fn interval(&self) -> std::time::Duration {
+        self.config.interval
+    }
+
+    /// Build the privacy-safe export batch from the current rollup and the
+    /// opt-in-resolved relay labels.
+    ///
+    /// `engine` folds in the optional engine reorg metrics once that workstream
+    /// lands; pass `None` until then.
+    pub async fn build_batch(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+    ) -> RelayTelemetryExportBatch {
+        self.build_batch_with_app_performance(engine, None).await
+    }
+
+    /// Build a privacy-safe batch including optional app-performance rollups.
+    pub async fn build_batch_with_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> RelayTelemetryExportBatch {
+        if !self.permit.valid() {
+            return RelayTelemetryExportBatch::default();
+        }
+        let rollup = self.relay_plane.telemetry_rollup(engine).await;
+        // The exporter only exists when opted in, so resolution is always
+        // available here; default to an empty resolution defensively.
+        let resolution = self
+            .relay_plane
+            .resolve_relay_labels(&self.config)
+            .await
+            .unwrap_or_default();
+        build_export_batch_with_app_performance(&rollup, &resolution, app_performance.as_ref())
+    }
+}
+
+#[cfg(feature = "otlp-export")]
+use crate::collector_host_safety as host_safety;
+
+#[cfg(feature = "otlp-export")]
+mod otlp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{
+        AnyValue, InstrumentationScope, KeyValue, any_value,
+    };
+    use opentelemetry_proto::tonic::metrics::v1::{
+        AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint,
+        ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use prost::Message;
+
+    use crate::export_config::RelayTelemetryResource;
+
+    use super::host_safety::{self, REQUEST_TIMEOUT};
+    use super::{ExportMetricValue, RelayExportError, RelayTelemetryExportBatch};
+
+    const SCOPE_NAME: &str = "marmot.relay_telemetry";
+
+    fn unix_nano(time: SystemTime) -> u64 {
+        time.duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or_default()
+    }
+
+    fn point_attributes(point: &super::ExportMetricPoint) -> Vec<KeyValue> {
+        if let Some(relay) = &point.relay {
+            return vec![KeyValue {
+                key: "relay".to_owned(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(relay.clone())),
+                }),
+                ..Default::default()
+            }];
+        }
+        point.failure.map_or_else(Vec::new, |failure| {
+            vec![
+                string_key_value("failure_stage", failure.failure_stage.as_str()),
+                string_key_value("error_class", failure.error_class.as_str()),
+            ]
+        })
+    }
+
+    fn string_key_value(key: &str, value: impl Into<String>) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.into())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resource_attributes(resource: &RelayTelemetryResource) -> Vec<KeyValue> {
+        let mut attributes = vec![
+            string_key_value("service.name", "mdk"),
+            string_key_value("service.namespace", "marmot"),
+            string_key_value("service.version", resource.service_version.clone()),
+            string_key_value("service.instance.id", resource.service_instance_id.clone()),
+            string_key_value(
+                "deployment.environment.name",
+                resource.deployment_environment.clone(),
+            ),
+            string_key_value("tenant", resource.tenant.clone()),
+            string_key_value("os.type", resource.os_type.clone()),
+            string_key_value("os.version", resource.os_version.clone()),
+        ];
+        if let Some(model) = &resource.device_model_identifier {
+            attributes.push(string_key_value("device.model.identifier", model.clone()));
+        }
+        attributes
+    }
+
+    fn metric_unit(point: &super::ExportMetricPoint) -> &'static str {
+        match point.value {
+            ExportMetricValue::Histogram(_) => "ms",
+            ExportMetricValue::Counter(_) | ExportMetricValue::Gauge(_) => "1",
+        }
+    }
+
+    /// Encode the batch into an OTLP/HTTP `ExportMetricsServiceRequest`.
+    ///
+    /// Counters become monotonic cumulative sums, gauges become gauges, and
+    /// histograms become cumulative OTLP histograms carrying the same bucket
+    /// edges as the device-local snapshots (cumulative since `start_ns`).
+    pub(super) fn to_request(
+        batch: &RelayTelemetryExportBatch,
+        resource: &RelayTelemetryResource,
+        start_ns: u64,
+        now_ns: u64,
+    ) -> ExportMetricsServiceRequest {
+        let metrics = batch
+            .points
+            .iter()
+            .map(|point| {
+                let attributes = point_attributes(point);
+                let data = match &point.value {
+                    ExportMetricValue::Counter(value) => metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes,
+                            start_time_unix_nano: start_ns,
+                            time_unix_nano: now_ns,
+                            value: Some(number_data_point::Value::AsInt(*value as i64)),
+                            ..Default::default()
+                        }],
+                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        is_monotonic: true,
+                    }),
+                    ExportMetricValue::Gauge(value) => metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            attributes,
+                            start_time_unix_nano: start_ns,
+                            time_unix_nano: now_ns,
+                            value: Some(number_data_point::Value::AsDouble(*value)),
+                            ..Default::default()
+                        }],
+                    }),
+                    ExportMetricValue::Histogram(histogram) => {
+                        let mut bucket_counts = histogram.bucket_counts.clone();
+                        // OTLP histograms carry one more bucket than bounds: the
+                        // final bucket counts samples above the largest bound.
+                        bucket_counts.push(histogram.overflow_count);
+                        let count = bucket_counts.iter().sum();
+                        metric::Data::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                attributes,
+                                start_time_unix_nano: start_ns,
+                                time_unix_nano: now_ns,
+                                count,
+                                sum: Some(histogram.sum_ms as f64),
+                                bucket_counts,
+                                explicit_bounds: histogram
+                                    .bounds_ms
+                                    .iter()
+                                    .map(|bound| *bound as f64)
+                                    .collect(),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        })
+                    }
+                };
+                Metric {
+                    name: point.name.to_owned(),
+                    unit: metric_unit(point).to_owned(),
+                    data: Some(data),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes(resource),
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: SCOPE_NAME.to_owned(),
+                        ..Default::default()
+                    }),
+                    metrics,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// POST an OTLP metrics request to the configured full OTLP metrics URL.
+    pub(super) async fn push(
+        batch: &RelayTelemetryExportBatch,
+        metrics_url: &str,
+        resource: &RelayTelemetryResource,
+        authorization_bearer_token: &str,
+        started_at: SystemTime,
+        permit: &crate::DiagnosticsPermit,
+    ) -> Result<(), RelayExportError> {
+        push_with_resolver(
+            batch,
+            metrics_url,
+            resource,
+            authorization_bearer_token,
+            started_at,
+            host_safety::system_resolve,
+            Some(permit),
+        )
+        .await
+    }
+
+    async fn push_with_resolver<F, Fut>(
+        batch: &RelayTelemetryExportBatch,
+        metrics_url: &str,
+        resource: &RelayTelemetryResource,
+        authorization_bearer_token: &str,
+        started_at: SystemTime,
+        resolver: F,
+        permit: Option<&crate::DiagnosticsPermit>,
+    ) -> Result<(), RelayExportError>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>>,
+    {
+        // Include our explicit DNS lookup in the overall attempt deadline.
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let pin = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = host_safety::resolve_with(metrics_url, resolver) => {
+                        result.map_err(|_| RelayExportError::Request)?
+                    }
+                }
+            } else {
+                host_safety::resolve_with(metrics_url, resolver)
+                    .await
+                    .map_err(|_| RelayExportError::Request)?
+            };
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let client = pin.build_client().map_err(|_| RelayExportError::Request)?;
+            let request = to_request(
+                batch,
+                resource,
+                unix_nano(started_at),
+                unix_nano(SystemTime::now()),
+            );
+            let body = request.encode_to_vec();
+            let request = client
+                .post(pin.url)
+                .header("content-type", "application/x-protobuf")
+                .bearer_auth(authorization_bearer_token)
+                .body(body);
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let response = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = request.send() => result,
+                }
+            } else {
+                request.send().await
+            }
+            .map_err(|_| RelayExportError::Request)?;
+            if !response.status().is_success() {
+                return Err(RelayExportError::Status(response.status().as_u16()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RelayExportError::Request)?
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification, SyncFailureStage};
+        use crate::export_config::RelayTelemetryResource;
+        use crate::relay_telemetry_export::{
+            ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayTelemetryExportBatch,
+            metric_names,
+        };
+
+        fn test_resource() -> RelayTelemetryResource {
+            RelayTelemetryResource {
+                service_version: "1.0".into(),
+                service_instance_id: "test-instance".into(),
+                deployment_environment: "test".into(),
+                tenant: "test-tenant".into(),
+                os_type: "test-os".into(),
+                os_version: "1.0".into(),
+                device_model_identifier: None,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn relay_telemetry_host_safety_rejects_before_any_connection() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            for endpoint in [
+                format!(
+                    "https://public.example:{}/private?secret=query",
+                    addr.port()
+                ),
+                format!("http://public.example:{}/private?secret=query", addr.port()),
+                format!("http://user:password@localhost:{}/", addr.port()),
+                format!("http://localhost:{}/#fragment", addr.port()),
+            ] {
+                let result = push_with_resolver(
+                    &RelayTelemetryExportBatch::default(),
+                    &endpoint,
+                    &test_resource(),
+                    "bearer-secret",
+                    SystemTime::now(),
+                    |_, _| async { Ok(vec![addr.ip()]) },
+                    None,
+                )
+                .await;
+                let error = result.unwrap_err();
+                assert_eq!(format!("{error:?}"), "Request");
+                assert_eq!(
+                    error.to_string(),
+                    "relay telemetry export request failed to send"
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unsafe or malformed destination received a connection"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
+            use crate::export_config::RelayTelemetryExportConfig;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let complete = RelayTelemetryExportConfig {
+                enabled: true,
+                endpoint: Some(format!(
+                    "http://localhost:{}/metrics",
+                    listener.local_addr().unwrap().port()
+                )),
+                authorization_bearer_token: Some("bearer-secret".into()),
+                resource: Some(test_resource()),
+                ..Default::default()
+            };
+            let plane = transport_nostr::MarmotRelayPlane::full_history();
+            assert!(
+                crate::RelayTelemetryExporter::new(
+                    &plane,
+                    complete.clone(),
+                    crate::product_analytics::test_permit()
+                )
+                .is_some()
+            );
+            for case in 0..7 {
+                let mut config = complete.clone();
+                match case {
+                    0 => config.enabled = false,
+                    1 => config.endpoint = None,
+                    2 => config.authorization_bearer_token = None,
+                    3 => config.authorization_bearer_token = Some(" ".into()),
+                    4 => config.resource = None,
+                    5 => config.resource.as_mut().unwrap().tenant.clear(),
+                    _ => config.endpoint = Some("https://user:password@localhost/".into()),
+                }
+                // Construction is the only entrance to export; no exporter
+                // exists on these paths to invoke a DNS resolver or HTTP push.
+                assert!(
+                    crate::RelayTelemetryExporter::new(
+                        &plane,
+                        config,
+                        crate::product_analytics::test_permit()
+                    )
+                    .is_none()
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn to_request_maps_points_to_otlp_metrics() {
+            let batch = RelayTelemetryExportBatch {
+                points: vec![
+                    ExportMetricPoint {
+                        name: metric_names::DELIVERY_COUNT,
+                        relay: Some("wss://a.example".into()),
+                        failure: None,
+                        value: ExportMetricValue::Counter(7),
+                    },
+                    ExportMetricPoint {
+                        name: metric_names::FIRST_DELIVERER_RATE,
+                        relay: Some("wss://a.example".into()),
+                        failure: None,
+                        value: ExportMetricValue::Gauge(0.5),
+                    },
+                    ExportMetricPoint {
+                        name: metric_names::CROSS_RELAY_SPREAD,
+                        relay: None,
+                        failure: None,
+                        value: ExportMetricValue::Histogram(ExportHistogram {
+                            bounds_ms: vec![10, 50],
+                            bucket_counts: vec![1, 2],
+                            overflow_count: 3,
+                            sum_ms: 123,
+                        }),
+                    },
+                    ExportMetricPoint {
+                        name: metric_names::APP_ACCOUNT_SYNC_FAILURES,
+                        relay: None,
+                        failure: Some(SyncFailureClassification::new(
+                            SyncFailureStage::CgkaIngest,
+                            SyncErrorClass::Protocol,
+                        )),
+                        value: ExportMetricValue::Counter(2),
+                    },
+                ],
+            };
+
+            let request = to_request(
+                &batch,
+                &RelayTelemetryResource {
+                    service_version: "1.4.2".to_owned(),
+                    service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
+                    deployment_environment: "staging".to_owned(),
+                    tenant: "mdk-ios".to_owned(),
+                    os_type: "ios".to_owned(),
+                    os_version: "17.5".to_owned(),
+                    device_model_identifier: Some("iPhone15,3".to_owned()),
+                },
+                100,
+                200,
+            );
+            let resource = request.resource_metrics[0].resource.as_ref().unwrap();
+            let resource_attr = |key: &str| {
+                resource
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key == key)
+                    .and_then(|attr| attr.value.as_ref())
+                    .and_then(|value| value.value.as_ref())
+                    .map(|value| match value {
+                        any_value::Value::StringValue(value) => value.as_str(),
+                        other => panic!("expected string resource attr, got {other:?}"),
+                    })
+            };
+            assert_eq!(resource_attr("service.name"), Some("mdk"));
+            assert_eq!(resource_attr("service.namespace"), Some("marmot"));
+            assert_eq!(resource_attr("service.version"), Some("1.4.2"));
+            assert_eq!(
+                resource_attr("service.instance.id"),
+                Some("8e1ca50b-05a2-4c31-a31c-1e69c75a9366")
+            );
+            assert_eq!(
+                resource_attr("deployment.environment.name"),
+                Some("staging")
+            );
+            assert_eq!(resource_attr("deployment.environment"), None);
+            assert_eq!(resource_attr("tenant"), Some("mdk-ios"));
+            assert_eq!(resource_attr("os.type"), Some("ios"));
+            assert_eq!(resource_attr("os.version"), Some("17.5"));
+            assert_eq!(resource_attr("device.model.identifier"), Some("iPhone15,3"));
+
+            let scope_metrics = &request.resource_metrics[0].scope_metrics[0];
+            assert_eq!(scope_metrics.scope.as_ref().unwrap().name, SCOPE_NAME);
+            assert_eq!(scope_metrics.metrics.len(), 4);
+            assert_eq!(scope_metrics.metrics[0].unit, "1");
+            assert_eq!(scope_metrics.metrics[1].unit, "1");
+            assert_eq!(scope_metrics.metrics[2].name, "cross_relay_spread_ms");
+            assert_eq!(scope_metrics.metrics[2].unit, "ms");
+            let classified = match &scope_metrics.metrics[3].data {
+                Some(metric::Data::Sum(sum)) => &sum.data_points[0],
+                other => panic!("expected classified failure sum, got {other:?}"),
+            };
+            let attribute = |key: &str| {
+                classified
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == key)
+                    .and_then(|attribute| attribute.value.as_ref())
+                    .and_then(|value| value.value.as_ref())
+                    .map(|value| match value {
+                        any_value::Value::StringValue(value) => value.as_str(),
+                        other => panic!("expected string failure attr, got {other:?}"),
+                    })
+            };
+            assert_eq!(attribute("failure_stage"), Some("cgka_ingest"));
+            assert_eq!(attribute("error_class"), Some("protocol"));
+            assert_eq!(classified.attributes.len(), 2);
+
+            // Counter -> monotonic cumulative Sum, carrying the relay label.
+            let sum = match &scope_metrics.metrics[0].data {
+                Some(metric::Data::Sum(sum)) => sum,
+                other => panic!("expected sum, got {other:?}"),
+            };
+            assert!(sum.is_monotonic);
+            assert_eq!(
+                sum.aggregation_temporality,
+                AggregationTemporality::Cumulative as i32
+            );
+            let point = &sum.data_points[0];
+            assert_eq!(point.value, Some(number_data_point::Value::AsInt(7)));
+            assert_eq!(point.start_time_unix_nano, 100);
+            assert_eq!(point.time_unix_nano, 200);
+            assert_eq!(point.attributes[0].key, "relay");
+
+            // Histogram -> bucket_counts = per-bucket + overflow, same bounds and sum, no label.
+            let histogram = match &scope_metrics.metrics[2].data {
+                Some(metric::Data::Histogram(histogram)) => histogram,
+                other => panic!("expected histogram, got {other:?}"),
+            };
+            let point = &histogram.data_points[0];
+            assert!(
+                point.attributes.is_empty(),
+                "population metric carries no label"
+            );
+            assert_eq!(point.bucket_counts, vec![1, 2, 3]);
+            assert_eq!(point.explicit_bounds, vec![10.0, 50.0]);
+            assert_eq!(point.count, 6);
+            assert_eq!(point.sum, Some(123.0));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn account_publish_counters_round_trip_as_unlabeled_cumulative_sums() {
+            use std::time::UNIX_EPOCH;
+
+            use crate::export_config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
+            use transport_nostr::test_support::{AccountPublishFixture, PublishScript};
+
+            let fixture = AccountPublishFixture::activate().await;
+            let exporter = crate::RelayTelemetryExporter::new(
+                &fixture.plane,
+                RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                    .with_runtime_config(RelayTelemetryRuntimeConfig {
+                        otlp_endpoint: Some("https://otlp.example/v1/metrics".into()),
+                        authorization_bearer_token: Some("token".into()),
+                        resource: Some(test_resource()),
+                    }),
+                crate::product_analytics::test_permit(),
+            )
+            .expect("opted-in exporter");
+            let (primed, _) = exporter.since_baseline(exporter.build_batch(None).await);
+            let primed_value = |name: &str| match primed
+                .points
+                .iter()
+                .find(|point| point.name == name)
+                .map(|point| &point.value)
+            {
+                Some(ExportMetricValue::Counter(value)) => *value,
+                other => panic!("primed {name} should be a counter, got {other:?}"),
+            };
+            assert_eq!(primed_value(metric_names::PUBLISH_ATTEMPTS), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_SUCCESSES), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_FAILURES), 0);
+            assert_eq!(primed_value(metric_names::PUBLISH_CANCELLATIONS), 0);
+
+            fixture
+                .publish(PublishScript::Accept, 1)
+                .await
+                .expect("success");
+            fixture
+                .publish(PublishScript::Error, 1)
+                .await
+                .expect_err("failure");
+            fixture.cancel_in_flight().await;
+            let (delta, started) = exporter.since_baseline(exporter.build_batch(None).await);
+            let start_ns = started
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let request = to_request(
+                &delta,
+                &test_resource(),
+                start_ns,
+                start_ns.saturating_add(1),
+            );
+            let decoded = ExportMetricsServiceRequest::decode(request.encode_to_vec().as_slice())
+                .expect("prost round trip");
+            let sum = |name: &str| {
+                let metric = decoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.name == name)
+                    .unwrap_or_else(|| panic!("missing {name}"));
+                let sum = match &metric.data {
+                    Some(metric::Data::Sum(sum)) => sum,
+                    other => panic!("{name} should be a sum, got {other:?}"),
+                };
+                assert!(sum.is_monotonic, "{name} must be monotonic");
+                assert_eq!(
+                    sum.aggregation_temporality,
+                    AggregationTemporality::Cumulative as i32
+                );
+                let point = &sum.data_points[0];
+                assert!(
+                    point.attributes.is_empty(),
+                    "{name} data point must not carry relay, failure, or identity attributes"
+                );
+                match point.value {
+                    Some(number_data_point::Value::AsInt(value)) => value,
+                    ref other => panic!("{name} value {other:?}"),
+                }
+            };
+            assert_eq!(sum(metric_names::PUBLISH_ATTEMPTS), 3);
+            assert_eq!(sum(metric_names::PUBLISH_SUCCESSES), 1);
+            assert_eq!(sum(metric_names::PUBLISH_FAILURES), 1);
+            assert_eq!(sum(metric_names::PUBLISH_CANCELLATIONS), 1);
+        }
+    }
+}
+
+#[cfg(feature = "otlp-export")]
+impl RelayTelemetryExporter {
+    /// Build the batch and push it once to the configured collector.
+    ///
+    /// Returns the number of metric points pushed.
+    pub async fn export_once(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+    ) -> Result<usize, RelayExportError> {
+        self.export_once_with_app_performance(engine, None).await
+    }
+
+    /// Build the batch with optional app-performance rollups and push it once.
+    pub async fn export_once_with_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> Result<usize, RelayExportError> {
+        if !self.permit.valid()
+            || self
+                .permit
+                .telemetry_rejected
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RelayExportError::Request);
+        }
+        let endpoint = self
+            .config
+            .endpoint
+            .clone()
+            .ok_or(RelayExportError::MissingEndpoint)?;
+        let resource = self
+            .config
+            .resource
+            .as_ref()
+            .ok_or(RelayExportError::MissingResource)?;
+        let authorization_bearer_token = self
+            .config
+            .authorization_bearer_token
+            .as_deref()
+            .ok_or(RelayExportError::MissingAuthorizationToken)?;
+        // Baseline every source series before resolving export labels. A relay whose
+        // label becomes available later must not expose its pre-consent history.
+        let rollup = self.relay_plane.telemetry_rollup(engine).await;
+        let internal_labels = RelayLabelResolution::from_pairs(rollup.relays.iter().map(|relay| {
+            (
+                RelayIndex(relay.relay_index),
+                cgka_traits::TransportEndpoint(relay.relay_index.to_string()),
+            )
+        }));
+        let raw_batch = build_export_batch_with_app_performance(
+            &rollup,
+            &internal_labels,
+            app_performance.as_ref(),
+        );
+        let (mut batch, started_at) = self.since_baseline(raw_batch);
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
+        let resolution = self
+            .relay_plane
+            .resolve_relay_labels(&self.config)
+            .await
+            .unwrap_or_default();
+        batch.points.retain_mut(|point| {
+            let Some(index) = point.relay.as_deref() else {
+                return true;
+            };
+            let Some(endpoint) = index
+                .parse()
+                .ok()
+                .and_then(|index| resolution.label_for(RelayIndex(index)))
+            else {
+                return false;
+            };
+            point.relay = Some(endpoint.0.clone());
+            true
+        });
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
+        let count = batch.len();
+        otlp::push(
+            &batch,
+            &endpoint,
+            resource,
+            authorization_bearer_token,
+            started_at,
+            &self.permit,
+        )
+        .await
+        .inspect_err(|error| {
+            if matches!(error, RelayExportError::Status(400 | 401 | 403 | 404 | 422)) {
+                self.permit.reject_telemetry();
+            }
+        })?;
+        tracing::debug!(
+            target: "marmot_observability::relay_telemetry_export",
+            method = "export_once",
+            point_count = count,
+            "pushed relay telemetry export batch"
+        );
+        Ok(count)
+    }
+
+    /// Build and push once, retrying transient failures within one export window.
+    ///
+    /// Performs the initial attempt plus up to three retries with exponential
+    /// backoff. Attempts are deadline-bound by the configured interval, so a
+    /// failed collector never creates a disk queue or spills into the next
+    /// scheduled window.
+    pub async fn export_once_with_retries(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+    ) -> Result<usize, RelayExportError> {
+        self.export_once_with_retries_and_app_performance(engine, None)
+            .await
+    }
+
+    async fn export_once_with_retries_and_app_performance(
+        &self,
+        engine: Option<EngineReorgMetrics>,
+        app_performance: Option<AppPerformanceSnapshot>,
+    ) -> Result<usize, RelayExportError> {
+        let deadline = Instant::now() + self.config.interval;
+        let mut last_error = None;
+        for attempt in 0..EXPORT_MAX_ATTEMPTS {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(
+                remaining,
+                self.export_once_with_app_performance(engine.clone(), app_performance.clone()),
+            )
+            .await
+            {
+                Ok(Ok(count)) => return Ok(count),
+                Ok(Err(err @ RelayExportError::Status(400 | 401 | 403 | 404 | 422))) => {
+                    return Err(err);
+                }
+                Ok(Err(err)) => last_error = Some(err),
+                Err(_) => last_error = Some(RelayExportError::Request),
+            }
+            if attempt + 1 >= EXPORT_MAX_ATTEMPTS {
+                break;
+            }
+            let delay = retry_delay(self.config.interval, attempt);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(delay.min(remaining)).await;
+        }
+        Err(last_error.unwrap_or(RelayExportError::Request))
+    }
+
+    /// Poll-and-push on the configured interval until `shutdown` flips to `true`.
+    ///
+    /// Engine reorg metrics are not yet folded into the periodic loop; it
+    /// reports adapter and relay-plane metrics until the engine snapshot is
+    /// wired in at this seam.
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.run_loop(&mut shutdown, None).await;
+    }
+
+    /// Poll-and-push relay and app-performance telemetry on the configured
+    /// interval until `shutdown` flips to `true`.
+    pub async fn run_with_app_performance(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        app_performance: AppPerformanceTelemetry,
+    ) {
+        self.run_loop(&mut shutdown, Some(app_performance)).await;
+    }
+
+    async fn run_loop(
+        self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        app_performance: Option<AppPerformanceTelemetry>,
+    ) {
+        if !*shutdown.borrow()
+            && self
+                .export_once_with_retries_and_app_performance(
+                    None,
+                    app_performance
+                        .as_ref()
+                        .map(AppPerformanceTelemetry::snapshot),
+                )
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                target: "marmot_observability::relay_telemetry_export",
+                method = "run",
+                "relay telemetry export push failed"
+            );
+        }
+        loop {
+            if !self.permit.valid()
+                || self
+                    .permit
+                    .telemetry_rejected
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            let delay = jittered_export_interval(self.config.interval);
+            tokio::select! {
+                _ = self.permit.cancelled()=>break,
+                _ = tokio::time::sleep(delay) => {
+                    if self
+                        .export_once_with_retries_and_app_performance(
+                            None,
+                            app_performance.as_ref().map(AppPerformanceTelemetry::snapshot),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "marmot_observability::relay_telemetry_export",
+                            method = "run",
+                            "relay telemetry export push failed"
+                        );
+                    }
+                }
+                result = shutdown.changed() => {
+                    // `changed()` errors when the sender is dropped; treat that
+                    // as a shutdown too, otherwise the branch would resolve
+                    // immediately every iteration and spin the loop.
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+impl RelayTelemetryExporter {
+    /// Keep local lifetime measurements intact; each exporter has its own collection epoch.
+    #[cfg(any(test, feature = "otlp-export"))]
+    fn since_baseline(
+        &self,
+        current: RelayTelemetryExportBatch,
+    ) -> (RelayTelemetryExportBatch, std::time::SystemTime) {
+        let mut state = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = state.as_ref().is_some_and(|period| {
+            current.points.iter().any(|point| {
+                period
+                    .previous
+                    .points
+                    .iter()
+                    .chain(period.baseline.points.iter())
+                    .find(|old| {
+                        old.name == point.name
+                            && old.relay == point.relay
+                            && old.failure == point.failure
+                    })
+                    .is_some_and(|old| metric_reset(&point.value, &old.value))
+            })
+        });
+        if state.is_none() || reset {
+            *state = Some(ExportCollectionPeriod {
+                started: std::time::SystemTime::now(),
+                baseline: current.clone(),
+                previous: current.clone(),
+            });
+        }
+        let period = state.as_mut().expect("initialized export baseline");
+        let started = period.started;
+        for point in &current.points {
+            if let Some(old) = period.previous.points.iter_mut().find(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            }) {
+                *old = point.clone();
+            } else {
+                period.previous.points.push(point.clone());
+            }
+        }
+        let baseline = &mut period.baseline;
+        let mut output = current.clone();
+        for point in &mut output.points {
+            let index = baseline.points.iter().position(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            });
+            // Optional sources may already contain pre-consent history when first
+            // supplied. Establish their baseline before exporting any cumulative data.
+            let index = index.unwrap_or_else(|| {
+                baseline.points.push(point.clone());
+                baseline.points.len() - 1
+            });
+            let old = &baseline.points[index];
+            match (&mut point.value, &old.value) {
+                (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => {
+                    *value -= base
+                }
+                (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+                    for (count, base) in value.bucket_counts.iter_mut().zip(&base.bucket_counts) {
+                        *count -= base;
+                    }
+                    value.overflow_count -= base.overflow_count;
+                    value.sum_ms -= base.sum_ms;
+                }
+                _ => {}
+            }
+        }
+        let counters = output.points.clone();
+        for point in &mut output.points {
+            if point.name == metric_names::OBSERVED_REORG_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v) if p.name == name => Some(v),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let settles = count(metric_names::SETTLES);
+                let reorgs = count(metric_names::POST_SETTLE_REORGS);
+                point.value = ExportMetricValue::Gauge(if settles == 0 {
+                    0.0
+                } else {
+                    reorgs as f64 / settles as f64
+                });
+            }
+            if point.name == metric_names::FIRST_DELIVERER_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v)
+                                if p.name == name && p.relay == point.relay =>
+                            {
+                                Some(v)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let total = count(metric_names::DELIVERY_COUNT);
+                let redundant = count(metric_names::REDUNDANT_COUNT);
+                point.value = ExportMetricValue::Gauge(if total == 0 {
+                    0.0
+                } else {
+                    total.saturating_sub(redundant) as f64 / total as f64
+                });
+            }
+        }
+        (output, started)
+    }
+}
+#[cfg(any(test, feature = "otlp-export"))]
+fn metric_reset(value: &ExportMetricValue, baseline: &ExportMetricValue) -> bool {
+    match (value, baseline) {
+        (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => value < base,
+        (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+            value.bounds_ms != base.bounds_ms
+                || value.bucket_counts.len() != base.bucket_counts.len()
+                || value.sum_ms < base.sum_ms
+                || value.overflow_count < base.overflow_count
+                || value
+                    .bucket_counts
+                    .iter()
+                    .zip(&base.bucket_counts)
+                    .any(|(v, b)| v < b)
+        }
+        (ExportMetricValue::Gauge(_), ExportMetricValue::Gauge(_)) => false,
+        _ => true,
+    }
+}

@@ -26,8 +26,8 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{MemberId, MessageId};
 use marmot_forensics::{
-    AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditTransportContext,
-    AuditTransportWire, JsonlRecorder,
+    AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditRecord,
+    AuditTransportContext, AuditTransportWire, ForensicRecorder, JsonlRecorder, SharedRecorder,
 };
 use storage_sqlite::SqliteAccountStorage;
 
@@ -132,14 +132,14 @@ impl TransportPeeler for ParkingPeeler {
 fn current_profile_engine(
     seed: &[u8],
     peeler: Box<dyn TransportPeeler>,
-    recorder: Option<JsonlRecorder>,
+    audit: Option<&SharedRecorder>,
 ) -> Engine<SqliteAccountStorage> {
-    let builder = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let builder = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .identity(valid_identity(seed))
         .account_identity_proof_signer(proof_signer(seed))
         .peeler(peeler);
-    let builder = match recorder {
-        Some(recorder) => builder.recorder(Box::new(recorder)),
+    let builder = match audit {
+        Some(audit) => builder.recorder(Box::new(audit.clone())),
         None => builder,
     };
     builder.build().expect("build current-profile engine")
@@ -167,12 +167,12 @@ fn group_request(members: Vec<cgka_traits::engine::KeyPackage>) -> CreateGroupRe
     }
 }
 
-/// Record the two kinds of row that carry no context of their own: the
-/// engine's recorder-health row and an app row forwarded without a context.
-fn record_context_free_rows(engine: &Engine<SqliteAccountStorage>) {
-    engine.audit_recorder_health();
-    engine.audit_external(
-        None,
+/// Record the two kinds of row that carry no context of their own: an engine
+/// row, which falls back to the in-flight operation's context, and an app row
+/// recorded straight into the shared recorder without a context.
+fn record_context_free_rows(engine: &Engine<SqliteAccountStorage>, audit: &SharedRecorder) {
+    engine.audit_engine_context();
+    audit.record(AuditRecord::new(
         None,
         AuditEventKind::SyncDrain {
             duration_ms: 0,
@@ -182,7 +182,13 @@ fn record_context_free_rows(engine: &Engine<SqliteAccountStorage>) {
             cursor_before_secs: None,
             cursor_after_secs: None,
         },
-    );
+    ));
+}
+
+fn jsonl_audit(path: &std::path::Path, engine_id: &str) -> SharedRecorder {
+    SharedRecorder::new(Box::new(
+        JsonlRecorder::open(path, engine_id.to_string()).unwrap(),
+    ))
 }
 
 fn read_events(path: &std::path::Path) -> Vec<AuditEvent> {
@@ -222,12 +228,15 @@ fn assert_operation_context_ends_with_operation(
         "the entry row carries the operation id"
     );
 
-    let [.., health, app_row] = events else {
+    let [.., engine_row, app_row] = events else {
         panic!("expected the two context-free rows at the end of the log");
     };
-    assert!(matches!(health.kind, AuditEventKind::RecorderHealth { .. }));
+    assert!(matches!(
+        engine_row.kind,
+        AuditEventKind::EngineContext { .. }
+    ));
     assert!(matches!(app_row.kind, AuditEventKind::SyncDrain { .. }));
-    for row in [health, app_row] {
+    for row in [engine_row, app_row] {
         let system_stamp = AuditEventContext {
             human_action: Some(AuditHumanActionContext {
                 action: row.kind.type_tag().into(),
@@ -262,7 +271,7 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
     let recorder = JsonlRecorder::open(&path, "test-engine-abc".to_string()).unwrap();
 
     let identity = valid_identity(b"self");
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
@@ -361,7 +370,7 @@ async fn epoch_confirmed_inherits_operation_human_action() {
     let recorder = JsonlRecorder::open(&path, "test-engine-epoch".to_string()).unwrap();
 
     let identity = valid_identity(b"self");
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
@@ -462,7 +471,7 @@ async fn engine_without_recorder_is_silent_and_does_not_crash() {
     // No recorder configured -> NoopRecorder. Engine should function normally
     // and emit zero side effects.
     let identity = valid_identity(b"self");
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
@@ -491,7 +500,7 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
     let recorder = JsonlRecorder::open(&path, "test-engine-wire".to_string()).unwrap();
 
     let identity = valid_identity(b"self");
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
@@ -769,14 +778,14 @@ async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let recorder = JsonlRecorder::open(&path, "test-engine-dropped-send".to_string()).unwrap();
+    let audit = jsonl_audit(&path, "test-engine-dropped-send");
     let reached = Arc::new(AtomicBool::new(false));
     let mut engine = current_profile_engine(
         b"dropped-send",
         Box::new(ParkingPeeler {
             reached: reached.clone(),
         }),
-        Some(recorder),
+        Some(&audit),
     );
     // A founding group with no invitees wraps nothing, so it completes.
     let (group_id, _) = engine
@@ -806,8 +815,8 @@ async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
     );
     drop(send);
 
-    record_context_free_rows(&engine);
-    drop(engine);
+    record_context_free_rows(&engine, &audit);
+    drop((engine, audit));
 
     assert_operation_context_ends_with_operation(
         &read_events(&path),
@@ -822,7 +831,7 @@ async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
 async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let recorder = JsonlRecorder::open(&path, "test-engine-dropped-create".to_string()).unwrap();
+    let audit = jsonl_audit(&path, "test-engine-dropped-create");
     let mut bob = current_profile_engine(b"dropped-create-bob", Box::new(StubPeeler), None);
     let bob_kp = bob.fresh_key_package().await.expect("bob key package");
     let reached = Arc::new(AtomicBool::new(false));
@@ -831,7 +840,7 @@ async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind(
         Box::new(ParkingPeeler {
             reached: reached.clone(),
         }),
-        Some(recorder),
+        Some(&audit),
     );
 
     let mut create = Box::pin(engine.create_group_with_audit_context(
@@ -848,8 +857,8 @@ async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind(
     );
     drop(create);
 
-    record_context_free_rows(&engine);
-    drop(engine);
+    record_context_free_rows(&engine, &audit);
+    drop((engine, audit));
 
     assert_operation_context_ends_with_operation(
         &read_events(&path),
@@ -865,9 +874,9 @@ async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind(
 async fn completed_group_creation_keeps_its_context_until_it_returns() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let recorder = JsonlRecorder::open(&path, "test-engine-completed-create".to_string()).unwrap();
+    let audit = jsonl_audit(&path, "test-engine-completed-create");
     let mut engine =
-        current_profile_engine(b"completed-create", Box::new(StubPeeler), Some(recorder));
+        current_profile_engine(b"completed-create", Box::new(StubPeeler), Some(&audit));
     engine
         .create_group_with_audit_context(
             group_request(vec![]),
@@ -875,8 +884,8 @@ async fn completed_group_creation_keeps_its_context_until_it_returns() {
         )
         .await
         .expect("create group");
-    record_context_free_rows(&engine);
-    drop(engine);
+    record_context_free_rows(&engine, &audit);
+    drop((engine, audit));
 
     let events = read_events(&path);
     let trailing_group_context = events

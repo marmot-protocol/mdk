@@ -3,9 +3,11 @@
 //! The create and invite paths know the whole requested roster before they
 //! mutate MLS state. Resolve that set as a set: canonicalize aliases, collapse
 //! duplicate account ids, reuse discovery routes, and fetch current KeyPackages
-//! from relays before every invitation. Cached packages are discovery hints, not
-//! evidence that a recipient still owns the private bundle. Unsupported batch
-//! queries fall back to bounded single-author relay requests.
+//! and their deletion requests from relays before every invitation. Each
+//! account contributes one KeyPackage per selected device. Cached packages are
+//! discovery hints, not evidence that a recipient still owns the private
+//! bundle. Unsupported batch queries fall back to bounded single-author relay
+//! requests.
 
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -17,16 +19,14 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
 use futures::{StreamExt, stream};
 use nostr_sdk::prelude::PublicKey;
-use transport_nostr_adapter::{
-    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
-};
+use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 
 use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    fresh_relay_list_status_from_records, merge_relay_list_status,
-    preferred_fresh_key_package_from_records,
+    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records, key_package_queries,
+    key_package_read_page_full, merge_relay_list_status, select_key_packages_from_records,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -42,7 +42,6 @@ const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 // scoped deletion proof share one deadline. No per-route or candidate retry
 // renews it; slow/incomplete coverage remains retryable rather than absence.
 const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
-const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
 pub const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -186,6 +185,8 @@ struct RelayListResolution {
 }
 
 pub struct ResolvedMemberKeyPackages {
+    /// Each account's selected KeyPackages, best first, accounts in input
+    /// order. An account with several devices contributes several.
     pub key_packages: Vec<KeyPackage>,
     pub stats: MemberKeyPackageResolutionStats,
 }
@@ -194,10 +195,16 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// Resolve a roster as one deterministic set.
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
-    /// their first input position. Every package is fetched from relays; cached
-    /// packages are never a fallback if that lookup fails. On error, the error
-    /// belonging to the first unresolved canonical member is returned even if
-    /// later relay work completed earlier.
+    /// their first input position. Each account yields every KeyPackage
+    /// [`select_key_packages_from_records`] selects, best first, from what its
+    /// relays returned. Every device is sought, not guaranteed (mdk#2628,
+    /// D12): packages a read returned are selected even when the read was
+    /// incomplete, so a device whose package no relay returned is left out,
+    /// and inviting the account again adds it. A read that yields nothing
+    /// usable still fails the lookup rather than deciding on nothing. Every package
+    /// is fetched from relays; cached packages are never a fallback if that
+    /// lookup fails. On error, the error belonging to the first unresolved
+    /// canonical member is returned even if later relay work completed earlier.
     pub async fn resolve_member_key_packages(
         &self,
         member_refs: &[&str],
@@ -333,7 +340,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
         let mut outcomes = (0..targets.len())
             .map(|_| None)
-            .collect::<Vec<Option<Result<KeyPackage, DirectoryError>>>>();
+            .collect::<Vec<Option<Result<Vec<KeyPackage>, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
@@ -492,7 +499,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             targets[index].account_id_hex.clone(),
                         ));
                     }
-                    key_packages.push(key_package);
+                    key_packages.extend(key_package);
                 }
                 Err(error) => return Err(error),
             }
@@ -506,22 +513,43 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         })
     }
 
-    fn accept_fetched_key_package(
+    /// Revalidate one account's selection on the real clock, best first. A
+    /// package that expired since selection drops out; the account fails only
+    /// when none is left. Commits remember the best one in the directory cache.
+    fn accept_fetched_key_packages(
         &self,
         purpose: MemberResolutionPurpose,
-        fetched: FetchedKeyPackage,
-    ) -> Result<KeyPackage, DirectoryError> {
-        let key_package = self.validate_member_key_package_current(
-            &fetched.account_id_hex,
-            fetched.key_package.clone(),
-        )?;
-        match purpose {
-            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
-                self.remember_directory_key_package(&fetched)?
+        selected: Vec<FetchedKeyPackage>,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Result<Vec<KeyPackage>, DirectoryError> {
+        let mut accepted = Vec::with_capacity(selected.len());
+        let mut first_error = None;
+        for mut fetched in selected {
+            match self.validate_member_key_package_current(
+                &fetched.account_id_hex,
+                fetched.key_package.clone(),
+            ) {
+                Ok(key_package) => {
+                    if accepted.is_empty()
+                        && matches!(
+                            purpose,
+                            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
+                        )
+                    {
+                        fetched.relay_lists = relay_lists.clone();
+                        self.remember_directory_key_package(&fetched)?;
+                    }
+                    accepted.push(key_package);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
-            MemberResolutionPurpose::Prewarm => {}
         }
-        Ok(key_package)
+        match first_error {
+            Some(error) if accepted.is_empty() => Err(error),
+            _ => Ok(accepted),
+        }
     }
 
     fn validate_member_key_package_current(
@@ -645,6 +673,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             DirectoryFetchOutcome {
                                 records,
                                 complete: retry.complete,
+                                complete_endpoints: retry.complete_endpoints,
                             },
                         )
                     }
@@ -783,7 +812,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
-        outcomes: &mut [Option<Result<KeyPackage, DirectoryError>>],
+        outcomes: &mut [Option<Result<Vec<KeyPackage>, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) {
@@ -828,23 +857,18 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .iter()
                     .map(|index| targets[*index].account_id_hex.clone())
                     .collect::<Vec<_>>();
-                let query = DirectoryEventQuery::new(
-                    KIND_MARMOT_KEY_PACKAGE,
-                    authors.clone(),
-                    authors.len() * KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                );
-                (indices, endpoints, query)
+                (indices, endpoints, key_package_queries(authors))
             })
             .collect::<Vec<_>>();
         let directory = self.clone();
         let requests = request_specs
             .into_iter()
-            .map(move |(indices, endpoints, query)| {
+            .map(move |(indices, endpoints, queries)| {
                 let directory = directory.clone();
                 async move {
                     let result = directory
                         .relay_plane
-                        .fetch_directory_events(endpoints, vec![query])
+                        .fetch_directory_events(endpoints, queries)
                         .await
                         .map_err(|error| {
                             DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
@@ -875,36 +899,39 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = preferred_fresh_key_package_from_records(
+                let selected = select_key_packages_from_records(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    &self.config.key_package_client_preference,
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
-                // is decided by the per-member recovery below.
+                // is decided by the per-member recovery below. A single-author
+                // batch that selects is used as is (D12).
                 match selected {
-                    Ok(Some(selected))
-                        if purpose == MemberResolutionPurpose::Prewarm
-                            || !multiple_authors
-                            || selected.priority == 2 =>
+                    Ok(selected)
+                        if !selected.is_empty()
+                            && (purpose == MemberResolutionPurpose::Prewarm
+                                || !multiple_authors)
+                            && !key_package_read_page_full(account_id, &account_records) =>
                     {
-                        let mut fetched = selected.fetched;
-                        fetched.relay_lists = targets[index].relay_lists.clone();
-                        outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
+                        outcomes[index] = Some(self.accept_fetched_key_packages(
+                            purpose,
+                            selected,
+                            &targets[index].relay_lists,
+                        ));
                     }
-                    // Bounded multi-author results can hide an older preferred
-                    // slot even when they contain a valid lower-priority one.
-                    // Relays may cap below our requested limit, so even a
-                    // short batch does not prove completeness. Prewarm only
-                    // needs existence, while commits seek the preferred slot.
-                    // A priority-2 winner already has the best tier in a
-                    // newest-first prefix. This is a bounded preference search,
-                    // not proof of relay completeness: neither path can detect
-                    // a newer publication omitted from a non-prefix response.
-                    // Keep observed slot replacements when combining the refetch.
+                    // Bounded multi-author results can hide some of an
+                    // account's slots or their deletion requests. Relays may
+                    // cap below our requested limit, so even a short batch
+                    // does not prove completeness. Prewarm only needs
+                    // existence, while commits seek every device's slot from
+                    // a single-author read. Neither path can detect a newer
+                    // publication omitted from a non-prefix response. A full
+                    // page of KeyPackages or deletion requests falls back
+                    // too, and recovery reports it incomplete. Keep observed slot replacements
+                    // when combining the refetch.
                     _ => {
                         fallback.push(index);
                         fallback_records.insert(index, account_records);
@@ -948,18 +975,11 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 .map(move |(index, target, endpoints, observed_records)| {
                     let directory = directory.clone();
                     async move {
-                        let query = DirectoryEventQuery::new(
-                            KIND_MARMOT_KEY_PACKAGE,
-                            vec![target.account_id_hex.clone()],
-                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
-                        );
+                        let queries = key_package_queries(vec![target.account_id_hex.clone()]);
                         let result = async {
                             let (mut records, complete) = match directory
                                 .relay_plane
-                                .fetch_directory_events_with_completion(
-                                    endpoints.clone(),
-                                    vec![query],
-                                )
+                                .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                             {
                                 Ok(outcome) => (outcome.records, outcome.complete),
@@ -979,21 +999,20 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                         discovery: &directory.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
+                                        wanted: MAX_KEY_PACKAGES_PER_ACCOUNT,
                                     },
                                 )
                                 .await?;
-                            let mut fetched = preferred_fresh_key_package_from_records(
+                            select_key_packages_from_records(
                                 &target.account_id_hex,
                                 &records.records,
                                 records.freshness,
                                 requirements,
-                                &self.config.key_package_client_preference,
                             )?
-                            // Recovery returned, so lookup coverage is complete.
-                            .into_value_or_missing(&target.account_id_hex)?
-                            .fetched;
-                            fetched.relay_lists = target.relay_lists;
-                            Ok::<_, DirectoryError>(fetched)
+                            // Recovery returned: an empty selection is a
+                            // complete negative, while a non-empty one may
+                            // still leave out a device (D12).
+                            .into_value_or_missing(&target.account_id_hex)
                         }
                         .await;
                         (index, result)
@@ -1002,8 +1021,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let mut fallback_results =
             stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
         while let Some((index, result)) = fallback_results.next().await {
-            outcomes[index] =
-                Some(result.and_then(|fetched| self.accept_fetched_key_package(purpose, fetched)));
+            outcomes[index] = Some(result.and_then(|selected| {
+                self.accept_fetched_key_packages(purpose, selected, &targets[index].relay_lists)
+            }));
         }
     }
 }

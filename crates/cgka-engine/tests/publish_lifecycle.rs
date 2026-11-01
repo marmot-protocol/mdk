@@ -20,11 +20,10 @@ use cgka_engine::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP;
 use cgka_engine::{EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::OutboundFanout;
-use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::{
@@ -34,13 +33,15 @@ use cgka_traits::maintenance::{
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage,
-    GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage, MessageStorage,
-    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
-    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
+    AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
+    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
+    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
+    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStatus,
+    DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage,
+    KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -126,6 +127,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -236,7 +238,7 @@ fn build(id: &[u8]) -> impl CgkaEngine {
 }
 
 fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -248,7 +250,7 @@ fn build_with_clock(id: &[u8], clock: ManualConvergenceClock) -> impl CgkaEngine
 }
 
 fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -288,7 +290,7 @@ fn retained_anchor_snapshot_names(
 
 #[tokio::test]
 async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
@@ -342,7 +344,7 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
 
 #[tokio::test]
 async fn send_gate_filters_stored_rows() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let message_rows = Arc::new(AtomicUsize::new(0));
     let mut alice = EngineBuilder::new(FaultStorage {
         inner: storage.clone(),
@@ -432,7 +434,7 @@ async fn send_gate_filters_stored_rows() {
 
 #[tokio::test]
 async fn current_group_creation_persists_automatic_maintenance_enrollment() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(b"current-alice"))
         .account_identity_proof_signer(proof_signer(b"current-alice"))
@@ -467,7 +469,7 @@ async fn current_group_creation_persists_automatic_maintenance_enrollment() {
 
 #[tokio::test]
 async fn self_update_restart_republishes_the_identical_signed_event() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
@@ -514,7 +516,7 @@ async fn self_update_restart_republishes_the_identical_signed_event() {
 
 #[tokio::test]
 async fn invite_publish_failed_rolls_back_projected_member_set() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -641,6 +643,8 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             payload: StoredMessagePayload::staged_invite_welcome(
                 stale_welcome,
                 MessageId::new(b"rolled-back-origin-commit".to_vec()),
+                None,
+                None,
             )
             .encode()
             .unwrap(),
@@ -769,7 +773,7 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
 
 #[tokio::test]
 async fn confirmed_commits_prune_retained_anchor_snapshots_to_rewind_horizon() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
 
@@ -1459,22 +1463,6 @@ impl CapabilityStorage for FaultStorage {
     ) -> StorageResult<Option<CapabilityRequirement>> {
         self.inner.feature_requirement(feature)
     }
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.inner
-            .save_member_capabilities(group_id, member, capabilities)
-    }
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        self.inner.member_capabilities(group_id, member_id)
-    }
 }
 
 impl ConvergencePolicyStorage for FaultStorage {
@@ -1504,6 +1492,44 @@ impl AccountDeviceSignerStorage for FaultStorage {
         marmot_identity: &MemberId,
     ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
         self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl AccountDeviceHistoryKeyStorage for FaultStorage {
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey> {
+        self.inner.put_account_device_history_key_if_absent(key)
+    }
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>> {
+        self.inner.account_device_history_key(marmot_identity)
+    }
+}
+
+impl DeviceGroupWelcomeStorage for FaultStorage {
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()> {
+        self.inner.put_device_group_welcome_expectation(expectation)
+    }
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectation(group_id)
+    }
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectations()
+    }
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.delete_device_group_welcome_expectation(group_id)
     }
 }
 
@@ -1719,7 +1745,7 @@ fn build_fault_engine(
     id: &[u8],
     fault: ProcessedFault,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage {
         message_rows: Arc::default(),
@@ -1742,7 +1768,7 @@ fn build_fault_engine(
 
 #[tokio::test]
 async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let disband_request_fault = ProcessedFault::default();
     let mut alice = EngineBuilder::new(FaultStorage {
@@ -1832,7 +1858,7 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
 
 #[test]
 fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
     let lifecycle_fault = ProcessedFault::default();
     let mut engine = EngineBuilder::new(FaultStorage {
@@ -1868,6 +1894,8 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         last_consumed_at: None,
         retained_private_material: Vec::new(),
         pending_replacement: None,
+        unusable_artifact_replaced_by: None,
+        slot_withdrawn_at: None,
     };
 
     lifecycle_fault.arm(1);
@@ -1890,7 +1918,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         .as_mut()
         .unwrap()
         .generation_revision = 0;
-    engine.put_key_package_lifecycle(&state).unwrap();
+    handle.put_key_package_lifecycle(&state).unwrap();
     let old_state = state.clone();
     let old_bundles = handle.stored_key_package_bundles().unwrap();
     lifecycle_fault.arm(1);
@@ -1909,6 +1937,10 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     assert_eq!(
         state.retained_private_material[0].key_package,
         old_state.pending_replacement.unwrap().key_package
+    );
+    assert!(
+        state.retained_private_material[0].awaiting_confirmed_replacement,
+        "no replacement is confirmed yet, so the superseded bundle's grace has not started"
     );
     assert_eq!(handle.stored_key_package_bundles().unwrap().len(), 2);
 }
@@ -2012,7 +2044,7 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
 
     for fail_anchor in [true, false] {
         for remove_member in [false, true] {
-            let storage = SqliteAccountStorage::in_memory().unwrap();
+            let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
             let fault = ConfirmationFault::default();
             let mut alice = EngineBuilder::new(FaultStorage {
                 inner: storage.clone(),
@@ -2030,7 +2062,7 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
             .build()
             .unwrap();
             let peer = |seed: &[u8]| {
-                EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
                     .identity(pad32(seed))
                     .account_identity_proof_signer(proof_signer(seed))
                     .protocol_profile(ProtocolProfile::Current)
@@ -2234,7 +2266,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         Advance::Inputs,
         Advance::DeterministicInputs,
     ] {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let fault = ConfirmationFault::default();
         let clock = ManualConvergenceClock::new(1_000, 10_000);
         let mut alice = EngineBuilder::new(FaultStorage {
@@ -2627,7 +2659,9 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
-    let pinned_epoch = alice.epoch(&group_id).unwrap();
+    let pin = alice.epoch_pin(&group_id).unwrap();
+    let pinned_epoch = pin.epoch;
+    assert_eq!(pinned_epoch, alice.epoch(&group_id).unwrap());
 
     let SendResult::GroupEvolution { pending, .. } = alice
         .send(SendIntent::SelfUpdate {
@@ -2638,13 +2672,17 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
     else {
         panic!("self-update stages a group evolution")
     };
+    // While the commit is pending, the pin names the commit's epoch, whose
+    // secrets the group context exports.
+    let staged = alice.epoch_pin(&group_id).unwrap();
+    assert_eq!(staged.epoch.0, pinned_epoch.0 + 1);
 
     let payload = app_payload_for(&alice, "media bound to the pre-commit epoch");
     let refused = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(pinned_epoch),
+            expected_epoch: Some(pin),
         })
         .await;
     assert!(
@@ -2667,13 +2705,18 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
 
     // The refusal left the group usable: a message pinned to the settled
     // epoch encrypts under exactly that epoch.
-    let settled_epoch = alice.epoch(&group_id).unwrap();
+    let settled = alice.epoch_pin(&group_id).unwrap();
+    assert_eq!(
+        settled, staged,
+        "a pin read while the commit was pending must match once it merges"
+    );
+    let settled_epoch = settled.epoch;
     let payload = app_payload_for(&alice, "re-derived for the new epoch");
     let sent = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(settled_epoch),
+            expected_epoch: Some(settled),
         })
         .await
         .unwrap();
@@ -2697,7 +2740,8 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
     let mut alice = build(b"alice");
     let mut bob = build_with_clock(b"bob", bob_clock.clone());
     let group_id = group_with_bob(&mut alice, &mut bob).await;
-    let pinned_epoch = bob.epoch(&group_id).unwrap();
+    let pin = bob.epoch_pin(&group_id).unwrap();
+    let pinned_epoch = pin.epoch;
 
     let SendResult::GroupEvolution {
         msg: commit,
@@ -2725,7 +2769,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(pinned_epoch),
+            expected_epoch: Some(pin),
         })
         .await;
     let folded_epoch = bob.epoch(&group_id).unwrap();
@@ -2758,6 +2802,127 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
         matches!(
             sent,
             SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == folded_epoch
+        ),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_the_same_epoch() {
+    // The fold can also leave the epoch number where it was: a retained rival
+    // commit from the same source epoch wins branch selection inside the
+    // send's own preflight and replaces this device's commit. The group is
+    // still at the pinned number, on another branch whose key schedule the
+    // pinned payload was not bound to. The pin's identity must refuse it.
+    let (winner_id, loser_id) = if pad32(b"same-epoch-a") < pad32(b"same-epoch-b") {
+        (b"same-epoch-a".as_slice(), b"same-epoch-b".as_slice())
+    } else {
+        (b"same-epoch-b".as_slice(), b"same-epoch-a".as_slice())
+    };
+    let loser_clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut winner = build_with_clock(winner_id, ManualConvergenceClock::new(1_000, 10_000));
+    let mut loser = build_with_clock(loser_id, loser_clock.clone());
+    let mut carol = build(b"same-epoch-carol");
+    let mut dave = build(b"same-epoch-dave");
+
+    let loser_kp = loser.fresh_key_package().await.unwrap();
+    let (group_id, created) = winner
+        .create_group(CreateGroupRequest {
+            name: "same-epoch rival".into(),
+            description: String::new(),
+            members: vec![loser_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // Both commits below are privileged, so they order by committer
+            // identity and the winner's sorts first.
+            initial_admins: vec![loser.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("expected a staged group creation")
+    };
+    winner.confirm_published(pending).await.unwrap();
+    for welcome in welcomes {
+        loser.join_welcome(welcome).await.unwrap();
+    }
+    let source_epoch = loser.epoch(&group_id).unwrap();
+
+    let invite = async |engine: &mut _, key_package| {
+        let SendResult::GroupEvolution { msg, pending, .. } = CgkaEngine::send(
+            engine,
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![key_package],
+                initial_admins: vec![],
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("an invite stages a group evolution")
+        };
+        CgkaEngine::confirm_published(engine, pending)
+            .await
+            .unwrap();
+        msg
+    };
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    invite(&mut loser, carol_kp).await;
+    let rival = invite(&mut winner, dave_kp).await;
+
+    // The loser pins the epoch its own commit reached, then holds the rival
+    // as retained convergence input.
+    let pin = loser.epoch_pin(&group_id).unwrap();
+    assert_eq!(pin.epoch.0, source_epoch.0 + 1);
+    assert_ne!(
+        pin,
+        winner.epoch_pin(&group_id).unwrap(),
+        "two branches at one epoch number must not share a pin"
+    );
+    loser.ingest(rival).await.unwrap();
+    assert_eq!(loser.epoch_pin(&group_id).unwrap(), pin);
+    loser_clock.advance_ms(1_000);
+
+    let payload = app_payload_for(&loser, "media bound to the losing branch");
+    let refused = loser
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(pin),
+        })
+        .await;
+    let selected = loser.epoch_pin(&group_id).unwrap();
+    assert_eq!(
+        selected,
+        winner.epoch_pin(&group_id).unwrap(),
+        "the send must have selected the rival branch before preparing"
+    );
+    assert_eq!(selected.epoch, pin.epoch);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AppMessageEpochMismatch { expected, current })
+                if expected == pin.epoch && current == pin.epoch
+        ),
+        "expected a same-number epoch mismatch, got {refused:?}"
+    );
+
+    // Nothing was prepared: a message pinned to the selected branch goes out
+    // under it.
+    let payload = app_payload_for(&loser, "re-derived for the selected branch");
+    let sent = loser
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(selected),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent,
+            SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == selected.epoch
         ),
         "{sent:?}"
     );
@@ -2911,7 +3076,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
     // traffic touches it or the process restarts. Unknown must therefore be
     // treated as retained.
     for resolve_by_confirming in [true, false] {
-        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
         let queued_intent_list_fault = ProcessedFault::default();
         let mut alice = EngineBuilder::new(FaultStorage {
             message_rows: Arc::default(),
@@ -2981,7 +3146,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
 
 #[tokio::test]
 async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
-    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let queued_intent_list_fault = ProcessedFault::default();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = EngineBuilder::new(FaultStorage {
@@ -3071,7 +3236,7 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
     // which neither `confirm_published` nor `publish_failed` is ever called.
     // Without a cap, a sender looping into that group grows the durable store
     // without bound while every call still reports `Queued`.
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
@@ -3214,7 +3379,10 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
 /// under a publication this client is still holding.
 #[tokio::test]
 async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved() {
-    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut alice = build_engine_with_storage(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
     let stable_epoch = alice.epoch(&group_id).unwrap();
@@ -3269,7 +3437,10 @@ async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved()
 /// empty no-op, and the publication still resolves through its own transition.
 #[tokio::test]
 async fn an_inbound_commit_under_a_held_publication_is_retained_not_converged() {
-    let mut alice = build_engine_with_storage(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut alice = build_engine_with_storage(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+    );
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
 

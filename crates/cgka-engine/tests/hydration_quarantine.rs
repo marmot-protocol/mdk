@@ -6,19 +6,20 @@ use cgka_traits::engine::{
     SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
-    DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
-    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
-    WelcomeStorage,
+    AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage, AccountDeviceSignerBinding,
+    AccountDeviceSignerStorage, CapabilityStorage, ConvergencePassStorage,
+    ConvergencePolicyStorage, DeviceGroupWelcomeExpectation, DeviceGroupWelcomeStorage,
+    DisbandCandidate, DisbandCandidateStorage, DisbandRequest, DisbandRequestStorage,
+    DisbandTombstoneStorage, GroupStateCheckpointRef, GroupStorage, KeyPackageBundleStorage,
+    LeaveRequest, LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -101,6 +102,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -247,7 +249,7 @@ fn assert_probe_work_rows(
 
 #[tokio::test]
 async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let healthy_group = create_confirmed_group(&mut initial).await;
     let healthy_epoch = storage.get_group(&healthy_group).unwrap().epoch;
@@ -311,7 +313,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
 
 #[tokio::test]
 async fn hydration_classifies_stored_wire_profile_mismatch_as_member_validation_failure() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     drop(initial);
@@ -343,7 +345,7 @@ async fn hydration_classifies_stored_wire_profile_mismatch_as_member_validation_
 
 #[tokio::test]
 async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_group() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let broken_group = GroupId::new(vec![0]);
     insert_marmot_group_without_openmls_state(&storage, &broken_group, "broken-first", 3);
 
@@ -744,22 +746,6 @@ impl CapabilityStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Option<CapabilityRequirement>> {
         self.inner.feature_requirement(feature)
     }
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.inner
-            .save_member_capabilities(group_id, member, capabilities)
-    }
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        self.inner.member_capabilities(group_id, member_id)
-    }
 }
 
 impl ConvergencePolicyStorage for FlakyGroupRecordStorage {
@@ -789,6 +775,44 @@ impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
         marmot_identity: &MemberId,
     ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
         self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl AccountDeviceHistoryKeyStorage for FlakyGroupRecordStorage {
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey> {
+        self.inner.put_account_device_history_key_if_absent(key)
+    }
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>> {
+        self.inner.account_device_history_key(marmot_identity)
+    }
+}
+
+impl DeviceGroupWelcomeStorage for FlakyGroupRecordStorage {
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()> {
+        self.inner.put_device_group_welcome_expectation(expectation)
+    }
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectation(group_id)
+    }
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>> {
+        self.inner.device_group_welcome_expectations()
+    }
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.delete_device_group_welcome_expectation(group_id)
     }
 }
 
@@ -888,7 +912,7 @@ fn build_current_flaky_engine(
 }
 
 fn build_current_named_client(name: &[u8]) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().expect("storage"))
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().expect("storage"))
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
@@ -899,7 +923,8 @@ fn build_current_named_client(name: &[u8]) -> Engine<SqliteAccountStorage> {
 
 #[tokio::test]
 async fn welcome_delivery_accessors_hide_quarantined_groups() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut alice = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
     let mut bob = build_current_named_client(b"bob-quarantined-welcome");
     let bob_key_package = bob.fresh_key_package().await.expect("bob key package");
@@ -982,7 +1007,8 @@ async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorag
 
 #[tokio::test]
 async fn retry_recovers_a_transiently_quarantined_group() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     let group_epoch = initial.group_record(&group_id).unwrap().epoch;
@@ -1036,7 +1062,8 @@ async fn retry_recovers_a_transiently_quarantined_group() {
 
 #[tokio::test]
 async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     drop(initial);
@@ -1071,7 +1098,8 @@ async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
 /// replay is lost) is the one the design forbids.
 #[tokio::test]
 async fn a_failed_announce_mark_replays_again_instead_of_quarantining() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     let epoch = initial.group_record(&group_id).unwrap().epoch;
@@ -1152,7 +1180,8 @@ async fn a_failed_announce_mark_replays_again_instead_of_quarantining() {
 /// though the mirror still says otherwise.
 #[tokio::test]
 async fn retrying_a_quarantined_terminal_group_announces_once_despite_a_stale_mirror() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     let mut record = initial.group_record(&group_id).unwrap();
@@ -1230,7 +1259,8 @@ async fn retrying_a_quarantined_terminal_group_announces_once_despite_a_stale_mi
 
 #[tokio::test]
 async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     let baseline_epoch = initial.epoch(&group_id).unwrap();
@@ -1352,7 +1382,8 @@ async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
 
 #[tokio::test]
 async fn retry_keeps_group_quarantined_when_still_unhealthy() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     drop(initial);
@@ -1392,7 +1423,8 @@ async fn retry_keeps_group_quarantined_when_still_unhealthy() {
 /// because it deliberately skips that path's quarantine event.
 #[tokio::test]
 async fn failed_retry_clears_the_epoch_entry_hydration_already_wrote() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     drop(initial);
@@ -1425,7 +1457,8 @@ async fn failed_retry_clears_the_epoch_entry_hydration_already_wrote() {
 
 #[tokio::test]
 async fn a_failed_retry_republishes_a_restored_evolution_exactly_once() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut initial = build_flaky_engine(storage.clone());
     let group_id = create_confirmed_group_flaky(&mut initial).await;
     // Stage a self-update and lose the process before resolving it: the
@@ -1510,7 +1543,8 @@ async fn a_failed_retry_republishes_a_restored_evolution_exactly_once() {
 
 #[tokio::test]
 async fn retry_for_unknown_group_errors() {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut engine = build_flaky_engine(storage);
     let unknown = GroupId::new(b"never-quarantined".to_vec());
     assert!(matches!(
@@ -1522,7 +1556,7 @@ async fn retry_for_unknown_group_errors() {
 // ── Quarantine enforcement on the live data path (mdk#364 / #365) ──
 
 fn build_named_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -1575,7 +1609,8 @@ async fn quarantined_alice_with_live_bob() -> (
     Engine<SqliteAccountStorage>,
     GroupId,
 ) {
-    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let storage =
+        FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory_for_test().expect("storage"));
     let mut alice = build_flaky_engine(storage.clone());
     let (mut bob, _bob_storage) = build_named_client(b"bob-quarantine");
 
@@ -1858,7 +1893,7 @@ async fn rejoin_welcome_clears_quarantine() {
     };
     bob.confirm_published(pending).await.expect("bob confirms");
 
-    let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice-rejoin"))
@@ -1940,7 +1975,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
     };
     bob.confirm_published(pending).await.expect("bob confirms");
 
-    let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice-replay"))
@@ -2022,7 +2057,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
 // skipped, and the group still hydrates to the same epoch.
 #[tokio::test]
 async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group = create_confirmed_group(&mut initial).await;
     let epoch = storage.get_group(&group).unwrap().epoch;
@@ -2065,7 +2100,7 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
 // snapshot before it reads either the Marmot record or the OpenMLS group.
 #[tokio::test]
 async fn hydration_recovers_interrupted_retained_anchor_probe() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2126,7 +2161,7 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
 // A crash mid-rewind must be recovered on the same rail.
 #[tokio::test]
 async fn hydration_recovers_interrupted_candidate_branch_probe() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2194,7 +2229,7 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
 // rewound epoch as this device's own.
 #[tokio::test]
 async fn hydration_recovers_interrupted_past_peel_rewind() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2258,7 +2293,7 @@ async fn hydration_recovers_interrupted_past_peel_rewind() {
 // them into one row and silently disarm this check.
 #[tokio::test]
 async fn hydration_fails_closed_on_two_interrupted_rewind_probes_of_different_kinds() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     drop(initial);
@@ -2292,7 +2327,7 @@ async fn hydration_fails_closed_on_two_interrupted_rewind_probes_of_different_ki
 // restore the outer and drop the inner rather than refuse the group.
 #[tokio::test]
 async fn hydration_recovers_the_outermost_of_two_nested_interrupted_guards() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2348,7 +2383,7 @@ async fn hydration_recovers_the_outermost_of_two_nested_interrupted_guards() {
 // and holds the only copy of the pre-replay live state.
 #[tokio::test]
 async fn hydration_recovers_a_standalone_interrupted_replay() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2402,7 +2437,7 @@ async fn hydration_recovers_a_standalone_interrupted_replay() {
 // pre-apply live state rather than accepting a partially rewound projection.
 #[tokio::test]
 async fn hydration_recovers_interrupted_convergence_apply() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial).await;
     let live_group = storage.get_group(&group_id).expect("live group");
@@ -2447,7 +2482,7 @@ async fn hydration_recovers_interrupted_convergence_apply() {
 // still hydrates (full validation passes) and the marker is refreshed.
 #[tokio::test]
 async fn stale_validation_marker_forces_revalidation_and_refresh() {
-    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
     let mut initial = build_engine(storage.clone());
     let group = create_confirmed_group(&mut initial).await;
     let epoch = storage.get_group(&group).unwrap().epoch;

@@ -56,6 +56,8 @@ pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
 pub const PUSH_VERSION: &str = "marmot-push-v1";
 pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
 const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
+/// Most elements a kind 447 announce's `have` may carry.
+const PUSH_MAX_HAVE_ENTRIES: usize = 4_096;
 const PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS: usize = 32;
 // NIP-59's nested encryption fits 19 tokens below a 64 KiB event ceiling;
 // 20 tokens cross it. The protocol's 32-token rumor bound remains separate.
@@ -320,6 +322,10 @@ pub struct NotificationUpdate {
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
+    /// Typed Sonar sticker reference for an otherwise-empty kind-9 message.
+    /// Host apps localize the notification body (for example, "Sticker") and
+    /// never need to parse raw tags.
+    pub sticker: Option<crate::AppStickerRef>,
     /// Reaction emoji (Nostr kind 7 content); `None` for non-reactions. Additive
     /// at the DTO level (no `trigger`/`preview_text` change), but it changes the
     /// generated UniFFI record: consumers must regenerate bindings and ship the
@@ -350,6 +356,8 @@ pub struct LocalPushRegistrationDebug {
     pub shareable: bool,
     pub local_notifications_enabled: bool,
     pub native_push_enabled: bool,
+    /// This device's own leaf in the group, or `None` while it holds no
+    /// active leaf (for example after its removal).
     pub local_leaf_index: Option<u32>,
     pub local_token_cached: bool,
 }
@@ -362,7 +370,9 @@ pub struct GroupPushTokenDebugEntry {
     pub token_fingerprint: String,
     pub server_pubkey_hex: String,
     pub has_relay_hint: bool,
+    /// The record's member holds at least one leaf in the group's current tree.
     pub active_leaf: bool,
+    /// The member still holds the record's leaf. Only these records are active.
     pub member_matches_active_leaf: bool,
     pub is_local_member: bool,
     pub updated_at_ms: i64,
@@ -371,7 +381,10 @@ pub struct GroupPushTokenDebugEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPushDebugInfo {
     pub total_token_count: u32,
+    /// Records whose member still holds the record's leaf.
     pub active_token_count: u32,
+    /// Records whose member no longer holds the record's leaf: it is blank or
+    /// another member's.
     pub stale_token_count: u32,
     pub missing_relay_hint_count: u32,
     pub last_token_list_updated_at_ms: Option<i64>,
@@ -398,6 +411,16 @@ pub(crate) struct PushTokenGossipEntry {
     pub encrypted_token: String,
     pub owner_ts: i64,
     pub owner_sig: String,
+}
+
+/// A kind 447 announce: the sender's own current records in `tokens`, and in
+/// `have` the records and tombstones it holds in the group, each named by
+/// [`push_have_element`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PushTokenAnnouncePayload {
+    pub v: String,
+    pub tokens: Vec<PushTokenGossipEntry>,
+    pub have: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -503,6 +526,27 @@ pub(crate) struct PushTokenRemovalRecord {
     pub server_pubkey_hex: String,
     pub owner_ts: i64,
     pub owner_sig: String,
+}
+
+/// A token record read back from storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredGroupPushToken {
+    pub record: GroupPushTokenRecord,
+    /// `SHA-256(SignedRecord)` hex as stored for the record. `None` when the
+    /// stored digest is not the one the record's fields produce, or the fields
+    /// produce none.
+    pub record_digest: Option<String>,
+}
+
+/// A tombstone read back from storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredPushTokenTombstone {
+    /// `SHA-256(SignedRecord)` hex of the removal, as stored.
+    pub record_digest: String,
+    /// The owner-signed removal, which any member may relay unchanged in a kind
+    /// 449. `None` for a tombstone written before migration 0118: it kept no
+    /// signature and stays local-only.
+    pub removal: Option<PushTokenRemovalRecord>,
 }
 
 pub fn parse_provider_token(platform: PushPlatform, raw_token: &str) -> Result<Vec<u8>, AppError> {
@@ -1156,19 +1200,167 @@ pub(crate) async fn local_token_removal_payload(
     record.sign_owner_with_signer(group_id_hex, signer).await?;
     let payload = PushTokenRemovalPayload {
         v: PUSH_VERSION.to_owned(),
-        removals: vec![PushTokenRemovalEntry {
-            member_id_hex: record.member_id_hex.clone(),
-            leaf_index: record.leaf_index,
-            platform: record.platform.as_str().to_owned(),
-            token_fingerprint: record.token_fingerprint.clone(),
-            server_pubkey_hex: record.server_pubkey_hex.clone(),
-            owner_ts: record.owner_ts,
-            owner_sig: record.owner_sig.clone(),
-        }],
+        removals: vec![PushTokenRemovalEntry::from_record(&record)],
     };
     Ok((payload, record))
 }
 
+/// The `have` element naming the record or tombstone whose
+/// `SHA-256(SignedRecord)` is `record_digest_hex`: the digest's first 8 bytes
+/// as standard base64. `None` unless the digest is 64 hex characters.
+pub(crate) fn push_have_element(record_digest_hex: &str) -> Option<String> {
+    push_have_prefix(record_digest_hex).map(|prefix| BASE64_STANDARD.encode(prefix))
+}
+
+/// The digest prefix a `have` element names for the record or tombstone whose
+/// `SHA-256(SignedRecord)` is `record_digest_hex`. `None` unless the digest is
+/// 64 hex characters.
+pub(crate) fn push_have_prefix(record_digest_hex: &str) -> Option<[u8; 8]> {
+    if record_digest_hex.len() != 64 {
+        return None;
+    }
+    let digest = hex::decode(record_digest_hex).ok()?;
+    <[u8; 8]>::try_from(&digest[..8]).ok()
+}
+
+/// The `have` of a kind 447 that asks members for what its sender lacks: the
+/// 8-byte digest prefixes it names. A request names none.
+pub(crate) type PushHave = HashSet<[u8; 8]>;
+
+/// What an inbound kind 447 asks of the members that receive it: an announce
+/// asks for what its `have` lacks, and a request (empty or missing `tokens`,
+/// no `have`)
+/// for everything, as an announce whose `have` is empty. `None` for a
+/// self-update with no `have`, or whose `have` is not an array or holds more
+/// than 4,096 elements: such a `have` is ignored before any element is
+/// decoded, and the 447 draws no repair reply. An element that is not a
+/// string decoding to exactly 8 bytes names nothing.
+///
+/// This reads only `v`, `tokens` and `have`; the 447's entries are applied
+/// by [`parse_push_gossip`] whatever its `have` holds.
+pub(crate) fn parse_push_repair_ask(content: &str) -> Option<PushHave> {
+    let shape: PushRepairAskShape = serde_json::from_str(content).ok()?;
+    if shape.v != PUSH_VERSION {
+        return None;
+    }
+    match (shape.tokens, shape.have) {
+        // A missing `tokens` reads as an empty one.
+        (PushArrayLen::Absent | PushArrayLen::Len(0), PushArrayLen::Absent) => {
+            Some(PushHave::new())
+        }
+        (_, PushArrayLen::Len(_)) => {
+            let elements: PushHaveElements = serde_json::from_str(content).ok()?;
+            Some(
+                elements
+                    .have
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|element| BASE64_STANDARD.decode(element).ok())
+                    .filter_map(|digest| <[u8; 8]>::try_from(digest).ok())
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// A 447's `v`, and the shape of its `tokens` and `have`. A `have` of more
+/// than 4,096 elements fails the whole shape. Nothing here decodes an entry
+/// or element.
+#[derive(Deserialize)]
+struct PushRepairAskShape {
+    v: String,
+    #[serde(default)]
+    tokens: PushArrayLen<{ usize::MAX }>,
+    #[serde(default)]
+    have: PushArrayLen<PUSH_MAX_HAVE_ENTRIES>,
+}
+
+/// A JSON member's shape: absent, not an array, or an array of at most `MAX`
+/// elements, counted without decoding any. A longer array fails to
+/// deserialize as soon as its element `MAX + 1` is seen.
+#[derive(Default)]
+enum PushArrayLen<const MAX: usize> {
+    #[default]
+    Absent,
+    NotArray,
+    Len(usize),
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for PushArrayLen<MAX> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LenVisitor<const MAX: usize>;
+
+        impl<'de, const MAX: usize> Visitor<'de> for LenVisitor<MAX> {
+            type Value = PushArrayLen<MAX>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "any JSON value")
+            }
+
+            fn visit_seq<A>(self, mut elements: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0_usize;
+                while elements.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                    if count > MAX {
+                        return Err(A::Error::custom(format!("array exceeds {MAX} elements")));
+                    }
+                }
+                Ok(PushArrayLen::Len(count))
+            }
+
+            fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while entries.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+        }
+
+        deserializer.deserialize_any(LenVisitor::<MAX>)
+    }
+}
+
+/// A `have` already checked to be an array within the element limit.
+#[derive(Deserialize)]
+struct PushHaveElements {
+    have: Vec<serde_json::Value>,
+}
+
+/// Decode inbound kind 447, 448 or 449 content. A 447's `have` is read
+/// separately, by [`parse_push_repair_ask`]: whatever it holds, this applies
+/// the 447 as the self-update or request its `tokens` make it.
 pub(crate) fn parse_push_gossip(
     kind: u64,
     group_id_hex: &str,
@@ -1338,6 +1530,18 @@ impl PushTokenGossipEntry {
 }
 
 impl PushTokenRemovalEntry {
+    fn from_record(record: &PushTokenRemovalRecord) -> Self {
+        Self {
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.as_str().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
+        }
+    }
+
     fn into_record(self) -> Result<PushTokenRemovalRecord, AppError> {
         validate_account_hex(&self.member_id_hex, "member id")?;
         validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;
@@ -1615,6 +1819,13 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }
@@ -1857,6 +2068,7 @@ fn notification_update_from_classified_group_state(
         sender,
         receiver,
         preview_text: None,
+        sticker: None,
         reaction_emoji: None,
         reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
@@ -1970,6 +2182,7 @@ fn notification_update_from_message(
         sender,
         receiver,
         preview_text: preview_text_for_message(&event.message),
+        sticker: crate::sticker_ref_from_message(&event.message),
         reaction_emoji,
         reacted_to_preview,
         timestamp_ms: unix_now_ms(),
@@ -2032,6 +2245,7 @@ fn notification_update_from_group_join(
         sender,
         receiver,
         preview_text: None,
+        sticker: None,
         reaction_emoji: None,
         reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
@@ -2101,11 +2315,13 @@ pub(crate) fn message_text_mentions_account(
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
-/// kinds and blank text never produce a preview. Structured agent kinds expose
-/// only approved text/status fields; group-system rows expose supported parsed
-/// text only, so their JSON envelope never reaches a notification payload.
+/// kinds, device-group kinds and blank text never produce a preview.
+/// Structured agent kinds expose only approved text/status fields;
+/// group-system rows expose supported parsed text only, so their JSON envelope
+/// never reaches a notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind)
+        || crate::client::device_group::is_device_group_kind(kind)
         || kind == MARMOT_APP_EVENT_KIND_POLL
         || plaintext.trim().is_empty()
     {
@@ -2218,19 +2434,26 @@ pub(crate) fn dedupe_notification_updates(
     out
 }
 
+/// Check each stored token record against the group's canonical
+/// `(member_id_hex, leaf_index)` roster, the one push-token leaf
+/// reconciliation uses. `local_leaf_index` is this device's own leaf; a
+/// member's sibling leaves share its member id, so it is not derived here.
 pub(crate) fn group_debug_info(
     settings: NotificationSettings,
     registration: Option<StoredPushRegistration>,
     tokens: Vec<GroupPushTokenRecord>,
     local_account_id_hex: &str,
-    active_members: &[String],
+    member_leaves: &[(String, u32)],
+    local_leaf_index: Option<u32>,
 ) -> GroupPushDebugInfo {
-    let active_by_member = active_members
+    let active_leaves = member_leaves
         .iter()
-        .enumerate()
-        .map(|(index, member)| (member.clone(), index as u32))
-        .collect::<BTreeMap<_, _>>();
-    let local_leaf_index = active_by_member.get(local_account_id_hex).copied();
+        .map(|(member, leaf_index)| (member.as_str(), *leaf_index))
+        .collect::<HashSet<_>>();
+    let active_members = member_leaves
+        .iter()
+        .map(|(member, _)| member.as_str())
+        .collect::<HashSet<_>>();
     let local_token_cached = registration.is_some();
     let mut latest = None;
     let mut active_count = 0_u32;
@@ -2243,11 +2466,10 @@ pub(crate) fn group_debug_info(
         if token.relay_hint.is_none() {
             missing_relay_hint_count += 1;
         }
-        let active_leaf = active_by_member.contains_key(&token.member_id_hex);
-        let member_matches_active_leaf = active_by_member
-            .get(&token.member_id_hex)
-            .is_some_and(|leaf_index| *leaf_index == token.leaf_index);
-        if active_leaf && member_matches_active_leaf {
+        let active_leaf = active_members.contains(token.member_id_hex.as_str());
+        let member_matches_active_leaf =
+            active_leaves.contains(&(token.member_id_hex.as_str(), token.leaf_index));
+        if member_matches_active_leaf {
             active_count += 1;
         }
         entries.push(GroupPushTokenDebugEntry {
@@ -2418,6 +2640,9 @@ pub(crate) fn decrypt_push_token_for_test(
     validate_provider_token_len(&plaintext[3..3 + token_len])?;
     Ok((platform, plaintext[3..3 + token_len].to_vec()))
 }
+
+mod lists;
+pub(crate) use lists::{PushGossipLists, push_announce, push_gossip_lists};
 
 #[cfg(test)]
 mod tests;

@@ -2,8 +2,186 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
+  found in its own slot that it did not make, which only this device warns
+  of. Kind 462 is no longer reserved. The device roster changed its encoding,
+  so existing development device groups must be recreated.
+
+- A device that its device group removes after its link was made is
+  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
+  signed out. `MarmotEventFfi` adds `DeviceUnlinked { account_id_hex,
+  account_label }`, sent once; `AccountSummaryFfi` adds `unlinked`; and
+  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in,
+  logging in or importing the key of such an account returns. Show that this
+  device was unlinked and offer
+  `sign_out_and_wipe`, which skips leaving chats and deleting the slot;
+  signing in again is then a new link. Update exhaustive Swift/Kotlin
+  handling and regenerate bindings with the matching native library.
+
+- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
+  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
+  stays in through another of its devices. Show no "removed from group"
+  notice for it. Update exhaustive Swift/Kotlin handling and regenerate
+  bindings with the matching native library.
+
+- `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
+  reason }` (mdk#2694): a send that waited for the group to settle was dropped
+  because the settled state refused it; tell the user, who may try again.
+  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
+  matching native library.
+
+- `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
+  (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
+  with the matching native library.
+
+- `MarmotEventFfi` adds `KeyPackageRefreshOverdueChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+- `MarmotEventFfi` adds `DeviceLinkChanged { account_id_hex, account_label }`
+  (mdk#2628 item 3.3b). Update exhaustive Swift/Kotlin handling and regenerate
+  bindings with the matching native library.
+
+- `MarmotEventFfi` adds `UnrecognizedSignInsChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+
+- `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library. Neither is produced until the recovery runner owns history.
+
+- `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
+  for an `enable_account_devices` call the group cannot take now (mdk#2628).
+  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
+  matching native library.
+
+- `MarmotDeploymentFfi` drops `key_package_preferred_clients` and
+  `key_package_last_clients` (mdk#2628): the KeyPackage `client` tag no longer
+  ranks invite candidates. Remove them from any record a host builds field by
+  field and regenerate bindings with the matching native library; hosts that
+  start from `marmot_deployment_white_noise()` or `marmot_deployment_neutral()`
+  only regenerate.
+
+- `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch, current_epoch }`
+  and `MediaReferenceEpochUnsettled { source_epoch }`. They replace the
+  generic `InvalidMediaReference` for these two cases: the first means the
+  group left the epoch the attachment was encrypted under, so upload the file
+  again; the second means the epoch is settling, so sync and send again. Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library (#2158).
+
+- Sonar-compatible stickers. `MarmotKitError` adds `InvalidSticker`, `StickerNotFound`,
+  `StickerNetwork`, `StickerImport` and `StickerImportUnsupported`; they previously had no
+  sticker path. `AppMessageRecordFfi`, `ReceivedMessageFfi`, `NotificationUpdateFfi`,
+  `ChatListMessagePreviewFfi`, `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` add
+  `sticker: Option<StickerRefFfi>`, the typed kind-9 sticker reference; it is `None` for a
+  deleted row. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when`
+  handling and code that constructs these records. New `Marmot` methods `sticker_packs`,
+  `sticker_pack`, `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`,
+  `uninstall_sticker_pack`, `fetch_sticker_asset`, `send_sticker` and
+  `import_signal_sticker_pack` (which validates the link and then refuses before any
+  network call) use the new `StickerRefFfi`, `StickerFfi`, `StickerPackFfi`,
+  `StickerAssetFfi`, `StickerSyncResultFfi` and `StickerImportResultFfi` records.
+  `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
+
+### Added
+
+- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
+  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
+  whether the inbox's is (`inbox_catching_up`), and every notice as
+  `history_notices` lists them (mdk#2660). Re-read it on
+  `RecoveryStatusChanged`. Until the recovery runner owns history nothing is
+  ever catching up.
+
+- `MarmotOptions.devicePlatform` names the platform this device runs on, such
+  as `iOS`. With `clientName`, each device writes it into its own roster
+  entry, so `linked_devices` shows every device's client and platform
+  (mdk#2628 item 3.6). Defaults to none; written only where device groups are.
+
+- `rename_linked_device(account_ref, slot_id_hex, label)` renames one of this
+  account's devices, this one included, with one roster commit in the device
+  group (mdk#2628 item 3.6). It is refused with nothing sent while the device
+  group has an earlier change in flight (`device_group_busy`; retry later),
+  and in release builds until the roster's spec lands. A rename whose commit
+  loses a fork is made again later, unless another rename of that device
+  won.
+
+- `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
+  whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
+  syncing; `retry_group_convergence` grants one more attempt. Regenerate
+  bindings with the matching native library.
+- Device linking (mdk#2628 item 3.3b): `start_device_link`,
+  `confirm_device_link_match` and `cancel_device_link` on the new device,
+  `link_device` and `decline_device_link` on a device already signed in, and
+  `device_link_snapshot`, each returning a `DeviceLinkSnapshotFfi`. Re-read it
+  on `DeviceLinkChanged`. Every call is refused in release builds until the
+  pairing and device-group specs land.
+
+- `linked_devices(account_ref)` returns this account's own devices as
+  `LinkedDeviceFfi` records, from the roster of the device group this device
+  trusts, this device first (mdk#2628 item 3.1). Re-read it on
+  `LinkedDevicesChanged`. It is empty in release builds until the roster's
+  spec lands.
+- `LinkedDeviceFfi` adds `last_active_at`, when a heartbeat last showed a
+  sibling running, and `inactive`, this device's own judgement 30 days after
+  the later of that and when it first found the sibling in the roster
+  (mdk#2628 item 3.6). Each device sends a heartbeat in the device group at
+  most once an hour while it runs. Release builds show neither.
+
+- `key_package_refresh_overdue(account_ref)` says when this device's device
+  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
+  so the app can tell the user before inviters stop treating the device as
+  fresh at 30 days. Re-read it on `KeyPackageRefreshOverdueChanged`. It is
+  false in release builds until the roster's spec lands.
+
+- `unrecognized_sign_ins(account_ref)` returns sign-ins of this account that
+  this device does not recognize as `UnrecognizedSignInFfi` records (mdk#2628
+  item 3.2). `answer_sign_in(account_ref, slot_id_hex, response)` answers one
+  with a `SignInResponseFfi`, and `check_sign_ins(account_ref)` checks now.
+  Re-read the list on `UnrecognizedSignInsChanged`. It is empty in release
+  builds until the roster's spec lands.
+
+- `compromise_warning(account_ref)` returns the account's open compromise
+  warning on this device as `CompromiseWarningItemFfi` records (mdk#2628 item
+  3.7a), and `dismiss_compromise_warning(account_ref)` closes it on this
+  device. Re-read it on `CompromiseWarningChanged`. `start_fresh(account_ref)`
+  answers every sign-in from before this device Not now without rejecting
+  any, and `started_fresh(account_ref)` says whether the device did so and
+  still has no device group. All are empty or false in release builds until
+  the roster's spec lands.
+
+- An admin can turn on account-devices in an existing group (mdk#2628):
+  `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
+  only when the user asks, and the group can never turn it off.
+  `account_devices_activation(account_ref, group_id_hex)` answers whether the
+  group is eligible with an `AccountDevicesActivationFfi` (`Eligible`,
+  `NotAdmin`, `AlreadyEnabled`, `LegacyGroup`, `MembersNeedUpdate`,
+  `DevicesNeedReplacement`, `DeviceLimitExceeded`) that never names which members or devices hold it
+  back. See the README's "Turning on account devices".
+
 ### Changed
 
+- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
+  475 and 476 as reserved, and one received in a chat makes no timeline row,
+  message or notification (mdk#2628). They are read only in the account's
+  device group.
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
+  last 30 days, at most 20, or the single best one when none is that recent.
+  See the README's KeyPackage selection section.
+- Group member rows are accounts, not devices (mdk#2628). `group_members`,
+  `group_details`, `group_roster`, `group_member_ids_page` and
+  `group_conversation_snapshot` list an account with several devices in the
+  group once, and `AppGroupMemberRecordFfi` and `GroupMemberDetailsFfi` gain
+  `device_count` (binding default 1). `member_count`, admin counts and
+  `is_last_admin` count accounts, and a chat between two accounts stays direct
+  whatever devices either person uses.
 - `AttachmentTransferSubscription.next()` returns a replacement that changes a
   row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A host that polled
@@ -22,6 +200,9 @@
     failure reads `local storage error`, an unknown engine group `unknown
     local group`, and any other engine failure `session error`. Account
     failures outside the engine still read `account error`.
+- `new_with_client_name` and `MarmotOptions.client_name` leave out a name
+  longer than 64 bytes once trimmed instead of publishing it; the KeyPackage
+  still publishes, untagged (mdk#2628).
 
 ## 0.14.0 - 2026-10-23
 

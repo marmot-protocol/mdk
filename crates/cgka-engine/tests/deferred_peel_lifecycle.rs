@@ -103,6 +103,7 @@ fn passthrough_welcome(msg: &TransportMessage) -> Result<PeeledMessage, PeelerEr
         content: PeeledContent::Welcome {
             created_at: None,
             bytes: msg.payload.clone(),
+            key_package_event_id: None,
         },
         origin: msg.clone(),
     })
@@ -345,7 +346,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
 }
 
 fn build_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -374,7 +375,7 @@ fn build_gated_client<P>(
 where
     P: TransportPeeler + Clone + 'static,
 {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -464,7 +465,7 @@ where
 }
 
 fn build_epoch_sealed_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_epoch_sealed_client_with_storage(name, storage.clone());
     (engine, storage)
 }
@@ -696,7 +697,7 @@ async fn contested_rival_app_backlog_with_peeler<P>(
 where
     P: TransportPeeler + 'static,
 {
-    let incumbent_storage = SqliteAccountStorage::in_memory().unwrap();
+    let incumbent_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut incumbent = build_epoch_sealed_client_with_storage_and_peeler(
         b"candidate-cache-incumbent",
         incumbent_storage.clone(),
@@ -1653,7 +1654,7 @@ async fn deferred_peel_redeferral_records_no_self_transition() {
     let dir = tempfile::TempDir::new().unwrap();
     let audit_path = dir.path().join("audit.jsonl");
     let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, "carol".into()).unwrap();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let peeler = CountingEpochGatePeeler::new();
     let mut carol = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
@@ -1783,7 +1784,7 @@ async fn deferred_peel_retry_budget_refuses_without_terminal_dedup() {
 #[tokio::test]
 async fn deferred_peel_residence_survives_restart_and_backward_clock() {
     let clock = ManualConvergenceClock::new(1_000, 10_000);
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let carol_client =
         build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
     let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
@@ -4049,7 +4050,7 @@ async fn alice_disbanding_with_future_epoch_deferred_row() -> (
     TransportMessage,
     Vec<TransportMessage>,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(0, 10_000);
     let peeler = CountingEpochGatePeeler::new();
     let mut alice = build_current_gated_client(
@@ -4061,7 +4062,7 @@ async fn alice_disbanding_with_future_epoch_deferred_row() -> (
     let mut bob = build_current_gated_client(
         b"bob-disband-deferred",
         CountingEpochGatePeeler::new(),
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         ManualConvergenceClock::new(0, 10_000),
     );
 
@@ -4226,7 +4227,7 @@ async fn wedged_victim_crawling_a_rival_branch() -> (
     GroupId,
     TransportMessage,
 ) {
-    let victim_storage = SqliteAccountStorage::in_memory().unwrap();
+    let victim_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut victim =
         build_epoch_sealed_client_with_storage(b"crawl-victim", victim_storage.clone());
     let (mut rival, _rival_storage) = build_epoch_sealed_client(b"crawl-rival");

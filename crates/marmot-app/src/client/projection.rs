@@ -196,6 +196,20 @@ impl AppClient {
         let Some(group_id) = event_group_id(event) else {
             return Ok(None);
         };
+        // A device group is never projected, whatever its events say. Its
+        // join settles whether it is one.
+        if self.state_group_record(group_id).is_none()
+            && self.is_device_group(group_id)?
+            && (!matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. })
+                || self.settle_held_device_group(group_id)?)
+        {
+            self.note_device_roster_changed();
+            // Its roster may now hold a slot this device rejected, or have
+            // lost a rejection it made (mdk#2628 3.2).
+            self.recheck_sign_in_rejections();
+            self.observe_device_group_event(event)?;
+            return Ok(Some(self.ensure_device_group_route(group_id)?));
+        }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {
             return Ok(None);
         }
@@ -228,7 +242,7 @@ impl AppClient {
     /// event cannot rebuild the projection or reinstall a terminal route.
     pub(crate) fn clear_terminal_local_group_deletion_frontiers(
         &self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         for event in &effects.events {
@@ -251,6 +265,14 @@ impl AppClient {
 
     pub(crate) fn refresh_group(&mut self, group_id: &GroupId) {
         if self.state_group_record(group_id).is_none() {
+            match self.is_device_group(group_id) {
+                Ok(true) => {
+                    let _ = self.ensure_device_group_route(group_id);
+                    return;
+                }
+                Err(_) => return,
+                Ok(false) => {}
+            }
             match self.has_local_group_deletion_frontier(group_id) {
                 Ok(true) => {
                     let _ = self.ensure_local_deleted_group_route(group_id);
@@ -556,6 +578,11 @@ impl AppClient {
             changed |= self.reconcile_canonical_self_membership(&group_id)?;
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
+                // A restart settles a join an interrupted run never saw.
+                if self.is_device_group(&group_id)? && self.settle_held_device_group(&group_id)? {
+                    self.ensure_device_group_route(&group_id)?;
+                    continue;
+                }
                 if self
                     .app
                     .account_storage(&self.state.label)?
@@ -580,7 +607,8 @@ impl AppClient {
             };
             let mut dirty = false;
             if let Ok(group) = self.runtime.group_record(&group_id) {
-                let live_count = u64::try_from(group.members.len()).ok();
+                let live_count =
+                    u64::try_from(crate::groups::member_account_count(&group.members)).ok();
                 if projected_group.member_count != live_count {
                     projected_group.member_count = live_count;
                     dirty = true;
@@ -604,6 +632,8 @@ impl AppClient {
     /// Deferred runtime opens call this after their background hydration
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
+        self.reconcile_device_groups()?;
+        self.sync_device_tag_group()?;
         if self.reconcile_live_engine_groups()? {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
@@ -648,7 +678,7 @@ impl AppClient {
                 {
                     // The durable terminal record repairs this again on reopen;
                     // retain the event for the session worker's bounded retry too.
-                    self.retain_applied_effects(&marmot_account::AccountDeviceEffects {
+                    self.retain_applied_effects(&marmot_session::AccountDeviceEffects {
                         events: vec![event],
                         ..Default::default()
                     });
@@ -802,7 +832,7 @@ impl AppClient {
     #[cfg(test)]
     pub(crate) fn finalize_published_app_message_source_retention(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
         self.finalize_published_app_message_source_retention_with_status(effects)
             .map(|(updates, _)| updates)
@@ -812,7 +842,7 @@ impl AppClient {
     /// be retried independently through the durable accepted fanout.
     pub(super) fn finalize_published_app_message_source_retention_with_status(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(Vec<crate::AppProjectionUpdate>, bool), AppError> {
         if effects.published_app_messages.is_empty() {
             return Ok((Vec::new(), true));
@@ -913,7 +943,7 @@ impl AppClient {
     /// instead would delete the only evidence the revival needs.
     fn revive_published_local_send(
         &self,
-        published: &marmot_account::PublishedApplicationMessage,
+        published: &marmot_session::PublishedApplicationMessage,
         group_id_hex: &str,
     ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
         if !self
@@ -1024,7 +1054,7 @@ impl AppClient {
     /// fail. The canonical activity remains valid even if that refresh fails.
     pub(crate) fn queue_own_group_system_projection_updates(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         // Gate on having published a commit: own send paths always carry a
         // report. Reportless convergence effects are synthesized by the inbound
@@ -1439,6 +1469,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::GroupCreateAdminNotMember => "read_marker_failed:group_create_admin_not_member",
+        AppError::GroupInviteIncludesInviter => "read_marker_failed:group_invite_includes_inviter",
+        AppError::DeviceGroupRefused(_) => "read_marker_failed:device_group_refused",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {
@@ -1515,6 +1547,13 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
         AppError::MediaUploadTimedOut => "read_marker_failed:media_upload_timed_out",
         AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",
+        AppError::InvalidSticker(_) => "read_marker_failed:invalid_sticker",
+        AppError::StickerNotFound => "read_marker_failed:sticker_not_found",
+        AppError::StickerRelay(_) => "read_marker_failed:sticker_relay",
+        AppError::StickerImport(_) => "read_marker_failed:sticker_import",
+        AppError::StickerExternalSignerImportUnsupported => {
+            "read_marker_failed:sticker_external_signer_import_unsupported"
+        }
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",

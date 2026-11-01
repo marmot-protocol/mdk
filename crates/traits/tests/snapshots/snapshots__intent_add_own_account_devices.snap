@@ -1,0 +1,25 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::AddOwnAccountDevices\n{ group_id: gid(), key_packages: vec![KeyPackage::new(vec![0xEF; 4])], }"
+---
+{
+  "AddOwnAccountDevices": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "key_packages": [
+      {
+        "bytes": [
+          239,
+          239,
+          239,
+          239
+        ],
+        "protocol_profile": "legacy"
+      }
+    ]
+  }
+}

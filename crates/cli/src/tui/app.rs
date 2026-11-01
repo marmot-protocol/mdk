@@ -128,10 +128,11 @@ pub(crate) struct TuiApp {
     pub(crate) effects: EffectRunner,
     /// Receiver for the launch daemon auto-start's outcome, delivered from its
     /// own one-shot thread and drained on `tick`. Auto-start deliberately does
-    /// not ride the shared FIFO `effects` worker: its `wn daemon start` blocks up
-    /// to five seconds on a readiness poll and has no ordering dependency with
-    /// user effects, so queueing it there would stall the first user action
-    /// behind it. `None` until auto-start spawns, and again once its result folds.
+    /// not ride the shared FIFO `effects` worker: its `wn daemon start` blocks
+    /// until the daemon it launched answers, for up to 60 seconds, and has no
+    /// ordering dependency with user effects, so queueing it there would stall
+    /// the first user action behind it. `None` until auto-start spawns, and
+    /// again once its result folds.
     pub(crate) daemon_autostart: Option<Receiver<Result<Value, String>>>,
 }
 
@@ -412,10 +413,11 @@ impl TuiApp {
 
     /// Launch daemon auto-start: when the daemon is down and the TUI holds a
     /// relay source to give it, start it exactly as `/daemon start` would — but
-    /// on its own one-shot thread, because `wn daemon start` blocks up to five
-    /// seconds on its readiness poll. It runs off the shared FIFO effect worker
-    /// deliberately: it has no ordering dependency with user effects, so queueing
-    /// it there would stall the first user action behind that five-second poll.
+    /// on its own one-shot thread, because `wn daemon start` blocks until the
+    /// daemon it launched answers, for up to 60 seconds. It runs off the shared
+    /// FIFO effect worker deliberately: it has no ordering dependency with user
+    /// effects, so queueing it there would stall the first user action behind
+    /// that wait.
     /// The thread mirrors the media worker — spawn, run the subprocess, deliver
     /// the outcome over a channel drained on `tick`. Without a relay source the
     /// start would only fail with `missing_relay_url`, so one honest status is

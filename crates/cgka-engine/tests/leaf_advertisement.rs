@@ -82,6 +82,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -174,7 +175,7 @@ struct Device {
 
 impl Device {
     fn old(id: &'static [u8]) -> Self {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let engine = open(id, storage.clone(), old_components());
         Self {
             id,
@@ -319,7 +320,7 @@ async fn a_legacy_profile_leaf_is_refreshed_once_not_on_every_cycle() {
     // self-update would change it. Legacy-profile leaves carry the legacy proof
     // extension alongside an app_data_dictionary, so one self-update refreshes
     // them and the report clears; it must not stay stale and re-arm forever.
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let build = |storage: SqliteAccountStorage, supported: Vec<AppComponentId>| {
         let mut engine = EngineBuilder::new(storage)
             .legacy_compatibility_profile()

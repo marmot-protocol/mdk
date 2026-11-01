@@ -19,7 +19,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/engine.rs` | Public engine trait, send/create requests, outputs, group events. |
 | `src/storage.rs` | Storage traits, the `StorageProvider` aggregate (`type Mls` / `mls_storage()`), and the snapshot/rollback contract. |
 | `src/engine_state.rs` | Epoch and welcome state machines. |
-| `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record. |
+| `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record; `SiblingWelcomeJoin`, what joining from a sibling Welcome came to: settled, or held while this device still holds the chat. |
 | `src/error.rs` | `EngineError` and `PeelerError` — the engine/peeler error vocabulary. |
 | `src/types.rs` | Core id newtypes (`GroupId`/`MemberId`/`MessageId`), `EpochId`, and the `Backend` enum. |
 | `src/group.rs` | `Group` and `Member` storage records. |
@@ -36,6 +36,8 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/app_components/blossom_image.rs` | `GroupBlossomImageV1` state, codec, and Marmot media-type canonicalization. |
 | `src/app_components/encrypted_media.rs` | Frozen `EncryptedMediaPolicyV1` / `BlobStoreEndpointV1` state, codec, and endpoint-URL validation. |
 | `src/app_components/encrypted_media_v2.rs` | Current `marmot.group.encrypted-media.v2` state and codec. |
+| `src/app_components/device_roster.rs` | `DeviceRosterV1` (`marmot.account.device-roster.v1`) state: the leaf tag key, devices with their tag signature keys, and rejected slots (a removed device's keeps its key); its diff-style `DeviceRosterUpdateV1` operations, codec and `apply`. Unreleased wire format until its spec is adopted. |
+| `src/app_components/device_tag.rs` | `marmot.member.device-tag.v1` (0x800f) wire structures (`DeviceTagV1`, the sealed `DeviceTagContentV1`, the signed content) with exact decoding, and `DeviceTagClaim`. Sealing, signing and reading need the MLS crypto provider and live in `cgka_engine::device_tag`. |
 | `src/app_components/lifecycle.rs` | `GroupLifecycleV1` (`marmot.group.lifecycle.v1`) authenticated terminal lifecycle state. |
 | `src/app_components/tests.rs` | Byte-level component codec unit tests. |
 | `src/app_components/avatar_url.rs` | `GroupAvatarUrlV1` state, codec, wire URL validation, and contact-safety helper. |

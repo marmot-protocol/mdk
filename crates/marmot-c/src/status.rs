@@ -165,6 +165,34 @@ pub enum MarmotStatus {
     /// The current kind-3 contact list has at least 2,048 follows, more than
     /// MDK reads from one list; a follow or unfollow published nothing.
     FollowListTooLarge = 107,
+    /// An attachment was encrypted at an epoch the group has left, so it cannot
+    /// be sent; upload the file again (mdk#2158).
+    MediaReferenceStaleEpoch = 108,
+    /// The group's epoch is unsettled, so an attachment cannot be sent yet;
+    /// sync and send again (mdk#2158).
+    MediaReferenceEpochUnsettled = 109,
+    /// The group cannot turn on account-devices now; the detail names the
+    /// aggregate reason `marmot_account_devices_activation` reports. It never
+    /// names which members or devices hold the group back.
+    AccountDevicesActivationRefused = 110,
+    /// Sticker data failed validation: pack metadata, a reference, a link,
+    /// or downloaded bytes that do not match the exact hash, MIME type, or
+    /// dimensions. Retrying the same input cannot succeed.
+    InvalidSticker = 111,
+    /// The sticker pack, or the exact `(pack, shortcode, plaintext hash)`
+    /// asset, is not known locally and could not be resolved.
+    StickerNotFound = 112,
+    /// A sticker relay or Blossom operation did not complete. Local intent is
+    /// kept; retry when connectivity returns.
+    StickerNetwork = 113,
+    /// Signal sticker import was refused or failed. Import is refused before
+    /// any network call while its fetch cannot be pinned.
+    StickerImport = 114,
+    /// Signal sticker import is not available for external-signing accounts.
+    StickerImportUnsupported = 115,
+    /// This device was unlinked from the account by its other devices. The
+    /// account stays signed out here: wipe it, then link the device again.
+    AccountUnlinked = 116,
 }
 
 thread_local! {
@@ -258,6 +286,12 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::EmptyPassphrase => MarmotStatus::EmptyPassphrase,
         MarmotKitError::EncryptionFailed { .. } => MarmotStatus::EncryptionFailed,
         MarmotKitError::Io { .. } => MarmotStatus::Io,
+        MarmotKitError::InvalidSticker { .. } => MarmotStatus::InvalidSticker,
+        MarmotKitError::StickerNotFound => MarmotStatus::StickerNotFound,
+        MarmotKitError::StickerNetwork { .. } => MarmotStatus::StickerNetwork,
+        MarmotKitError::StickerImport { .. } => MarmotStatus::StickerImport,
+        MarmotKitError::StickerImportUnsupported => MarmotStatus::StickerImportUnsupported,
+        MarmotKitError::AccountUnlinked { .. } => MarmotStatus::AccountUnlinked,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
@@ -270,6 +304,10 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
         MarmotKitError::InvalidAppComponent { .. } => MarmotStatus::InvalidAppComponent,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::MediaReferenceStaleEpoch { .. } => MarmotStatus::MediaReferenceStaleEpoch,
+        MarmotKitError::MediaReferenceEpochUnsettled { .. } => {
+            MarmotStatus::MediaReferenceEpochUnsettled
+        }
         MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
         MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
@@ -294,6 +332,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::DisbandingUnsupportedMembers
         }
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
+        MarmotKitError::AccountDevicesActivationRefused { .. } => {
+            MarmotStatus::AccountDevicesActivationRefused
+        }
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
@@ -424,6 +465,11 @@ mod tests {
             MarmotKitError::InvalidMediaReference {
                 details: "d".into(),
             },
+            MarmotKitError::MediaReferenceStaleEpoch {
+                source_epoch: 2,
+                current_epoch: 3,
+            },
+            MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 },
             MarmotKitError::MediaAttachmentRejected {
                 kind: marmot_uniffi::conversions::MediaAttachmentRejectionKindFfi::MissingField,
                 details: "d".into(),
@@ -490,6 +536,10 @@ mod tests {
             MarmotKitError::DisbandingNotEnabled {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::AccountDevicesActivationRefused {
+                group_id_hex: "aa".into(),
+                reason: marmot_uniffi::AccountDevicesActivationFfi::MembersNeedUpdate,
+            },
             MarmotKitError::GroupDisbanding {
                 group_id_hex: "aa".into(),
             },
@@ -547,6 +597,20 @@ mod tests {
             MarmotKitError::GroupUnrecoverableRepairRequired {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::InvalidSticker {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerNotFound,
+            MarmotKitError::StickerNetwork {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerImport {
+                details: "d".into(),
+            },
+            MarmotKitError::StickerImportUnsupported,
+            MarmotKitError::AccountUnlinked {
+                account_ref: "a".into(),
+            },
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -555,7 +619,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            98,
+            107,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -590,8 +654,37 @@ mod tests {
             107
         );
         assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceStaleEpoch {
+                source_epoch: 2,
+                current_epoch: 3,
+            }) as i32,
+            108
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 })
+                as i32,
+            109
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::AccountDevicesActivationRefused {
+                group_id_hex: "aa".into(),
+                reason: marmot_uniffi::AccountDevicesActivationFfi::NotAdmin,
+            }) as i32,
+            110
+        );
+        assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::StickerImportUnsupported) as i32,
+            115
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::AccountUnlinked {
+                account_ref: "a".into()
+            }) as i32,
+            116
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,

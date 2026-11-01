@@ -30,22 +30,6 @@ fn ids(page: &ChatListPage) -> Vec<&str> {
     page.rows.iter().map(|r| r.group_id_hex.as_str()).collect()
 }
 
-#[test]
-fn four_lists_partition_terminal_and_archive_state_and_suppress_invites_from_unread() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    seed(&store, "01", false, "member", 0, false);
-    seed(&store, "02", false, "member", 1, false);
-    seed(&store, "03", true, "member", 1, false);
-    seed(&store, "04", false, "left", 1, false);
-    seed(&store, "05", true, "removed", 1, false);
-    seed(&store, "06", false, "member", 9, true);
-    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01", "02", "06"]);
-    assert_eq!(ids(&page(&app, ChatListView::Unread)), ["02"]);
-    assert_eq!(ids(&page(&app, ChatListView::Archived)), ["03"]);
-    assert_eq!(ids(&page(&app, ChatListView::Left)), ["04", "05"]);
-}
-
 fn engine_group(store: &SqliteAccountStorage, id: &str) -> GroupId {
     let bytes = hex::decode(id).unwrap();
     store
@@ -74,11 +58,37 @@ fn query(
 
 #[test]
 fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
+    let set_archived = |store: &SqliteAccountStorage, id: &str, archived: bool| {
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE account_groups SET archived = {archived} WHERE group_id_hex = '{id}';
+                 UPDATE chat_list_rows SET archived = {archived} WHERE group_id_hex = '{id}';"
+            ))
+            .unwrap();
+    };
     for id in ["ABCD", "aBcD"] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let app = store.app_storage();
         seed(&store, id, false, "member", 4, false);
         let group = engine_group(&store, id);
+        // An anchor accepts the normalized id in both directions; a view
+        // without the row has no anchor.
+        for direction in [
+            ChatListPageDirection::Forward,
+            ChatListPageDirection::Backward,
+        ] {
+            let anchored = app
+                .chat_list_page_from_anchor(ChatListView::Chats, "abcd", 10, direction)
+                .unwrap();
+            assert_eq!(ids(&anchored), [id]);
+            assert!(matches!(
+                app.chat_list_page_from_anchor(ChatListView::Archived, "abcd", 10, direction),
+                Err(ChatListPageError::AnchorUnavailable)
+            ));
+        }
+        let cursor = page(&app, ChatListView::Chats).last;
         store
             .put_leave_request(&LeaveRequest {
                 group_id: group.clone(),
@@ -87,10 +97,27 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
             })
             .unwrap();
         assert!(page(&app, ChatListView::Chats).rows.is_empty(), "{id}");
+        let left = page(&app, ChatListView::Left);
+        assert_eq!(left.rows[0].leave_requested_at_ms, Some(123));
+        assert_eq!(left.rows[0].self_membership, crate::SelfMembership::Member);
+        // The engine write moved the navigation revision.
+        assert!(matches!(
+            app.chat_list_page(query(
+                ChatListView::Chats,
+                1,
+                ChatListPageDirection::Forward,
+                cursor
+            )),
+            Err(ChatListPageError::StaleCursor)
+        ));
+        // A queued leave keeps an archived row in Left, not Archived.
+        set_archived(&store, id, true);
+        assert!(page(&app, ChatListView::Archived).rows.is_empty());
         assert_eq!(
             page(&app, ChatListView::Left).rows[0].leave_requested_at_ms,
             Some(123)
         );
+        set_archived(&store, id, false);
         store.clear_leave_request(&group).unwrap();
         assert_eq!(ids(&page(&app, ChatListView::Chats)), [id]);
         let mut request = DisbandRequest {
@@ -103,10 +130,10 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
         assert!(page(&app, ChatListView::Left).rows[0].disbanding);
         request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
         store.put_disband_request(&request).unwrap();
-        assert_eq!(
-            page(&app, ChatListView::Chats).rows[0].disband_request,
-            Some(request)
-        );
+        let active = page(&app, ChatListView::Chats);
+        assert!(!active.rows[0].disbanding);
+        assert_eq!(active.rows[0].disband_request, Some(request));
+        // An authenticated candidate gates work even when our own request failed.
         store
             .lock()
             .unwrap()
@@ -150,71 +177,30 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
     }
 }
 
+/// A queued leave keeps an archived chat in Left across a restart.
 #[test]
-fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    seed(&store, "01", false, "member", 4, false);
+fn a_queued_leave_still_lists_as_left_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite3");
+    let key = crate::SqlCipherKey::new("07".repeat(32)).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "01", true, "member", 3, false);
     let group = engine_group(&store, "01");
-    let cursor = page(&app, ChatListView::Chats).last;
     store
         .put_leave_request(&LeaveRequest {
-            group_id: group.clone(),
+            group_id: group,
             requested_at_ms: 123,
             last_proposed_epoch: None,
         })
         .unwrap();
-    assert!(page(&app, ChatListView::Chats).rows.is_empty());
-    let left = page(&app, ChatListView::Left);
-    assert_eq!(left.rows[0].leave_requested_at_ms, Some(123));
-    assert_eq!(left.rows[0].self_membership, crate::SelfMembership::Member);
-    assert!(matches!(
-        app.chat_list_page(query(
-            ChatListView::Chats,
-            1,
-            ChatListPageDirection::Forward,
-            cursor
-        )),
-        Err(ChatListPageError::StaleCursor)
-    ));
-    store.clear_leave_request(&group).unwrap();
-    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
-    let mut request = DisbandRequest {
-        group_id: group.clone(),
-        requested_at_ms: 124,
-        status: DisbandRequestStatus::Pending,
-        last_prepared_epoch: None,
-    };
-    store.put_disband_request(&request).unwrap();
-    assert!(page(&app, ChatListView::Left).rows[0].disbanding);
-    request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
-    store.put_disband_request(&request).unwrap();
-    let active = page(&app, ChatListView::Chats);
-    assert!(!active.rows[0].disbanding);
-    assert_eq!(active.rows[0].disband_request, Some(request));
-    // An authenticated candidate gates work even when our own request failed.
-    store.lock().unwrap().execute("INSERT INTO cgka_disband_candidates(group_id, commit_id, record) VALUES (?1, x'01', x'00')", [group.as_slice()]).unwrap();
-    assert!(page(&app, ChatListView::Left).rows[0].disbanding);
-    store
-        .lock()
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
         .unwrap()
-        .execute(
-            "DELETE FROM cgka_disband_candidates WHERE group_id = ?1",
-            [group.as_slice()],
-        )
-        .unwrap();
-    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO cgka_disband_tombstones(group_id, record) VALUES (?1, x'00')",
-            [group.as_slice()],
-        )
-        .unwrap();
+        .app_storage();
+    assert!(page(&store, ChatListView::Archived).rows.is_empty());
     assert_eq!(
-        page(&app, ChatListView::Left).rows[0].lifecycle_state,
-        cgka_traits::GroupLifecycleState::Disbanded
+        page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
+        Some(123)
     );
 }
 
@@ -585,32 +571,6 @@ fn page_does_not_decode_unrelated_operation_records() {
 }
 
 #[test]
-fn reopening_preserves_queued_leave_and_bounded_navigation() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("account.sqlite3");
-    let key = crate::SqlCipherKey::new("07".repeat(32)).unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    seed(&store, "01", true, "member", 3, false);
-    let group = engine_group(&store, "01");
-    store
-        .put_leave_request(&LeaveRequest {
-            group_id: group,
-            requested_at_ms: 123,
-            last_proposed_epoch: None,
-        })
-        .unwrap();
-    store.close().unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key)
-        .unwrap()
-        .app_storage();
-    assert!(page(&store, ChatListView::Archived).rows.is_empty());
-    assert_eq!(
-        page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
-        Some(123)
-    );
-}
-
-#[test]
 fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
     use crate::base::query_work_test_support::measure;
     for (count, pin_cap) in [(256, 8), (4096, 8), (256, 256), (4096, 4096)] {
@@ -792,33 +752,6 @@ fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks(
             .collect::<Vec<_>>(),
         [Some(0), Some(1), Some(2)]
     );
-}
-
-#[test]
-fn stable_anchor_accepts_normalized_ids_for_mixed_case_rows() {
-    for id in ["ABCD", "aBcD"] {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        seed(&store, id, false, "member", 1, false);
-        for direction in [
-            ChatListPageDirection::Forward,
-            ChatListPageDirection::Backward,
-        ] {
-            let anchored = store
-                .app_storage()
-                .chat_list_page_from_anchor(ChatListView::Chats, "abcd", 10, direction)
-                .unwrap();
-            assert_eq!(ids(&anchored), [id]);
-            assert!(matches!(
-                store.app_storage().chat_list_page_from_anchor(
-                    ChatListView::Archived,
-                    "abcd",
-                    10,
-                    direction
-                ),
-                Err(ChatListPageError::AnchorUnavailable)
-            ));
-        }
-    }
 }
 
 #[test]
@@ -1377,4 +1310,41 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
         })
         .unwrap();
     assert!(!app.account_attention_total().unwrap().has_unread());
+}
+
+#[test]
+fn window_reads_reject_invalid_queries_and_missing_base_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let too_many = (0..201).map(|i| format!("{i:04x}")).collect();
+    for query in [
+        window_query(0, &[], 0),
+        window_query(201, &[], 0),
+        window_query(10, &[], 10),
+        crate::ChatListWindowQuery {
+            anchors: too_many,
+            ..window_query(10, &[], 0)
+        },
+    ] {
+        assert!(matches!(
+            app.read_chat_list_window(query),
+            Err(ChatListPageError::InvalidWindowQuery)
+        ));
+    }
+
+    // A group without its base chat row: the window is unavailable, not empty.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('01', '', 0)",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        app.read_chat_list_window(window_query(10, &[], 0)),
+        Err(ChatListPageError::Storage(
+            cgka_traits::storage::StorageError::NotFound
+        ))
+    ));
 }

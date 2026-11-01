@@ -35,7 +35,8 @@ rather than restating it here.
 - Do not print or log nsecs, secret key hex, plaintext database keys, or other key material. Read nsecs from stdin
   (`src/secret.rs`), never argv. Render untrusted text for humans through `src/terminal.rs`; keep `--json` lossless.
 - Keep loopback relay and blob endpoints behind `WN_ALLOW_LOOPBACK_RELAYS` / `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`.
-  `WN_DEV_SETTLEMENT_QUIESCENCE_MS` is honoured only in `test-policy-overrides` builds and is an error otherwise.
+  `WN_DEV_SETTLEMENT_QUIESCENCE_MS` and `WN_DEV_DAEMON_START_TIMEOUT_MS` are honoured only in `test-policy-overrides`
+  builds and are an error otherwise.
 
 ## Command Surface
 

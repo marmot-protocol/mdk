@@ -1,11 +1,7 @@
 use crate::base::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
-use cgka_traits::capabilities::{
-    Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
-};
-use cgka_traits::group::Member;
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::storage::{CapabilityStorage, StorageResult};
-use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -88,110 +84,50 @@ impl CapabilityStorage for SqliteAccountStorage {
             .map(|record| deserialize::<CapabilityRequirementRow>(&record).map(Into::into))
             .transpose()
     }
-
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT OR REPLACE INTO cgka_member_capabilities
-                    (group_id, member_id, capabilities)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    group_id.as_slice(),
-                    member.id.as_slice(),
-                    serialize(&capabilities)?
-                ],
-            )
-            .storage()?;
-        Ok(())
-    }
-
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        let record: Option<Vec<u8>> = self
-            .lock()?
-            .query_row_cached(
-                "SELECT capabilities FROM cgka_member_capabilities
-                 WHERE group_id = ?1 AND member_id = ?2",
-                params![group_id.as_slice(), member_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?;
-        record.map(|record| deserialize(&record)).transpose()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
-    use crate::base::test_support::{gid, member_id, sample_group};
-    use cgka_traits::storage::GroupStorage;
 
     #[test]
-    fn feature_registry_and_member_capabilities_roundtrip() {
+    fn feature_requirements_round_trip_and_reuse_one_description_allocation() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
-        let feature = Feature("self-remove");
-        let requirement = CapabilityRequirement {
-            requires: Capability::Proposal(10),
-            level: RequirementLevel::Required,
-            description: "MIP-03",
-        };
-        store
-            .register_feature(feature.clone(), requirement.clone())
-            .unwrap();
-        assert_eq!(
-            store.feature_requirement(&feature).unwrap(),
-            Some(requirement)
+        let required = (
+            Feature("self-remove"),
+            CapabilityRequirement {
+                requires: Capability::Proposal(10),
+                level: RequirementLevel::Required,
+                description: "self remove proposal",
+            },
         );
-
-        let member = Member {
-            id: member_id(1),
-            credential: vec![],
-        };
-        let mut caps = GroupCapabilities::default();
-        caps.insert(Capability::Proposal(10));
-        store
-            .save_member_capabilities(&gid(1), &member, caps.clone())
-            .unwrap();
-        assert_eq!(
-            store.member_capabilities(&gid(1), &member.id).unwrap(),
-            Some(caps)
+        let optional = (
+            Feature("agent-text-stream"),
+            CapabilityRequirement {
+                requires: Capability::AppComponent(0x8006),
+                level: RequirementLevel::Optional,
+                description: "agent text stream over QUIC",
+            },
         );
+        for (feature, requirement) in [&required, &optional] {
+            store
+                .register_feature(feature.clone(), requirement.clone())
+                .unwrap();
+        }
+        for (feature, requirement) in [&required, &optional] {
+            assert_eq!(
+                store.feature_requirement(feature).unwrap().as_ref(),
+                Some(requirement)
+            );
+        }
         assert_eq!(
-            store.member_capabilities(&gid(2), &member.id).unwrap(),
+            store.feature_requirement(&Feature("unknown")).unwrap(),
             None
         );
-    }
 
-    #[test]
-    fn feature_requirement_reuses_description_allocation_across_reads() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let feature = Feature("agent-text-stream");
-        store
-            .register_feature(
-                feature.clone(),
-                CapabilityRequirement {
-                    requires: Capability::AppComponent(0x8006),
-                    level: RequirementLevel::Optional,
-                    description: "agent text stream over QUIC",
-                },
-            )
-            .unwrap();
-
-        let first = store.feature_requirement(&feature).unwrap().unwrap();
-        let second = store.feature_requirement(&feature).unwrap().unwrap();
-
-        assert_eq!(first.description, second.description);
+        let first = store.feature_requirement(&optional.0).unwrap().unwrap();
+        let second = store.feature_requirement(&optional.0).unwrap().unwrap();
         assert_eq!(
             first.description.as_ptr(),
             second.description.as_ptr(),

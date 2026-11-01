@@ -50,7 +50,13 @@ command matrix beside durable evidence.
   app invalidations, recoveries, and expectation/invariant failures. `ObserveExact` opts a portable scenario into the
   canonical snapshot and scenario-input ledger while legacy `Observe` stays stable for existing fixtures.
   `ProbeBidirectionalDecryptability` actively exercises send, peel, MLS decrypt, and delivery. V3's `expect_tick_error`
-  records a normalized expected transport refusal and continues.
+  records a normalized expected transport refusal and continues. V3's account-devices actions set per-client 0x800d
+  support (`HarnessClient::set_account_devices_supported` plus a restart) and send the activation Commit
+  (`HarnessClient::try_require_account_devices`); keep new 0x800d scenarios on these rather than a second path. A
+  group founded while every founder supports 0x800d requires it from the start, so an activation scenario gives one
+  founder support only after creation, then a `self_update`.
+  `remove_own_account_devices` sends the engine's same-account Remove intent
+  (`HarnessClient::try_remove_own_account_devices`, naming each device by its leaf signature key).
 - **`src/scenario_ir.rs`** — Canonical v2/v3 compiler: validates input, assigns stable action ids, records the
   virtual-time schedule, derives per-action capabilities, and preflights the whole schedule before the subject runs
   anything. `SCENARIO_IR_V3_ONLY_STEP_KINDS` lists post-v2 actions; v2 documents that use them fail to compile. JSON
@@ -132,8 +138,8 @@ command matrix beside durable evidence.
   `PayloadCount` asserts cover `AppMessage` without inventing a cross-sender payload order.
 - **`src/vector.rs`** — `ScenarioTrace`, observations, and semantic `TraceExpectation` checks: epoch/member/payload
   facts, member additions/removals, client convergence, epoch changes, app invalidations, exact canonical state,
-  input dispositions, pending-work blockers, decryptability matrices, and settled `ConvergenceDecisionObservation`
-  entries from the forensic recorder.
+  input dispositions, pending-work blockers, decryptability matrices, settled `ConvergenceDecisionObservation`
+  entries from the forensic recorder, and `AccountDevicesState`, which checks 0x800d's state rules on an exact state.
 - **`src/scenario_input_ledger.rs`** — Per-client commit/proposal/application input accounting joined to transport,
   MLS content, and inner Marmot event ids, without production engine hooks.
 - **`src/pending_work.rs`** — Strict instantaneous local-progress observation and the adapter-neutral structural
@@ -320,7 +326,8 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   policy inputs.
 - **Tracing audit is repo-wide.** `tests/tracing_audit.rs` scans production Rust source for `tracing::*` calls. New
   tracing must include explicit `target` and `method` fields and must not include account ids, group ids, message ids,
-  relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material.
+  relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. `just tracing-audit` runs it in seconds
+  without building this crate, which is how the pull-request pre-check runs it.
 - **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and Welcomes go
   through `transport-nostr-peeler`.
 - **`HarnessClient` exposes only what tests need.** Needing the inner `Engine<S>` is a smell — extend the harness API

@@ -17,6 +17,32 @@ pub(crate) fn source_authority(
     })
 }
 
+/// `group`'s merged epoch and the branch it is on. The identity hashes the
+/// epoch authenticator, as `source_authority` does, so two branches at one
+/// epoch number never share a pin.
+pub(crate) fn epoch_pin(group: &openmls::group::MlsGroup) -> cgka_traits::engine::EpochPin {
+    pin_of(group.epoch(), group.epoch_authenticator())
+}
+
+/// The pin of the epoch `staged` would merge, or `None` when this device is
+/// not a member of that epoch.
+pub(crate) fn staged_epoch_pin(
+    staged: &openmls::group::StagedCommit,
+) -> Option<cgka_traits::engine::EpochPin> {
+    let authenticator = staged.epoch_authenticator()?;
+    Some(pin_of(staged.group_context().epoch(), authenticator))
+}
+
+fn pin_of(
+    epoch: openmls::group::GroupEpoch,
+    authenticator: &openmls::schedule::EpochAuthenticator,
+) -> cgka_traits::engine::EpochPin {
+    cgka_traits::engine::EpochPin {
+        epoch: cgka_traits::types::EpochId(epoch.as_u64()),
+        identity: Sha256::digest(authenticator.as_slice()).into(),
+    }
+}
+
 /// Stable transient reference used when convergence reports a decrypted
 /// application payload without retaining the plaintext itself.
 pub(crate) fn decrypted_payload_ref(payload: &[u8]) -> String {
@@ -247,6 +273,9 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                     message_id: request.message_id.clone(),
                     epoch: request.epoch,
                     sender: request.sender,
+                    // Only moderation controls reach this rail, and its
+                    // durable request keeps no leaf.
+                    sender_leaf_index: None,
                     payload: source.payload,
                     authority: Some(source.authority),
                     retention: request.retention.or_else(|| {
@@ -286,7 +315,7 @@ mod tests {
     fn vanished_source_snapshot_stays_unresolved_and_restores_live_state() {
         use cgka_traits::storage::{GroupStorage, MessageStorage};
         use cgka_traits::{EpochId, GroupId, MessageId};
-        let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap();
         let group_id = GroupId::new(vec![7; 16]);
         let group = cgka_traits::group::Group {
             id: group_id.clone(),

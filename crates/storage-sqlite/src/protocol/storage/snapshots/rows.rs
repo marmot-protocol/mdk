@@ -1,11 +1,9 @@
 use crate::base::codec::SensitiveBytes;
-use cgka_traits::capabilities::GroupCapabilities;
 #[cfg(feature = "test-conformance-replay")]
 use cgka_traits::convergence_pass::DurableConvergencePass;
 use cgka_traits::group::Group;
 use cgka_traits::message::MessageRecord;
 use cgka_traits::storage::QueuedOutboundIntent;
-use cgka_traits::types::MemberId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -19,7 +17,6 @@ pub(super) struct Snapshot {
     pub(super) messages: Option<Vec<OrderedMessage>>,
     /// Same contract as `messages`, for `cgka_queued_outbound`.
     pub(super) queued_outbound: Option<Vec<OrderedQueuedOutbound>>,
-    pub(super) member_caps: Vec<MemberCapabilitiesSnapshot>,
     pub(super) convergence_policy: Option<Vec<u8>>,
     pub(super) validated_tree_marker: Option<Vec<u8>>,
     pub(super) openmls_values: Vec<OpenMlsValueSnapshot>,
@@ -32,7 +29,6 @@ pub(super) struct Snapshot {
 #[derive(Serialize, Deserialize)]
 pub(super) struct GroupStateCheckpoint {
     pub(super) group: Group,
-    pub(super) member_caps: Vec<MemberCapabilitiesSnapshot>,
     pub(super) validated_tree_marker: Option<Vec<u8>>,
     pub(super) openmls_values: Vec<OpenMlsValueSnapshot>,
 }
@@ -64,12 +60,6 @@ pub(super) struct OrderedMessage {
 pub(super) struct OrderedQueuedOutbound {
     pub(super) insert_order: i64,
     pub(super) record: QueuedOutboundIntent,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct MemberCapabilitiesSnapshot {
-    pub(super) member_id: MemberId,
-    pub(super) capabilities: GroupCapabilities,
 }
 
 #[derive(Serialize, Deserialize)]

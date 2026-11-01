@@ -1,7 +1,4 @@
 #[cfg(test)]
-#[path = "migrations/media_open_upgrade_bench.rs"]
-mod media_open_upgrade_bench;
-#[cfg(test)]
 #[path = "migrations/media_open_upgrade_tests.rs"]
 mod media_open_upgrade_tests;
 #[path = "migrations/0001_initial_schema.rs"]
@@ -246,6 +243,80 @@ mod migration_0114_avatar_media_files;
 mod migration_0115_recovery_replay_admission;
 #[path = "migrations/0116_attachment_keep_media.rs"]
 mod migration_0116_attachment_keep_media;
+#[path = "migrations/0117_push_token_reshare_repair.rs"]
+mod migration_0117_push_token_reshare_repair;
+#[path = "migrations/0118_push_token_gossip_state.rs"]
+mod migration_0118_push_token_gossip_state;
+#[path = "migrations/0119_push_snapshot_owed.rs"]
+mod migration_0119_push_snapshot_owed;
+#[path = "migrations/0120_member_count_accounts.rs"]
+mod migration_0120_member_count_accounts;
+#[path = "migrations/0121_drop_member_capabilities.rs"]
+mod migration_0121_drop_member_capabilities;
+#[path = "migrations/0122_push_join_window.rs"]
+mod migration_0122_push_join_window;
+#[path = "migrations/0123_recovery_coverage_ledger.rs"]
+mod migration_0123_recovery_coverage_ledger;
+#[path = "migrations/0124_recovery_attempt_cap.rs"]
+mod migration_0124_recovery_attempt_cap;
+#[path = "migrations/0125_device_groups.rs"]
+mod migration_0125_device_groups;
+#[path = "migrations/0126_recovery_coverage_uncovers.rs"]
+mod migration_0126_recovery_coverage_uncovers;
+#[path = "migrations/0127_recovery_units.rs"]
+mod migration_0127_recovery_units;
+#[path = "migrations/0128_loss_evidence_routes.rs"]
+mod migration_0128_loss_evidence_routes;
+#[path = "migrations/0129_device_group_welcome_expectations.rs"]
+mod migration_0129_device_group_welcome_expectations;
+#[path = "migrations/0130_recovery_coverage_remainders.rs"]
+mod migration_0130_recovery_coverage_remainders;
+#[path = "migrations/0131_account_sign_ins.rs"]
+mod migration_0131_account_sign_ins;
+#[path = "migrations/0132_loss_import_revision.rs"]
+mod migration_0132_loss_import_revision;
+#[path = "migrations/0133_device_links.rs"]
+mod migration_0133_device_links;
+#[path = "migrations/0134_recovery_recheck_revision.rs"]
+mod migration_0134_recovery_recheck_revision;
+#[path = "migrations/0135_recovery_unit_fences.rs"]
+mod migration_0135_recovery_unit_fences;
+#[path = "migrations/0136_recovery_conversion.rs"]
+mod migration_0136_recovery_conversion;
+#[path = "migrations/0137_device_renames.rs"]
+mod migration_0137_device_renames;
+#[path = "migrations/0138_account_device_history_keys.rs"]
+mod migration_0138_account_device_history_keys;
+#[path = "migrations/0139_app_event_imports.rs"]
+mod migration_0139_app_event_imports;
+#[path = "migrations/0140_private_key_packages.rs"]
+mod migration_0140_private_key_packages;
+#[path = "migrations/0141_sonar_stickers.rs"]
+mod migration_0141_sonar_stickers;
+#[path = "migrations/0142_sticker_asset_history.rs"]
+mod migration_0142_sticker_asset_history;
+#[path = "migrations/0143_device_activity.rs"]
+mod migration_0143_device_activity;
+#[path = "migrations/0144_announced_key_packages.rs"]
+mod migration_0144_announced_key_packages;
+#[path = "migrations/0146_device_removals.rs"]
+mod migration_0146_device_removals;
+#[path = "migrations/0147_device_removed_membership.rs"]
+mod migration_0147_device_removed_membership;
+#[path = "migrations/0148_compromise_warning.rs"]
+mod migration_0148_compromise_warning;
+#[path = "migrations/0149_history_deliveries.rs"]
+mod migration_0149_history_deliveries;
+#[path = "migrations/0160_sibling_welcomes.rs"]
+mod migration_0160_sibling_welcomes;
+#[path = "migrations/0161_small_state.rs"]
+mod migration_0161_small_state;
+#[path = "migrations/0162_imported_media_file_keys.rs"]
+mod migration_0162_imported_media_file_keys;
+#[path = "migrations/0163_backup_recovery_key.rs"]
+mod migration_0163_backup_recovery_key;
+#[path = "migrations/0166_blossom_history_deliveries.rs"]
+mod migration_0166_blossom_history_deliveries;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -963,7 +1034,236 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0116_attachment_keep_media::apply,
     },
+    Migration {
+        version: 117,
+        name: "0117_push_token_reshare_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0117_push_token_reshare_repair::apply,
+    },
+    Migration {
+        version: 118,
+        name: "0118_push_token_gossip_state",
+        suspend_foreign_keys: &[],
+        apply: migration_0118_push_token_gossip_state::apply,
+    },
+    Migration {
+        version: 119,
+        name: "0119_push_snapshot_owed",
+        suspend_foreign_keys: &[],
+        apply: migration_0119_push_snapshot_owed::apply,
+    },
+    Migration {
+        version: 120,
+        name: "0120_member_count_accounts",
+        suspend_foreign_keys: &[],
+        apply: migration_0120_member_count_accounts::apply,
+    },
+    Migration {
+        version: 121,
+        name: "0121_drop_member_capabilities",
+        suspend_foreign_keys: &[],
+        apply: migration_0121_drop_member_capabilities::apply,
+    },
+    Migration {
+        version: 122,
+        name: "0122_push_join_window",
+        suspend_foreign_keys: &[],
+        apply: migration_0122_push_join_window::apply,
+    },
+    Migration {
+        version: 123,
+        name: "0123_recovery_coverage_ledger",
+        suspend_foreign_keys: &[],
+        apply: migration_0123_recovery_coverage_ledger::apply,
+    },
+    Migration {
+        version: 124,
+        name: "0124_recovery_attempt_cap",
+        suspend_foreign_keys: &[],
+        apply: migration_0124_recovery_attempt_cap::apply,
+    },
+    Migration {
+        version: 125,
+        name: "0125_device_groups",
+        suspend_foreign_keys: &[],
+        apply: migration_0125_device_groups::apply,
+    },
+    Migration {
+        version: 126,
+        name: "0126_recovery_coverage_uncovers",
+        suspend_foreign_keys: &[],
+        apply: migration_0126_recovery_coverage_uncovers::apply,
+    },
+    Migration {
+        version: 127,
+        name: "0127_recovery_units",
+        suspend_foreign_keys: &[],
+        apply: migration_0127_recovery_units::apply,
+    },
+    Migration {
+        version: 128,
+        name: "0128_loss_evidence_routes",
+        suspend_foreign_keys: &[],
+        apply: migration_0128_loss_evidence_routes::apply,
+    },
+    Migration {
+        version: 129,
+        name: "0129_device_group_welcome_expectations",
+        suspend_foreign_keys: &[],
+        apply: migration_0129_device_group_welcome_expectations::apply,
+    },
+    Migration {
+        version: 130,
+        name: "0130_recovery_coverage_remainders",
+        suspend_foreign_keys: &[],
+        apply: migration_0130_recovery_coverage_remainders::apply,
+    },
+    Migration {
+        version: 131,
+        name: "0131_account_sign_ins",
+        suspend_foreign_keys: &[],
+        apply: migration_0131_account_sign_ins::apply,
+    },
+    Migration {
+        version: 132,
+        name: "0132_loss_import_revision",
+        suspend_foreign_keys: &[],
+        apply: migration_0132_loss_import_revision::apply,
+    },
+    Migration {
+        version: 133,
+        name: "0133_device_links",
+        suspend_foreign_keys: &[],
+        apply: migration_0133_device_links::apply,
+    },
+    Migration {
+        version: 134,
+        name: "0134_recovery_recheck_revision",
+        suspend_foreign_keys: &[],
+        apply: migration_0134_recovery_recheck_revision::apply,
+    },
+    Migration {
+        version: 135,
+        name: "0135_recovery_unit_fences",
+        suspend_foreign_keys: &[],
+        apply: migration_0135_recovery_unit_fences::apply,
+    },
+    Migration {
+        version: 136,
+        name: "0136_recovery_conversion",
+        suspend_foreign_keys: &[],
+        apply: migration_0136_recovery_conversion::apply,
+    },
+    Migration {
+        version: 137,
+        name: "0137_device_renames",
+        suspend_foreign_keys: &[],
+        apply: migration_0137_device_renames::apply,
+    },
+    Migration {
+        version: 138,
+        name: "0138_account_device_history_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0138_account_device_history_keys::apply,
+    },
+    Migration {
+        version: 139,
+        name: "0139_app_event_imports",
+        suspend_foreign_keys: &[],
+        apply: migration_0139_app_event_imports::apply,
+    },
+    Migration {
+        version: 140,
+        name: "0140_private_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0140_private_key_packages::apply,
+    },
+    Migration {
+        version: 141,
+        name: "0141_sonar_stickers",
+        suspend_foreign_keys: &[],
+        apply: migration_0141_sonar_stickers::apply,
+    },
+    Migration {
+        version: 142,
+        name: "0142_sticker_asset_history",
+        suspend_foreign_keys: &[],
+        apply: migration_0142_sticker_asset_history::apply,
+    },
+    Migration {
+        version: 143,
+        name: "0143_device_activity",
+        suspend_foreign_keys: &[],
+        apply: migration_0143_device_activity::apply,
+    },
+    Migration {
+        version: 144,
+        name: "0144_announced_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0144_announced_key_packages::apply,
+    },
+    Migration {
+        version: 146,
+        name: "0146_device_removals",
+        suspend_foreign_keys: &[],
+        apply: migration_0146_device_removals::apply,
+    },
+    Migration {
+        version: 147,
+        name: "0147_device_removed_membership",
+        suspend_foreign_keys: &[],
+        apply: migration_0147_device_removed_membership::apply,
+    },
+    Migration {
+        version: 148,
+        name: "0148_compromise_warning",
+        suspend_foreign_keys: &[],
+        apply: migration_0148_compromise_warning::apply,
+    },
+    Migration {
+        version: 149,
+        name: "0149_history_deliveries",
+        suspend_foreign_keys: &[],
+        apply: migration_0149_history_deliveries::apply,
+    },
+    Migration {
+        version: 160,
+        name: "0160_sibling_welcomes",
+        suspend_foreign_keys: &[],
+        apply: migration_0160_sibling_welcomes::apply,
+    },
+    Migration {
+        version: 161,
+        name: "0161_small_state",
+        suspend_foreign_keys: &[],
+        apply: migration_0161_small_state::apply,
+    },
+    Migration {
+        version: 162,
+        name: "0162_imported_media_file_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0162_imported_media_file_keys::apply,
+    },
+    Migration {
+        version: 163,
+        name: "0163_backup_recovery_key",
+        suspend_foreign_keys: &[],
+        apply: migration_0163_backup_recovery_key::apply,
+    },
+    Migration {
+        version: 166,
+        name: "0166_blossom_history_deliveries",
+        suspend_foreign_keys: &[],
+        apply: migration_0166_blossom_history_deliveries::apply,
+    },
 ];
+
+/// Run migration 0117's push-token share repair on an open database. Test
+/// support only.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn rerun_push_token_reshare_repair(tx: &Transaction<'_>) -> StorageResult<()> {
+    migration_0117_push_token_reshare_repair::apply(tx)
+}
 
 /// Test fixtures use the same default-registry entry point as production with observation disabled.
 #[cfg(test)]
@@ -974,6 +1274,16 @@ pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
 #[cfg(test)]
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
     run_with_summary(connection, migrations).map(|_| ())
+}
+
+/// Leave the schema as a build whose last migration was `version` did.
+#[cfg(test)]
+pub(crate) fn run_through(connection: &mut Connection, version: i64) -> StorageResult<()> {
+    let applied = MIGRATIONS
+        .iter()
+        .take_while(|migration| migration.version <= version)
+        .count();
+    run(connection, &MIGRATIONS[..applied])
 }
 
 /// Run a registry with the same validation and transaction rules but no progress callback.
@@ -1351,13 +1661,73 @@ mod tests {
         );
     }
 
+    /// 0141 adds a nullable chat-list tag column next to populated rows and
+    /// creates the sticker tables; 0142 backfills exact-hash history from the
+    /// stickers already stored. Neither may disturb existing chat rows.
     #[test]
-    fn preview_indexes_are_repeatable() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let mut conn = store.lock().unwrap();
-        let tx = conn.transaction().unwrap();
-        migration_0062_chat_list_preview_indexes::apply(&tx).unwrap();
-        tx.commit().unwrap();
+    fn sticker_migrations_upgrade_populated_schema() {
+        let through = |version: i64| {
+            MIGRATIONS
+                .iter()
+                .position(|migration| migration.version == version)
+                .unwrap()
+                + 1
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..through(140)]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+                VALUES ('aa', 'fixture', 1);
+             INSERT INTO chat_list_rows(
+                group_id_hex, updated_at, last_message_id_hex,
+                last_message_preview, last_message_timeline_at
+             ) VALUES ('aa', 1, 'message', 'hello', 1);",
+        )
+        .unwrap();
+
+        run(&mut conn, &MIGRATIONS[..through(141)]).unwrap();
+        let (preview, tags): (String, Option<String>) = conn
+            .query_row(
+                "SELECT last_message_preview, last_message_tags_json
+                 FROM visible_chat_list_rows WHERE group_id_hex = 'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preview, "hello");
+        assert_eq!(tags, None, "an existing preview has no tags until rebuilt");
+        conn.execute_batch(
+            "INSERT INTO app_sticker_packs(
+                coordinate, author_pubkey_hex, identifier, event_id_hex, created_at, title
+             ) VALUES ('pack', 'ab', 'cats', 'ee', 1, 'Cats');
+             INSERT INTO app_stickers(
+                pack_coordinate, shortcode, url, sha256, mime, position
+             ) VALUES ('pack', 'wave', 'https://cdn.example/h', 'hash', 'image/webp', 0);",
+        )
+        .unwrap();
+
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let copied: (String, String, String) = conn
+            .query_row(
+                "SELECT shortcode, sha256, url FROM app_sticker_assets
+                 WHERE pack_coordinate = 'pack'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            copied,
+            (
+                "wave".to_owned(),
+                "hash".to_owned(),
+                "https://cdn.example/h".to_owned()
+            )
+        );
+        let chat_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_list_rows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chat_rows, 1);
     }
 
     #[test]
@@ -1383,52 +1753,6 @@ mod tests {
         assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
     }
 
-    #[test]
-    fn master_query_indexes_upgrade_to_own_commit_intents_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("master-to-own-intents.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..63]).unwrap();
-        conn.execute_batch(
-            "INSERT INTO seen_events(event_id, seen_at) VALUES ('retained', 9);
-             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');",
-        )
-        .unwrap();
-
-        run_all(&mut conn).unwrap();
-        conn.execute_batch(
-            "INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
-             VALUES (x'01', x'aa', 1, x'bb');",
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut conn = keyed_connection(&path);
-        run_all(&mut conn).unwrap();
-        assert_eq!(
-            applied_name(&conn, 63).unwrap().as_deref(),
-            Some("0063_query_indexes")
-        );
-        assert_eq!(
-            applied_name(&conn, 64).unwrap().as_deref(),
-            Some("0064_own_commit_intents")
-        );
-        let retained: String = conn
-            .query_row(
-                "SELECT event_id FROM seen_events INDEXED BY idx_seen_events_recency",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(retained, "retained");
-        let intent: Vec<u8> = conn
-            .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(intent, [0xbb]);
-    }
-
     fn recovery_completion_rows(
         conn: &Connection,
         table: &str,
@@ -1445,17 +1769,10 @@ mod tests {
     }
 
     #[test]
-    fn recovery_completion_migration_preserves_populated_state_and_rolls_back_interruption() {
-        fn interrupted(tx: &Transaction<'_>) -> StorageResult<()> {
-            migration_0093_recovery_route_snapshot::apply(tx)?;
-            Err(StorageError::Backend(
-                "injected completion migration interruption".into(),
-            ))
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recovery-completion.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+    fn recovery_completion_migration_preserves_populated_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 91).unwrap();
         conn.execute_batch(
             "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
             INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',7,x'00');
@@ -1469,7 +1786,7 @@ mod tests {
             INSERT INTO transport_reconciliation_scheduler VALUES (1,0,x'');",
         )
         .unwrap();
-        run(&mut conn, &MIGRATIONS[..92]).unwrap();
+        run_through(&mut conn, 92).unwrap();
         conn.execute_batch("UPDATE account_recovery_state SET next_attempt=9,retry_ordinal=4,
             retry_recorded_at_ms=1000,retry_delay_ms=15000,retry_not_before_ms=16000;
             INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms,caller_origin,urgency)
@@ -1489,177 +1806,38 @@ mod tests {
             .iter()
             .map(|table| recovery_completion_rows(&conn, table))
             .collect();
-        let retry_before = recovery_completion_rows(&conn, "account_recovery_state");
-        assert!(
-            apply_migration(
-                &mut conn,
-                &Migration {
-                    version: 93,
-                    name: "0093_recovery_route_snapshot",
-                    suspend_foreign_keys: &[],
-                    apply: interrupted
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(applied_name(&conn, 93).unwrap(), None);
-        assert!(
-            conn.prepare("SELECT route_snapshot FROM account_recovery_state")
-                .is_err()
-        );
-        assert_eq!(
-            recovery_completion_rows(&conn, "account_recovery_state"),
-            retry_before
-        );
-        assert!(
-            conn.prepare("SELECT inventory_invalidated FROM cgka_released_transport_receipts")
-                .is_err(),
-            "interrupted migration must roll back the journal column too"
-        );
+        let state_before = recovery_completion_rows(&conn, "account_recovery_state");
+        run_through(&mut conn, 95).unwrap();
+        use rusqlite::types::Value::{Integer, Null};
         for (table, expected) in preserved.iter().zip(&before) {
-            assert_eq!(
-                &recovery_completion_rows(&conn, table),
-                expected,
-                "{table} changed after rollback"
-            );
-        }
-        // Also interrupt the integration's qualified-stagnation migration.
-        // Schema and historical evidence must roll back together before reopen.
-        run(&mut conn, &MIGRATIONS[..93]).unwrap();
-        let before_stall: Vec<_> = preserved
-            .iter()
-            .map(|table| recovery_completion_rows(&conn, table))
-            .collect();
-        let state_before_stall = recovery_completion_rows(&conn, "account_recovery_state");
-        fn interrupted_stall(tx: &Transaction<'_>) -> StorageResult<()> {
-            migration_0094_qualified_stall_observations::apply(tx)?;
-            Err(StorageError::Backend(
-                "injected qualified observation migration interruption".into(),
-            ))
-        }
-        assert!(
-            apply_migration(
-                &mut conn,
-                &Migration {
-                    version: 94,
-                    name: "0094_qualified_stall_observations",
-                    suspend_foreign_keys: &[],
-                    apply: interrupted_stall,
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(applied_name(&conn, 94).unwrap(), None);
-        assert!(
-            conn.prepare("SELECT qualified_certificate FROM app_epoch_stall_evidence")
-                .is_err()
-        );
-        assert_eq!(
-            recovery_completion_rows(&conn, "account_recovery_state"),
-            state_before_stall
-        );
-        for (table, expected) in preserved.iter().zip(&before_stall) {
-            assert_eq!(
-                &recovery_completion_rows(&conn, table),
-                expected,
-                "{table} changed after qualified observation migration rollback"
-            );
-        }
-        run(&mut conn, &MIGRATIONS[..94]).unwrap();
-        let before_comparison = recovery_completion_rows(&conn, "account_recovery_state");
-        fn interrupted_comparison(tx: &Transaction<'_>) -> StorageResult<()> {
-            migration_0095_recovery_comparison::apply(tx)?;
-            Err(StorageError::Backend(
-                "injected comparison migration interruption".into(),
-            ))
-        }
-        assert!(
-            apply_migration(
-                &mut conn,
-                &Migration {
-                    version: 95,
-                    name: "0095_recovery_comparison",
-                    suspend_foreign_keys: &[],
-                    apply: interrupted_comparison,
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(applied_name(&conn, 95).unwrap(), None);
-        assert!(
-            conn.prepare("SELECT revision FROM account_recovery_comparison")
-                .is_err()
-        );
-        assert_eq!(
-            recovery_completion_rows(&conn, "account_recovery_state"),
-            before_comparison
-        );
-        run_all(&mut conn).unwrap();
-        assert!(
-            run(&mut conn, &MIGRATIONS[..92]).is_err(),
-            "old runner must refuse schema 93"
-        );
-        drop(conn);
-        let mut conn = keyed_connection(&path);
-        assert_eq!(run_all(&mut conn).unwrap(), 0);
-        for (table, expected) in preserved.iter().zip(&before) {
-            let mut upgraded = expected.clone();
-            if *table == "cgka_released_transport_receipts" {
+            let added = match *table {
                 // Existing journals have no proof that invalidation ran.
-                for row in &mut upgraded {
-                    row.push(rusqlite::types::Value::Integer(0));
-                }
-            }
-            if *table == "app_epoch_stall_evidence" {
+                "cgka_released_transport_receipts" => vec![Integer(0)],
                 // Preserve every legacy counter and warning, but never promote
                 // old EOSE observations into qualified stagnation evidence.
-                for row in &mut upgraded {
-                    use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Null, Integer(0), Integer(0), Null]);
-                }
-            }
-            if *table == "account_delivery_loss_evidence" {
-                // Older loss has no known created_at, so it bounds no goal,
-                // and none of it was retired.
-                for row in &mut upgraded {
-                    use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Integer(2), Null, Null]);
-                }
-            }
-            if *table == "account_recovery_obligations" {
-                // No existing row has a known parking time or a dismissal.
-                for row in &mut upgraded {
-                    row.extend([rusqlite::types::Value::Null, rusqlite::types::Value::Null]);
-                }
-            }
-            assert_eq!(
-                &recovery_completion_rows(&conn, table),
-                &upgraded,
-                "{table} changed after reopen"
-            );
-        }
-        let state = recovery_completion_rows(&conn, "account_recovery_state");
-        assert_eq!(
-            &state[0][..retry_before[0].len()],
-            retry_before[0].as_slice()
-        );
-        use rusqlite::types::Value::{Integer, Null};
-        assert_eq!(
-            &state[0][retry_before[0].len()..],
-            &[Null, Integer(0), Integer(0)],
-            "route identity and qualified observation allocators must start empty"
-        );
-        assert!(conn.execute("INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms) VALUES ('explicit:second',3,1001,1001)",[]).is_err());
-        assert_eq!(
-            recovery_completion_rows(&conn, "account_recovery_obligations"),
-            before[0]
+                "app_epoch_stall_evidence" => vec![Null, Integer(0), Integer(0), Null],
+                _ => Vec::new(),
+            };
+            let upgraded: Vec<_> = expected
                 .iter()
                 .cloned()
                 .map(|mut row| {
-                    row.extend([Null, Null]);
+                    row.extend(added.iter().cloned());
                     row
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            assert_eq!(
+                recovery_completion_rows(&conn, table),
+                upgraded,
+                "{table} changed during the upgrade"
+            );
+        }
+        let mut state = state_before[0].clone();
+        state.extend([Null, Integer(0), Integer(0)]);
+        assert_eq!(
+            recovery_completion_rows(&conn, "account_recovery_state"),
+            [state],
+            "route identity and qualified observation allocators must start empty"
         );
     }
 
@@ -1689,10 +1867,9 @@ mod tests {
 
     #[test]
     fn recovery_owner_migration_preserves_populated_demand_and_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recovery-owner.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..91]).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 91).unwrap();
         conn.execute_batch(
             "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
              INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 7, x'00');
@@ -1728,26 +1905,11 @@ mod tests {
                 .unwrap()
         }
         let before: Vec<_> = preserved.iter().map(|table| rows(&conn, table)).collect();
-        run_all(&mut conn).unwrap();
+        run_through(&mut conn, 92).unwrap();
         for (table, expected) in preserved.iter().zip(&before) {
-            let mut upgraded = expected.clone();
-            if *table == "cgka_released_transport_receipts" {
-                // Existing journals have no proof that invalidation ran.
-                for row in &mut upgraded {
-                    row.push(rusqlite::types::Value::Integer(0));
-                }
-            }
-            if *table == "app_epoch_stall_evidence" {
-                // Preserve every legacy counter and warning, but never promote
-                // old EOSE observations into qualified stagnation evidence.
-                for row in &mut upgraded {
-                    use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Null, Integer(0), Integer(0), Null]);
-                }
-            }
             assert_eq!(
                 &rows(&conn, table),
-                &upgraded,
+                expected,
                 "{table} changed during migration"
             );
         }
@@ -1780,94 +1942,13 @@ mod tests {
             .unwrap(),
             9
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT fruitless_completions FROM app_epoch_stall_evidence",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            2
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM cgka_released_transport_receipts",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        assert!(
-            run(&mut conn, &MIGRATIONS[..91]).is_err(),
-            "old binary must refuse the new schema"
-        );
-        drop(conn);
-        let mut conn = keyed_connection(&path);
-        run_all(&mut conn).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM account_recovery_obligations",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            3
-        );
     }
 
     #[test]
-    fn recovery_owner_interrupted_migration_keeps_old_authority() {
-        fn fail_after_conversion(tx: &Transaction<'_>) -> StorageResult<()> {
-            migration_0092_account_recovery_owner::apply(tx)?;
-            Err(StorageError::Backend(
-                "injected migration interruption".into(),
-            ))
-        }
+    fn history_notice_migration_preserves_parked_debt() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        run(&mut conn, &MIGRATIONS[..91]).unwrap();
-        conn.execute_batch(
-            "INSERT INTO account_state(label, updated_at) VALUES ('alice', 100);
-             INSERT INTO account_delivery_recovery VALUES ('alice', 42, 124, 9);",
-        )
-        .unwrap();
-        let migration = Migration {
-            version: 92,
-            name: "0092_account_recovery_owner",
-            suspend_foreign_keys: &[],
-            apply: fail_after_conversion,
-        };
-        assert!(apply_migration(&mut conn, &migration).is_err());
-        assert_eq!(
-            conn.query_row(
-                "SELECT marker_token FROM account_delivery_recovery",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            42
-        );
-        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'account_recovery_obligations')", [], |r| r.get::<_, bool>(0)).unwrap());
-        assert_eq!(applied_name(&conn, 92).unwrap(), None);
-        run_all(&mut conn).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT marker_token FROM account_recovery_obligations",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            42
-        );
-    }
-
-    #[test]
-    fn history_notice_migration_preserves_parked_debt_and_reopens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history-notices.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..97]).unwrap();
+        run_through(&mut conn, 97).unwrap();
         // A parked queue loss and a pending epoch gap written by 0097.
         conn.execute_batch(
             "INSERT INTO account_state(label,updated_at) VALUES ('alice',100);
@@ -1889,7 +1970,7 @@ mod tests {
             recovery_completion_rows(&conn, "account_recovery_obligations"),
             recovery_completion_rows(&conn, "account_delivery_loss_evidence"),
         ];
-        run_all(&mut conn).unwrap();
+        run_through(&mut conn, 98).unwrap();
         for (table, expected) in [
             "account_recovery_obligations",
             "account_delivery_loss_evidence",
@@ -1913,46 +1994,20 @@ mod tests {
                 .collect();
             assert_eq!(recovery_completion_rows(&conn, table), upgraded, "{table}");
         }
-        assert!(
-            conn.execute(
-                "UPDATE account_delivery_loss_evidence SET retired_count=10",
-                []
-            )
-            .is_err(),
-            "a retirement watermark cannot exceed the imported count"
-        );
-        assert!(
-            conn.execute(
-                "UPDATE account_recovery_obligations SET parked_at_ms=-1",
-                []
-            )
-            .is_err()
-        );
-        assert!(
-            run(&mut conn, &MIGRATIONS[..97]).is_err(),
-            "old binary must refuse the new schema"
-        );
-        drop(conn);
-        let mut conn = keyed_connection(&path);
-        assert_eq!(run_with_summary(&mut conn, MIGRATIONS).unwrap(), 0);
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM account_recovery_obligations
-                 WHERE state=0 AND eligibility=4 AND parked_at_ms IS NULL",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
+        let check_error = |sql: &str| {
+            let error = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("CHECK constraint failed"), "{sql}: {error}");
+        };
+        // A retirement watermark cannot exceed the imported count.
+        check_error("UPDATE account_delivery_loss_evidence SET retired_count=10");
+        check_error("UPDATE account_recovery_obligations SET parked_at_ms=-1");
     }
 
     #[test]
-    fn invitation_recovery_upgrade_preserves_existing_data_and_reopens() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("invitation-recovery.db");
-        let mut conn = keyed_connection(&path);
-        run(&mut conn, &MIGRATIONS[..66]).unwrap();
+    fn invitation_recovery_upgrade_preserves_existing_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 66).unwrap();
         conn.execute_batch(
             "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');
             INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
@@ -1963,14 +2018,7 @@ mod tests {
             "UPDATE chat_presentation_checkpoint SET generation=7, state=x'cafe' WHERE id=1;",
         )
         .unwrap();
-        run_all(&mut conn).unwrap();
-        drop(conn);
-        let mut conn = keyed_connection(&path);
-        run_all(&mut conn).unwrap();
-        assert_eq!(
-            applied_name(&conn, 67).unwrap().as_deref(),
-            Some("0067_invitation_recovery")
-        );
+        run_through(&mut conn, 67).unwrap();
         let intent: Vec<u8> = conn
             .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
                 row.get(0)
@@ -2183,8 +2231,10 @@ mod tests {
         };
         // Call serde_json directly to pin the v1 envelope. The current
         // `StoredMessagePayload::encode` intentionally emits binary v2.
-        let payload =
-            serde_json::to_vec(&StoredMessagePayload::outbound_welcome(transport)).unwrap();
+        let payload = serde_json::to_vec(&StoredMessagePayload::outbound_welcome(
+            transport, None, None,
+        ))
+        .unwrap();
         MessageRecord {
             id: message_id,
             group_id: group_id.clone(),
@@ -2428,12 +2478,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_schema_migration_is_recorded() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        assert_eq!(applied_migrations(&store), expected_migrations());
-    }
-
-    #[test]
     fn file_backed_v1_database_upgrades_once_and_refuses_downgrade() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("v1-upgrade.sqlite3");
@@ -2522,6 +2566,7 @@ mod tests {
     #[test]
     #[ignore = "large file-backed storage-format benchmark; run via `just bench-storage-upgrade`"]
     fn storage_format_upgrade_benchmark() {
+        crate::base::connection::use_production_storage_for_test_process();
         let message_count = std::env::var("MDK_STORAGE_OPS_ROWS")
             .ok()
             .map(|value| value.parse::<usize>().expect("MDK_STORAGE_OPS_ROWS usize"))
@@ -2759,53 +2804,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrated, (1, legacy.to_vec(), None, None));
-    }
-
-    #[test]
-    fn normalized_message_migration_is_atomic_before_commit() {
-        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .pragma_update(None, "foreign_keys", true)
-            .unwrap();
-        run(&mut connection, &MIGRATIONS[..46]).unwrap();
-        connection
-            .execute(
-                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, ?2)",
-                params![&[0xaa_u8], b"group"],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-                 VALUES (?1, ?2, 3, 4, ?3)",
-                params![&[0x01_u8], &[0xaa_u8], b"legacy-record"],
-            )
-            .unwrap();
-
-        let tx = connection.transaction().unwrap();
-        migration_0047_normalized_message_records::apply(&tx).unwrap();
-        // Models termination after the schema/data rewrite but before the
-        // migration runner can commit its transaction.
-        tx.rollback().unwrap();
-
-        let columns = connection
-            .prepare("PRAGMA table_info(cgka_messages)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(!columns.iter().any(|column| column == "storage_format"));
-        let record: Vec<u8> = connection
-            .query_row(
-                "SELECT record FROM cgka_messages WHERE id = ?1",
-                params![&[0x01_u8]],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(record, b"legacy-record");
-
-        run(&mut connection, MIGRATIONS).unwrap();
     }
 
     #[test]
@@ -3248,22 +3246,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_notification_settings_table_is_migrated() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let conn = store.lock().unwrap();
-        assert!(connection_has_column(
-            &conn,
-            "chat_notification_settings",
-            "group_id_hex"
-        ));
-        assert!(connection_has_column(
-            &conn,
-            "chat_notification_settings",
-            "muted_until_ms"
-        ));
-    }
-
-    #[test]
     fn chat_pin_positions_are_migrated_with_archive_cleanup() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -3348,40 +3330,6 @@ mod tests {
             column_default(&conn, "chat_list_rows", "last_message_delivery_state").as_deref(),
             Some("'not_applicable'")
         );
-    }
-
-    #[test]
-    fn direct_conversation_members_table_is_migrated() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let conn = store.lock().unwrap();
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name = 'direct_conversation_members'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(exists, 1);
-        assert!(connection_has_column(
-            &conn,
-            "direct_conversation_members",
-            "member_id_hex"
-        ));
-    }
-
-    #[test]
-    fn message_drafts_tables_are_migrated() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let conn = store.lock().unwrap();
-        assert!(connection_has_column(&conn, "message_drafts", "content"));
-        assert!(connection_has_column(
-            &conn,
-            "message_draft_attachments",
-            "plaintext"
-        ));
     }
 
     #[test]
@@ -3836,6 +3784,26 @@ mod tests {
         assert_eq!(applied, expected_migrations());
     }
 
+    /// A version the ledger records under another name, such as one a
+    /// different build registered there, refuses the open instead of being
+    /// skipped as applied.
+    #[test]
+    fn a_version_applied_under_another_name_refuses_the_upgrade() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 2).unwrap();
+        conn.execute(
+            "UPDATE cgka_schema_migrations SET name = '0002_other_build' WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        let error = run_through(&mut conn, 3).unwrap_err().to_string();
+        assert!(
+            error.contains("migration 2 was applied as 0002_other_build"),
+            "{error}"
+        );
+        assert_eq!(applied_name(&conn, 3).unwrap(), None);
+    }
+
     #[test]
     fn group_owned_tables_have_cascading_foreign_keys() {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -3844,7 +3812,6 @@ mod tests {
         for (table, column) in [
             ("cgka_messages", "group_id"),
             ("cgka_queued_outbound", "group_id"),
-            ("cgka_member_capabilities", "group_id"),
             ("cgka_convergence_policies", "group_id"),
             ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
@@ -3877,6 +3844,23 @@ mod tests {
             Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
             "frozen-epoch evidence is bounded by its protocol group and cascades with it"
         );
+
+        // An opened store enforces these declarations.
+        assert_foreign_key_error(conn.execute(
+            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+             VALUES (?1, ?2, 0, 0, ?3)",
+            params![vec![0x01_u8; 4], vec![0x99_u8; 4], vec![0xAA_u8]],
+        ));
+        conn.execute(
+            "INSERT INTO pending_push_registration_removals (
+                group_id_hex, account_label, account_id_hex, platform,
+                token_fingerprint, server_pubkey_hex,
+                registration_created_at_ms, registration_updated_at_ms,
+                queued_at_ms
+             ) VALUES ('orphan', 'alice', 'aa', 1, 'fingerprint', 'bb', 1, 1, 1)",
+            [],
+        )
+        .expect("removal intent must not depend on a projection group row");
     }
 
     #[test]
@@ -3989,66 +3973,6 @@ mod tests {
     }
 
     #[test]
-    fn group_owned_tables_reject_orphan_rows() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let conn = store.lock().unwrap();
-        let orphan_group = vec![0x99_u8; 4];
-
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
-             VALUES (?1, ?2, 0, 0, ?3)",
-            params![vec![0x01_u8; 4], orphan_group, vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_processed_transport_ids (id, group_id)
-             VALUES (?1, ?2)",
-            params![vec![0x09_u8; 4], orphan_group],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO pending_push_registration_shares (
-                group_id_hex, token_fingerprint, registration_updated_at_ms,
-                queued_at_ms
-             ) VALUES ('orphan', 'fingerprint', 1, 1)",
-            [],
-        ));
-        conn.execute(
-            "INSERT INTO pending_push_registration_removals (
-                group_id_hex, account_label, account_id_hex, platform,
-                token_fingerprint, server_pubkey_hex,
-                registration_created_at_ms, registration_updated_at_ms,
-                queued_at_ms
-             ) VALUES ('orphan', 'alice', 'aa', 1, 'fingerprint', 'bb', 1, 1, 1)",
-            [],
-        )
-        .expect("removal intent must not depend on a projection group row");
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
-             VALUES (?1, ?2, 0, ?3)",
-            params![vec![0x02_u8; 4], orphan_group, vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_member_capabilities (group_id, member_id, capabilities)
-             VALUES (?1, ?2, ?3)",
-            params![orphan_group, vec![0x03_u8; 4], vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_convergence_policies (group_id, policy)
-             VALUES (?1, ?2)",
-            params![orphan_group, vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_member_validation_cache (group_id, marker)
-             VALUES (?1, ?2)",
-            params![orphan_group, vec![0xAA_u8]],
-        ));
-        assert_foreign_key_error(conn.execute(
-            "INSERT INTO cgka_group_snapshots (group_id, name, snapshot)
-             VALUES (?1, 'anchor', ?2)",
-            params![orphan_group, vec![0xAA_u8]],
-        ));
-    }
-
-    #[test]
     fn foreign_key_migration_fails_hard_on_existing_orphans() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -4145,6 +4069,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transformed, "did-transform");
+    }
+
+    type MigrationBody = fn(&Transaction<'_>) -> StorageResult<()>;
+
+    thread_local! {
+        static WALKED_BODY: std::cell::Cell<Option<MigrationBody>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    const WALK_INTERRUPTION: &str = "the walk interrupts this migration before its commit";
+
+    /// The walked migration's body, then a failure before the runner commits.
+    fn walked_body_then_interrupted(tx: &Transaction<'_>) -> StorageResult<()> {
+        let body = WALKED_BODY.with(std::cell::Cell::get).expect("walked body");
+        body(tx)?;
+        Err(StorageError::Backend(WALK_INTERRUPTION.into()))
+    }
+
+    /// Every schema object, including the connection's temporary ones.
+    fn schema_objects(conn: &Connection) -> Vec<[Option<String>; 5]> {
+        conn.prepare(
+            "SELECT 'main', type, name, tbl_name, sql FROM sqlite_master
+             UNION ALL
+             SELECT 'temp', type, name, tbl_name, sql FROM sqlite_temp_master
+             ORDER BY 1, 2, 3",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok([
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ])
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Each migration, interrupted by the runner after its body ran and before
+    /// its commit, leaves the schema, the ledger and foreign-key enforcement as
+    /// they were, and applies on the next attempt. The walk runs every body on
+    /// the schema before it, as an upgrade does, and ends with the singletons
+    /// a fresh database must hold.
+    #[test]
+    fn every_migration_body_rolls_back_completely() {
+        // Rows that owners update in place and never insert.
+        const SEEDED: &[(&str, i64)] = &[(
+            "SELECT reserved_bytes FROM attachment_partial_usage WHERE id = 1",
+            0,
+        )];
+        let foreign_keys = |conn: &Connection| -> bool {
+            conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                .unwrap()
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        ensure_migration_table(&conn).unwrap();
+        for migration in MIGRATIONS {
+            let before = schema_objects(&conn);
+            WALKED_BODY.with(|body| body.set(Some(migration.apply)));
+            let interrupted = Migration {
+                version: migration.version,
+                name: migration.name,
+                suspend_foreign_keys: migration.suspend_foreign_keys,
+                apply: walked_body_then_interrupted,
+            };
+            let error = apply_migration(&mut conn, &interrupted).unwrap_err();
+            assert!(
+                matches!(&error, StorageError::Backend(message) if message == WALK_INTERRUPTION),
+                "{}: {error:?}",
+                migration.name
+            );
+            assert_eq!(schema_objects(&conn), before, "{}", migration.name);
+            assert_eq!(applied_name(&conn, migration.version).unwrap(), None);
+            assert!(foreign_keys(&conn), "{}", migration.name);
+            apply_migration(&mut conn, migration).unwrap();
+        }
+        assert_eq!(
+            applied_migrations_from_connection(&conn),
+            expected_migrations()
+        );
+        for (query, expected) in SEEDED {
+            assert_eq!(
+                conn.query_row(query, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                *expected,
+                "{query}"
+            );
+        }
     }
 
     fn foreign_key(

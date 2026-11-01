@@ -19,7 +19,8 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
-use crate::{ProductFamily, ProductObservation, ProductUnit};
+use crate::{ProductFamily, ProductUnit};
+use marmot_observability::ProductOperation;
 use nostr_directory::error::DirectoryError;
 use nostr_directory::hydrate_directory_record;
 use nostr_directory::public_directory_user_record;
@@ -60,7 +61,6 @@ impl MarmotApp {
                 .collect(),
             default_relays: self.relay_endpoints(),
             max_future_skew: self.config.directory_max_future_skew,
-            key_package_client_preference: self.deployment().key_package_client_preference.clone(),
             open_ranking: self.deployment().open_ranking.clone(),
             fallback_seeds: self.config.directory_search_fallback_seeds.clone(),
             http_builder: crate::network_proxy::http_builder,
@@ -119,43 +119,53 @@ impl DirectoryResources for MarmotApp {
             .send(account_id_hex.to_owned());
         self.presentation_signals.wake();
     }
+
+    fn account_key_package_published(&self, account_id_hex: &str) {
+        self.sign_in_nudges.nudge(account_id_hex);
+    }
 }
 
 /// Directory analytics go to the app's usage-diagnostics collector, under the
 /// families and units they always used.
 impl DirectoryObserver for MarmotApp {
-    type Observation = ProductObservation;
+    type Observation = DirectoryProductObservation;
 
     fn begin(
         &self,
         family: ObservedFamily,
         operation: &'static str,
         unit: ObservedUnit,
-    ) -> Option<ProductObservation> {
+    ) -> Option<DirectoryProductObservation> {
         self.product_analytics
-            .begin(product_family(family), operation, product_unit(unit))
+            .operation(product_family(family), operation, product_unit(unit))
+            .map(DirectoryProductObservation)
     }
 }
 
-impl DirectoryObservation for ProductObservation {
+/// A directory operation recorded into the app's collector. The directory's observation trait is
+/// implemented on this `marmot-app` type because neither the trait nor the collector's operation
+/// is local to `marmot-app` once the collector moves to its own crate (#2627).
+pub struct DirectoryProductObservation(ProductOperation);
+
+impl DirectoryObservation for DirectoryProductObservation {
     fn counts_only(self) -> Self {
-        ProductObservation::counts_only(self)
+        Self(self.0.counts_only())
     }
 
     fn count(&self, outcome: &str, unit: ObservedUnit, count: u64) {
-        ProductObservation::count(self, outcome, product_unit(unit), count);
+        self.0.count(outcome, product_unit(unit), count);
     }
 
     fn directory_sample(&self, outcome: &str, source: &str, count: u64) {
-        ProductObservation::directory_sample(self, outcome, source, count);
+        self.0.directory_sample(outcome, source, count);
     }
 
     fn finish(self, outcome: &str) {
-        ProductObservation::finish(self, outcome);
+        self.0.finish(outcome);
     }
 
     fn discard(self) {
-        ProductObservation::discard(self);
+        self.0.discard();
     }
 }
 
@@ -451,7 +461,7 @@ mod observer_tests {
     fn directory_observations_keep_their_events_and_drop_rule() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = MarmotApp::with_relays(dir.path(), vec![]);
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
 
         let counts = DirectoryObserver::begin(

@@ -1,0 +1,1123 @@
+use cgka_traits::TransportEndpoint;
+use transport_nostr_adapter::HistogramBucket;
+
+use crate::app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncErrorClass,
+    SyncFailureClassification, SyncFailureCount, SyncFailureStage,
+};
+use crate::export_config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
+use transport_nostr::{EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup};
+
+use super::*;
+
+fn hist(count: u64) -> DurationHistogramSnapshot {
+    DurationHistogramSnapshot {
+        buckets: vec![HistogramBucket {
+            upper_bound_ms: 50,
+            count,
+        }],
+        overflow_count: 0,
+        sum_ms: count.saturating_mul(50),
+    }
+}
+
+fn runtime_config() -> RelayTelemetryRuntimeConfig {
+    RelayTelemetryRuntimeConfig {
+        otlp_endpoint: Some("https://otlp.example.org/v1/metrics".to_owned()),
+        authorization_bearer_token: Some("token".to_owned()),
+        resource: Some(RelayTelemetryResource {
+            service_version: "1.4.2".to_owned(),
+            service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
+            deployment_environment: "staging".to_owned(),
+            tenant: "mdk-ios".to_owned(),
+            os_type: "ios".to_owned(),
+            os_version: "17.5".to_owned(),
+            device_model_identifier: None,
+        }),
+    }
+}
+
+#[test]
+fn build_export_batch_labels_only_resolved_relays() {
+    let rollup = RelayTelemetryRollup {
+        relays: vec![
+            RelayRollupEntry {
+                relay_index: 0,
+                first_event_latency: hist(2),
+                eose_latency: hist(1),
+                delivered_first: 3,
+                delivered_later: 1,
+            },
+            // Index 1 has no resolved label, so it must be skipped entirely.
+            RelayRollupEntry {
+                relay_index: 1,
+                delivered_first: 9,
+                ..Default::default()
+            },
+        ],
+        cross_relay_spread: hist(5),
+        messages_observed: 5,
+        connection_attempts: 4,
+        connection_successes: 3,
+        publish_attempts: 2,
+        publish_successes: 2,
+        ..Default::default()
+    };
+    let resolution = RelayLabelResolution::from_pairs([(
+        RelayIndex(0),
+        TransportEndpoint("wss://a.example".into()),
+    )]);
+
+    let batch = build_export_batch(&rollup, &resolution);
+
+    // Only the resolved relay appears, and only as a `relay` label.
+    assert_eq!(batch.relay_labels(), vec!["wss://a.example"]);
+
+    let relay_points: Vec<_> = batch
+        .points
+        .iter()
+        .filter(|point| point.relay.is_some())
+        .collect();
+    assert!(
+        relay_points
+            .iter()
+            .all(|point| point.relay.as_deref() == Some("wss://a.example")),
+        "every per-relay point carries the single resolved relay label",
+    );
+    assert!(
+        relay_points
+            .iter()
+            .any(|point| point.name == metric_names::FIRST_EVENT_LATENCY)
+    );
+    assert!(relay_points.iter().any(|point| {
+        point.name == metric_names::DELIVERY_COUNT && point.value == ExportMetricValue::Counter(4)
+    }));
+    assert!(relay_points.iter().any(|point| {
+        point.name == metric_names::FIRST_DELIVERER_RATE
+            && point.value == ExportMetricValue::Gauge(0.75)
+    }));
+
+    // Population points carry no label, and the cross-relay spread is one.
+    assert!(
+        batch.points.iter().any(|point| {
+            point.name == metric_names::CROSS_RELAY_SPREAD && point.relay.is_none()
+        })
+    );
+    // No publish/connection/population point ever carries a relay label.
+    assert!(
+        batch
+            .points
+            .iter()
+            .filter(|point| point.name != metric_names::FIRST_EVENT_LATENCY
+                && point.name != metric_names::EOSE_LATENCY
+                && point.name != metric_names::DELIVERY_COUNT
+                && point.name != metric_names::REDUNDANT_COUNT
+                && point.name != metric_names::FIRST_DELIVERER_RATE)
+            .all(|point| point.relay.is_none())
+    );
+}
+
+#[test]
+fn build_export_batch_forwards_histogram_bucket_edges() {
+    let rollup = RelayTelemetryRollup {
+        cross_relay_spread: DurationHistogramSnapshot {
+            buckets: vec![
+                HistogramBucket {
+                    upper_bound_ms: 10,
+                    count: 1,
+                },
+                HistogramBucket {
+                    upper_bound_ms: 50,
+                    count: 2,
+                },
+            ],
+            overflow_count: 4,
+            sum_ms: 123_456,
+        },
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+    let spread = batch
+        .points
+        .iter()
+        .find(|point| point.name == metric_names::CROSS_RELAY_SPREAD)
+        .expect("cross relay spread point");
+    match &spread.value {
+        ExportMetricValue::Histogram(histogram) => {
+            assert_eq!(histogram.bounds_ms, vec![10, 50]);
+            assert_eq!(histogram.bucket_counts, vec![1, 2]);
+            assert_eq!(histogram.overflow_count, 4);
+            assert_eq!(histogram.sum_ms, 123_456);
+            assert_eq!(histogram.total(), 7);
+        }
+        other => panic!("expected histogram, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_export_batch_folds_in_engine_metrics_when_present() {
+    let rollup = RelayTelemetryRollup {
+        engine: Some(EngineReorgMetrics {
+            settles: 4,
+            post_settle_reorgs: 1,
+            reorg_lateness_ms: hist(1),
+        }),
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::OBSERVED_REORG_RATE
+            && point.value == ExportMetricValue::Gauge(0.25)
+    }));
+    assert!(
+        batch
+            .points
+            .iter()
+            .any(|point| point.name == metric_names::REORG_LATENESS)
+    );
+    // Engine metrics are population-level: no relay label.
+    assert!(
+        batch
+            .points
+            .iter()
+            .filter(|point| point.name == metric_names::SETTLES
+                || point.name == metric_names::POST_SETTLE_REORGS
+                || point.name == metric_names::OBSERVED_REORG_RATE
+                || point.name == metric_names::REORG_LATENESS)
+            .all(|point| point.relay.is_none())
+    );
+}
+
+#[test]
+fn build_export_batch_includes_unlabeled_message_counters() {
+    let rollup = RelayTelemetryRollup {
+        messages_observed: 5,
+        messages_corroborated: 4,
+        messages_single_source: 1,
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+
+    for (name, value) in [
+        (metric_names::MESSAGE_OBSERVED, 5),
+        (metric_names::MESSAGE_CORROBORATED, 4),
+        (metric_names::MESSAGE_SINGLE_SOURCE, 1),
+    ] {
+        assert!(batch.points.iter().any(|point| {
+            point.name == name
+                && point.relay.is_none()
+                && point.value == ExportMetricValue::Counter(value)
+        }));
+        assert!(!name.ends_with("_total"));
+    }
+}
+
+#[test]
+fn build_export_batch_includes_unlabeled_reconciliation_counters() {
+    let rollup = RelayTelemetryRollup {
+        reconciliation_attempts: 9,
+        reconciliation_order_unproven_passes: 2,
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+
+    for (name, value) in [
+        (metric_names::RECONCILIATION_ATTEMPTS, 9),
+        (metric_names::RECONCILIATION_ORDER_UNPROVEN_PASSES, 2),
+    ] {
+        assert!(batch.points.iter().any(|point| {
+            point.name == name
+                && point.relay.is_none()
+                && point.failure.is_none()
+                && point.value == ExportMetricValue::Counter(value)
+        }));
+    }
+}
+
+#[test]
+fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
+    let rollup = RelayTelemetryRollup {
+        activations_full: 11,
+        activations_degraded: 3,
+        activations_failed: 1,
+        group_syncs_full: 17,
+        group_syncs_degraded: 5,
+        group_syncs_failed: 2,
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+
+    for (name, value) in [
+        (metric_names::ACCOUNT_ACTIVATIONS_FULL, 11),
+        (metric_names::ACCOUNT_ACTIVATIONS_DEGRADED, 3),
+        (metric_names::ACCOUNT_ACTIVATIONS_FAILED, 1),
+        (metric_names::GROUP_SYNCS_FULL, 17),
+        (metric_names::GROUP_SYNCS_DEGRADED, 5),
+        (metric_names::GROUP_SYNCS_FAILED, 2),
+    ] {
+        let matching: Vec<_> = batch
+            .points
+            .iter()
+            .filter(|point| point.name == name)
+            .collect();
+        assert_eq!(matching.len(), 1, "{name} is one device-wide point");
+        assert!(matching[0].relay.is_none());
+        assert!(matching[0].failure.is_none());
+        assert_eq!(matching[0].value, ExportMetricValue::Counter(value));
+    }
+}
+
+#[test]
+fn build_export_batch_appends_unlabeled_app_performance_metrics() {
+    let app_performance = AppPerformanceSnapshot {
+        app_start: AppPerformanceOperationSnapshot {
+            attempts: 3,
+            successes: 2,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(2),
+        },
+        group_invite_engine_publish: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(4),
+        },
+        group_details_read: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 2,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(1),
+        },
+        group_conversation_snapshot_read: AppPerformanceOperationSnapshot {
+            attempts: 4,
+            successes: 3,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(2),
+        },
+        chat_list_row_read: AppPerformanceOperationSnapshot {
+            attempts: 3,
+            successes: 3,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(1),
+        },
+        group_roster_read: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(1),
+        },
+        group_accept_invite: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 1,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(3),
+        },
+        media_download_body_transfer: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 1,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(8),
+        },
+        host_splash_ready: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(5),
+        },
+        account_transport_activation: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(2),
+        },
+        account_subscription_registration: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 0,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(3),
+        },
+        account_sync: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 0,
+            failures: 1,
+            failure_classifications: vec![SyncFailureCount {
+                classification: SyncFailureClassification::new(
+                    SyncFailureStage::CgkaIngest,
+                    SyncErrorClass::Protocol,
+                ),
+                count: 1,
+            }],
+            duration_ms: hist(1),
+        },
+        sqlcipher_migration_probe_runs: 7,
+        sqlcipher_migration_probe_skips: 42,
+        ..Default::default()
+    };
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&app_performance),
+    );
+
+    assert!(batch.points.iter().all(|point| point.relay.is_none()));
+    let sync_failure = batch
+        .points
+        .iter()
+        .find(|point| point.name == metric_names::APP_ACCOUNT_SYNC_FAILURES)
+        .expect("classified sync failure point");
+    assert_eq!(
+        sync_failure.failure,
+        Some(SyncFailureClassification::new(
+            SyncFailureStage::CgkaIngest,
+            SyncErrorClass::Protocol,
+        ))
+    );
+    assert_eq!(sync_failure.value, ExportMetricValue::Counter(1));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_START_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(3)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_START_SUCCESSES
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_HOST_SPLASH_READY_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_ACCOUNT_TRANSPORT_ACTIVATION_SUCCESSES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_HOST_SPLASH_READY_DURATION
+            && point.value
+                == ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![50],
+                    bucket_counts: vec![5],
+                    overflow_count: 0,
+                    sum_ms: 250,
+                })
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_START_FAILURES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_CONVERSATION_SNAPSHOT_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(4)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_CHAT_LIST_ROW_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(3)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS
+            && point.relay.is_none()
+            && point.value == ExportMetricValue::Counter(7)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_SQLCIPHER_MIGRATION_PROBE_SKIPS
+            && point.relay.is_none()
+            && point.value == ExportMetricValue::Counter(42)
+    }));
+    for metric_name in [
+        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
+        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
+        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
+        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
+        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
+        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
+        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
+    ] {
+        assert!(
+            batch.points.iter().any(|point| point.name == metric_name),
+            "missing create-group telemetry export {metric_name}",
+        );
+    }
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    // The accept-invite phase is population-level like every other
+    // app-performance point: all four metrics exist and carry no relay label.
+    for metric_name in [
+        metric_names::APP_GROUP_ACCEPT_INVITE_DURATION,
+        metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS,
+        metric_names::APP_GROUP_ACCEPT_INVITE_SUCCESSES,
+        metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES,
+    ] {
+        assert!(
+            batch
+                .points
+                .iter()
+                .any(|point| point.name == metric_name && point.relay.is_none()),
+            "missing unlabeled accept-invite telemetry export {metric_name}",
+        );
+    }
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_ACCEPT_INVITE_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    // Every media phase uses the same population-only export path. Assert all
+    // four points per phase remain free of relay and failure attributes so a
+    // later field addition cannot silently turn media activity into a dynamic
+    // per-host, per-account, or per-message series.
+    for metric_names in [
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
+        ],
+    ] {
+        for name in metric_names {
+            assert!(
+                batch.points.iter().any(|point| point.name == name
+                    && point.relay.is_none()
+                    && point.failure.is_none()),
+                "missing unlabeled media telemetry export {name}",
+            );
+        }
+    }
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+
+    let duration = batch
+        .points
+        .iter()
+        .find(|point| point.name == metric_names::APP_START_DURATION)
+        .expect("app start duration metric");
+    match &duration.value {
+        ExportMetricValue::Histogram(histogram) => {
+            assert_eq!(histogram.bounds_ms, vec![50]);
+            assert_eq!(histogram.bucket_counts, vec![2]);
+        }
+        other => panic!("expected histogram, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
+    let relay_plane = MarmotRelayPlane::full_history();
+
+    // Off by default, and enabled-without-endpoint is still inert.
+    assert!(
+        RelayTelemetryExporter::new(
+            &relay_plane,
+            RelayTelemetryExportConfig::disabled(),
+            crate::product_analytics::test_permit()
+        )
+        .is_none()
+    );
+    assert!(
+        RelayTelemetryExporter::new(
+            &relay_plane,
+            RelayTelemetryExportConfig {
+                enabled: true,
+                endpoint: None,
+                ..Default::default()
+            },
+            crate::product_analytics::test_permit()
+        )
+        .is_none()
+    );
+
+    let exporter = RelayTelemetryExporter::new(
+        &relay_plane,
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .expect("opted-in exporter is constructed");
+    let batch = exporter.build_batch(None).await;
+
+    // No relay traffic yet: population points only, no relay labels leak.
+    assert!(batch.relay_labels().is_empty());
+    assert!(
+        batch
+            .points
+            .iter()
+            .any(|point| point.name == metric_names::CROSS_RELAY_SPREAD)
+    );
+    assert!(batch.points.iter().all(|point| point.relay.is_none()));
+}
+
+#[test]
+fn collection_period_subtracts_history_and_detects_resets_against_previous_sample() {
+    let exporter = RelayTelemetryExporter::new(
+        &MarmotRelayPlane::full_history(),
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .unwrap();
+    let batch = |total, redundant, buckets: Vec<u64>, sum| RelayTelemetryExportBatch {
+        points: vec![
+            ExportMetricPoint {
+                name: metric_names::DELIVERY_COUNT,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(total),
+            },
+            ExportMetricPoint {
+                name: metric_names::REDUNDANT_COUNT,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(redundant),
+            },
+            ExportMetricPoint {
+                name: metric_names::FIRST_DELIVERER_RATE,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(0.99),
+            },
+            ExportMetricPoint {
+                name: metric_names::CROSS_RELAY_SPREAD,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![10, 20],
+                    bucket_counts: buckets,
+                    overflow_count: 0,
+                    sum_ms: sum,
+                }),
+            },
+        ],
+    };
+    let (initial, start) = exporter.since_baseline(batch(10, 5, vec![2, 3], 80));
+    assert_eq!(initial.points[0].value, ExportMetricValue::Counter(0));
+    let (later, later_start) = exporter.since_baseline(batch(20, 7, vec![4, 4], 110));
+    assert_eq!(start, later_start);
+    assert_eq!(later.points[0].value, ExportMetricValue::Counter(10));
+    assert_eq!(later.points[2].value, ExportMetricValue::Gauge(0.8));
+    assert_eq!(
+        later.points[3].value,
+        ExportMetricValue::Histogram(ExportHistogram {
+            bounds_ms: vec![10, 20],
+            bucket_counts: vec![2, 1],
+            overflow_count: 0,
+            sum_ms: 30
+        })
+    );
+    // Still above the original baseline, but below the previous sample: a source reset.
+    let (reset, reset_start) = exporter.since_baseline(batch(15, 6, vec![3, 4], 100));
+    assert!(reset_start >= later_start);
+    assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
+    let mut next = batch(16, 6, vec![3, 5], 120);
+    next.points.push(ExportMetricPoint {
+        name: "new_series",
+        relay: None,
+        failure: None,
+        value: ExportMetricValue::Counter(3),
+    });
+    let (next, _) = exporter.since_baseline(next);
+    assert_eq!(
+        next.points.last().unwrap().value,
+        ExportMetricValue::Counter(0)
+    );
+    assert_eq!(next.points[2].value, ExportMetricValue::Gauge(1.0));
+}
+
+#[test]
+fn late_cumulative_sources_start_at_zero_and_retain_their_baseline_when_absent() {
+    let exporter = RelayTelemetryExporter::new(
+        &MarmotRelayPlane::full_history(),
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .unwrap();
+    let batch = |count| RelayTelemetryExportBatch {
+        points: vec![
+            ExportMetricPoint {
+                name: "late_counter",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(count),
+            },
+            ExportMetricPoint {
+                name: "late_histogram",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![10],
+                    bucket_counts: vec![count],
+                    overflow_count: count,
+                    sum_ms: count * 30,
+                }),
+            },
+            ExportMetricPoint {
+                name: "late_gauge",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(12.0),
+            },
+        ],
+    };
+    let empty = || RelayTelemetryExportBatch { points: vec![] };
+    let (_, start) = exporter.since_baseline(empty());
+    let (first, first_start) = exporter.since_baseline(batch(100));
+    assert_eq!(start, first_start);
+    assert_eq!(first.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(first.points[1].value, batch(0).points[1].value);
+    assert_eq!(first.points[2].value, ExportMetricValue::Gauge(12.0));
+    exporter.since_baseline(empty());
+    let (next, _) = exporter.since_baseline(batch(103));
+    assert_eq!(next.points[0].value, ExportMetricValue::Counter(3));
+    assert_eq!(next.points[1].value, batch(3).points[1].value);
+    exporter.since_baseline(empty());
+    let (reset, _) = exporter.since_baseline(batch(102));
+    assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(reset.points[1].value, batch(0).points[1].value);
+}
+
+#[test]
+fn message_journey_metric_export() {
+    use crate::app_telemetry::{
+        AppPerformanceOperation, AppPerformanceTelemetry, HostPerformanceOperation,
+        HostPerformanceOutcome,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    for operation in [
+        AppPerformanceOperation::OutboundMessageQueueWait,
+        AppPerformanceOperation::OutboundMessageLocalProjection,
+        AppPerformanceOperation::OutboundMessageLocalAccept,
+        AppPerformanceOperation::OutboundMessagePublish,
+        AppPerformanceOperation::OutboundMessageResponse,
+        AppPerformanceOperation::InboundDeliveryProjection,
+    ] {
+        telemetry.record(operation, std::time::Duration::from_millis(60), true);
+        telemetry.record(operation, std::time::Duration::from_millis(120), false);
+    }
+    for operation in [
+        HostPerformanceOperation::OutboundMessageVisible,
+        HostPerformanceOperation::InboundMessageVisible,
+    ] {
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(60),
+            HostPerformanceOutcome::Success,
+        );
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(120),
+            HostPerformanceOutcome::Failure,
+        );
+    }
+    let snapshot = telemetry.snapshot();
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&snapshot),
+    );
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    for (name, operation) in [
+        (
+            "outbound_message_queue_wait",
+            &snapshot.outbound_message_queue_wait,
+        ),
+        (
+            "outbound_message_local_projection",
+            &snapshot.outbound_message_local_projection,
+        ),
+        (
+            "outbound_message_local_accept",
+            &snapshot.outbound_message_local_accept,
+        ),
+        (
+            "outbound_message_publish",
+            &snapshot.outbound_message_publish,
+        ),
+        (
+            "outbound_message_response",
+            &snapshot.outbound_message_response,
+        ),
+        (
+            "inbound_delivery_projection",
+            &snapshot.inbound_delivery_projection,
+        ),
+        (
+            "host_outbound_message_visible",
+            &snapshot.host_outbound_message_visible,
+        ),
+        (
+            "host_inbound_message_visible",
+            &snapshot.host_inbound_message_visible,
+        ),
+    ] {
+        assert_eq!(operation.attempts, 2);
+        assert_eq!(operation.successes, 1);
+        assert_eq!(operation.failures, 1);
+        assert_eq!(operation.duration_ms.sum_ms, 180);
+        for suffix in ["duration_ms", "attempts", "successes", "failures"] {
+            let name = format!("app_{name}_{suffix}");
+            let points = batch
+                .points
+                .iter()
+                .filter(|point| point.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(points.len(), 1, "{name} must be exported exactly once");
+            assert!(points[0].relay.is_none());
+        }
+        legacy.as_object_mut().unwrap().remove(name);
+    }
+    let legacy: AppPerformanceSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.outbound_message_queue_wait.attempts, 0);
+    assert_eq!(legacy.host_inbound_message_visible.attempts, 0);
+}
+
+#[test]
+fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels() {
+    use crate::app_telemetry::{
+        AppPerformanceTelemetry, RuntimePerformanceOperation as Op, runtime::Outcome,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    let exporter = RelayTelemetryExporter::new(
+        &MarmotRelayPlane::full_history(),
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .unwrap();
+    let batch = || {
+        build_export_batch_with_app_performance(
+            &RelayTelemetryRollup::default(),
+            &RelayLabelResolution::default(),
+            Some(&telemetry.snapshot()),
+        )
+    };
+    exporter.since_baseline(batch());
+    telemetry.record_runtime(
+        Op::AccountStartupRetrySuppressed,
+        std::time::Duration::ZERO,
+        Outcome::NotReady,
+    );
+    let observation = telemetry.observe(Op::ConversationOpen);
+    let (active, _) = exporter.since_baseline(batch());
+    let points: Vec<_> = active
+        .points
+        .iter()
+        .filter(|p| p.name.starts_with("app_runtime_"))
+        .collect();
+    assert_eq!(points.len(), Op::ALL.len() * 11);
+    assert!(
+        points
+            .iter()
+            .all(|p| p.relay.is_none() && p.failure.is_none())
+    );
+    let metric = |batch: &RelayTelemetryExportBatch, name| {
+        batch
+            .points
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap()
+            .value
+            .clone()
+    };
+    assert_eq!(
+        metric(
+            &active,
+            "app_runtime_account_startup_retry_suppressed_not_ready"
+        ),
+        ExportMetricValue::Counter(1)
+    );
+    assert_eq!(
+        metric(&active, "app_runtime_conversation_open_started"),
+        ExportMetricValue::Counter(1)
+    );
+    assert_eq!(
+        metric(&active, "app_runtime_conversation_open_in_flight"),
+        ExportMetricValue::Gauge(1.0)
+    );
+    observation.finish(Outcome::Success);
+    let (finished, _) = exporter.since_baseline(batch());
+    assert_eq!(
+        metric(&finished, "app_runtime_conversation_open_completed"),
+        ExportMetricValue::Counter(1)
+    );
+    assert_eq!(
+        metric(&finished, "app_runtime_conversation_open_in_flight"),
+        ExportMetricValue::Gauge(0.0)
+    );
+    assert!(
+        matches!(metric(&finished, "app_runtime_conversation_open_duration_ms"), ExportMetricValue::Histogram(h) if h.bucket_counts.iter().sum::<u64>() + h.overflow_count == 1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_publish_counters_are_unlabeled_population_points() {
+    use transport_nostr::test_support::{AccountPublishFixture, PublishScript};
+
+    let fixture = AccountPublishFixture::activate().await;
+    let exporter = RelayTelemetryExporter::new(
+        &fixture.plane,
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .expect("opted-in exporter");
+    fixture
+        .publish(PublishScript::Accept, 1)
+        .await
+        .expect("success");
+    fixture
+        .publish(PublishScript::Error, 1)
+        .await
+        .expect_err("failure");
+    fixture.cancel_in_flight().await;
+    let batch = exporter.build_batch(None).await;
+    let counter = |name: &str| {
+        let point = batch
+            .points
+            .iter()
+            .find(|point| point.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(point.relay.is_none(), "{name} must not carry a relay label");
+        assert!(
+            point.failure.is_none(),
+            "{name} must not carry a failure classification"
+        );
+        match point.value {
+            ExportMetricValue::Counter(value) => value,
+            ref other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    };
+    assert_eq!(counter(metric_names::PUBLISH_ATTEMPTS), 3);
+    assert_eq!(counter(metric_names::PUBLISH_SUCCESSES), 1);
+    assert_eq!(counter(metric_names::PUBLISH_FAILURES), 1);
+    assert_eq!(counter(metric_names::PUBLISH_CANCELLATIONS), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_activation_counters_reach_the_export_batch() {
+    use transport_nostr::test_support::AccountPublishFixture;
+
+    let fixture = AccountPublishFixture::activate().await;
+    let exporter = RelayTelemetryExporter::new(
+        &fixture.plane,
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .expect("opted-in exporter");
+    let batch = exporter.build_batch(None).await;
+    let counter = |name: &str| {
+        let point = batch
+            .points
+            .iter()
+            .find(|point| point.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(point.relay.is_none(), "{name} must not carry a relay label");
+        assert!(
+            point.failure.is_none(),
+            "{name} must not carry a failure classification"
+        );
+        match point.value {
+            ExportMetricValue::Counter(value) => value,
+            ref other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    };
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_FULL), 1);
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_DEGRADED), 0);
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_FAILED), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_FULL), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_DEGRADED), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_FAILED), 0);
+}
+
+#[test]
+fn host_stages_use_registry() {
+    use crate::app_telemetry::{
+        AppPerformanceTelemetry, HostPerformanceOperation as Host,
+        HostPerformanceOutcome as Outcome, RuntimePerformanceOperation as Op,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    let stages = [
+        (
+            Host::LinuxStartupBeforeVault,
+            Op::HostLinuxStartupBeforeVault,
+        ),
+        (Host::LinuxStartupAfterVault, Op::HostLinuxStartupAfterVault),
+        (Host::WindowInit, Op::HostWindowInit),
+        (Host::FontsInit, Op::HostFontsInit),
+        (Host::RuntimeInit, Op::HostRuntimeInit),
+        (Host::AccountLoad, Op::HostAccountLoad),
+        (Host::AccountSwitch, Op::HostAccountSwitch),
+        (Host::FrameUpdate, Op::HostFrameUpdate),
+        (Host::FrameLayout, Op::HostFrameLayout),
+        (Host::FrameDraw, Op::HostFrameDraw),
+        (Host::FramePresent, Op::HostFramePresent),
+        (Host::LinuxFramePostPresent, Op::HostLinuxFramePostPresent),
+        (Host::LinuxFrameUntilPresent, Op::HostLinuxFrameUntilPresent),
+        (Host::LinuxFrameIdleWait, Op::HostLinuxFrameIdleWait),
+        (Host::ChatListLoad, Op::HostChatListLoad),
+        (Host::ContactsLoad, Op::HostContactsLoad),
+        (Host::ArchivedChatListLoad, Op::HostArchivedChatListLoad),
+        (Host::ProfileLoad, Op::HostProfileLoad),
+        (Host::ProfileRead, Op::HostProfileRead),
+        (Host::TimelineOpen, Op::HostTimelineOpen),
+        (Host::TimelinePage, Op::HostTimelinePage),
+        (Host::TimelineHandoff, Op::HostTimelineHandoff),
+        (Host::TimelineApply, Op::HostTimelineApply),
+        (Host::MessageSend, Op::HostMessageSend),
+        (Host::MessageSearch, Op::HostMessageSearch),
+        (Host::ConversationSearch, Op::HostConversationSearch),
+        (Host::MediaQueueWait, Op::HostMediaQueueWait),
+        (Host::MediaPrepare, Op::HostMediaPrepare),
+        (Host::MediaLoad, Op::HostMediaLoad),
+        (Host::MediaCacheRead, Op::HostMediaCacheRead),
+        (Host::MediaDecode, Op::HostMediaDecode),
+        (Host::MediaApply, Op::HostMediaApply),
+        (Host::LinuxVaultDeriveKey, Op::HostLinuxVaultDeriveKey),
+        (Host::LinuxVaultOpen, Op::HostLinuxVaultOpen),
+        (Host::LinuxVaultCreate, Op::HostLinuxVaultCreate),
+        (Host::LinuxVaultPersist, Op::HostLinuxVaultPersist),
+        (Host::SettingsSave, Op::HostSettingsSave),
+    ];
+    for (index, (operation, _)) in stages.into_iter().enumerate() {
+        for outcome in [
+            Outcome::Success,
+            Outcome::Failure,
+            Outcome::Cancelled,
+            Outcome::Timeout,
+            Outcome::Unavailable,
+        ] {
+            telemetry.record_host_performance(
+                operation,
+                std::time::Duration::from_millis(index as u64 + 1),
+                outcome,
+            );
+        }
+    }
+    let snapshot = telemetry.snapshot();
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&snapshot),
+    );
+    for (index, (_, operation)) in stages.into_iter().enumerate() {
+        let stage = snapshot
+            .runtime_operations
+            .iter()
+            .find(|s| s.operation == operation)
+            .unwrap();
+        assert_eq!((stage.started, stage.completed, stage.in_flight), (5, 5, 0));
+        assert_eq!(
+            [
+                stage.successes,
+                stage.failures,
+                stage.cancelled,
+                stage.timeouts,
+                stage.not_ready
+            ],
+            [1; 5]
+        );
+        let names = operation.metric_names();
+        for (name, expected) in names[..7].iter().zip([5, 5, 1, 1, 1, 1, 1]) {
+            let points: Vec<_> = batch.points.iter().filter(|p| p.name == *name).collect();
+            assert_eq!(points.len(), 1);
+            assert!(points[0].relay.is_none() && points[0].failure.is_none());
+            assert_eq!(points[0].value, ExportMetricValue::Counter(expected));
+        }
+        let histogram = batch.points.iter().find(|p| p.name == names[7]).unwrap();
+        assert!(histogram.relay.is_none() && histogram.failure.is_none());
+        let ExportMetricValue::Histogram(histogram) = &histogram.value else {
+            panic!("expected histogram")
+        };
+        assert_eq!(histogram.sum_ms, (index as u64 + 1) * 5);
+        assert_eq!(
+            histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
+            5
+        );
+        for name in &names[8..] {
+            let point = batch.points.iter().find(|p| p.name == *name).unwrap();
+            assert_eq!(point.value, ExportMetricValue::Gauge(0.0));
+        }
+    }
+}

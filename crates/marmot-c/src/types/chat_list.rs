@@ -1,5 +1,6 @@
 //! C mirrors of the durable chat-list projection conversions.
 
+use super::sticker::MarmotStickerRef;
 use marmot_uniffi::conversions::{
     ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
     ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
@@ -114,6 +115,7 @@ c_mirror! {
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
+        opt_rec sticker: MarmotStickerRef,
         copy timeline_at: u64,
         opt_copy has_retention_seconds/retention_seconds: u64,
         opt_copy has_retention_expires_at/retention_expires_at: u64,
@@ -287,6 +289,7 @@ mod tests {
                 sender_display_name: None,
                 plaintext: "hello".to_owned(),
                 content_tokens: marmot_uniffi::MarkdownDocumentFfi::default(),
+                sticker: None,
                 kind: 9,
                 timeline_at: 999,
                 retention_seconds,
@@ -343,6 +346,7 @@ mod tests {
             sender_display_name: None,
             plaintext: "raw".into(),
             content_tokens: MarkdownDocumentFfi::default(),
+            sticker: None,
             kind: 1210,
             timeline_at: 50,
             retention_seconds: None,

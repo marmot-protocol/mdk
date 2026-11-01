@@ -488,8 +488,11 @@ convergence-release-hardening-lane manifest:
     cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- validate "{{manifest}}" --require-mixed-builds
     cargo run -p convergence-campaign-runner --bin cgka-distributed-campaign --locked -- run "{{manifest}}"
 
+# Builds the std-only audit with rustc alone, as the pull-request pre-check does,
+# so it skips the simulator crate's build.
 tracing-audit:
-    cargo nextest run -p cgka-conformance-simulator --test tracing_audit
+    ./scripts/check_tracing_audit.sh
+    python3 scripts/test_check_tracing_audit.py
 
 tamarin:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }
@@ -685,6 +688,6 @@ release-profile-gate:
 # passes, and the release pin proof. Run it once for shared build-input or
 # workflow changes; ordinary pushes use the scoped checks in AGENTS.md.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate tracing-audit c-parity-gate binding-docs-gate binding-build-gate convergence-ledger-gate campaign-toolchain-gate app-stack-campaign-contract audit-otlp-receiver-contract agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate apple-privacy-gate release-profile-gate clippy test-convergence-policy-pin test

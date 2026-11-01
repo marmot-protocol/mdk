@@ -3,7 +3,7 @@
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
 use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
-use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
+use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::conversation_presentation::{
     ConversationAuthority, ConversationHeaderState, ConversationPresentationError,
@@ -11,10 +11,12 @@ use crate::conversation_presentation::{
 };
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
-use crate::{AppPerformanceTelemetry, RuntimePerformanceOperation as RuntimeOp};
-use cgka_engine::group_authority::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
+use marmot_observability::PerformanceRecorder;
+use marmot_observability::{Observation, Outcome as TelemetryOutcome};
+use marmot_session::GroupAuthoritySnapshot;
 use std::{
+    collections::BTreeSet,
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -62,8 +64,8 @@ impl From<StorageError> for ConversationWindowError {
         AppError::from(error).into()
     }
 }
-impl From<cgka_session::SessionError> for ConversationWindowError {
-    fn from(error: cgka_session::SessionError) -> Self {
+impl From<marmot_session::SessionError> for ConversationWindowError {
+    fn from(error: marmot_session::SessionError) -> Self {
         AppError::from(error).into()
     }
 }
@@ -247,12 +249,22 @@ impl AppClient {
             }
         }
     }
+    /// The groups with a conversation window open on this account. A window
+    /// registers its capture at its first worker read and releases it when
+    /// it closes. The recovery runner serves their routes first.
+    pub(crate) fn open_conversation_groups(&self) -> BTreeSet<Vec<u8>> {
+        self.conversation_captures
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|capture| capture.group.as_slice().to_vec())
+            .collect()
+    }
     pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
         self.conversation_captures
             .retain(|capture| capture.strong_count() > 0);
         publish_conversation_captures_from_session(
             &self.conversation_captures,
-            self.runtime.session(),
+            self.runtime.group_authority_view(),
             &self.app,
             &self.state.label,
             group,
@@ -264,7 +276,7 @@ impl AppClient {
 /// closed windows across a network wait; each upgrade lasts one checkpoint.
 pub(crate) fn publish_conversation_captures_from_session(
     observers: &[Weak<SendCapture>],
-    session: &cgka_session::AccountDeviceSession,
+    view: marmot_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
@@ -295,7 +307,7 @@ pub(crate) fn publish_conversation_captures_from_session(
         // latest observers still require only their current-query capture.
         let latest = if latest_query != query {
             capture_conversation_from_session(
-                session,
+                view,
                 app,
                 label,
                 &observer.group,
@@ -308,7 +320,7 @@ pub(crate) fn publish_conversation_captures_from_session(
             None
         };
         if let Ok(captured) = capture_conversation_from_session(
-            session,
+            view,
             app,
             label,
             &observer.group,
@@ -327,6 +339,22 @@ pub(crate) fn publish_conversation_captures_from_session(
 }
 /// Only called with the live client. Frozen startup/recovery snapshots return
 /// NotReady at their dispatch sites instead of entering this path.
+/// What a stale `Member` row reads as from a capture's live facts, if this
+/// device is not a member. Live removal facts do not distinguish voluntary
+/// departure from eviction, so `Removed` is the conservative fallback, except
+/// for a removed copy that still lists the account: only this device's leaf
+/// went (mdk#2628 D62).
+fn stale_member_departure(authority: &GroupAuthoritySnapshot) -> Option<crate::SelfMembership> {
+    let facts = authority.facts;
+    if facts.removed && facts.account_listed {
+        Some(crate::SelfMembership::DeviceRemoved)
+    } else if facts.removed || (!facts.is_member && !facts.disbanded && !facts.unrecoverable) {
+        Some(crate::SelfMembership::Removed)
+    } else {
+        None
+    }
+}
+
 pub(super) fn capture_conversation(
     client: &mut AppClient,
     group: &GroupId,
@@ -334,7 +362,7 @@ pub(super) fn capture_conversation(
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
     capture_conversation_from_session(
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &client.app,
         &client.state.label,
         group,
@@ -347,7 +375,7 @@ pub(super) fn capture_conversation(
 /// keyed read projection may be repaired locally outside that snapshot; cold
 /// engine authority never triggers hydration or uses cached permissions.
 fn capture_conversation_from_session(
-    session: &cgka_session::AccountDeviceSession,
+    view: marmot_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
@@ -356,7 +384,7 @@ fn capture_conversation_from_session(
 ) -> Result<CapturedConversation, ConversationWindowError> {
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
-        session.with_group_authority_snapshot(group, |storage, authority| {
+        view.with_group_authority_snapshot(group, |storage, authority| {
             if storage
                 .app_storage()
                 .chat_presentation_version()?
@@ -370,14 +398,12 @@ fn capture_conversation_from_session(
                 .conversation_account_snapshot(&group_hex, query.clone())?;
             // A startup migration can still carry Member until its owner backfills.
             // Use this capture's compact live membership, without loading another roster.
-            // Live removal facts do not distinguish voluntary departure from eviction.
-            // Removed is the conservative fallback only for stale Member rows; explicit
-            // Leaving/Left/Removed/Disbanded projection states remain authoritative.
-            let facts = authority.facts;
+            // Explicit Leaving/Left/Removed/DeviceRemoved/Disbanded projection
+            // states remain authoritative.
             if account.presentation_input.self_membership == crate::SelfMembership::Member
-                && (facts.removed || (!facts.is_member && !facts.disbanded && !facts.unrecoverable))
+                && let Some(departed) = stale_member_departure(&authority)
             {
-                account.presentation_input.self_membership = crate::SelfMembership::Removed;
+                account.presentation_input.self_membership = departed;
             }
             Ok(CapturedConversation {
                 account,
@@ -541,7 +567,8 @@ async fn acquire_worker(
     while !ready.is_closed() {
         let observation = accounts
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::ConversationWorkerAcquire);
         let result = async {
             let account = accounts.resolve(&label)?;
@@ -581,7 +608,7 @@ pub(super) fn telemetry_outcome<T>(
     }
 }
 async fn measured<T>(
-    telemetry: &AppPerformanceTelemetry,
+    telemetry: &PerformanceRecorder,
     operation: RuntimeOp,
     work: impl std::future::Future<Output = Result<T, ConversationWindowError>>,
 ) -> Result<T, ConversationWindowError> {
@@ -592,7 +619,7 @@ async fn measured<T>(
 }
 
 struct Reader {
-    telemetry: AppPerformanceTelemetry,
+    telemetry: PerformanceRecorder,
     authority_ready: Option<Observation>,
     send_ready: Option<Observation>,
     app: MarmotApp,
@@ -853,7 +880,7 @@ impl MarmotAppRuntime {
         group: &GroupId,
         query: ConversationOpenQuery,
     ) -> Result<RuntimeConversationWindowSubscription, ConversationWindowError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         measured(&telemetry, RuntimeOp::ConversationOpen, async {
             self.shared.lifecycle().ensure_running()?;
             if !(1..=CONVERSATION_WINDOW_MAX_ROWS).contains(&query.limit) {

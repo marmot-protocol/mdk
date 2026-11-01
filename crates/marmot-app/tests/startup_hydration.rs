@@ -276,7 +276,7 @@ async fn held_hydration_body() {
             .group_member_ids_page(BENCH_ACCOUNT, &[group_ids[0].clone(), unknown])
             .await,
         Err(AppError::UnknownGroup(_))
-            | Err(AppError::Session(cgka_session::SessionError::Engine(
+            | Err(AppError::Session(marmot_session::SessionError::Engine(
                 cgka_traits::error::EngineError::UnknownGroup(_)
             )))
     ));
@@ -316,7 +316,7 @@ async fn held_hydration_body() {
     .expect("roster read during the hold must wait for its group only")
     .unwrap();
     assert_eq!(roster.self_membership, SelfMembership::Member);
-    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
     assert_eq!(roster.members.len(), members.len());
 
     // The pipeline itself is still held: only the session-open stage sample

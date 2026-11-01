@@ -223,12 +223,19 @@ impl SqliteAppStorage {
                      WHERE cause=7 AND demand_key!=?1 AND state IN (1,2))",
                     [&key],
                 ).storage()?;
+                // A new wire generation is not new evidence: a goal parked by
+                // its attempt cap stays parked until its notice is dismissed.
                 conn.execute_cached(
                     "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=MAX(revision,?3)+1,state=0,eligibility=0,updated_at_ms=?2,
-                     incomplete_reason=NULL,parked_at_ms=NULL
+                     revision=MAX(revision,?3)+1,state=0,
+                     eligibility=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
+                         THEN 4 ELSE 0 END,
+                     parked_at_ms=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
+                         THEN parked_at_ms ELSE NULL END,
+                     updated_at_ms=?2,incomplete_reason=NULL
                      WHERE cause=7 AND demand_key!=?1",
-                    params![key,sqlite_integer(now_ms)?,scope_revision],
+                    params![key,sqlite_integer(now_ms)?,scope_revision,
+                        sqlite_integer(super::plan::RECOVERY_PARK_AFTER_ATTEMPTS)?],
                 ).storage()?;
             }
             // A new request for a known event or incremental history is new

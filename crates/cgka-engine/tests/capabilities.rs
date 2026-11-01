@@ -21,7 +21,7 @@ use cgka_traits::storage::GroupStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -84,6 +84,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -173,7 +174,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -187,7 +188,7 @@ fn build_engine_with_components(
     id: &[u8],
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -202,7 +203,7 @@ fn build_engine_with_registry_and_components(
     registry: FeatureRegistry,
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
@@ -991,10 +992,11 @@ async fn non_admin_cannot_upgrade_group_capabilities() {
 }
 
 #[tokio::test]
-async fn bob_sees_alice_caps_cached_after_invite_commit() {
-    // Bob joins via welcome (cache only has self). Alice then invites carol;
-    // bob ingests the commit, which contains carol's KeyPackage. Bob's
-    // cache now holds carol's capabilities extracted from the staged commit.
+async fn welcome_joiner_reads_earlier_members_capabilities_from_the_tree() {
+    // Bob joins via welcome, then Alice invites carol and bob ingests the
+    // commit. Capability answers read every leaf from the tree, so bob knows
+    // alice's capabilities from the moment he joins and computes the same
+    // answer she does (app-components/README.md, "Eligibility").
     let mut alice = build_client(
         b"alice",
         registry_selfremove_required_and_reactions_optional(),
@@ -1030,11 +1032,16 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
     alice.confirm_published(create_pending).await.unwrap();
     bob.join_welcome(welcome_for_bob).await.unwrap();
 
-    // Before invite: bob can see alice's caps via the group's Required
-    // (MIP-03 guarantee) OR via ingest of alice's commits — but not for
-    // reactions (not required). Let's test reactions-upgradeable from
-    // bob's side AFTER an invite commit brings him alice's and carol's
-    // KeyPackages via the StagedCommit.
+    for engine in [&alice, &bob] {
+        let status = engine
+            .feature_status(&group_id, &Feature("reactions"))
+            .unwrap();
+        assert!(
+            matches!(status, FeatureStatus::Upgradeable),
+            "every leaf supports reactions → Upgradeable, got: {status:?}"
+        );
+    }
+
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let invite = alice
         .send(cgka_traits::engine::SendIntent::Invite {
@@ -1058,26 +1065,23 @@ async fn bob_sees_alice_caps_cached_after_invite_commit() {
     };
     bob.ingest(routed).await.unwrap();
 
-    // Bob now has self's caps AND carol's caps (from the commit). Alice's
-    // caps aren't directly visible to bob — but since reactions is universal
-    // in this scenario, alice's advertised caps would matter for "upgradeable"
-    // accuracy. For this test we prove carol's caps landed:
-    // reactions-upgradeable is true iff every known member supports it,
-    // which holds for (bob, carol) — alice's caps aren't in bob's cache
-    // but the group record contains her as a member, so if the cache
-    // doesn't know her caps we'd return Unavailable. Expected behavior:
-    // reactions shows Unavailable because bob doesn't know alice's caps.
-    let status = bob
-        .feature_status(&group_id, &Feature("reactions"))
-        .unwrap();
-    // Bob doesn't know alice's caps (she joined before bob was a member).
-    // So from bob's perspective, reactions cannot be confirmed universally.
-    // The cache defaulting to empty means alice "doesn't support" from
-    // bob's POV — so Unavailable is the honest answer.
-    assert!(
-        matches!(status, FeatureStatus::Unavailable { .. }),
-        "bob can't confirm alice's caps → Unavailable, got: {status:?}"
-    );
+    for engine in [&alice, &bob] {
+        let status = engine
+            .feature_status(&group_id, &Feature("reactions"))
+            .unwrap();
+        assert!(
+            matches!(status, FeatureStatus::Upgradeable),
+            "every leaf supports reactions → Upgradeable, got: {status:?}"
+        );
+        assert!(
+            engine
+                .upgradeable_capabilities(&group_id)
+                .unwrap()
+                .proposals
+                .contains(&REACTIONS_PROPOSAL),
+            "reactions is upgradeable from every member's view"
+        );
+    }
 }
 
 // ── B1 regression: convergence-side capability upgrade ────────────────────
@@ -1086,7 +1090,7 @@ fn build_concrete_with_storage(
     id: &[u8],
     registry: FeatureRegistry,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -1381,7 +1385,7 @@ async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
         registry_with_agent_stream_roles(),
         agent_stream_supported_components(),
     );
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_engine_on_storage_with_registry_and_components(
         b"bob",
         bob_storage.clone(),
@@ -1426,5 +1430,433 @@ async fn join_welcome_self_check_rejects_local_member_missing_required_role() {
     assert!(
         matches!(err, EngineError::MissingRequiredCapabilities { .. }),
         "expected MissingRequiredCapabilities at join self-check, got {err:?}"
+    );
+}
+
+// ── Several leaves per account (mdk#2628 D10) ──────────────────────────────
+//
+// Capability answers count every current leaf, so one device of an account
+// that lacks a capability withholds it from the group even while a sibling
+// device of the same account advertises it.
+
+const TEST_COMPONENT_FEATURE: Feature = Feature("test-app-component");
+
+/// A current-profile device of `account`. Devices built from one label share
+/// the account identity and differ in their MLS signature keys.
+fn device_on(
+    account: &[u8],
+    storage: SqliteAccountStorage,
+    supports_test_component: bool,
+) -> Engine<SqliteAccountStorage> {
+    let mut supported = default_group_components();
+    if supports_test_component {
+        supported.insert(TEST_APP_COMPONENT);
+    }
+    let mut engine = EngineBuilder::new(storage)
+        .identity(pad32(account))
+        .account_identity_proof_signer(proof_signer(account))
+        .feature_registry(registry_selfremove_required_and_component_optional())
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine
+}
+
+/// Rebuild `device` on its own storage, as a restart does, and hydrate
+/// `group_id` fully.
+fn restart(
+    account: &[u8],
+    storage: &SqliteAccountStorage,
+    supports_test_component: bool,
+    group_id: &GroupId,
+) -> Engine<SqliteAccountStorage> {
+    let mut engine = device_on(account, storage.clone(), supports_test_component);
+    engine.ensure_hydrated(group_id).unwrap();
+    engine
+}
+
+fn routed(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
+    TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    }
+}
+
+fn apply(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
+    let result = engine
+        .converge_stored_openmls_messages_at(group_id, 1_000_000)
+        .expect("buffered commit converges");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+}
+
+/// Every engine reports the test component the same way: upgradeable and
+/// offered when `available`, otherwise unavailable and not offered.
+fn assert_test_component(
+    engines: &[&Engine<SqliteAccountStorage>],
+    group_id: &GroupId,
+    available: bool,
+) {
+    for (index, engine) in engines.iter().enumerate() {
+        let status = engine
+            .feature_status(group_id, &TEST_COMPONENT_FEATURE)
+            .unwrap();
+        let offered = engine
+            .upgradeable_capabilities(group_id)
+            .unwrap()
+            .app_components
+            .contains(TEST_APP_COMPONENT);
+        if available {
+            assert!(
+                matches!(status, FeatureStatus::Upgradeable) && offered,
+                "engine {index}: expected upgradeable, got {status:?} (offered: {offered})"
+            );
+        } else {
+            assert!(
+                matches!(&status, FeatureStatus::Unavailable { missing }
+                    if missing.app_components.contains(TEST_APP_COMPONENT))
+                    && !offered,
+                "engine {index}: expected unavailable, got {status:?} (offered: {offered})"
+            );
+        }
+    }
+}
+
+/// Alice and carol are co-admins; bob's account holds two leaves, and only
+/// `bob` supports the test component, not `bob_sibling`.
+struct MixedDeviceGroup {
+    alice: Engine<SqliteAccountStorage>,
+    alice_storage: SqliteAccountStorage,
+    carol: Engine<SqliteAccountStorage>,
+    carol_storage: SqliteAccountStorage,
+    bob: Engine<SqliteAccountStorage>,
+    bob_sibling: Engine<SqliteAccountStorage>,
+    bob_sibling_storage: SqliteAccountStorage,
+    group_id: GroupId,
+}
+
+async fn mixed_device_group() -> MixedDeviceGroup {
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = device_on(b"alice", alice_storage.clone(), true);
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut carol = device_on(b"carol", carol_storage.clone(), true);
+    let mut bob = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let bob_sibling_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut bob_sibling = device_on(b"bob", bob_sibling_storage.clone(), false);
+
+    // One invitee per Welcome: the mock peeler names a Welcome by its bytes.
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "mixed devices".into(),
+            description: "".into(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert_test_component(&[&alice, &carol], &group_id, true);
+
+    // The lacking device joins first, so its account's last-added leaf
+    // advertises the component.
+    let mut joined = vec![&mut carol];
+    for device in [&mut bob_sibling, &mut bob] {
+        let SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } = alice
+            .send(cgka_traits::engine::SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![device.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("device invitation")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        device.join_welcome(welcomes.remove(0)).await.unwrap();
+        for member in &mut joined {
+            member.ingest(routed(msg.clone(), &group_id)).await.unwrap();
+            apply(member, &group_id);
+        }
+        joined.push(device);
+    }
+    drop(joined);
+    MixedDeviceGroup {
+        alice,
+        alice_storage,
+        carol,
+        carol_storage,
+        bob,
+        bob_sibling,
+        bob_sibling_storage,
+        group_id,
+    }
+}
+
+/// One device of bob's account lacks the component, so no member reports it
+/// as supported by every member or offers it, the admin's upgrade is refused
+/// before it stages a commit, and restarts keep that answer. Once the lacking
+/// device re-advertises its leaf with the component, every member offers it.
+#[tokio::test]
+async fn a_device_that_lacks_a_capability_withholds_it_until_its_leaf_advertises_it() {
+    let MixedDeviceGroup {
+        mut alice,
+        alice_storage,
+        mut carol,
+        carol_storage,
+        mut bob,
+        bob_sibling,
+        bob_sibling_storage,
+        group_id,
+    } = mixed_device_group().await;
+    assert_test_component(&[&alice, &carol, &bob, &bob_sibling], &group_id, false);
+
+    let epoch = alice.epoch(&group_id).unwrap();
+    let error = alice
+        .upgrade_group_capabilities(&group_id)
+        .await
+        .expect_err("nothing is upgradeable while one leaf lacks the component");
+    assert!(
+        error.to_string().contains("no upgradeable capabilities"),
+        "{error}"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), epoch);
+
+    // The answer comes from authenticated state: a restarted committer and a
+    // restarted receiver compute it again after hydration.
+    drop(alice);
+    drop(carol);
+    alice = restart(b"alice", &alice_storage, true, &group_id);
+    carol = restart(b"carol", &carol_storage, true, &group_id);
+    assert_test_component(&[&alice, &carol], &group_id, false);
+
+    // The lacking device upgrades, restarts, and replaces its leaf.
+    drop(bob_sibling);
+    let mut bob_sibling = restart(b"bob", &bob_sibling_storage, true, &group_id);
+    let SendResult::GroupEvolution { msg, pending, .. } = bob_sibling
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self-update commit")
+    };
+    bob_sibling.confirm_published(pending).await.unwrap();
+    for member in [&mut alice, &mut carol, &mut bob] {
+        member.ingest(routed(msg.clone(), &group_id)).await.unwrap();
+        apply(member, &group_id);
+    }
+    assert_test_component(&[&alice, &carol, &bob, &bob_sibling], &group_id, true);
+
+    drop(carol);
+    let carol = restart(b"carol", &carol_storage, true, &group_id);
+    assert_test_component(&[&carol], &group_id, true);
+}
+
+/// Removing only the lacking device's leaf makes the component available,
+/// while bob's account stays a member through its other device.
+#[tokio::test]
+async fn removing_the_device_that_lacks_a_capability_makes_it_available() {
+    let MixedDeviceGroup {
+        mut alice,
+        alice_storage,
+        carol,
+        carol_storage,
+        mut bob,
+        bob_sibling,
+        group_id,
+        ..
+    } = mixed_device_group().await;
+    let bob_id = bob.self_id();
+    let sibling_leaf = bob_sibling.own_leaf_index(&group_id).unwrap();
+    let remove = raw_remove_leaf_commit(&carol_storage, &carol.self_id(), &group_id, sibling_leaf);
+    for member in [&mut alice, &mut bob] {
+        member.ingest(remove.clone()).await.unwrap();
+        apply(member, &group_id);
+        assert!(
+            member
+                .members(&group_id)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == bob_id)
+        );
+    }
+    assert_test_component(&[&alice, &bob], &group_id, true);
+
+    drop(alice);
+    let alice = restart(b"alice", &alice_storage, true, &group_id);
+    assert_test_component(&[&alice], &group_id, true);
+}
+
+/// Carol's raw OpenMLS Remove of one leaf: MDK has no intent that removes a
+/// single device of an account.
+fn raw_remove_leaf_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    leaf: u32,
+) -> TransportMessage {
+    use cgka_engine::provider::EngineOpenMlsProvider;
+    use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+    use openmls::group::MlsGroup;
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::RustCrypto;
+    use openmls_traits::OpenMlsProvider as _;
+    use tls_codec::Serialize as _;
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mut mls_group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = storage.account_device_signer(sender).unwrap().unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let (commit, _welcome, _group_info) = mls_group
+        .remove_members(
+            &provider,
+            &signer,
+            &[openmls::prelude::LeafNodeIndex::new(leaf)],
+        )
+        .unwrap();
+    let payload = commit.tls_serialize_detached().unwrap();
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-leaf-remove".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// While an invite is pending, the leaf it adds counts, as the invitee counts
+/// in `members()`; a failed publish drops it again.
+#[tokio::test]
+async fn a_pending_invite_counts_the_leaf_it_adds_until_its_publish_fails() {
+    let mut alice = device_on(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut carol = device_on(
+        b"carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut dave = device_on(
+        b"dave",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        false,
+    );
+    let (group_id, _) = alice
+        .create_group(CreateGroupRequest {
+            name: "pending invite".into(),
+            description: "".into(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert_test_component(&[&alice], &group_id, true);
+
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![dave.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("invite commit")
+    };
+    assert_test_component(&[&alice], &group_id, false);
+
+    alice.publish_failed(pending).await.unwrap();
+    assert_test_component(&[&alice], &group_id, true);
+}
+
+/// Every KeyPackage passed in bounds what a new group can require, including
+/// several of one account: bob's second device lacks the component.
+#[tokio::test]
+async fn every_key_package_of_an_account_bounds_what_a_new_group_can_require() {
+    let mut alice = device_on(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut bob = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        true,
+    );
+    let mut bob_sibling = device_on(
+        b"bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        false,
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let bob_sibling_kp = bob_sibling.fresh_key_package().await.unwrap();
+
+    assert!(
+        alice
+            .constructable_capabilities(std::slice::from_ref(&bob_kp))
+            .unwrap()
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
+    let both = vec![bob_kp, bob_sibling_kp];
+    assert!(
+        !alice
+            .constructable_capabilities(&both)
+            .unwrap()
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
+
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "requires the component".into(),
+            description: "".into(),
+            members: both,
+            required_features: vec![TEST_COMPONENT_FEATURE],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("bob's second device cannot process the component");
+    assert!(
+        matches!(error, EngineError::MissingRequiredCapabilities { .. }),
+        "{error:?}"
     );
 }

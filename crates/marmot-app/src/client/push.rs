@@ -8,10 +8,77 @@ use crate::notifications;
 
 use super::AppClient;
 
+mod announce;
+mod repair;
 #[cfg(test)]
 mod tests;
 
+use announce::PushShareForm;
+pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
+pub(crate) use repair::PushRepairs;
+
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
+
+/// The group a merged Commit may have grown: a member add, or a Commit that
+/// branch selection re-adopted after withdrawing it. Either way a member may
+/// now hold no record of this device's token.
+///
+/// The re-share is edge-triggered from these in-memory engine events. A crash
+/// or a failed queue write at a narrow moment loses it, and the new member
+/// then misses this token as before mdk#2604; token requests (mdk#2611) are
+/// what repair that. `MemberAdded` is per account, so a new device of an
+/// existing member never triggers it.
+pub(crate) fn member_add_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupId> {
+    match event {
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
+            ..
+        }
+        | cgka_traits::engine::GroupEvent::GroupStateRevalidated { group_id, .. } => Some(group_id),
+        _ => None,
+    }
+}
+
+/// A merged Commit by this account that added a member: its group and the
+/// epoch it started from. This device then owes the group a push snapshot.
+///
+/// `actor` names an account, not a device, so once an account has several
+/// devices, each of them sends a snapshot after any one of them adds a member.
+fn own_member_add<'a>(
+    event: &'a cgka_traits::engine::GroupEvent,
+    self_id: &cgka_traits::MemberId,
+) -> Option<(&'a GroupId, u64)> {
+    match event {
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            epoch,
+            actor: Some(actor),
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
+            ..
+        } if actor == self_id => Some((group_id, epoch.0.saturating_sub(1))),
+        _ => None,
+    }
+}
+
+/// The owed push snapshot one leaf-adding Commit recorded, and what to put back
+/// if that Commit never merges.
+pub(crate) struct RecordedPushSnapshot {
+    group_id_hex: String,
+    previous: Option<u64>,
+    recorded: u64,
+}
+
+/// What one owed push snapshot or announce needs now.
+enum PushGossipGate {
+    /// Send it: the group can take messages, and a snapshot's adding Commit
+    /// has merged.
+    Due,
+    /// The Commit has not merged, or the group cannot take messages yet.
+    NotYet,
+    /// The group ended: nobody is left to send it to.
+    Void,
+}
 
 impl AppClient {
     pub(crate) async fn upsert_and_share_push_registration(
@@ -21,43 +88,28 @@ impl AppClient {
         server_pubkey_hex: &str,
         relay_hint: Option<String>,
     ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
-        let observation = self.app.product_analytics.begin(
+        let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Notification,
             "register",
             crate::ProductUnit::Action,
         );
-        let result = Box::pin(self.upsert_and_share_push_registration_unobserved(
-            platform,
-            raw_token,
-            server_pubkey_hex,
-            relay_hint,
-        ))
-        .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn upsert_and_share_push_registration_unobserved(
-        &mut self,
-        platform: notifications::PushPlatform,
-        raw_token: &str,
-        server_pubkey_hex: &str,
-        relay_hint: Option<String>,
-    ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
-        let registration = self.app.upsert_push_registration(
-            &self.state.label,
-            platform,
-            raw_token,
-            server_pubkey_hex,
-            relay_hint,
-        )?;
-        let share = self.share_push_registration().await?;
-        Ok(notifications::PushRegistrationSyncResult {
-            registration,
-            share,
-        })
+        let work = async move {
+            let registration = self.app.upsert_push_registration(
+                &self.state.label,
+                platform,
+                raw_token,
+                server_pubkey_hex,
+                relay_hint,
+            )?;
+            let share = self.share_push_registration().await?;
+            Ok(notifications::PushRegistrationSyncResult {
+                registration,
+                share,
+            })
+        };
+        observed
+            .run_async(Box::pin(work), marmot_observability::success_or_failure)
+            .await
     }
 
     pub(crate) async fn share_push_registration(
@@ -239,13 +291,29 @@ impl AppClient {
                         continue;
                     }
                 };
-                let content = match serde_json::to_string(&payload) {
+                let form = self.push_share_form(&group_id, &record);
+                let content = match form {
+                    PushShareForm::Defer => {
+                        tracing::debug!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            skipped_groups = 1_u64,
+                            "push token update waits until its owed announce is recorded",
+                        );
+                        continue;
+                    }
+                    PushShareForm::Announce { .. } => {
+                        self.build_push_announce(&group_id, std::slice::from_ref(&record))
+                    }
+                    PushShareForm::Plain => serde_json::to_string(&payload).map_err(AppError::from),
+                };
+                let content = match content {
                     Ok(content) => content,
                     Err(err) => {
                         tracing::warn!(
                             target: "marmot_app::notifications",
                             method = "share_push_registration",
-                            error_kind = AppError::from(err).privacy_safe_kind(),
+                            error_kind = err.privacy_safe_kind(),
                             "push token gossip serialization failed",
                         );
                         continue;
@@ -259,6 +327,9 @@ impl AppClient {
                         if summary.accept_disposition
                             == cgka_traits::SendAcceptDisposition::Published =>
                     {
+                        if let PushShareForm::Announce { settles_owed } = form {
+                            self.record_push_announce(&group_id, Some(settles_owed));
+                        }
                         if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
                         {
                             tracing::warn!(
@@ -276,7 +347,14 @@ impl AppClient {
                             registration.registration.updated_at_ms,
                         )?;
                     }
-                    Ok((_event, _summary)) => {
+                    Ok((event, _summary)) => {
+                        if let PushShareForm::Announce { settles_owed } = form {
+                            self.note_push_announce_left_in_outbox(
+                                &group_id,
+                                event.id,
+                                Some(settles_owed),
+                            );
+                        }
                         tracing::debug!(
                             target: "marmot_app::notifications",
                             method = "share_push_registration",
@@ -335,6 +413,17 @@ impl AppClient {
     }
 
     pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
+        let snapshots_pending = self.send_owed_push_snapshots().await;
+        let shares_pending = self.retry_pending_push_registration_shares().await;
+        // After the shares: one sent after a join window ends is the announce.
+        let announces_pending = self.send_due_push_announces().await;
+        // After the announces, which look at the fetch clock first. A repair
+        // reply is not an announce and settles no announce owed.
+        let repairs_pending = self.send_due_push_repairs().await;
+        snapshots_pending || shares_pending || announces_pending || repairs_pending
+    }
+
+    async fn retry_pending_push_registration_shares(&mut self) -> bool {
         match self.share_push_registration().await {
             Ok(outcome) if outcome.failed_groups > 0 => {
                 tracing::warn!(
@@ -366,7 +455,12 @@ impl AppClient {
             .app
             .has_pending_push_registration_work(&self.state.label)
         {
-            Ok(pending) => pending,
+            Ok(pending) => {
+                pending
+                    || self.has_due_push_snapshot()
+                    || self.has_due_push_announce()
+                    || self.has_due_push_repair()
+            }
             Err(err) => {
                 tracing::warn!(
                     target: "marmot_app::notifications",
@@ -377,6 +471,375 @@ impl AppClient {
                 true
             }
         }
+    }
+
+    /// A merged Commit added a member, who cannot read this device's earlier
+    /// shares: queue the current registration for the group again. One queue
+    /// row per group absorbs every add in a batch.
+    pub(crate) fn queue_push_registration_share_after_member_added(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if self
+            .runtime
+            .leave_in_progress(group_id)
+            .map_err(marmot_session::SessionError::from)?
+        {
+            return Ok(());
+        }
+        let queued = self.app.queue_current_push_registration_share_for_group(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+        )?;
+        if queued {
+            self.push_registration_share_queued = true;
+            tracing::debug!(
+                target: "marmot_app::notifications",
+                method = "queue_push_registration_share_after_member_added",
+                queued_groups = 1_u64,
+                "push token share queued for a member add",
+            );
+        }
+        Ok(())
+    }
+
+    /// Queue one share per group that `events` may have grown. A
+    /// group whose queue write fails is kept for the account worker to retry.
+    pub(crate) fn queue_push_registration_shares_for_member_adds(
+        &mut self,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) {
+        for event in events {
+            if let Some(group_id) = member_add_group(event) {
+                self.pending_member_add_push_shares.insert(group_id.clone());
+            }
+            self.note_own_member_add(event);
+        }
+        self.retry_pending_member_add_push_shares();
+    }
+
+    /// Record the snapshots owed for own member adds whose earlier write
+    /// failed.
+    fn retry_pending_own_add_push_snapshots(&mut self) {
+        let snapshots: Vec<_> = self
+            .pending_own_add_push_snapshots
+            .iter()
+            .map(|(group_id, after_epoch)| (group_id.clone(), *after_epoch))
+            .collect();
+        for (group_id, after_epoch) in snapshots {
+            match self.app.record_group_push_snapshot_owed(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                after_epoch,
+            ) {
+                Ok(recorded) => {
+                    self.pending_own_add_push_snapshots.remove(&group_id);
+                    self.push_registration_share_queued |= recorded;
+                }
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_own_add_push_snapshots",
+                    error_kind = error.privacy_safe_kind(),
+                    "push snapshot owed after a member add was not recorded"
+                ),
+            }
+        }
+    }
+
+    /// Queue the shares owed for member adds whose earlier queue write failed,
+    /// and record the snapshots owed for own adds whose earlier write failed.
+    pub(crate) fn retry_pending_member_add_push_shares(&mut self) {
+        self.retry_pending_own_add_push_snapshots();
+        let groups: Vec<_> = self
+            .pending_member_add_push_shares
+            .iter()
+            .cloned()
+            .collect();
+        for group_id in groups {
+            match self.queue_push_registration_share_after_member_added(&group_id) {
+                Ok(()) => {
+                    self.pending_member_add_push_shares.remove(&group_id);
+                }
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_member_add_push_shares",
+                    error_kind = error.privacy_safe_kind(),
+                    "push token share after a member add was not queued"
+                ),
+            }
+        }
+    }
+
+    /// Whether a member add queued a share or owed a snapshot since the last
+    /// call.
+    pub(crate) fn take_queued_push_registration_share(&mut self) -> bool {
+        std::mem::take(&mut self.push_registration_share_queued)
+    }
+
+    /// Record that `event`, if it is a merged Commit by this account adding a
+    /// member, owes the group a push snapshot. The invite command recorded it
+    /// before staging or queueing the Commit; this records the epoch the
+    /// Commit started from, which a queued invite cannot know in advance, and
+    /// wakes the account worker to send it. A failed write is retried with
+    /// the member-add shares.
+    pub(crate) fn note_own_member_add(&mut self, event: &cgka_traits::engine::GroupEvent) {
+        if let Some((group_id, after_epoch)) = own_member_add(event, &self.runtime.self_id()) {
+            let owed = self
+                .pending_own_add_push_snapshots
+                .entry(group_id.clone())
+                .or_insert(after_epoch);
+            *owed = (*owed).max(after_epoch);
+            self.retry_pending_own_add_push_snapshots();
+        }
+    }
+
+    /// Record, before a Commit that adds leaves is published from
+    /// `source_epoch`, that this device owes the group a push snapshot once the
+    /// Commit merges.
+    pub(crate) fn record_push_snapshot_owed(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<RecordedPushSnapshot, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let previous = self
+            .app
+            .group_push_snapshot_owed(&self.state.label, &group_id_hex)?;
+        let recorded = previous.map_or(source_epoch, |previous| previous.max(source_epoch));
+        self.app
+            .record_group_push_snapshot_owed(&self.state.label, &group_id_hex, source_epoch)?;
+        Ok(RecordedPushSnapshot {
+            group_id_hex,
+            previous,
+            recorded,
+        })
+    }
+
+    /// Put back the owed snapshot that `snapshot` replaced: its Commit will
+    /// never merge. Best effort, since a snapshot that stays owed is sent once
+    /// the group's epoch next passes, to members who already hold it.
+    pub(crate) fn restore_push_snapshot_owed(&self, snapshot: RecordedPushSnapshot) {
+        if snapshot.previous == Some(snapshot.recorded) {
+            return;
+        }
+        if let Err(error) = self.app.replace_group_push_snapshot_owed(
+            &self.state.label,
+            &snapshot.group_id_hex,
+            snapshot.recorded,
+            snapshot.previous,
+        ) {
+            tracing::warn!(
+                target: "marmot_app::notifications",
+                method = "restore_push_snapshot_owed",
+                error_kind = error.privacy_safe_kind(),
+                "owed push snapshot of an unmerged commit was not restored"
+            );
+        }
+    }
+
+    /// Whether a snapshot this device owes can be sent now.
+    pub(crate) fn has_due_push_snapshot(&self) -> bool {
+        match self.app.owed_group_push_snapshots(&self.state.label) {
+            Ok(owed) => owed.into_iter().any(|(group_id_hex, after_epoch)| {
+                !matches!(
+                    self.push_gossip_gate(&group_id_hex, Some(after_epoch)),
+                    PushGossipGate::NotYet
+                )
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "has_due_push_snapshot",
+                    error_kind = error.privacy_safe_kind(),
+                    "owed push snapshot read failed",
+                );
+                true
+            }
+        }
+    }
+
+    /// Whether `group_id_hex` can take push gossip now, and for an owed
+    /// snapshot, whether the group's merged epoch has passed `after_epoch`.
+    ///
+    /// Leaving the group, or losing membership, deletes its owed snapshot and
+    /// join window with the rest of its gossip state, so a row here belongs to
+    /// a group this device is still in, though perhaps not hydrated yet.
+    fn push_gossip_gate(&self, group_id_hex: &str, after_epoch: Option<u64>) -> PushGossipGate {
+        let Ok(group_id) = hex::decode(group_id_hex).map(GroupId::new) else {
+            return PushGossipGate::Void;
+        };
+        match self.runtime.epoch_state(&group_id) {
+            Some(cgka_traits::EpochState::Disbanded(_)) => return PushGossipGate::Void,
+            Some(cgka_traits::EpochState::Stable { epoch })
+                if after_epoch.is_none_or(|after_epoch| epoch.0 > after_epoch) => {}
+            // Not hydrated or quarantined, still resolving a publish, or
+            // recovering.
+            _ => return PushGossipGate::NotYet,
+        }
+        if self
+            .runtime
+            .group_record(&group_id)
+            .is_ok_and(|group| group.is_terminal())
+        {
+            return PushGossipGate::Void;
+        }
+        // A queued invite, or one convergence superseded that waits for fresh
+        // KeyPackages, has not added its members yet, and a disband or block
+        // can still be undone.
+        let waiting = self.runtime.leave_in_progress(&group_id).unwrap_or(true)
+            || self
+                .runtime
+                .disbanding_in_progress(&group_id)
+                .unwrap_or(true)
+            || self
+                .runtime
+                .has_queued_outbound_intents(&group_id)
+                .unwrap_or(true)
+            || self
+                .runtime
+                .pending_reinvites()
+                .map(|reinvites| reinvites.iter().any(|record| record.group_id == group_id))
+                .unwrap_or(true)
+            || self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    Ok(storage
+                        .app_storage()
+                        .direct_conversation_has_blocked_user(group_id_hex)?)
+                })
+                .unwrap_or(true);
+        if waiting {
+            PushGossipGate::NotYet
+        } else {
+            PushGossipGate::Due
+        }
+    }
+
+    /// Send every owed push snapshot whose adding Commit has merged: kind 448
+    /// lists of the token records this device holds in the group, then kind
+    /// 449 lists of its relayable tombstones. A device that holds neither sends
+    /// nothing. Returns whether a snapshot that could be sent remains owed.
+    ///
+    /// A list counts as sent once the runtime accepts it, including into the
+    /// group's durable outbox. A snapshot that fails part way is sent whole
+    /// again later; recipients apply what they already hold as a no-op.
+    pub(crate) async fn send_owed_push_snapshots(&mut self) -> bool {
+        let owed = match self.app.owed_group_push_snapshots(&self.state.label) {
+            Ok(owed) => owed,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "send_owed_push_snapshots",
+                    error_kind = error.privacy_safe_kind(),
+                    "owed push snapshot read failed",
+                );
+                return true;
+            }
+        };
+        let mut pending = false;
+        for (group_id_hex, after_epoch) in owed {
+            let settle = match self.push_gossip_gate(&group_id_hex, Some(after_epoch)) {
+                PushGossipGate::NotYet => continue,
+                PushGossipGate::Void => true,
+                PushGossipGate::Due => match self.send_push_snapshot(&group_id_hex).await {
+                    Ok(()) => true,
+                    // The group's state changed since it was checked; the
+                    // next check settles or sends the snapshot.
+                    Err(
+                        AppError::GroupRemoved(_)
+                        | AppError::GroupDisbanding(_)
+                        | AppError::UserBlocked,
+                    ) => false,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "marmot_app::notifications",
+                            method = "send_owed_push_snapshots",
+                            error_kind = error.privacy_safe_kind(),
+                            "push snapshot remains owed",
+                        );
+                        pending = true;
+                        false
+                    }
+                },
+            };
+            if settle
+                && let Err(error) = self.app.replace_group_push_snapshot_owed(
+                    &self.state.label,
+                    &group_id_hex,
+                    after_epoch,
+                    None,
+                )
+            {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "send_owed_push_snapshots",
+                    error_kind = error.privacy_safe_kind(),
+                    "sent push snapshot was not settled",
+                );
+                pending = true;
+            }
+        }
+        pending
+    }
+
+    async fn send_push_snapshot(&mut self, group_id_hex: &str) -> Result<(), AppError> {
+        let group_id = GroupId::new(
+            hex::decode(group_id_hex)
+                .map_err(|_| AppError::InvalidPushGossip("invalid group id".into()))?,
+        );
+        let tokens = self
+            .app
+            .stored_group_push_tokens(&self.state.label, group_id_hex)?;
+        let tombstones = self
+            .app
+            .group_push_token_tombstones(&self.state.label, group_id_hex)?;
+        let sender_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        let lists = notifications::push_gossip_lists(
+            &tokens,
+            &tombstones,
+            &sender_hex,
+            group_id.as_slice().len(),
+        )?;
+        if lists.unverified_records + lists.unsigned_tombstones + lists.oversized_entries > 0 {
+            tracing::debug!(
+                target: "marmot_app::notifications",
+                method = "send_push_snapshot",
+                unverified_records = lists.unverified_records,
+                unsigned_tombstones = lists.unsigned_tombstones,
+                oversized_entries = lists.oversized_entries,
+                "push snapshot leaves out entries it cannot relay",
+            );
+        }
+        let token_lists = lists.token_lists.len();
+        let removal_lists = lists.removal_lists.len();
+        let intents = lists
+            .token_lists
+            .into_iter()
+            .map(|content| AppMessageIntent::PushTokenList { content })
+            .chain(
+                lists
+                    .removal_lists
+                    .into_iter()
+                    .map(|content| AppMessageIntent::PushTokenRemoval { content }),
+            );
+        for intent in intents {
+            self.send_app_event(&group_id, intent).await?;
+        }
+        if token_lists + removal_lists > 0 {
+            tracing::debug!(
+                target: "marmot_app::notifications",
+                method = "send_push_snapshot",
+                token_lists,
+                removal_lists,
+                "push snapshot sent",
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn queue_current_push_registration_removal_for_group(
@@ -548,10 +1011,18 @@ impl AppClient {
         self.publish_notification_trigger_tokens(tokens).await
     }
 
-    async fn publish_notification_trigger_tokens(
+    pub(crate) async fn publish_notification_trigger_tokens(
         &self,
         tokens: Vec<notifications::GroupPushTokenRecord>,
     ) -> Result<(), AppError> {
+        // An unlinked account wakes no one (mdk#2628 D67). Triggers go out
+        // through the adapter's anonymous publisher, which the account's
+        // publish stop does not cover.
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
         let account = self.app.account_home().account(&self.state.label)?;
         let by_server = notifications::token_records_by_server(tokens, &account.account_id_hex);
         if by_server.is_empty() {
@@ -600,6 +1071,8 @@ impl AppClient {
                             "trigger",
                             crate::ProductUnit::Attempt,
                         );
+                        // This function refuses an unlinked account above.
+                        #[allow(clippy::disallowed_methods)]
                         let result = self
                             .adapter
                             .publish_signed_event(fallback, endpoints, &event, 1)
@@ -677,6 +1150,27 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
+    /// Diagnostics only: trigger selection reads stored records directly. Uses
+    /// the canonical leaf roster that push-token leaf reconciliation uses.
+    pub(crate) fn group_push_debug_info(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<notifications::GroupPushDebugInfo, AppError> {
+        self.ensure_group(group_id)?;
+        let membership = self.runtime.canonical_group_membership(group_id)?;
+        let local_leaf_index = if membership.local_leaf_active {
+            Some(self.runtime.own_leaf_index(group_id)?)
+        } else {
+            None
+        };
+        self.app.group_push_debug_info(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            &membership.member_leaves,
+            local_leaf_index,
+        )
+    }
+
     pub(crate) fn cleanup_stale_push_tokens_best_effort(&mut self, group_id: &GroupId) {
         match self.reconcile_push_token_leaves(group_id) {
             Ok(()) => {
@@ -700,10 +1194,7 @@ impl AppClient {
         if record.removed || record.disbanded.is_some() {
             return Ok(());
         }
-        let membership = self
-            .runtime
-            .session()
-            .canonical_group_membership(group_id)?;
+        let membership = self.runtime.canonical_group_membership(group_id)?;
         self.app.reconcile_group_push_token_leaves(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
@@ -740,6 +1231,7 @@ pub(crate) fn notification_trigger_for_intent(
     match intent {
         AppMessageIntent::Chat { .. }
         | AppMessageIntent::TaggedChat { .. }
+        | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
         | AppMessageIntent::Poll { .. }
@@ -761,6 +1253,7 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::GroupSystem { .. }
         | AppMessageIntent::Custom { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
+        | AppMessageIntent::PushTokenList { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,
     }
 }

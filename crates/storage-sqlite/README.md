@@ -67,6 +67,19 @@ Default connection settings are privacy/durability oriented:
 Override with `open_encrypted_with_options` or `in_memory_with_options`. There is no first-class key rotation: create a
 new encrypted database, migrate data, and replace the old file.
 
+Tests can opt out of two defaults, because memory security turns every SQLite allocation into system calls and a full
+fsync per commit adds disk waits. Together they made up most of the workspace test lane's run time. Both helpers exist
+only in this crate's own tests or with the `test-support` feature, and do nothing until a test calls them:
+
+- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`, copied from a migrated template
+  kept beside the test binary. The first store a build opens replays the migrations and writes the template; where the
+  binary's directory takes no files, every store replays them. This crate's own unit tests get it from `in_memory()`;
+  dependents call it explicitly.
+- After a test process calls `relax_storage_for_test_process()`, every database it opens skips
+  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests, and
+  this crate's own unit tests start that way. The tests that pin the production settings never call it, and here they
+  call `use_production_storage_for_test_process()` first.
+
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
 
@@ -178,6 +191,11 @@ inputs, draft descriptors, and persisted controls in one deferred read. `Storage
 public storage calls under one deferred transaction, enforcing and restoring SQLite query-only mode even when nested.
 See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
 
+A sibling's read position (small state, mdk#2628 item 4.3) advances the read marker as a local read does, but keeps a
+manual-unread reminder. It may name a message this device does not hold yet: unread counts compare canonical order
+keys, not ids. The position this device sends is the furthest delivered message, other than an edit, at or before its
+read marker, so a marker on a synthesized group system row or an undelivered send still has one.
+
 Selected composer reads and revision-checked mutations share the encrypted draft tables; migration 0073 tracks legacy
 writes too, and queued/fanout acceptance clears only its submitted revision atomically. See the
 [draft contract](../../docs/marmot-architecture/further-context/conversation-drafts.md).
@@ -248,6 +266,77 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   flag, preserving populated obligations, loss evidence, retry state, receipts, maintenance, inventory, and cursors.
   Unexpected duplicate explicit rows make migration fail atomically; no demand is silently discarded. Later
   migrations add stall observations, recovery comparison, the loss `created_at` bound, and history notices.
+- **Coverage ledger (`recovery_coverage.rs`, migration 0123, mdk#2660).** Per route (the inbox or a group's transport
+  route) and relay, the inclusive `created_at` ranges proved complete, each with its proof (live boundary, comparison
+  certificate, sweep slice, re-check), plus each route's goal floor. `record_recovery_coverage` is the one write entry
+  point for a covered `(route, relay, since, until, proof)` slice; it merges overlapping or touching ranges of the same
+  route, relay and proof and keeps the oldest proof time. Coverage on a route is what every given relay covers, merged
+  across proofs. Debt is the goal floor up to a caller-given time minus that coverage; a route without a goal owes
+  nothing. Each delivery or notification loss import, and a legacy clear that re-arms an older generation, un-covers in
+  its own transaction what the generations it newly charged lost. A generation recorded through
+  `record_account_recovery_loss_routed` with its routes (migration 0128, at most `MAX_LOSS_ROUTES`) un-covers only
+  those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
+  holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Imports stay
+  count-driven, since the relay plane gives an adopted marker's new drops a fresh token. A worker observation past the
+  durable count (`mark_account_delivery_recovery_observed`) merges the relay plane's routes for its generation as a
+  marker write would, lowering the generation's floor to the lowest bound they list, and makes the generation
+  account-wide when it passes none. Each import stamps every generation it charges with the loss
+  revision its join left (`import_revision`, migration 0132). `recovery_loss_reach` reads where one cause's unresolved loss
+  may have lost events, by route, and `recovery_loss_reach_after` reads the same for loss imported after a loss
+  revision: what a checkpoint captured at that revision has not seen. Acknowledgment deletes the generations it
+  reclaims and keeps the highest stamp it deleted (`acknowledged_import_revision`), so below it the read answers
+  `None`: where that loss reached is no longer known.
+  `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
+  placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
+  deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
+  ends when retention pruning passes it. A release with no inventory row leaves
+  the ledger to the epoch gap it arms. Every un-cover is also
+  appended to the un-cover log (migration 0126) under a new account generation. `recovery_coverage_mark` reads that
+  generation before a fetch, and `record_recovery_coverage_since` subtracts from its slices every range un-covered
+  on their routes after the mark, or records nothing once the log (an hour, at most 4,096 rows) no longer reaches
+  back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
+  pruning is not an un-cover. First, what each route the caller passes still owes below the floor on any of its
+  certifying relays joins the route's parked remainder (migration 0130): one range per route under a park revision,
+  never coverage, cleared only by dismissal. The prune then marks every route settled below its floor, and a later
+  prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
+  floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
+  shadow mode: no obligation, retry, fence or schedule reads it.
+- **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
+  `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
+  revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and
+  byte budget, each unit's parked and retired spans and the capture ranges it fences (migration 0135) sit beside it. `settle_recovery_unit` applies one quantum's
+  outcome in one transaction with policy values the caller passes; a unit's debt is the route goal minus that relay's
+  coverage, its retired spans and, unless it holds a probe, its parked spans. Parked and retired spans are never
+  coverage. `stage_recovery_slice` writes a proven slice's unseen events and its coverage, through the subtracting
+  write, in one transaction, so a crash before settlement refetches nothing; staged rows leave once seen. A re-check
+  settles through `settle_recovery_recheck`, which charges its relay and the account budget but never touches the
+  unit's retry state, and records its pass's progress only under the revision it began on (migration 0134): every
+  request that makes the pass due, a long relay cooldown ending among them, bumps it in the same write.
+  `staged_recovery_routes` and `recovery_unit_fences` tell the runner which groups to read, and
+  `reclaim_staged_recovery_routes` gives back what a route it no longer lists staged. Nothing schedules on
+  this state yet.
+- **Upgrade conversion (`account_recovery/convert.rs`, migration 0136, mdk#2660 phase 4).**
+  `convert_recovery_obligations` turns the old owner's queue-loss, notification-loss, explicit, incremental and
+  native-replay obligations into ledger debt and runner retry state, once, before the runner first starts.
+  Epoch-gap, known-event and maintenance obligations stay. The caller passes what storage does not have: every
+  current route (the inbox included, so routing is hydrated) with its required relays and standing floor, the
+  ledger's spelling of a relay a stored scope names, the retention floor and the time. Each step is one transaction
+  that also advances the marker (`recovery_conversion_pending`), so a crash leaves every row intact or converted and
+  gone, the next call resumes, and a finished conversion does nothing. In order: phase 2's live-boundary ranges and
+  shadow remainders are dropped (comparison, sweep and re-check ranges stay), goals settle at the window floor and
+  every current route's standing goal starts; dismissed rows retire their uncertified scopes' windows on the relays
+  they recorded, below where live loss reaches that route; live loss un-covers what it reached once, as an import
+  charges it (a generation that named its routes reaches only those, from their bounds; any other reaches every route
+  from its floor), parks what lies below the window, and counts as imported, generations no import charged yet under
+  a new loss revision they are stamped with; parked rows break their routes' required relays that still owe history,
+  under one revision per route (one notice), keeping the earliest park time; a pending explicit repair re-arms every
+  unit; satisfied rows go. Converted rows are deleted with their scopes, with no third state, and nothing becomes
+  coverage. `recovery_conversion_report` keeps the counts by cause and disposition until
+  `acknowledge_recovery_conversion_report`, and `recovery_conversion_notices_changed` asks for one announcement of
+  the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
+  `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
+  recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
+  (newer or grown loss stays for the import). Nothing calls the conversion yet.
 
 ## Tests and benchmarks
 

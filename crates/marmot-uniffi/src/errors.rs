@@ -107,6 +107,26 @@ pub enum MarmotKitError {
     /// is unusable (empty batch, oversized, no endpoint).
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
+    /// An attachment was encrypted at `source_epoch`, but the group moved to
+    /// `current_epoch`, or to another branch at the same epoch, before it could
+    /// be sent (mdk#2158). Its media key is bound to the epoch it was encrypted
+    /// under, so it cannot be sent; upload the file again. Nothing was
+    /// published.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again"
+    )]
+    MediaReferenceStaleEpoch {
+        source_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The group's epoch is unsettled, so an attachment encrypted at
+    /// `source_epoch` cannot be sent right now. Nothing was published. Sync
+    /// and send again; if the epoch moved, that send fails with
+    /// `MediaReferenceStaleEpoch` and the file must be uploaded again.
+    #[error(
+        "the group's epoch is unsettled, so media encrypted at epoch {source_epoch} cannot be sent yet; sync and send again"
+    )]
+    MediaReferenceEpochUnsettled { source_epoch: u64 },
     /// An encrypted-media `imeta` reference failed MDK's shared strict parser
     /// (mdk#1787): `parse_media_imeta_tag` on an inbound tag, or a host-built
     /// reference passed to build/send/upload/download whose fields are
@@ -232,6 +252,14 @@ pub enum MarmotKitError {
     },
     #[error("group {group_id_hex} has not enabled disbanding")]
     DisbandingNotEnabled { group_id_hex: String },
+    /// The group cannot turn on account-devices now. `reason` is the same
+    /// aggregate answer `Marmot::account_devices_activation` gives, never
+    /// `Eligible`; it never names which members or devices hold it back.
+    #[error("group {group_id_hex} cannot turn on account-devices now: {reason:?}")]
+    AccountDevicesActivationRefused {
+        group_id_hex: String,
+        reason: crate::conversions::AccountDevicesActivationFfi,
+    },
     #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
     /// This device was removed from the group; it goes on without us. Kept
@@ -355,6 +383,21 @@ pub enum MarmotKitError {
     /// repair arrives on a remote member's schedule.
     #[error("group {group_id_hex} is unrecoverable and needs to be re-joined before sending")]
     GroupUnrecoverableRepairRequired { group_id_hex: String },
+    #[error("invalid sticker data: {details}")]
+    InvalidSticker { details: String },
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker network operation failed: {details}")]
+    StickerNetwork { details: String },
+    #[error("sticker import failed: {details}")]
+    StickerImport { details: String },
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerImportUnsupported,
+    /// This device was unlinked from the account by its other devices. The
+    /// account stays signed out here: wipe it, then link the device again
+    /// (mdk#2628 D67).
+    #[error("this device was unlinked from the account: {account_ref}")]
+    AccountUnlinked { account_ref: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
     /// The account worker is completing an exclusive catch-up and definitely
@@ -460,6 +503,11 @@ impl From<&AppError> for MarmotKitError {
                     account: account.clone(),
                 }
             }
+            AppError::AccountHome(AccountHomeError::AccountUnlinked(account_ref)) => {
+                Self::AccountUnlinked {
+                    account_ref: account_ref.clone(),
+                }
+            }
             // #543: reveal_nsec must surface its required failure modes as typed
             // FFI errors, not the untyped `Runtime` bucket, so a key-backup
             // surface can distinguish "no exportable key" / "keystore locked" /
@@ -540,12 +588,16 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference {
                 details: details.clone(),
             },
-            stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
-                details: stale.to_string(),
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } => Self::MediaReferenceStaleEpoch {
+                source_epoch: *source_epoch,
+                current_epoch: *current_epoch,
             },
-            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
-                Self::InvalidMediaReference {
-                    details: unsettled.to_string(),
+            AppError::MediaReferenceEpochUnsettled { source_epoch } => {
+                Self::MediaReferenceEpochUnsettled {
+                    source_epoch: *source_epoch,
                 }
             }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
@@ -633,6 +685,17 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
+            AppError::InvalidSticker(details) => Self::InvalidSticker {
+                details: details.clone(),
+            },
+            AppError::StickerNotFound => Self::StickerNotFound,
+            AppError::StickerRelay(details) => Self::StickerNetwork {
+                details: details.clone(),
+            },
+            AppError::StickerImport(details) => Self::StickerImport {
+                details: details.clone(),
+            },
+            AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -677,6 +740,12 @@ impl MarmotKitError {
             EngineError::DisbandingNotEnabled { group_id } => Self::DisbandingNotEnabled {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            EngineError::AccountDevicesActivationRefused { group_id, reason } => {
+                Self::AccountDevicesActivationRefused {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    reason: marmot_app::AppAccountDevicesActivation::from(Some(*reason)).into(),
+                }
+            }
             EngineError::UnknownMember { group_id, member } => Self::MemberNotInGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
@@ -724,8 +793,8 @@ mod tests {
     use super::MarmotKitError;
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
-    use marmot_account::{AccountError, AccountHomeError};
-    use marmot_app::AppError;
+    use marmot_account::AccountHomeError;
+    use marmot_app::{AccountError, AppError};
 
     #[test]
     fn attachment_configuration_and_account_errors_stay_typed() {
@@ -877,7 +946,7 @@ mod tests {
     // field was added to eliminate.
     // Asserted against `from_engine_error` directly rather than through an
     // `AppError`: a leave failure arrives wrapped as
-    // `AppError::Session(SessionError::Engine(..))`, and `cgka-session` is not a
+    // `AppError::Session(SessionError::Engine(..))`, and `marmot-session` is not a
     // dependency of this crate. `From<AppError>` funnels every such error through
     // `as_engine_error()` into this same function (see above), so this covers the
     // mapping without pulling in a crate just to construct a wrapper.
@@ -906,6 +975,52 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected DisbandingNotEnabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_devices_activation_refusal_crosses_ffi_with_its_aggregate_reason() {
+        use crate::conversions::AccountDevicesActivationFfi;
+        use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
+        let group_id = cgka_traits::GroupId::new(vec![0x22; 16]);
+        for (reason, expected) in [
+            (Refusal::NotAdmin, AccountDevicesActivationFfi::NotAdmin),
+            (
+                Refusal::AlreadyRequired,
+                AccountDevicesActivationFfi::AlreadyEnabled,
+            ),
+            (
+                Refusal::LegacyProfile,
+                AccountDevicesActivationFfi::LegacyGroup,
+            ),
+            (
+                Refusal::UnsupportedLeaves,
+                AccountDevicesActivationFfi::MembersNeedUpdate,
+            ),
+            (
+                Refusal::LeafCarriesData,
+                AccountDevicesActivationFfi::DevicesNeedReplacement,
+            ),
+            (
+                Refusal::LeafLimitExceeded,
+                AccountDevicesActivationFfi::DeviceLimitExceeded,
+            ),
+        ] {
+            let ffi =
+                MarmotKitError::from_engine_error(&EngineError::AccountDevicesActivationRefused {
+                    group_id: group_id.clone(),
+                    reason,
+                });
+            match ffi {
+                MarmotKitError::AccountDevicesActivationRefused {
+                    group_id_hex,
+                    reason,
+                } => {
+                    assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("expected AccountDevicesActivationRefused, got {other:?}"),
+            }
         }
     }
 
@@ -959,6 +1074,37 @@ mod tests {
         assert!(
             matches!(ffi, MarmotKitError::Runtime { .. }),
             "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
+        );
+    }
+
+    /// mdk#2158: an attachment whose epoch the group left, or whose group is
+    /// mid-epoch-change, crosses the FFI as its own typed error with both
+    /// epochs, not as a generic invalid reference a host can only string-match.
+    #[test]
+    fn media_epoch_failures_cross_ffi_as_typed_variants() {
+        let stale: MarmotKitError = AppError::MediaReferenceStaleEpoch {
+            source_epoch: 2,
+            current_epoch: 3,
+        }
+        .into();
+        assert!(
+            matches!(
+                stale,
+                MarmotKitError::MediaReferenceStaleEpoch {
+                    source_epoch: 2,
+                    current_epoch: 3
+                }
+            ),
+            "{stale:?}"
+        );
+        let unsettled: MarmotKitError =
+            AppError::MediaReferenceEpochUnsettled { source_epoch: 4 }.into();
+        assert!(
+            matches!(
+                unsettled,
+                MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 4 }
+            ),
+            "{unsettled:?}"
         );
     }
 
@@ -1112,6 +1258,38 @@ mod tests {
             matches!(wrapped, MarmotKitError::Io { .. }),
             "AccountHome IO failure must map to Io, got {wrapped:?}"
         );
+    }
+
+    /// Each sticker failure crosses the FFI as its own variant; none may
+    /// fall through to the generic `Runtime` arm.
+    #[test]
+    fn sticker_errors_map_to_their_typed_variants() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: Vec<(AppError, Expected)> = vec![
+            (
+                AppError::InvalidSticker("bad hash".into()),
+                |e| matches!(e, MarmotKitError::InvalidSticker { details } if details == "bad hash"),
+            ),
+            (AppError::StickerNotFound, |e| {
+                matches!(e, MarmotKitError::StickerNotFound)
+            }),
+            (
+                AppError::StickerRelay("offline".into()),
+                |e| matches!(e, MarmotKitError::StickerNetwork { details } if details == "offline"),
+            ),
+            (
+                AppError::StickerImport("refused".into()),
+                |e| matches!(e, MarmotKitError::StickerImport { details } if details == "refused"),
+            ),
+            (AppError::StickerExternalSignerImportUnsupported, |e| {
+                matches!(e, MarmotKitError::StickerImportUnsupported)
+            }),
+        ];
+        for (app_err, expected) in cases {
+            let label = format!("{app_err:?}");
+            let ffi = MarmotKitError::from(app_err);
+            assert!(expected(&ffi), "{label} mapped to {ffi:?}");
+        }
     }
 
     #[test]

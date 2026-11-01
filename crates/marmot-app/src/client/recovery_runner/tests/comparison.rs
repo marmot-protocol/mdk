@@ -1,0 +1,720 @@
+//! Comparison and re-check units (PR 4c) over real account storage, against
+//! the model relay answering NIP-77.
+
+use super::*;
+use storage_sqlite::TransportReconciliationItem;
+
+impl Account {
+    /// The account holds `events` on `route`: its reconciliation inventory.
+    pub(super) fn hold(&self, route: &Route, events: &[Event]) {
+        let items = events
+            .iter()
+            .map(|event| TransportReconciliationItem {
+                event_id: event.id.to_bytes(),
+                created_at: event.created_at.as_secs(),
+            })
+            .collect::<Vec<_>>();
+        self.app
+            .record_reconciliation_items(items.iter().map(|item| (route, item)))
+            .unwrap();
+    }
+
+    fn record_caps(&self, relay: &str, caps: RelayCaps, now: u64) {
+        self.app
+            .record_recovery_relay_caps(
+                relay,
+                Some(RecoveryRelayCaps {
+                    max_limit: caps.max_limit,
+                    negentropy: caps.negentropy,
+                }),
+                now,
+            )
+            .unwrap();
+    }
+
+    pub(super) fn staged_events(&self, route: &Route) -> u64 {
+        self.app
+            .staged_recovery_usage(std::slice::from_ref(route), None)
+            .unwrap()
+            .events
+    }
+}
+
+/// `count` events spread evenly over `[since, until)`.
+pub(super) fn spread(group: [u8; 32], since: u64, until: u64, count: u64) -> Vec<Event> {
+    (0..count)
+        .map(|index| event(group, since + index * (until - since) / count))
+        .collect()
+}
+
+pub(super) fn ids(events: &[Event]) -> BTreeSet<EventId> {
+    events.iter().map(|event| event.id).collect()
+}
+
+/// A difference six times what one quantum may fetch, in a range whose relay
+/// set is past the truncation limit: each quantum certifies a prefix under
+/// the production item and byte limits, the next resumes after it, and no id
+/// is fetched twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_compares_a_large_difference_in_prefixes_over_several_quanta() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let held = spread([1; 32], floor, t0, 5_000);
+    let missing = spread([1; 32], floor, t0, 12_000);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held.iter().chain(&missing).cloned().collect())
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    host.tails.stand(&route, RELAY, t0);
+    let policy = test_policy();
+    let per_quantum = usize::try_from(policy.staging.group_events).unwrap();
+    let (mut runner, _handle) = runner(&host, policy);
+
+    let mut quanta = 0;
+    let mut owed_from = floor;
+    while let Some(first) = account.debt(&route, RELAY, t0 - 1).first() {
+        assert_eq!(
+            first.since_seconds, owed_from,
+            "the debt's prefix moved alone"
+        );
+        quanta += 1;
+        assert!(quanta <= 12, "the difference never finished");
+        let fetched_before = relay.fetched_ids().len();
+        let summary = ran(runner.step().await);
+        assert_eq!(
+            (summary.outcome, summary.recheck),
+            (Outcome::Advanced, false)
+        );
+        assert!(relay.fetched_ids().len() - fetched_before <= per_quantum);
+        owed_from = account
+            .debt(&route, RELAY, t0 - 1)
+            .first()
+            .map_or(t0, |owed| owed.since_seconds);
+        assert!(
+            owed_from > first.since_seconds,
+            "a quantum certified no prefix"
+        );
+    }
+
+    assert!(quanta >= 6, "the difference fit in {quanta} quanta");
+    assert!(relay.queries().is_empty(), "a comparison unit swept");
+    let comparisons = relay.comparisons();
+    assert_eq!(
+        (comparisons[0].since, comparisons[0].until),
+        (floor, t0 - 1),
+        "the first window is the whole debt"
+    );
+    let fetched = relay.fetched_ids();
+    assert_eq!(fetched.len(), missing.len(), "an id was fetched twice");
+    assert_eq!(fetched.into_iter().collect::<BTreeSet<_>>(), ids(&missing));
+    // Admission releases what lies below the relay's position as it goes.
+    assert_eq!(
+        account.staged_events(&route) + account.admitted_events(),
+        missing.len() as u64
+    );
+}
+
+/// A unit compares only where the account already holds events in the owed
+/// range; with nothing held, a sweep fetches the same events for fewer
+/// requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_compares_where_the_account_holds_events_and_sweeps_elsewhere() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (holding, empty) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let held = every([1; 32], floor, t0, 60);
+    let missing = every([1; 32], floor + 30, t0, 60);
+    account.hold(&holding, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(
+            held.iter()
+                .chain(&missing)
+                .cloned()
+                .chain(every([2; 32], floor, t0, 60))
+                .collect(),
+        )
+        .build();
+    let routes = vec![required(&holding, &[RELAY]), required(&empty, &[RELAY])];
+    let host = TestHost::new(&account, &clock, routes, &[&relay]);
+    for route in [&holding, &empty] {
+        account.goal(route, floor);
+        account.rechecked(route, RELAY, t0);
+        host.tails.stand(route, RELAY, t0);
+    }
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(run_until_idle(&mut runner, 4).await, [Outcome::Advanced; 2]);
+
+    assert!(!relay.comparisons().is_empty());
+    assert_eq!(
+        relay.fetched_ids().into_iter().collect::<BTreeSet<_>>(),
+        ids(&missing)
+    );
+    let swept = relay.queries();
+    assert!(!swept.is_empty());
+    assert!(swept.iter().all(|query| query.route
+        == SweepRoute::Group {
+            nostr_group_id: [2; 32]
+        }));
+    for route in [&holding, &empty] {
+        assert!(account.debt(route, RELAY, t0 - 1).is_empty());
+    }
+}
+
+/// Re-checks run only on required relays whose caps show NIP-77: a cap-only
+/// relay's count proofs re-check nothing, and a best-effort relay is never
+/// re-checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_never_rechecks_a_cap_only_relay() {
+    const BEST_EFFORT: &str = "wss://c.example";
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let events = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &events);
+    let cap_only = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(events.clone())
+        .build();
+    let compares = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(events.clone())
+        .build();
+    let best_effort = ModelRelay::new(BEST_EFFORT, caps(500, true))
+        .with_events(events)
+        .build();
+    let routes = vec![RunnerRoute {
+        best_effort: vec![BEST_EFFORT.to_owned()],
+        ..required(&route, &[RELAY, OTHER_RELAY])
+    }];
+    let host = TestHost::new(
+        &account,
+        &clock,
+        routes,
+        &[&cap_only, &compares, &best_effort],
+    );
+    account.goal(&route, floor);
+    for relay in [RELAY, OTHER_RELAY, BEST_EFFORT] {
+        account.live_boundary(&route, relay, floor, t0 - 1);
+        host.tails.stand(&route, relay, t0);
+    }
+    account.record_caps(RELAY, caps(500, false), t0);
+    account.record_caps(OTHER_RELAY, caps(500, true), t0);
+    account.record_caps(BEST_EFFORT, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let rechecked = ran(runner.step().await);
+    assert_eq!(
+        (rechecked.key.relay.as_str(), rechecked.recheck),
+        (OTHER_RELAY, true)
+    );
+    assert_eq!(rechecked.outcome, Outcome::NoProgress);
+    let done = clock.now();
+    assert_eq!(
+        idle(runner.step().await),
+        Some(done + RUNNER_RECHECK_INTERVAL_SECS)
+    );
+
+    assert!(!compares.comparisons().is_empty());
+    for untouched in [&cap_only, &best_effort] {
+        assert_eq!(untouched.requests(), 0);
+    }
+    assert!(account.app.recovery_unit(&route, RELAY).unwrap().is_none());
+    assert!(
+        account
+            .app
+            .recovery_unit(&route, BEST_EFFORT)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// An explicit repair asks a relay to compare again: one that would not
+/// earlier in this process, on a connection still up, is re-checked once the
+/// repair re-arms it, so the repair can end with its window covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_rechecks_a_relay_that_would_not_compare_before() {
+    use super::super::{PassBound, RepairEnd};
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let events = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &events);
+    let compares = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(events)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[OTHER_RELAY])],
+        &[&compares],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, OTHER_RELAY, floor, t0 - 1);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    account.record_caps(OTHER_RELAY, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    // As an earlier group comparison it refused leaves it.
+    runner.memory.would_not_compare(OTHER_RELAY);
+
+    let end = runner
+        .repair(&PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(
+        matches!(end, RepairEnd::Covered),
+        "the repair re-checked the relay"
+    );
+    assert!(!compares.comparisons().is_empty());
+}
+
+/// A full pass is due again six hours after it finished, and at once after an
+/// epoch gap, from the gap's bound. What it finds inside covered ranges
+/// arrived late: it is staged and counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rechecks_six_hours_after_a_full_pass_and_at_once_after_an_epoch_gap() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let held = every([1; 32], floor, t0, HOUR);
+    let late = event([1; 32], floor + 90 * 60);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held.iter().cloned().chain([late.clone()]).collect())
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, RELAY, floor, t0 - 1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let (mut runner, handle) = runner(&host, test_policy());
+
+    // No pass has finished yet, so one is due at once. It finds the late
+    // event and finishes.
+    let first = ran(runner.step().await);
+    assert!(first.recheck);
+    assert_eq!(relay.fetched_ids(), [late.id]);
+    assert_eq!(handle.late_findings(), 1);
+    assert_eq!(account.staged_events(&route), 1);
+    let finished = account.unit(&route, RELAY).recheck.completed_at_seconds;
+    let finished = finished.expect("the pass finished");
+    let due = finished + RUNNER_RECHECK_INTERVAL_SECS;
+    assert_eq!(idle(runner.step().await), Some(due));
+
+    // Due six hours on, and not before.
+    clock.advance_to(due - 1);
+    assert_eq!(idle(runner.step().await), Some(due));
+    clock.advance_to(due);
+    let again = ran(runner.step().await);
+    assert_eq!((again.recheck, again.outcome), (true, Outcome::NoProgress));
+    assert_eq!(handle.late_findings(), 1, "nothing new arrived late");
+    assert!(idle(runner.step().await) > Some(clock.now()));
+
+    // An epoch gap makes the group's re-check due at once, from its bound.
+    let bound = floor + 12 * HOUR;
+    account
+        .app
+        .make_recovery_recheck_due(&route, None, Some(bound))
+        .unwrap();
+    handle.bump();
+    assert_eq!(
+        account.unit(&route, RELAY).recheck.completed_at_seconds,
+        None
+    );
+    let compared_before = relay.comparisons().len();
+    let gap = ran(runner.step().await);
+    assert!(gap.recheck);
+    let windows = &relay.comparisons()[compared_before..];
+    assert!(!windows.is_empty());
+    assert!(windows.iter().all(|window| window.since >= bound));
+    assert!(
+        account
+            .unit(&route, RELAY)
+            .recheck
+            .completed_at_seconds
+            .is_some()
+    );
+}
+
+/// A pass the relay fails mid-way keeps every range covered and resumes
+/// where it got to, not from the window's floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_resumes_a_failed_recheck_pass_and_uncovers_nothing() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    // Two covered ranges with a gap the goal does not reach: two comparison
+    // calls in one pass.
+    let older = (floor, floor + HOUR - 1);
+    let newer = (floor + 2 * HOUR, t0 - 1);
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, newer.0);
+    account.live_boundary(&route, RELAY, older.0, older.1);
+    account.live_boundary(&route, RELAY, newer.0, newer.1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let still_covered = |account: &Account| {
+        [older, newer].iter().all(|&(since, until)| {
+            account
+                .app
+                .recovery_unit_cursor(&route, RELAY, since, until)
+                .unwrap()
+                .is_none()
+        })
+    };
+    assert!(still_covered(&account));
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // The older range compares; the relay drops before the newer one does.
+    relay.gate.hold_from(1);
+    let stepping = tokio::spawn(async move {
+        let summary = ran(runner.step().await);
+        (runner, summary)
+    });
+    wait_until("the second comparison", WAIT, || relay.gate.waiting() == 1).await;
+    relay.set_reachable(false);
+    relay.gate.open();
+    let (mut runner, failed) = stepping.await.unwrap();
+    assert_eq!(
+        (failed.recheck, failed.outcome),
+        (true, Outcome::Unreachable)
+    );
+
+    assert!(still_covered(&account), "a failed pass un-covered");
+    assert!(account.debt(&route, RELAY, t0 - 1).is_empty());
+    let pass = account.unit(&route, RELAY).recheck;
+    assert_eq!(pass.position_seconds, Some(older.1 + 1));
+    assert_eq!(pass.completed_at_seconds, None);
+
+    // Held back while it moves nowhere, then it resumes past the older range.
+    relay.set_reachable(true);
+    let held_until = idle(runner.step().await).expect("the pass is held, not done");
+    clock.advance_to(held_until);
+    let compared_before = relay.comparisons().len();
+    let resumed = ran(runner.step().await);
+    assert_eq!(
+        (resumed.recheck, resumed.outcome),
+        (true, Outcome::NoProgress)
+    );
+    let windows = &relay.comparisons()[compared_before..];
+    assert_eq!(windows.first().map(|window| window.since), Some(newer.0));
+    assert!(
+        account
+            .unit(&route, RELAY)
+            .recheck
+            .completed_at_seconds
+            .is_some()
+    );
+    assert!(still_covered(&account));
+}
+
+/// A re-check whose settle commits and whose progress write then fails keeps
+/// its attempt open, and the refund that follows changes nothing: the relay's
+/// answer stands and the account keeps the charge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_a_settled_recheck_whose_progress_write_failed() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, RELAY, floor, t0 - 1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    // The relay failed once before, so an answer shows in its streak.
+    account
+        .app
+        .settle_recovery_recheck(&route, RELAY, Outcome::Unreachable, &test_policy().unit, t0)
+        .unwrap();
+    let streak = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .unreachable_streak
+    };
+    assert_eq!(streak(), 1);
+    let faults = account.fault_connection();
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_recheck_progress BEFORE UPDATE OF recheck_position_seconds
+             ON account_recovery_units BEGIN SELECT RAISE(ABORT, 'recheck progress fault'); END;",
+        )
+        .unwrap();
+    let attempts = || {
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts
+    };
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let open = runner.open_attempts();
+
+    let failed = ran(runner.step().await);
+    assert_eq!(
+        (failed.recheck, failed.outcome),
+        (true, Outcome::LocalFailure)
+    );
+    let pass = account.unit(&route, RELAY).recheck;
+    assert_eq!(pass.completed_at_seconds, None, "its progress was not kept");
+    assert_eq!(streak(), 0, "its settle committed the relay's answer");
+    assert_eq!(attempts(), 1);
+    assert!(!open.is_empty(), "its attempt stays open");
+
+    faults
+        .execute_batch("DROP TRIGGER fail_recheck_progress;")
+        .unwrap();
+    open.refund(&account.app, &test_policy().unit, clock.now());
+    assert!(open.is_empty());
+    assert_eq!(attempts(), 1, "the refund kept the settled charge");
+    assert_eq!(streak(), 0, "and the relay's answer");
+}
+
+/// A repair that makes a pass due while one of its quanta runs is not
+/// swallowed, though it leaves the pass looking as it did: the quantum
+/// records nothing, and the pass runs again from the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_reruns_a_recheck_pass_made_due_mid_quantum() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let older = (floor, floor + HOUR - 1);
+    let newer = (floor + 2 * HOUR, t0 - 1);
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, newer.0);
+    account.live_boundary(&route, RELAY, older.0, older.1);
+    account.live_boundary(&route, RELAY, newer.0, newer.1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    // The older range compares; the repair lands before the newer one does.
+    relay.gate.hold_from(1);
+    let stepping = tokio::spawn(async move {
+        let summary = ran(runner.step().await);
+        (runner, summary)
+    });
+    wait_until("the second comparison", WAIT, || relay.gate.waiting() == 1).await;
+    let began = account.unit(&route, RELAY).recheck;
+    account.app.rearm_all_recovery_units().unwrap();
+    let requested = account.unit(&route, RELAY).recheck;
+    assert_eq!(
+        (requested.position_seconds, requested.completed_at_seconds),
+        (began.position_seconds, began.completed_at_seconds),
+        "the repair leaves the pass looking as it did"
+    );
+    relay.gate.open();
+    let (mut runner, interrupted) = stepping.await.unwrap();
+    assert!(interrupted.recheck);
+    assert_eq!(account.unit(&route, RELAY).recheck, requested);
+
+    // The pass runs again from the floor, and this time it is recorded.
+    let compared_before = relay.comparisons().len();
+    let again = ran(runner.step().await);
+    assert!(again.recheck);
+    let windows = &relay.comparisons()[compared_before..];
+    assert_eq!(windows.first().map(|window| window.since), Some(older.0));
+    assert!(
+        account
+            .unit(&route, RELAY)
+            .recheck
+            .completed_at_seconds
+            .is_some()
+    );
+}
+
+/// A comparison's fetch by id still reading when the quantum runs out is
+/// interrupted, and what it read is charged as a sweep's reply is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_charges_the_fetch_a_cut_comparison_was_reading() {
+    const READ: u64 = 4096;
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let held = every([1; 32], floor, t0, 60);
+    let missing = every([1; 32], floor + 30, t0, 60);
+    account.hold(&route, &held);
+    // Request 0 is the comparison; the fetch after it is held until the
+    // quantum is cut.
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held.iter().chain(&missing).cloned().collect())
+        .interruptible(READ)
+        .build();
+    relay.gate.hold_from(1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.rechecked(&route, RELAY, t0);
+    host.tails.stand(&route, RELAY, t0);
+    let policy = RecoveryRunnerPolicy {
+        quantum: Duration::from_millis(500),
+        ..test_policy()
+    };
+    let (mut runner, _handle) = runner(&host, policy);
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::NoProgress);
+    assert_eq!(relay.comparisons().len(), 1);
+    assert_eq!(
+        relay.fetched_ids().len(),
+        missing.len(),
+        "the fetch went out"
+    );
+    assert_eq!(account.staged_events(&route), 0);
+    assert_eq!(
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .event_bytes,
+        READ
+    );
+}
+
+/// What a re-check finds is staged like any fetched history, so a full
+/// relay's re-check waits even where its own debt holds the group's frontier:
+/// the debt moves the frontier, the re-check never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_holds_a_full_relays_recheck_back_but_not_its_frontier_debt() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let mid = t0 - HOUR / 2;
+    let events = every([1; 32], floor, mid, 60);
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    let other = ModelRelay::new(OTHER_RELAY, caps(500, false)).build();
+    // A swept and staged the older half hour and owes the newer one, so it
+    // holds the frontier; B owes nothing.
+    account.goal(&route, floor);
+    account.swept(&route, RELAY, &events, floor, mid);
+    account.live_boundary(&route, OTHER_RELAY, floor, t0 - 1);
+    account.record_caps(RELAY, caps(500, true), t0);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY, OTHER_RELAY])],
+        &[&relay, &other],
+    );
+    host.tails.stand(&route, RELAY, t0);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    let mut policy = test_policy();
+    // Whether A's debt and A's re-check are held back.
+    let held_back = |survey: Survey| {
+        let of = |candidates: Vec<Candidate>| {
+            candidates
+                .into_iter()
+                .find(|candidate| candidate.key.relay == RELAY)
+                .map(|candidate| candidate.blocked)
+        };
+        (of(survey.candidates), of(survey.rechecks))
+    };
+    assert_eq!(
+        held_back(host.survey(policy).await),
+        (Some(false), Some(false))
+    );
+
+    // A's share of the group is full.
+    policy.staging.group_events = events.len() as u64;
+    assert_eq!(
+        held_back(host.survey(policy).await),
+        (Some(false), Some(true))
+    );
+}
+
+/// A re-check of a retained prior route passes over nothing past its goal's
+/// end, though the ledger covers later seconds there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rechecks_a_retained_route_only_through_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.record_caps(RELAY, caps(500, true), t0);
+    account.live_boundary(&route, RELAY, floor, t0);
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let summary = ran(runner.step().await);
+    assert!(summary.recheck);
+    let comparisons = relay.comparisons();
+    assert!(!comparisons.is_empty());
+    assert!(comparisons.iter().all(|window| window.until <= ceiling));
+}

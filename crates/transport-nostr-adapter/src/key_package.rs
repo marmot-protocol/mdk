@@ -12,6 +12,9 @@ pub const KIND_MARMOT_KEY_PACKAGE: u64 = 30_443;
 
 pub const CLIENT_TAG: &str = "client";
 
+/// Longest client name, in bytes, that a KeyPackage `client` tag carries.
+pub const CLIENT_NAME_MAX_BYTES: usize = 64;
+
 const D_TAG: &str = "d";
 const IDENTITY_TAG: &str = "i";
 const MLS_PROTOCOL_VERSION_TAG: &str = "mls_protocol_version";
@@ -20,9 +23,42 @@ const MLS_EXTENSIONS_TAG: &str = "mls_extensions";
 const MLS_PROPOSALS_TAG: &str = "mls_proposals";
 const APP_COMPONENTS_TAG: &str = "app_components";
 
+/// Whether `name` fits a KeyPackage `client` tag: 1 to
+/// [`CLIENT_NAME_MAX_BYTES`] bytes of UTF-8.
+pub fn is_valid_client_name(name: &str) -> bool {
+    (1..=CLIENT_NAME_MAX_BYTES).contains(&name.len())
+}
+
+/// The client name a KeyPackage event's `client` tag carries, read the one way
+/// every MDK reader reads it.
+///
+/// The name is the tag's first value; later values are ignored unvalidated.
+/// More than one `client` tag, a first value that is missing or outside the
+/// name bounds, or an event that is not a KeyPackage reads as no tag. The name
+/// is self-reported display metadata: it never makes an event invalid and
+/// never decides validity, selection or group state.
+pub fn key_package_client_name(event: &NostrTransportEvent) -> Option<&str> {
+    if event.kind != KIND_MARMOT_KEY_PACKAGE {
+        return None;
+    }
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == CLIENT_TAG));
+    let tag = tags.next()?;
+    if tags.next().is_some() {
+        return None;
+    }
+    tag.get(1)
+        .map(String::as_str)
+        .filter(|name| is_valid_client_name(name))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NostrKeyPackagePublication {
     /// Advisory host application label, absent for generic MDK consumers.
+    /// Must satisfy [`is_valid_client_name`]; it becomes the only value of the
+    /// event's one `client` tag.
     pub client_name: Option<String>,
     pub account_id: MemberId,
     pub key_package: KeyPackage,
@@ -84,6 +120,15 @@ impl NostrKeyPackagePublication {
                 "Marmot KeyPackage publish endpoints must not be empty".into(),
             ));
         }
+        if self
+            .client_name
+            .as_deref()
+            .is_some_and(|name| !is_valid_client_name(name))
+        {
+            return Err(TransportAdapterError::Publish(
+                "Marmot KeyPackage client tag must carry a 1 to 64 byte name".into(),
+            ));
+        }
 
         let identity = hex::encode(self.account_id.as_slice());
         let mut tags = vec![
@@ -108,7 +153,72 @@ impl NostrKeyPackagePublication {
             created_at,
         ))
     }
+
+    /// Whether a prepared, signed `event` is exactly the event this
+    /// publication describes at the event's own `created_at`: same author,
+    /// kind, tags and content. Only such an event is ever sent, so one that
+    /// does not match, for example because an earlier build signed it under
+    /// rules this one no longer accepts, can never be published.
+    pub fn matches_prepared_event(
+        &self,
+        event: &NostrTransportEvent,
+    ) -> Result<bool, TransportAdapterError> {
+        let expected = self.to_event_at(event.created_at)?;
+        Ok(event.sig.is_some()
+            && event.pubkey == expected.pubkey
+            && event.kind == expected.kind
+            && event.tags == expected.tags
+            && event.content == expected.content
+            && event.created_at == expected.created_at)
+    }
 }
+
+/// The unsigned kind 5 request asking relays to stop serving one KeyPackage
+/// slot: exactly one `a` tag, `30443:<lowercase hex author>:<d>` with no relay
+/// hint, and one `k` tag. Relays drop every publication in the slot up to
+/// `created_at`.
+pub fn key_package_slot_deletion_event(
+    account_id: &MemberId,
+    slot_id: &str,
+    created_at: u64,
+) -> NostrTransportEvent {
+    let author = hex::encode(account_id.as_slice());
+    let address = format!("{KIND_MARMOT_KEY_PACKAGE}:{author}:{slot_id}");
+    NostrTransportEvent::new_unsigned_at(
+        author,
+        KIND_EVENT_DELETION,
+        vec![
+            vec!["a".to_owned(), address],
+            vec!["k".to_owned(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        String::new(),
+        created_at,
+    )
+}
+
+/// The unsigned kind 5 request asking relays to stop serving one event in
+/// the author's own KeyPackage slot, by id (mdk#2628 item 3.4, D63): exactly
+/// one `e` tag naming it and one `k` tag. It covers that event whatever its
+/// `created_at`, which a slot deletion cannot when the event is dated past
+/// the request. Receivers selecting KeyPackages ignore `e` tags.
+pub fn key_package_event_deletion_event(
+    account_id: &MemberId,
+    event_id_hex: &str,
+    created_at: u64,
+) -> NostrTransportEvent {
+    NostrTransportEvent::new_unsigned_at(
+        hex::encode(account_id.as_slice()),
+        KIND_EVENT_DELETION,
+        vec![
+            vec!["e".to_owned(), event_id_hex.to_owned()],
+            vec!["k".to_owned(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+        ],
+        String::new(),
+        created_at,
+    )
+}
+
+const KIND_EVENT_DELETION: u64 = 5;
 
 #[derive(Clone)]
 pub struct NostrKeyPackagePublisher {
@@ -152,14 +262,7 @@ impl NostrKeyPackagePublisher {
         publication: &NostrKeyPackagePublication,
         event: &NostrTransportEvent,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        let expected = publication.to_event_at(event.created_at)?;
-        if event.sig.is_none()
-            || event.pubkey != expected.pubkey
-            || event.kind != expected.kind
-            || event.tags != expected.tags
-            || event.content != expected.content
-            || event.created_at != expected.created_at
-        {
+        if !publication.matches_prepared_event(event)? {
             return Err(TransportAdapterError::Publish(
                 "prepared KeyPackage event does not match publication".into(),
             ));
@@ -266,6 +369,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slot_deletion_names_only_the_slot_address_and_kind() {
+        let account_id = MemberId::new(vec![0xAB; 32]);
+        let event = key_package_slot_deletion_event(&account_id, "slot-1", 1_700_000_000);
+        assert_eq!(event.kind, 5);
+        assert_eq!(event.pubkey, "ab".repeat(32));
+        assert_eq!(event.created_at, 1_700_000_000);
+        assert_eq!(event.content, "");
+        assert_eq!(
+            event.tags,
+            vec![
+                vec!["a".to_owned(), format!("30443:{}:slot-1", "ab".repeat(32))],
+                vec!["k".to_owned(), "30443".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn event_deletion_names_only_the_event_and_kind() {
+        let account_id = MemberId::new(vec![0xAB; 32]);
+        let event_id = "cd".repeat(32);
+        let event = key_package_event_deletion_event(&account_id, &event_id, 1_700_000_000);
+        assert_eq!(event.kind, 5);
+        assert_eq!(event.pubkey, "ab".repeat(32));
+        assert_eq!(event.created_at, 1_700_000_000);
+        assert_eq!(event.content, "");
+        assert_eq!(
+            event.tags,
+            vec![
+                vec!["e".to_owned(), event_id],
+                vec!["k".to_owned(), "30443".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn key_package_event_carries_one_bounded_client_tag_or_refuses_the_name() {
+        let mut publication = sample_publication();
+        assert!(client_tags(&publication.to_event().unwrap()).is_empty());
+        // Bounds count bytes, not characters: 32 two-byte characters fit.
+        for name in [
+            "whitenoise".to_owned(),
+            "a".to_owned(),
+            "x".repeat(CLIENT_NAME_MAX_BYTES),
+            "é".repeat(CLIENT_NAME_MAX_BYTES / 2),
+        ] {
+            publication.client_name = Some(name.clone());
+            let event = publication.to_event().unwrap();
+            assert_eq!(
+                client_tags(&event),
+                [&vec![CLIENT_TAG.to_owned(), name.clone()]]
+            );
+            assert_eq!(key_package_client_name(&event), Some(name.as_str()));
+        }
+        for name in [
+            String::new(),
+            "x".repeat(CLIENT_NAME_MAX_BYTES + 1),
+            "é".repeat(CLIENT_NAME_MAX_BYTES / 2 + 1),
+        ] {
+            publication.client_name = Some(name);
+            assert!(publication.to_event().is_err());
+        }
+    }
+
+    #[test]
+    fn client_name_reader_ignores_malformed_tags_without_rejecting_them() {
+        let with_client_tags = |client_tags: &[&[&str]]| {
+            let mut event = sample_publication().to_event().unwrap();
+            event.tags.extend(client_tags.iter().map(|tag| {
+                std::iter::once(CLIENT_TAG)
+                    .chain(tag.iter().copied())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            }));
+            event
+        };
+        let longest = "x".repeat(CLIENT_NAME_MAX_BYTES);
+        let overlong = "x".repeat(CLIENT_NAME_MAX_BYTES + 1);
+        for (tags, expected) in [
+            (vec![], None),
+            (vec![&["whitenoise"][..]], Some("whitenoise")),
+            (vec![&[longest.as_str()][..]], Some(longest.as_str())),
+            // Values after the name are ignored without validation.
+            (
+                vec![&["whitenoise", "31990:abc:app", "wss://hint.example"][..]],
+                Some("whitenoise"),
+            ),
+            (vec![&["whitenoise", ""][..]], Some("whitenoise")),
+            (vec![&["whitenoise"][..], &["whitenoise"][..]], None),
+            (vec![&["whitenoise"][..], &["other"][..]], None),
+            (vec![&["whitenoise"][..], &[][..]], None),
+            (vec![&[][..]], None),
+            (vec![&[""][..]], None),
+            (vec![&[overlong.as_str()][..]], None),
+        ] {
+            assert_eq!(
+                key_package_client_name(&with_client_tags(&tags)),
+                expected,
+                "{tags:?}"
+            );
+        }
+        // The tag means nothing on any other event shape.
+        let mut relay_list = with_client_tags(&[&["whitenoise"]]);
+        relay_list.kind = crate::KIND_NIP65_RELAY_LIST;
+        assert_eq!(key_package_client_name(&relay_list), None);
+    }
+
+    #[test]
+    fn a_client_value_that_is_not_unicode_cannot_reach_the_reader() {
+        // JSON text is UTF-8, so a value that is not valid UTF-8 can only be
+        // spelled as a lone surrogate escape. Such an event never decodes, so
+        // every name the reader sees is UTF-8 by type.
+        let mut event = sample_publication().to_event().unwrap();
+        event
+            .tags
+            .push(vec![CLIENT_TAG.into(), "not-unicode".into()]);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(serde_json::from_str::<NostrTransportEvent>(&json).is_ok());
+        let json = json.replace("not-unicode", "\\ud800");
+        assert!(serde_json::from_str::<NostrTransportEvent>(&json).is_err());
+    }
+
     #[tokio::test]
     async fn publisher_sends_marmot_key_package_event_to_configured_endpoints() {
         let relay = Arc::new(RecordingRelay::default());
@@ -298,6 +523,14 @@ mod tests {
                 TransportEndpoint("wss://kp-b.example".into()),
             ],
         }
+    }
+
+    fn client_tags(event: &NostrTransportEvent) -> Vec<&Vec<String>> {
+        event
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|name| name == CLIENT_TAG))
+            .collect()
     }
 
     fn tag<'a>(event: &'a NostrTransportEvent, name: &str) -> Option<&'a str> {

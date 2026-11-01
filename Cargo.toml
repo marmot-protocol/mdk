@@ -6,7 +6,7 @@ members = [
     "crates/nostr-directory",
     "crates/traits",
     "crates/cgka-engine",
-    "crates/cgka-session",
+    "crates/marmot-session",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
     "crates/convergence-campaign-runner",
@@ -22,6 +22,8 @@ members = [
     "crates/marmot-forensics",
     "crates/marmot-markdown",
     "crates/marmot-account",
+    "crates/marmot-pairing",
+    "crates/marmot-observability",
     "crates/marmot-app",
     "crates/marmot-uniffi",
     "crates/marmot-uniffi-macros",
@@ -106,6 +108,9 @@ sha2 = "0.10"
 url = "2"
 psl = "2"
 chacha20poly1305 = "0.10"
+# Device pairing's ephemeral key agreement. Already in the tree through
+# OpenMLS's HPKE provider; `static_secrets` lets a test pin the key bytes.
+x25519-dalek = { version = "3.0", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 openssl = { version = "0.10", features = ["vendored"] }
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
@@ -113,6 +118,9 @@ async-wsocket = "0.17"
 tokio-socks = "0.5.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
+# Recovery words for backups (mdk#2628 4.4): 12 BIP-39 English words. Already
+# in the lockfile through nostr's NIP-06 support.
+bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
@@ -148,8 +156,9 @@ media-store = { path = "crates/media-store" }
 nostr-directory = { path = "crates/nostr-directory" }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
-cgka-session = { path = "crates/cgka-session" }
+marmot-session = { path = "crates/marmot-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
+sonar-stickers = { version = "0.1.0", features = ["nostr"] }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
@@ -161,6 +170,8 @@ agent-control = { path = "crates/agent-control" }
 marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
+marmot-pairing = { path = "crates/marmot-pairing" }
+marmot-observability = { path = "crates/marmot-observability" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 marmot-uniffi-macros = { path = "crates/marmot-uniffi-macros" }
@@ -182,6 +193,13 @@ libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7
 # unchanged. `test` inherits these overrides from `dev`.
 [profile.dev.package."*"]
 debug = false
+
+# Build the bundled SQLCipher C code optimized in dev and test builds too. Every
+# test that opens a database replays the migrations, and at -O0 SQLite's own SQL
+# parsing was a fifth of the workspace test lane's CPU (mdk#2738). Release
+# builds already optimize it.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
 
 # Standard release profile for MarmotKit and other workspace release consumers.
 # Thin LTO with one codegen unit is the measured candidate; do not add a custom

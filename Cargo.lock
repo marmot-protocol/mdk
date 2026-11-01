@@ -1018,28 +1018,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cgka-session"
-version = "0.15.0-dev"
-dependencies = [
- "async-trait",
- "cgka-engine",
- "cgka-traits",
- "hex",
- "marmot-forensics",
- "nostr 0.45.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "storage-sqlite",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "transport-nostr-adapter",
- "transport-nostr-peeler",
-]
-
-[[package]]
 name = "cgka-traits"
 version = "0.15.0-dev"
 dependencies = [
@@ -3608,26 +3586,16 @@ version = "0.15.0-dev"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
- "async-trait",
- "cgka-engine",
- "cgka-session",
- "cgka-traits",
  "fs-private",
- "futures",
  "hex",
  "keyring-core",
  "libc",
- "marmot-forensics",
  "nostr 0.45.5",
- "rand 0.8.6",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
@@ -3641,26 +3609,28 @@ dependencies = [
  "agent-stream-compose",
  "async-trait",
  "base64",
+ "bip39",
  "bytes",
  "cgka-engine",
- "cgka-session",
  "cgka-traits",
  "chacha20poly1305 0.10.1",
- "chrono",
  "criterion",
  "fs-private",
  "fs4",
  "futures",
  "hex",
  "hkdf 0.12.4",
- "httpdate",
  "image",
  "jsonschema",
  "keyring-core",
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",
+ "marmot-observability",
+ "marmot-pairing",
+ "marmot-session",
  "media-store",
+ "nostr 0.44.8",
  "nostr 0.45.5",
  "nostr-directory",
  "nostr-relay-builder",
@@ -3680,6 +3650,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sonar-stickers",
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
@@ -3743,6 +3714,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-observability"
+version = "0.15.0-dev"
+dependencies = [
+ "cgka-traits",
+ "chrono",
+ "hex",
+ "httpdate",
+ "jsonschema",
+ "marmot-forensics",
+ "opentelemetry-proto",
+ "prost",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "transport-nostr",
+ "transport-nostr-adapter",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "marmot-pairing"
+version = "0.15.0-dev"
+dependencies = [
+ "cgka-traits",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "marmot-pairing",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "marmot-session"
+version = "0.15.0-dev"
+dependencies = [
+ "async-trait",
+ "cgka-engine",
+ "cgka-traits",
+ "futures",
+ "hex",
+ "marmot-forensics",
+ "marmot-session",
+ "nostr 0.45.5",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto",
+ "openmls_traits",
+ "rand 0.8.6",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "storage-sqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tls_codec",
+ "tokio",
+ "tracing",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
+]
+
+[[package]]
 name = "marmot-terminal-harness"
 version = "0.15.0-dev"
 dependencies = [
@@ -3766,7 +3814,6 @@ dependencies = [
 name = "marmot-uniffi"
 version = "0.15.0-dev"
 dependencies = [
- "cgka-engine",
  "cgka-traits",
  "futures",
  "hex",
@@ -6121,6 +6168,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonar-stickers"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fe25971b1cd6a0c07a3e5df81178463983e3162b0b42097c1f2f118f56c5c78"
+dependencies = [
+ "hex",
+ "nostr 0.44.8",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "spki"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6862,6 +6923,7 @@ dependencies = [
  "cgka-traits",
  "futures",
  "hex",
+ "marmot-pairing",
  "nostr 0.45.5",
  "nostr-gossip",
  "nostr-memory",

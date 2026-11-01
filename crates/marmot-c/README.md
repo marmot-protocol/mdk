@@ -25,6 +25,7 @@ per feature.
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
   [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
+  [turning on account devices](#turning-on-account-devices),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
 - [Smoke test and example](#smoke-test-and-example)
@@ -188,7 +189,7 @@ records retain ordinary strings and do not use this C-only encoding.
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
-persistence, client label, secret store and attachment acquisition mode; NULL options or zero initialization selects
+persistence, client label, secret store, attachment acquisition mode and device platform; NULL options or zero initialization selects
 the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
@@ -441,6 +442,66 @@ distinct user/bunker/client keys, mixed accounts, approvals and logout:
 cargo run --release -p marmot-c --example nip46_smoke
 ```
 
+## Linked devices
+
+`marmot_linked_devices` blocks on the account worker, reads local group state only, and writes an owned
+`MarmotLinkedDeviceList`; free it with `marmot_linked_device_list_free`. Each `MarmotLinkedDevice` has its
+`slot_id_hex` handle, `is_this_device`, `label`, `client` and `platform` (empty until set), `linked_at`, a
+`linked_by_slot_id_hex` that is NULL for the founder, a `MarmotLinkedDeviceStatus` and three setting flags. The list
+is empty until this device trusts a device group, and in every release build until the roster's spec lands. Re-read
+it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` blocks on the account worker and renames one
+device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
+[shared contract](../marmot-uniffi/README.md#linked-devices).
+
+When another of the account's devices removes this one, `MARMOT_EVENT_DEVICE_UNLINKED` fires once and the account
+stops on this device: `MarmotAccountSummary.unlinked` and `signed_out` stay set, and `marmot_sign_in_account` returns
+`MARMOT_STATUS_ACCOUNT_UNLINKED`. `marmot_sign_out_and_wipe` skips leaving its chats and deleting its slot. See the
+[shared contract](../marmot-uniffi/README.md#this-device-unlinked).
+
+`marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this
+device's device group has held its KeyPackage refresh back for a week. Re-read it on
+`MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`. See the
+[shared contract](../marmot-uniffi/README.md#overdue-keypackage-refresh).
+
+## Unrecognized sign-ins
+
+`marmot_unrecognized_sign_ins` blocks on the account worker, reads local state only, and writes an owned
+`MarmotUnrecognizedSignInList`; free it with `marmot_unrecognized_sign_in_list_free`. `marmot_check_sign_ins` checks
+the account's slots now, over the network, and writes the list after the check. Each `MarmotUnrecognizedSignIn` has
+its `slot_id_hex` handle, `client` (empty when none), `appeared_at`, `last_seen_at`, `before_this_device`,
+`signed_in`, a `MarmotUnrecognizedSignInState`, and a `linked_by_slot_id_hex` set only for `LinkedElsewhere`.
+`marmot_answer_sign_in` takes a `MarmotSignInResponse` discriminant as `uint32_t`; an out-of-range value is
+`MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in every release build until the roster's spec lands. Re-read it on
+`MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#unrecognized-sign-ins).
+
+`marmot_start_fresh` answers every sign-in from before this device Not now, now and when one is listed later, without
+rejecting any, and `marmot_started_fresh` writes whether the device did so and still has no device group; re-read it
+on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
+
+## Compromise warning
+
+`marmot_compromise_warning` blocks on the account worker, reads local state only, and writes the account's open
+compromise warning on this device as an owned `MarmotCompromiseWarningItemList`; free it with
+`marmot_compromise_warning_item_list_free`. An empty list means no warning is open. Each `MarmotCompromiseWarningItem`
+has its `reason`, the `slot_id_hex` the item names, a `key_package_ref_hex` set only for
+`MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, and `occurred_at`. `reason` is a
+`MarmotCompromiseWarningReason` discriminant carried as `uint32_t`: later releases add values, so show one the host
+does not know as a generic reason. `marmot_dismiss_compromise_warning` closes the warning on this device only. Re-read
+it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in every release build until the roster's spec lands. See
+the [shared contract](../marmot-uniffi/README.md#compromise-warning).
+
+## Linking a new device
+
+`marmot_start_device_link`, `marmot_confirm_device_link_match` and `marmot_cancel_device_link` (on the new device),
+`marmot_link_device` and `marmot_decline_device_link` (on a device already signed in) and
+`marmot_device_link_snapshot` each block on the account worker and write an owned `MarmotDeviceLinkSnapshot`; free it
+with `marmot_device_link_snapshot_free`. `new_device` is NULL unless this device asked to be linked. Both
+`MarmotNewDeviceLinkState` and each prompt's `MarmotDeviceLinkPromptState` are tagged unions: `Comparing` carries
+`code`/`code_len` emoji with screen-reader descriptions, `CannotLink` carries `missing`/`missing_len`, and
+`AddedElsewhere` carries both labels. `marmot_link_device` takes the label and two `uint8_t` setting flags. Every call
+is refused in release builds until the pairing and device-group specs land. Re-read on
+`MARMOT_EVENT_DEVICE_LINK_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#linking-a-new-device).
+
 ## History may be incomplete notices
 
 `marmot_history_notices` blocks on the account worker, reads local durable state only, and writes an owned
@@ -453,6 +514,11 @@ on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
 `marmot_group_recovery_status_free`. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
 disappear and return.
+`marmot_account_recovery_status` writes an owned `MarmotAccountRecoveryStatus`: the groups still catching up
+(`catching_up_group_ids_hex`/`catching_up_group_ids_hex_len`), `inbox_catching_up`, and every notice
+(`notices`/`notices_len`); free it with `marmot_account_recovery_status_free` and re-read it on
+`MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Nothing is catching up, and neither that event nor
+`MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY` is produced, until the recovery runner owns history (mdk#2660).
 Group changes for a group whose unresolved epoch-gap recovery covers its current local epoch
 return `MARMOT_STATUS_GROUP_CATCHING_UP`. Retry after it syncs, or, once the user accepts that
 the change may split the group, call `marmot_acknowledge_group_catching_up` and retry. See the
@@ -469,6 +535,13 @@ status is returned.
 The C ABI mirrors the [shared reporting operations](../marmot-uniffi/README.md#group-reporting). Pages are capped at
 100 and cursors are exclusive. Deep-free returned pages with `marmot_content_report_page_free` or
 `marmot_report_dismissal_page_free`; the reported message uses the ordinary timeline record and its free function.
+
+## Turning on account devices
+
+The C ABI mirrors the [shared flow](../marmot-uniffi/README.md#turning-on-account-devices). Call
+`marmot_account_devices_activation` and offer `marmot_enable_account_devices` only on
+`MARMOT_ACCOUNT_DEVICES_ACTIVATION_ELIGIBLE`. A refused activation returns
+`MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED`; the last-error detail names the aggregate reason.
 
 ## Host-driven agent publishing
 

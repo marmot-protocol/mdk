@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn disband_request_roundtrips_and_cascades_with_group() {
+    fn disband_request_roundtrips_clears_per_group_and_cascades_with_group() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 3, 0);
         store.put_group(&group).unwrap();
@@ -365,6 +365,40 @@ mod tests {
                 .unwrap()
                 .contains(&hex::encode(group.id.as_slice()))
         );
+
+        let other = sample_group(gid(2), 3, 0);
+        store.put_group(&other).unwrap();
+        let candidate = |group_id: &cgka_traits::GroupId| DisbandCandidate {
+            group_id: group_id.clone(),
+            source_epoch: EpochId(3),
+            commit_id: mid(9),
+            content_commit_id: mid(10),
+            commit_digest: [0xA5; 32],
+            actor: member_id(0),
+            local_was_committer_leaf: false,
+            former_members: Vec::new(),
+        };
+        store
+            .put_disband_request(&DisbandRequest {
+                group_id: other.id.clone(),
+                ..request.clone()
+            })
+            .unwrap();
+        store.put_disband_candidate(&candidate(&group.id)).unwrap();
+        store.put_disband_candidate(&candidate(&other.id)).unwrap();
+        store.clear_disband_request(&other.id).unwrap();
+        store.clear_disband_candidates(&other.id).unwrap();
+        assert_eq!(store.disband_request(&other.id).unwrap(), None);
+        assert!(store.list_disband_candidates(&other.id).unwrap().is_empty());
+        assert_eq!(
+            store.disband_request(&group.id).unwrap(),
+            Some(request.clone())
+        );
+        assert_eq!(
+            store.list_disband_candidates(&group.id).unwrap(),
+            vec![candidate(&group.id)]
+        );
+
         store.delete_group(&group.id).unwrap();
         assert_eq!(store.disband_request(&group.id).unwrap(), None);
     }
@@ -498,12 +532,13 @@ mod tests {
     /// an existing guard with a freshly built `announced: false` must not clear
     /// the latch — that would resurrect the per-open replay silently. The
     /// marker is owned by `mark_disband_tombstone_announced`, so it survives
-    /// any rewrite of the guard around it.
+    /// any rewrite of the guard around it. Preserve-on-rewrite is an OR on that
+    /// one field, not a refusal to update: the rewritten payload still lands.
     #[test]
     fn rewriting_a_guard_cannot_clear_its_announced_marker() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group_id = gid(11);
-        let guard = DisbandTombstone {
+        let mut guard = DisbandTombstone {
             epoch: EpochId(3),
             actor: member_id(5),
             origin_commit_id: None,
@@ -513,9 +548,19 @@ mod tests {
             announced: false,
         };
         store.put_disband_tombstone(&group_id, &guard).unwrap();
+        assert!(
+            !store
+                .disband_tombstone(&group_id)
+                .unwrap()
+                .unwrap()
+                .announced,
+            "a first guard write is unannounced"
+        );
         store.mark_disband_tombstone_announced(&group_id).unwrap();
 
-        // The dangerous rewrite: same guard value the settle path constructs.
+        // The dangerous rewrite: a freshly built `announced: false` guard, as
+        // the settle path constructs, here with a changed payload.
+        guard.epoch = EpochId(4);
         store.put_disband_tombstone(&group_id, &guard).unwrap();
         let after = store.disband_tombstone(&group_id).unwrap().unwrap();
         assert!(
@@ -530,39 +575,6 @@ mod tests {
             guard,
             "everything except the marker must come from the rewritten value"
         );
-    }
-
-    /// The first write of a guard is unannounced, and a rewrite that carries a
-    /// changed payload still lands: preserve-on-rewrite is an OR on one field,
-    /// not a refusal to update.
-    #[test]
-    fn a_first_guard_write_is_unannounced_and_rewrites_still_update_the_payload() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let group_id = gid(12);
-        let mut guard = DisbandTombstone {
-            epoch: EpochId(4),
-            actor: member_id(6),
-            origin_commit_id: None,
-            commit_digest: [0x2e; 32],
-            local_was_committer_leaf: false,
-            former_members: Vec::new(),
-            announced: false,
-        };
-        store.put_disband_tombstone(&group_id, &guard).unwrap();
-        assert!(
-            !store
-                .disband_tombstone(&group_id)
-                .unwrap()
-                .unwrap()
-                .announced
-        );
-
-        store.mark_disband_tombstone_announced(&group_id).unwrap();
-        guard.epoch = EpochId(5);
-        store.put_disband_tombstone(&group_id, &guard).unwrap();
-        let after = store.disband_tombstone(&group_id).unwrap().unwrap();
-        assert_eq!(after.epoch, EpochId(5));
-        assert!(after.announced);
     }
 
     /// Marking a group that has no guard is a no-op, not an error: hydration

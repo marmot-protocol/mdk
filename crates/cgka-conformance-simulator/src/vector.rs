@@ -8,7 +8,10 @@ use crate::{
     BidirectionalDecryptabilityObservation, HarnessClient, PendingWorkObservation,
     ScenarioInputLedgerEntry, ScenarioSpec,
 };
-use cgka_engine::conformance_snapshot::ConformanceCanonicalStateSnapshot;
+use cgka_engine::conformance_snapshot::{
+    ConformanceCanonicalStateSnapshot, ConformanceGroupSnapshot,
+};
+use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, MAX_LEAVES_PER_ACCOUNT};
 use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
 use marmot_forensics::AuditEventKind;
 use serde::{Deserialize, Serialize};
@@ -154,6 +157,16 @@ pub enum TraceExpectation {
     ClientsNotEquivalent {
         clients: Vec<String>,
         reason: String,
+    },
+    /// Require the client's adopted canonical state to require
+    /// `marmot.group.account-devices.v1` exactly when `required` is true, and a
+    /// state that requires it to satisfy the component's state rules: every
+    /// leaf advertises it, the GroupContext carries no data under its id, and
+    /// no account holds more than 20 leaves. Leaf data under the id is not in
+    /// the canonical projection, so the engine's own validation covers it.
+    AccountDevicesState {
+        client: String,
+        required: bool,
     },
     /// Require the complete per-client commit/proposal/application input ledger.
     ScenarioInputLedger {
@@ -551,6 +564,43 @@ impl TraceExpectation {
                             "equivalent": false,
                         }),
                         actual: json!(snapshots),
+                    });
+                }
+            }
+            TraceExpectation::AccountDevicesState { client, required } => {
+                let Some(observation) = client_canonical_observation(observed, client) else {
+                    mismatches.push(ExpectationFailure {
+                        kind: "missing_canonical_state".into(),
+                        message: format!(
+                            "client {client} was not observed with observe_client_exact"
+                        ),
+                        expected: json!(self),
+                        actual: client_observation(observed, client)
+                            .map_or(Value::Null, |observation| json!(observation)),
+                    });
+                    return;
+                };
+                let Some(ConformanceCanonicalStateSnapshot::Live(snapshot)) =
+                    observation.canonical_state.as_ref()
+                else {
+                    mismatches.push(ExpectationFailure {
+                        kind: "account_devices_state_not_live".into(),
+                        message: format!("client {client} has no live canonical group state"),
+                        expected: json!(self),
+                        actual: json!(observation.canonical_state),
+                    });
+                    return;
+                };
+                let actual = account_devices_state(snapshot);
+                if actual.required != *required || !actual.violations.is_empty() {
+                    mismatches.push(ExpectationFailure {
+                        kind: "account_devices_state_mismatch".into(),
+                        message: format!(
+                            "client {client} account-devices state: required {}, violations {:?}",
+                            actual.required, actual.violations
+                        ),
+                        expected: json!({ "required": required, "violations": [] }),
+                        actual: json!(actual),
                     });
                 }
             }
@@ -1019,6 +1069,69 @@ fn client_canonical_observation<'a>(
         .find(|observation| observation.client == client && observation.canonical_state.is_some())
 }
 
+/// What a canonical state shows of `marmot.group.account-devices.v1`.
+/// Violations are aggregate descriptions with no identities.
+#[derive(Debug, Serialize)]
+struct AccountDevicesStateObservation {
+    required: bool,
+    violations: Vec<String>,
+}
+
+fn account_devices_state(snapshot: &ConformanceGroupSnapshot) -> AccountDevicesStateObservation {
+    let required = snapshot
+        .required_capabilities
+        .app_components
+        .contains(&ACCOUNT_DEVICES_COMPONENT_ID);
+    let mut violations = Vec::new();
+    if !required {
+        return AccountDevicesStateObservation {
+            required,
+            violations,
+        };
+    }
+    let unsupported = snapshot
+        .leaves
+        .iter()
+        .filter(|leaf| {
+            !leaf
+                .capabilities
+                .app_components
+                .contains(&ACCOUNT_DEVICES_COMPONENT_ID)
+        })
+        .count();
+    if unsupported > 0 {
+        violations.push(format!(
+            "{unsupported} leaves do not advertise the component"
+        ));
+    }
+    if snapshot
+        .app_components
+        .iter()
+        .any(|component| component.component_id == ACCOUNT_DEVICES_COMPONENT_ID)
+    {
+        violations.push("the GroupContext carries data under the component".into());
+    }
+    let mut leaves_per_account = std::collections::BTreeMap::<&str, usize>::new();
+    for leaf in &snapshot.leaves {
+        *leaves_per_account
+            .entry(leaf.account_identity_hex.as_str())
+            .or_default() += 1;
+    }
+    let over_limit = leaves_per_account
+        .values()
+        .filter(|count| **count > MAX_LEAVES_PER_ACCOUNT)
+        .count();
+    if over_limit > 0 {
+        violations.push(format!(
+            "{over_limit} accounts hold more than {MAX_LEAVES_PER_ACCOUNT} leaves"
+        ));
+    }
+    AccountDevicesStateObservation {
+        required,
+        violations,
+    }
+}
+
 fn client_pending_work_observation<'a>(
     observed: &'a ScenarioTrace,
     client: &str,
@@ -1330,7 +1443,10 @@ fn observe_app_invalidation_reason(reason: AppMessageInvalidationReason) -> Stri
 mod tests {
     use super::*;
     use crate::ScenarioInputDisposition;
-    use cgka_engine::conformance_snapshot::{ConformanceGroupSnapshot, ConformanceLeafSnapshot};
+    use cgka_engine::conformance_snapshot::{
+        ConformanceAppComponent, ConformanceLeafCapabilities, ConformanceLeafSnapshot,
+        ConformanceRequiredCapabilities,
+    };
 
     fn observation(client: &str, epoch: u64, member_count: usize) -> ClientObservation {
         ClientObservation {
@@ -1909,6 +2025,121 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    /// A live snapshot whose leaves belong to `accounts` (one entry per leaf)
+    /// and advertise account-devices when `supported`.
+    fn account_devices_snapshot(
+        required: bool,
+        accounts: &[&str],
+        supported: bool,
+    ) -> ConformanceCanonicalStateSnapshot {
+        let mut app_components = vec![0x8003];
+        if required {
+            app_components.push(ACCOUNT_DEVICES_COMPONENT_ID);
+        }
+        let leaf_components = if supported {
+            vec![0x8003, ACCOUNT_DEVICES_COMPONENT_ID]
+        } else {
+            vec![0x8003]
+        };
+        ConformanceCanonicalStateSnapshot::Live(Box::new(ConformanceGroupSnapshot {
+            epoch: 2,
+            leaves: accounts
+                .iter()
+                .enumerate()
+                .map(|(index, account)| ConformanceLeafSnapshot {
+                    leaf_index: index as u32,
+                    account_identity_hex: (*account).into(),
+                    capabilities: ConformanceLeafCapabilities {
+                        app_components: leaf_components.clone(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            required_capabilities: ConformanceRequiredCapabilities {
+                app_components,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+    }
+
+    fn account_devices_failures(
+        snapshot: ConformanceCanonicalStateSnapshot,
+        required: bool,
+    ) -> Vec<ExpectationFailure> {
+        let mut alice = observation("alice", 2, 2);
+        alice.canonical_state = Some(snapshot);
+        compare_trace_expectations(
+            None,
+            &[TraceExpectation::AccountDevicesState {
+                client: "alice".into(),
+                required,
+            }],
+            &trace(vec![alice]),
+        )
+    }
+
+    #[test]
+    fn account_devices_state_matches_the_required_flag() {
+        let required = account_devices_snapshot(true, &["alice", "bob"], true);
+        assert!(account_devices_failures(required.clone(), true).is_empty());
+        let not_required = account_devices_snapshot(false, &["alice", "carol"], false);
+        assert!(account_devices_failures(not_required.clone(), false).is_empty());
+
+        for (snapshot, expected) in [(required, false), (not_required, true)] {
+            let failures = account_devices_failures(snapshot, expected);
+            assert_eq!(failures.len(), 1, "{failures:#?}");
+            assert_eq!(failures[0].kind, "account_devices_state_mismatch");
+        }
+    }
+
+    #[test]
+    fn account_devices_state_rejects_states_that_break_the_rules() {
+        let unsupported = account_devices_snapshot(true, &["alice", "carol"], false);
+        let mut group_context_data = account_devices_snapshot(true, &["alice"], true);
+        let ConformanceCanonicalStateSnapshot::Live(snapshot) = &mut group_context_data else {
+            unreachable!()
+        };
+        snapshot.app_components.push(ConformanceAppComponent {
+            component_id: ACCOUNT_DEVICES_COMPONENT_ID,
+            data_hex: String::new(),
+        });
+        let over_limit =
+            account_devices_snapshot(true, &["alice"; MAX_LEAVES_PER_ACCOUNT + 1], true);
+
+        for (snapshot, violation) in [
+            (unsupported, "leaves do not advertise the component"),
+            (group_context_data, "the GroupContext carries data"),
+            (over_limit, "accounts hold more than 20 leaves"),
+        ] {
+            let failures = account_devices_failures(snapshot, true);
+            assert_eq!(failures.len(), 1, "{failures:#?}");
+            assert_eq!(failures[0].kind, "account_devices_state_mismatch");
+            assert!(
+                failures[0].message.contains(violation),
+                "{violation}: {}",
+                failures[0].message
+            );
+        }
+        let at_limit = account_devices_snapshot(true, &["alice"; MAX_LEAVES_PER_ACCOUNT], true);
+        assert!(account_devices_failures(at_limit, true).is_empty());
+    }
+
+    #[test]
+    fn account_devices_state_requires_an_exact_observation() {
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::AccountDevicesState {
+                client: "alice".into(),
+                required: true,
+            }],
+            &trace(vec![observation("alice", 2, 2)]),
+        );
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert_eq!(failures[0].kind, "missing_canonical_state");
     }
 
     #[test]

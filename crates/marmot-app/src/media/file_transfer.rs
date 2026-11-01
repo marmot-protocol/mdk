@@ -499,7 +499,7 @@ impl Read for DecryptingReader<'_> {
 #[allow(clippy::too_many_arguments)] // Shared media policy, protected sink and operation controls.
 pub(crate) async fn download_file(
     reference: super::MediaAttachmentReference,
-    media_secret: &[u8],
+    media_key: super::MediaKey<'_>,
     endpoints: &[crate::AppBlobEndpoint],
     allowed_kinds: &[String],
     transport: &super::BlossomHttpTransport,
@@ -526,8 +526,7 @@ pub(crate) async fn download_file(
             super::crypto::canonical_media_type_v2(&reference.media_type)?
         }
     };
-    let key = Zeroizing::new(super::crypto::derive_media_file_key(
-        media_secret,
+    let key = Zeroizing::new(media_key.file_key(
         version,
         &plaintext_hash,
         &media_type,

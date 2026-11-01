@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-20
+updated: 2026-10-30
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -23,6 +23,12 @@ Tracking issue: marmot-protocol/mdk#381.
 - **Each structure documents its bound** (max size, TTL, or eviction policy) below and enforces it in code.
 
 ## Inventory
+
+### Own-checkpoint sender rotation (`cgka-engine/src/maintenance.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Epoch-bound Manual maintenance markers | One per restored own-checkpoint epoch/authenticator; retained across the same horizon as exact checkpoints | Prune only after checkpoint pruning, strictly below its retained epoch floor. Completed or failed phases never release the restored epoch's send gate. A different authenticated epoch releases that gate; ordinary Manual maintenance may still perform one rotation. Group deletion and terminal teardown remove its records. |
 
 ### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
 
@@ -52,7 +58,7 @@ Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event
 pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
 the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
-### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
+### `marmot-observability` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
@@ -74,6 +80,25 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
+
+### `cgka-engine` device-group Welcome expectations (`src/group_lifecycle.rs`, `marmot-app` `src/client/device_group.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_device_group_welcome_expectations` | One row per device group a confirmed link waits to join: a group id, the expected sender's signature key and a deadline. The app records one only alongside its `awaiting_welcome` row, and an account holds at most one such row, so at most one in practice. | The join it admits deletes it in the same transaction. The app deletes it before the row when the link is withdrawn or its 10-minute wait ends (`end_welcome_waits`, on every new link and every reconcile), which also drops a waiting row left without its expectation. |
+
+### `cgka-engine` announced KeyPackages (`src/announced_key_packages.rs`, `storage-sqlite` `src/protocol/storage/announced_key_packages.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+
+### `storage-sqlite` compromise warning (`src/app/compromise_warning.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `account_compromise_warning_items` | One row per rejected sign-in this device gathered and per KeyPackage it found in its own slot that it did not make, at most 4,096 (`COMPROMISE_WARNING_ITEM_CAP`). Sign-ins each take a user's answer, so only someone publishing into this device's slot many times over nears the cap. | An unseen rejected sign-in goes once neither this device nor the roster holds it. A seen found KeyPackage goes 7,261,200 seconds after it was found, by when it has expired; an unseen one stays until dismissed. Past the cap the oldest rows go, seen ones first, so the warning stays open while any row is unseen; a dropped seen row that comes back warns again, telling the user no more than a new KeyPackage in the slot would. |
+| `account_compromise_warning_baseline` | One row: the device group whose first roster this device gathered. | Replaced when the device trusts another device group. |
 
 ### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
 
@@ -146,6 +171,12 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
+| `AppClient.device_link_changed` | One flag | Set at open and when a pairing drive changes linking as hosts read it; cleared at the same seams, which announce `DeviceLinkChanged`; dropped with the client, whose replacement opens with it set. |
+| `AppClient.linked_devices_changed` | One flag | Set at open and by a hidden device-group event or a change of device-group trust; cleared at the next account-level or applied-summary publication seam, which announces `LinkedDevicesChanged`; dropped with the client, whose replacement opens with it set. |
+| `AppClient.pending_recovery_words` | One entry: 16 bytes of zeroized entropy and two word positions | Set by `begin_recovery_words`, replacing any earlier one; cleared once the words are confirmed or cancelled; dropped (and zeroized) with the client, whose replacement opens without it. |
+| `AppClient.key_package_refresh_overdue` and `key_package_refresh_overdue_changed` | One `Option<bool>` and one flag | The answer is replaced after each maintenance pass; a change sets the flag, which the next account-level or applied-summary publication seam clears by announcing `KeyPackageRefreshOverdueChanged`. Both are dropped with the client, whose replacement opens with the flag set. |
+| `AppClient.unrecognized_sign_ins_changed` | One flag | Set at open, by a sign-in check or answer that changed what hosts see, and with every roster change that sets `linked_devices_changed`; cleared at the same seams, which announce `UnrecognizedSignInsChanged`; dropped with the client, whose replacement opens with it set. |
+| `AppClient.compromise_warning_changed` and `compromise_warning_gather_due` | Two flags | Both set at open; the gather flag also by every roster change and This wasn't me answer, and cleared by the gather the next host read or publication seam runs (a failed gather keeps it); the changed flag is set by a gather or dismissal that changed what hosts see and cleared at the same seams as `unrecognized_sign_ins_changed`, which announce `CompromiseWarningChanged`. Both are dropped with the client, whose replacement opens with them set. |
 | `AppClient.history_notice_baseline` | One entry (16-byte obligation id, revision, optional group id) per parked recovery obligation; input-relative to the parked demand keys, not to history | Replaced wholesale from one indexed read at each publication seam; dropped with the client. Losing it costs at most one extra `HistoryNoticesChanged`. |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
 | Avatar acquisition | At most 2,048 jobs, each descriptor at most 16 KiB; at most four HTTP/results across foreground media and avatar work, with one permit kept free by background admission | Job rows cascade with asset eviction/removal. Selected source changes replace demand atomically. Interrupted work resumes after worker reconstruction; retry deadlines persist and 16 consecutive transient failures slow to one daily probe. Worker exit cancels active I/O. |
@@ -153,6 +184,28 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | Avatar identity demand | 2,048 explicit registrations; 64 inspected per batch after directory version changes | Eviction removes registration; group deletion/account cache clear removes demand. Placeholder registrations remain eligible for later profile updates. No historical-roster crawl. |
 | Avatar upgrade ledger | At most one key per chat present at migration 0078 | Consumed in transactions of at most 64 rows; never recreated on restart. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
+
+### `marmot-session` own-slot check (`src/runtime/own_slot.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `AccountDeviceRuntime.slot_superseded_through` | One `Option<Timestamp>` | Raised by the own-slot check to the newest foreign publication found in this device's slot and its current publication's time. Cleared when a publication of its own newer than it becomes current, or when the clock went back so far that no publication could outrank it. Dropped with the runtime; the host reads the slot again at open. |
+
+### `marmot-app` device pairing (`src/client/device_pairing/live.rs`)
+
+Built only with `unreleased-device-pairing`, and empty unless `dev_device_groups` is on. Pairing keeps its secrets
+only in memory, so every structure here is dropped with the client, ending any link in progress.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `PairingInbox` | 64 pairing messages (`INBOX_CAPACITY`) | Drained at each drive; the oldest is dropped at the cap. |
+| `ExistingDevicePairing` sessions (`marmot-pairing`) | 32 tracked requests (`MAX_TRACKED_REQUESTS`); owed cancels capped at the same | A session is kept until its request's 10-minute TTL ends, and expired at each drive. A request past the cap is not tracked, but still counts as competing. |
+| `DevicePairing.prompts` | One per tracked request: at most 32 live, plus ended ones | An ended prompt goes 10 minutes after its last change; one never ended ends 20 minutes after its request. Not now removes it at once. An approval retries while the device group is unsettled, until `LINK_RETRY_SECS` after the new device sent its confirmation, then ends as `LinkFailed`. A committed link's prompt stays until `decide_device_links` decides the link: linked once the new device's first commit arrives, or `LinkFailed` `LINK_DEADLINE_SECS` (an hour) after it was linked. A restart drops it; the link is decided without it. |
+| `DevicePairing.new_device` | One link | Replaced by the next start. A wait that ended keeps its link until the engine's expectation is withdrawn, retried each drive. |
+| `DevicePairing.outbox` | The messages owed to live sessions | Each goes once a relay accepts it, or 10 minutes after it was stamped. |
+| `DevicePairing.quiet_since` | One `Instant` per pending link in `device_links` | Removed when its link is decided, when its device group stops being quiet or its roster lists the link, and when the link is no longer pending. |
+| `DevicePairing.removed_after_join` | One flag | Set when this device is removed from a device group it joined before its first commit there landed; cleared by the next start, and dropped with the client. |
+| `DevicePairing.last_view` | One `DeviceLinkSnapshot` of the link and prompts above | Replaced at the end of a drive whose view differs, which raises `DeviceLinkChanged`. |
 
 ### `storage-sqlite` attachment acquisition (`src/attachment_acquisition.rs`)
 
@@ -285,3 +338,15 @@ Transiently failed selected routes stay pending; serviced or unattempted routes
 never erase unresolved coverage. Retained inventory may be narrower than older
 coverage debt. This adds no disk-cap claim for the previously approved unresolved
 loss-generation watermark exception.
+
+### Recovery runner retry state and staging (`storage-sqlite/src/app/recovery_units.rs`, `recovery_staging.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `account_recovery_units` | One row per (route, relay) the runner has served, like the coverage ledger's rows | Re-armed in place; never grows per attempt |
+| `account_recovery_unit_spans` | Parked spans are the unit's debt at its last park, so no more ranges than its coverage gaps; retired spans add only dismissed debt. Both kinds stay inside the route's goal window, so retention bounds them as it bounds goals | Coverage trims what it proves; a re-arm drops parked spans and explicit repair drops both kinds; dismissal turns parked into retired; the retention prune drops both kinds below its floor |
+| `account_recovery_relays` | One row per relay the runner has served | Updated in place |
+| `account_recovery_budget` | At most 61 per-minute rows | Rows older than the rolling hour are deleted on every charge and read |
+| `account_recovery_unit_fences` | Only the runner writes it. At most 8 ranges per unit, past which it joins the newest into one; each is capture debt the unit still owes | Admission drops a range once nothing in it is owed, and every range of a relay its route no longer requires; the retention prune drops ranges below its floor |
+| `account_recovery_staged` | Only the runner writes it, and no production path runs the runner before the switch-over. A relay that has staged 2,048 events or 8 MiB for a group, or any relay once the account holds 64 MiB, waits while another relay holds that group's admission frontier; a debt unit at the frontier is never held back, and a re-check, which never moves the frontier, waits at the bound like any other. Nothing is fetched for a group admission cannot drain: one held behind an event the engine kept no trace of, or every group while admission waits after local failures. So while admission can drain the group, each relay can pass a bound by at most one quantum; a stalled group is not swept | Admission removes a row once its event is seen; a row that no longer decodes, or whose route the runner no longer lists, is discarded and its second owed again |
+

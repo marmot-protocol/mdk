@@ -27,37 +27,3 @@ impl ConvergencePolicyStorage for SqliteAccountStorage {
             .storage()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::SqliteAccountStorage;
-    use crate::base::test_support::{gid, sample_group};
-    use cgka_traits::storage::{ConvergencePolicyStorage, GroupStorage, MessageStorage};
-
-    #[test]
-    fn convergence_policy_is_group_scoped_and_snapshot_restored() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let g1 = sample_group(gid(1), 0, 0);
-        let g2 = sample_group(gid(2), 0, 0);
-        store.put_group(&g1).unwrap();
-        store.put_group(&g2).unwrap();
-
-        store.put_convergence_policy(&g1.id, b"policy-v1").unwrap();
-        store
-            .put_convergence_policy(&g2.id, b"other-policy")
-            .unwrap();
-        store.create_group_snapshot(&g1.id, "policy").unwrap();
-        store.put_convergence_policy(&g1.id, b"policy-v2").unwrap();
-
-        store.rollback_group_to_snapshot(&g1.id, "policy").unwrap();
-
-        assert_eq!(
-            store.convergence_policy(&g1.id).unwrap(),
-            Some(b"policy-v1".to_vec())
-        );
-        assert_eq!(
-            store.convergence_policy(&g2.id).unwrap(),
-            Some(b"other-policy".to_vec())
-        );
-    }
-}

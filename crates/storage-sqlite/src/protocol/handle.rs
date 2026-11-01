@@ -1,7 +1,5 @@
 //! `SqliteAccountStorage`: the engine's handle on the account database.
 
-#[cfg(feature = "test-migrated-template")]
-use crate::base::connection::open_account_in_memory_from_migrated_template;
 use crate::base::connection::{
     ConnectionGuard, DatabaseCloser, OpenedAccount, SharedConnection, SqlCipherKey,
     SqliteStorageOptions, SqliteTimingObserver, open_account_encrypted, open_account_in_memory,
@@ -31,7 +29,7 @@ pub struct SqliteAccountStorage {
 pub type SqliteStorage = SqliteAccountStorage;
 
 impl SqliteAccountStorage {
-    fn from_opened(opened: OpenedAccount) -> Self {
+    pub(crate) fn from_opened(opened: OpenedAccount) -> Self {
         let openmls = SqliteOpenMlsStorage::new(opened.connection.clone());
         Self {
             connection: opened.connection,
@@ -68,21 +66,38 @@ impl SqliteAccountStorage {
         crate::protocol::storage::snapshots::import_replay(self, group_id, snapshot)
     }
 
+    /// An unencrypted in-memory store with the default options. This crate's
+    /// own unit tests get [`Self::in_memory_for_test`] instead.
     pub fn in_memory() -> StorageResult<Self> {
-        Self::in_memory_with_options(SqliteStorageOptions::default())
+        #[cfg(test)]
+        {
+            Self::in_memory_for_test()
+        }
+        #[cfg(not(test))]
+        {
+            Self::in_memory_with_options(SqliteStorageOptions::default())
+        }
+    }
+
+    /// An unencrypted in-memory store without SQLCipher's memory security, for
+    /// tests that do not assert it. Memory security turns every allocation in
+    /// the process into system calls (see `relax_storage_for_test_process`).
+    ///
+    /// The store is a copy of a migrated template, which the test binary's
+    /// processes share, rather than a replay of every migration. The copy
+    /// draws its own per-database values, so it is the same database a
+    /// replay opens.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_memory_for_test() -> StorageResult<Self> {
+        crate::cross::migrated_template::open(SqliteStorageOptions {
+            cipher_memory_security: false,
+            ..SqliteStorageOptions::default()
+        })
+        .map(Self::from_opened)
     }
 
     pub fn in_memory_with_options(options: SqliteStorageOptions) -> StorageResult<Self> {
         open_account_in_memory(options).map(Self::from_opened)
-    }
-
-    /// Test-only in-memory storage copied from one migrated template per
-    /// process. Harnesses that open thousands of short-lived databases would
-    /// otherwise replay every migration for each. Opening the copy still runs
-    /// the migration ledger check, which finds nothing to apply.
-    #[cfg(feature = "test-migrated-template")]
-    pub fn in_memory_from_migrated_template(options: SqliteStorageOptions) -> StorageResult<Self> {
-        open_account_in_memory_from_migrated_template(options).map(Self::from_opened)
     }
 
     /// Open a private encrypted account store with the standard privacy and durability defaults.

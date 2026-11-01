@@ -14,8 +14,10 @@ impl AppClient {
     /// Queue the host notification independently from the storage projection delta.
     pub(crate) fn mark_recovery_status_changed(&mut self, group_id: &GroupId) {
         self.mark_group_projection_dirty(group_id);
-        self.pending_recovery_status_updates
-            .insert(group_id.clone());
+        if self.host_may_see_group(group_id) {
+            self.pending_recovery_status_updates
+                .insert(group_id.clone());
+        }
     }
 
     /// Read only bounded offer metadata, without loading any MLS group.
@@ -54,7 +56,6 @@ impl AppClient {
         let group = self.runtime.group_record(group_id)?;
         let rejoin_invitations = self
             .runtime
-            .session()
             .pending_group_rejoins_for(group_id)?
             .into_iter()
             .filter_map(|candidate| {
@@ -66,7 +67,7 @@ impl AppClient {
                 })
             })
             .collect();
-        let records = self.runtime.session().reinvite_recovery_records()?;
+        let records = self.runtime.reinvite_recovery_records()?;
         let mut pending_reinvites = 0u32;
         let mut failed_reinvites = 0u32;
         for record in records.iter().filter(|record| &record.group_id == group_id) {
@@ -75,9 +76,8 @@ impl AppClient {
                 for package in key_packages {
                     let metadata = self
                         .runtime
-                        .session()
                         .key_package_metadata(package)
-                        .map_err(cgka_session::SessionError::from)?;
+                        .map_err(marmot_session::SessionError::from)?;
                     missing |= !group.members.iter().any(|member| {
                         hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
                     });
@@ -115,11 +115,16 @@ impl AppClient {
         welcome_id: &cgka_traits::MessageId,
         token: &[u8],
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let group_id = self
-            .runtime
-            .session_mut()
-            .confirm_group_rejoin(welcome_id, token)
-            .await?;
+        // Rejoining unwraps the retained Welcome again. Keep block updates out
+        // until both the native replacement and its app projection have settled.
+        let policy_lock = self.app.block_update_lock(&self.state.label).await;
+        let _policy_guard = policy_lock.lock().await;
+        // A confirmation that fails can still retire offers: one whose
+        // carriers were all withdrawn, or a Welcome it refuses.
+        let offers = self.rejoin_offer_snapshot()?;
+        let confirmed = self.runtime.confirm_group_rejoin(welcome_id, token).await;
+        self.reconcile_rejoin_offer_changes(offers)?;
+        let group_id = confirmed?;
         // GroupJoined is durably journaled by the engine, so a failed app
         // projection refresh is repaired by the ordinary reopen/drain path.
         let summary = self.drain_pending_session_events().await?;
@@ -142,33 +147,30 @@ impl AppClient {
             .list_welcomes()?
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id && candidate.rejoin.is_some())
-            .ok_or(AppError::Session(cgka_session::SessionError::Engine(
+            .ok_or(AppError::Session(marmot_session::SessionError::Engine(
                 cgka_traits::EngineError::InvalidWelcome,
             )))?;
-        self.runtime
-            .session_mut()
-            .decline_group_rejoin(welcome_id)?;
+        self.runtime.decline_group_rejoin(welcome_id)?;
         self.mark_recovery_status_changed(&candidate.group_id);
         Ok(())
     }
 
     pub(crate) fn observe_recovery_health(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         for event in &effects.events {
             let group = match event {
                 cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } => Some(group_id),
+                // MLS never decrypts this device's own messages, so every received
+                // message came from another leaf. One from a sibling device of this
+                // account proves current-epoch health like any other member's.
                 cgka_traits::engine::GroupEvent::MessageReceived {
-                    group_id,
-                    sender,
-                    epoch,
-                    ..
-                } if sender != &self.runtime.session().self_id()
-                    && self
-                        .runtime
-                        .group_record(group_id)
-                        .is_ok_and(|group| group.epoch == *epoch) =>
+                    group_id, epoch, ..
+                } if self
+                    .runtime
+                    .group_record(group_id)
+                    .is_ok_and(|group| group.epoch == *epoch) =>
                 {
                     Some(group_id)
                 }
@@ -206,19 +208,25 @@ impl AppClient {
         {
             return Ok(());
         }
-        if self
-            .runtime
-            .session_mut()
-            .retry_rejoins_after_trusted_removal()
-            .await?
         {
-            let summary = self.drain_pending_session_events().await?;
-            self.pending_applied_sync_summary.merge(summary);
+            // Normal inbox admission owns this lock itself; this separate retry
+            // seam must hold it through projection without nesting that path.
+            let policy_lock = self.app.block_update_lock(&self.state.label).await;
+            let _policy_guard = policy_lock.lock().await;
+            // The retry also retires offers it cannot join, which the host
+            // shows until it is told.
+            let offers = self.rejoin_offer_snapshot()?;
+            let joined = self.runtime.retry_rejoins_after_trusted_removal().await;
+            self.reconcile_rejoin_offer_changes(offers)?;
+            if joined? {
+                let summary = self.drain_pending_session_events().await?;
+                self.pending_applied_sync_summary.merge(summary);
+            }
         }
         let now_ms = super::sync::epoch_stall_now_ms();
         // One bounded lookup per seam; reserve before await so cancellations,
         // restarts and relay failures cannot spin or lose the original intent.
-        for record in self.runtime.session().pending_reinvites()? {
+        for record in self.runtime.pending_reinvites()? {
             if record
                 .reinvite
                 .as_ref()
@@ -226,16 +234,11 @@ impl AppClient {
             {
                 continue;
             }
-            if !self
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&record.group_id)?
-            {
+            if !self.runtime.ensure_group_hydrated(&record.group_id)? {
                 continue;
             }
             if !self
                 .runtime
-                .session_mut()
                 .reserve_reinvite_lookup(&record.commit_id, now_ms)?
             {
                 if record
@@ -269,13 +272,16 @@ impl AppClient {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Only accounts with no device on the canonical roster are looked
+            // up again. A lost device of an account still in the group, or one
+            // left out below, is reported by the engine as needing a new
+            // invite (mdk#2628, D13).
             let mut members = Vec::new();
             for package in key_packages {
                 let metadata = self
                     .runtime
-                    .session()
                     .key_package_metadata(package)
-                    .map_err(cgka_session::SessionError::from)?;
+                    .map_err(marmot_session::SessionError::from)?;
                 if !group.as_ref().is_some_and(|group| {
                     group.members.iter().any(|member| {
                         hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
@@ -290,16 +296,15 @@ impl AppClient {
                 } else {
                     let requirements = match self
                         .runtime
-                        .session()
                         .invite_key_package_requirements(&record.group_id)
                     {
                         Ok(requirements) => requirements,
                         Err(error @ cgka_traits::EngineError::Storage(_)) => {
-                            return Err(cgka_session::SessionError::from(error).into());
+                            return Err(marmot_session::SessionError::from(error).into());
                         }
                         Err(_) => break,
                     };
-                    match self
+                    let resolved = match self
                         .app
                         .directory()
                         .resolve_compatible_member_key_packages(
@@ -311,11 +316,31 @@ impl AppClient {
                     {
                         Ok(resolved) => resolved.key_packages,
                         Err(_) => break,
+                    };
+                    let refs = |package: &cgka_traits::engine::KeyPackage| {
+                        self.runtime
+                            .key_package_metadata(package)
+                            .map(|metadata| {
+                                (
+                                    metadata.credential_identity_hex,
+                                    metadata.key_package_ref_hex,
+                                )
+                            })
+                            .map_err(marmot_session::SessionError::from)
+                    };
+                    let consumed = key_packages
+                        .iter()
+                        .map(|package| refs(package).map(|(_, reference)| reference))
+                        .collect::<Result<HashSet<_>, _>>()?;
+                    let mut tagged = Vec::with_capacity(resolved.len());
+                    for package in resolved {
+                        let (account, reference) = refs(&package)?;
+                        tagged.push((account, consumed.contains(&reference), package));
                     }
+                    without_consumed_packages(tagged)
                 };
             match self
                 .runtime
-                .session_mut()
                 .reissue_invite_with_key_packages(&record.commit_id, packages)
             {
                 Ok(Some(report)) => {
@@ -340,5 +365,43 @@ impl AppClient {
             break;
         }
         Ok(())
+    }
+}
+
+/// The lost invite consumed its packages, and the engine refuses to reissue
+/// one. A device that has not replaced its consumed package sits the reissue
+/// out while another device of its account can join, and the engine reports
+/// that device as needing a new invite. An account left with
+/// only consumed packages keeps them, so the reissue waits for a replacement
+/// as it does for a single-device account.
+fn without_consumed_packages<T>(packages: Vec<(String, bool, T)>) -> Vec<T> {
+    let joinable = packages
+        .iter()
+        .filter(|(_, consumed, _)| !consumed)
+        .map(|(account, _, _)| account.clone())
+        .collect::<HashSet<_>>();
+    packages
+        .into_iter()
+        .filter(|(account, consumed, _)| !consumed || !joinable.contains(account))
+        .map(|(_, _, package)| package)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_consumed_packages;
+
+    #[test]
+    fn a_device_with_a_consumed_package_sits_out_while_its_account_can_join() {
+        let package = |account: &str, consumed, name| (account.to_owned(), consumed, name);
+        assert_eq!(
+            without_consumed_packages(vec![
+                package("bob", false, "bob laptop"),
+                package("bob", true, "bob phone"),
+                package("carol", true, "carol phone"),
+                package("dave", false, "dave phone"),
+            ]),
+            vec!["bob laptop", "carol phone", "dave phone"]
+        );
     }
 }

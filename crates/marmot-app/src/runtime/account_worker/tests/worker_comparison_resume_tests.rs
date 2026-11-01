@@ -993,7 +993,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
             })
             .await
             .unwrap();
-        let Some(cgka_session::PublishWork::ApplicationMessage { msg, .. }) =
+        let Some(marmot_session::PublishWork::ApplicationMessage { msg, .. }) =
             effects.publish.into_iter().next()
         else {
             panic!("a real MLS send produces its encrypted envelope");

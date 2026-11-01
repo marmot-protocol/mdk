@@ -81,6 +81,14 @@ pub enum MarmotGroupEventKind {
     GroupMemberLeavesRemoved {
         epoch: u64,
     },
+    /// A send that waited for the group to settle was dropped unsent: the
+    /// settled state refused it. Nothing retries it; the user may try again.
+    /// `intent_kind` names the action and `reason` is a stable tag.
+    QueuedIntentRefused {
+        intent_id_hex: *mut c_char,
+        intent_kind: *mut c_char,
+        reason: *mut c_char,
+    },
 }
 
 impl From<GroupEventKindFfi> for MarmotGroupEventKind {
@@ -91,6 +99,15 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 Self::LocalGroupCopyTerminated { voluntary }
             }
             F::LocalGroupCopyRestored => Self::LocalGroupCopyRestored,
+            F::QueuedIntentRefused {
+                intent_id_hex,
+                intent_kind,
+                reason,
+            } => Self::QueuedIntentRefused {
+                intent_id_hex: owned_c_string(intent_id_hex),
+                intent_kind: owned_c_string(intent_kind),
+                reason: owned_c_string(reason),
+            },
             F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
             F::GroupJoined {
@@ -198,6 +215,15 @@ impl CFree for MarmotGroupEventKind {
                 } => {
                     free_c_string(*message_id_hex);
                     free_c_string(*resource);
+                }
+                Self::QueuedIntentRefused {
+                    intent_id_hex,
+                    intent_kind,
+                    reason,
+                } => {
+                    free_c_string(*intent_id_hex);
+                    free_c_string(*intent_kind);
+                    free_c_string(*reason);
                 }
                 Self::MessageReceived { sender_id_hex, .. } => free_c_string(*sender_id_hex),
                 Self::AppMessageInvalidated {
@@ -316,6 +342,62 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's linked devices may have changed; re-read
+    /// `marmot_linked_devices`. Also fires once each time the account's
+    /// worker opens or reconnects. Carries no device or group identities, and
+    /// may fire with no visible change.
+    LinkedDevicesChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// Whether this device's KeyPackage refresh is overdue may have changed;
+    /// re-read `marmot_key_package_refresh_overdue`. Also fires once each
+    /// time the account's worker opens or reconnects, and may fire with no
+    /// change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's unrecognized sign-ins may have changed; re-read
+    /// `marmot_unrecognized_sign_ins`. Also fires once each time the
+    /// account's worker opens or reconnects. Carries no slots, and may fire
+    /// with no visible change.
+    UnrecognizedSignInsChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's compromise warning may have changed; re-read
+    /// `marmot_compromise_warning`. Also fires once each time the account's
+    /// worker opens or reconnects. Carries no slots, and may fire with no
+    /// visible change.
+    CompromiseWarningChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// Linking a new device may have changed as this device shows it;
+    /// re-read `marmot_device_link_snapshot`. Also fires once each time the
+    /// account's worker opens or reconnects, which ends any link in
+    /// progress. Carries no device, session or group identities, and may
+    /// fire with no visible change.
+    DeviceLinkChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's recovery status may have changed; re-read
+    /// `marmot_account_recovery_status`. Carries no group identities. Not
+    /// raised until the recovery runner owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// the accounts and show the device-level notice. Fires once; afterwards
+    /// `MarmotAccountSummary.unlinked` says so.
+    DeviceUnlinked {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -423,6 +505,55 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            } => Self::LinkedDevicesChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } => Self::KeyPackageRefreshOverdueChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::UnrecognizedSignInsChanged {
+                account_id_hex,
+                account_label,
+            } => Self::UnrecognizedSignInsChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            } => Self::CompromiseWarningChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceLinkChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RecoveryStatusChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceUnlinked {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -472,6 +603,34 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::HistoryNoticesChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::LinkedDevicesChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::KeyPackageRefreshOverdueChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::UnrecognizedSignInsChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::CompromiseWarningChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::DeviceLinkChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::RecoveryStatusChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::DeviceUnlinked {
                     account_id_hex,
                     account_label,
                 } => {
@@ -569,6 +728,187 @@ mod tests {
         }
         assert_eq!(audit::live_allocations(), before);
     }
+
+    #[test]
+    fn linked_devices_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::LinkedDevicesChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ad".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn key_package_refresh_overdue_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::KeyPackageRefreshOverdueChanged {
+                account_id_hex: "ae".repeat(32),
+                account_label: "dave".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::KeyPackageRefreshOverdueChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ae".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dave"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn sign_ins_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::UnrecognizedSignInsChanged {
+                account_id_hex: "ae".repeat(32),
+                account_label: "dana".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::UnrecognizedSignInsChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ae".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dana"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn compromise_warning_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::CompromiseWarningChanged {
+                account_id_hex: "af".repeat(32),
+                account_label: "dana".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dana"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn device_link_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::DeviceLinkChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ad".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn recovery_status_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::RecoveryStatusChanged {
+            account_id_hex: "af".repeat(32),
+            account_label: "erin".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "erin"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
     #[test]
     fn native_membership_events_convert_and_free_deeply() {
         let _lock = audit::test_lock();

@@ -230,6 +230,7 @@ mod tests {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
         let failure = SyncFailure::new(
             SyncSummary::default(),

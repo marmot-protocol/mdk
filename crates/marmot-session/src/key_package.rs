@@ -1,0 +1,205 @@
+//! KeyPackage publication: publication payload, publisher trait, and no-op impl.
+
+use async_trait::async_trait;
+use cgka_traits::engine::KeyPackage;
+use cgka_traits::maintenance::SignedPublicationArtifact;
+use cgka_traits::{MemberId, MessageId, Timestamp, TransportEndpoint};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackagePublication {
+    pub account_id: MemberId,
+    pub key_package: KeyPackage,
+    /// Stable replaceable-event slot (`d` for Nostr kind 30443).
+    pub slot_id: String,
+    /// Exact authored timestamp selected by lifecycle orchestration.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
+/// A request to stop serving this device's slot at sign-out
+/// (`foundation/key-packages.md`, "Stopping publication").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageSlotWithdrawal {
+    pub account_id: MemberId,
+    /// The one slot the request names: this device's own, or a sibling's
+    /// that the device group removed (mdk#2628 3.6b, D22).
+    pub slot_id: String,
+    /// Every publication in the slot up to this time is withdrawn.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
+/// A request to stop serving one publication in this device's slot that
+/// this device did not make and cannot outrank: its time is past what this
+/// device would sign (mdk#2628 item 3.4, D63). It names that event alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageEventDeletion {
+    pub account_id: MemberId,
+    /// The publication's transport event id.
+    pub event_id: MessageId,
+    /// The current time: the request covers that event whatever its time.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyPackagePublishReceipt {
+    pub accepted: Vec<TransportEndpoint>,
+    pub failed: Vec<TransportEndpoint>,
+}
+
+/// Failure returned by a [`KeyPackagePublisher`].
+///
+/// `externally_exposed` records whether the exact signed event crossed the
+/// transport boundary before the error occurred. The pending replacement and
+/// its private bundle remain durable in either case until acknowledgement or
+/// MLS lifetime expiry; this bit only distinguishes safe regeneration before
+/// exposure from an ambiguous publication that must retry identical bytes.
+///
+/// `artifact_unusable` means the publisher will never send these signed
+/// bytes, for example because they were signed by an earlier build under rules
+/// this one no longer accepts. Retrying them cannot succeed, so the runtime
+/// replaces the KeyPackage with a freshly signed one instead (mdk#2628, D8).
+#[derive(Debug, thiserror::Error)]
+#[error("key package publication failed: {message}")]
+pub struct KeyPackagePublishError {
+    pub message: String,
+    pub externally_exposed: bool,
+    pub artifact_unusable: bool,
+}
+
+impl KeyPackagePublishError {
+    /// The publication failed before any external exposure could occur.
+    pub fn unexposed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            externally_exposed: false,
+            artifact_unusable: false,
+        }
+    }
+
+    /// The publication may have exposed the KeyPackage to an external transport
+    /// before failing.
+    pub fn exposed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            externally_exposed: true,
+            artifact_unusable: false,
+        }
+    }
+
+    /// The publisher refused the signed artifact before sending it and will
+    /// refuse it on every retry.
+    pub fn unusable_artifact(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            externally_exposed: false,
+            artifact_unusable: true,
+        }
+    }
+}
+
+#[async_trait]
+pub trait KeyPackagePublisher: Send + Sync {
+    /// One-time compatibility import for the former JSON cache authority.
+    ///
+    /// `Ok(None)` means no legacy record exists. The account/device creation
+    /// layer must provision and persist a fresh slot before publication; the
+    /// runtime never guesses freshness or mints a replacement slot.
+    fn legacy_slot_id(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(None)
+    }
+
+    /// Produce the exact signed transport artifact without network exposure.
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<SignedPublicationArtifact, KeyPackagePublishError>;
+
+    /// Publish an already signed artifact. Retries must pass the identical
+    /// bytes returned by `prepare_key_package`.
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError>;
+
+    /// Ask the transport to stop serving `withdrawal.slot_id` and nothing
+    /// else. The receipt lists the endpoints that accepted the request.
+    async fn withdraw_key_package_slot(
+        &self,
+        _withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "this publisher cannot withdraw a KeyPackage slot",
+        ))
+    }
+
+    /// Ask the transport to stop serving `deletion.event_id`, a publication
+    /// in this device's slot, and nothing else. The receipt lists the
+    /// endpoints that accepted the request.
+    async fn delete_key_package_event(
+        &self,
+        _deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "this publisher cannot delete a KeyPackage event",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopKeyPackagePublisher;
+
+#[async_trait]
+impl KeyPackagePublisher for NoopKeyPackagePublisher {
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<SignedPublicationArtifact, KeyPackagePublishError> {
+        use sha2::{Digest, Sha256};
+        let mut bytes = publication.key_package.bytes().to_vec();
+        bytes.extend_from_slice(publication.slot_id.as_bytes());
+        bytes.extend_from_slice(&publication.created_at.0.to_be_bytes());
+        let id = cgka_traits::MessageId::new(Sha256::digest(&bytes).to_vec());
+        Ok(SignedPublicationArtifact {
+            id,
+            created_at: publication.created_at,
+            bytes,
+        })
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        _artifact: &SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: publication.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn withdraw_key_package_slot(
+        &self,
+        withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: withdrawal.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn delete_key_package_event(
+        &self,
+        deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: deletion.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+}

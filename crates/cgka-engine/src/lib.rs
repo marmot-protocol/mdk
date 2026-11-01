@@ -30,8 +30,11 @@
 //! - [`capability_manager`], [`capabilities`], [`upgrade`] - capability policy.
 //! - [`auto_committer`] - SelfRemove auto-commit eligibility policy.
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
+//! - [`commit_class`] - the one class that decides a Commit's authority and priority.
 
+mod account_devices_activation;
 pub mod account_identity_proof;
+mod announced_key_packages;
 pub mod app_components;
 
 pub(crate) mod app_payload;
@@ -41,12 +44,14 @@ pub(crate) mod bounded_id_set;
 pub mod canonicalization;
 pub mod capabilities;
 pub mod capability_manager;
+pub mod commit_class;
 #[cfg(feature = "test-conformance-snapshot")]
 pub mod conformance_snapshot;
 pub mod convergence;
 pub mod convergence_clock;
 pub(crate) mod convergence_input;
 mod deadline;
+pub mod device_tag;
 pub mod disband;
 pub mod distributed_convergence;
 pub mod engine;
@@ -57,19 +62,25 @@ pub mod group_authority;
 pub mod group_context_view;
 pub mod group_lifecycle;
 pub mod group_state_changes;
+pub mod history_key;
 pub mod identity;
 pub mod key_package;
 pub mod leaf_advertisement;
+mod link_device;
 pub mod maintenance;
 mod membership_effects;
 pub(crate) mod message_disposition;
 pub mod message_processor;
 pub(crate) mod mls_group_cache;
 pub mod openmls_projection;
+mod own_account_devices;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
+pub mod private_key_packages;
 pub mod provider;
 pub mod publish;
+mod queued_intent_refusal;
+pub mod recovery_key;
 pub mod self_update;
 pub mod snapshot_guard;
 pub(crate) mod test_crash_hooks;
@@ -88,5 +99,5 @@ pub use feature_registry::FeatureRegistry;
 pub use key_package::{KeyPackageMetadata, KeyPackageRetirementReport, key_package_metadata};
 pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
-    default_join_config, join_config,
+    application_message_len, default_join_config, join_config,
 };

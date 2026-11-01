@@ -9,19 +9,27 @@ use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
-use cgka_traits::engine::{SendIntent, SendResult};
+use cgka_traits::engine::{EpochPin, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
+use openmls_traits::OpenMlsProvider as _;
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
+
+/// A staged Commit's Welcome wrapped for one added KeyPackage, not yet
+/// recorded ([`Engine::wrap_staged_welcomes`]).
+pub(crate) struct WrappedWelcome {
+    message: TransportMessage,
+    key_package_ref: Vec<u8>,
+}
 
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_ready(
@@ -115,10 +123,41 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
+            SendIntent::AddOwnAccountDevices {
+                group_id,
+                key_packages,
+            } => {
+                self.do_send_add_own_account_devices(group_id, key_packages)
+                    .await
+            }
+            SendIntent::RemoveOwnAccountDevices {
+                group_id,
+                leaf_signature_keys,
+            } => {
+                self.do_send_remove_own_account_devices(group_id, leaf_signature_keys)
+                    .await
+            }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
             SendIntent::UpdateAppComponents { group_id, updates } => {
                 self.do_send_update_app_components(group_id, updates).await
+            }
+            SendIntent::ReplaceDeviceEntry {
+                group_id,
+                slot,
+                expected,
+                entry,
+            } => {
+                self.do_send_replace_device_entry(group_id, slot, *expected, *entry)
+                    .await
+            }
+            SendIntent::ReplaceAccountEntry {
+                group_id,
+                expected,
+                entry,
+            } => {
+                self.do_send_replace_account_entry(group_id, *expected, *entry)
+                    .await
             }
             SendIntent::UpdateGroupData {
                 group_id,
@@ -130,6 +169,26 @@ impl<S: StorageProvider> Engine<S> {
             }
             SendIntent::EnableDisbanding { group_id } => {
                 self.do_enable_group_disbanding(group_id).await
+            }
+            SendIntent::EnableAccountDevices { group_id } => {
+                self.do_enable_account_devices(group_id).await
+            }
+            SendIntent::LinkDevice {
+                group_id,
+                key_package,
+                roster_update,
+                deliver_until,
+            } => {
+                self.do_send_link_device(group_id, key_package, roster_update, deliver_until)
+                    .await
+            }
+            SendIntent::UnlinkDevice {
+                group_id,
+                leaf_signature_key,
+                roster_update,
+            } => {
+                self.do_send_unlink_device(group_id, leaf_signature_key, roster_update)
+                    .await
             }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
@@ -209,9 +268,21 @@ impl<S: StorageProvider> Engine<S> {
             &mut required,
             &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
         );
+        // A device already in the group is skipped rather than added again:
+        // its new leaf would repeat a signature key, and OpenMLS refuses the
+        // whole Commit. So is a second package from one device in this invite.
+        let current_members = crate::group_lifecycle::marmot_members(&mls_group);
+        let mut signature_keys = current_members
+            .iter()
+            .map(|member| member.credential.clone())
+            .collect::<HashSet<_>>();
+        let mut source_kps = Vec::with_capacity(key_packages.len());
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
-        for kp in &key_packages {
-            let parsed = self.parse_key_package(kp)?;
+        for kp in key_packages {
+            let parsed = self.parse_key_package(&kp)?;
+            if !signature_keys.insert(parsed.leaf_node().signature_key().as_slice().to_vec()) {
+                continue;
+            }
             if kp.protocol_profile != existing.protocol_profile {
                 return Err(EngineError::InvalidAccountIdentityProof(format!(
                     "cannot invite a {:?} KeyPackage into a {:?} group",
@@ -226,16 +297,28 @@ impl<S: StorageProvider> Engine<S> {
                     had: Box::new(had),
                 });
             }
+            source_kps.push(kp);
             parsed_kps.push(parsed);
         }
+        if parsed_kps.is_empty() {
+            return Err(EngineError::Other(
+                "the invite adds no device: each one is already in the group".into(),
+            ));
+        }
+        let key_packages = source_kps;
 
         let mut resulting_admins = Vec::new();
         let mut granted_admin_ids = Vec::new();
         if !initial_admins.is_empty() {
-            let invitee_ids = parsed_kps
-                .iter()
-                .map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()))
-                .collect::<Result<Vec<_>, _>>()?;
+            // An account that already has a device here is a member, and
+            // granting it admin is a separate action.
+            let mut invitee_ids = Vec::with_capacity(parsed_kps.len());
+            for kp in &parsed_kps {
+                let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
+                if !current_members.iter().any(|member| member.id == id) {
+                    invitee_ids.push(id);
+                }
+            }
             let current_admins = crate::app_components::admins_of_group(&mls_group)?;
             resulting_admins = current_admins.clone();
             let mut seen_grants = HashSet::new();
@@ -274,10 +357,29 @@ impl<S: StorageProvider> Engine<S> {
         // fanout after confirm is unchanged. Non-empty grants couple the
         // admin-policy update into the same Add commit (#1298).
         let (commit_out, welcome_out) = if granted_admin_ids.is_empty() {
-            let (commit_out, welcome_out, _gi) = mls_group
-                .add_members(&provider, &self.identity.signer, &parsed_kps)
-                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-            (commit_out, welcome_out)
+            // OpenMLS's `add_members`, whose UpdatePath tags this device's
+            // leaf when the leaf needs a tag.
+            let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
+            let bundle = mls_group
+                .commit_builder()
+                .propose_adds(parsed_kps.iter().cloned())
+                .force_self_update(true)
+                .leaf_node_parameters(leaf_node_parameters)
+                .load_psks(provider.storage())
+                .map_err(|e| EngineError::Backend(format!("add_members load_psks: {e:?}")))?
+                .build(
+                    provider.rand(),
+                    provider.crypto(),
+                    &self.identity.signer,
+                    |_| true,
+                )
+                .map_err(|e| EngineError::Backend(format!("add_members build: {e:?}")))?
+                .stage_commit(&provider)
+                .map_err(|e| EngineError::Backend(format!("add_members stage: {e:?}")))?;
+            let welcome_out = bundle
+                .to_welcome_msg()
+                .ok_or_else(|| EngineError::Backend("add_members produced no Welcome".into()))?;
+            (bundle.into_commit(), welcome_out)
         } else {
             let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
@@ -300,6 +402,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_current_profile_invariants_for_staged_commit(
             &mls_group,
             staged_commit,
@@ -343,58 +451,39 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
+        let welcomes = self
+            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &key_packages, &parsed_kps)
+            .await?;
+        crate::capability_manager::check_key_package_profiles(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+        )?;
+        // Update the Marmot record with the projected post-merge member
+        // list — `members()` walks this list (and `feature_status` counts the
+        // pending commit's added leaves), and users expect the API to
+        // reflect "what I just asked for" while the publish is pending.
+        // Epoch stays at the pre-merge value; that updates on confirm.
+        // On `publish_failed`, the engine re-derives from the (still-
+        // unmerged) MLS state, which naturally drops the projection.
+        let projected_members =
+            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+
         self.record_sent_openmls_message(
             &commit_msg,
             commit_bytes.as_slice(),
             &group_id,
             pre_commit_epoch,
         )?;
-
-        let mut welcomes = Vec::with_capacity(parsed_kps.len());
-        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(&mls_group)?;
-        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
-            let recipient = {
-                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
-                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
-                MemberId::new(bc.identity().to_vec())
-            };
-            let payload = EncryptedPayload {
-                ciphertext: welcome_bytes.clone(),
-                aad: vec![],
-            };
-            let wrapped = if let Some(metadata) =
-                crate::group_lifecycle::welcome_metadata_for_key_package(
-                    source_kp,
-                    welcome_relays.as_deref(),
-                )? {
-                self.peeler
-                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
-                    .await
-            } else {
-                self.peeler.wrap_welcome(&payload, &recipient).await
-            }
-            .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(
-                &wrapped,
-                &commit_msg.id,
-                &group_id,
-                pre_commit_epoch,
-            )?;
-            welcomes.push(wrapped);
-        }
-
-        // Cache invitees' capabilities NOW so `feature_status` reflects the
-        // pending invite immediately. Update the Marmot record with the
-        // projected post-merge member list — `members()` and
-        // `feature_status` walk this list, and users expect the API to
-        // reflect "what I just asked for" while the publish is pending.
-        // Epoch stays at the pre-merge value; that updates on confirm.
-        // On `publish_failed`, the engine re-derives from the (still-
-        // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
+        let welcomes = self.record_staged_welcomes(
+            welcomes,
+            &group_id,
+            &commit_msg.id,
+            pre_commit_epoch,
+            None,
+        )?;
         let mut group_record = existing;
-        group_record.members =
-            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        group_record.members = projected_members;
         self.storage.put_group(&group_record)?;
 
         // State: begin pending at the projected new epoch via EpochManager.
@@ -436,6 +525,81 @@ impl<S: StorageProvider> Engine<S> {
             welcomes,
             pending: pending_ref,
         })
+    }
+
+    /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
+    /// that KeyPackage's account and naming its publication (joining.md,
+    /// "Delivery"). This writes nothing, and a caller wraps every Welcome
+    /// before it records its Commit: a Welcome that cannot be wrapped, as one
+    /// for a KeyPackage that names no publication, refuses the intent with
+    /// nothing written. [`Self::record_staged_welcomes`] records them.
+    pub(crate) async fn wrap_staged_welcomes(
+        &self,
+        mls_group: &MlsGroup,
+        welcome_bytes: &[u8],
+        key_packages: &[cgka_traits::engine::KeyPackage],
+        parsed_kps: &[openmls::prelude::KeyPackage],
+    ) -> Result<Vec<WrappedWelcome>, EngineError> {
+        let mut welcomes = Vec::with_capacity(parsed_kps.len());
+        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
+        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
+            let recipient = {
+                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
+                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+                MemberId::new(bc.identity().to_vec())
+            };
+            let payload = EncryptedPayload {
+                ciphertext: welcome_bytes.to_vec(),
+                aad: vec![],
+            };
+            let message = if let Some(metadata) =
+                crate::group_lifecycle::welcome_metadata_for_key_package(
+                    source_kp,
+                    welcome_relays.as_deref(),
+                )? {
+                self.peeler
+                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
+                    .await
+            } else {
+                self.peeler.wrap_welcome(&payload, &recipient).await
+            }
+            .map_err(EngineError::Peeler)?;
+            welcomes.push(WrappedWelcome {
+                message,
+                key_package_ref: crate::key_package::key_package_ref(parsed_kp)?
+                    .as_slice()
+                    .to_vec(),
+            });
+        }
+        Ok(welcomes)
+    }
+
+    /// Record wrapped Welcomes as staged delivery work of `commit_id`, once
+    /// its Commit is recorded. Invites and same-account Adds deliver their
+    /// Welcomes this way. A device link's Welcome records `deliver_until`,
+    /// after which it is never published.
+    pub(crate) fn record_staged_welcomes(
+        &mut self,
+        welcomes: Vec<WrappedWelcome>,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+        source_epoch: EpochId,
+        deliver_until: Option<cgka_traits::transport::Timestamp>,
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        welcomes
+            .into_iter()
+            .map(|welcome| {
+                self.record_staged_invite_welcome(
+                    &welcome.message,
+                    commit_id,
+                    welcome.key_package_ref,
+                    deliver_until,
+                    group_id,
+                    source_epoch,
+                )?;
+                Ok(welcome.message)
+            })
+            .collect()
     }
 
     async fn do_send_remove_members(
@@ -555,10 +719,25 @@ impl<S: StorageProvider> Engine<S> {
         let commit_out = if resulting_admins.len() == admins.len() {
             // No admin loses their last leaf: a plain Remove commit carries
             // the admin set forward unchanged.
-            let (commit_out, _welcome_opt, _gi) = mls_group
-                .remove_members(&provider, &self.identity.signer, &leaf_indices)
-                .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
-            commit_out
+            // OpenMLS's `remove_members`, whose UpdatePath tags this
+            // device's leaf when the leaf needs a tag.
+            let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
+            mls_group
+                .commit_builder()
+                .propose_removals(leaf_indices.iter().copied())
+                .leaf_node_parameters(leaf_node_parameters)
+                .load_psks(provider.storage())
+                .map_err(|e| EngineError::Backend(format!("remove_members load_psks: {e:?}")))?
+                .build(
+                    provider.rand(),
+                    provider.crypto(),
+                    &self.identity.signer,
+                    |_| true,
+                )
+                .map_err(|e| EngineError::Backend(format!("remove_members build: {e:?}")))?
+                .stage_commit(&provider)
+                .map_err(|e| EngineError::Backend(format!("remove_members stage: {e:?}")))?
+                .into_commit()
         } else {
             // Couple an admin-policy update dropping the de-leafed admin keys
             // into the same commit. The AdminDepletion guard above ensures
@@ -581,6 +760,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
             &mls_group,
             &group_id,
@@ -813,11 +998,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
-        if !group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id())
-        {
+        if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             self.clear_leave_request_state(group_id)?;
             return Ok(false);
         }
@@ -850,7 +1031,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     ) -> Result<SendResult, EngineError> {
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
@@ -872,18 +1053,33 @@ impl<S: StorageProvider> Engine<S> {
 
         // The authoritative epoch is the loaded MLS state, read at the last
         // moment before encryption. `do_send` may have folded retained peer
-        // commits into this send on the way here, so a payload pinned to the
-        // epoch the caller saw can legitimately no longer be encrypted under
-        // it. Nothing has been written yet; hand the untouched group back.
+        // commits into this send on the way here, or selected a rival branch
+        // at the same epoch number, so a payload pinned to the epoch the
+        // caller saw can legitimately no longer be encrypted under it. The
+        // pin's identity tells the branches apart where the numbers agree.
+        // Nothing has been written yet; hand the untouched group back.
         let source_epoch = EpochId(mls_group.epoch().as_u64());
         if let Some(expected) = expected_epoch
-            && expected != source_epoch
+            && expected != crate::app_payload::epoch_pin(&mls_group)
         {
             self.return_unmodified_mls_group(&group_id, mls_group);
             return Err(EngineError::AppMessageEpochMismatch {
-                expected,
+                expected: expected.epoch,
                 current: source_epoch,
             });
+        }
+        // Queued preparation bypasses the public send gate. Never encrypt
+        // under an installed checkpoint's possibly reused sender generation,
+        // even if a caller reaches this seam before maintenance is confirmed.
+        if crate::maintenance::replay_rotation_required(&self.storage, &group_id, &mls_group)? {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "RestoredEpoch",
+                    to: "send",
+                    reason: "restored epoch requires a confirmed self update",
+                },
+            ));
         }
 
         let app_event =

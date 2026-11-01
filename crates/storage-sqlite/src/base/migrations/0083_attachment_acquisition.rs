@@ -88,12 +88,11 @@ END;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::base::migrations::{MIGRATIONS, run};
     use rusqlite::Connection;
 
     #[test]
-    fn attachment_acquisition_upgrade_preserves_discovery_and_rolls_back_atomically() {
+    fn attachment_acquisition_upgrade_preserves_discovery() {
         let mut conn = Connection::open_in_memory().unwrap();
         run(&mut conn, &MIGRATIONS[..82]).unwrap();
         conn.execute_batch(r#"
@@ -106,12 +105,6 @@ mod tests {
             conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
         };
-        let tx = conn.transaction().unwrap();
-        apply(&tx).unwrap();
-        assert_eq!(count(&tx, "attachment_acquisition"), 0);
-        tx.rollback().unwrap();
-        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='attachment_acquisition')", [], |r|r.get::<_,bool>(0)).unwrap());
-        assert_eq!(count(&conn, "attachment_history"), 2);
         run(&mut conn, MIGRATIONS).unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
         assert_eq!(count(&conn, "attachment_history"), 2);

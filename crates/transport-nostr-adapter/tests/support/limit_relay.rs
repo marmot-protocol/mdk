@@ -13,10 +13,14 @@
 //! session id), never CLOSED; a NEG session is freed only by NEG-CLOSE, a
 //! same-id NEG-OPEN or disconnect, not by reconciliation completion; ordinary
 //! REQ filters have `limit` silently clamped to 500.
+//!
+//! `LimitConfig::eose_hints` adds wok's NIP-67 hints to one-filter REQs:
+//! `["finish"]` on an EOSE that sent every match, `["more"]` when the limit
+//! cut it.
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,6 +43,9 @@ pub mod reason {
     pub const KIND_NOT_ALLOWED: &str = "invalid: kind not allowed";
     pub const MALFORMED: &str = "invalid: malformed REQ";
     pub const TOO_MANY_TAGS: &str = "invalid: too many tags in filter";
+    /// wok's refusal when a connection's queued scans are full.
+    pub const RATE_LIMITED: &str =
+        "rate-limited: too many historical queries waiting on this connection";
     /// strfry sends this as a NOTICE with no session id.
     pub const TOO_MANY_NEG: &str = "ERROR: too many concurrent NEG requests";
 }
@@ -98,6 +105,10 @@ pub struct LimitConfig {
     pub max_tag_keys_per_filter: usize,
     /// Clamp each ordinary REQ filter's `limit` (absent or larger) to this.
     pub req_limit_clamp: Option<u64>,
+    /// `limit` given to an ordinary REQ filter that names none, before the
+    /// clamp (wok: NIP-11 `default_limit` below `max_limit`). `None` leaves it
+    /// to the clamp.
+    pub req_default_limit: Option<u64>,
     /// Live NEG sessions per connection (a separate counter from REQs).
     pub max_neg_sessions: usize,
     /// Phantom NEG sessions every connection starts with, to pre-fill the cap.
@@ -106,6 +117,10 @@ pub struct LimitConfig {
     /// `max_subscriptions` (strfry 1.1.3 does not do this).
     pub neg_counts_toward_limit: bool,
     pub reject_style: RejectStyle,
+    /// Send NIP-67 hints on one-filter REQs, as wok does. The proxy asks the
+    /// upstream for one event past the limit, holds it back, and answers
+    /// `more` if it came, `finish` if not.
+    pub eose_hints: bool,
 }
 
 impl Default for LimitConfig {
@@ -118,10 +133,12 @@ impl Default for LimitConfig {
             allowed_kinds: Some(PRODUCTION_ALLOWED_KINDS.into_iter().collect()),
             max_tag_keys_per_filter: 3,
             req_limit_clamp: Some(REQ_LIMIT_CLAMP),
+            req_default_limit: None,
             max_neg_sessions: 200,
             neg_prefilled_sessions: 0,
             neg_counts_toward_limit: false,
             reject_style: RejectStyle::Closed,
+            eose_hints: false,
         }
     }
 }
@@ -181,6 +198,9 @@ pub struct LimitStats {
     pub closes_unknown: usize,
     /// Live REQs the upstream itself ended with CLOSED.
     pub upstream_closed: usize,
+    /// NIP-67 hints sent on EOSE.
+    pub finish_hints: usize,
+    pub more_hints: usize,
     pub neg_opens: usize,
     pub neg_rejections: BTreeMap<&'static str, usize>,
     pub neg_closes: usize,
@@ -200,6 +220,10 @@ pub struct LimitStats {
     pub req_log: Vec<ReqRecord>,
     /// Flush markers (`FLUSH_PREFIX`) the proxy has handled.
     pub flushes: BTreeSet<String>,
+    /// EVENT frames forwarded since `stall_after_events`, and the EVENT, EOSE
+    /// and CLOSED frames held back once it stalled.
+    pub events_before_stall: usize,
+    pub stalled_frames: usize,
 }
 
 impl LimitStats {
@@ -305,6 +329,23 @@ impl LimitStats {
 struct ConnectionState {
     active: HashSet<String>,
     neg: HashSet<String>,
+    /// REQs that get a NIP-67 hint, until their EOSE.
+    hinted: HashMap<String, HintedReq>,
+}
+
+/// One hinted REQ: the limit its client sees and the events sent so far.
+struct HintedReq {
+    limit: Option<u64>,
+    sent: u64,
+}
+
+/// What the proxy does with one upstream frame.
+enum RelayVerdict {
+    Forward,
+    /// Hold back an event past a hinted REQ's limit, or a stalled frame.
+    Drop,
+    /// Send this frame instead (a hinted EOSE).
+    Rewrite(String),
 }
 
 #[derive(Default)]
@@ -312,9 +353,14 @@ struct Shared {
     stats: LimitStats,
     states: Vec<ConnectionState>,
     neg_fault: Option<NegFault>,
+    /// REQs still to refuse with `reason::RATE_LIMITED`.
+    rate_limit_next_reqs: usize,
     /// Delay before each client frame is handled, so a refusal or an upstream
     /// answer costs about one simulated round trip.
     client_delay: Duration,
+    /// Upstream EVENT frames to forward before every later EVENT, EOSE and
+    /// CLOSED is held back.
+    stall_after_events: Option<usize>,
 }
 
 impl Shared {
@@ -466,12 +512,20 @@ impl LimitRelay {
                             }
                             frame = relay_read.next() => {
                                 let Some(Ok(message)) = frame else { break };
-                                if let Message::Text(text) = &message {
-                                    inspect_relay_frame(&shared, connection, text.as_str());
-                                }
+                                let verdict = match &message {
+                                    Message::Text(text) => {
+                                        inspect_relay_frame(&shared, connection, text.as_str())
+                                    }
+                                    _ => RelayVerdict::Forward,
+                                };
                                 if matches!(message, Message::Close(_)) {
                                     break;
                                 }
+                                let message = match verdict {
+                                    RelayVerdict::Forward => message,
+                                    RelayVerdict::Drop => continue,
+                                    RelayVerdict::Rewrite(text) => Message::Text(text.into()),
+                                };
                                 if client_write.send(message).await.is_err() {
                                     break;
                                 }
@@ -507,6 +561,22 @@ impl LimitRelay {
     /// Simulate a round trip of about `delay` on every connection.
     pub fn set_client_delay(&self, delay: Duration) {
         self.shared.lock().unwrap().client_delay = delay;
+    }
+
+    /// Refuse the next `count` otherwise-valid REQs with `reason::RATE_LIMITED`.
+    pub fn rate_limit_next_reqs(&self, count: usize) {
+        self.shared.lock().unwrap().rate_limit_next_reqs = count;
+    }
+
+    /// Forward the next `events` upstream EVENT frames, across connections,
+    /// then hold back every later EVENT, EOSE and CLOSED (the local relay
+    /// closes an `ids` REQ it served): replies cut off mid-stream, left
+    /// waiting for an end that never comes.
+    pub fn stall_after_events(&self, events: usize) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.stall_after_events = Some(events);
+        shared.stats.events_before_stall = 0;
+        shared.stats.stalled_frames = 0;
     }
 
     /// Switch the injected NEG behaviour for every connection.
@@ -672,6 +742,10 @@ fn inspect_client_frame(
             {
                 violation = Some(reason::TOO_MANY_SUBSCRIPTIONS);
             }
+            if violation.is_none() && shared.rate_limit_next_reqs > 0 {
+                shared.rate_limit_next_reqs -= 1;
+                violation = Some(reason::RATE_LIMITED);
+            }
             let outcome = match violation {
                 None if already_active => ReqOutcome::Replaced,
                 None => ReqOutcome::Accepted,
@@ -687,11 +761,19 @@ fn inspect_client_frame(
             match violation {
                 None => {
                     shared.stats.accepted_reqs += 1;
-                    shared.states[connection].active.insert(id);
+                    shared.states[connection].active.insert(id.clone());
                     shared.refresh(connection);
                     let mut frame = frame;
                     let mut clamped = false;
+                    let hinted = config.eose_hints && frame.len() == 3;
+                    shared.states[connection].hinted.remove(&id);
                     for filter in frame.iter_mut().skip(2) {
+                        if let Some(default) = config.req_default_limit
+                            && filter.get("limit").is_none()
+                        {
+                            filter["limit"] = Value::from(default);
+                            clamped = true;
+                        }
                         let limit = filter.get("limit").and_then(Value::as_u64);
                         shared.stats.max_req_limit_seen =
                             shared.stats.max_req_limit_seen.max(limit.unwrap_or(0));
@@ -701,6 +783,16 @@ fn inspect_client_frame(
                             filter["limit"] = Value::from(clamp);
                             shared.stats.clamped_filters += 1;
                             clamped = true;
+                        }
+                        if hinted {
+                            let limit = filter.get("limit").and_then(Value::as_u64);
+                            if let Some(limit) = limit {
+                                filter["limit"] = Value::from(limit + 1);
+                                clamped = true;
+                            }
+                            shared.states[connection]
+                                .hinted
+                                .insert(id.clone(), HintedReq { limit, sent: 0 });
                         }
                     }
                     if clamped {
@@ -736,6 +828,7 @@ fn inspect_client_frame(
         "CLOSE" => {
             shared.stats.closes += 1;
             shared.stats.connections[connection].closes += 1;
+            shared.states[connection].hinted.remove(&id);
             if !shared.states[connection].active.remove(&id) {
                 shared.stats.closes_unknown += 1;
             }
@@ -844,18 +937,50 @@ fn inspect_client_frame(
 }
 
 /// Account for one upstream frame.
-fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) {
+fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) -> RelayVerdict {
     let Ok(Value::Array(frame)) = serde_json::from_str::<Value>(text) else {
-        return;
+        return RelayVerdict::Forward;
     };
     let verb = frame.first().and_then(Value::as_str).unwrap_or_default();
     let Some(id) = frame.get(1).and_then(Value::as_str) else {
-        return;
+        return RelayVerdict::Forward;
     };
     let mut shared = shared.lock().unwrap();
+    if let Some(budget) = shared.stall_after_events
+        && matches!(verb, "EVENT" | "EOSE" | "CLOSED")
+    {
+        if shared.stats.events_before_stall >= budget {
+            shared.stats.stalled_frames += 1;
+            return RelayVerdict::Drop;
+        }
+        if verb == "EVENT" {
+            shared.stats.events_before_stall += 1;
+        }
+    }
     match verb {
+        "EVENT" => {
+            if let Some(req) = shared.states[connection].hinted.get_mut(id) {
+                req.sent += 1;
+                if req.limit.is_some_and(|limit| req.sent > limit) {
+                    return RelayVerdict::Drop;
+                }
+            }
+        }
         // EOSE does not end a live subscription; only CLOSED does.
+        "EOSE" => {
+            if let Some(req) = shared.states[connection].hinted.remove(id) {
+                let hint = if req.limit.is_some_and(|limit| req.sent > limit) {
+                    shared.stats.more_hints += 1;
+                    "more"
+                } else {
+                    shared.stats.finish_hints += 1;
+                    "finish"
+                };
+                return RelayVerdict::Rewrite(serde_json::json!(["EOSE", id, [hint]]).to_string());
+            }
+        }
         "CLOSED" => {
+            shared.states[connection].hinted.remove(id);
             if shared.states[connection].active.remove(id) {
                 shared.stats.upstream_closed += 1;
             }
@@ -869,4 +994,5 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) {
         }
         _ => {}
     }
+    RelayVerdict::Forward
 }

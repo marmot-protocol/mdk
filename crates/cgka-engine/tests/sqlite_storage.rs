@@ -90,6 +90,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -308,4 +309,43 @@ async fn hydration_migrates_and_persists_existing_sender_ratchet_policy() {
         DEFAULT_MAXIMUM_FORWARD_DISTANCE,
         "maximum forward-distance migration must survive another process restart"
     );
+}
+
+/// A device's history key (mdk#2628 4.1) is generated once, on first use,
+/// and kept with the rest of its state: a reopened engine reads the same
+/// public half and opens what a sibling sealed to it.
+#[tokio::test]
+async fn the_history_key_survives_reopen_and_opens_what_a_sibling_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let laptop_path = dir.path().join("laptop.sqlite");
+    let key = SqlCipherKey::new("sqlite engine history key").unwrap();
+
+    let laptop = build_client(
+        SqliteAccountStorage::open_encrypted(&laptop_path, &key).unwrap(),
+        b"alice-sqlite",
+    );
+    assert_eq!(laptop.open_history(b"context", b"sealed").unwrap(), None);
+    let history_key = laptop.history_public_key().unwrap();
+    assert_eq!(history_key.len(), 32);
+    assert_eq!(laptop.history_public_key().unwrap(), history_key);
+    drop(laptop);
+
+    let phone = build_client(SqliteAccountStorage::in_memory().unwrap(), b"alice-sqlite");
+    assert_ne!(phone.history_public_key().unwrap(), history_key);
+    let sealed = phone
+        .seal_history(&history_key, b"context", b"history")
+        .unwrap();
+
+    let reopened = build_client(
+        SqliteAccountStorage::open_encrypted(&laptop_path, &key).unwrap(),
+        b"alice-sqlite",
+    );
+    assert_eq!(reopened.history_public_key().unwrap(), history_key);
+    assert_eq!(
+        reopened.open_history(b"context", &sealed).unwrap(),
+        Some(b"history".to_vec())
+    );
+    assert_eq!(reopened.open_history(b"other", &sealed).unwrap(), None);
+    // The sealing device's own key does not open it.
+    assert_eq!(phone.open_history(b"context", &sealed).unwrap(), None);
 }

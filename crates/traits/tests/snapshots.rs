@@ -13,7 +13,7 @@ use cgka_traits::capabilities::{
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, EpochPin, GroupEvent,
     GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason, KeyPackage,
     SendIntent, SendResult,
 };
@@ -249,7 +249,8 @@ fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() 
     };
 
     let raw_payload = StoredMessagePayload::raw_transport(raw);
-    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome);
+    let outbound_welcome_payload =
+        StoredMessagePayload::outbound_welcome(outbound_welcome, None, None);
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls);
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
@@ -550,6 +551,17 @@ fn snapshot_send_intents() {
         }
     );
     insta::assert_json_snapshot!(
+        "intent_app_message_pinned",
+        SendIntent::AppMessage {
+            group_id: gid(),
+            payload: b"hello".to_vec(),
+            expected_epoch: Some(EpochPin {
+                epoch: EpochId(7),
+                identity: [0xAB; 32],
+            }),
+        }
+    );
+    insta::assert_json_snapshot!(
         "intent_invite",
         SendIntent::Invite {
             group_id: gid(),
@@ -562,6 +574,33 @@ fn snapshot_send_intents() {
         SendIntent::RemoveMembers {
             group_id: gid(),
             members: vec![mem_id()],
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_add_own_account_devices",
+        SendIntent::AddOwnAccountDevices {
+            group_id: gid(),
+            key_packages: vec![KeyPackage::new(vec![0xEF; 4])],
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_remove_own_account_devices",
+        SendIntent::RemoveOwnAccountDevices {
+            group_id: gid(),
+            leaf_signature_keys: vec![vec![0x5C; 4]],
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_enable_account_devices",
+        SendIntent::EnableAccountDevices { group_id: gid() }
+    );
+    insta::assert_json_snapshot!(
+        "intent_link_device",
+        SendIntent::LinkDevice {
+            group_id: gid(),
+            key_package: KeyPackage::new(vec![0xEF; 4]),
+            roster_update: vec![0x5C; 4],
+            deliver_until: Timestamp(1_700_000_600),
         }
     );
     insta::assert_json_snapshot!("intent_leave", SendIntent::Leave { group_id: gid() });
@@ -640,6 +679,15 @@ fn snapshot_group_events() {
         GroupEvent::LocalGroupCopyRestored { group_id: gid() }
     );
     insta::assert_json_snapshot!(
+        "event_queued_intent_refused",
+        GroupEvent::QueuedIntentRefused {
+            group_id: gid(),
+            intent_id: mid(),
+            intent_kind: "update_group_data".into(),
+            reason: "not_group_admin".into(),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_group_member_leaves_removed",
         GroupEvent::GroupMemberLeavesRemoved {
             group_id: gid(),
@@ -680,6 +728,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_leaf_index: None,
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -696,6 +745,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_leaf_index: None,
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -707,6 +757,7 @@ fn snapshot_group_events() {
         message_id: mid(),
         epoch: EpochId(7),
         sender: mem_id(),
+        sender_leaf_index: None,
         payload: b"hi".to_vec(),
         retention: None,
         encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(

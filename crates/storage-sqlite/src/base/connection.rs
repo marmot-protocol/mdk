@@ -1214,42 +1214,6 @@ pub(crate) fn open_account_in_memory(
     finish_account_open(connection, options, None)
 }
 
-/// Test-only in-memory database copied from one migrated template per
-/// process. Harnesses that open thousands of short-lived databases would
-/// otherwise replay every migration for each. Opening the copy still runs
-/// the migration ledger check, which finds nothing to apply.
-#[cfg(feature = "test-migrated-template")]
-pub(crate) fn open_account_in_memory_from_migrated_template(
-    options: SqliteStorageOptions,
-) -> StorageResult<OpenedAccount> {
-    static TEMPLATE: std::sync::OnceLock<Mutex<rusqlite::Connection>> = std::sync::OnceLock::new();
-    if TEMPLATE.get().is_none() {
-        let template_options = SqliteStorageOptions {
-            cipher_memory_security: false,
-            ..options.clone()
-        };
-        let mut template = rusqlite::Connection::open_in_memory().storage()?;
-        apply_cipher_pragmas(&template, &template_options)?;
-        apply_operational_pragmas(&template, &template_options)?;
-        migrations::run_all_observed(&mut template, None)?;
-        // A concurrent first caller may win; either template is complete.
-        let _ = TEMPLATE.set(Mutex::new(template));
-    }
-    let template = TEMPLATE
-        .get()
-        .expect("template was just initialized")
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut connection = rusqlite::Connection::open_in_memory().storage()?;
-    apply_cipher_pragmas(&connection, &options)?;
-    rusqlite::backup::Backup::new(&template, &mut connection)
-        .storage()?
-        .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
-        .storage()?;
-    drop(template);
-    finish_account_open(connection, options, None)
-}
-
 /// Create private database files before opening and observing the unpublished connection.
 pub(crate) fn open_account_encrypted(
     path: &Path,
@@ -1447,7 +1411,48 @@ fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) ->
     Ok(())
 }
 
-fn apply_cipher_pragmas(
+/// This crate's own unit tests start relaxed. Dependents built with
+/// `test-support` start on the defaults until a test relaxes them.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_PROCESS_STORAGE_RELAXED: AtomicBool = AtomicBool::new(cfg!(test));
+
+/// Skip SQLCipher's memory security and full fsync for every database this
+/// process opens from now on, whatever options the open passes. Test support
+/// only: call it before the process opens its first database, since SQLCipher
+/// keeps memory security on once any connection has enabled it.
+///
+/// Memory security is a process-wide allocator that makes every SQLite
+/// allocation a `mlock` and every free a scrub and `munlock`. Together with a
+/// full fsync per commit it was most of the workspace test lane's run time
+/// (mdk#2738). Neither changes what a test observes, except a test of those
+/// settings: the tests that pin them never call this.
+#[cfg(any(test, feature = "test-support"))]
+pub fn relax_storage_for_test_process() {
+    TEST_PROCESS_STORAGE_RELAXED.store(true, Ordering::Release);
+}
+
+/// Return this test process to SQLCipher's memory security and full fsync.
+/// This crate's unit tests start relaxed, so the tests that pin the production
+/// settings call this before opening anything. Under `cargo test`, whose tests
+/// share one process, it also returns the tests still running to the
+/// defaults, which only slows them.
+#[cfg(test)]
+pub(crate) fn use_production_storage_for_test_process() {
+    TEST_PROCESS_STORAGE_RELAXED.store(false, Ordering::Release);
+}
+
+fn test_process_storage_relaxed() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        TEST_PROCESS_STORAGE_RELAXED.load(Ordering::Acquire)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
+}
+
+pub(crate) fn apply_cipher_pragmas(
     connection: &rusqlite::Connection,
     options: &SqliteStorageOptions,
 ) -> StorageResult<()> {
@@ -1458,7 +1463,7 @@ fn apply_cipher_pragmas(
             i64::from(options.cipher_compatibility),
         )
         .storage()?;
-    if options.cipher_memory_security {
+    if options.cipher_memory_security && !test_process_storage_relaxed() {
         connection
             .execute_batch("PRAGMA cipher_memory_security = ON;")
             .storage()?;
@@ -1489,8 +1494,13 @@ fn apply_operational_pragmas(
             .pragma_update(None, "temp_store", "MEMORY")
             .storage()?;
     }
+    let synchronous = if test_process_storage_relaxed() {
+        SqliteSynchronous::Normal
+    } else {
+        options.synchronous
+    };
     connection
-        .pragma_update(None, "synchronous", options.synchronous.as_pragma())
+        .pragma_update(None, "synchronous", synchronous.as_pragma())
         .storage()?;
     let journal_mode = format!("PRAGMA journal_mode = {}", options.journal_mode.as_pragma());
     let _: String = connection
@@ -1601,66 +1611,6 @@ mod tests {
     };
     use tracing::{Event, Subscriber, field::Visit};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
-
-    #[cfg(feature = "test-migrated-template")]
-    #[test]
-    fn migrated_template_copies_match_a_migrated_database_and_stay_independent() {
-        fn schema(store: &SqliteAccountStorage) -> Vec<(String, String, Option<String>)> {
-            let conn = store.lock().unwrap();
-            let mut statement = conn
-                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
-                .unwrap();
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        }
-        fn ledger(store: &SqliteAccountStorage) -> Vec<i64> {
-            let conn = store.lock().unwrap();
-            let mut statement = conn
-                .prepare("SELECT version FROM cgka_schema_migrations ORDER BY version")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        }
-        let migrated = SqliteAccountStorage::in_memory().unwrap();
-        assert!(migrated.migration_summary().0 > 0);
-        let first =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        let second =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        assert_eq!(
-            first.migration_summary().0,
-            0,
-            "the copy needs no migration"
-        );
-        assert_eq!(schema(&first), schema(&migrated));
-        assert_eq!(ledger(&first), ledger(&migrated));
-        assert!(!ledger(&first).is_empty());
-
-        first
-            .lock()
-            .unwrap()
-            .execute_batch("CREATE TABLE template_copy_probe(value INTEGER)")
-            .unwrap();
-        let probe = "SELECT count(*) FROM sqlite_master WHERE name = 'template_copy_probe'";
-        let count = |store: &SqliteAccountStorage| -> i64 {
-            store
-                .lock()
-                .unwrap()
-                .query_row(probe, [], |row| row.get(0))
-                .unwrap()
-        };
-        assert_eq!(count(&first), 1);
-        assert_eq!(count(&second), 0, "copies must not share pages");
-        let third =
-            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
-        assert_eq!(count(&third), 0, "writes must not reach the template");
-    }
 
     #[test]
     fn disabled_timing_skips_observer_lock_and_can_be_reenabled() {
@@ -2543,6 +2493,7 @@ mod tests {
 
     #[test]
     fn encrypted_connection_applies_operational_defaults() {
+        use_production_storage_for_test_process();
         for key in [
             SqlCipherKey::new("operational defaults key").unwrap(),
             SqlCipherKey::raw([0x42; 32]),
@@ -3058,6 +3009,7 @@ mod tests {
 
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
+        use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         for key in [
             SqlCipherKey::new("trace setup key").unwrap(),
@@ -3121,6 +3073,7 @@ mod tests {
 
     #[test]
     fn public_hardened_open_pins_cipher_pragmas_before_keying() {
+        use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
         for key in [
             SqlCipherKey::new("public hardened key").unwrap(),
@@ -3351,6 +3304,8 @@ mod tests {
 
     #[test]
     fn custom_options_can_relax_operational_defaults_for_tests() {
+        // From the defaults, so `synchronous` comes from the options.
+        use_production_storage_for_test_process();
         let store = SqliteAccountStorage::in_memory_with_options(SqliteStorageOptions {
             busy_timeout_ms: 250,
             journal_mode: SqliteJournalMode::Delete,
@@ -3368,6 +3323,73 @@ mod tests {
         assert_eq!(pragma_i64(&conn, "secure_delete"), 0);
         assert_eq!(pragma_i64(&conn, "trusted_schema"), 1);
         assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+    }
+
+    /// Set in the child process that runs
+    /// `relaxed_test_process_skips_memory_security_and_full_fsync`.
+    const RELAXED_STORAGE_CHILD: &str = "STORAGE_SQLITE_RELAXED_STORAGE_CHILD";
+
+    /// Memory security is process-wide, so the checks run in a child process
+    /// of this test binary, where no other test can have turned it on.
+    #[test]
+    fn relaxed_test_process_skips_memory_security_and_full_fsync() {
+        if std::env::var_os(RELAXED_STORAGE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "base::connection::tests::relaxed_test_process_skips_memory_security_and_full_fsync",
+                    "--nocapture",
+                ])
+                .env(RELAXED_STORAGE_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        // Start from the defaults, so the relaxation below is what is checked.
+        use_production_storage_for_test_process();
+        relax_storage_for_test_process();
+        let key = SqlCipherKey::raw([0x42; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        let connection = rusqlite::Connection::open(dir.path().join("marmot.sqlite")).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+        let store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
+            connection,
+            &key,
+            SqliteStorageOptions::default(),
+        )
+        .unwrap();
+        let hardened = rusqlite::Connection::open(dir.path().join("hardened.sqlite")).unwrap();
+        hardened.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+        open_hardened_sqlcipher(&hardened, &key, SqlCipherHardening::live_cache()).unwrap();
+
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        assert_eq!(
+            statements.iter().filter(|step| **step == "key").count(),
+            2,
+            "{statements:?}"
+        );
+        assert!(
+            !statements.contains(&"cipher_memory_security"),
+            "{statements:?}"
+        );
+        let conn = store.lock().unwrap();
+        assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+        assert_eq!(pragma_string(&conn, "cipher_memory_security"), "0");
     }
 
     #[test]

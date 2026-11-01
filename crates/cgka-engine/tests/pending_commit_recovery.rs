@@ -86,6 +86,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -187,8 +188,8 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     //    before resolving the publish. ───────────────────────────────────────
     {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
-        let bob_store = SqliteAccountStorage::in_memory().unwrap();
-        let carol_store = SqliteAccountStorage::in_memory().unwrap();
+        let bob_store = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let carol_store = SqliteAccountStorage::in_memory_for_test().unwrap();
         let mut alice = build_client(alice_store, b"alice-pcr");
         let mut bob = build_client(bob_store, b"bob-pcr");
         let mut carol = build_client(carol_store, b"carol-pcr");
@@ -316,7 +317,10 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 
     // The group is no longer wedged: a fresh commit-creating operation must
     // succeed rather than failing on the leftover pending commit.
-    let mut carol = build_client(SqliteAccountStorage::in_memory().unwrap(), b"carol-pcr-2");
+    let mut carol = build_client(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        b"carol-pcr-2",
+    );
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let retry = alice
         .send(SendIntent::Invite {
@@ -361,8 +365,8 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
     //    before resolving the publish. ─────────────────────────────────────
     {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
-        let bob_store = SqliteAccountStorage::in_memory().unwrap();
-        let carol_store = SqliteAccountStorage::in_memory().unwrap();
+        let bob_store = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let carol_store = SqliteAccountStorage::in_memory_for_test().unwrap();
         let mut alice = build_selfremove_client(alice_store, b"alice-dsr");
         let mut bob = build_selfremove_client(bob_store, b"bob-dsr");
         let mut carol = build_selfremove_client(carol_store, b"carol-dsr");

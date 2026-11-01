@@ -61,6 +61,12 @@ pub struct RecoveryLossImport {
     /// transaction: the lowest bound charged by any unresolved generation of
     /// the cause, or `None` when any charge had no known time.
     pub goal_floor: Option<u64>,
+    /// Whether some generation this import charged named no routes, so every
+    /// route lost coverage from its floor. When `false`, only the routes its
+    /// generations named did, and their goals widened in the same
+    /// transaction. An import whose `transition` is `Unchanged` is reported
+    /// only for this, so the owner can widen current routes' goals.
+    pub every_route: bool,
 }
 
 /// `(revision, cause, state, eligibility, group_id)` as stored.

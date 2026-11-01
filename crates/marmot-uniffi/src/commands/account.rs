@@ -34,6 +34,7 @@ impl Marmot {
                 external_signing: m.external_signing,
                 signed_out: m.signed_out,
                 running: m.running,
+                unlinked: m.unlinked,
             })
             .collect())
     }
@@ -65,7 +66,7 @@ impl Marmot {
     }
 
     /// Destructive sign-out: leave every active MLS group (best-effort), delete
-    /// the account's relay-published KeyPackages, then wipe all local state for
+    /// this device's relay-published KeyPackage slot, then wipe all local state for
     /// this account (MLS state DB, cached media/secrets, SQL account row, and
     /// the secret-store nsec). After this returns the account ref is no longer
     /// valid for any further FFI call. The returned `WipeOutcomeFfi` reports
@@ -80,9 +81,9 @@ impl Marmot {
 
     /// Non-destructive sign-out: deactivate the account on this device and,
     /// when `delete_key_packages` is `true` (the default behavior in the UI),
-    /// publish kind:5 deletions for its relay-published KeyPackages so
-    /// strangers cannot gift-wrap a Welcome into a new group while it is signed
-    /// out.
+    /// publish one kind:5 deletion for this device's KeyPackage slot so
+    /// nobody can add this device to a new group while it is signed out. The
+    /// account's other devices keep their KeyPackages.
     ///
     /// Unlike [`sign_out_and_wipe`](Self::sign_out_and_wipe) /
     /// [`remove_account`](Self::remove_account), this keeps ALL local state on
@@ -140,6 +141,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -232,6 +234,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -293,6 +296,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -337,6 +341,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -372,6 +377,7 @@ impl Marmot {
             external_signing: account.external_signing,
             signed_out: account.signed_out,
             running: account.running,
+            unlinked: account.unlinked,
         })
     }
 
@@ -778,6 +784,7 @@ impl Marmot {
                 external_signing: result.account.external_signing,
                 signed_out: result.account.signed_out,
                 running: true,
+                unlinked: result.account.unlinked,
             },
             profile: profile.into(),
             readiness: result.readiness.into(),

@@ -1,0 +1,48 @@
+[package]
+name = "marmot-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+test-policy-overrides = ["cgka-engine/test-policy-overrides"]
+# The session type, its accessors and `AccountDeviceRuntime::new`, for tests
+# that drive the session directly to set up scenarios. Production opens the
+# runtime with `AccountDeviceRuntime::open` and reaches the session only
+# through it.
+# Enable only as a dev-dependency.
+test-support = []
+
+[dependencies]
+async-trait.workspace = true
+cgka-engine.workspace = true
+cgka-traits.workspace = true
+futures.workspace = true
+hex.workspace = true
+marmot-forensics.workspace = true
+rand.workspace = true
+sha2.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# This crate's own integration tests reach the session accessors.
+marmot-session = { workspace = true, features = ["test-support"] }
+nostr.workspace = true
+# A same-account Add in a group that does not require account-devices is
+# built with raw OpenMLS, because the engine refuses to send one.
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tls_codec.workspace = true
+tokio.workspace = true
+transport-nostr-adapter.workspace = true
+transport-nostr-peeler.workspace = true

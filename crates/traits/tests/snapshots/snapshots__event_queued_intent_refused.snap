@@ -1,0 +1,22 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::QueuedIntentRefused\n{\n    group_id: gid(), intent_id: mid(), intent_kind:\n    \"update_group_data\".into(), reason: \"not_group_admin\".into(),\n}"
+---
+{
+  "QueuedIntentRefused": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "intent_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "intent_kind": "update_group_data",
+    "reason": "not_group_admin"
+  }
+}

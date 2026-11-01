@@ -32,7 +32,8 @@ pub use member_key_packages::{
 pub use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 pub use previews::{MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead};
 pub use published_records::{
-    AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
+    AccountKeyPackageSlots, AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage,
+    MissingRelayListKind, OwnSlotRead, SlotKeyPackage, SlotPublication, SlotPublicationKeyPackage,
     key_package_from_hex_with_optional_source, key_package_from_record, push_unique_strings,
     relay_list_state_from_event, sort_directory_records,
 };
@@ -73,10 +74,10 @@ pub use methods::{USER_DIRECTORY_SEARCH_MAX_FRONTIER, cached_or_unknown_follow_l
 pub use previews::EVENT_DELETION_QUERY_LIMIT;
 #[cfg(any(test, feature = "test-support"))]
 pub use published_records::{
-    DirectoryFreshness, KeyPackageSelection, PreferredKeyPackage, fresh_or_cached_key_package,
-    latest_fresh_key_package_from_records, preferred_fresh_key_package_from_records,
-    relay_list_queries, relay_list_status_from_records, relays_from_relay_list_event,
-    require_key_package_tag, require_multi_value_key_package_tag_matches,
+    DirectoryFreshness, KEY_PACKAGE_FRESHNESS, KeyPackageSelection, MAX_KEY_PACKAGES_PER_ACCOUNT,
+    account_key_package_slots_from_records, fresh_or_cached_key_package, relay_list_queries,
+    relay_list_status_from_records, relays_from_relay_list_event, require_key_package_tag,
+    require_multi_value_key_package_tag_matches, select_key_packages_from_records,
     validated_cached_key_package,
 };
 #[cfg(any(test, feature = "test-support"))]

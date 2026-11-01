@@ -66,17 +66,21 @@ pub(crate) fn chat_mute_is_effective(
 /// The local account's own membership in a projected group.
 ///
 /// `Member` is the default and the fallback for unknown/forward-incompatible
-/// state: uncertainty must never hide a conversation. `Left` and `Removed` are
-/// both terminal "no longer a member" states that suppress the account's unread
-/// aggregate; they differ only in *why* membership ended — `Left` is a
-/// voluntary self-removal (including declining an invite), `Removed` is an
-/// eviction by another member.
+/// state: uncertainty must never hide a conversation. `Left`, `Removed` and
+/// `DeviceRemoved` are terminal "no longer a member on this device" states
+/// that suppress the account's unread aggregate; they differ only in *why*
+/// membership ended — `Left` is a voluntary self-removal (including declining
+/// an invite), `Removed` is an eviction of the account by another member, and
+/// `DeviceRemoved` is the removal of this device's leaf while the account
+/// keeps another device in the group (mdk#2628 D62), which hosts do not show
+/// as a removal from the group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelfMembership {
     #[default]
     Member,
     Left,
     Removed,
+    DeviceRemoved,
 }
 
 impl SelfMembership {
@@ -86,6 +90,7 @@ impl SelfMembership {
             SelfMembership::Member => "member",
             SelfMembership::Left => "left",
             SelfMembership::Removed => "removed",
+            SelfMembership::DeviceRemoved => "device_removed",
         }
     }
 
@@ -95,8 +100,14 @@ impl SelfMembership {
         match value {
             "left" => SelfMembership::Left,
             "removed" => SelfMembership::Removed,
+            "device_removed" => SelfMembership::DeviceRemoved,
             _ => SelfMembership::Member,
         }
+    }
+
+    /// Whether this device is no longer a member, for whatever reason.
+    pub fn departed(self) -> bool {
+        self != SelfMembership::Member
     }
 }
 
@@ -176,15 +187,16 @@ pub struct StoredAccountGroup {
     pub admin_keys_hex: String,
     pub archived: bool,
     pub pending_confirmation: bool,
-    /// Current locally observed MLS roster size. `None` for legacy rows until a
-    /// live group hydration persists the projection.
+    /// Number of member accounts in the locally observed MLS roster; an
+    /// account with several devices counts once (migration 0120). `None` for
+    /// legacy rows until a live group hydration persists the projection.
     pub member_count: Option<u64>,
-    /// Hex member ids for a Direct conversation (empty name, roster size 2).
+    /// Hex account ids for a Direct conversation (empty name, two member accounts).
     /// Persisted in `direct_conversation_members` so reuse lookup can query by
     /// peer without scanning every unnamed two-member chat. `None` when the
     /// group is not currently classified as Direct.
     pub direct_member_ids_hex: Option<Vec<String>>,
-    /// Current authoritative two-member roster, including explicitly named groups.
+    /// Current authoritative two-account roster, including explicitly named groups.
     pub presentation_member_ids_hex: Option<Vec<String>>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
@@ -442,6 +454,67 @@ pub struct AccountGroupPushToken {
     pub updated_at_ms: i64,
 }
 
+/// A durable removal for one push record key. Its `(owner_ts, record_digest)`
+/// stamp suppresses any record with a lower stamp for the same key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountGroupPushTokenTombstone {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: u8,
+    pub server_pubkey_hex: String,
+    /// Owner-signed millisecond ordering stamp of the removal.
+    pub owner_ts: i64,
+    /// `SHA-256(SignedRecord)` hex of the removal: the ordering tie-breaker.
+    pub record_digest: String,
+    /// The rest of the owner-signed removal, so any member can relay the
+    /// tombstone unchanged in a kind 449. `None` for a tombstone written before
+    /// migration 0118, which kept no signature and stays local-only.
+    pub removal_proof: Option<AccountPushTokenRemovalProof>,
+    pub created_at_ms: i64,
+}
+
+/// The removal fields a tombstone needs beyond its key and stamp to rebuild
+/// the owner-signed removal entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountPushTokenRemovalProof {
+    pub token_fingerprint: String,
+    /// 128-hex BIP-340 signature by `member_id_hex` over the removal.
+    pub owner_sig: String,
+}
+
+/// This device's push-token gossip state in one group, for its current
+/// membership. The row goes when the device leaves or is removed, and with the
+/// group's projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountGroupPushGossipState {
+    pub group_id_hex: String,
+    /// When a Welcome installed this device's copy of the group, which opened
+    /// its join window there. Set from then until the device announces once
+    /// the window ends. `None` for a group this device created, for one
+    /// joined before migration 0122, and once the window has closed.
+    pub joining_since_ms: Option<i64>,
+    /// When this device's join became final. `None` until recorded, and for a
+    /// group joined before migration 0118.
+    pub joined_at_ms: Option<i64>,
+    /// Time counted toward the join window since the join completed: time
+    /// during which this device could fetch the group's messages. Zero until
+    /// the join completes and for a group with no window.
+    pub join_window_counted_ms: i64,
+    /// When this device last came to owe the group an announce besides the
+    /// one that ends its join window: a send found the periodic one due, or
+    /// it shared a new or changed record of its own. Each new debt raises it
+    /// past the previous value, even if the clock went back. `None` when none
+    /// is owed.
+    pub announce_owed_at_ms: Option<i64>,
+    /// When this device last announced in the group. `None` if it never has.
+    pub last_announced_at_ms: Option<i64>,
+    /// The device owes the group a push snapshot once its merged epoch passes
+    /// this one: a Commit it published from this epoch adds leaves. `None`
+    /// when nothing is owed.
+    pub snapshot_owed_after_epoch: Option<u64>,
+}
+
 struct RawStoredAccountGroup {
     group_id_hex: String,
     endpoint: String,
@@ -689,6 +762,7 @@ impl SqliteAppStorage {
             marker_token,
             dropped_count,
             earliest_created_at,
+            None,
         )
         .map(|_| ())
     }
@@ -1186,15 +1260,17 @@ impl SqliteAppStorage {
                 .iter()
                 .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
             {
-                let group_was_new = !conn
+                // The stored row's Welcome, or `None` when the group has no row.
+                let stored_welcome = conn
                     .query_row_cached(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
-                         )",
+                        "SELECT via_welcome_message_id_hex FROM account_groups
+                         WHERE group_id_hex = ?1",
                         params![&group.group_id_hex],
-                        |row| row.get::<_, bool>(0),
+                        |row| row.get::<_, Option<String>>(0),
                     )
+                    .optional()
                     .storage()?;
+                let group_was_new = stored_welcome.is_none();
                 let nostr_routing_last_epoch =
                     i64::try_from(group.nostr_routing_last_epoch).unwrap_or(i64::MAX);
                 let prior_nostr_routes_json = serde_json::to_string(&group.prior_nostr_routes)
@@ -1290,6 +1366,25 @@ impl SqliteAppStorage {
                         conn.execute_cached("UPDATE push_registration SET last_shared_at_ms = NULL", [])
                             .storage()?;
                     }
+                }
+                // A Welcome that installs or replaces this device's copy opens
+                // its push join window in the group, with the group's row. A
+                // group this device created has no window.
+                if group.via_welcome_message_id_hex.is_some()
+                    && stored_welcome.as_ref() != Some(&group.via_welcome_message_id_hex)
+                {
+                    conn.execute_cached(
+                        "INSERT INTO group_push_gossip_state (group_id_hex, joining_since_ms)
+                         SELECT group_id_hex, ?2 FROM account_groups
+                         WHERE group_id_hex = ?1 AND self_membership = 'member'
+                         ON CONFLICT(group_id_hex) DO UPDATE SET
+                            joining_since_ms = excluded.joining_since_ms,
+                            joined_at_ms = NULL,
+                            join_window_counted_ms = 0,
+                            announce_owed_at_ms = NULL",
+                        params![&group.group_id_hex, unix_now_ms()],
+                    )
+                    .storage()?;
                 }
 
                 delete_stale_group_components(&conn, &group.group_id_hex, &group.components)?;
@@ -1664,10 +1759,9 @@ impl SqliteAppStorage {
     /// Returns whether this transitioned an existing departed projection back to Member.
     pub fn restore_group_self_membership(&self, group_id_hex: &str) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
-            let departed = matches!(
-                self.group_self_membership(group_id_hex)?,
-                Some(SelfMembership::Left | SelfMembership::Removed)
-            );
+            let departed = self
+                .group_self_membership(group_id_hex)?
+                .is_some_and(SelfMembership::departed);
             if departed {
                 self.lock()?
                     .execute_cached(
@@ -1684,8 +1778,8 @@ impl SqliteAppStorage {
 
     /// Record the local account's own membership in `group_id_hex` so the
     /// chat list and removed-group-suppressed unread aggregate reflect whether
-    /// the account is still in the group and, if not, how it left. `Left` and
-    /// `Removed` both suppress the group's unread; `Member` re-affirms it
+    /// the account is still in the group and, if not, how it left. Every
+    /// departed state suppresses the group's unread; `Member` re-affirms it
     /// (preserve / un-suppress on re-add). No-op when the group has no
     /// `account_groups` row yet, so this never resurrects pruned projection
     /// state.
@@ -1736,10 +1830,16 @@ impl SqliteAppStorage {
                         .storage()?;
                     }
                 }
-                SelfMembership::Left | SelfMembership::Removed => {
+                SelfMembership::Left | SelfMembership::Removed | SelfMembership::DeviceRemoved => {
                     conn.execute_cached(
                         "DELETE FROM pending_push_registration_shares
                          WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
+                    // Gossip state covers one membership; a later join starts afresh.
+                    conn.execute_cached(
+                        "DELETE FROM group_push_gossip_state WHERE group_id_hex = ?1",
                         params![group_id_hex],
                     )
                     .storage()?;
@@ -2634,6 +2734,66 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Queue `account_label`'s current registration for one joined group again
+    /// when native push is on. A member added by a merged Commit cannot read
+    /// this device's earlier share. The queue holds only unfinished work, so a
+    /// revision whose share already completed is published again.
+    pub fn queue_current_push_registration_share_for_group(
+        &self,
+        account_label: &str,
+        group_id_hex: &str,
+        queued_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let queued = conn
+                .execute_cached(
+                    "INSERT INTO pending_push_registration_shares (
+                        group_id_hex, token_fingerprint, registration_updated_at_ms,
+                        queued_at_ms, last_attempted_at_ms
+                     )
+                     SELECT account_groups.group_id_hex,
+                            push_registration.token_fingerprint,
+                            push_registration.updated_at_ms, ?3, NULL
+                     FROM account_groups
+                     CROSS JOIN push_registration
+                     JOIN notification_settings
+                       ON notification_settings.account_label = push_registration.account_label
+                     WHERE account_groups.group_id_hex = ?2
+                       AND account_groups.self_membership = 'member'
+                       AND push_registration.account_label = ?1
+                       AND notification_settings.native_push_enabled = 1
+                     ON CONFLICT(group_id_hex) DO UPDATE SET
+                        token_fingerprint = excluded.token_fingerprint,
+                        registration_updated_at_ms = excluded.registration_updated_at_ms,
+                        queued_at_ms = excluded.queued_at_ms,
+                        last_attempted_at_ms = NULL",
+                    params![account_label, group_id_hex, queued_at_ms],
+                )
+                .storage()?
+                > 0;
+            if queued {
+                conn.execute_cached(
+                    "UPDATE push_registration SET last_shared_at_ms = NULL
+                     WHERE account_label = ?1",
+                    params![account_label],
+                )
+                .storage()?;
+            }
+            Ok(queued)
+        })
+    }
+
+    /// Run migration 0117's one-time push-token share repair again. Test
+    /// support only: the migration ledger runs it once per database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rerun_push_token_reshare_repair_for_test(&self) -> StorageResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        crate::base::migrations::rerun_push_token_reshare_repair(&tx)?;
+        tx.commit().storage()
+    }
+
     pub fn has_pending_push_registration_work(&self) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(
@@ -2843,65 +3003,351 @@ impl SqliteAppStorage {
     /// Apply an owner-verified removal: when its `(owner_ts, record_digest)` stamp
     /// is strictly greater than both the live record and any existing tombstone
     /// for the key, delete the live record and write/refresh the durable
-    /// tombstone. Returns whether the removal was applied.
-    #[allow(clippy::too_many_arguments)]
+    /// tombstone, including its removal proof. The same removal again only
+    /// fills in a missing proof. Returns whether the removal was applied.
     pub fn apply_group_push_token_tombstone(
         &self,
-        group_id_hex: &str,
-        member_id_hex: &str,
-        leaf_index: u32,
-        platform: u8,
-        server_pubkey_hex: &str,
-        owner_ts: i64,
-        record_digest: &str,
-        created_at_ms: i64,
+        tombstone: &AccountGroupPushTokenTombstone,
     ) -> StorageResult<bool> {
         retry_on_busy(|| {
             let mut conn = self.lock()?;
             let tx = conn.transaction().storage()?;
-            let incoming = (owner_ts, record_digest);
+            let incoming = (tombstone.owner_ts, tombstone.record_digest.as_str());
             let key = PushTokenKey {
-                group_id_hex,
-                member_id_hex,
-                leaf_index,
-                platform,
-                server_pubkey_hex,
+                group_id_hex: &tombstone.group_id_hex,
+                member_id_hex: &tombstone.member_id_hex,
+                leaf_index: tombstone.leaf_index,
+                platform: tombstone.platform,
+                server_pubkey_hex: &tombstone.server_pubkey_hex,
             };
-            let tombstone = read_push_tombstone_stamp(&tx, key)?;
+            let existing = read_push_tombstone_stamp(&tx, key)?;
             let live = read_push_token_stamp(&tx, key)?;
             let strictly_newer = |stored: &Option<(i64, String)>| {
                 push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
             };
-            if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+            if !strictly_newer(&existing) || !strictly_newer(&live) {
+                // An equal stamp is the same signed removal, so it may bring the
+                // proof a tombstone written before migration 0118 lacks.
+                if let Some(proof) = &tombstone.removal_proof
+                    && existing
+                        .as_ref()
+                        .is_some_and(|(ts, digest)| (*ts, digest.as_str()) == incoming)
+                {
+                    tx.execute_cached(
+                        "UPDATE group_push_token_tombstones
+                         SET token_fingerprint = ?6, owner_sig = ?7
+                         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+                           AND platform = ?4 AND server_pubkey_hex = ?5 AND owner_sig IS NULL",
+                        params![
+                            key.group_id_hex,
+                            key.member_id_hex,
+                            u32_to_i64(key.leaf_index),
+                            i64::from(key.platform),
+                            key.server_pubkey_hex,
+                            &proof.token_fingerprint,
+                            &proof.owner_sig,
+                        ],
+                    )
+                    .storage()?;
+                    tx.commit().storage()?;
+                }
                 return Ok(false);
             }
             delete_push_token(&tx, key)?;
+            let proof = tombstone.removal_proof.as_ref();
             tx.execute_cached(
                 "INSERT INTO group_push_token_tombstones (
                     group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
-                    owner_ts, record_digest, created_at_ms
+                    owner_ts, record_digest, created_at_ms, token_fingerprint, owner_sig
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex)
                  DO UPDATE SET
                     owner_ts = excluded.owner_ts,
                     record_digest = excluded.record_digest,
-                    created_at_ms = excluded.created_at_ms",
+                    created_at_ms = excluded.created_at_ms,
+                    token_fingerprint = excluded.token_fingerprint,
+                    owner_sig = excluded.owner_sig",
                 params![
-                    group_id_hex,
-                    member_id_hex,
-                    u32_to_i64(leaf_index),
-                    i64::from(platform),
-                    server_pubkey_hex,
-                    owner_ts,
-                    record_digest,
-                    created_at_ms,
+                    &tombstone.group_id_hex,
+                    &tombstone.member_id_hex,
+                    u32_to_i64(tombstone.leaf_index),
+                    i64::from(tombstone.platform),
+                    &tombstone.server_pubkey_hex,
+                    tombstone.owner_ts,
+                    &tombstone.record_digest,
+                    tombstone.created_at_ms,
+                    proof.map(|proof| proof.token_fingerprint.as_str()),
+                    proof.map(|proof| proof.owner_sig.as_str()),
                 ],
             )
             .storage()?;
             tx.commit().storage()?;
             Ok(true)
         })
+    }
+
+    /// Every tombstone held for `group_id_hex`, in record-key order. A tombstone
+    /// without a `removal_proof` predates migration 0118 and must not be relayed.
+    pub fn group_push_token_tombstones(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Vec<AccountGroupPushTokenTombstone>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
+                        owner_ts, record_digest, created_at_ms, token_fingerprint, owner_sig
+                 FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?1
+                 ORDER BY member_id_hex, leaf_index, platform, server_pubkey_hex",
+            )
+            .storage()?;
+        statement
+            .query_map(params![group_id_hex], group_push_token_tombstone_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// This device's push gossip state in `group_id_hex`, if any is recorded.
+    pub fn group_push_gossip_state(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Option<AccountGroupPushGossipState>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
+                 FROM group_push_gossip_state
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                group_push_gossip_state_from_row,
+            )
+            .optional()
+            .storage()
+    }
+
+    /// Every group this device owes a push snapshot, in group id order.
+    pub fn owed_group_push_snapshots(&self) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
+                 FROM group_push_gossip_state
+                 WHERE snapshot_owed_after_epoch IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Every group whose push join window this device has open, or whose
+    /// window ended without an announce yet, in group id order.
+    pub fn joining_group_push_gossip_states(
+        &self,
+    ) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
+                 FROM group_push_gossip_state
+                 WHERE joining_since_ms IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Every group where this device owes an announce besides the one that
+    /// ends its join window, in group id order.
+    pub fn owed_group_push_announce_states(
+        &self,
+    ) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
+                 FROM group_push_gossip_state
+                 WHERE announce_owed_at_ms IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Record that this device owes `group_id_hex` an announce as of
+    /// `owed_at_ms`, raising the stored value past any earlier one so that
+    /// an announce built before this debt cannot settle it. Returns the value
+    /// stored, or `None`, recording nothing, unless this device is a member of
+    /// a projected group.
+    pub fn record_group_push_announce_owed(
+        &self,
+        group_id_hex: &str,
+        owed_at_ms: i64,
+    ) -> StorageResult<Option<i64>> {
+        self.lock()?
+            .query_row_cached(
+                "INSERT INTO group_push_gossip_state (group_id_hex, announce_owed_at_ms)
+                 SELECT group_id_hex, ?2 FROM account_groups
+                 WHERE group_id_hex = ?1 AND self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    announce_owed_at_ms = MAX(
+                        COALESCE(
+                            group_push_gossip_state.announce_owed_at_ms + 1,
+                            excluded.announce_owed_at_ms
+                        ),
+                        excluded.announce_owed_at_ms
+                    )
+                 RETURNING announce_owed_at_ms",
+                params![group_id_hex, owed_at_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()
+    }
+
+    /// Record that this device owes `group_id_hex` a push snapshot once its
+    /// merged epoch passes `after_epoch`, the epoch a leaf-adding Commit it is
+    /// about to publish starts from. A later epoch replaces an earlier one,
+    /// since one snapshot after the last add covers both. Returns false,
+    /// recording nothing, unless this device is a member of a projected group.
+    pub fn record_group_push_snapshot_owed(
+        &self,
+        group_id_hex: &str,
+        after_epoch: u64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, snapshot_owed_after_epoch)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                snapshot_owed_after_epoch = MAX(
+                    COALESCE(group_push_gossip_state.snapshot_owed_after_epoch, excluded.snapshot_owed_after_epoch),
+                    excluded.snapshot_owed_after_epoch
+                )",
+            group_id_hex,
+            u64_to_i64(after_epoch)?,
+        )
+    }
+
+    /// Replace the owed snapshot epoch of `group_id_hex` with `replacement`
+    /// (`None` settles it) only while it is still `expected`, so settling one
+    /// snapshot cannot drop an owed epoch recorded meanwhile. Returns whether
+    /// it was replaced.
+    pub fn replace_group_push_snapshot_owed(
+        &self,
+        group_id_hex: &str,
+        expected: u64,
+        replacement: Option<u64>,
+    ) -> StorageResult<bool> {
+        let replacement = replacement.map(u64_to_i64).transpose()?;
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "UPDATE group_push_gossip_state SET snapshot_owed_after_epoch = ?3
+                 WHERE group_id_hex = ?1 AND snapshot_owed_after_epoch = ?2",
+                params![group_id_hex, u64_to_i64(expected)?, replacement],
+            )
+            .storage()?
+            > 0)
+    }
+
+    /// Record when this device's join to `group_id_hex` became final. The
+    /// first recorded time stands until a later Welcome installs the group
+    /// again. Returns false, recording nothing, unless this device is a member
+    /// of a projected group.
+    pub fn record_group_push_gossip_join(
+        &self,
+        group_id_hex: &str,
+        joined_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, joined_at_ms)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                joined_at_ms = COALESCE(group_push_gossip_state.joined_at_ms, excluded.joined_at_ms)",
+            group_id_hex,
+            joined_at_ms,
+        )
+    }
+
+    /// Count `counted_ms` toward every open join window whose join has
+    /// completed: time during which this device could fetch its groups'
+    /// messages. Returns how many windows it counted toward.
+    pub fn count_push_join_window_time(&self, counted_ms: i64) -> StorageResult<usize> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE group_push_gossip_state
+                 SET join_window_counted_ms = join_window_counted_ms + ?1
+                 WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL",
+                params![counted_ms],
+            )
+            .storage()
+    }
+
+    /// Record that this device published, at `announced_at_ms`, an announce
+    /// in `group_id_hex` built while the owed announce stood at
+    /// `settles_owed`. It announces only once its join window there has
+    /// ended, so the window closes, and the owed announce is settled only
+    /// while it still holds that value: a debt recorded since the announce was
+    /// built stays owed. Keeps the latest time. Returns false, recording
+    /// nothing, unless this device is a member of a projected group.
+    pub fn record_group_push_gossip_announce(
+        &self,
+        group_id_hex: &str,
+        announced_at_ms: i64,
+        settles_owed: Option<i64>,
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "INSERT INTO group_push_gossip_state (group_id_hex, last_announced_at_ms)
+                 SELECT group_id_hex, ?2 FROM account_groups
+                 WHERE group_id_hex = ?1 AND self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    last_announced_at_ms = MAX(
+                        COALESCE(group_push_gossip_state.last_announced_at_ms, excluded.last_announced_at_ms),
+                        excluded.last_announced_at_ms
+                    ),
+                    joining_since_ms = NULL,
+                    announce_owed_at_ms = CASE
+                        WHEN group_push_gossip_state.announce_owed_at_ms IS ?3 THEN NULL
+                        ELSE group_push_gossip_state.announce_owed_at_ms
+                    END",
+                params![group_id_hex, announced_at_ms, settles_owed],
+            )
+            .storage()?
+            > 0)
+    }
+
+    fn upsert_group_push_gossip_state(
+        &self,
+        sql: &str,
+        group_id_hex: &str,
+        value: i64,
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(sql, params![group_id_hex, value])
+            .storage()?
+            > 0)
     }
 
     pub fn group_push_tokens(
@@ -3700,6 +4146,32 @@ fn group_push_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Accoun
     })
 }
 
+fn group_push_token_tombstone_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountGroupPushTokenTombstone> {
+    let token_fingerprint: Option<String> = row.get(8)?;
+    let owner_sig: Option<String> = row.get(9)?;
+    Ok(AccountGroupPushTokenTombstone {
+        group_id_hex: row.get(0)?,
+        member_id_hex: row.get(1)?,
+        leaf_index: i64_to_u32(row.get(2)?, 2)?,
+        platform: i64_to_u8(row.get(3)?, 3)?,
+        server_pubkey_hex: row.get(4)?,
+        owner_ts: row.get(5)?,
+        record_digest: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        // The schema stores both or neither.
+        removal_proof: token_fingerprint
+            .zip(owner_sig)
+            .map(
+                |(token_fingerprint, owner_sig)| AccountPushTokenRemovalProof {
+                    token_fingerprint,
+                    owner_sig,
+                },
+            ),
+    })
+}
+
 /// Identifies one push record key `(group, member, leaf, platform, server)`,
 /// shared by the live `group_push_tokens` table and the tombstone table.
 #[derive(Clone, Copy)]
@@ -3813,6 +4285,27 @@ fn i64_to_u8(value: i64, column: usize) -> rusqlite::Result<u8> {
 fn i64_to_u16(value: i64, column: usize) -> rusqlite::Result<u16> {
     u16::try_from(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(err))
+    })
+}
+
+fn group_push_gossip_state_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountGroupPushGossipState> {
+    let snapshot_owed_after_epoch: Option<i64> = row.get(3)?;
+    Ok(AccountGroupPushGossipState {
+        group_id_hex: row.get(0)?,
+        joining_since_ms: row.get(4)?,
+        joined_at_ms: row.get(1)?,
+        join_window_counted_ms: row.get(5)?,
+        announce_owed_at_ms: row.get(6)?,
+        last_announced_at_ms: row.get(2)?,
+        snapshot_owed_after_epoch: snapshot_owed_after_epoch
+            .map(|epoch| {
+                u64::try_from(epoch).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(err))
+                })
+            })
+            .transpose()?,
     })
 }
 

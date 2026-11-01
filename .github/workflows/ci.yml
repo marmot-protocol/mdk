@@ -2,8 +2,9 @@ name: CI
 
 # The merge queue is the merge gate and runs the full matrix, stopping at the
 # first failed job so the queue ejects that PR at once. Pull requests run a
-# fast pre-check (format, static gates, audit, clippy, WASM build) unless
-# labelled `ci:full`. The queue fast-forwards master to the commit it tested, so
+# fast pre-check (format, static gates, audit, clippy, WASM build, and the
+# workspace tests that finish quickly) unless labelled `ci:full`. The queue
+# fast-forwards master to the commit it tested, so
 # master pushes only refresh the Rust caches pull requests and merge groups
 # restore: GitHub scopes a cache saved by a merge-group run to its temporary
 # branch. Those pushes run only when an input of the rust-cache key changes.
@@ -85,7 +86,8 @@ jobs:
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
-      # precheck: pull requests without `ci:full` run only the fast gates.
+      # precheck: pull requests without `ci:full` run the fast gates and the
+      # quick workspace tests.
       # full: merge groups, manual runs and `ci:full` run every job.
       # warm: master pushes run only the jobs that save a Rust cache.
       - name: Select CI mode
@@ -147,6 +149,11 @@ jobs:
 
       - name: Naming gate (retired legacy tokens)
         run: ./scripts/check_legacy_naming.sh
+
+      - name: Tracing and direct-output source audit
+        run: |
+          ./scripts/check_tracing_audit.sh
+          python3 scripts/test_check_tracing_audit.py
 
       - name: C binding command-surface parity gate
         run: python3 scripts/check_c_binding_parity.py
@@ -409,8 +416,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # marmot-account holds the keychain code. marmot-session holds the
+      # account runtime, which this step linted as part of marmot-account
+      # before the runtime moved there.
       - name: Check iOS account keychain code
-        run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
+        run: cargo clippy -p marmot-account -p marmot-session --target aarch64-apple-ios --locked -- -D warnings
 
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers
@@ -446,12 +456,13 @@ jobs:
         # Keep in sync with `just test-convergence-policy-pin`.
         run: cargo test -p cgka-engine --test convergence_policy_pin --locked
 
+  # Pre-checks build the workspace tests here and run the quick ones in place.
+  # Full runs archive them for the test shards. Master pushes build them only
+  # to save the Rust caches; the jobs that run them need the full mode.
   rust-test-build:
     name: Build workspace tests
     needs: changes
-    # Pre-checks run no tests. Master pushes build test archives only to save
-    # the Rust caches; the jobs that run them need the full mode.
-    if: needs.changes.outputs.ci_mode != 'precheck'
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -481,11 +492,20 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           shared-key: rust-test
 
+      # Every test runs, but the `precheck` profile stops each one after half
+      # a second and counts it as passed (TIMEOUT-PASS): this catches a test
+      # that fails quickly, and the merge queue still runs every test to the
+      # end. About two thirds of the workspace tests finish inside that window.
+      - name: Run quick workspace tests
+        if: needs.changes.outputs.ci_mode == 'precheck'
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile precheck -E "$WORKSPACE_FILTER"
+
       - name: Verify workspace shard coverage
-        run: bash scripts/check_ci_partitions.sh 7 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
+        if: needs.changes.outputs.ci_mode != 'precheck'
+        run: bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
-        if: always()
+        if: always() && needs.changes.outputs.ci_mode != 'precheck'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: workspace-compiler-timings
@@ -494,6 +514,7 @@ jobs:
           retention-days: 7
 
       - name: Archive workspace tests
+        if: needs.changes.outputs.ci_mode != 'precheck'
         run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
 
       - name: Upload test archive
@@ -507,15 +528,19 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Seven shards keep the slowest one near 20 minutes. Each shard's tests run
-  # about four at a time, so its time tracks its total test time, and a slow
-  # runner adds up to a quarter to that; the slowest test run took 25 minutes.
+  # Fourteen shards keep the slowest one near 15 minutes. Each shard's tests run
+  # four at a time, so its time tracks its total test time, and the slowest
+  # runners add up to a fifth to that. That total grows fast (it doubled in the
+  # second half of October 2026, #2738), so add shards before the slowest one
+  # passes 20 minutes. `slice:` deals the whole test list out in turn, which
+  # stays balanced as tests are added; `count:` restarts the deal for every test
+  # binary, so each binary's first test lands on shard 1.
   # The 2 GB test archive downloads in under a minute on East US runners but
   # has taken up to 20 minutes on central and western ones (#2568), so the
   # download and the tests get separate budgets and a slow download cannot cut
   # the test run short.
   rust-test:
-    name: Rust tests (${{ matrix.partition }}/7)
+    name: Rust tests (${{ matrix.partition }}/14)
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
@@ -523,7 +548,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4, 5, 6, 7]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     steps:
       - name: Check out repository
@@ -556,7 +581,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/7 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition slice:${{ matrix.partition }}/14 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
@@ -590,8 +615,12 @@ jobs:
 
       - name: Test consent and both diagnostic exporters
         run: |
+          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib usage_diagnostics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib runtimes_from_one_app_share --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib observed_operations:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --test relay_telemetry_otlp --locked
           cargo test -p marmot-c --features otlp-export,product-analytics-export,alloc-audit product_analytics --locked
           cargo test -p agent-connector --features otlp-export,product-analytics-export usage_diagnostics:: --locked
@@ -630,7 +659,7 @@ jobs:
           shared-key: cli-e2e
 
       - name: Verify CLI shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
+        run: bash scripts/check_ci_partitions.sh count:2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
 
       - name: Archive CLI tests
         run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
@@ -723,7 +752,7 @@ jobs:
           shared-key: relay-runtime
 
       - name: Verify relay runtime shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci -E 'binary(relay_runtime)'
+        run: bash scripts/check_ci_partitions.sh count:2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci -E 'binary(relay_runtime)'
 
       - name: Archive relay runtime tests
         run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
@@ -880,7 +909,7 @@ jobs:
           shared-key: simulator-tests
 
       - name: Verify simulator smoke shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p cgka-conformance-simulator --locked --profile ci -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
+        run: bash scripts/check_ci_partitions.sh count:2 -p cgka-conformance-simulator --locked --profile ci -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
 
       - name: Archive default-feature simulator tests
         run: cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
@@ -1227,13 +1256,17 @@ jobs:
       # The Windows code lives in fs-private, account file replacement and
       # local audit delivery, and is covered by those crates' unit tests,
       # marmot-account's home tests and marmot-forensics' audit tests.
-      # marmot-account's runtime binary is excluded: its publish, fanout and
-      # maintenance scenarios are platform-neutral, run on Linux CI, and took
-      # over 30 minutes here.
       - name: Test filesystem, account replacement, and audit delivery
         run: >-
           cargo nextest run --locked -p fs-private -p marmot-account -p marmot-forensics
-          -E 'not (package(marmot-account) & binary(runtime))'
+
+      # The account runtime's unit tests, which ran in the step above until the
+      # runtime moved from marmot-account to marmot-session. Only the library
+      # runs: marmot-session's test binaries, the runtime's publish, fanout and
+      # maintenance scenarios and the session's, are platform-neutral and run
+      # on Linux CI, and the runtime's took over 30 minutes here.
+      - name: Test account runtime units
+        run: cargo nextest run --locked -p marmot-session --lib
 
       - name: Test runtime root ownership
         run: >-

@@ -1,0 +1,22 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::RemoveOwnAccountDevices\n{ group_id: gid(), leaf_signature_keys: vec![vec![0x5C; 4]], }"
+---
+{
+  "RemoveOwnAccountDevices": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "leaf_signature_keys": [
+      [
+        92,
+        92,
+        92,
+        92
+      ]
+    ]
+  }
+}

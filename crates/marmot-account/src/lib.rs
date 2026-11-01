@@ -1,40 +1,20 @@
-//! Thin account-device orchestration for Marmot.
+//! Account identity, files and secrets for Marmot.
 //!
-//! This crate is intentionally small. It owns the app-level coordination that
-//! sits above `AccountDeviceSession`: transport account activation, transport
-//! routing, KeyPackage publication, and publish confirmation or rollback.
+//! This crate is intentionally small. It owns the local account home: account
+//! records, setup journals, signing-key storage and NIP-49 export. The
+//! account-device runtime that drives a session over a transport lives in
+//! `marmot-session`.
 
 mod error;
 mod home;
 mod io;
-mod key_package;
 mod keyring;
 mod nip49_export;
-mod routing;
-mod runtime;
 mod secret_store;
-mod time;
 
-pub use error::{AccountError, AccountHomeError, AccountHomeResult, AccountResult};
+pub use error::{AccountHomeError, AccountHomeResult};
 pub use home::{
     AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
     EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, NostrAccountImport,
 };
-pub use key_package::{
-    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    NoopKeyPackagePublisher,
-};
-pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
-pub use runtime::{
-    AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,
-    CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
-    MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
-    PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
-    WelcomeDeliveryFailure,
-};
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
-pub use time::{
-    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
-    WallClock,
-};

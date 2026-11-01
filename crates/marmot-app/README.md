@@ -89,7 +89,8 @@ database and releases file locks; `shutdown` alone does not. See
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate
+and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
 
 ## SOCKS5 routing
@@ -168,7 +169,9 @@ requires acknowledgements from its operational relays.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
-legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot.
+legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot. The
+session runtime refreshes the slot at least weekly, after a consumed Welcome and when supported capabilities change;
+see [marmot-session](../marmot-session/README.md#this-devices-keypackage-slot).
 
 **Inventory.** `account_key_package_records` / `account_key_packages` expose one current relay event per addressable
 slot in the validated fetch window. `account_key_package_relay_events` returns that window's current and superseded
@@ -285,6 +288,13 @@ targets.
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+**Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
+projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
+account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
+between two accounts stays direct, and takes its title and avatar from the other account, whatever devices either
+person uses. Membership rows follow the engine's account-level changes: a second device joining, or one of several
+leaving, makes no row; an account's first device joining or last device leaving does.
+
 **Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
 work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
 notifications and invitation recovery. Quiet observations return repaired deltas once without republishing the accepted
@@ -393,6 +403,121 @@ comparison runs off the worker; mutations, subsequent repair requests, and reads
 order. Send fairness remains #1947 work. All automatic history triggers use the same owner, job and durable pacing;
 bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
 
+## Linked devices
+
+`MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
+the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
+its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
+`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, and in every release build
+until the roster's spec lands. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
+says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
+change.
+
+Each device writes its own `client` and `platform`: `MarmotAppConfig::key_package_client_name` and
+`MarmotAppConfig::device_platform` (a short name such as `iOS`), trimmed, and empty when blank or over 64 bytes. It
+writes them with its next KeyPackage announcement in the device group.
+
+`MarmotAppRuntime::rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one
+included: one roster commit in the device group, through the same roster write path as slot announcements, that changes
+only that entry's label and rename id. The label is at most 64 bytes of UTF-8; empty clears it. While the device group
+has an earlier change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")`
+with nothing sent, since a commit then could build on a roster that is about to change; retry later. A rename whose
+commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
+stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
+
+When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
+nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once, after the account is signed out; from then on
+`ManagedAccount::unlinked` and `signed_out` stay set, and signing in, logging in, importing its key or starting
+onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing its local history; reads still return it,
+as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
+which the other devices did; signing in again is then a new link.
+
+### Recovery words
+
+An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).
+`MarmotAppRuntime::begin_recovery_words(account_ref)` makes new words as `RecoveryWords`: show the 12 `words` once,
+then ask for the words at `confirm_positions` (1-based) and pass them, in order, to `confirm_recovery_words`. MDK holds
+the words in memory only and forgets them once their change went out or after `cancel_recovery_words`; a restart
+starts over with new words. Confirming keeps only the key's public half: in the device group's roster, or on this
+device while it has no device group, until the device group it founds carries it. A device that joins a device group
+instead leaves the group's backups as they are and forgets the key it kept. The first device to turn backups on writes
+them, and new words from any device keep that writer. A mismatch (`recovery_words_mismatch`), a busy device group
+(`device_group_busy`) or any other error keeps the words for another try; trying again commits nothing if the roster
+already holds their key. `turn_off_backups` turns backups off for every device of the account by clearing the writer
+and the key; backups already written stay until deleted, and turning backups on again takes new words. Both are
+refused as `device_group_busy` while the device group can't take the change, including while a change of this
+device's is still in flight. `backup_settings` says whether backups are on and whether this device writes them, as the
+device group's roster holds them now. Two devices changing backups at once can drop one change: MDK commits it again
+only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
+are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. Nothing writes
+backups yet, and every call is refused as `DeviceGroupRefused("roster_unsupported")` in release builds until the backup
+spec lands.
+
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
+so a device group that can't take that Commit holds the refresh back.
+`MarmotAppRuntime::key_package_refresh_overdue(account_ref)` is true once a refresh is owed, the KeyPackage it would
+publish is still unannounced, and the slot's newest publication by this device is a week old, or there is none. Inviters stop treating the device as fresh at 30
+days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
+announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
+`MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
+time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
+roster's spec lands.
+
+## Unrecognized sign-ins
+
+`MarmotAppRuntime::unrecognized_sign_ins(account_ref)` lists sign-ins of this account that this device does not
+recognize as `UnrecognizedSignIn`s (mdk#2628), the earliest to appear first. Each is a fresh, valid KeyPackage of the
+account in a slot that neither this device nor the roster of its device group knows. One that is
+`before_this_device` was found by this device's first check: ask whether the user still has it. Any other is new: ask
+whether it was them. The account checks its slots at open, every six hours, and soon after one of its KeyPackages
+arrives live; `check_sign_ins` checks now. `answer_sign_in` takes a `SignInResponse`: `NotNow` keeps one listed
+without a prompt, `Reject` records it as rejected in the device group's roster, and `Dismiss` ends a prompt another
+device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
+and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
+build until the roster's spec lands.
+
+`start_fresh` is the answer when the user no longer has the devices the first check found: every sign-in from before
+this device is answered Not now, now and when one is listed later, and nothing is rejected, so one of them can still
+link this device. It is refused before the first check and once this device trusts a device group. `started_fresh`
+says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
+are here.
+
+## Compromise warning
+
+`MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
+`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item means
+someone holding the account's signing key published where the account's devices did not: a sign-in answered This
+wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage this device found in its own slot that it did
+not make (`ForeignOwnSlotKeyPackage`), which warns on this device only and which it has replaced. The warning gathers
+this device's rejections and those in its device group's roster; rejections
+already in the first roster this device trusts count as seen, and a rejected sign-in leaves once its slot is linked as
+a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
+branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
+host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
+each time the account's worker opens. All of it is empty and silent in every release build until the roster's spec
+lands.
+
+## Linking a new device
+
+Device linking (mdk#2628) runs through the account runtime, and only in builds with `unreleased-device-pairing` and
+`dev_device_groups`; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
+
+- On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from
+  `WaitingForAnswer` to `Comparing`, with seven emoji and their English descriptions for screen readers, then
+  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` ends it.
+- On a device already signed in, a prompt shows the same code once that device checked the new device's KeyPackage.
+  `link_device` takes the prompt id, the new device's label and its two settings, both on by default.
+  `decline_device_link` is Not now. The prompt stays `Linking` until the new device's first change in the device
+  group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
+  again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
+  20 devices, when several sign-ins compete, and who added the device on another device.
+- `device_link_snapshot` reads linking without changing it. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
+  also fires once each time the account's worker opens or reconnects, which ends any link in progress: pairing keeps
+  its secrets only in memory.
+
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.
@@ -406,6 +531,12 @@ own occurrences also set `GroupRecoveryStatus::history_may_be_incomplete` and li
 account-wide ones (loss, incremental and explicit history) appear only in the list.
 `MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
 `GroupStateUpdated`.
+
+`MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
+the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
+them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing
+is ever catching up and neither that event nor `HistoryNoticeCause::UnprovenHistory` (history the runner could not
+prove on a route's relays) is produced.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
@@ -504,6 +635,11 @@ real founding, publication, receipt, peel, join and checkpoint boundaries. The
 ```sh
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
+
+Local forensic files expire automatically 30 days after their last write, including files that have not been
+uploaded. Daily rotation keeps roughly 30 days of history with up to one extra day. Cleanup runs on exclusive app
+open and hourly across every account and failed-wipe remnant, even with recording or uploads disabled. Legacy files
+age out without rewriting their contents. The separate key-reveal security log is excluded.
 
 ## Run the tests
 

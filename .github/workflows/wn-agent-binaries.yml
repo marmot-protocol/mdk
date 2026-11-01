@@ -36,12 +36,13 @@ on:
       - crates/agent-control/**
       - crates/agent-stream-compose/**
       - crates/cgka-engine/**
-      - crates/cgka-session/**
       - crates/fs-private/**
       - crates/marmot-account/**
       - crates/marmot-app/**
       - crates/marmot-forensics/**
       - crates/marmot-markdown/**
+      - crates/marmot-observability/**
+      - crates/marmot-session/**
       - crates/media-store/**
       - crates/nostr-directory/**
       - crates/storage-sqlite/**

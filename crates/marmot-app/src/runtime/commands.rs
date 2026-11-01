@@ -17,7 +17,6 @@ use super::{
     local_account_worker_response, long_account_worker_catch_up_response,
     long_account_worker_response, publish_app_runtime_group_state_updated,
 };
-use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
@@ -29,8 +28,20 @@ use crate::{
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
 };
+use marmot_observability::AppPerformanceOperation;
 
 impl AccountManager {
+    #[cfg(test)]
+    pub(super) async fn unlink_device_for_test(&self, account_ref: &str) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::UnlinkDeviceForTest { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response.await.map_err(|_| AppError::TransportClosed)?
+    }
+
     #[cfg(test)]
     pub(super) async fn unhydrated_group_count_for_test(
         &self,
@@ -64,7 +75,7 @@ impl AccountManager {
         let handle = tokio::spawn(async move {
             let catch_up_started_at = Instant::now();
             let catch_up = post_mutation.catch_up_account_commands(vec![command]).await;
-            post_mutation.shared.app_performance_telemetry().record(
+            post_mutation.shared.observer.performance().record(
                 AppPerformanceOperation::GroupInvitePostMutationCatchUp,
                 catch_up_started_at.elapsed(),
                 catch_up.is_ok(),
@@ -92,7 +103,8 @@ impl AccountManager {
     ) {
         let observation = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::CatchUpAfterMutation);
         let result = self.catch_up_account_commands(vec![command]).await;
         observation.finish_app(&result);
@@ -121,7 +133,8 @@ impl AccountManager {
             let result = manager.catch_up_account_commands(vec![command]).await;
             manager
                 .shared
-                .app_performance_telemetry()
+                .observer
+                .performance()
                 .record_classified_result(
                     AppPerformanceOperation::AccountCatchUp,
                     started_at.elapsed(),
@@ -130,7 +143,7 @@ impl AccountManager {
                         .err()
                         .map(super::account_catch_up_metric_classification),
                 );
-            manager.shared.app_performance_telemetry().record(
+            manager.shared.observer.performance().record(
                 AppPerformanceOperation::GroupCreatePostMutationCatchUp,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -200,7 +213,7 @@ impl AccountManager {
             .directory()
             .prewarm_group_member_key_packages(&member_refs)
             .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
             started_at.elapsed(),
             result.is_ok(),
@@ -275,7 +288,7 @@ impl AccountManager {
             Ok::<_, AppError>(created)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -400,7 +413,7 @@ impl AccountManager {
         }
         .await;
         let result = result.map(|created| created.group_id);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -441,7 +454,7 @@ impl AccountManager {
             .create_group_with_options_outcome(account_ref, name, members, options)
             .await
             .and_then(CanonicalCreatedGroup::into_detailed);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -563,7 +576,7 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupMlsStateRead,
             started_at.elapsed(),
             result.is_ok(),
@@ -649,6 +662,44 @@ impl AccountManager {
         self.catch_up_committed(command, "enable_group_disbanding")
             .await;
         self.schedule_audit_log_tracker_update("enable_group_disbanding");
+        Ok(summary)
+    }
+
+    pub async fn account_devices_activation(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::AppAccountDevicesActivation, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AccountDevicesActivation {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn enable_account_devices(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::EnableAccountDevices {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.catch_up_committed(command, "enable_account_devices")
+            .await;
+        self.schedule_audit_log_tracker_update("enable_account_devices");
         Ok(summary)
     }
 
@@ -854,7 +905,7 @@ impl AccountManager {
             Ok(summary)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupInviteMembers,
             started_at.elapsed(),
             result.is_ok(),
@@ -1005,6 +1056,236 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn linked_devices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::LinkedDevice>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::LinkedDevices { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::KeyPackageRefreshOverdue { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UnrecognizedSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, receiver) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AnswerSignIn {
+                slot_id_hex: slot_id_hex.to_owned(),
+                response,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(receiver).await
+    }
+
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CheckSignIns { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn start_fresh(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StartFresh { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StartedFresh { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn compromise_warning(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CompromiseWarning { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn dismiss_compromise_warning(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DismissCompromiseWarning { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RenameLinkedDevice {
+                slot_id_hex,
+                label,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn remove_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RemoveLinkedDevice {
+                slot_id_hex,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RemovedDeviceLeftoverChats { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn begin_recovery_words(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::RecoveryWords, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BeginRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConfirmRecoveryWords { answers, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CancelRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::TurnOffBackups { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn backup_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupSettings, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BackupSettings { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,
@@ -1130,18 +1411,16 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared
-            .app_performance_telemetry()
-            .record_classified_result(
-                AppPerformanceOperation::GroupAcceptInvite,
-                started_at.elapsed(),
-                result.as_ref().err().map(|error| {
-                    crate::SyncFailureClassification::new(
-                        crate::SyncFailureStage::AccountWorker,
-                        error.sync_error_class(),
-                    )
-                }),
-            );
+        self.shared.observer.performance().record_classified_result(
+            AppPerformanceOperation::GroupAcceptInvite,
+            started_at.elapsed(),
+            result.as_ref().err().map(|error| {
+                crate::SyncFailureClassification::new(
+                    crate::SyncFailureStage::AccountWorker,
+                    error.sync_error_class(),
+                )
+            }),
+        );
         result
     }
 
@@ -1388,7 +1667,7 @@ impl AccountManager {
             Ok(summary)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupPromoteAdmin,
             started_at.elapsed(),
             result.is_ok(),
@@ -1470,7 +1749,7 @@ impl AccountManager {
         revision: crate::MessageDraftRevision,
         attachments: Vec<MediaAttachmentReference>,
     ) -> Result<SendSummary, AppError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let caller = telemetry.observe(RuntimeOp::DraftSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
@@ -1513,7 +1792,7 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let caller = telemetry.observe(RuntimeOp::DirectSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
@@ -1539,7 +1818,7 @@ impl AccountManager {
         }
         .await;
         caller.finish_app(&result);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),
             result.is_ok(),
@@ -1655,19 +1934,13 @@ impl AccountManager {
         let command = self.worker_commands(&account.account_id_hex).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::Members {
+            .send(AccountWorkerCommand::GroupPushDebugInfo {
                 group_id: group_id.clone(),
                 respond,
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let members = account_worker_response(response)
-            .await?
-            .into_iter()
-            .map(|member| member.member_id_hex)
-            .collect::<Vec<_>>();
-        self.app
-            .group_push_debug_info(&account.label, &hex::encode(group_id.as_slice()), &members)
+        account_worker_response(response).await
     }
 
     pub(crate) async fn send_app_event(
@@ -1692,7 +1965,7 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),
             result.is_ok(),
@@ -2091,6 +2364,20 @@ impl AccountManager {
         Ok(summary)
     }
 
+    pub(crate) async fn device_link(
+        &self,
+        account_ref: &str,
+        op: crate::DeviceLinkOp,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeviceLink { op, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -2119,6 +2406,33 @@ impl AccountManager {
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::RotateKeyPackage { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn withdraw_key_package_slot(&self, account_ref: &str) -> Result<usize, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if account.signed_out && account.can_sign() {
+            // A signed-out account runs no worker, so nothing else publishes
+            // into its slot: open its session for the withdrawal alone. The
+            // session is exclusive, so no worker opens it until this closes.
+            self.ensure_worker_reaped(&account.account_id_hex).await?;
+            let mut client = self
+                .app
+                .local_client_with_relay_plane(
+                    &account.label,
+                    &self.app.relay_plane,
+                    Some(self.shared.lifecycle()),
+                )
+                .await?;
+            return client.withdraw_key_package_slot().await;
+        }
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::WithdrawKeyPackageSlot { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await

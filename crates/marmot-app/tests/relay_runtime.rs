@@ -2431,16 +2431,6 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         1,
         "setup must open the worker-owned session exactly once"
     );
-    assert!(
-        dir.path()
-            .join("key-packages")
-            .join(format!(
-                "{}.capability-refresh-v1-relay-scan-complete",
-                created.account.label
-            ))
-            .exists(),
-        "a generated account must persist the guaranteed-empty cutover scan marker before opening"
-    );
 
     let fetched = app
         .directory()
@@ -3595,10 +3585,10 @@ async fn app_component_lifecycle() {
     );
 
     let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
-    // Protocol space: an assigned id, the draft multi-device-join id the
-    // registry already owns, and the registry's next unassigned id. All three
-    // are below the application range and none of them reaches an MLS commit.
-    for protocol_id in [0x8003, 0x800a, 0x800d] {
+    // Protocol space: an assigned id, the withdrawn multi-device-join id
+    // (marmot#427), 0x800d, and an id the registry never assigned. All are
+    // below the application range and none of them reaches an MLS commit.
+    for protocol_id in [0x8003, 0x800a, 0x800d, 0xefff] {
         let reserved = runtime
             .update_app_component(&alice, &group, protocol_id, vec![])
             .await
@@ -4232,7 +4222,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             .await
             .expect("roster reads must not wait for scheduled recovery")
             .unwrap();
-            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
             assert_eq!(roster.self_membership, SelfMembership::Member);
             assert_eq!(roster.members.len(), 2);
         }
@@ -4334,7 +4324,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     .await
     .expect("roster read must not block on the initial catch-up")
     .unwrap();
-    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
     assert_eq!(roster.self_membership, SelfMembership::Member);
     let roster_member_ids = roster
         .members
@@ -5305,6 +5295,34 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
     runtime.shutdown().await;
 }
 
+/// Wait until `account` has joined `group` and holds a token record of `member`.
+async fn wait_for_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match runtime.group_push_debug_info(account, group).await {
+                Ok(view)
+                    if view
+                        .tokens
+                        .iter()
+                        .any(|token| token.member_id_hex == member) =>
+                {
+                    break;
+                }
+                Ok(_) | Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {}
+                Err(error) => panic!("push debug info failed: {error}"),
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's push token must reach the account");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removed_member_triggers_local_push_token_cleanup() {
     let dir = tempfile::tempdir().unwrap();
@@ -5319,34 +5337,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let carol = create_network_ready_identity(&runtime, setup).await;
-    let mut bob_chats = runtime
-        .subscribe_chats(&bob.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let mut carol_chats = runtime
-        .subscribe_chats(&carol.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let group_id = runtime
-        .create_group(
-            &alice.account.account_id_hex,
-            "removal cleanup",
-            &[
-                bob.account.account_id_hex.clone(),
-                carol.account.account_id_hex.clone(),
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-    // Group creation schedules recipient catch-up in the background. Wait for
-    // both recipients to join before registering tokens, otherwise a share can
-    // succeed with no joined groups and leave this cleanup test racing setup.
-    let group_id_hex = hex::encode(group_id.as_slice());
-    wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
-    wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
-
+    // Tokens are registered before anyone joins; no host share or catch-up
+    // follows, so every share below is the workers' own.
     for member in [&bob, &carol] {
         app.set_native_push_enabled(&member.account.account_id_hex, true)
             .unwrap();
@@ -5358,14 +5351,47 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             Some(url.clone()),
         )
         .unwrap();
-        let share = runtime
-            .share_push_registration(&member.account.account_id_hex)
-            .await
-            .unwrap();
-        assert_eq!(share.failed_groups, 0);
-        assert_eq!(share.pending_groups, 0);
     }
-    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "removal cleanup",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    // Bob's token reaches Alice before Carol is added, so only Bob's re-share
+    // after the add can bring it to Carol (mdk#2604).
+    wait_for_member_push_token(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    runtime
+        .invite_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&carol.account.account_id_hex),
+        )
+        .await
+        .unwrap();
+    wait_for_member_push_token(
+        &runtime,
+        &carol.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    wait_for_member_push_token(
+        &runtime,
+        &bob.account.account_id_hex,
+        &group_id,
+        &carol.account.account_id_hex,
+    )
+    .await;
 
     let bob_view_before = runtime
         .group_push_debug_info(&bob.account.account_id_hex, &group_id)
@@ -5409,6 +5435,115 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     })
     .await
     .expect("MemberRemoved must eventually clear carol's tokens from bob's projection");
+
+    runtime.shutdown().await;
+}
+
+/// Wait until `account` holds no token record of `member`.
+async fn wait_for_no_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let view = runtime.group_push_debug_info(account, group).await.unwrap();
+            if view
+                .tokens
+                .iter()
+                .all(|token| token.member_id_hex != member)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the departed member's push tokens must leave the account");
+}
+
+/// A removal blanks a leaf, so a later member's leaf no longer equals its
+/// position in member order. Push debug info checks each record against the
+/// real (member, leaf) roster and reports the device's own leaf (mdk#2622).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_debug_info_reads_real_leaves_after_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let carol_id = &carol.account.account_id_hex;
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    for member in [bob_id, carol_id] {
+        app.set_native_push_enabled(member, true).unwrap();
+        app.upsert_push_registration(
+            member,
+            PushPlatform::Fcm,
+            &format!("token-{}", &member[..8]),
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+    }
+    // Bob joins in the founding Commit (leaf 1) and Carol after him (leaf 2).
+    let group_id = runtime
+        .create_group(
+            alice_id,
+            "leaf positions",
+            std::slice::from_ref(bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    runtime
+        .invite_members(alice_id, &group_id, std::slice::from_ref(carol_id))
+        .await
+        .unwrap();
+    wait_for_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+    wait_for_member_push_token(&runtime, carol_id, &group_id, carol_id).await;
+    wait_for_member_push_token(&runtime, alice_id, &group_id, carol_id).await;
+
+    runtime
+        .remove_members(alice_id, &group_id, std::slice::from_ref(bob_id))
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    // Bob's records leave each device once it applies his removal.
+    wait_for_no_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    wait_for_no_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+
+    for (account, local_leaf_index) in [(alice_id, 0), (carol_id, 2)] {
+        let view = runtime
+            .group_push_debug_info(account, &group_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            view.local_registration.local_leaf_index,
+            Some(local_leaf_index),
+            "the device's own leaf, not its position in member order"
+        );
+        let carol_record = view
+            .tokens
+            .iter()
+            .find(|token| &token.member_id_hex == carol_id)
+            .expect("each device holds Carol's record");
+        assert_eq!(carol_record.leaf_index, 2);
+        assert!(carol_record.active_leaf);
+        assert!(carol_record.member_matches_active_leaf);
+        assert_eq!(view.stale_token_count, 0);
+        assert_eq!(view.active_token_count, view.total_token_count);
+    }
 
     runtime.shutdown().await;
 }
@@ -11312,7 +11447,7 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     let account_id = created.account.account_id_hex.clone();
 
     // The initial KeyPackage was published to the relay during setup, so the
-    // wipe's stage-2 discovery should find and delete at least one.
+    // wipe's stage 2 deletes this device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11329,8 +11464,8 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     assert!(outcome.group_leave_failures.is_empty());
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11595,11 +11730,11 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
     // No groups joined, so nothing to leave and no leave failures.
     assert_eq!(outcome.groups_left, 0);
     assert!(outcome.group_leave_failures.is_empty());
-    // Stage 2 signs the kind:5 deletions through the registered external
+    // Stage 2 signs the kind:5 deletion through the registered external
     // signer, so the relay cleanup is as complete as it is for a local account.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11761,6 +11896,154 @@ async fn app_runtime_sign_out_keeps_external_signer_registration() {
     runtime.shutdown().await;
 }
 
+/// The events `author` has of `kind` on the relay at `url`.
+async fn relay_events_of(url: &str, author: &str, kind: Kind) -> Vec<nostr::prelude::Event> {
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+            nostr_sdk::prelude::RelayUrl::parse(url).unwrap(),
+            vec![
+                nostr::prelude::Filter::new()
+                    .author(nostr::prelude::PublicKey::parse(author).unwrap())
+                    .kind(kind),
+            ],
+        )]))
+        .timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    client.shutdown().await;
+    events.into_iter().collect()
+}
+
+fn event_tags(event: &nostr::prelude::Event) -> Vec<Vec<String>> {
+    event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice().to_vec())
+        .collect()
+}
+
+fn slot_of(event: &nostr::prelude::Event) -> Option<String> {
+    event_tags(event)
+        .into_iter()
+        .find(|tag| tag.first().is_some_and(|name| name == "d"))
+        .and_then(|tag| tag.get(1).cloned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_one_device_deletes_only_its_own_key_package_slot() {
+    // mdk#1697: each device of an account publishes into its own slot, and
+    // signing one out deletes that slot and nothing else
+    // (`foundation/key-packages.md`, "Stopping publication").
+    let (_relay, url) = mock_relay().await;
+    let config = || MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_inviter = tempfile::tempdir().unwrap();
+    let device_a = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir_a.path(),
+        url.clone(),
+        config(),
+    ));
+    let app_b = MarmotApp::with_relay_and_config(dir_b.path(), url.clone(), config());
+    let device_b = MarmotAppRuntime::new(app_b.clone());
+    let inviter = MarmotApp::with_relay_and_config(dir_inviter.path(), url.clone(), config());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        discovery_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let created = create_network_ready_identity(&device_a, setup.relay_options_only()).await;
+    let account_id = created.account.account_id_hex.clone();
+    let nsec = AccountHome::open(dir_a.path())
+        .reveal_nsec(&created.account.label)
+        .unwrap();
+    device_b
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(nsec.to_string())),
+            ..setup
+        })
+        .await
+        .unwrap();
+    let slot_a = device_a
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    let lifecycle_b = device_b
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(slot_a, lifecycle_b.stable_slot_id);
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    let mut expected = vec![slot_a.clone(), lifecycle_b.stable_slot_id.clone()];
+    expected.sort();
+    assert_eq!(slots, expected);
+
+    let outcome = device_a
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+
+    // One kind 5 naming A's slot, with exactly one `a` and one `k` tag.
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot_a}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    // B's KeyPackage stays on the relay, and an inviter still selects it.
+    let remaining = relay_events_of(&url, &account_id, Kind::Custom(30443)).await;
+    assert_eq!(
+        remaining.iter().filter_map(slot_of).collect::<Vec<_>>(),
+        vec![lifecycle_b.stable_slot_id.clone()]
+    );
+    assert_eq!(
+        inviter
+            .directory()
+            .resolve_member_key_packages(&[account_id.as_str()])
+            .await
+            .unwrap(),
+        vec![lifecycle_b.current_key_package.clone().unwrap()]
+    );
+
+    // Signing A back in republishes its slot and deletes nothing more.
+    device_a.sign_in_account(&account_id).await.unwrap();
+    device_a.publish_key_package(&account_id).await.unwrap();
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    assert_eq!(slots, expected);
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::EventDeletion)
+            .await
+            .len(),
+        1
+    );
+    device_a.shutdown_and_close().await.unwrap();
+    device_b.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     // mdk#477: a non-destructive sign-out must clean up the relay
@@ -11784,8 +12067,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     .await;
     let account_id = created.account.account_id_hex.clone();
 
-    // Setup published a KeyPackage to the relay, so the sign-out should find
-    // and delete at least one.
+    // Setup published a KeyPackage to the relay, so the sign-out deletes this
+    // device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11802,8 +12085,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
 
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11892,6 +12175,11 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
     )
     .await;
     let account_id = created.account.account_id_hex;
+    let before = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let outcome = runtime
         .sign_out(&account_id, SignOutOptions::default())
@@ -11906,6 +12194,15 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
         runtime.accounts().resolve(&account_id).is_ok(),
         "best-effort remote failure must keep the local account"
     );
+    // No relay accepted the deletion, so the slot is recorded as it was.
+    runtime.sign_in_account(&account_id).await.unwrap();
+    let after = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.slot_withdrawn_at, None);
+    assert_eq!(after.authored_event_id, before.authored_event_id);
     runtime.shutdown().await;
 }
 
@@ -11978,6 +12275,70 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
+    // A signed-out account runs no worker; wiping it still deletes the slot
+    // it left published before its private material goes.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let account_id = created.account.account_id_hex;
+    let slot = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    runtime
+        .sign_out(
+            &account_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .iter()
+            .filter_map(slot_of)
+            .collect::<Vec<_>>(),
+        vec![slot.clone()]
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    assert!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_rejects_unknown_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, _url) = mock_app(&dir).await;
@@ -12041,8 +12402,8 @@ async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
         .unwrap();
 
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -13036,117 +13397,6 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
     })
     .await;
     runtime.shutdown().await;
-}
-
-/// mdk#1451: an injected Welcome-intent index failure must atomically roll back
-/// a multi-member staged invite before relay exposure. No repair-row prefix or
-/// phantom membership may survive restart.
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invite_members_returns_when_welcome_intent_recording_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let (relay, app, url) = gift_wrap_blocking_app_with_config(
-        &dir,
-        BlockNextGiftWraps::new(),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_dev_fail_invite_welcome_intent(true),
-    )
-    .await;
-    let runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![endpoint(&url)],
-        bootstrap_relays: vec![endpoint(&url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
-    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
-    let carol = create_network_ready_identity(&runtime, setup).await;
-    let dave = create_network_ready_identity(
-        &runtime,
-        AccountSetupRequest {
-            default_relays: vec![endpoint(&url)],
-            bootstrap_relays: vec![endpoint(&url)],
-            publish_initial_key_package: true,
-            ..AccountSetupRequest::default()
-        },
-    )
-    .await;
-    let alice_id = alice.account.account_id_hex.clone();
-    let bob_id = bob.account.account_id_hex.clone();
-    let carol_id = carol.account.account_id_hex.clone();
-    let dave_id = dave.account.account_id_hex.clone();
-    let mut events = runtime.subscribe();
-
-    let group_id = runtime
-        .create_group(
-            &alice_id,
-            "canonical invite despite intent failure",
-            std::slice::from_ref(&bob_id),
-            None,
-        )
-        .await
-        .unwrap();
-    wait_for_event(&mut events, |event| {
-        matches!(
-            event,
-            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
-                if account_id_hex == &bob_id && joined_group == &group_id
-        )
-    })
-    .await;
-
-    let error = timeout(
-        Duration::from_secs(5),
-        runtime.invite_members(&alice_id, &group_id, &[carol_id.clone(), dave_id.clone()]),
-    )
-    .await
-    .expect("intent persistence failure must roll back promptly")
-    .expect_err("an unexposed, rolled-back invite must return its persistence error");
-    assert!(matches!(error, AppError::Publish(_)));
-    assert!(
-        runtime
-            .pending_welcome_deliveries(&alice_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "failed Welcome-intent persistence must not leave a durable repair handle"
-    );
-    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
-    assert!(
-        members
-            .iter()
-            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
-        "rolled-back invitees must disappear from the live roster"
-    );
-
-    runtime.shutdown().await;
-
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        url.clone(),
-        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
-    let runtime = MarmotAppRuntime::new(app);
-    runtime.reconcile_accounts().await.unwrap();
-    assert!(
-        runtime
-            .pending_welcome_deliveries(&alice_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "restart must not invent Welcome repair handles the first attempt never persisted"
-    );
-    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
-    assert!(
-        members
-            .iter()
-            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
-        "rolled-back multi-member invite must remain absent after restart"
-    );
-    runtime.shutdown().await;
-    drop(relay);
 }
 
 /// mdk#1451: an injected local-projection failure after confirm must not fail

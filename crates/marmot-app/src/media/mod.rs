@@ -17,8 +17,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::MarmotNostrSigner;
 
-use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 mod blossom;
 mod crypto;
@@ -32,12 +33,12 @@ pub(crate) mod legacy_migration;
 pub(crate) mod outgoing;
 pub(crate) mod storage_compaction;
 pub(crate) use crypto::media_hash_from_reference;
+pub(crate) use crypto::{MediaKey, media_file_key_for_reference};
 mod group_image;
 mod host_safety;
 
-use blossom::{
-    blossom_content_hash_from_url, upload_blossom_blob, upload_blossom_blob_with_content_type,
-};
+pub(crate) use blossom::upload_blossom_blob;
+use blossom::{blossom_content_hash_from_url, upload_blossom_blob_with_content_type};
 use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, media_nonce_from_reference,
     validate_sha256_hex,
@@ -50,7 +51,7 @@ use host_safety::{validate_blossom_fetch_url, validate_locator};
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
 #[cfg(test)]
 pub(crate) use blossom::fetch_blossom_blob;
-pub(crate) use blossom::{BlossomHttpTransport, blossom_blob_url};
+pub(crate) use blossom::{BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_limited};
 pub use group_image::{MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS};
 pub(crate) use group_image::{
     fetch_group_image_with_transport, prepare_group_image_upload, upload_group_image,
@@ -98,9 +99,10 @@ impl MediaDownloadBenchmarkTransport {
     pub async fn fetch_with_telemetry(
         &self,
         url: &str,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &crate::AppPerformanceTelemetry,
     ) -> Result<Vec<u8>, AppError> {
-        blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(telemetry)).await
+        let telemetry = PerformanceRecorder::from(telemetry);
+        blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(&telemetry)).await
     }
 
     /// Fetch one integrity-bound blob through the ordered production locator path.
@@ -108,8 +110,9 @@ impl MediaDownloadBenchmarkTransport {
         &self,
         locators: Vec<String>,
         ciphertext_sha256: String,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &crate::AppPerformanceTelemetry,
     ) -> Result<Vec<u8>, AppError> {
+        let telemetry = PerformanceRecorder::from(telemetry);
         let reference = MediaAttachmentReference {
             locators: locators
                 .into_iter()
@@ -133,7 +136,7 @@ impl MediaDownloadBenchmarkTransport {
             &[],
             &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
             &self.0,
-            Some(telemetry),
+            Some(&telemetry),
         )
         .await
         .map_err(AttachmentDownloadFailure::into_error)
@@ -944,6 +947,51 @@ async fn upload_blossom_blob_with_fallback(
     )))
 }
 
+/// Uploads one history bundle's ciphertext (mdk#2628 4.2c) to the first of
+/// `servers` that takes it, as an attachment tries its chat's endpoints, and
+/// returns that server.
+pub(crate) async fn upload_history_blob(
+    servers: &[String],
+    ciphertext: Bytes,
+    hash_hex: &str,
+    signer: &dyn MarmotNostrSigner,
+    transport: &BlossomHttpTransport,
+) -> Result<String, AppError> {
+    let mut timed_out = false;
+    for server in servers {
+        match upload_blossom_blob(server, ciphertext.clone(), hash_hex, signer, transport).await {
+            Ok(_) => return Ok(server.clone()),
+            Err(AppError::ExternalSignerRejected) => return Err(AppError::ExternalSignerRejected),
+            Err(error) => timed_out |= matches!(error, AppError::MediaUploadTimedOut),
+        }
+    }
+    Err(if timed_out {
+        AppError::MediaUploadTimedOut
+    } else {
+        AppError::BlobStore("history blob upload failed for all Blossom servers".into())
+    })
+}
+
+/// Fetches one history bundle's ciphertext from the Blossom server `server`
+/// at its SHA-256 `hash`, through the dial-safe transport, reading at most
+/// `max_bytes`. Other bytes than `hash` names are refused.
+pub(crate) async fn fetch_history_blob(
+    server: &str,
+    hash: &[u8; 32],
+    max_bytes: u64,
+    transport: &BlossomHttpTransport,
+) -> Result<Vec<u8>, AppError> {
+    let url = blossom::blossom_blob_url_with_extension(server, &hex::encode(hash), None);
+    let transport = transport.clone().with_download_limit(max_bytes);
+    let ciphertext = blossom::fetch_blossom_blob_limited_with_transport(&url, &transport).await?;
+    if <[u8; 32]>::from(Sha256::digest(&ciphertext)) != *hash {
+        return Err(AppError::BlobStore(
+            "history blob does not match its hash".into(),
+        ));
+    }
+    Ok(ciphertext)
+}
+
 fn upload_error_summary(err: &AppError) -> String {
     match err {
         AppError::BlobStore(message)
@@ -970,7 +1018,7 @@ pub(crate) async fn download_encrypted_media(
     let transport = BlossomHttpTransport::new(allow_loopback_blob_endpoints);
     download_encrypted_media_with_transport(
         reference,
-        media_secret,
+        MediaKey::EpochSecret(media_secret),
         fallback_endpoints,
         allowed_locator_kinds,
         &transport,
@@ -1018,15 +1066,15 @@ impl AttachmentDownloadFailure {
 /// recording only reviewed aggregate phase outcomes.
 pub(crate) async fn download_encrypted_media_with_transport(
     reference: MediaAttachmentReference,
-    media_secret: &[u8],
+    key: MediaKey<'_>,
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<MediaDownloadResult, AppError> {
     download_encrypted_media_classified(
         reference,
-        media_secret,
+        key,
         fallback_endpoints,
         allowed_locator_kinds,
         transport,
@@ -1038,11 +1086,11 @@ pub(crate) async fn download_encrypted_media_with_transport(
 
 pub(crate) async fn download_encrypted_media_classified(
     reference: MediaAttachmentReference,
-    media_secret: &[u8],
+    key: MediaKey<'_>,
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<MediaDownloadResult, AttachmentDownloadFailure> {
     // Structural validation only: an out-of-policy or client-unsupported locator
     // is judged at fetch time below, where it degrades to an unfetchable outcome
@@ -1069,20 +1117,16 @@ pub(crate) async fn download_encrypted_media_classified(
             .map_err(AttachmentDownloadFailure::Stop)?,
     };
     let nonce = media_nonce_from_reference(&reference).map_err(AttachmentDownloadFailure::Stop)?;
-    let file_key = derive_media_file_key(
-        media_secret,
-        version,
-        &plaintext_hash,
-        &media_type,
-        &reference.file_name,
-    )
-    .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?;
+    let file_key = zeroize::Zeroizing::new(
+        key.file_key(version, &plaintext_hash, &media_type, &reference.file_name)
+            .map_err(|e| AttachmentDownloadFailure::Stop(media_download_failure(e)))?,
+    );
     let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     if let Some(resume) = &transport.resume {
         resume.phase(3).await?;
     }
     let decrypt_started = Instant::now();
-    let cipher = ChaCha20Poly1305::new_from_slice(&file_key).map_err(|_| {
+    let cipher = ChaCha20Poly1305::new_from_slice(file_key.as_slice()).map_err(|_| {
         record_media_download_phase(
             telemetry,
             AppPerformanceOperation::MediaDownloadDecrypt,
@@ -1197,7 +1241,7 @@ async fn fetch_encrypted_media_blob_with_observer(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AppError> {
     fetch_encrypted_media_blob_classified(
         reference,
@@ -1215,7 +1259,7 @@ async fn fetch_encrypted_media_blob_classified(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure> {
     // Fetchability is judged against CURRENT policy + current client support.
     // This client only fetches `blossom-v1`, so if the group's current policy
@@ -1434,7 +1478,7 @@ fn media_download_failure(err: AppError) -> AppError {
 
 /// Record one reviewed media phase without dynamic labels or identifiers.
 fn record_media_download_phase(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
     started_at: Instant,
     success: bool,
@@ -1446,7 +1490,7 @@ fn record_media_download_phase(
 
 /// Record time lost to a candidate only when another locator will be tried.
 fn record_locator_failover_if_needed(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     started_at: Instant,
     candidate_index: usize,
     candidate_count: usize,

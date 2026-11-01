@@ -71,7 +71,9 @@ pub(crate) struct AttachmentResume {
     pub permission: Option<crate::runtime::attachment_permission::PermissionLease>,
     /// Once verification finishes, cancellation waits for the receipt and result.
     pub finishing: Arc<AtomicBool>,
-    pub updates: Option<tokio::sync::watch::Sender<()>>,
+    /// Wakes transfer observers after each progress or phase write: byte
+    /// progress as progress, a body restart or a new phase as a state change.
+    pub updates: Option<crate::runtime::attachment_controls::AttachmentUpdates>,
 }
 fn retry(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Retry(AppError::BlobStore(message.into()))
@@ -410,6 +412,9 @@ impl AttachmentResume {
             .min(super::blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES)
     }
 
+    /// Records `received` of `total` ciphertext bytes for this attempt, from
+    /// zero again when `restart` starts a new body, and wakes transfer
+    /// observers: plain byte progress as progress, a restart as a state change.
     pub(crate) async fn progress(
         &self,
         received: u64,
@@ -434,10 +439,20 @@ impl AttachmentResume {
             return Err(retry("transfer no longer admitted"));
         }
         if let Some(updates) = &self.updates {
-            updates.send_modify(|_| {});
+            // A restart starts a body, possibly on a fallback server after a
+            // verification phase, and the write puts the row back in
+            // Downloading: once per body, so it is reported as a state change.
+            if restart {
+                updates.state_changed();
+            } else {
+                updates.progressed();
+            }
         }
         Ok(())
     }
+    /// Records that the attempt entered verification phase `phase` (ciphertext
+    /// verification, decryption or plaintext verification) and wakes observers
+    /// with a state change, since the row enters that transfer state.
     pub(crate) async fn phase(&self, phase: u8) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
         let updated = tokio::task::spawn_blocking(move || {
@@ -454,7 +469,7 @@ impl AttachmentResume {
             return Err(retry("transfer no longer admitted"));
         }
         if let Some(updates) = &self.updates {
-            updates.send_modify(|_| {});
+            updates.state_changed();
         }
         Ok(())
     }

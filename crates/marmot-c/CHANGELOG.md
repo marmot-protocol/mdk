@@ -7,8 +7,157 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE` is now
+  `MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, with the
+  same value (mdk#2628 D74, 3.7b): a KeyPackage this device found in its own
+  slot that it did not make, which only this device warns of. Kind 462 is no
+  longer reserved. The device roster changed its encoding, so existing
+  development device groups must be recreated. Use matching regenerated
+  headers and libraries.
+
+- A device that its device group removes after its link was made is
+  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
+  signed out. The new `MARMOT_EVENT_DEVICE_UNLINKED` event, sent once, says
+  so; `MarmotAccountSummary` gains a trailing `unlinked`; and signing in to
+  such an account returns the new `MARMOT_STATUS_ACCOUNT_UNLINKED` (116).
+  `marmot_sign_out_and_wipe` skips leaving its chats and deleting its slot;
+  signing in again is then a new link. The struct layout changed: use
+  matching regenerated headers and libraries.
+
+- `MarmotSelfMembership` and `MarmotConversationParticipation` add
+  `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
+  chat the account stays in through another of its devices. Show no "removed
+  from group" notice for it. Handle the new values and use matching
+  regenerated headers and libraries.
+
+- `MarmotGroupEventKind` adds `QueuedIntentRefused { intent_id_hex,
+  intent_kind, reason }` (mdk#2694), freed with its event. Handle the new tag
+  and use matching regenerated headers and libraries.
+
+- `MarmotHistoryNoticeCause` appends `UnprovenHistory`, and `MarmotEvent`
+  appends `RecoveryStatusChanged { account_id_hex, account_label }`, freed with
+  its event (mdk#2660). Existing values keep their numbers. Handle the new
+  values in exhaustive switches and use matching regenerated headers and
+  libraries. Neither is produced until the recovery runner owns history.
+
+- `marmot_deployment_set_key_package_client_preference` is removed
+  (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
+  Drop the call and use matching regenerated headers and libraries.
+
+### Added
+
+- `marmot_account_recovery_status` writes an owned
+  `MarmotAccountRecoveryStatus`: the groups whose history is still being
+  fetched (`catching_up_group_ids_hex`), whether the inbox's is
+  (`inbox_catching_up`), and every notice (`notices`) (mdk#2660). Free it with
+  `marmot_account_recovery_status_free`, and re-read it on
+  `MARMOT_EVENT_RECOVERY_STATUS_CHANGED`. Until the recovery runner owns
+  history nothing is ever catching up.
+- `MarmotClientOptions` gains a trailing `device_platform`: the platform this
+  device runs on, such as "iOS", which each device writes with its client
+  label into its own roster entry (mdk#2628 item 3.6). NULL leaves it out.
+  The struct layout changed: use matching regenerated headers and libraries.
+- `marmot_rename_linked_device` renames one of this account's devices, this
+  one included, by its `slot_id_hex`, with one roster commit in the device
+  group (mdk#2628 item 3.6). It fails with nothing sent while the device group
+  has an earlier change in flight, and in release builds until the roster's
+  spec lands. A rename whose commit loses a fork is made again later, unless
+  another rename of that device won. Use matching regenerated headers and
+  libraries.
+- `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
+  group whose convergence pass spent its failure budget (mdk#2684). Show it as
+  stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
+  The struct grows, so use matching regenerated headers and libraries.
+- Device linking (mdk#2628 item 3.3b): `marmot_start_device_link`,
+  `marmot_confirm_device_link_match`, `marmot_cancel_device_link`,
+  `marmot_link_device`, `marmot_decline_device_link` and
+  `marmot_device_link_snapshot` write a `MarmotDeviceLinkSnapshot` (free with
+  `marmot_device_link_snapshot_free`). The new
+  `MARMOT_EVENT_DEVICE_LINK_CHANGED` event says to re-read it. Every call is
+  refused in release builds until the pairing and device-group specs land. Use
+  matching regenerated headers and libraries.
+- `marmot_linked_devices` writes this account's own devices as a
+  `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
+  the roster of the device group this device trusts, this device first
+  (mdk#2628 item 3.1). The new `MARMOT_EVENT_LINKED_DEVICES_CHANGED` event says
+  to re-read it. The list is empty in release builds until the roster's spec
+  lands. Use matching regenerated headers and libraries.
+- `MarmotLinkedDevice` adds `has_last_active_at`/`last_active_at`, when a
+  heartbeat last showed a sibling running, and `inactive`, this device's own
+  judgement 30 days after the later of that and when it first found the
+  sibling in the roster (mdk#2628 item 3.6). Use matching regenerated headers
+  and libraries.
+- `marmot_key_package_refresh_overdue` writes whether this device's device
+  group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
+  so the app can tell the user before inviters stop treating the device as
+  fresh at 30 days. The new `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`
+  event says to re-read it. It is false in release builds until the roster's
+  spec lands. Use matching regenerated headers and libraries.
+- `marmot_unrecognized_sign_ins` and `marmot_check_sign_ins` write sign-ins of
+  this account that this device does not recognize as a
+  `MarmotUnrecognizedSignInList` (free with
+  `marmot_unrecognized_sign_in_list_free`) (mdk#2628 item 3.2).
+  `marmot_answer_sign_in` answers one with a `MarmotSignInResponse`
+  discriminant. The new `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED` event says
+  to re-read the list. It is empty in release builds until the roster's spec
+  lands. Use matching regenerated headers and libraries.
+- `marmot_compromise_warning` writes the account's open compromise warning on
+  this device as a `MarmotCompromiseWarningItemList` (free with
+  `marmot_compromise_warning_item_list_free`) (mdk#2628 item 3.7a), whose
+  `reason` is a `MarmotCompromiseWarningReason` discriminant as `uint32_t`.
+  `marmot_dismiss_compromise_warning` closes it on this device, and the new
+  `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED` event says to re-read it.
+  `marmot_start_fresh` answers every sign-in from before this device Not now
+  without rejecting any, and `marmot_started_fresh` writes whether the device
+  did so and still has no device group. All are empty or false in release
+  builds until the roster's spec lands. Use matching regenerated headers and
+  libraries.
+- `marmot_account_devices_activation` and `marmot_enable_account_devices` let
+  an admin turn on account-devices in an existing group, only when the user
+  asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that
+  never names which members or devices hold the group back; a refused
+  activation returns the new `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED`
+  (110). Existing status values are unchanged. Use matching regenerated
+  headers and libraries.
+- Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (108): the group left the
+  epoch an attachment was encrypted under, so upload it again; and
+  `MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED` (109): the group's epoch is
+  settling, so sync and send again. Both previously returned
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`. Existing status values are
+  unchanged. Use matching regenerated headers and libraries (#2158).
+
+- Sonar-compatible stickers: `marmot_sticker_packs`, `marmot_sticker_pack`,
+  `marmot_sync_sticker_packs`, `marmot_fetch_sticker_pack`, `marmot_install_sticker_pack`,
+  `marmot_uninstall_sticker_pack`, `marmot_fetch_sticker_asset`, `marmot_send_sticker` and
+  `marmot_import_signal_sticker_pack` (validates the link, then refuses before any network
+  call), with records `MarmotStickerRef`, `MarmotSticker`, `MarmotStickerPack`,
+  `MarmotStickerAsset`, `MarmotStickerSyncResult` and `MarmotStickerImportResult` and their
+  `*_free` functions. `MarmotSticker.plaintext_sha256` is the exact hash the fetch and send
+  calls take; `MarmotStickerImportResult.skipped_signal_sticker_ids` is a `uint32_t` array,
+  `(NULL, 0)` when empty. `MarmotAppMessageRecord`, `MarmotReceivedMessage`,
+  `MarmotNotificationUpdate`, `MarmotChatListMessagePreview`, `MarmotTimelineMessageRecord`
+  and `MarmotTimelineReplyPreview` add a nullable `sticker` at the position of the
+  matching UniFFI field, so those layouts change. New status codes `MARMOT_STATUS_INVALID_STICKER` (111),
+  `MARMOT_STATUS_STICKER_NOT_FOUND` (112), `MARMOT_STATUS_STICKER_NETWORK` (113),
+  `MARMOT_STATUS_STICKER_IMPORT` (114) and `MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED` (115).
+  Use matching regenerated headers and libraries.
+
 ### Changed
 
+- `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
+  461, 473, 475 and 476 as reserved, and one received in a chat makes no
+  timeline row, message or notification (mdk#2628). They are read only in
+  the account's device group.
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
+  last 30 days, at most 20, or the single best one when none is that recent.
+- Group member rows are accounts, not devices (mdk#2628).
+  `MarmotAppGroupMemberRecord` and `MarmotGroupMemberDetails` gain
+  `device_count`, and an account with several devices in the group is one
+  row; `member_count`, admin counts and `is_last_admin` count accounts. Use
+  matching regenerated headers and libraries.
 - `marmot_attachment_transfer_subscription_next` returns a replacement that
   changes a row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A timeout no longer loses
@@ -27,6 +176,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
     `local storage error`, an unknown engine group `unknown local group`, and
     any other engine failure `session error`. Account failures outside the
     engine still read `account error`.
+- `marmot_client_new_with_client_name` and `MarmotClientOptions.client_name`
+  leave out a name longer than 64 bytes once trimmed instead of publishing it;
+  the KeyPackage still publishes, untagged (mdk#2628).
 
 ## [0.14.0] - 2026-10-23
 

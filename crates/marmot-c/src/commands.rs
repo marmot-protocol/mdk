@@ -43,21 +43,24 @@ use crate::types::chat_list::{
     MarmotExistingDirectConversation,
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
+use crate::types::compromise_warning::MarmotCompromiseWarningItemList;
+use crate::types::device_link::MarmotDeviceLinkSnapshot;
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
 use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
-    MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
-    MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
-    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
-    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupDetails,
-    MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
-    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
-    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPreparedGroupImageUpload,
-    MarmotPreparedGroupImageUploadList,
+    MarmotAccountDevicesActivation, MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList,
+    MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
+    MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotCreatedGroup,
+    MarmotDisbandRequest, MarmotGroupAppComponent, MarmotGroupCommitDelivery,
+    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
+    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
-use crate::types::history_notice::MarmotHistoryNoticeList;
+use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
+use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
     MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
 };
@@ -85,6 +88,11 @@ use crate::types::push::{
 use crate::types::relay::{
     MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
     MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
+};
+use crate::types::sign_in::{MarmotSignInResponse, MarmotUnrecognizedSignInList};
+use crate::types::sticker::{
+    MarmotStickerAsset, MarmotStickerImportResult, MarmotStickerPack, MarmotStickerPackList,
+    MarmotStickerSyncResult,
 };
 use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
@@ -563,8 +571,8 @@ c_cmd! {
 
     /// Non-destructive sign-out: deactivate the account on this device,
     /// keeping local state so it can sign back in later. When
-    /// `delete_key_packages` is true, relay-published KeyPackages get
-    /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
+    /// `delete_key_packages` is true, this device's KeyPackage slot gets a
+    /// NIP-09 deletion. Free with `marmot_sign_out_outcome_free`.
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
     /// Retry onboarding against explicitly selected discovery relays.
@@ -763,10 +771,123 @@ c_cmd! {
     /// `marmot_history_notice_list_free`.
     async fn marmot_history_notices(account_ref: str) -> rec(MarmotHistoryNoticeList) = history_notices;
 
+    /// Read the account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice. Re-read on the
+    /// `RecoveryStatusChanged` event. Free with
+    /// `marmot_account_recovery_status_free`.
+    async fn marmot_account_recovery_status(account_ref: str) -> rec(MarmotAccountRecoveryStatus) = account_recovery_status;
+
     /// Dismiss one notice once the user accepts the history may be incomplete.
     /// Durable; recorded as its own outcome, never as recovered history.
     /// Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
     async fn marmot_dismiss_history_notice(account_ref: str, notice_id: str) -> scalar(bool) = dismiss_history_notice;
+
+    /// List this account's own devices from the roster of the device group
+    /// this device trusts: this device first, then by when each was linked.
+    /// Empty until this device trusts a device group, and always empty in
+    /// release builds until the roster's spec lands. Re-read on the
+    /// `LinkedDevicesChanged` event. Free with
+    /// `marmot_linked_device_list_free`.
+    async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
+
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement that must come first; warn the user
+    /// while it is. Always false until this device trusts a device group,
+    /// and in release builds until the device group's spec lands. Re-read on
+    /// the `KeyPackageRefreshOverdueChanged` event.
+    async fn marmot_key_package_refresh_overdue(account_ref: str) -> scalar(bool) = key_package_refresh_overdue;
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `marmot_linked_devices`: one roster commit in the
+    /// device group. The label is at most 64 bytes of UTF-8; an empty
+    /// string clears it. Fails while device groups are off, for an unknown
+    /// device, or while the device group has an earlier change in flight
+    /// (retry later). A rename whose commit loses a fork is made again later,
+    /// unless another rename of that device won. Re-read on the
+    /// `LinkedDevicesChanged` event.
+    async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
+    /// Remove another of this account's devices, by its `slot_id_hex` from
+    /// `marmot_linked_devices`, from the device group and every chat, and
+    /// delete its KeyPackage slot. The removal is recorded at once and
+    /// carried out as the device group allows; the device shows
+    /// `removal_pending` until then. Fails while device groups are off, for
+    /// an unknown device, for this device (sign out instead), or for a
+    /// device whose link is not made yet. Re-read on the
+    /// `LinkedDevicesChanged` event.
+    async fn marmot_remove_linked_device(account_ref: str, slot_id_hex: str) -> unit = remove_linked_device;
+    /// How many chats this device is in still hold a device this account
+    /// removed, because the chat doesn't take a same-account removal; a chat
+    /// admin can remove it. Zero while device groups are off. Not evented:
+    /// read it when showing the device list.
+    async fn marmot_removed_device_leftover_chats(account_ref: str) -> scalar(u32) = removed_device_leftover_chats;
+
+    /// List the sign-ins of this account that this device does not
+    /// recognize, the earliest to appear first. Always empty in release
+    /// builds until the roster's spec lands. Re-read on the
+    /// `UnrecognizedSignInsChanged` event. Free with
+    /// `marmot_unrecognized_sign_in_list_free`.
+    async fn marmot_unrecognized_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = unrecognized_sign_ins;
+
+    /// Check the account's KeyPackage slots for new sign-ins now and write
+    /// the list after the check. A read that reached no relay fails. Free
+    /// with `marmot_unrecognized_sign_in_list_free`.
+    async fn marmot_check_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = check_sign_ins;
+
+    /// Start this device without the devices its first check found ("No,
+    /// start fresh"): each sign-in from before this device is answered Not
+    /// now, now and when one is listed later. It rejects nothing and raises
+    /// no warning, so one of those devices can still link this one. Fails
+    /// before the first check and once this device trusts a device group.
+    async fn marmot_start_fresh(account_ref: str) -> unit = start_fresh;
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false in release builds until the roster's spec lands.
+    async fn marmot_started_fresh(account_ref: str) -> scalar(bool) = started_fresh;
+
+    /// List the account's open compromise warning on this device: each
+    /// rejection the user has not seen here, the earliest gathered first.
+    /// Empty when no warning is open. The host writes the wording, and never
+    /// says the account's devices stopped whoever holds the key. Always empty
+    /// in release builds until the roster's spec lands. Re-read on the
+    /// `CompromiseWarningChanged` event. Free with
+    /// `marmot_compromise_warning_item_list_free`.
+    async fn marmot_compromise_warning(account_ref: str) -> rec(MarmotCompromiseWarningItemList) = compromise_warning;
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged.
+    async fn marmot_dismiss_compromise_warning(account_ref: str) -> unit = dismiss_compromise_warning;
+
+    /// On a new device: ask a device of this account already signed in to
+    /// link this one. Refused in release builds until the pairing and
+    /// device-group specs land. Re-read on the `DeviceLinkChanged` event.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_start_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = start_device_link;
+
+    /// On the new device: the user says both screens show the same emoji.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_confirm_device_link_match(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = confirm_device_link_match;
+
+    /// On the new device: cancel the link. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_cancel_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = cancel_device_link;
+
+    /// On a device already signed in: Link device. `label` is the name the
+    /// user gave the new device, at most 64 bytes. Offer both settings on
+    /// by default: `add_to_all_chats` adds it to the chats this account's
+    /// devices are in, and `bring_history` brings it those chats' history.
+    /// Free with `marmot_device_link_snapshot_free`.
+    async fn marmot_link_device(account_ref: str, prompt_id: str, label: str, add_to_all_chats: flag, bring_history: flag) -> rec(MarmotDeviceLinkSnapshot) = link_device;
+
+    /// On a device already signed in: Not now. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_decline_device_link(account_ref: str, prompt_id: str) -> rec(MarmotDeviceLinkSnapshot) = decline_device_link;
+
+    /// Linking as this device shows it now: its own new-device link, if
+    /// any, and the prompts for sign-ins it can link. Re-read on the
+    /// `DeviceLinkChanged` event. Free with
+    /// `marmot_device_link_snapshot_free`.
+    async fn marmot_device_link_snapshot(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = device_link_snapshot;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.
@@ -1088,6 +1209,18 @@ c_cmd! {
     /// `marmot_group_mutation_result_free`.
     async fn marmot_enable_group_disbanding(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMutationResult) = enable_group_disbanding;
 
+    /// Whether the account can turn on account-devices in the group now.
+    /// Ask before offering `marmot_enable_account_devices`. The answer is
+    /// about the whole group, never which members or devices hold it back.
+    async fn marmot_account_devices_activation(account_ref: str, group_id_hex: str) -> enum_ret(MarmotAccountDevicesActivation) = account_devices_activation;
+
+    /// Turn on account-devices in one admin Commit, only when the user asks;
+    /// it can never be turned off. Returns
+    /// `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED` unless
+    /// `marmot_account_devices_activation` would answer `ELIGIBLE`. Free with
+    /// `marmot_group_mutation_result_free`.
+    async fn marmot_enable_account_devices(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMutationResult) = enable_account_devices;
+
     /// Request terminal disbanding of the group. Writes this account's
     /// durable request outcome; free it with
     /// `marmot_disband_request_free`.
@@ -1222,6 +1355,38 @@ c_cmd! {
     /// `now_ms` is the caller's wall clock. Free with
     /// `marmot_retention_sweep_report_free`.
     async fn marmot_sweep_expired_retention(account_ref: str, now_ms: val u64) -> rec(MarmotRetentionSweepReport) = sweep_expired_retention;
+}
+
+/// Answer the unrecognized sign-in in `slot_id_hex`. `response` is a
+/// `MarmotSignInResponse` discriminant: `NotNow` keeps it listed with no
+/// prompt, `Reject` records it as rejected in the device group's roster
+/// (now or once that is possible), and `Dismiss` only ends a prompt another
+/// device already answered. An out-of-range `response` is
+/// `MARMOT_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` and `slot_id_hex` must be
+/// valid NUL-terminated strings. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_answer_sign_in(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    slot_id_hex: *const c_char,
+    response: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let slot = try_arg!(unsafe { required_str(slot_id_hex) });
+        let response = try_arg!(MarmotSignInResponse::from_c(response));
+        deliver_unit(
+            client.block_on(
+                client
+                    .marmot
+                    .answer_sign_in(account, slot, response.to_ffi()),
+            ),
+        )
+    })
 }
 
 /// Parse Markdown text into the display token tree. Infallible: malformed
@@ -3405,6 +3570,153 @@ pub unsafe extern "C" fn marmot_message_edit_history(
                     (has_before != 0).then_some(before_edited_at),
                     before,
                     limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Read the encrypted sticker projection off the UI thread.
+/// `installed_only` is a uint8_t flag. `has_limit` 0 leaves the limit unset.
+/// Free with `marmot_sticker_pack_list_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_sticker_packs(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    installed_only: u8,
+    search: *const c_char,
+    has_limit: u8,
+    limit: u32,
+    out: *mut *mut MarmotStickerPackList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let search = try_arg!(unsafe { crate::memory::optional_str(search) });
+        let limit = crate::memory::c_bool(has_limit).then_some(limit);
+        unsafe {
+            deliver(
+                client.marmot.sticker_packs(
+                    account_ref,
+                    crate::memory::c_bool(installed_only),
+                    search,
+                    limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+c_cmd! {
+    /// Read one cached pack by coordinate or trusted pack link. NULL when absent.
+    /// Free with `marmot_sticker_pack_free`.
+    sync fn marmot_sticker_pack(
+        account_ref: str, input: str,
+    ) -> opt_rec(MarmotStickerPack) = sticker_pack;
+
+    /// Refresh recent public packs and this account's installed list.
+    /// Free with `marmot_sticker_sync_result_free`.
+    async fn marmot_sync_sticker_packs(
+        account_ref: str,
+    ) -> rec(MarmotStickerSyncResult) = sync_sticker_packs;
+
+    /// Fetch one pack from its relay hints, then the account relays.
+    /// Free with `marmot_sticker_pack_free`.
+    async fn marmot_fetch_sticker_pack(
+        account_ref: str, input: str,
+    ) -> rec(MarmotStickerPack) = fetch_sticker_pack;
+
+    /// Record local install intent and publish the installed list.
+    /// Free with `marmot_sticker_pack_free`.
+    async fn marmot_install_sticker_pack(
+        account_ref: str, input: str,
+    ) -> rec(MarmotStickerPack) = install_sticker_pack;
+
+    /// Record local uninstall intent and publish the installed list.
+    async fn marmot_uninstall_sticker_pack(
+        account_ref: str, input: str,
+    ) -> unit = uninstall_sticker_pack;
+
+    /// Validate a canonical Signal pack link, then refuse before any network
+    /// call. The pinned importer cannot be address-pinned, so this command
+    /// does not download or upload. `blossom_server` may be NULL. Free with
+    /// `marmot_sticker_import_result_free`.
+    async fn marmot_import_signal_sticker_pack(
+        account_ref: str, signal_link: str, blossom_server: opt_str,
+    ) -> rec(MarmotStickerImportResult) = import_signal_sticker_pack;
+}
+
+/// Download one exact sticker asset. The reference is borrowed and not freed.
+/// Free the result with `marmot_sticker_asset_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_fetch_sticker_asset(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    out: *mut *mut MarmotStickerAsset,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.fetch_sticker_asset(account_ref, sticker_ref)),
+                out,
+            )
+        }
+    })
+}
+
+/// Send an exact sticker reference into a group.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_sticker(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .send_sticker(account_ref, group_id_hex, sticker_ref),
                 ),
                 out,
             )

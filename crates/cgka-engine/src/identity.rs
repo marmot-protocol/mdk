@@ -5,7 +5,7 @@
 //! signing key.
 
 use cgka_traits::error::EngineError;
-use cgka_traits::group::ProtocolProfile;
+use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
@@ -134,9 +134,12 @@ impl Identity {
         self.account_identity_proof.protocol_profile()
     }
 
+    /// Extensions for a new own LeafNode, carrying `device_tag` when this
+    /// device can tag.
     pub(crate) fn leaf_extensions(
         &self,
         supported_app_components: &cgka_traits::app_components::AppComponentSet,
+        device_tag: Option<Vec<u8>>,
     ) -> Result<Extensions<LeafNode>, EngineError> {
         let extensions = match &self.account_identity_proof {
             crate::account_identity_proof::AccountIdentityProofMaterial::LegacyExtension(
@@ -145,6 +148,7 @@ impl Identity {
                 crate::app_components::leaf_app_components_extension(
                     supported_app_components,
                     None,
+                    device_tag,
                 )?,
                 extension.clone(),
             ],
@@ -153,6 +157,7 @@ impl Identity {
             ) => vec![crate::app_components::leaf_app_components_extension(
                 supported_app_components,
                 Some(component),
+                device_tag,
             )?],
         };
         Extensions::from_vec(extensions)
@@ -254,6 +259,15 @@ pub(crate) fn local_leaf_is_active(group: &MlsGroup, identity: &MemberId) -> boo
             BasicCredential::try_from(leaf.credential().clone())
                 .is_ok_and(|credential| credential.identity() == identity.as_slice())
         })
+}
+
+/// Whether this device's local copy is still a member: its removal is not realized and the
+/// record lists its account. `removed` is set exactly when this device's own leaf leaves,
+/// while a sibling device's leaf keeps the account on the roster, so the roster alone never
+/// answers this. A copy whose leaf is gone but whose removal is not yet realized still
+/// counts, so realization can read its leave request.
+pub(crate) fn local_copy_is_member(record: &Group, identity: &MemberId) -> bool {
+    !record.removed && record.members.iter().any(|member| &member.id == identity)
 }
 
 #[cfg(test)]

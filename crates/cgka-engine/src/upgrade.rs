@@ -15,10 +15,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::component::ComponentData;
 use openmls::extensions::{Extension, Extensions, RequiredCapabilitiesExtension};
 use openmls::group::MlsGroup;
-use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{ExtensionType, ProposalType};
 use tls_codec::Serialize as _;
 
@@ -160,7 +159,12 @@ impl<S: StorageProvider> Engine<S> {
                     _ => None,
                 }),
         )?;
-        let mut commit_builder = mls_group.commit_builder();
+        let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
+        let leaf_node_parameters =
+            self.own_commit_leaf_parameters(&mls_group, &app_component_updates)?;
+        let mut commit_builder = mls_group
+            .commit_builder()
+            .leaf_node_parameters(leaf_node_parameters);
         if let Some(new_extensions) = new_extensions {
             commit_builder = commit_builder
                 .propose_group_context_extensions(new_extensions)
@@ -177,14 +181,11 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|e| EngineError::Backend(format!("upgrade load_psks: {e:?}")))?;
         let mut app_data = builder.app_data_dictionary_updater();
-        for proposal in builder.app_data_update_proposals() {
-            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-                app_data.set(ComponentData::from_parts(
-                    proposal.component_id(),
-                    data.clone(),
-                ));
-            }
-        }
+        crate::app_components::apply_app_data_updates(
+            roster_required,
+            &mut app_data,
+            builder.app_data_update_proposals(),
+        )?;
         builder.with_app_data_dictionary_updates(app_data.changes());
         let commit_bundle = builder
             .build(
@@ -207,6 +208,12 @@ impl<S: StorageProvider> Engine<S> {
             let staged_commit = mls_group
                 .pending_commit()
                 .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
+            crate::commit_class::authorize_own_staged_commit(
+                &mls_group,
+                group_id,
+                self.identity.self_id(),
+                staged_commit,
+            )?;
             crate::app_components::validate_app_component_integrity_for_staged_commit(
                 &mls_group,
                 group_id,

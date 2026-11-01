@@ -10,10 +10,10 @@
 //! methods in `tokio::task::spawn_blocking`.
 
 use crate::app_components::AppComponentData;
-use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
+use crate::capabilities::CapabilityRequirement;
 use crate::convergence_pass::DurableConvergencePass;
 use crate::engine::{GroupEvent, SendIntent};
-use crate::group::{Group, Member};
+use crate::group::Group;
 use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, PeriodicMaintenancePolicy,
@@ -259,6 +259,9 @@ pub enum OpenMlsContentFilter {
     WithoutProcessedApplications,
     /// Only applications whose epoch is this one.
     ApplicationsAt(EpochId),
+    /// Only commits and proposals whose epoch is from `from` through
+    /// `through`, the selection input inside a convergence pass's horizon.
+    CommitsAndProposalsBetween { from: EpochId, through: EpochId },
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.
@@ -336,9 +339,10 @@ pub trait MessageStorage {
     /// The filter only narrows what is read: a backend may return rows it
     /// excludes, and the default returns every row, so callers classify each
     /// returned row themselves. It must not leave out any other row.
-    /// Convergence pass seeding, the send gate, and the deferred-peel commit
-    /// fingerprint list through this, so a backend that classifies rows does
-    /// not hand them the group's whole delivered history.
+    /// Convergence pass seeding, the send gate, the deferred-peel commit
+    /// fingerprint and a failed batch's check for new selection input list
+    /// through this, so a backend that classifies rows does not hand them the
+    /// group's whole delivered history.
     fn list_openmls_messages_in_states(
         &self,
         group_id: &GroupId,
@@ -766,11 +770,11 @@ pub trait WelcomeStorage {
 
 // ── CapabilityStorage ───────────────────────────────────────────────────────
 
-/// Feature registry + per-member capability cache.
+/// Feature registry.
 ///
-/// Per-member capabilities can be read live from OpenMLS, but the cache avoids
-/// repeated tree walks, retains capabilities for members who later leave, and
-/// keeps `feature_status` a cheap local lookup.
+/// Members' capabilities are not stored: the engine reads them from each
+/// current leaf of the MLS tree, so every device of an account counts on its
+/// own.
 pub trait CapabilityStorage {
     fn register_feature(
         &self,
@@ -782,19 +786,6 @@ pub trait CapabilityStorage {
         &self,
         feature: &crate::capabilities::Feature,
     ) -> StorageResult<Option<CapabilityRequirement>>;
-
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()>;
-
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>>;
 }
 
 // ── ConvergencePolicyStorage ────────────────────────────────────────────────
@@ -850,6 +841,88 @@ pub trait AccountDeviceSignerStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
 }
 
+// ── AccountDeviceHistoryKeyStorage ─────────────────────────────────────────
+
+/// This device's history key (mdk#2628 4.1): an HPKE key pair under
+/// `ciphersuite`, whose public half the device writes into its own entry in
+/// its device group's roster so siblings can seal chat history to it. A
+/// device has one, kept for as long as its account-device storage lives.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountDeviceHistoryKey {
+    pub marmot_identity: MemberId,
+    /// The MLS ciphersuite whose HPKE the key pair belongs to.
+    pub ciphersuite: u16,
+    pub public_key: Vec<u8>,
+    pub private_key: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for AccountDeviceHistoryKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountDeviceHistoryKey")
+            .field("marmot_identity", &self.marmot_identity)
+            .field("ciphersuite", &self.ciphersuite)
+            .field("public_key", &self.public_key)
+            .field("private_key", &RedactedValue)
+            .finish()
+    }
+}
+
+pub trait AccountDeviceHistoryKeyStorage {
+    /// Store `key` unless a history key is already stored for its identity,
+    /// and return the one stored afterwards: `key`, or the earlier one.
+    fn put_account_device_history_key_if_absent(
+        &self,
+        key: &AccountDeviceHistoryKey,
+    ) -> StorageResult<AccountDeviceHistoryKey>;
+    fn account_device_history_key(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceHistoryKey>>;
+}
+
+// ── DeviceGroupWelcomeStorage ──────────────────────────────────────────────
+
+/// The Welcome a new device waits for after a confirmed device link
+/// (mdk#2628 D28, D30, D41): into `group_id`, a group that requires the
+/// device roster, sent by the leaf whose MLS signature key is
+/// `sender_signature_key`, adding this device by the KeyPackage whose
+/// `KeyPackageRef` is `key_package_ref`, before `expires_at` (Unix seconds).
+///
+/// While it is stored and unexpired, it reserves both: the engine joins no
+/// other Welcome into `group_id`, and no Welcome into another group that
+/// adds this device by `key_package_ref`. The join that matches it consumes
+/// it in the join's own transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupWelcomeExpectation {
+    pub group_id: GroupId,
+    pub sender_signature_key: Vec<u8>,
+    /// A record stored before the link named its KeyPackage reads as empty,
+    /// which matches no Welcome.
+    #[serde(default)]
+    pub key_package_ref: Vec<u8>,
+    pub expires_at: u64,
+}
+
+pub trait DeviceGroupWelcomeStorage {
+    /// Store `expectation`, replacing any for the same group.
+    fn put_device_group_welcome_expectation(
+        &self,
+        expectation: &DeviceGroupWelcomeExpectation,
+    ) -> StorageResult<()>;
+    fn device_group_welcome_expectation(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<DeviceGroupWelcomeExpectation>>;
+    /// Every stored expectation, expired ones included. One stands for each
+    /// link this device waits on, so there are few.
+    fn device_group_welcome_expectations(
+        &self,
+    ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>>;
+    /// Whether an expectation for `group_id` was there to delete.
+    fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
+}
+
 // ── KeyPackageBundleStorage ────────────────────────────────────────────────
 
 /// Account-device-local enumeration of persisted OpenMLS KeyPackage bundles.
@@ -888,6 +961,134 @@ impl fmt::Debug for StoredKeyPackageBundle {
 pub trait KeyPackageBundleStorage {
     fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>>;
     fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()>;
+}
+
+// ── PrivateKeyPackageStorage ───────────────────────────────────────────────
+
+/// A single-use KeyPackage this device issued to one sibling in its device
+/// group, handed over inside the device group and never published (mdk#2628
+/// item 3.4b). Its private bundle sits in OpenMLS storage under
+/// `key_package_ref`; the engine writes and deletes the two together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedPrivateKeyPackage {
+    pub key_package_ref: Vec<u8>,
+    /// The sibling's KeyPackage slot, the Nostr `d` its roster entry is keyed
+    /// by.
+    pub recipient_slot: [u8; 32],
+    pub not_before: u64,
+    pub not_after: u64,
+    /// The KeyPackage as an `mls_key_package` MLSMessage, for its hand-off.
+    pub key_package: Vec<u8>,
+    pub issued_at: u64,
+    /// Whether its hand-off has been queued to the device group. One that was
+    /// not is sent again.
+    pub hand_off_queued: bool,
+    /// Whether it counts toward the sibling's stock. A request from the
+    /// sibling stops every earlier record counting, since their hand-offs may
+    /// be lost; their private keys stay until used or expired.
+    pub counted: bool,
+    /// The request this record answers, so a request is answered once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<MessageId>,
+}
+
+/// When a private KeyPackage stops counting as usable stock: halfway through
+/// its lifetime, about 15 days in. It stays valid until `not_after`.
+pub fn private_key_package_halfway(not_before: u64, not_after: u64) -> u64 {
+    not_before + not_after.saturating_sub(not_before) / 2
+}
+
+/// The private KeyPackages this device issued to its siblings.
+pub trait PrivateKeyPackageStorage {
+    fn put_issued_private_key_package(&self, record: &IssuedPrivateKeyPackage)
+    -> StorageResult<()>;
+    fn issued_private_key_package(
+        &self,
+        key_package_ref: &[u8],
+    ) -> StorageResult<Option<IssuedPrivateKeyPackage>>;
+    /// Every issued record, oldest first.
+    fn list_issued_private_key_packages(&self) -> StorageResult<Vec<IssuedPrivateKeyPackage>>;
+    fn delete_issued_private_key_package(&self, key_package_ref: &[u8]) -> StorageResult<()>;
+}
+
+// ── AnnouncedKeyPackageStorage ─────────────────────────────────────────────
+
+/// A KeyPackage a device-group roster announced for one of its device slots
+/// (mdk#2628 D31 item 7).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnnouncedKeyPackage {
+    /// The device's KeyPackage slot, the Nostr `d` its roster entry is keyed
+    /// by.
+    pub slot: [u8; 32],
+    pub key_package_ref: Vec<u8>,
+}
+
+/// How long an announcement is kept after the last roster state this device
+/// applied that announced it: as long as a KeyPackage publication stays
+/// fresh, so a relay still serving it after a newer announcement is covered.
+/// A slot whose roster entry still announces it needs no record.
+pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// How many announcements each slot of a group keeps, newest first.
+pub const ANNOUNCED_KEY_PACKAGES_PER_SLOT: usize = 16;
+
+/// Every KeyPackage a device-group roster this device held announced, by
+/// group and slot (mdk#2628 D31 item 7). The engine records each roster
+/// state it applies; nothing in the engine reads them back.
+pub trait AnnouncedKeyPackageStorage {
+    /// Record `announced` as seen in `group_id`'s roster at `seen_at`. A pair
+    /// already recorded keeps the later of the two times.
+    fn record_announced_key_packages(
+        &self,
+        group_id: &GroupId,
+        announced: &[AnnouncedKeyPackage],
+        seen_at: u64,
+    ) -> StorageResult<()>;
+    /// Drop every record last seen before `before`, and each group slot's
+    /// records beyond its `per_slot` most recently seen.
+    fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()>;
+    /// What `group_id`'s rosters announced, last seen at or after `since`.
+    fn announced_key_packages(
+        &self,
+        group_id: &GroupId,
+        since: u64,
+    ) -> StorageResult<Vec<AnnouncedKeyPackage>>;
+}
+
+// ── SiblingAddStorage ──────────────────────────────────────────────────────
+
+/// A sibling device this device's own confirmed Commit added to a group
+/// (mdk#2628 D76): the slot the added leaf's device tag read as, against the
+/// device group's roster when the Commit was confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiblingAdd {
+    pub group_id: GroupId,
+    pub slot: [u8; 32],
+    pub added_at: u64,
+}
+
+/// How long a sibling add is kept: as long as the history it owes.
+pub const SIBLING_ADD_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The sibling devices this device's own confirmed Commits added to groups
+/// (mdk#2628 D76). The engine records each in the transaction that confirms
+/// its Commit and never reads them; the app owes each the group's history
+/// and then forgets it.
+pub trait SiblingAddStorage {
+    /// Record that a Commit confirmed at `added_at` added the siblings at
+    /// `slots` to `group_id`, and drop every add recorded before
+    /// `added_at - SIBLING_ADD_RETENTION_SECS`. A pair already recorded takes
+    /// the later time.
+    fn record_sibling_adds(
+        &self,
+        group_id: &GroupId,
+        slots: &[[u8; 32]],
+        added_at: u64,
+    ) -> StorageResult<()>;
+    /// Every recorded add, oldest first.
+    fn sibling_adds(&self) -> StorageResult<Vec<SiblingAdd>>;
+    /// Forget `add`, unless the pair was recorded again since.
+    fn forget_sibling_add(&self, add: &SiblingAdd) -> StorageResult<()>;
 }
 
 // ── MaintenanceStorage ─────────────────────────────────────────────────────
@@ -1009,6 +1210,8 @@ pub trait StorageProvider:
     + DeferredPeelGenerationStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
+    + AccountDeviceHistoryKeyStorage
+    + DeviceGroupWelcomeStorage
     + KeyPackageBundleStorage
     + Send
     + Sync
@@ -1074,6 +1277,24 @@ pub trait StorageProvider:
     /// remain valid `StorageProvider`s, while production SQLCipher storage
     /// exposes the durable maintenance capability.
     fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        None
+    }
+
+    /// Optional store of the private KeyPackages this device issued to its
+    /// siblings (mdk#2628 item 3.4b). A backend without one issues none.
+    fn private_key_package_storage(&self) -> Option<&dyn PrivateKeyPackageStorage> {
+        None
+    }
+
+    /// Optional store of the KeyPackages device-group rosters announced
+    /// (mdk#2628 D31 item 7). A backend without one records none.
+    fn announced_key_package_storage(&self) -> Option<&dyn AnnouncedKeyPackageStorage> {
+        None
+    }
+
+    /// Optional store of the sibling devices this device's own Commits added
+    /// (mdk#2628 D76). A backend without one records none.
+    fn sibling_add_storage(&self) -> Option<&dyn SiblingAddStorage> {
         None
     }
 

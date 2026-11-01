@@ -95,14 +95,14 @@ and reasoned about on its own:
  apps (MarmotKit / C)    wn CLI · wnd · TUI    wn-agent ──► agent runtimes
             └────────────────┬─────┴──────────────┘
                      marmot-app        multi-account runtime, projections
-                     marmot-account    account homes, keys, transport orchestration
-                     cgka-session      one encrypted account-device lifecycle
+                     marmot-session    account-device runtime over one encrypted session
                      cgka-engine       OpenMLS group state machine + commit convergence
                      storage-sqlite    SQLCipher persistence (one DB per account-device)
 
  transport-nostr                     the relay plane: shared relay sessions, delivery, directory fetches
  transport-nostr-peeler / -adapter   Nostr events ⇄ engine messages, relay I/O
  transport-quic-stream / -broker     transient live previews for agent replies
+ marmot-account                      account homes, signing keys, secret storage
 ```
 
 - The engine is generic over a storage trait and knows nothing about Nostr; transport code lives in the peeler and
@@ -135,7 +135,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | --- | --- | --- |
 | Engine | [`cgka-engine`](crates/cgka-engine/README.md) | OpenMLS-backed group state machine and commit convergence |
 | | [`traits`](crates/traits/README.md) (`cgka-traits`) | Shared traits and cross-boundary types |
-| | [`cgka-session`](crates/cgka-session/README.md) | Encrypted account-device session over the engine |
 | Storage | [`storage-sqlite`](crates/storage-sqlite/README.md) | SQLCipher persistence for engine, session, and simulator |
 | | [`fs-private`](crates/fs-private/README.md) | Owner-only file, directory, and socket creation |
 | | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
@@ -144,9 +143,12 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
-| App | [`marmot-account`](crates/marmot-account/README.md) | Account homes, key storage, transport orchestration |
+| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages |
+| | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
+| | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
+| | [`marmot-observability`](crates/marmot-observability/README.md) | Diagnostics exporters: relay telemetry, product analytics and its consent state, audit delivery |
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
 | | [`marmot-forensics`](crates/marmot-forensics/README.md) | Append-only JSONL forensic audit schema |
 | Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings |
@@ -173,15 +175,19 @@ just ci                      # full local parity with GitHub CI (slow)
 ```
 
 Pull requests run a pre-check of a few minutes: formatting, the static and
-contract gates, dependency audit, workspace clippy and the WASM build. They run
-no tests. The merge queue runs the full matrix on the exact commit it merges:
-every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
-suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
-Tamarin, Hermes and installer checks. `Required CI` must pass there before a
-change lands. A queue run stops at its first failed job, so the queue ejects a
-failing change within minutes rather than after the whole run. Master pushes run CI only to refresh the Rust dependency caches
-that pull requests and merge groups restore, and only when `Cargo.lock`, a
-`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
+contract gates (the tracing audit among them), dependency audit, workspace
+clippy, the WASM build, and the workspace tests with the `precheck` nextest
+profile. That profile stops each test after half a second and counts it as
+passed, so the pre-check fails on a test that fails quickly and leaves the
+slower ones to the queue. The merge queue runs the full matrix on the exact
+commit it merges: every workspace test with the `ci` nextest profile, the CLI
+and relay end-to-end suites, simulator lanes, C bindings, iOS clippy, Windows
+filesystem contracts, Tamarin, Hermes and installer checks. `Required CI` must
+pass there before a change lands. A queue run stops at its first failed job, so
+the queue ejects a failing change within minutes rather than after the whole
+run. Master pushes run CI only to refresh the Rust dependency caches that pull
+requests and merge groups restore, and only when `Cargo.lock`, a `Cargo.toml`,
+the toolchain pin, Cargo config or `ci.yml` changes.
 
 Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
 along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS

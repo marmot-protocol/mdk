@@ -203,6 +203,8 @@ pub struct AttachmentWorkerDemand {
 /// fetch; claim must still succeed for this exact asset before network work.
 pub struct AttachmentAcquisitionSource {
     pub group_id_hex: String,
+    /// The app event carrying the attachment.
+    pub message_id_hex: String,
     pub source_epoch: u64,
     pub slot: serde_json::Value,
 }
@@ -451,16 +453,16 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !matches_store(&conn, reference)? { return Ok(None); }
-            let row = conn.query_row(&format!("SELECT group_id_hex,source_epoch,slot_json
+            let row = conn.query_row(&format!("SELECT group_id_hex,message_id_hex,source_epoch,slot_json
                 FROM attachment_acquisition q WHERE token=?1 AND due<=?2 AND cancelled=0 AND permission_paused=0 AND {SOURCE_MATCH} AND {ACCEPTED}
                 AND (expires_at IS NULL OR expires_at>?2)"), params![reference.token,now], |r|
-                Ok((r.get::<_,String>(0)?,nonnegative(r,1)?,r.get::<_,String>(2)?))).optional().storage()?;
-            let Some((group_id_hex,source_epoch,slot)) = row else {
+                Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,nonnegative(r,2)?,r.get::<_,String>(3)?))).optional().storage()?;
+            let Some((group_id_hex,message_id_hex,source_epoch,slot)) = row else {
                 conn.execute("UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
                     WHERE token=?1 AND due<=?2",params![reference.token,now]).storage()?;
                 return Ok(None);
             };
-            Ok(Some(AttachmentAcquisitionSource { group_id_hex,source_epoch,
+            Ok(Some(AttachmentAcquisitionSource { group_id_hex,message_id_hex,source_epoch,
                 slot: serde_json::from_str(&slot).map_err(|_| invalid("invalid stored attachment slot"))? }))
         })
     }

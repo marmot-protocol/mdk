@@ -12,20 +12,29 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::compromise_warning::{
+    COMPROMISE_WARNING_ITEM_CAP, COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS,
+    CompromiseWarningGather, CompromiseWarningReason, CompromiseWarningRecord, FirstTrustedRoster,
+    ObservedWarningItem,
+};
+pub use app::device_activity::{DeviceActivityRecord, DeviceHeartbeatSent};
+pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };
 pub use app::handle::SqliteAppStorage;
 
 pub use app::account_recovery::{
-    ParkedRecoveryObligation, QualifiedRecoveryStallSample, RECOVERY_PARK_AFTER_QUIET_PASSES,
-    RecoveryCause, RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan,
-    RecoveryDemand, RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
-    RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport, RecoveryLossSnapshot,
-    RecoveryLossWatermark, RecoveryObligationState, RecoveryObligationStatus, RecoveryPassProgress,
-    RecoveryPredicate, RecoveryReplayPlacement, RecoveryRequest, RecoveryRetryState,
-    RecoveryRevisionFence, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
-    RecoveryScopeToken, StoredRecoveryScope,
+    MAX_LOSS_ROUTES, ParkedRecoveryObligation, QualifiedRecoveryStallSample,
+    RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryCause,
+    RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan, RecoveryConversionInput,
+    RecoveryConversionReport, RecoveryConversionRoute, RecoveryConvertedLoss,
+    RecoveryConvertedObligations, RecoveryDemand, RecoveryDemandTicket, RecoveryDemandTransition,
+    RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport,
+    RecoveryLossReach, RecoveryLossSnapshot, RecoveryLossWatermark, RecoveryObligationState,
+    RecoveryObligationStatus, RecoveryPassProgress, RecoveryPredicate, RecoveryReplayPlacement,
+    RecoveryRequest, RecoveryRetryState, RecoveryRevisionFence, RecoveryScopeCheckpoint,
+    RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use app::local_submissions::LocalSubmission;
 pub use app::media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};
@@ -43,8 +52,9 @@ pub use app::transport::user_blocks::{
 };
 
 pub use app::account_projection::{
-    AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,
-    AccountNotificationSettings, AccountPendingPushRegistrationRemoval, AccountPushRegistration,
+    AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushGossipState,
+    AccountGroupPushToken, AccountGroupPushTokenTombstone, AccountNotificationSettings,
+    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountPushTokenRemovalProof,
     AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
@@ -83,7 +93,9 @@ pub use app::chat_list::{
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
     ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
     ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, RetentionExpiryScan, conversation_kind,
+    ExistingDirectConversation, MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition,
+    RetentionExpiryScan, SmallStateBroadcast, SmallStateItem, SmallStateItemName, SmallStateRule,
+    SmallStateSchedule, SmallStateSync, SmallStateValue, SmallStateVersion, conversation_kind,
     select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
@@ -94,18 +106,46 @@ pub use app::chat_presentation::{
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
     PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
+pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
+pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
+pub use app::device_removals::DeviceRemovalRecord;
+pub use app::history_deliveries::{
+    HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryDelivery,
+};
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
     StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
+pub use app::private_key_packages::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage};
+pub use app::recovery_coverage::{
+    RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageProved, RecoveryCoverageRange,
+    RecoveryCoverageSlice,
+};
+pub use app::recovery_staging::{
+    RecoveryStaged, RecoveryStagedSlice, RecoveryStagedUsage, StagedRecoveryEvent,
+    StagedRecoveryEvents,
+};
+pub use app::recovery_units::{
+    RecoveryAccountUsage, RecoveryParkedRoute, RecoveryRecheckPass, RecoveryRelayCaps,
+    RecoveryRelayHealth, RecoveryRouteRemainder, RecoverySpanRetirement, RecoveryUnit,
+    RecoveryUnitBreak, RecoveryUnitFence, RecoveryUnitOutcome, RecoveryUnitPark,
+    RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
+};
+pub use app::sibling_welcomes::{MAX_STASHED_SIBLING_WELCOMES, StashedSiblingWelcome};
+pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
+pub use app::stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
+};
 pub use app::timeline::{
-    BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
+    AppEventImport, BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
+    ConversationWindowQuery, DeletionSource, HistoryExportEvent, HistoryExportRow,
+    ImportedAppEvent, ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
     SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
     TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
     TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
@@ -122,6 +162,8 @@ pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use base::connection::relax_storage_for_test_process;
 pub use base::connection::{
     CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
     SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,

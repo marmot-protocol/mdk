@@ -34,8 +34,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
-  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, the
-  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
+  and gossip, with announces and join windows in `push/announce.rs`, repair replies in `push/repair.rs`, and
+  notification-trigger publishing),
+  `retention.rs` (the engine-owned retention sweep policy, the
+  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -47,10 +50,295 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `refresh_group_routes` when the drained prefix carried zero deliveries and clean routes.
 - Keep app-defined custom events on the `AppMessageIntent::Custom` path in `src/messages/intents.rs`: kind, tags, and
   content pass through verbatim, and kinds MDK owns (`is_reserved_app_event_kind`: chat, reaction, edit, delete,
-  agent, group system, push token) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
+  agent, group system, push token, and the device-group kinds `is_device_group_kind` lists) are rejected with `AppError::InvalidAppMessagePayload` so apps cannot forge
   protocol-owned events. Custom kinds project as standalone timeline rows under
   `TimelineUpdateTrigger::CustomEvent` (never folding onto a target message like reactions/deletes) and are queryable
   by kind through `AppMessageQuery::kinds`.
+- Never project the account's device group (mdk#2628 item 3.1, `src/client/device_group.rs`). A group is one when
+  `device_groups` records it or the engine says it requires the device roster (`is_device_group`). Every seam that
+  could re-project a group absent from the projection checks that first and keeps only its route:
+  `suppress_local_deleted_group_event` (both event loops), `refresh_group`, `reconcile_live_engine_groups` and
+  `refresh_routing`. Every host surface built from engine or recovery state rather than the projection filters with
+  `host_may_see_group`, which fails closed: quarantine, history notices and their changes, epoch-stall escalations,
+  deferred events, recovery-status and superseded-change updates, convergence park notices, and Welcome redelivery. A
+  new such surface filters too. Trust is separate from hiding. Act on a device group's roster only once `device_groups`
+  says `created` or `linked`. Never judge a joined Welcome: the engine decides which Welcome joins, before the join
+  (mdk#2628 D28, D30). `record_confirmed_device_link` refuses a group this device already holds, writes the
+  `awaiting_welcome` row, then records the engine's `DeviceGroupWelcomeExpectation` (group, the existing device's leaf
+  signature key, the confirmed `KeyPackageRef`, `WELCOME_WAIT_SECS`), deleting the row if that fails. Withdrawing a
+  link and ending a wait (`withdraw_confirmed_device_link`, `end_welcome_waits` on every record and reconcile) delete
+  the expectation before the row, so once either returns no Welcome under the link joins. A row a crash or failure
+  leaves without its expectation admits nothing, and `end_welcome_waits` drops it at once rather than at the wait's
+  end. Decide from the engine's durable group record (`stored_group`), never the live group a deferred open has not
+  hydrated, and settle trust in one place (`settle_held_device_group`: the live join and the restart reconcile). A held
+  device group with an `awaiting_welcome` row joined in time, whatever the row's age. A held device group with no row
+  stays `untrusted`, and a group under a row that does not require the roster drops the row; neither arises through the
+  engine. A routing rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile installs
+  its route. The founding roster lists only this device and its sign-in rejections, never the linked slot's; the
+  founding Add takes the account's own device only through the confirmed `KeyPackageRef` and sets its entry, as a later
+  link does (D41). Confirmed links come from device pairing; the `test-policy-overrides` hooks
+  (`dev_create_device_group`, `dev_record_confirmed_device_link`, `dev_withdraw_confirmed_device_link`) stay for tests.
+- Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
+  it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
+  stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
+  worker's account-level and applied-summary seams drain into one payload-free `LinkedDevicesChanged`. Every client
+  opens with it set: a client dropped before a drain (a reconnect attempt whose transport fails) takes its change with
+  it, and its replacement cannot see that change. Startup and reconnect settle trust with no command after them, so a
+  new seam that settles trust must reach one of those two.
+- Name the device group to tag from (mdk#2628 3.1d) with `sync_device_tag_group`, which picks the same group the
+  announcement does. Naming hydrates it, so never name it at a deferred open's end: the post-hydration reconcile
+  does, as do settling a join, creating a group, maintenance and every KeyPackage publication. Name it before reading
+  whether the current KeyPackage still serves (`key_package_republish_falls_back`), since an untagged one is stale once
+  this device tags. The founder's founding entry carries its own tag signature key; every other device sets its own
+  in maintenance or, before a host KeyPackage publication, through `set_device_tag_key`, once per call, since the
+  runtime stages no KeyPackage while the key is due.
+- The overdue-refresh warning (`key_package_refresh_overdue`) asks the runtime's announcement gate, never a copy of
+  the roster. The client recomputes it after each maintenance pass; a change sets
+  `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
+  `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
+  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) writes a fresh rename
+  id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
+  roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
+  since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
+  or commit ids. Every entry is created with a fresh rename id (`fresh_rename_id`: the creator's founding entry, the
+  founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
+  Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
+  device entries.
+- Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
+  as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
+  A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and
+  `create_device_group` founds the roster with it and this device writing; trusting any device group, founded or
+  joined, forgets it in the trust write (`trust_device_group`), so a device that joins one leaves the group's backups
+  as they are. Confirm and turn-off settle an unsettled creation first (`reconcile_device_groups`), so a creation whose
+  trust write failed takes the change in its roster rather than in the kept key. In a device group, write the roster's account entry only through the runtime's
+  `edit_roster_account_entry` (`ReplaceAccountEntry`, a compare-and-set over the entry this device read), and only
+  while the device group takes a commit from this device. That gate stays closed while a re-issue is owed, so neither
+  action answers "nothing to send" while a change of this device's may still land. Never send a backup change again
+  from here, and never store what became of one (D75): the engine's re-issue and the runtime's retry are the only
+  paths that commit one again, and a change whose re-issue is refused stays lost. `backup_settings` reads the roster's
+  account entry as it is now, so the user sees a lost change and can make it again. The backup spec leaves the rest
+  of a device's own handling local; MDK's is this. A confirm refused as `device_group_busy` (the group can't take
+  the commit, its entry changed, or the engine would only queue the send: `AccountEntryUnsettled`), or failing with
+  any other error, keeps the words in memory for another try with the same words from a fresh read, which finds their
+  key in place if the commit went out after all; a cancel or a restart drops them, and the user starts again with new
+  words. A turn-off refused as `device_group_busy` changes nothing. An
+  update this device committed ends when its publication fails and the engine discards it, when branch selection
+  drops it onto another account entry (its re-issue is a conflict, so it is refused at the drop), or once branch
+  selection can no longer drop it. Until its publication has an outcome, and from a drop until its re-issue is
+  committed or refused, the gate answers another change with `device_group_busy`.
+- New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
+  inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
+  `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
+  device already joined), only brings a check forward (`SignInNudges`):
+  a KeyPackage is addressable, so the one a Welcome names is served only as its slot's newest publication. The
+  first check's baseline, every slot id its read returned whether or not it counted, never a publication time, separates
+  devices that were here first from new sign-ins. Only a complete read changes whether a listed sign-in is still signed
+  in, and a slot holding a valid publication that is merely stale (`current_slots`) stays signed in. A read of the
+  configured directory relays, when the account lists none, is never complete. Rejections are recorded locally first,
+  then committed to the trusted roster through the runtime's rejected-slot write (`reject_device_slots`), behind the
+  gate the runtime's own roster updates wait behind; a device with no device group keeps them until
+  `create_device_group` founds the roster with them or it trusts a group it joined. A rejection is committed only while
+  the roster has no entry for the slot, and never replaces one; a slot the roster holds as a device ends it, since the
+  user confirmed that link. A rejection stays pending until the roster shows it. A sign-in this device dismissed is
+  listed again once the roster has no entry for its slot. Every device-group event and every superseded roster update
+  rechecks every rejection (`recheck_sign_in_rejections`): it ends at once a rejection of a slot the roster now holds as
+  a device, so a link that branch selection drops before the next pass asks again rather than restoring `not_me`, and
+  re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
+  only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
+  cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
+  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A roster device's
+  KeyPackage matches its slot when the trusted roster announces it now or the engine recorded it from a roster state
+  applied in the last 30 days (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts
+  read the list as `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
+  (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
+  payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
+  Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
+  later (storage writes them as `not_now` while `started_fresh_at` is set); it never rejects and never warns.
+- The own-slot check (mdk#2628 3.4, `src/client/sign_ins.rs`) rides 3.2's read: `read_account_key_package_slots` also
+  reads this device's slot by `d` from every relay (`OwnSlotRead`), keeping each relay's current publication there by
+  NIP-01's rule, valid or not. One whose event id is none of this device's current, pending or retained events is
+  foreign (`OwnSlotForeign`); an older event of its own is a lagging relay, which fanout retry owns. `check_sign_ins`
+  hands foreign ones to `replace_foreign_slot_publications`, which publishes a newer KeyPackage or, for one dated past
+  the skew window, asks the relays to delete it by id (D63). It also hands over each relay whose own read finished and
+  returned nothing in the slot (`OwnSlotRead::empty`), named as the lifecycle's publication targets name it, to
+  `refill_emptied_slot`, which publishes a new KeyPackage when one accepted the current publication, while this
+  device's trusted roster, if it has one, lists it as a device (`listed_as_device`). A failed or unfinished read never
+  shows a relay empty. An incomplete own-slot read is retried within the hour. Before handing foreign ones over, it
+  records in the compromise warning each valid current-profile KeyPackage of the account among them whose LeafNode
+  signature key is not this device's (`ForeignOwnSlotKeyPackage`, 3.7b): this device made a KeyPackage exactly when it
+  carries its signature key, which never rotates, so a backup restore, a pre-group KeyPackage or a republished copy
+  never warns. Only the device that found it warns.
+- The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
+  (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
+  sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,
+  and the KeyPackages its own-slot check found (a seen one goes a KeyPackage's lifetime after it was found, when it can
+  no longer be valid). Never gather `removed` slots. Gathering is lazy: a roster change (`note_device_roster_changed`)
+  or a Reject answer sets `compromise_warning_gather_due`, and the next host read or publication seam gathers once.
+  The first roster this device trusts from a device group goes in seen (D68: the user saw those on the devices that
+  were there); its own rejections still warn. Storage takes that roster in the same transaction that makes the group
+  trusted, so every trust site goes through `AppClient::trust_device_group` (storage refuses any other move into a
+  trusted state): Creating to Created passes no roster rejections (a founding roster holds only the founder's), and
+  AwaitingWelcome to Linked passes the roster the engine holds. Only a group trusted before migration 0148 takes its
+  first gather instead. Dismiss is per
+  device. An unseen rejected sign-in that neither this device nor the roster holds leaves the warning (a link ended
+  it, or a branch dropped it); a seen one stays seen. Keep `CompromiseWarningReason` exhaustive so each binding maps a new reason
+  explicitly; the stored reason is text with no CHECK, and an unknown one is skipped on read.
+- Send and read messages between this account's devices through `src/client/device_group/messages.rs`: one
+  `send_device_group_message` (`false` means it reached no relay; a feature that records the event's id first builds
+  it with `device_group_event` and sends it with `send_device_group_event`), one dispatch by kind in `observe_device_group_event`
+  (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
+  D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
+  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460,
+  461, 473, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and the
+  stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
+  withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
+  whose withdrawal a feature acts on is listed in `withdrawal_handled` and dispatched in
+  `device_group_message_withdrawn`. Each such message is recorded with its kind in `device_group_messages` when sent
+  (before the send; its message id is filled in from whichever drain's effects publish it, in
+  `retain_effect_projection`) and when read. Records go after a week or past 4,096, so a feature also acts on a
+  withdrawn message with no record, which may be of any kind.
+- Hand private KeyPackages only inside the trusted device group (mdk#2628 item 3.4b, `src/client/private_key_packages.rs`).
+  Read a request (459) or hand-off (460) only from that group, addressed to this device's slot, from another slot its
+  roster lists, sent by a leaf whose device tag reads as that slot's, and keep a hand-off only if every KeyPackage is
+  this account's, single-use, unexpired and tagged as that slot's (mdk#2628 D33, through 3.1d's tag reader; never a
+  second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
+  device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
+  Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 relay URLs
+  distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
+  the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
+  joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one whose checks could not be read,
+  or admitted but not stashed, fails the event's projection, which is retried. One into a chat still held active is
+  held, never a rejoin offer (D72): its row keeps the chat's id, and a pass joins it, with no consent asked, only once
+  that copy reads removed or unrecoverable. A held row goes only when its carrier is withdrawn, its KeyPackage is used
+  or expired, the chat is forgotten or disbanded, or a full stash makes room for a new Welcome. A forget refuses only
+  the carriers dated before it, so the same Welcome sent again afterwards joins, whether or not a pass held it first.
+  Every call that can store or retire a rejoin offer (ingest, the retry, a confirmation, a decline, a join from the
+  stash) tells the host which chats' offers changed, even when it fails after a join.
+  Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
+  ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
+  be untagged.
+- Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
+  `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
+  sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
+  (`owe_added_siblings_history`) before sending anything, never from another trigger. Whether the sibling asks for
+  history and carries a history key is read at send time; a history that cannot be sent is forgotten. Record each
+  delivery's chat and receiver by app event id before its send, so a withdrawal or a later terminal publish failure
+  (`history_delivery_failed`, from the retained failed-message bookkeeping) owes the history again; keep it owed
+  until every delivery reached a relay. Seal only the bundle's key and hash, to the receiver's history key, with
+  `delivery_context` binding the purpose, both slots and the chat. Read a delivery only in the trusted device group,
+  addressed to this device, from a sibling through `ensure_sent_by`, and refuse one that does not open rather than
+  park it. Import through 4.2a's `import_history_bundle`, never another path; park a delivery whose chat this device
+  does not hold yet. Keep the inline budget (`INLINE_BUNDLE_MAX_PLAINTEXT`) inside the 32,768-byte content limit for
+  a 256-byte chat id. A history that needs more than `MAX_INLINE_BUNDLES`, or holds an event too large for one, goes
+  through Blossom as a whole, never mixed: upload its newest `MAX_BLOSSOM_BUNDLES` bundles off the worker
+  (`HistoryUpload`, dispatched by `dispatch_history_blobs` on the media executor), each to the first of the chat's
+  Blossom endpoints that takes it, keeping bundle keys only in memory; send its deliveries, each naming its server,
+  only once every blob is uploaded. A receiver parks a Blossom delivery (refusing one whose chat could carry no
+  history, as `history_chat` does) and fetches the blob off the worker once it holds the chat (`HistoryFetch`), through the dial-safe Blossom transport, bounded by the largest bundle
+  ciphertext; a failed upload, send or fetch waits and tries again, and a row that fails to prepare waits alone
+  rather than block the rest. A chat with no Blossom endpoint forgets such a history. Only a refusal drops a
+  received delivery: any other error fails the projection so it is read again.
+- Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
+  device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
+  send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one
+  or failed, so a crash mid-send costs at most one extra heartbeat, never an hour's silence. Count one only when the sending leaf's tag reads as a
+  sibling in the tree this device holds when it reads it (one from an earlier epoch counts for no device), never read
+  its content, and date it `min(created_at, now)`. Judge `inactive` locally for the Devices screen; never write the
+  roster's `inactive` status from it.
+- Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
+  `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
+  `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
+  pairing rumors to the `PairingInbox`; the engine still sees them refused. Pairing secrets (the code, keys and session
+  ids) live only in the in-memory `marmot-pairing` sessions: never persist them, and never log them, a slot or a label.
+  A device adds a sibling only after both users confirmed the code and the new device's confirmation verified, through
+  exactly the confirmed `KeyPackageRef`: a first link creates the device group, a later one sends one
+  `SendIntent::LinkDevice` commit, sent through `runtime.send_with_audit_context` so the runtime releases its Welcome
+  only once the commit is confirmed (never split the Welcome off for app delivery). On both paths the prompt stays
+  `Linking` after the commit: `decide_device_links` is the one gate for every link in `device_links`, prompt or not
+  (D40). A link is `Linked` once the new device's first commit, which sets its roster entry's `tag_signature_key` to
+  the leaf key the link added (`leaf_signature_key_hex`), is on the selected branch: the device group is `Stable` with
+  no pending convergence input. It fails when its group was never made, when the quiet roster has not listed it as
+  this device's link for a whole settlement window (`MarmotApp::settlement_quiescence_ms`, in milliseconds, whose
+  override only test-policy builds read), or when that commit is still absent `LINK_DEADLINE_SECS` after the entry's
+  `linked_at`. A decided link never changes, and a link whose approval still waits to be retried is not decided. A
+  failed link ends its prompt as `LinkFailed` with a `CannotLink` cancel. Its Welcome, found by the `KeyPackageRef`
+  recorded before the commit (`welcomes_for_key_package`), is withdrawn before the failure is recorded. While the
+  Welcome's deadline may be ahead (before `linked_at` plus `WELCOME_WAIT_SECS`), a failure is recorded only once that
+  withdrawal succeeds: until then the link stays pending and the next drive decides it again. From then on the runtime
+  refuses the Welcome, so the failure is recorded and the removal does not wait for the withdrawal. Never rely on a Welcome id written after the commit, which a crash can lose. Welcome publishers (startup
+  recovery, a maintenance pass, a fanout retry) run before the gate and whether or not device groups are on, so the
+  gate never guards delivery: both link paths pass the new device's wait end (`Approval::wait_ends`) to the engine as
+  the Welcome's `deliver_until`, and the runtime's publish check refuses it from then on. While the roster
+  lists the device as this device's link, it also removes its entry, and its leaf if the engine's tree still has one, in
+  one `SendIntent::UnlinkDevice` commit; never decide the leaf from the stored member list, which a staged removal has
+  already changed. A withdrawal that fails never holds the removal back. A link refused as
+  `LinkDeviceUnsettled` made no commit, even while another commit resolves. Publish an undelivered Welcome again every
+  few seconds until the new device's Welcome wait ends; neither its publication nor its delivery decides a link.
+  `drive_unpublished_welcome_delivery` returns a `#[must_use]` `WelcomeDelivery`; chat creation goes on either way, as
+  the Welcome stays owed. Prompt ids are random, so an id a host kept from before a reopen names no prompt. The engine
+  refuses a link or an unlink with `LinkDeviceUnsettled` rather than queue it; retry a link on each drive until a
+  minute before the new device's Welcome wait ends, counted from when the new device sent its confirmation, never
+  attempt it after that, and cancel it as `LinkFailed`. The existing device's confirmation names `own_signature_key`,
+  its leaf key in the device group, and the new device records it with the link (`record_confirmed_device_link`).
+  Ending the new device's wait (cancel, a withdrawn link, timeout) withdraws the engine's expectation first and keeps
+  the wait until that succeeds, retrying on each drive. Record each link in `device_links` before its commit, so a
+  crash cannot lose it. The new device records a `device_group_joins` row before it trusts the group it joined, nudges
+  its first commit there (`set_device_tag_key`) on each drive rather than waiting for maintenance, and drops the row
+  once that commit landed. Removed from the device group, it forgets its copy (`forget_group_local`). The roster the
+  removal left decides how: a failed link's undo leaves the slot no entry and no rejected slot, so it shows
+  `Ended { LinkFailed }`; any other removal, from a group it founded or from a roster it can't read (a failed read
+  included), unlinks it (D67). Never decide that from the `device_group_joins` row: one catch-up can apply the first
+  commit and the removal. Every ingest notes the removal as it applies it (`note_device_group_removal` in
+  `retain_effect_projection`): it sets the stop flag and the account's publish stop, then `mark_account_unlinked` writes
+  `unlinked` and `signed_out`, and the copy is forgotten only once that mark lands, so a failed mark is made again at
+  the next open. Every publisher `relay_client_for_account_id` hands out refuses to publish once the publish stop is set
+  or the record says unlinked, so nothing goes out whichever path a publish comes from; build account publishers only
+  through it (`clippy.toml` bans the other ways). The engine stores a removal before the app marks it, so before it
+  hands out the first publisher for an account in a process, it looks once for a stored removal no record shows (a crash
+  between the two) and stops the account; only a client can tell an unlink from a failed link, so its open decides and
+  lifts the stop for a failed link (`lift_failed_link_publish_stop`). The stop is in memory and otherwise cleared only
+  when the account is removed. Admission stops taking input once the flag is set; the pairing drive notes a removal
+  before it sends anything; the worker stops right after an ingest that unlinked it (startup and maintenance catch-ups,
+  admission turns, deliveries), and the runtime then deactivates the account, making the mark again in the write that
+  signs it out, and only then sends `DeviceUnlinked`, so a host that wipes and signs in again on hearing it never meets
+  that deactivation. `MarmotApp::client`, `sign_in_account`, `run_due_maintenance`, both logins, a
+  key import and both onboarding starts refuse an unlinked account, before anything is written or sent;
+  `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into that group is a
+  first join, held by the engine to the link rather than to the forget's date. A new device never starts a link by a
+  KeyPackage it already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so
+  a used one would also admit the Welcome that installed the forgotten copy. The start waits for the replacement's
+  publication (`key_package_not_published`). Each drive ends by comparing linking as hosts read it with
+  `DevicePairing::last_view` and sets `device_link_changed` when it differs; the client opens with that flag set, and
+  the same two seams as `linked_devices_changed` drain it into `DeviceLinkChanged`.
+- Small state (`src/small_state.rs` and `src/client/small_state.rs`, mdk#2628 4.3) keeps each chat's read position,
+  pin, mute and archive the same on the account's devices, from the first maintenance pass after this device trusts a
+  device group. A pass is one storage transaction (`sync_small_state`): a local state that differs from what this
+  device last observed is its user's change, so no setter needs a hook and leaving a chat is never a change. Archives
+  go through the worker's in-memory account state (`apply_sibling_archives`, one save, mdk#178) and, like pins and
+  mutes from siblings, record no product outcome. Each chat a pass changes gets one chat-list update through `pending_projection_updates`. The merge rule's tie-break
+  (`tie_break`), its placement of a new pin (`new_pin_index`) and the broadcast schedule (`broadcast_due`) are each one
+  function; change them nowhere else. Recovery is a broadcast of every held item, with no stopping condition and
+  nothing tracked per sibling: at start, daily, when the device-group tip passes the app-payload window since the last
+  one, and an hour after the last when a sibling asked. Each maintenance pass then sends what is owed: updates split
+  to fit 32,768 bytes, each page's items marked sent only after it went out (a duplicate is harmless, a loss is not),
+  and a broadcast request when owed. Updates and requests are read from any member of the trusted device group, never
+  through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
+  request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
+  an archived chat waits, unobserved, until the chat is unarchived.
+- Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
+  `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
+  `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy
+  create's `GroupCreated` work rides them. Note a Welcome a publish could not deliver in one place,
+  `note_welcome_delivery_failures`, called from `remember_published_reports` (every seam that applies runtime
+  effects) and from the device-link send; never write a pending Welcome row or queue `WelcomeDeliveryPending` from a
+  drive. It announces each Welcome once per process (`announced_welcome_failures`) and leaves a failure without a
+  group (the startup retry's) to `reconcile_pending_welcome_delivery_index`. The worker's projection drain
+  (`publish_client_pending_projection_updates`) broadcasts the queued events, so every worker seam does.
+  `note_welcome_delivery_failures` and that reconcile are the pending table's only writers; never write a row before a
+  commit is exposed, since the engine stages an invite's Welcomes with its commit.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.
@@ -129,9 +417,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
-  `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
-  HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+  the per-account upload checkpoint file (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for audit
+  settings, recorder open/build, file enumeration, path validation/resolution/removal, and upload. Audit-log unit tests
+  live in its own `#[cfg(test)] mod tests`.
+- The v4 upload's HTTP half is `marmot-observability`'s `src/audit_upload.rs`: snapshot capture, the checkpoint record,
+  endpoint validation with its retired-host check, the per-attempt pinned request and the response handling. It opens
+  no files:
+  `audit_log.rs` validates and opens each audit file and reads and writes the checkpoint file, then hands it the open
+  file or the record. It returns `AuditUploadError`; `From<AuditUploadError> for AppError` in `src/error.rs` restores
+  the variant, message and `privacy_safe_kind` the upload reported before it had its own type, and
+  `error::audit_upload_error_tests` covers every failure.
 - Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records actual retained founding
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or
@@ -145,11 +440,123 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
-  charges or history certificates. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
+  charges or history certificates. Ledger notices (behind `runner_owns_debt`) record `notice_shown` and
+  `notice_dismissed` with cause `unproven_history`, the route tag as the obligation id. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
-- Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
+- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
+  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
+  routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
+  requests (`record_recovery_request`), native
+  synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
+  un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
+  `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
+  and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
+  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  second after the oldest event counted (never before the REQ's `since`) through the second before the count's
+  `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
+  uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
+  un-cover mark before each look at the adapter and write through `record_recovery_coverage_since`; a generation that
+  loss imported since the last look may have reached never proves again (`LiveCoverage`), and the log is read again
+  after the look so loss imported during it gives no tail; the adapter is looked at again after the write, and a
+  generation it no longer reports streaming with the same count gives none either. Past the request an open,
+  healthy REQ vouches only provisionally: `LiveTails`, held in memory and never written to the ledger, because nothing
+  proves when an open REQ stopped delivering. A tail starts at the count's `live_from`, which for a REQ the relay pool
+  sent again is its EOSE, never the request stamp, and stands only while the adapter reports the count streaming
+  (`ReplayEndpointView::streaming`: the relay client still names the connection its serial started on); a count
+  that is not streaming is recorded as ended. A tail can outlive its REQ by the time the adapter takes to process
+  notifications already queued for that relay, an accepted limit: a forwarder that falls behind records loss, which
+  breaks it, and a tail never reaches the ledger. Read tails at every debt read; they lapse without an event. A route whose group's live frames
+  the adapter's fence holds gets no live boundary until they are released, while its tail stands. Debt that drives work reads the ledger only up to
+  `LiveTails::owed_until`, refreshed by `AppClient::live_tails`; without it an idle connected account owes its own
+  live frames. Storage keeps a released receipt's second out of every live boundary, and a tail starts past the
+  newest one on its route; only a fetch proof covers it, on its own relay. Live-boundary tests live in
+  `recovery_coverage/live_boundary_tests.rs`. `coverage_shadow_report`
+  is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it once
+  loss invalidates by route (its predicate at the current route, inventory and obligation revisions; newer loss voids
+  it only where storage's `recovery_loss_reach_after` says loss imported after the scope's loss revision, retired or
+  not, reached its route inside its window; a scope that would hold but whose newer loss was since acknowledged is not
+  comparable, because acknowledgment deletes where it reached). A loss obligation's scope on a route its own loss
+  (`recovery_loss_reach`) never reached there is not comparable, and loss goals are restored only on reached routes,
+  from their reach. A scope whose floor is unknown or older than the
+  retained window is owed from the retention floor. Before it prunes, it passes the current routes and
+  their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
+  every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
+  (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
+  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  Known disagreements
+  are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
+- Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
+  `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
+  `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
+  With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
+  the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
+  admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
+  holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out.
+  Whoever lets go of a runner, by a stop, an abort or a dropped in-place pass, refunds the attempts it began and never
+  settled as `Unanswered` (`OpenAttempts`), through storage that is still open, and a settle whose write failed stays
+  open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
+  and after a crash, the charge stays until it ages out of the hour. A
+  directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
+  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
+  stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
+  through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
+  route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
+  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
+  credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
+  tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
+  covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
+  reached right after a `rate-limited:` reply settles `RateLimited`. Every event byte a required relay sends is
+  charged to the account's rolling hour, cut and discarded replies included; best-effort relays are never charged.
+  A quantum cut by its deadline, shutdown or the pass deadline interrupts its request in flight rather than dropping
+  it, so the reply it was reading is charged too (`SweepRelay::interrupt`); an interrupted request is no answer and
+  never clears a rate limit.
+  A comparison or re-check quantum settles through the same table: its end maps to a sweep end (`compare::verdict`).
+  A re-check settles the relay and the account budget but never its unit's retry state, records pass progress only
+  under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
+  runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
+  re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
+  Admission releases a group's staged events oldest first below its admission frontier, never past an event the
+  engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
+  (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
+  `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
+  with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
+  them or `enable_live_fences` before the switch-over. The inbox is a route like a group's, compared only and never
+  swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
+  comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
+  takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
+  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
+  worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
+  Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
+  today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
+  judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check
+  only where `recheck::owed`, the survey's own predicate, owes one. Each survey publishes the required units still catching up
+  (`RunnerHost::surveyed`) into `AppTransportRouting`'s catching-up watch: the only source of the account recovery
+  status, the worker's `RecoveryStatusChanged` cue, and the condition for a remainder's notice. Ledger notices
+  (`HistoryNoticeCause::UnprovenHistory`, ids from `ledger_route_tag` and the park revision) skip a suspended group's
+  routes (`RunnerRoute::suspended`) and a broken unit on a relay its route no longer requires. A notice's revision and
+  its dismissal (`dismiss_recovery_route_park_on`) cover exactly what it shows. They, the status and its event show
+  nothing with the gate off.
+  An Unrecoverable group's routes are suspended (`RunnerRoute.unrecoverable`, read from the engine's group record
+  each debt turn): never scheduled, charged, broken or noticed, left out of admission so what they staged is given
+  back as an unlisted route's is, and with the gate on the comparison owner drops their
+  epoch-gap obligations from its grant fence (`suspended_epoch_gaps`); gate off, it fetches them as before. A
+  retained route's ceiling (`retained_route_goal_until`) caps every debt and re-check read through
+  `DebtTurn::owed_until`/`checked_until`; never store it. Route-gone retirement runs only in the runner's debt turn
+  (`settle_recovery_route_changes`), from drops `replace_group_routes` records once a runner tracks them; a full
+  `replace` records only inbox drops, and a group left with no route is forgotten, not retired. A relay the routes
+  carry again reopens only its `RouteGone` spans; do not re-arm units on a route add. Reconnects come from the relay
+  pool's connection generations (`NostrSdkRelayClient::relay_connections`), diffed at each step, and an unknown caps
+  read (`None`) is never evidence. Window hints come from the live conversation captures
+  (`open_conversation_groups`). The breaker's pauses and late findings are process counters
+  (`recovery_runner_counts`) carried only by the v5 `recovery_runner_paused` row, written through the turn's audit
+  sink (`WorkerTurn::audit`). Logs carry aggregates only.
+- The configured audit OTLP/HTTP sender is `marmot-observability`'s `src/audit_otlp_sender.rs`, which hosts name as
+  `marmot_app::audit_otlp_sender`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
   outcomes retain the prepared range. Runtime tracker/manual triggers and additive native bindings configure it;
@@ -186,10 +593,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  Retention/deletion of v4 sealed segments is mdk#1014, not this contract.
+  `audit_log/retention.rs` owns the fixed 30-day local forensic retention policy, independently of uploads and consent.
+  Sweep metadata on exclusive-root startup and hourly across accounts and failed-wipe remnants, independent of
+  account workers. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
+  unlinking; drain directory-local cursor work, cancel only a prepared attempt owning that inode and block new
+  reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
+  never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the
+  recorder recheck metadata and protect its canonical/actual backing paths under its own lock.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
-  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
-  segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and
+  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files). Retention deletes expired
+  segments, and each tracker run stats every file and
   rewrites the whole sidecar. Do not add a per-upload or per-line entry, and do not treat the sidecar as durable state:
   losing it costs one repeat transfer per file and nothing else.
 - A file above `AUDIT_LOG_UPLOAD_MAX_BYTES` has no app-level transfer path. `post_audit_log_file` enforces the same
@@ -245,7 +658,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   package and stable replaceable d-tag; expired or policy-invalid packages rotate to a fresh package ref.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
-- Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
+- Keep protocol engine behavior in `cgka-engine` and session ownership in `marmot-session`.
+- Name no `cgka_engine` item in production code. `cgka-engine` is only a dev-dependency here, so the library build
+  rejects one; engine types come through `marmot-session`'s re-exports. The crate root re-exports the lower stack's error
+  types (`AccountError`, `SessionError`) and identity-proof signer types, so hosts reach them through `marmot_app`
+  (mdk#2602).
 - Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is
   no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
   they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
@@ -277,7 +694,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   fence while any loss obligation is pending, clears the plane only against the exact observed generation, and
   never counts a recovery success. Notice ids are opaque and must not be logged.
 - Keep an account's delivery route open when its relay notification consumer lags: charge the lag as notification
-  loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
+  loss with the REQ floors its SDK context reported at the lag (per route when known; record them through
+  `record_account_recovery_loss_routed`), and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
 - AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
@@ -331,6 +749,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   route first in the routing table (`replace_group_routes` preserves the caller's order; a new lead is a change): the
   adapter reads the lead as the route that resumes from the cursor. A locally deleted group lists its current route
   first too, never its frontier copy. See `docs/marmot-architecture/further-context/account-recovery.md` section 5.
+- Keep the post-join history fetch's lifetime apart from the PostJoin obligation's phase (mdk#2626).
+  `advance_post_join_maintenance_subscriptions` keeps a group's session while its fetch is owed, whatever phase commits
+  moved the obligation to, and ends the fetch only through `settle_post_join_history_fetch`: `Fetched` needs the
+  session's qualified boundary, open native ingress and the adapter's placement verdict for that subscription, and
+  the deadline expires only a session whose boundary has not qualified. While a fetch is owed, its session is
+  requested and retained under the fetch's job alone; an early-phase obligation (a re-armed one, or an earlier copy's
+  after a replacement Welcome) keeps the session alive but never picks its job. A session installed for another fetch
+  id (an earlier copy), or whose demand is gone before its boundary qualified, never ends the current one. The fetch never moves the obligation, so self-update timing stays the
+  obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
@@ -354,21 +781,40 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 - Keep the relay-telemetry export path in the relay plane (`transport-nostr`, rollup in its `src/telemetry.rs`) and
-  `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new` constructor). It is
+  `marmot-observability`'s `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new`
+  constructor). It is
   opt-in and off by default: `RelayTelemetryExporter::new` is the single construction gate, relay-identity
   resolution requires it (through the plane's `RelayExportGate`, which the export config implements), and export
   points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
-  build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
-  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
+  build. Keep per-attempt collector DNS validation and pinning in `marmot-observability`'s `collector_host_safety.rs`: validate
+  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
+  client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
+  it builds none, so nothing dials, tests included: a test that dials hands in a builder itself. Endpoint parsers and the exporters' resolved config live in `marmot-observability`'s `export_config.rs`;
+  `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
   builder; that crate's `clippy.toml` holds the same ban) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
   direct `nostr_sdk`/`reqwest` constructors. Allow that lint only where a fresh reqwest builder goes straight into
   `http_builder()` or in local test fixtures. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
-  helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
+  helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. Relay
+  NIP-11 fetches (`relay_caps.rs`) pin through its `pin_with` too, after the relay gate (`RelaySafetyPolicy`). See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
+- The diagnostics exporters live in [`marmot-observability`](../marmot-observability/AGENTS.md) (mdk#2627). Its
+  surface is its crate root; its other modules are private. This crate records through `Observer`'s views
+  (`ProductRecorder`, `PerformanceRecorder`, `ProductOperation`), runs the collectors through
+  `marmot_observability::wiring`, names everything else at the crate root, and re-exports what hosts name at their
+  `marmot_app::` paths: the `product_analytics` and `audit_otlp_sender` modules, and the other types by name from the
+  crate root. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
+  and `AuditOtlpSender`, so do not give them new `pub` methods; add the method to a view or to `wiring`. An operation
+  recorded as one product outcome runs its body through `ProductRecorder::observed` and an outcome rule
+  (`success_or_failure`, `confirmed_or_failure`, `send_outcome` or its own); do not write an `_unobserved` twin beside
+  it.
+- Diagnostics tests that need a `MarmotApp`, its runtime or the network-proxy policy live in `src/observability_tests/`,
+  one module per crate file. They reach the crate as the rest of this crate does, plus the fixtures its root
+  re-exports and its `_for_test` hooks, which `marmot-observability`'s `test-support` feature (enabled here as a
+  dev-dependency only) builds.
 
 ## Code map (modules not covered above)
 
@@ -384,13 +830,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
   to the deployment operator: config validation, staged outbox, retry, purge; tests in
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
-  `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
+  `history_bundle/tests.rs`), `history_delivery.rs` (the sealed history delivery's encoding, sealing context,
+  inline limits and Blossom server rules), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
+  `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
-  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
-  `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `projection.rs` (legacy account
+  stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `usage_diagnostics.rs`
+  (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
+  product collector only through `marmot_observability::wiring`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
@@ -400,7 +849,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
+- `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
+  recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
+  runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
+  a direct client), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
@@ -414,10 +866,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 
 - `test-policy-overrides`: test-only convergence timing/rewind overrides. Never enable in app artifacts.
 - `otlp-export`: OTLP protobuf encoding and HTTP push for relay telemetry (the privacy mapping stays in the default
-  build).
-- `product-analytics-export`: product analytics export path.
+  build); forwards to `marmot-observability/otlp-export`.
+- `product-analytics-export`: product analytics export path; forwards to `marmot-observability/product-analytics-export`.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
-- `test-support`: exposes `error_kind_table` to the host crates' tests. Enable it only as a dev-dependency.
+- `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
+  (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
 
 ## Verification
 

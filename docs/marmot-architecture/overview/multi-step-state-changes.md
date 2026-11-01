@@ -47,7 +47,7 @@ The current-profile create path crosses three deliberately separate ownership la
 | --- | --- | --- | --- |
 | MLS group plus exact founding Welcome bytes/destinations | Authoritative | The engine commits these atomically before app projection work. | Session open reloads the group and retained outbound Welcomes. |
 | Account group plus materialized chat-list row | Derived, durable host projection | One app SQLCipher transaction writes both; the detailed create result returns that exact committed row. | Account-open reconciliation derives the group projection from the engine. |
-| `app_pending_welcome_delivery` | Convenience-only repair index | Founding create does not write it synchronously. Actual delivery failures populate it, and an explicit pending query reconciles it from engine obligations. | Account open and pending-delivery enumeration rebuild missing rows and remove completed tracked rows. |
+| `app_pending_welcome_delivery` | Convenience-only repair index | Neither a create nor an invite writes it before publishing: the engine already holds every Welcome, staged with an invite's commit. Actual delivery failures populate it, whichever path published the Welcome, and an explicit pending query reconciles it from engine obligations. | Account open and pending-delivery enumeration rebuild missing rows and remove completed tracked rows. |
 
 The engine transaction remains the authoritative point of no return. The app transaction does not widen or nest the
 engine transaction across components, so lock ordering is unchanged. Removing the eager convenience-index commit cuts

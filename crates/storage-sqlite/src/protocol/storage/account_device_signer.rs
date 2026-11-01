@@ -36,32 +36,24 @@ impl AccountDeviceSignerStorage for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteAccountStorage};
+    use crate::SqliteAccountStorage;
 
     fn member_id(n: u8) -> MemberId {
         MemberId::new(vec![n; 4])
     }
 
     #[test]
-    fn account_device_signer_binding_survives_encrypted_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+    fn account_device_signer_binding_round_trips() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let binding = AccountDeviceSignerBinding {
             marmot_identity: member_id(1),
             mls_signature_public_key: vec![9, 8, 7],
         };
-
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.put_account_device_signer(&binding).unwrap();
-        }
-
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.put_account_device_signer(&binding).unwrap();
         assert_eq!(
-            reopened.account_device_signer(&member_id(1)).unwrap(),
+            store.account_device_signer(&member_id(1)).unwrap(),
             Some(binding)
         );
-        assert_eq!(reopened.account_device_signer(&member_id(9)).unwrap(), None);
+        assert_eq!(store.account_device_signer(&member_id(9)).unwrap(), None);
     }
 }

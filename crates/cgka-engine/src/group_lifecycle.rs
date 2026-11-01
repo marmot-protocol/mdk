@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
 };
+use crate::device_tag::{OwnDeviceTag, own_device_slot};
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
@@ -19,7 +20,8 @@ use crate::wire_format::{
 };
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
-    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
+    ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -27,15 +29,16 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::maintenance::{
     GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy,
+    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
     BasicCredential, CreationFromExternalError, Extension, Extensions, KeyPackageBundle,
     MlsMessageBodyIn, MlsMessageIn, WelcomeError,
@@ -63,6 +66,17 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         maintenance.periodic_maintenance_policy()?,
         PeriodicMaintenancePolicy::EnabledForNewGroups
     );
+    let post_join = post_join.map(|(welcome_id, sampled_jitter_ms)| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-post-join-maintenance-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(welcome_id.as_slice());
+        (
+            MessageId::new(hasher.finalize().to_vec()),
+            sampled_jitter_ms,
+        )
+    });
     maintenance.put_group_maintenance(&GroupMaintenanceState {
         group_id: group_id.clone(),
         enrolled_at: Some(enrolled_at),
@@ -70,14 +84,12 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
         next_periodic_rotation_at: None,
         leaf_refresh_due_at: None,
+        // A joined copy owes its history fetch from the moment it exists.
+        post_join_history: post_join
+            .as_ref()
+            .map(|(obligation_id, _)| PostJoinHistoryFetch::new(obligation_id.clone())),
     })?;
-    if let Some((welcome_id, sampled_jitter_ms)) = post_join {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-post-join-maintenance-v1");
-        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
-        hasher.update(group_id.as_slice());
-        hasher.update(welcome_id.as_slice());
-        let obligation_id = MessageId::new(hasher.finalize().to_vec());
+    if let Some((obligation_id, sampled_jitter_ms)) = post_join {
         maintenance.put_maintenance_obligation(&MaintenanceObligation {
             id: obligation_id,
             group_id: group_id.clone(),
@@ -119,6 +131,71 @@ pub(crate) fn welcome_content_dedup_id(
     }
 }
 
+/// Receiving flow step 2 (`protocol-core/joining.md`): a delivery joins only
+/// when it names a KeyPackage this device published. `first_held` is the first
+/// Welcome secret, in OpenMLS order, for which this device holds a private
+/// bundle; the result is the reference the join consumes.
+///
+/// A delivery naming one of [`KeyPackageLifecycleState::held_publications`] is
+/// this device's join, and a missing bundle fails it as before. One naming any
+/// other KeyPackage, such as a sibling device's, is not addressed to this
+/// device. The exception is a Welcome that only opens with a bundle whose
+/// publication this device never recorded: KeyPackages kept from before ids
+/// were recorded must still join after an upgrade, and a sibling's delivery
+/// can reach one only when it carries the same Welcome as this device's own.
+/// A transport that names no KeyPackage leaves the decision to the MLS match.
+pub(crate) fn welcome_key_package_of_this_device(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+    first_held: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EngineError> {
+    let held = || {
+        lifecycle
+            .into_iter()
+            .flat_map(KeyPackageLifecycleState::held_publications)
+    };
+    match claimed {
+        Some(claimed) if !held().any(|(id, _)| id == claimed) => first_held
+            .filter(|reference| !held().any(|(_, held_ref)| held_ref == reference.as_slice()))
+            .ok_or(EngineError::WelcomeNotAddressedToThisDevice),
+        _ => first_held.ok_or(EngineError::MissingWelcomeKeyPackage),
+    }
+}
+
+/// The route a Welcome arrived by, which decides whether it may consume a
+/// private KeyPackage (mdk#2628 3.5).
+#[derive(Clone, Debug)]
+pub(crate) enum WelcomeRoute {
+    /// A transport delivery, a stored rejoin offer or a direct join. It never
+    /// consumes a private KeyPackage.
+    Delivery,
+    /// A sibling Welcome the app admitted from the trusted device group. It
+    /// consumes only the private KeyPackage it names, and only one this
+    /// device issued to `from`'s slot.
+    Sibling {
+        from: DeviceSlotId,
+        key_package_ref: Vec<u8>,
+    },
+}
+
+/// Whether a delivery of a Welcome this device already joined names a
+/// KeyPackage publication this device never held. One Welcome reaches every
+/// device it adds, each in its own delivery of the same content, so once this
+/// device joined through its own, a sibling's lands on the content dedup
+/// marker. It is still not addressed to this device (mdk#2628 3.2). Without
+/// a claim or a lifecycle record, it stays a duplicate.
+pub(crate) fn joined_welcome_names_another_key_package(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+) -> bool {
+    match (lifecycle, claimed) {
+        (Some(lifecycle), Some(claimed)) => !lifecycle
+            .held_publications()
+            .any(|(held, _)| held == claimed),
+        _ => false,
+    }
+}
+
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -128,12 +205,14 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
+            | EngineError::UnexpectedDeviceGroupWelcome
             | EngineError::MissingWelcomeKeyPackage
             | EngineError::InvalidCredentialIdentity(_)
             | EngineError::InvalidAccountIdentityProof(_)
             | EngineError::MissingRequiredCapabilities { .. }
             | EngineError::NotGroupAdmin { .. }
             | EngineError::WelcomeAlreadyProcessed
+            | EngineError::SiblingWelcomePredatesForget
     )
 }
 
@@ -233,13 +312,79 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
     }
 }
 
+/// The longest group id a host may choose.
+pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
+
+/// A creation under a group id the host chose, as a device link's
+/// (mdk#2628 item 3.3b). A device group's founding Add adds the linked
+/// device and sets its roster entry by `roster_update` (D41). Its Welcomes are
+/// never published from `welcome_deliver_until` on, when the new device stops
+/// waiting (D40).
+pub(crate) struct ChosenGroup {
+    pub(crate) group_id: GroupId,
+    pub(crate) roster_update: Option<Vec<u8>>,
+    pub(crate) welcome_deliver_until: Timestamp,
+}
+
 impl<S: StorageProvider> Engine<S> {
-    /// Implementation of `CgkaEngine::create_group`.
+    /// A chosen group id must name no group this device holds in any state.
+    /// OpenMLS refuses an id with live state on its own, but a removed or
+    /// forgotten copy can keep a Marmot record without it, and the cleanup
+    /// guard of a failed creation would delete that record.
+    fn ensure_chosen_group_id_is_free(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if !(1..=MAX_CHOSEN_GROUP_ID_LEN).contains(&group_id.as_slice().len()) {
+            return Err(EngineError::Other(format!(
+                "a chosen group id has 1 to {MAX_CHOSEN_GROUP_ID_LEN} bytes"
+            )));
+        }
+        match self.storage.get_group(group_id) {
+            Ok(_) => {
+                return Err(EngineError::Other(
+                    "a group with the chosen id already exists".into(),
+                ));
+            }
+            Err(cgka_traits::storage::StorageError::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A forgotten id refuses every later record of the group, so a
+        // creation under one would leave MLS state no record can join.
+        if self.storage.is_group_forgotten(group_id)? {
+            return Err(EngineError::Other(
+                "the chosen id names a group this device forgot".into(),
+            ));
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let live = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?;
+        if live.is_some() {
+            return Err(EngineError::Other(
+                "a group with the chosen id already exists".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Implementation of `CgkaEngine::create_group`, optionally under a group
+    /// id the host chose.
     pub(crate) async fn do_create_group(
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        chosen: Option<ChosenGroup>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        if let Some(chosen) = &chosen {
+            // A legacy create holds its Welcomes with its pending commit,
+            // which keeps no delivery deadline (D40).
+            if self.new_protocol_profile == ProtocolProfile::Legacy {
+                return Err(EngineError::Other(
+                    "only a current-profile group is created under a chosen id".into(),
+                ));
+            }
+            self.ensure_chosen_group_id_is_free(&chosen.group_id)?;
+        }
         // 1. Validate invitees against required capabilities.
         let crate::key_package::CreationKeyPackageCapabilities {
             required: mut required_caps,
@@ -249,6 +394,15 @@ impl<S: StorageProvider> Engine<S> {
         let mut desired_components = AppComponentSet::from(default_group_components());
         for component_id in &required_caps.app_components.ids {
             desired_components.insert(*component_id);
+        }
+        // A creator that supports account-devices requires it when its own
+        // leaf and every founding KeyPackage advertise it
+        // (protocol-core/group-setup.md). The per-leaf negotiation below keeps
+        // it exactly then; the host does not choose it. A founding Add that
+        // breaks the component's rules, the leaf limit included, is refused
+        // below before any Welcome exists. Legacy groups never require it.
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            desired_components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         }
         let mut self_supported_components = self.supported_app_components.clone();
         if self.new_protocol_profile == ProtocolProfile::Current {
@@ -352,6 +506,34 @@ impl<S: StorageProvider> Engine<S> {
                 .is_empty(),
             "engine-owned components must not be negotiated out of a created group"
         );
+        // A device group's founding Add is a link's, as every Add there is
+        // (device-group.md, "Creating the device group"): it adds exactly the
+        // confirmed KeyPackage and sets that device's roster entry, so the
+        // founding roster never lists it (D41).
+        let founding_add_links = required_caps
+            .app_components
+            .contains(DEVICE_ROSTER_COMPONENT_ID)
+            && !parsed_kps.is_empty();
+        let founding_roster_update = chosen
+            .as_ref()
+            .and_then(|chosen| chosen.roster_update.as_deref());
+        match (founding_add_links, founding_roster_update) {
+            (true, Some(update)) if parsed_kps.len() == 1 => {
+                crate::link_device::validate_link_roster_update(update)?;
+            }
+            (true, _) => {
+                return Err(EngineError::Other(
+                    "a device group's founding Add adds exactly one device and sets its roster entry"
+                        .into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(EngineError::Other(
+                    "a founding roster update needs a device group's founding Add".into(),
+                ));
+            }
+            (false, None) => {}
+        }
         let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
         // 2. Build the group config with leaf capabilities, MLS
@@ -363,9 +545,30 @@ impl<S: StorageProvider> Engine<S> {
             self.new_protocol_profile,
             "identity proof material must match the new-state profile"
         );
+        // The founding leaf of a device group is tagged from the roster it
+        // founds, so the founder's first leaf there already reads as its own;
+        // a leaf in any other group from the device group's roster.
+        let own_tag = if required_caps
+            .app_components
+            .contains(DEVICE_ROSTER_COMPONENT_ID)
+        {
+            let own_slot = own_device_slot(&self.storage).ok().flatten();
+            req.app_components
+                .iter()
+                .find(|component| component.component_id == DEVICE_ROSTER_COMPONENT_ID)
+                .and_then(|component| decode_device_roster_v1(&component.data).ok())
+                .and_then(|roster| {
+                    OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
+                })
+        } else {
+            self.own_device_tag(&self.storage).ok().flatten()
+        };
+        let device_tag = own_tag
+            .map(|own| own.seal(&self.crypto, &self.identity.signer))
+            .transpose()?;
         let leaf_extensions = self
             .identity
-            .leaf_extensions(&self.supported_app_components)?;
+            .leaf_extensions(&self.supported_app_components, device_tag)?;
 
         // Validate the creator (implicit admin) on the SAME x-only secp256k1
         // basis as the co-admins below (mdk#737 review), so no admin-set entry
@@ -421,12 +624,21 @@ impl<S: StorageProvider> Engine<S> {
         // crash or write fault cannot leave a partial, undiscoverable group.
         let mut mls_group = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-            let group = MlsGroup::new(
-                &provider,
-                &self.identity.signer,
-                &group_config,
-                self.identity.credential_with_key.clone(),
-            )
+            let group = match &chosen {
+                Some(ChosenGroup { group_id, .. }) => MlsGroup::new_with_group_id(
+                    &provider,
+                    &self.identity.signer,
+                    &group_config,
+                    openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    self.identity.credential_with_key.clone(),
+                ),
+                None => MlsGroup::new(
+                    &provider,
+                    &self.identity.signer,
+                    &group_config,
+                    self.identity.credential_with_key.clone(),
+                ),
+            }
             .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
             crate::app_components::validate_current_profile_group_invariants(&group)?;
             Ok::<MlsGroup, EngineError>(group)
@@ -469,9 +681,44 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
-            let (_commit_out, welcome_out, _group_info) = mls_group
-                .add_members(&provider, &self.identity.signer, &parsed_kps)
-                .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            let welcome_out = match founding_roster_update {
+                // Built from the Add and the roster update only, as a link's
+                // Commit is, and authorized as every own device-group Commit.
+                Some(roster_update) => {
+                    let roster_proposal =
+                        Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                            DEVICE_ROSTER_COMPONENT_ID,
+                            roster_update.to_vec(),
+                        )));
+                    let (_commit_out, welcome_out) = self
+                        .stage_exact_commit_with_app_data_updates(
+                            &mut mls_group,
+                            &provider,
+                            Vec::new(),
+                            parsed_kps.clone(),
+                            vec![roster_proposal],
+                            "found_device_group",
+                        )?;
+                    let staged = mls_group.pending_commit().ok_or_else(|| {
+                        EngineError::Backend("founding add produced no pending commit".into())
+                    })?;
+                    crate::commit_class::authorize_own_staged_commit(
+                        &mls_group,
+                        &group_id,
+                        self.identity.self_id(),
+                        staged,
+                    )?;
+                    welcome_out.ok_or_else(|| {
+                        EngineError::Backend("founding add produced no Welcome".into())
+                    })?
+                }
+                None => {
+                    let (_commit_out, welcome_out, _group_info) = mls_group
+                        .add_members(&provider, &self.identity.signer, &parsed_kps)
+                        .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+                    welcome_out
+                }
+            };
             if self.new_protocol_profile == ProtocolProfile::Legacy {
                 pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
                     &self.storage,
@@ -500,17 +747,15 @@ impl<S: StorageProvider> Engine<S> {
             Some(bytes)
         };
 
-        // 4. Persist Marmot-side group record with the PROJECTED
-        //    post-merge member set before recording outbound welcomes.
-        //    SQLite enforces message/group foreign keys, so the group row
-        //    must exist before `record_sent_message` writes welcome records.
+        // 4. Build the Marmot-side group record with the PROJECTED
+        //    post-merge member set.
         //
         //    The MLS group is still at epoch 0 pre-merge, but the `members`
-        //    field surfaced via the `CgkaEngine::members` API and walked by
-        //    `feature_status` needs to reflect "who the user thinks is in the
-        //    group" — which includes invitees they just added. On
-        //    `publish_failed` we re-derive from the (still-unmerged) MLS
-        //    state, which naturally rolls the projection back.
+        //    field surfaced via the `CgkaEngine::members` API needs to
+        //    reflect "who the user thinks is in the group" — which includes
+        //    invitees they just added. On `publish_failed` we re-derive from
+        //    the (still-unmerged) MLS state, which naturally rolls the
+        //    projection back.
         let projected_members = projected_members_with_pending(&mls_group, &parsed_kps)?;
         let group_record = Group {
             id: group_id.clone(),
@@ -528,28 +773,10 @@ impl<S: StorageProvider> Engine<S> {
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
         };
-        if self.new_protocol_profile == ProtocolProfile::Legacy {
-            self.storage.put_group(&group_record)?;
-            // #740: index this group's transport routing id for O(1) inbound
-            // resolution (see `Engine::transport_group_id_index`). Best-effort:
-            // a routing-read failure only forfeits the fast path.
-            if let Ok(transport_group_id) =
-                crate::app_components::transport_group_id_of_group(&mls_group)
-            {
-                // Inlined `index_transport_group_route` (field-split borrows:
-                // `provider` above still holds `&self`); creation needs no
-                // retention prune yet.
-                self.transport_group_id_index
-                    .insert(transport_group_id.clone(), group_id.clone());
-                let _ = self.storage.put_transport_group_route(
-                    &transport_group_id,
-                    &group_id,
-                    EpochId(mls_group.epoch().as_u64()),
-                );
-            }
-        }
 
-        // 5. Wrap welcomes via the peeler.
+        // 5. Wrap welcomes via the peeler, before the group record or any
+        //    Welcome is written: a Welcome that cannot be wrapped refuses the
+        //    creation.
         //
         // Note: we intentionally do NOT emit the commit. The creator is the
         // only party who'd care about the "commit that creates the group at
@@ -577,10 +804,45 @@ impl<S: StorageProvider> Engine<S> {
                     self.peeler.wrap_welcome(&payload, &recipient).await
                 }
                 .map_err(EngineError::Peeler)?;
-                if self.new_protocol_profile == ProtocolProfile::Legacy {
-                    self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
-                }
                 welcomes.push(wrapped);
+            }
+        }
+
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            // Every check that can refuse the creation runs before its first
+            // write. A current-profile create runs them inside its creation
+            // transaction instead.
+            crate::capability_manager::check_key_packages_carry_profile(
+                group_record.protocol_profile,
+                &parsed_kps,
+            )?;
+            crate::capability_manager::check_own_leaf(
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
+            // SQLite enforces message/group foreign keys, so the group row
+            // must exist before `record_sent_message` writes welcome records.
+            self.storage.put_group(&group_record)?;
+            // #740: index this group's transport routing id for O(1) inbound
+            // resolution (see `Engine::transport_group_id_index`). Best-effort:
+            // a routing-read failure only forfeits the fast path.
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                // Inlined `index_transport_group_route` (field-split borrows:
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
+                self.transport_group_id_index
+                    .insert(transport_group_id.clone(), group_id.clone());
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
+            for welcome in &welcomes {
+                self.record_sent_message(welcome, &group_id, EpochId(0))?;
             }
         }
 
@@ -603,12 +865,12 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage
                     .with_transaction(|storage| -> Result<EpochId, EngineError> {
                         if mls_group.pending_commit().is_some() {
-                            // The capability cache validates every added leaf
-                            // against the persisted group's protocol profile.
-                            // Seed the projected record inside this same
-                            // transaction before inspecting the staged Add;
-                            // it is overwritten with the canonical epoch and
-                            // roster after the merge below.
+                            // The added-leaf check reads the persisted
+                            // group's protocol profile. Seed the projected
+                            // record inside this same transaction before
+                            // inspecting the staged Add; it is overwritten
+                            // with the canonical epoch and roster after the
+                            // merge below.
                             storage.put_group(&group_record)?;
                             {
                                 let staged = mls_group.pending_commit().ok_or_else(|| {
@@ -616,7 +878,7 @@ impl<S: StorageProvider> Engine<S> {
                                         "founding add lost its pending commit".into(),
                                     )
                                 })?;
-                                crate::capability_manager::cache_from_staged_commit(
+                                crate::capability_manager::check_added_leaf_profiles(
                                     storage, &group_id, staged,
                                 )?;
                             }
@@ -640,15 +902,29 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
+                        crate::announced_key_packages::record_roster_announcements(
+                            storage,
+                            &group_id,
+                            &mls_group,
+                            enrolled_at,
+                        )?;
 
-                        for welcome in &welcomes {
-                            let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
-                                .encode()
-                                .map_err(|error| {
-                                    EngineError::Serialize(format!(
-                                        "encode founding Welcome: {error:?}"
-                                    ))
-                                })?;
+                        for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
+                            let payload = StoredMessagePayload::outbound_welcome(
+                                welcome.clone(),
+                                Some(
+                                    crate::key_package::key_package_ref(parsed_kp)?
+                                        .as_slice()
+                                        .to_vec(),
+                                ),
+                                chosen.as_ref().map(|chosen| chosen.welcome_deliver_until),
+                            )
+                            .encode()
+                            .map_err(|error| {
+                                EngineError::Serialize(format!(
+                                    "encode founding Welcome: {error:?}"
+                                ))
+                            })?;
                             storage.put_message(&MessageRecord {
                                 id: welcome.id.clone(),
                                 group_id: group_id.clone(),
@@ -658,14 +934,12 @@ impl<S: StorageProvider> Engine<S> {
                                 deferred_peel: None,
                             })?;
                         }
-                        crate::capability_manager::cache_from_key_packages(
+                        crate::capability_manager::check_key_package_profiles(
                             storage,
                             &group_id,
                             &parsed_kps,
                         )?;
-                        crate::capability_manager::cache_self_capabilities(
-                            storage,
-                            &group_id,
+                        crate::capability_manager::check_own_leaf(
                             &mls_group,
                             self.identity.self_id(),
                             self.ciphersuite,
@@ -732,15 +1006,6 @@ impl<S: StorageProvider> Engine<S> {
             }
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
-
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
-        crate::capability_manager::cache_self_capabilities(
-            &self.storage,
-            &group_id,
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
 
         // 7. Enter PendingPublish — the caller must confirm_published once
         //    the transport hands off every welcome. The visible epoch
@@ -867,7 +1132,10 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self.do_join_welcome(welcome).await {
+            match self
+                .do_join_welcome(welcome, None, WelcomeRoute::Delivery)
+                .await
+            {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -925,6 +1193,7 @@ impl<S: StorageProvider> Engine<S> {
             peeled,
             content_id,
             Some((&candidate.group_id, local_state_token)),
+            WelcomeRoute::Delivery,
         )
         .await
     }
@@ -956,6 +1225,8 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
+        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
@@ -997,26 +1268,37 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_id = welcome_msg.id.clone();
 
         // 3. Peel.
-        let peeled = self
-            .peeler
-            .peel_welcome(&welcome_msg)
-            .await
-            .map_err(EngineError::Peeler)?;
-        let content_id = welcome_content_dedup_id(&peeled)?;
+        let (peeled, content_id) = match prepeeled {
+            Some(prepared) => prepared,
+            None => {
+                let peeled = self
+                    .peeler
+                    .peel_welcome(&welcome_msg)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = welcome_content_dedup_id(&peeled)?;
+                (peeled, content_id)
+            }
+        };
         if self.storage.has_ingress_dedup_marker(&content_id)? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
 
         let result = self
-            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone())
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone(), route)
             .await;
         match &result {
             Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
+                // A sibling Welcome refused for its carrier's date refuses
+                // that carrier only; every other refusal is the Welcome's.
+                let content_refused = !matches!(error, EngineError::SiblingWelcomePredatesForget);
                 self.storage.with_transaction(|storage| {
                     storage.put_ingress_dedup_marker(&welcome_id)?;
-                    storage.put_ingress_dedup_marker(&content_id)?;
+                    if content_refused {
+                        storage.put_ingress_dedup_marker(&content_id)?;
+                    }
                     Ok::<_, EngineError>(())
                 })?;
             }
@@ -1030,8 +1312,9 @@ impl<S: StorageProvider> Engine<S> {
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
-        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None)
+        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None, route)
             .await
     }
 
@@ -1042,12 +1325,15 @@ impl<S: StorageProvider> Engine<S> {
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
         consent: Option<(&GroupId, &[u8])>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
-        let (welcome_bytes, welcome_created_at) = match peeled.content {
-            cgka_traits::ingest::PeeledContent::Welcome { bytes, created_at } => {
-                (bytes, created_at)
-            }
+        let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
+            cgka_traits::ingest::PeeledContent::Welcome {
+                bytes,
+                created_at,
+                key_package_event_id,
+            } => (bytes, created_at, key_package_event_id),
             _ => {
                 return Err(EngineError::Peeler(
                     cgka_traits::error::PeelerError::Malformed(
@@ -1112,7 +1398,9 @@ impl<S: StorageProvider> Engine<S> {
             // Match in the same order OpenMLS uses: the first Welcome
             // KeyPackageRef for which this account-device has a private
             // bundle. Transport tags are deliberately outside this
-            // selection. Point-query per candidate ref — the same lookup
+            // selection; the delivery's KeyPackage claim only decides
+            // below whether it is addressed to this device. Point-query
+            // per candidate ref — the same lookup
             // `ProcessedWelcome::new_from_welcome` performs internally —
             // rather than enumerating, JSON-decoding, and re-hashing
             // every stored bundle on each join.
@@ -1128,8 +1416,56 @@ impl<S: StorageProvider> Engine<S> {
                     break;
                 }
             }
-            let consumed_key_package_ref =
-                consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?;
+            // Before anything is decrypted, so a delivery for another
+            // device consumes nothing and never reaches the rejoin offers.
+            let lifecycle = match (&key_package_claim, storage.maintenance_storage()) {
+                (Some(_), Some(maintenance)) => maintenance.key_package_lifecycle()?,
+                _ => None,
+            };
+            let consumed_key_package_ref = match welcome_key_package_of_this_device(
+                lifecycle.as_ref(),
+                key_package_claim.as_ref(),
+                consumed_key_package_ref.clone(),
+            ) {
+                // An offer this device already holds passed this check when
+                // it arrived, or was stored before deliveries were checked,
+                // when the MLS match alone decided. Such an offer may wrap
+                // this device's own Welcome in another device's delivery,
+                // and this device's own copy has usually passed the transport
+                // cursor, so the MLS match decides it still.
+                Err(EngineError::WelcomeNotAddressedToThisDevice)
+                    if storage
+                        .list_welcomes()?
+                        .iter()
+                        .any(|offer| offer.message_id == welcome_id) =>
+                {
+                    consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?
+                }
+                decided => decided?,
+            };
+            // A private KeyPackage joins only through a sibling Welcome from
+            // the device group, and only the one that Welcome names, issued
+            // to the sibling that sent it; a sibling Welcome consumes nothing
+            // else (mdk#2628 3.5). Refusing one as not addressed here
+            // remembers only this wrapper, so its content stays open to the
+            // route it belongs to.
+            let issued =
+                crate::private_key_packages::issued_record(storage, &consumed_key_package_ref)?;
+            let sibling_record = match (&route, issued) {
+                (WelcomeRoute::Delivery, None) => None,
+                (
+                    WelcomeRoute::Sibling {
+                        from,
+                        key_package_ref,
+                    },
+                    Some(record),
+                ) if &record.recipient_slot == from
+                    && key_package_ref == &consumed_key_package_ref =>
+                {
+                    Some(record)
+                }
+                _ => return Err(EngineError::WelcomeNotAddressedToThisDevice),
+            };
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -1143,6 +1479,15 @@ impl<S: StorageProvider> Engine<S> {
                     .as_slice()
                     .to_vec(),
             );
+            // Validating the joined state (5b) reads the GroupInfo's own app
+            // data, which OpenMLS drops when it stages the Welcome. Staging
+            // verifies the GroupInfo signature, so a rejected forgery never
+            // reaches that check.
+            let group_info_app_data = processed
+                .unverified_group_info()
+                .extensions()
+                .app_data_dictionary()
+                .cloned();
             // GroupInfo is still unverified here. Every tentative replacement
             // write is rolled back unless OpenMLS and Marmot checks succeed
             // and the local state permits this join.
@@ -1150,11 +1495,27 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::InvalidWelcome);
             }
 
+            // A forgotten group takes only a Welcome its author dated after
+            // the forget. A device link's Welcome is held to its link
+            // instead (5f): the existing device's leaf key and the
+            // KeyPackage the link confirmed, which is never one the device
+            // joined by, so the Welcome that installed the discarded copy
+            // stays out and the two devices' clocks never decide a link.
             let reset_cutoff = storage.group_local_reset_cutoff(&group_id)?;
-            if let Some(cutoff) = reset_cutoff
+            let awaited_by_a_link = storage
+                .device_group_welcome_expectation(&group_id)?
+                .is_some_and(|expected| expected.key_package_ref == consumed_key_package_ref);
+            let dated_reset = reset_cutoff.filter(|_| !awaited_by_a_link);
+            if let Some(cutoff) = dated_reset
                 && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
-                return Err(EngineError::InvalidWelcome);
+                // A sibling Welcome's date is its carrier's, so the same
+                // Welcome in a later carrier is a fresh one.
+                return Err(if sibling_record.is_some() {
+                    EngineError::SiblingWelcomePredatesForget
+                } else {
+                    EngineError::InvalidWelcome
+                });
             }
 
             let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
@@ -1172,11 +1533,12 @@ impl<S: StorageProvider> Engine<S> {
             };
             let (local_state_is_stale, repaired_unrecoverable) = match discarded.as_ref() {
                 Some(group) => {
-                    let self_is_recorded_member = group
-                        .members
-                        .iter()
-                        .any(|member| &member.id == self.identity.self_id());
-                    if self_is_recorded_member && !group.unrecoverable {
+                    // A sibling device's leaf keeps this account on the roster
+                    // after this device's removal, so the roster alone never
+                    // makes the discarded copy an active member.
+                    let copy_is_member =
+                        crate::identity::local_copy_is_member(group, self.identity.self_id());
+                    if copy_is_member && !group.unrecoverable {
                         // A fork can have advanced beyond the replacement epoch.
                         // Epoch ordering never grants consent: every distinct fully
                         // validated Welcome only offers explicit branch replacement.
@@ -1198,7 +1560,7 @@ impl<S: StorageProvider> Engine<S> {
                             confirmation_token = Some(token);
                         }
                     }
-                    if consent.is_some() && (!self_is_recorded_member || group.unrecoverable) {
+                    if consent.is_some() && (!copy_is_member || group.unrecoverable) {
                         return Err(rejoin_confirmation_required());
                     }
                     // Unrecoverable is the explicit exception: a fully
@@ -1242,10 +1604,11 @@ impl<S: StorageProvider> Engine<S> {
                 .welcome_sender()
                 .map_err(|_| EngineError::InvalidWelcome)?;
             let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            let welcome_sender_key = welcome_sender.signature_key().as_slice().to_vec();
             // Bind the timestamp's authenticated author to the MLS inviter;
             // an unrelated sender rewrapping old Welcome bytes cannot make
             // those bytes a fresh invitation across a reset boundary.
-            if reset_cutoff.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
+            if dated_reset.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
                 return Err(EngineError::InvalidWelcome);
             }
             let mls_group = staged
@@ -1267,8 +1630,11 @@ impl<S: StorageProvider> Engine<S> {
             {
                 return Err(EngineError::InvalidWelcome);
             }
-            crate::app_components::validate_current_profile_group_invariants(&mls_group)
-                .map_err(|_| EngineError::InvalidWelcome)?;
+            crate::app_components::validate_joined_group_invariants(
+                &mls_group,
+                group_info_app_data.as_ref(),
+            )
+            .map_err(|_| EngineError::InvalidWelcome)?;
 
             // Validate every known GroupContext component before any joined
             // state leaves this transaction. Commit ingest validates
@@ -1302,8 +1668,15 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
-            // 5d. The authenticated Welcome sender must be an admin.
-            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+            // 5d. The authenticated Welcome sender must be an admin, or a
+            // device of this account in a state that requires
+            // account-devices.
+            crate::app_components::require_welcome_author_authority(
+                &mls_group,
+                &group_id,
+                &welcome_sender_id,
+                self.identity.self_id(),
+            )?;
 
             // 5e. Every advertised admin must have a current member leaf.
             crate::app_components::reject_admins_without_member_leaf(
@@ -1316,7 +1689,52 @@ impl<S: StorageProvider> Engine<S> {
                 _ => EngineError::InvalidWelcome,
             })?;
 
+            // 5f. A Welcome into a group that requires the device roster, or
+            // into a group id a confirmed device link reserved, joins only as
+            // that link's Welcome: into a device group, from the leaf whose
+            // signature key the link named, adding this device by the
+            // KeyPackage the link confirmed, before its wait ends (mdk#2628
+            // D28, D30, D41). The group id alone is no proof: anyone holding
+            // the account key can read it and found a group under it. The
+            // join consumes the expectation in this transaction.
+            let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
+            match storage.device_group_welcome_expectation(&group_id)? {
+                Some(expected)
+                    if roster_required
+                        && expected.sender_signature_key == welcome_sender_key
+                        && expected.key_package_ref == consumed_key_package_ref
+                        && joined_at.0 < expected.expires_at =>
+                {
+                    storage.delete_device_group_welcome_expectation(&group_id)?;
+                }
+                Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
+                None => {}
+            }
+            // While a link waits, the KeyPackage it confirmed is reserved for
+            // it: no Welcome into another group, a chat included, consumes
+            // it (D41).
+            if storage
+                .device_group_welcome_expectations()?
+                .iter()
+                .any(|waiting| {
+                    waiting.group_id != group_id
+                        && waiting.key_package_ref == consumed_key_package_ref
+                        && joined_at.0 < waiting.expires_at
+                })
+            {
+                return Err(EngineError::UnexpectedDeviceGroupWelcome);
+            }
+
             if let Some(local_state_token) = confirmation_token {
+                // A sibling Welcome into a chat this device still holds, as
+                // one sent after a removal that has not reached it yet, is
+                // no offer: the app keeps it and joins it once the copy reads
+                // removed or unrecoverable. Held, it rolls back like an offer
+                // and marks nothing (mdk#2628 3.5b).
+                if sibling_record.is_some() {
+                    return Err(EngineError::SiblingWelcomeHeld { group_id });
+                }
                 pending_rejoin = Some(PendingWelcome {
                     message_id: welcome_id.clone(),
                     group_id: group_id.clone(),
@@ -1375,6 +1793,9 @@ impl<S: StorageProvider> Engine<S> {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
+            crate::announced_key_packages::record_roster_announcements(
+                storage, &group_id, &mls_group, joined_at,
+            )?;
             if local_state_is_stale {
                 if consent.is_some() {
                     // Explicitly discarding a fork also discards its rewind
@@ -1407,9 +1828,7 @@ impl<S: StorageProvider> Engine<S> {
                         },
                     )?;
             }
-            crate::capability_manager::cache_self_capabilities(
-                storage,
-                &group_id,
+            crate::capability_manager::check_own_leaf(
                 &mls_group,
                 self.identity.self_id(),
                 self.ciphersuite,
@@ -1468,6 +1887,10 @@ impl<S: StorageProvider> Engine<S> {
                     .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
                 lifecycle.record_consumed_key_package(&consumed_key_package_ref, joined_at);
                 maintenance.put_key_package_lifecycle(&lifecycle)?;
+            }
+            // The issued record goes with the bundle the join consumed.
+            if let Some(record) = &sibling_record {
+                crate::private_key_packages::delete_issued(storage, record)?;
             }
 
             // A Welcome-installed member must retain the joined epoch
@@ -1797,11 +2220,12 @@ pub(crate) fn welcome_metadata_for_key_package(
 }
 
 /// Build the projected post-merge member list: existing MLS members + each
-/// invitee whose KeyPackage is being added by the staged commit. Used by
-/// the send paths so `members()` and `feature_status` reflect the user's
-/// intended state during `PendingPublish`. On rollback, the engine simply
-/// calls `marmot_members(&mls_group)` against the still-unmerged group to
-/// discard the projection.
+/// invitee leaf the staged commit adds, one per KeyPackage, so an account's
+/// several devices each keep their entry. Used by the send paths so
+/// `members()` reflects the user's intended state during `PendingPublish`;
+/// `feature_status` counts the same added leaves from the pending commit. On
+/// rollback, the engine simply calls `marmot_members(&mls_group)` against the
+/// still-unmerged group to discard the projection.
 pub(crate) fn projected_members_with_pending(
     group: &MlsGroup,
     invitees: &[openmls::prelude::KeyPackage],
@@ -1809,11 +2233,9 @@ pub(crate) fn projected_members_with_pending(
     let mut out = marmot_members(group);
     for kp in invitees {
         let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
-        if !out.iter().any(|m| m.id == id) {
-            out.push(Member {
-                id,
-                credential: kp.leaf_node().signature_key().as_slice().to_vec(),
-            });
+        let credential = kp.leaf_node().signature_key().as_slice().to_vec();
+        if !out.iter().any(|m| m.id == id && m.credential == credential) {
+            out.push(Member { id, credential });
         }
     }
     Ok(out)
@@ -2079,5 +2501,71 @@ mod tests {
         let error = classify_openmls_welcome_error(WelcomeError::<&str>::NoMatchingKeyPackage);
         assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
         assert!(terminal_welcome_error(&error));
+    }
+
+    #[test]
+    fn a_welcome_joins_only_through_a_key_package_this_device_published() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+        let decide = |claimed: Option<MessageId>, first_held: Option<Vec<u8>>| {
+            welcome_key_package_of_this_device(Some(&lifecycle), claimed.as_ref(), first_held)
+        };
+
+        // This device's own delivery joins, or fails as it always has.
+        assert_eq!(decide(Some(id(1)), Some(vec![1])).unwrap(), vec![1]);
+        assert!(matches!(
+            decide(Some(id(1)), None),
+            Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+        // A sibling's or unknown delivery is not this device's, even when
+        // the shared Welcome also opens with this device's KeyPackage.
+        for first_held in [None, Some(vec![1])] {
+            assert!(matches!(
+                decide(Some(id(2)), first_held),
+                Err(EngineError::WelcomeNotAddressedToThisDevice)
+            ));
+        }
+        // A bundle with no recorded publication predates the ids.
+        assert_eq!(decide(Some(id(2)), Some(vec![9])).unwrap(), vec![9]);
+        assert_eq!(
+            welcome_key_package_of_this_device(None, Some(&id(2)), Some(vec![9])).unwrap(),
+            vec![9]
+        );
+        // Without a claim, the MLS match decides alone.
+        assert_eq!(decide(None, Some(vec![1])).unwrap(), vec![1]);
+        assert!(matches!(
+            decide(None, None),
+            Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+    }
+
+    #[test]
+    fn a_joined_welcome_delivered_for_another_key_package_is_not_a_duplicate() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+
+        // A sibling's or unknown delivery names a publication never held.
+        assert!(joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(2))
+        ));
+        // This device's own delivery again is a duplicate.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(1))
+        ));
+        // So is any delivery it cannot tell apart.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            None
+        ));
+        assert!(!joined_welcome_names_another_key_package(
+            None,
+            Some(&id(2))
+        ));
     }
 }

@@ -3,6 +3,7 @@
 //! Typed variants cover cases the engine can classify. `Backend(String)` is
 //! the fallback for backend failures that do not yet have a narrower variant.
 
+use crate::app_components::AppComponentId;
 use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 
@@ -90,6 +91,16 @@ pub enum EngineError {
     #[error("group disbanding is not enabled")]
     DisbandingNotEnabled { group_id: GroupId },
 
+    /// This device cannot turn on `marmot.group.account-devices.v1` in the
+    /// group (account-devices-v1.md, "Activation in an existing group").
+    /// Refused before anything is staged. `reason` is aggregate: it never
+    /// names which members or devices block activation.
+    #[error("account-devices activation refused: {reason}")]
+    AccountDevicesActivationRefused {
+        group_id: GroupId,
+        reason: AccountDevicesActivationRefusal,
+    },
+
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an
@@ -124,14 +135,25 @@ pub enum EngineError {
     #[error("invalid KeyPackage capabilities: recipient must generate a new conforming KeyPackage")]
     InvalidKeyPackageCapabilities { member: MemberId },
 
+    /// Group creation supplied an entry for a protocol component that carries
+    /// no data at any location, such as `marmot.group.account-devices.v1`.
+    /// The engine alone decides whether a group requires such a component,
+    /// and no client creates an entry under its id. Nothing was created.
+    #[error("group creation cannot supply data for no-data app component {component_id:#06x}")]
+    NoDataAppComponent { component_id: AppComponentId },
+
     /// An application message pinned to `expected` (see
     /// [`SendIntent::AppMessage::expected_epoch`](crate::engine::SendIntent))
-    /// reached encryption after the group had already advanced to `current`:
-    /// the send folded retained peer commits first. Nothing was prepared or
-    /// published. Routine input for epoch-bound payloads such as
+    /// reached encryption after the group had moved off that pin, to
+    /// `current`: the send folded retained peer commits first. When the two
+    /// numbers are equal, branch selection moved the group to another branch
+    /// at the same epoch, which the pin's identity tells apart. Nothing was
+    /// prepared or published. Routine input for epoch-bound payloads such as
     /// encrypted-media references, not an engine bug: the caller re-derives
     /// the payload for the current epoch (re-uploads the media).
-    #[error("application message pinned to epoch {expected} but the group is at epoch {current}")]
+    #[error(
+        "application message pinned to epoch {expected} but the group has moved off it (now at epoch {current})"
+    )]
     AppMessageEpochMismatch { expected: EpochId, current: EpochId },
 
     /// An application message pinned to `expected` arrived while the group's
@@ -145,6 +167,53 @@ pub enum EngineError {
         "application message pinned to epoch {expected} refused while the group epoch is unsettled"
     )]
     AppMessageEpochUnsettled { expected: EpochId },
+
+    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice)
+    /// or [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
+    /// refused instead of queued, because the device group has a Commit in
+    /// flight or convergence input still unsettled. Nothing was persisted.
+    /// A link never waits in the outbound queue: the new device stops waiting
+    /// for its Welcome, and a link sent after that would add a device that
+    /// never joins. Retry once the group settles, while the new device still
+    /// waits. An unlink is retried the same way, until it lands.
+    #[error("linking a device refused while the device group is unsettled")]
+    LinkDeviceUnsettled { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceDeviceEntry`](crate::engine::SendIntent::ReplaceDeviceEntry)
+    /// refused because the slot no longer holds the entry the replacement
+    /// was computed from: a commit applied since changed or removed it.
+    /// Nothing was staged. Read the roster again to retry.
+    #[error("a device entry replacement refused: the entry changed since it was read")]
+    DeviceEntryChanged { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused because the roster no longer holds the account entry the
+    /// replacement was computed from: a commit applied since changed it.
+    /// Nothing was staged. Read the roster again to retry.
+    #[error("an account entry replacement refused: the entry changed since it was read")]
+    AccountEntryChanged { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused instead of queued, because the device group has a Commit in
+    /// flight, convergence input still unsettled or other work due first.
+    /// Nothing was persisted. A backup change is answered only once it went
+    /// out or was refused (mdk#2628 D75), and a queued one could still be
+    /// refused at drain after the caller took it as sent. Retry once the
+    /// group settles.
+    #[error("an account entry replacement refused while the device group is unsettled")]
+    AccountEntryUnsettled { group_id: GroupId },
+
+    /// A Welcome refused because it is not the device-group Welcome a
+    /// confirmed device link expects (mdk#2628 D28, D30, D41): it joins a
+    /// group that requires the device roster with no link expecting it, it
+    /// comes from a leaf other than the one the link named, it adds this
+    /// device by a KeyPackage other than the one the link confirmed, it
+    /// arrives after the link's wait, it joins a group id a link reserved
+    /// without being that link's Welcome, or it adds this device to another
+    /// group by the KeyPackage a waiting link reserved. Nothing was joined;
+    /// an expectation it failed stays.
+    #[error("Welcome refused: not the device-group Welcome a confirmed link expects")]
+    UnexpectedDeviceGroupWelcome,
 
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
@@ -217,8 +286,28 @@ pub enum EngineError {
     )]
     MissingWelcomeKeyPackage,
 
+    /// The Welcome delivery names a KeyPackage this device did not publish,
+    /// such as another device's of the same account. Not a failed join: the
+    /// device leaves its KeyPackages as they were.
+    #[error("welcome is not addressed to this device")]
+    WelcomeNotAddressedToThisDevice,
+
     #[error("welcome already processed")]
     WelcomeAlreadyProcessed,
+
+    /// A sibling Welcome into a chat this device still holds an active copy
+    /// of, as one sent after a removal that has not reached it yet. Not a
+    /// failed join: nothing was written, and the same Welcome joins once that
+    /// copy reads removed or unrecoverable (mdk#2628 3.5b).
+    #[error("sibling welcome held while the chat's local copy is active")]
+    SiblingWelcomeHeld { group_id: GroupId },
+
+    /// A sibling Welcome whose carrier is dated at or before this device
+    /// forgot the chat. A sibling Welcome is dated by the message that
+    /// carried it, so this refuses that carrier only: the same Welcome in a
+    /// carrier dated after the forget still joins (mdk#2628 3.5b).
+    #[error("sibling welcome carried before the chat was forgotten")]
+    SiblingWelcomePredatesForget,
 
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
@@ -264,13 +353,22 @@ impl EngineError {
             EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
             EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
             EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+            EngineError::AccountDevicesActivationRefused { .. } => {
+                "account_devices_activation_refused"
+            }
             EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
             EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
             EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
             EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
+            EngineError::NoDataAppComponent { .. } => "no_data_app_component",
             EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+            EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
+            EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+            EngineError::AccountEntryChanged { .. } => "account_entry_changed",
+            EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",
+            EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
             EngineError::GroupUnrecoverableRepairRequired { .. } => {
@@ -282,7 +380,10 @@ impl EngineError {
             EngineError::Serialize(_) => "serialize",
             EngineError::InvalidWelcome => "invalid_welcome",
             EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
+            EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+            EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
+            EngineError::SiblingWelcomePredatesForget => "sibling_welcome_predates_forget",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",
         }
@@ -298,6 +399,50 @@ impl EngineError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, EngineError::Storage(e) if e.is_transient())
+    }
+}
+
+/// Why a group cannot turn on `marmot.group.account-devices.v1` now
+/// (account-devices-v1.md, "Activation in an existing group"). Each reason is
+/// a fact about the whole group, never about a particular member or device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDevicesActivationRefusal {
+    /// This device's account is not an active admin. Only an admin may change
+    /// the required-component list.
+    NotAdmin,
+    /// The group already requires the component.
+    AlreadyRequired,
+    /// The group is on the legacy profile, which never requires it.
+    LegacyProfile,
+    /// At least one current leaf does not advertise the component, so the
+    /// activation Commit would break the support invariant.
+    UnsupportedLeaves,
+    /// At least one current leaf carries data under the component's id, which
+    /// it defines none of. That leaf has to be replaced first.
+    LeafCarriesData,
+    /// At least one account has more than `max_leaves_per_account` leaves.
+    LeafLimitExceeded,
+}
+
+impl AccountDevicesActivationRefusal {
+    /// Stable snake_case name, safe for logs and status output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAdmin => "not_admin",
+            Self::AlreadyRequired => "already_required",
+            Self::LegacyProfile => "legacy_profile",
+            Self::UnsupportedLeaves => "unsupported_leaves",
+            Self::LeafCarriesData => "leaf_carries_data",
+            Self::LeafLimitExceeded => "leaf_limit_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for AccountDevicesActivationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

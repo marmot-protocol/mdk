@@ -97,6 +97,24 @@ fn native_view_predicates_exclude_ineligible_ids() {
             .chat_list_selection_snapshot(view)
             .unwrap();
         assert_eq!(ids(&store.app_storage(), &selection), expected);
+        // A display page reads the same view.
+        let page = store
+            .app_storage()
+            .chat_list_page(crate::ChatListPageQuery {
+                view,
+                limit: 100,
+                direction: crate::ChatListPageDirection::Forward,
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{view:?}"
+        );
     }
 }
 
@@ -234,4 +252,33 @@ fn caller_transaction_is_preserved() {
         ),
         ["01"]
     );
+}
+
+#[test]
+fn a_store_reset_makes_an_old_selection_stale() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "01", false, "member", 0, false);
+    let selection = app
+        .chat_list_selection_snapshot(ChatListView::Chats)
+        .unwrap();
+    assert_eq!(app.chat_list_selection_count(&selection).unwrap(), 1);
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("UPDATE chat_presentation_meta SET store_epoch = randomblob(16)")
+        .unwrap();
+    assert!(matches!(
+        app.chat_list_selection_count(&selection),
+        Err(ChatListSelectionError::StaleSelection)
+    ));
+    assert!(matches!(
+        app.chat_list_selection_page(&selection, 0, 1),
+        Err(ChatListSelectionError::StaleSelection)
+    ));
+    assert!(matches!(
+        app.revalidate_chat_list_selection(&selection),
+        Err(ChatListSelectionError::StaleSelection)
+    ));
 }

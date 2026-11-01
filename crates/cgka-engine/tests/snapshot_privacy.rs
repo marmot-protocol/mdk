@@ -82,6 +82,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -122,7 +123,7 @@ impl TransportPeeler for MockPeeler {
 
 #[tokio::test]
 async fn snapshot_names_do_not_embed_plaintext_group_id() {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
@@ -132,7 +133,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
         .build()
         .unwrap();
 
-    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
@@ -158,7 +159,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
     }
 
     // Force a few snapshots: invite, app message, update_group_data.
-    let mut carol = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    let mut carol = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))

@@ -104,6 +104,39 @@ fn native_replay_cause_round_trips_without_history_certification() {
     assert!(decode(&history).is_ok());
 }
 
+fn unproven_history_notice_row() -> Value {
+    let mut row = fixture("recording_started");
+    row["event"] = json!({
+        "type": "recovery_need_changed",
+        "cause": "unproven_history",
+        "change": "notice_shown",
+        "obligation_ref": "0000000000000000000000000000000000000000000000000000000000000000",
+        "obligation_revision": 3
+    });
+    row
+}
+
+#[test]
+fn unproven_history_notices_round_trip_without_a_charge_or_goal() {
+    let schema = validator();
+    for change in ["notice_shown", "notice_dismissed"] {
+        let mut row = unproven_history_notice_row();
+        row["event"]["change"] = json!(change);
+        assert!(schema.is_valid(&row));
+        let record = decode(&row).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record.to_json().unwrap()).unwrap(),
+            row
+        );
+    }
+    for (field, value) in [("charged", json!(4)), ("bound", json!("unbounded"))] {
+        let mut row = unproven_history_notice_row();
+        row["event"][field] = value;
+        assert!(schema.is_valid(&row));
+        assert!(decode(&row).is_err());
+    }
+}
+
 #[test]
 fn all_contract_fixtures_round_trip_through_rust_and_schema() {
     let schema = validator();

@@ -15,7 +15,7 @@ use marmot_account::AccountHome;
 pub(crate) use marmot_app::is_nostr_secret;
 use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
-    StreamStartView, UserProfileMetadata, tag_value,
+    SelfMembership, StreamStartView, UserProfileMetadata, tag_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1071,16 +1071,22 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
     })
 }
 
-/// `member`, `left`, or `removed`: the local membership classification as a
-/// stable lowercase token, matching the other snake_case lifecycle strings in
-/// CLI JSON rather than the storage enum's Rust variant spelling.
+/// The local membership classification as a stable snake_case token, matching
+/// the other lifecycle strings in CLI JSON rather than the storage enum's Rust
+/// variant spelling.
 pub(crate) fn self_membership_json(group: &AppGroupRecord) -> Value {
-    json!(
-        json!(group.self_membership)
-            .as_str()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "member".to_owned())
-    )
+    json!(self_membership_token(group.self_membership))
+}
+
+/// `member`, `left`, `removed`, or `device_removed` (this device's leaf was
+/// removed while the account stays in the group, mdk#2628 D62).
+fn self_membership_token(membership: SelfMembership) -> &'static str {
+    match membership {
+        SelfMembership::Member => "member",
+        SelfMembership::Left => "left",
+        SelfMembership::Removed => "removed",
+        SelfMembership::DeviceRemoved => "device_removed",
+    }
 }
 
 /// Render a `chats` row: the group record (`group_json`) enriched with the
@@ -1609,6 +1615,21 @@ mod tests {
         assert!(value.get("unread_mention_count").is_none());
         assert!(value.get("first_unread_message_id_hex").is_none());
         assert!(value.get("self_membership").is_none());
+    }
+
+    /// Every membership reads as its stored snake_case token.
+    #[test]
+    fn self_membership_tokens_are_snake_case() {
+        use super::{SelfMembership, self_membership_token};
+
+        for (membership, token) in [
+            (SelfMembership::Member, "member"),
+            (SelfMembership::Left, "left"),
+            (SelfMembership::Removed, "removed"),
+            (SelfMembership::DeviceRemoved, "device_removed"),
+        ] {
+            assert_eq!(self_membership_token(membership), token);
+        }
     }
 
     use marmot_app::{

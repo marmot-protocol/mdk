@@ -1496,6 +1496,12 @@ fn daemon_status_json_becomes_status_text() {
         daemon_status_sentence(&parse_daemon_view(&serde_json::json!({"running": false}))),
         "daemon not running"
     );
+    assert_eq!(
+        daemon_status_sentence(&parse_daemon_view(
+            &serde_json::json!({"running": true, "starting": true})
+        )),
+        "daemon starting"
+    );
 }
 
 #[test]
@@ -7112,6 +7118,7 @@ fn build_group_detail_tags_admins_and_self() {
         &admins,
         &["wss://relay.example".to_owned()],
         "aa",
+        true,
     );
     assert!(view.members[0].is_admin && view.members[0].is_self);
     assert!(!view.members[1].is_admin && !view.members[1].is_self);
@@ -7194,6 +7201,63 @@ fn open_group_detail_loads_state_and_esc_returns_to_main() {
         app.group_detail.is_none(),
         "group-detail state is dropped on exit"
     );
+}
+
+#[test]
+fn removed_device_with_sibling_admin_on_roster_is_not_self_or_admin() {
+    // This device was removed, but another device of the account keeps it on
+    // the roster as the sole admin. The detail view must not read that entry
+    // as this device: no "(you)" row, no admin guard on leave.
+    let self_id = "aa".repeat(32);
+    let bob_id = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"profile":{{"name":"Ops","description":"ops room"}},"self_membership":"removed","members":[{{"member_id":"{self_id}","npub":"npubself"}},{{"member_id":"{bob_id}","npub":"npubbob"}}],"admins":[{{"admin_id":"{self_id}","npub":"npubself"}}],"relays":["wss://relay.example"]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &self_id);
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: "cc".repeat(32),
+        name: "Ops".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('g')).expect("g opens group detail");
+    app.settle_effects(1);
+
+    let view = app.group_detail.as_ref().expect("group detail loaded");
+    assert!(view.members.iter().all(|member| !member.is_self));
+    assert!(
+        view.members[0].is_admin,
+        "the account is still listed as admin"
+    );
+    assert!(!view.account_is_admin);
+
+    app.handle_key(char_key('L'))
+        .expect("L on a removed device");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::LeaveGroup { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn self_membership_absent_from_group_show_reads_as_member() {
+    assert!(parse_self_is_member(&serde_json::json!({})));
+    assert!(parse_self_is_member(
+        &serde_json::json!({"self_membership": "member"})
+    ));
+    assert!(!parse_self_is_member(
+        &serde_json::json!({"self_membership": "removed"})
+    ));
+    assert!(!parse_self_is_member(
+        &serde_json::json!({"self_membership": "left"})
+    ));
 }
 
 #[test]

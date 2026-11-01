@@ -15,7 +15,8 @@
 //!   reported as already satisfied when none remain;
 //! - a lost invite retains its recipients while the host resolves fresh
 //!   KeyPackages; consumed material is rejected and recovery survives restart
-//!   (mdk#1735);
+//!   (mdk#1735). A lost device left out of the re-issue, including one whose
+//!   account another device keeps in the group, is reported as a conflict;
 //! - re-issue is bounded by [`MAX_OWN_COMMIT_REISSUE_ATTEMPTS`].
 //!
 //! Re-queued intents flow through the ordinary queued-intent drain, so they
@@ -42,7 +43,9 @@ pub const MAX_OWN_COMMIT_REISSUE_ATTEMPTS: u32 = 2;
 impl<S: StorageProvider> Engine<S> {
     /// The kind and authoring baseline to retain for an intent that is about
     /// to stage a group evolution, or `None` for intents that never need
-    /// re-issue (application messages, leaves, self-updates, disband).
+    /// re-issue (application messages, leaves, self-updates, same-account
+    /// Adds and Removes, enabling disbanding or account-devices, linking a
+    /// device, disband).
     pub(crate) fn own_commit_recording(
         &self,
         intent: &SendIntent,
@@ -81,10 +84,19 @@ impl<S: StorageProvider> Engine<S> {
                     OwnCommitBaseline::AppComponents { components },
                 ))
             }
+            // The intent carries its own baseline: the entry it replaces.
+            SendIntent::ReplaceDeviceEntry { .. } | SendIntent::ReplaceAccountEntry { .. } => {
+                Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
+            }
             SendIntent::AppMessage { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
+            | SendIntent::AddOwnAccountDevices { .. }
+            | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::EnableDisbanding { .. }
+            | SendIntent::EnableAccountDevices { .. }
+            | SendIntent::LinkDevice { .. }
+            | SendIntent::UnlinkDevice { .. }
             | SendIntent::Disband { .. } => None,
         })
     }
@@ -150,7 +162,9 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::Invite { .. } => SupersededIntentKind::Invite,
             SendIntent::RemoveMembers { .. } => SupersededIntentKind::RemoveMembers,
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
-            SendIntent::UpdateAppComponents { .. } => SupersededIntentKind::AppComponents,
+            SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
         let report = |outcome, reason| SupersededIntentReport {
@@ -290,6 +304,46 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 record.intent.clone()
             }
+            // Compared again when the re-issued copy is prepared, since
+            // another commit can change the entry before the drain.
+            SendIntent::ReplaceDeviceEntry {
+                group_id,
+                slot,
+                expected,
+                ..
+            } => {
+                let mls_group = self.load_mls_group(group_id)?;
+                if crate::app_components::device_entry_of_group(&mls_group, slot).as_ref()
+                    != Some(&**expected)
+                {
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the same device entry; its value stands",
+                        ),
+                        None,
+                    )));
+                }
+                record.intent.clone()
+            }
+            // Compared again when the re-issued copy is prepared, as above.
+            SendIntent::ReplaceAccountEntry {
+                group_id, expected, ..
+            } => {
+                let mls_group = self.load_mls_group(group_id)?;
+                if crate::app_components::account_entry_of_group(&mls_group).as_ref()
+                    != Some(&**expected)
+                {
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the account entry; its value stands",
+                        ),
+                        None,
+                    )));
+                }
+                record.intent.clone()
+            }
             _ => return Ok(None),
         };
 
@@ -349,6 +403,34 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(reports)
+    }
+
+    /// Whether an own commit in `group_id` lost a fork and its re-issue is
+    /// still owed: a reconciler missed the announcement and
+    /// [`Self::reissue_superseded_own_commits_from_state`] has not decided it
+    /// since. Such a commit has not reached its outcome.
+    pub fn owes_superseded_own_commit_reissue(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        for record in self.storage.list_own_commit_intents(Some(group_id))? {
+            if record.reinvite.is_some() {
+                continue;
+            }
+            match self.storage.get_message(&record.commit_id) {
+                Ok(message)
+                    if matches!(
+                        message.state,
+                        MessageState::ConvergenceDeferred | MessageState::EpochInvalidated
+                    ) =>
+                {
+                    return Ok(true);
+                }
+                Ok(_) | Err(cgka_traits::storage::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
     }
 
     /// Whether a confirmed commit staged from `record.source_epoch` can no
@@ -428,6 +510,8 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Transfer a lost invite to the ordinary outbound queue with newly resolved
     /// packages. Never reuse its consumed packages or change the requested identities.
+    /// A lost device that is neither in the group nor among the new packages
+    /// makes the outcome a conflict that needs a new invite, never a success.
     pub fn reissue_invite_with_key_packages(
         &mut self,
         commit_id: &MessageId,
@@ -450,15 +534,29 @@ impl<S: StorageProvider> Engine<S> {
         let group = self.stored_group_record(&record.group_id)?;
         let mut expected = std::collections::BTreeSet::new();
         let mut consumed = std::collections::BTreeSet::new();
+        // A lost device is never reported as added (mdk#2628, D13). One whose
+        // account another device keeps on the roster is not re-issued here,
+        // and one the fresh packages leave out stays out.
+        let mut devices_left_out = false;
+        let mut lost_devices = Vec::new();
+        let leaves = group
+            .as_ref()
+            .map(|group| group.members.as_slice())
+            .unwrap_or_default();
         for package in old {
             let metadata = crate::key_package::key_package_metadata(package)?;
             consumed.insert(metadata.key_package_ref_hex);
-            if !group.as_ref().is_some_and(|group| {
-                group.members.iter().any(|member| {
-                    hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
-                })
-            }) {
+            if !leaves
+                .iter()
+                .any(|member| hex::encode(member.id.as_slice()) == metadata.credential_identity_hex)
+            {
                 expected.insert(metadata.credential_identity_hex);
+                lost_devices.push(metadata.leaf_signature_key);
+            } else if !leaves
+                .iter()
+                .any(|member| member.credential == metadata.leaf_signature_key)
+            {
+                devices_left_out = true;
             }
         }
         let report = |outcome, reason| SupersededIntentReport {
@@ -483,6 +581,12 @@ impl<S: StorageProvider> Engine<S> {
         });
         if expected.is_empty() {
             self.storage.delete_own_commit_intent(commit_id)?;
+            if devices_left_out {
+                return Ok(Some(report(
+                    SupersededIntentOutcome::Conflict,
+                    "a device of a member already in the group was not added; it needs a new invite",
+                )));
+            }
             if unapplied_existing_admin_grant {
                 return Ok(Some(report(
                     SupersededIntentOutcome::Conflict,
@@ -512,18 +616,27 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_own_commit_intent(&record)?;
             return Ok(Some(report));
         }
+        // An account may bring one package per device, but never the same
+        // package twice.
         let mut actual = std::collections::BTreeSet::new();
+        let mut reissued_devices = std::collections::BTreeSet::new();
+        let mut fresh = std::collections::BTreeSet::new();
         for package in &key_packages {
             let metadata = crate::key_package::key_package_metadata(package)?;
             if consumed.contains(&metadata.key_package_ref_hex)
-                || !actual.insert(metadata.credential_identity_hex)
+                || !fresh.insert(metadata.key_package_ref_hex)
             {
                 return Err(EngineError::InvalidWelcome);
             }
+            actual.insert(metadata.credential_identity_hex);
+            reissued_devices.insert(metadata.leaf_signature_key);
         }
         if actual != expected {
             return Err(EngineError::InvalidWelcome);
         }
+        devices_left_out |= lost_devices
+            .iter()
+            .any(|device| !reissued_devices.contains(device));
         let intent = SendIntent::Invite {
             group_id: record.group_id.clone(),
             key_packages,
@@ -545,6 +658,12 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(())
             })?;
         self.schedule_pending_convergence_group(&record.group_id);
+        if devices_left_out {
+            return Ok(Some(report(
+                SupersededIntentOutcome::Conflict,
+                "missing members were queued for reinvitation; some of the lost devices need a new invite",
+            )));
+        }
         if unapplied_existing_admin_grant {
             return Ok(Some(report(
                 SupersededIntentOutcome::Conflict,

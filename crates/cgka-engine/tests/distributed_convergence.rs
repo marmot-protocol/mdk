@@ -52,6 +52,10 @@ mod delivered_witnesses;
 mod encrypted_media_source_secret;
 #[path = "distributed_convergence/historical_application_sender.rs"]
 mod historical_application_sender;
+#[path = "distributed_convergence/phantom_own_commit_branch.rs"]
+mod phantom_own_commit_branch;
+#[path = "distributed_convergence/refused_queued_intents.rs"]
+mod refused_queued_intents;
 mod support;
 use support::proof_signer;
 
@@ -144,6 +148,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -216,6 +221,7 @@ impl TransportPeeler for EpochGatePeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -270,7 +276,7 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_client_with_storage(id, storage.clone());
     (engine, storage)
 }
@@ -279,7 +285,7 @@ fn build_epoch_gate_client(
     id: &[u8],
     clock: Option<ManualConvergenceClock>,
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut builder = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -870,6 +876,128 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
             .expect("pending convergence query succeeds"),
         "the epoch-invalidated loser must not keep gating ordinary app traffic"
     );
+}
+
+async fn advance_scheduled_group(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    clock: &ManualConvergenceClock,
+) {
+    engine.drain_pending_convergence_groups();
+    for _ in 0..16 {
+        let delay = engine
+            .prepare_convergence_cutoff_delay_ms(group_id)
+            .unwrap()
+            .expect("retained input exposes a scheduler cutoff wake");
+        clock.advance_ms(delay);
+        if engine
+            .advance_convergence_inputs(group_id)
+            .await
+            .expect("scheduled background advance applies the selected branch")
+        {
+            assert!(!engine.has_pending_convergence_inputs(group_id).unwrap());
+            return;
+        }
+    }
+    panic!("bounded background advances must settle the retained branch");
+}
+
+#[tokio::test]
+async fn live_own_chain_recovers() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_client_with_storage_and_clock(b"alice", alice_storage, clock.clone());
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "live own chain").await;
+
+    // Carol's historical chain is own A, remote B, own C. Both local commits
+    // have real confirmation checkpoints; neither client is reopened below.
+    let mut commit_ids = Vec::new();
+    for (index, name) in ["own A", "remote B", "own C"].into_iter().enumerate() {
+        let (sender, receiver) = if index == 1 {
+            (&mut alice, &mut carol)
+        } else {
+            (&mut carol, &mut alice)
+        };
+        let commit = alice_rename_commit(sender, &group_id, name).await;
+        assert!(matches!(
+            receiver.ingest(commit.clone()).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ));
+        advance_scheduled_group(receiver, &group_id, &clock).await;
+        // Own wire records carry the outer id; their content-id aliases are
+        // Sent/OwnEcho markers, not stamped candidate-graph records.
+        commit_ids.push(if index == 1 {
+            content_id(&commit)
+        } else {
+            commit.id
+        });
+    }
+
+    // Model an earlier displaced canonical row, preserving its immutable MLS
+    // checkpoint and the later Processed rows. Selection can reconstruct this
+    // entire chain; apply must also restore own C after replaying remote B.
+    carol_storage
+        .update_message_state(&commit_ids[0], MessageState::ConvergenceDeferred)
+        .unwrap();
+    for commit_id in &commit_ids[1..] {
+        assert_eq!(
+            carol_storage.get_message(commit_id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+    carol.drain_events();
+    alice.drain_events();
+
+    // A real new remote commit, not a restart or a direct projection apply,
+    // gives the running host its next scheduled convergence cutoff.
+    let next = alice_rename_commit(&mut alice, &group_id, "recovered live").await;
+    assert!(matches!(
+        carol.ingest(next.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    commit_ids.push(content_id(&next));
+    advance_scheduled_group(&mut carol, &group_id, &clock).await;
+    for commit_id in &commit_ids {
+        assert_eq!(
+            carol_storage.get_message(commit_id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(5));
+    assert_eq!(
+        carol.members(&group_id).unwrap(),
+        alice.members(&group_id).unwrap()
+    );
+    let exporter = |engine: &Engine<SqliteAccountStorage>| {
+        engine
+            .group_context(&group_id)
+            .unwrap()
+            .exporter_secret("marmot/group-event", 32)
+            .expect("final MLS epoch exports an authenticated group secret")
+    };
+    assert_eq!(exporter(&carol), exporter(&alice));
+
+    for reverse in [false, true] {
+        let (sender, receiver, text) = if reverse {
+            (&mut alice, &mut carol, b"reply after recovery".as_slice())
+        } else {
+            (&mut carol, &mut alice, b"send after recovery".as_slice())
+        };
+        receiver.drain_events();
+        let message = send_app(sender, &group_id, text.to_vec()).await;
+        assert!(matches!(
+            receiver.ingest(message).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+        assert!(receiver.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { sender: author, payload, .. }
+                if *author == sender.self_id() && app_content(payload) == text
+        )));
+    }
 }
 
 /// A late application from common history can enter convergence while a newer
@@ -2156,6 +2284,132 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
     // Send eligibility is restored: the intent the removed-copy gate rejected
     // above now succeeds.
     send_app(&mut carol, &group_id, b"post-reorg send".to_vec()).await;
+}
+
+/// A host's advance never converges a removed copy again. Once the advance
+/// that realized this device's removal has returned, a same-epoch rival that
+/// would win stays unresolved and the copy stays removed: every host advance
+/// stops at the terminal gate, and ingest refuses new input for the copy. Only
+/// the stored-convergence call above
+/// (`superseded_self_removal_clears_removed_marker_and_restores_send`) reaches
+/// a pass that clears the marker. A device removed from its device group
+/// treats its removal as final from here on (mdk#2628 3.6b-1b).
+#[tokio::test]
+async fn a_host_advance_never_converges_a_removed_copy_again() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-removed-copy-stays-removed".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // The rename goes to the committer the tie-break favours, so the removal
+    // loses whenever a pass holds both.
+    let (mut renamer, mut remover) =
+        if commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id()) == 0 {
+            (alice, bob)
+        } else {
+            (bob, alice)
+        };
+    let remove_res = remover
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = evolution(remove_res);
+    remover.confirm_published(remove_pending).await.unwrap();
+    let rename_res = renamer
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("name after reorg".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = evolution(rename_res);
+    renamer.confirm_published(rename_pending).await.unwrap();
+    let remove_commit = route(remove_commit, &group_id);
+    let rename_commit = route(rename_commit, &group_id);
+
+    carol.ingest(remove_commit).await.unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("removal branch applies");
+    assert!(carol_storage.get_group(&group_id).unwrap().removed);
+    carol.drain_events();
+
+    // The winning rival is held in stored convergence, as in the test above.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_001_000)
+        .expect("sibling rename commit buffered");
+    assert!(carol.has_pending_convergence_inputs(&group_id).unwrap());
+
+    // Both host entry points run on the engine's clock, now well past the
+    // rival's settlement window, and leave the copy as it is.
+    clock.advance_ms(10_000_000);
+    assert!(
+        carol
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a removed copy drains nothing"
+    );
+    assert!(!carol.advance_convergence_inputs(&group_id).await.unwrap());
+
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert!(group.removed, "the removal stays realized");
+    assert_eq!(group.epoch, EpochId(2));
+    assert_ne!(group.name, "name after reorg");
+    assert!(
+        carol.has_pending_convergence_inputs(&group_id).unwrap(),
+        "the rival stays unresolved"
+    );
+    let events = carol.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. })),
+        "a removed copy is not restored by a host advance: {events:?}"
+    );
+
+    // The rival does win: the stored-convergence call settles on it and clears
+    // the marker, so the host advances above held back a winner.
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("reorg over the superseded removal");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+    assert!(!carol_storage.get_group(&group_id).unwrap().removed);
 }
 
 /// State-derived inverse of `realize_self_eviction`: a `removed` marker that
@@ -3654,14 +3908,20 @@ async fn admin_attempt_failure_consumes_reservation_and_inbound_proceeds() {
         .unwrap()
         .expect("pass survives the failed attempt");
     assert!(!consumed.fairness_slot_available);
-    assert_eq!(
+    // The settled state refuses the invite, so its attempt also retires it
+    // (mdk#2694): no later drain fails on it.
+    assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
-            .len(),
-        1,
-        "the durable intent stays queued after its failed attempt"
+            .is_empty(),
+        "the refused intent is retired by its failed attempt"
     );
+    assert!(carol.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::QueuedIntentRefused { intent_kind, reason, .. }
+            if intent_kind == "invite" && reason == "serialize"
+    )));
 
     let syncing = carol
         .converge_stored_openmls_messages_at(&group_id, 1_100_000)
@@ -5304,7 +5564,7 @@ async fn a_settled_convergence_pass_leaves_no_unscheduled_retained_intent() {
     // had not settled yet — must not leave the projection claiming the group is
     // idle while a user's message is still durable and unsent.
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -5475,15 +5735,15 @@ async fn a_completed_pass_rearms_the_drain_for_intents_queued_inside_the_window(
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = build_client_with_storage_and_clock(
         b"alice",
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         clock.clone(),
     );
     let mut bob = build_client_with_storage_and_clock(
         b"bob",
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         clock.clone(),
     );
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
@@ -7251,7 +7511,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
 #[tokio::test]
 async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_fails_closed() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7333,7 +7593,7 @@ async fn collecting_pass_restart_preserves_remaining_window_and_backward_clock_f
 #[tokio::test]
 async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7436,7 +7696,7 @@ async fn conformance_progress_uses_the_schedulers_effective_policy_deadline() {
 async fn rebuilt_engine_parks_losing_branch_app_for_revival_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -7793,7 +8053,7 @@ async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
 async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -8086,7 +8346,7 @@ async fn far_future_app_is_not_admitted_to_an_active_pass() {
 #[tokio::test]
 async fn convergence_pass_freezes_at_absolute_cap_under_continuous_selection_input() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -8329,7 +8589,7 @@ async fn buffered_convergence_pass_fixture(group_name: &str) -> BufferedPassFixt
     let audit_path = audit_dir.path().join("audit.jsonl");
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut david, _david_storage) = build_client(b"david");
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut carol = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
@@ -9486,7 +9746,7 @@ async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue()
 #[tokio::test]
 async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epoch_window() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut bob = build_client_with_max_past_epochs(b"bob", bob_storage.clone(), 1);
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -9785,8 +10045,11 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
     );
 }
 
+/// An intent the settled state refuses is retired and announced instead of
+/// failing the drain; storage failures keep it queued
+/// (`record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`).
 #[tokio::test]
-async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
+async fn advance_convergence_retires_a_queued_intent_the_settled_state_refuses() {
     let (mut alice, alice_storage) = build_client(b"alice");
 
     let (group_id, create) = alice
@@ -9821,16 +10084,33 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
         })
         .unwrap();
 
-    let err = alice.advance_convergence(&group_id).await.err().unwrap();
+    let drained = alice
+        .advance_convergence(&group_id)
+        .await
+        .expect("a refused queued intent does not fail the drain");
+    assert!(drained.is_empty());
     assert!(
-        matches!(err, cgka_traits::EngineError::Other(ref msg) if msg.contains("no fields")),
-        "expected validation error from queued intent regeneration, got {err:?}"
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
     );
-    let queued = alice_storage
-        .list_queued_outbound_intents(&group_id)
-        .unwrap();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, intent_id);
+    assert_eq!(
+        alice
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                GroupEvent::QueuedIntentRefused {
+                    intent_id,
+                    intent_kind,
+                    reason,
+                    ..
+                } => Some((intent_id, intent_kind, reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(intent_id, "update_group_data".into(), "other".into())]
+    );
 }
 
 #[tokio::test]
@@ -10005,7 +10285,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
 async fn queued_outbound_intent_survives_engine_rebuild() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(1_000, 10_000);
     let mut carol =
         build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
@@ -10356,7 +10636,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
     let recorder = JsonlRecorder::open(&path, "test-engine-conv".to_string()).unwrap();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
@@ -10428,7 +10708,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
 
 async fn ingest_app_and_read_audit(path: &std::path::Path) -> Vec<marmot_forensics::AuditEvent> {
     // Receiver (bob) records; sender (alice) does not need a recorder.
-    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let bob_recorder = marmot_forensics::JsonlRecorder::open(path, "bob-engine".into()).unwrap();
     let mut bob = EngineBuilder::new(bob_storage)
         .legacy_compatibility_profile()
@@ -11106,6 +11386,11 @@ async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alon
 
     // The winner's own commit is live; nothing to re-issue there.
     assert!(
+        !winner
+            .owes_superseded_own_commit_reissue(&group_id)
+            .unwrap()
+    );
+    assert!(
         winner
             .reissue_superseded_own_commits_from_state()
             .unwrap()
@@ -11120,7 +11405,10 @@ async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alon
 
     // The loser's commit was parked; the winner touched the other field, so
     // the edit is still valid and gets queued again with one attempt spent.
+    // Until that is decided, the commit has not reached its outcome.
+    assert!(loser.owes_superseded_own_commit_reissue(&group_id).unwrap());
     let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert!(!loser.owes_superseded_own_commit_reissue(&group_id).unwrap());
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(reports[0].commit_id, *loser_commit_id);
     assert_eq!(reports[0].kind, SupersededIntentKind::GroupProfile);
@@ -11582,6 +11870,269 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             IngestOutcome::Processed
         ));
     }
+}
+
+/// A lost invite comes back with one package per device of the account it
+/// named, never with one package twice.
+#[tokio::test]
+async fn superseded_invite_reissues_with_every_device_of_the_invited_account() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, _) = build_client(b"carol");
+    let (mut carol_laptop, _) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    let (inviter, storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+        (&mut bob, &bob_storage, &mut alice)
+    } else {
+        (&mut alice, &alice_storage, &mut bob)
+    };
+    let SendResult::GroupEvolution {
+        msg: invite_commit,
+        pending,
+        ..
+    } = inviter
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("invite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    let (rename, pending) = evolution(
+        winner
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("canonical".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut *inviter, &rename), (&mut *winner, &invite_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        engine
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+    }
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    let phone = carol.fresh_key_package().await.unwrap();
+    let laptop = carol_laptop.fresh_key_package().await.unwrap();
+    assert!(
+        inviter
+            .reissue_invite_with_key_packages(&invite_commit.id, vec![phone.clone(), phone.clone()])
+            .is_err()
+    );
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    let report = inviter
+        .reissue_invite_with_key_packages(&invite_commit.id, vec![phone, laptop])
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    let mut drained = inviter
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = drained.remove(0)
+    else {
+        panic!("reinvite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    // One Commit, one Welcome delivery per device.
+    assert!(drained.is_empty());
+    assert_eq!(welcomes.len(), 2);
+    for device in [&mut carol, &mut carol_laptop] {
+        device
+            .join_welcome(welcome_for(&welcomes, b"carol"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        inviter
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .filter(|member| member.id == carol.self_id())
+            .count(),
+        2
+    );
+}
+
+/// An invite of `invitees` that lost a same-epoch race, in a group of alice,
+/// bob and `carol_phone`. Returns the inviter, the group and the lost Commit.
+async fn lose_invite(
+    carol_phone: &mut Engine<SqliteAccountStorage>,
+    invitees: Vec<cgka_traits::engine::KeyPackage>,
+) -> (Engine<SqliteAccountStorage>, GroupId, MessageId) {
+    let (mut alice, _) = build_client(b"alice");
+    let (mut bob, _) = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_phone.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    let (mut inviter, mut winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+        (bob, alice)
+    } else {
+        (alice, bob)
+    };
+    let (invite_commit, pending) = evolution(
+        inviter
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: invitees,
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    inviter.confirm_published(pending).await.unwrap();
+    let (rename, pending) = evolution(
+        winner
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("canonical".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut inviter, &rename), (&mut winner, &invite_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        engine
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+    }
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    (inviter, group_id, invite_commit.id)
+}
+
+/// A lost invite that added only a device of an account already in the group
+/// is a conflict needing a new invite, never already applied (mdk#2628, D13).
+#[tokio::test]
+async fn lost_device_of_a_member_is_reported_as_needing_a_new_invite() {
+    let (mut carol_phone, _) = build_client(b"carol");
+    let (mut carol_laptop, _) = build_client(b"carol");
+    // The selection offers the phone's refreshed package too; the send skipped it.
+    let invitees = vec![
+        carol_phone.fresh_key_package().await.unwrap(),
+        carol_laptop.fresh_key_package().await.unwrap(),
+    ];
+    let (mut inviter, group_id, lost) = lose_invite(&mut carol_phone, invitees).await;
+
+    let report = inviter
+        .reissue_invite_with_key_packages(&lost, vec![])
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Conflict);
+    assert!(
+        inviter
+            .reissue_invite_with_key_packages(&lost, vec![])
+            .unwrap()
+            .is_none()
+    );
+    let carol_leaves = inviter
+        .members(&group_id)
+        .unwrap()
+        .into_iter()
+        .filter(|member| member.id == carol_laptop.self_id())
+        .count();
+    assert_eq!(carol_leaves, 1);
+}
+
+/// A re-issue that leaves out one of the lost invite's devices still queues
+/// the rest, and reports a conflict rather than success (mdk#2628, D13).
+#[tokio::test]
+async fn reissue_without_every_lost_device_is_reported_as_a_conflict() {
+    let (mut carol_phone, _) = build_client(b"carol");
+    let (mut dave_phone, _) = build_client(b"dave");
+    let (mut dave_laptop, _) = build_client(b"dave");
+    let invitees = vec![
+        dave_phone.fresh_key_package().await.unwrap(),
+        dave_laptop.fresh_key_package().await.unwrap(),
+    ];
+    let (mut inviter, group_id, lost) = lose_invite(&mut carol_phone, invitees).await;
+
+    let report = inviter
+        .reissue_invite_with_key_packages(
+            &lost,
+            vec![dave_phone.fresh_key_package().await.unwrap()],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Conflict);
+    let mut drained = inviter
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = drained.remove(0)
+    else {
+        panic!("reinvite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    assert_eq!(welcomes.len(), 1);
+    dave_phone
+        .join_welcome(welcome_for(&welcomes, b"dave"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

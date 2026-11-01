@@ -31,6 +31,10 @@ E11|crates/cgka-engine/src/message_processor/mod.rs|FOREGROUND_DEFERRED_PEEL_BUD
 E12|crates/cgka-engine/src/message_processor/mod.rs|MAX_FOREGROUND_DEFERRED_ROWS
 E13|crates/cgka-engine/src/message_processor/mod.rs|BACKGROUND_CONVERGENCE_BUDGET_MS
 E13|crates/cgka-engine/src/message_processor/mod.rs|BACKGROUND_CONVERGENCE_REPLAY_PROBES_PER_SLICE
+# E14 backs off and parks a frozen batch whose attempts keep failing (mdk#2684).
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_RETRY_BASE_MS
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_RETRY_MAX_MS
+E14|crates/cgka-engine/src/distributed_convergence.rs|CONVERGENCE_PASS_PARK_AFTER_FAILURES
 A1|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS
 A2|crates/marmot-app/src/runtime/account_worker.rs|MIN_CONVERGENCE_SETTLEMENT_DELAY
 A3|crates/marmot-app/src/runtime/account_worker.rs|CONVERGENCE_RETRY_BASE_DELAY
@@ -81,3 +85,33 @@ A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_BYTES
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_LIMITS
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_OPEN_UNTIL
 A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
+# A18 parks recovery obligations that cannot progress: scope streaks and the attempt cap.
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_QUIET_PASSES
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_UNSERVED_PASSES
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_ATTEMPTS
+# A19 is the recovery runner's starting values: unit retry, relay cooldown, account caps, quantum, staging and
+# the grace a cut request gets to report what it read.
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BACKOFF_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_BREAK_AFTER_NO_PROGRESS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_UNREACHABLE_RETRY_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_AFTER_UNREACHABLE
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_COOLDOWN_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_MAX_QUANTA_PER_HOUR
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_MAX_EVENT_BYTES_PER_HOUR
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_QUANTUM
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_REQUEST_TIMEOUT
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_EVENTS
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_GROUP_BYTES
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_STAGED_ACCOUNT_BYTES
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_ADMISSION_PER_TURN
+A19|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_FENCES_PER_UNIT
+A19|crates/transport-nostr-adapter/src/sweep/mod.rs|INTERRUPT_GRACE
+# A20 is the runner's comparison windows and re-check schedule.
+A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_INTERVAL_SECS
+A20|crates/marmot-app/src/client/recovery_runner/policy.rs|RUNNER_RECHECK_AFTER_COOLDOWN_SECS
+A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_SET_LIMIT
+A20|crates/transport-nostr-adapter/src/compare/mod.rs|COMPARE_IDS_PER_REQUEST

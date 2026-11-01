@@ -2809,6 +2809,99 @@ fn push_registration_completion_is_version_guarded_and_membership_scoped() {
     assert_eq!(store.pending_push_registration_removals().unwrap().len(), 2);
 }
 
+/// Re-queueing republishes a completed share of the label's current revision,
+/// only while native push is on and only for joined groups; another label's
+/// registration in the same database neither joins nor breaks the insert.
+#[test]
+fn current_push_registration_share_requeues_a_completed_revision() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .set_group_self_membership("bb", SelfMembership::Left)
+        .unwrap();
+    let registration = |label: &str, fingerprint: &str, at: i64| AccountPushRegistration {
+        account_label: label.to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: fingerprint.to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: at,
+        updated_at_ms: at,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration("legacy", "legacy", 30), vec![3])
+        .unwrap();
+    store
+        .set_native_push_enabled("legacy", &"11".repeat(32), true)
+        .unwrap();
+    store
+        .upsert_push_registration(registration("alice", "first", 10), vec![1])
+        .unwrap();
+    assert!(
+        !store
+            .queue_current_push_registration_share_for_group("alice", "aa", 40)
+            .unwrap(),
+        "native push is off"
+    );
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    for (fingerprint, at) in [("first", 10), ("legacy", 30)] {
+        store
+            .complete_push_registration_share("aa", fingerprint, at)
+            .unwrap();
+    }
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 10, 11)
+            .unwrap()
+    );
+
+    assert!(
+        store
+            .queue_current_push_registration_share_for_group("alice", "aa", 40)
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned()]
+    );
+    assert!(
+        store
+            .pending_push_registration_shares("legacy", 30)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .push_registration("alice")
+            .unwrap()
+            .unwrap()
+            .registration
+            .last_shared_at_ms,
+        None
+    );
+    assert!(
+        !store
+            .queue_current_push_registration_share_for_group("alice", "bb", 40)
+            .unwrap(),
+        "a departed group is not shared with"
+    );
+}
+
 #[test]
 fn push_registration_rotation_and_clear_queue_durable_removals() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
@@ -3226,6 +3319,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         group_id: cgka_traits::GroupId::new(vec![0xaa]),
         message_id: fresh_message_id.clone(),
         sender: MemberId::new(vec![7; 32]),
+        sender_leaf_index: None,
         epoch: EpochId(0),
         payload: b"fresh chat".to_vec(),
         retention: None,
@@ -3394,12 +3488,20 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     // rejecting relayed records after the group is re-bootstrapped.
     store
         .app_storage()
-        .apply_group_push_token_tombstone("aa", "member-aa", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .apply_group_push_token_tombstone(&push_tombstone("aa", "member-aa", 9, 500, "rd"))
         .unwrap();
     store
         .app_storage()
-        .apply_group_push_token_tombstone("bb", "member-bb", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .apply_group_push_token_tombstone(&push_tombstone("bb", "member-bb", 9, 500, "rd"))
         .unwrap();
+    for group_id_hex in ["aa", "bb"] {
+        assert!(
+            store
+                .app_storage()
+                .record_group_push_gossip_join(group_id_hex, 500)
+                .unwrap()
+        );
+    }
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
     let historical_message_id = MessageId::new(vec![1]);
@@ -3528,6 +3630,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "chat_list_rows",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "group_push_gossip_state",
         "encrypted_media_epoch_secret_references",
         "pending_push_registration_shares",
         "encrypted_media_epoch_secrets",
@@ -3555,6 +3658,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "message_timeline",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "group_push_gossip_state",
         "pending_push_registration_shares",
         "pending_push_registration_removals",
         "encrypted_media_epoch_secrets",
@@ -3762,6 +3866,26 @@ fn record_app_event_retries_concurrent_writer_contention() {
     assert_eq!(writer.app_storage().app_message_count().unwrap(), 1);
 }
 
+fn push_tombstone(
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+    owner_ts: i64,
+    record_digest: &str,
+) -> AccountGroupPushTokenTombstone {
+    AccountGroupPushTokenTombstone {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index,
+        platform: 1,
+        server_pubkey_hex: "cc".repeat(32),
+        owner_ts,
+        record_digest: record_digest.to_owned(),
+        removal_proof: None,
+        created_at_ms: owner_ts,
+    }
+}
+
 fn push_token(
     group_id_hex: &str,
     member_id_hex: &str,
@@ -3834,16 +3958,7 @@ fn push_token_apply_retries_concurrent_writer_contention() {
     let blocker = spawn_blocker();
     assert!(
         writer
-            .apply_group_push_token_tombstone(
-                &group_id,
-                &member_id,
-                0,
-                1,
-                &"cc".repeat(32),
-                200,
-                "r1",
-                200,
-            )
+            .apply_group_push_token_tombstone(&push_tombstone(&group_id, &member_id, 0, 200, "r1"))
             .expect("tombstone apply retries after transient contention")
     );
     blocker.join().unwrap();
@@ -3876,7 +3991,7 @@ fn apply_group_push_token_keeps_sibling_leaves_distinct() {
     // A removal targeting leaf 1 must leave leaf 2's record intact.
     assert!(
         store
-            .apply_group_push_token_tombstone(&g, &m, 1, 1, &"cc".repeat(32), 200, "r1", 200)
+            .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 1, 200, "r1"))
             .unwrap()
     );
     let stored = store.group_push_tokens(&g).unwrap();
@@ -3936,7 +4051,7 @@ fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
     // Removal at a higher stamp tombstones the key and clears the live row.
     assert!(
         store
-            .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+            .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 0, 200, "r2"))
             .unwrap()
     );
     assert!(store.group_push_tokens(&g).unwrap().is_empty());
@@ -3964,7 +4079,7 @@ fn member_cleanup_clears_tokens_and_tombstones() {
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     store
-        .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+        .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 0, 200, "r2"))
         .unwrap();
     // Departed member: both the (empty) live set and the durable tombstone go.
     store.remove_group_push_tokens_for_member(&g, &m).unwrap();
@@ -3976,6 +4091,439 @@ fn member_cleanup_clears_tokens_and_tombstones() {
             .apply_group_push_token(&push_token(&g, &m, 10, "d1"))
             .unwrap()
     );
+}
+
+/// A tombstone keeps the removal's fingerprint and signature, so it can be
+/// relayed. A newer removal replaces them; an older one changes nothing. A
+/// tombstone written without them lists as unrelayable until the same removal
+/// arrives again with them.
+#[test]
+fn push_tombstones_keep_their_removal_proof_and_list_per_group() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    let proof = |fingerprint: &str, sig: &str| AccountPushTokenRemovalProof {
+        token_fingerprint: fingerprint.to_owned(),
+        owner_sig: sig.to_owned(),
+    };
+    let relayable = |owner_ts: i64, digest: &str, sig: &str| AccountGroupPushTokenTombstone {
+        removal_proof: Some(proof("fp", sig)),
+        ..push_tombstone(&g, &m, 0, owner_ts, digest)
+    };
+
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&relayable(200, "r2", "sig-200"))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&relayable(100, "r1", "sig-100"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap(),
+        vec![relayable(200, "r2", "sig-200")]
+    );
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&relayable(300, "r3", "sig-300"))
+            .unwrap()
+    );
+    let local_only = push_tombstone(&g, &m, 1, 300, "r4");
+    let other_group = push_tombstone(&"ee".repeat(32), &m, 0, 300, "r5");
+    for tombstone in [&local_only, &other_group] {
+        assert!(store.apply_group_push_token_tombstone(tombstone).unwrap());
+    }
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap(),
+        vec![relayable(300, "r3", "sig-300"), local_only.clone()]
+    );
+
+    // Only the same removal, at an equal stamp, fills in the missing proof.
+    let with_proof = |owner_ts: i64, digest: &str| AccountGroupPushTokenTombstone {
+        removal_proof: Some(proof("fp", "sig-local")),
+        ..push_tombstone(&g, &m, 1, owner_ts, digest)
+    };
+    for other_removal in [with_proof(300, "r0"), with_proof(299, "r4")] {
+        assert!(
+            !store
+                .apply_group_push_token_tombstone(&other_removal)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        local_only
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&with_proof(300, "r4"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4")
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+                removal_proof: Some(proof("fp", "sig-other")),
+                ..with_proof(300, "r4")
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4"),
+        "a stored proof is never replaced at an equal stamp"
+    );
+
+    // A strictly newer record clears the tombstone, proof and all.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 400, "d4"))
+            .unwrap()
+    );
+    assert_eq!(store.group_push_token_tombstones(&g).unwrap().len(), 1);
+}
+
+/// Gossip state covers one membership of a projected group: writes need a
+/// joined group, the first join time stands, the latest announce
+/// wins, and leaving, a local delete or a projection prune clears the row.
+#[test]
+fn push_gossip_state_tracks_the_current_membership() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |groups: Vec<StoredAccountGroup>| {
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups,
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let state = |group: &str| app.group_push_gossip_state(group).unwrap();
+    assert!(!app.record_group_push_gossip_join("aa", 1).unwrap());
+    assert_eq!(state("aa"), None);
+    save(vec![group("aa", "alpha"), group("bb", "beta")]);
+
+    assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
+    assert!(app.record_group_push_gossip_join("aa", 20).unwrap());
+    assert!(
+        app.record_group_push_gossip_announce("aa", 50, None)
+            .unwrap()
+    );
+    assert!(
+        app.record_group_push_gossip_announce("aa", 40, None)
+            .unwrap()
+    );
+    let recorded = Some(AccountGroupPushGossipState {
+        group_id_hex: "aa".to_owned(),
+        joining_since_ms: None,
+        joined_at_ms: Some(10),
+        join_window_counted_ms: 0,
+        announce_owed_at_ms: None,
+        last_announced_at_ms: Some(50),
+        snapshot_owed_after_epoch: None,
+    });
+    assert_eq!(state("aa"), recorded);
+    // Saving the projection again keeps a still-joined group's row.
+    let mut renamed = group("aa", "renamed");
+    renamed.member_count = Some(3);
+    save(vec![renamed, group("bb", "beta")]);
+    assert_eq!(state("aa"), recorded);
+
+    for membership in [SelfMembership::Left, SelfMembership::Removed] {
+        app.set_group_self_membership("aa", SelfMembership::Member)
+            .unwrap();
+        assert!(app.record_group_push_gossip_join("aa", 60).unwrap());
+        assert_eq!(
+            app.record_group_push_announce_owed("aa", 60).unwrap(),
+            Some(60)
+        );
+        app.set_group_self_membership("aa", membership).unwrap();
+        assert_eq!(state("aa"), None, "{membership:?} ends the membership");
+        assert_eq!(app.record_group_push_announce_owed("aa", 65).unwrap(), None);
+        assert!(
+            !app.record_group_push_gossip_announce("aa", 70, None)
+                .unwrap()
+        );
+        assert_eq!(state("aa"), None, "no write after {membership:?}");
+    }
+    app.set_group_self_membership("aa", SelfMembership::Member)
+        .unwrap();
+    assert!(app.record_group_push_gossip_join("aa", 80).unwrap());
+    assert_eq!(state("aa").unwrap().joined_at_ms, Some(80));
+    assert_eq!(state("aa").unwrap().last_announced_at_ms, None);
+
+    assert!(app.record_group_push_gossip_join("bb", 90).unwrap());
+    store.delete_local_group_data("aa").unwrap();
+    assert_eq!(state("aa"), None);
+    save(Vec::new());
+    assert_eq!(state("bb"), None);
+}
+
+/// A Welcome opens this device's push join window with the group's row; a
+/// created group has none, a replay keeps the window, time counts toward it
+/// only once its join completed, a new Welcome reopens it and drops the
+/// earlier join and its counted time, and the announce at its end closes it.
+#[test]
+fn a_welcome_opens_the_push_join_window_until_the_announce() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |groups: Vec<StoredAccountGroup>| {
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups,
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let welcomed = |id: &str, welcome: &str| {
+        let mut group = group(id, "welcomed");
+        group.via_welcome_message_id_hex = Some(welcome.to_owned());
+        group
+    };
+    let state = |group: &str| app.group_push_gossip_state(group).unwrap();
+    let joining = || {
+        app.joining_group_push_gossip_states()
+            .unwrap()
+            .into_iter()
+            .map(|state| state.group_id_hex)
+            .collect::<Vec<_>>()
+    };
+
+    save(vec![group("aa", "created"), welcomed("bb", "w1")]);
+    assert_eq!(state("aa"), None, "a created group has no window");
+    let opened = state("bb").unwrap().joining_since_ms.unwrap();
+    assert_eq!(state("bb").unwrap().joined_at_ms, None);
+    assert_eq!(joining(), vec!["bb".to_owned()]);
+
+    // Time counts only toward a window whose join has completed.
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 0);
+    assert_eq!(state("bb").unwrap().join_window_counted_ms, 0);
+
+    // Saving the same Welcome again keeps the window, its join time and the
+    // time counted toward it.
+    assert!(app.record_group_push_gossip_join("bb", 10).unwrap());
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 1);
+    assert_eq!(app.count_push_join_window_time(7).unwrap(), 1);
+    save(vec![group("aa", "created"), welcomed("bb", "w1")]);
+    assert_eq!(state("bb").unwrap().joining_since_ms, Some(opened));
+    assert_eq!(state("bb").unwrap().joined_at_ms, Some(10));
+    assert_eq!(state("bb").unwrap().join_window_counted_ms, 12);
+
+    // The announce closes the window, and time no longer counts toward it; a
+    // new Welcome opens a fresh one and drops the earlier join and its
+    // counted time, keeping the announce time.
+    assert!(
+        app.record_group_push_gossip_announce("bb", 20, None)
+            .unwrap()
+    );
+    assert_eq!(state("bb").unwrap().joining_since_ms, None);
+    assert_eq!(joining(), Vec::<String>::new());
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 0);
+    save(vec![group("aa", "created"), welcomed("bb", "w2")]);
+    let reopened = state("bb").unwrap();
+    assert!(reopened.joining_since_ms.is_some());
+    assert_eq!(reopened.joined_at_ms, None);
+    assert_eq!(reopened.join_window_counted_ms, 0);
+    assert_eq!(reopened.last_announced_at_ms, Some(20));
+
+    // A Welcome saved while this device is not a member opens nothing.
+    save(vec![
+        group("aa", "created"),
+        welcomed("bb", "w2"),
+        group("cc", "gone"),
+    ]);
+    app.set_group_self_membership("cc", SelfMembership::Removed)
+        .unwrap();
+    save(vec![
+        group("aa", "created"),
+        welcomed("bb", "w2"),
+        welcomed("cc", "w3"),
+    ]);
+    assert_eq!(state("cc"), None);
+}
+
+/// An owed announce needs a joined group, and each new debt raises it past
+/// the last, even with an earlier clock. A published announce settles it only
+/// while it holds the value the announce was built under; a replay of the
+/// Welcome keeps it, and a new Welcome drops it.
+#[test]
+fn an_owed_push_announce_lasts_until_an_announce_built_under_it_or_a_new_welcome() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |welcome: &str| {
+        let mut welcomed = group("aa", "welcomed");
+        welcomed.via_welcome_message_id_hex = Some(welcome.to_owned());
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![welcomed],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let owed = || {
+        app.group_push_gossip_state("aa")
+            .unwrap()
+            .unwrap()
+            .announce_owed_at_ms
+    };
+    let owing = || {
+        app.owed_group_push_announce_states()
+            .unwrap()
+            .into_iter()
+            .map(|state| state.group_id_hex)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(app.record_group_push_announce_owed("aa", 10).unwrap(), None);
+    save("w1");
+    assert_eq!(owed(), None);
+    assert!(owing().is_empty());
+
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 10).unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 30).unwrap(),
+        Some(30)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 5).unwrap(),
+        Some(31),
+        "a debt recorded after a clock step back still raises it"
+    );
+    assert_eq!(owing(), vec!["aa".to_owned()]);
+    save("w1");
+    assert_eq!(owed(), Some(31), "a replayed Welcome keeps it");
+
+    assert!(
+        app.record_group_push_gossip_announce("aa", 20, Some(30))
+            .unwrap()
+    );
+    assert_eq!(
+        owed(),
+        Some(31),
+        "an announce built before the last debt settles nothing"
+    );
+    assert!(
+        app.record_group_push_gossip_announce("aa", 25, None)
+            .unwrap()
+    );
+    assert_eq!(owed(), Some(31));
+    assert!(
+        app.record_group_push_gossip_announce("aa", 26, Some(31))
+            .unwrap()
+    );
+    assert_eq!(owed(), None);
+    assert!(owing().is_empty());
+
+    assert!(
+        app.record_group_push_announce_owed("aa", 40)
+            .unwrap()
+            .is_some()
+    );
+    save("w2");
+    assert_eq!(owed(), None, "a new Welcome drops it");
+}
+
+/// An owed push snapshot needs a joined group, keeps the latest owed epoch,
+/// is replaced or settled only while it still holds the expected epoch, and
+/// ends with the membership.
+#[test]
+fn push_snapshot_owed_keeps_the_latest_add_for_the_current_membership() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let owed = |group: &str| {
+        app.group_push_gossip_state(group)
+            .unwrap()
+            .and_then(|state| state.snapshot_owed_after_epoch)
+    };
+    let owed_groups = || {
+        app.owed_group_push_snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|state| (state.group_id_hex, state.snapshot_owed_after_epoch))
+            .collect::<Vec<_>>()
+    };
+    assert!(!app.record_group_push_snapshot_owed("aa", 1).unwrap());
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha"), group("bb", "beta")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    assert_eq!(owed_groups(), Vec::new());
+
+    // An announce row owes nothing; recording keeps the other columns.
+    assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
+    assert_eq!(owed("aa"), None);
+    assert!(app.record_group_push_snapshot_owed("aa", 5).unwrap());
+    assert!(app.record_group_push_snapshot_owed("aa", 3).unwrap());
+    assert_eq!(owed("aa"), Some(5));
+    assert_eq!(
+        app.group_push_gossip_state("aa")
+            .unwrap()
+            .unwrap()
+            .joined_at_ms,
+        Some(10)
+    );
+    assert!(
+        app.record_group_push_snapshot_owed("bb", u64::MAX >> 1)
+            .unwrap()
+    );
+    assert_eq!(
+        owed_groups(),
+        vec![
+            ("aa".to_owned(), Some(5)),
+            ("bb".to_owned(), Some(u64::MAX >> 1))
+        ]
+    );
+    assert!(app.record_group_push_snapshot_owed("bb", u64::MAX).is_err());
+
+    // A stale expectation changes nothing; a current one restores or settles.
+    assert!(!app.replace_group_push_snapshot_owed("aa", 4, None).unwrap());
+    assert_eq!(owed("aa"), Some(5));
+    assert!(
+        app.replace_group_push_snapshot_owed("aa", 5, Some(2))
+            .unwrap()
+    );
+    assert_eq!(owed("aa"), Some(2));
+    assert!(app.replace_group_push_snapshot_owed("aa", 2, None).unwrap());
+    assert_eq!(owed("aa"), None);
+    assert!(!app.replace_group_push_snapshot_owed("cc", 0, None).unwrap());
+    assert_eq!(owed_groups(), vec![("bb".to_owned(), Some(u64::MAX >> 1))]);
+
+    assert!(app.record_group_push_snapshot_owed("aa", 7).unwrap());
+    app.set_group_self_membership("aa", SelfMembership::Left)
+        .unwrap();
+    assert_eq!(owed("aa"), None);
+    assert!(!app.record_group_push_snapshot_owed("aa", 8).unwrap());
+    store.delete_local_group_data("bb").unwrap();
+    assert_eq!(owed_groups(), Vec::new());
 }
 
 #[test]
@@ -4321,6 +4869,17 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         .app_storage()
         .record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
+    assert!(
+        store
+            .app_storage()
+            .insert_device_group(&crate::DeviceGroupRecord {
+                group_id_hex: "aa".into(),
+                trust: crate::DeviceGroupTrust::Untrusted,
+                key_package_ref_hex: None,
+                recorded_at: 1,
+            })
+            .unwrap()
+    );
     store
         .lock()
         .unwrap()
@@ -4347,6 +4906,7 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
     );
     assert!(!store.is_group_forgotten(&id).unwrap());
     assert!(store.list_groups().unwrap().contains(&id));
+    assert!(store.app_storage().device_group("aa").unwrap().is_some());
     assert_eq!(
         store
             .lock()
@@ -4375,6 +4935,7 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap()
     );
     assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(store.app_storage().device_group("aa").unwrap().is_none());
     assert!(
         store
             .app_storage()
@@ -4636,7 +5197,10 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
     store.apply_group_push_token(&sibling).unwrap();
     assert_eq!(store.group_push_tokens(&g).unwrap().len(), 2);
     store
-        .apply_group_push_token_tombstone(&g, &m, 2, 1, &"dd".repeat(32), 500, "withdrawn", 500)
+        .apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+            server_pubkey_hex: "dd".repeat(32),
+            ..push_tombstone(&g, &m, 2, 500, "withdrawn")
+        })
         .unwrap();
     store
         .remove_group_push_tokens_for_leaves(&g, &[(m.clone(), 0)], &[])
@@ -4687,27 +5251,15 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
     let mut old = push_token(&g, &m, 100, "old");
     old.leaf_index = 2;
     old.server_pubkey_hex = "dd".repeat(32);
-    app.apply_group_push_token_tombstone(
-        &g,
-        &m,
-        2,
-        1,
-        &old.server_pubkey_hex,
-        500,
-        "withdrawn",
-        500,
-    )
+    app.apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+        server_pubkey_hex: old.server_pubkey_hex.clone(),
+        ..push_tombstone(&g, &m, 2, 500, "withdrawn")
+    })
     .unwrap();
-    app.apply_group_push_token_tombstone(
-        &g,
-        &peer,
-        2,
-        1,
-        &old.server_pubkey_hex,
-        500,
-        "peer-withdrawn",
-        500,
-    )
+    app.apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+        server_pubkey_hex: old.server_pubkey_hex.clone(),
+        ..push_tombstone(&g, &peer, 2, 500, "peer-withdrawn")
+    })
     .unwrap();
     store
         .lock()
@@ -4755,5 +5307,329 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
     assert_eq!(
         app.reconcile_group_push_token_leaves(&g, &roster).unwrap(),
         0
+    );
+}
+
+fn hex_id(byte: u8, len: usize) -> String {
+    hex::encode(vec![byte; len])
+}
+
+fn direct_group(group_id_hex: &str, local: &str, peer: &str) -> StoredAccountGroup {
+    StoredAccountGroup {
+        member_count: Some(2),
+        direct_member_ids_hex: Some(vec![local.to_owned(), peer.to_owned()]),
+        ..group(group_id_hex, "")
+    }
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_does_not_clobber_newer_rows() {
+    let local = hex_id(0xaa, 32);
+    let old_peer = hex_id(0xbb, 32);
+    let new_peer = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &old_peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), new_peer.clone()])
+        .unwrap();
+    assert!(
+        !store
+            .fill_unindexed_direct_conversation_members(
+                &group_id,
+                &[local.clone(), old_peer.clone()]
+            )
+            .unwrap(),
+        "a later projection save must win over a stale backfill write"
+    );
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&new_peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&old_peer)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn fill_unindexed_direct_conversation_members_writes_when_empty() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let mut unindexed = direct_group(&group_id, &local, &peer);
+    unindexed.direct_member_ids_hex = None;
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![unindexed],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id.clone()]
+    );
+    assert!(
+        store
+            .fill_unindexed_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+}
+
+#[test]
+fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    store
+        .mark_account_import_complete("direct-conversation-members-backfill-v1")
+        .unwrap();
+    assert!(
+        !store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+
+    store
+        .reset_direct_conversation_members_backfill("direct-conversation-members-backfill-v1")
+        .unwrap();
+
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !store
+            .account_import_marker("direct-conversation-members-backfill-v1")
+            .unwrap()
+    );
+    assert_eq!(
+        store.unindexed_direct_conversation_group_ids().unwrap(),
+        vec![group_id]
+    );
+}
+
+#[test]
+fn persist_direct_index_follows_two_member_ids_not_stale_count() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+
+    let mut stale_count = direct_group(&group_id, &local, &peer);
+    stale_count.member_count = Some(3);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_count],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    let loaded = store
+        .load_account_projection_state("alice", 16)
+        .unwrap()
+        .groups
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id)
+        .expect("stale-count group");
+    let mut loaded_members = loaded.direct_member_ids_hex.expect("persisted members");
+    loaded_members.sort();
+    let mut expected_members = vec![local.clone(), peer.clone()];
+    expected_members.sort();
+    assert_eq!(
+        loaded_members, expected_members,
+        "empty-name projections with exactly two member ids must persist the index"
+    );
+
+    let mut stale_ids = direct_group(&group_id, &local, &peer);
+    stale_ids.direct_member_ids_hex = Some(vec![local.clone(), peer.clone(), extra]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![stale_ids],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty(),
+        "a three-member id slice must not persist the peer index"
+    );
+}
+
+#[test]
+fn replace_direct_conversation_members_rejects_non_two_member_slices() {
+    let local = hex_id(0xaa, 32);
+    let peer = hex_id(0xbb, 32);
+    let extra = hex_id(0xcc, 32);
+    let group_id = hex_id(0x11, 16);
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(&group_id, &local, &peer)],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+
+    store
+        .replace_direct_conversation_members(&group_id, std::slice::from_ref(&local))
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone(), extra])
+        .unwrap();
+    assert!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .replace_direct_conversation_members(&group_id, &[local.clone(), peer.clone()])
+        .unwrap();
+    assert_eq!(
+        store
+            .direct_conversation_candidate_rows(&peer)
+            .unwrap()
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![group_id.as_str()]
+    );
+}
+
+#[test]
+fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
+    // Backfill candidate set: rows still carrying the migration default
+    // 'member' are returned; rows explicitly flipped to 'removed' are not, so
+    // re-running the one-time backfill stays idempotent.
+    let other_group = group("22", "Marmot Lab");
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group("11", "Marmot Lab"), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    // Both rows start at the default 'member', so both are candidates.
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["11".to_owned(), "22".to_owned()]
+    );
+
+    // Once a row is flipped to 'removed' it drops out of the candidate set.
+    store
+        .set_group_self_membership("11", SelfMembership::Removed)
+        .unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // Re-affirming 'member' keeps a row in the candidate set (still default).
+    store
+        .set_group_self_membership("22", SelfMembership::Member)
+        .unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // No defaulted rows left once every row is explicitly resolved.
+    store
+        .set_group_self_membership("22", SelfMembership::Removed)
+        .unwrap();
+    assert!(
+        store
+            .account_group_ids_defaulting_to_member()
+            .unwrap()
+            .is_empty()
     );
 }

@@ -5,11 +5,12 @@ use cgka_traits::app_components::{
     GROUP_PROFILE_COMPONENT_ID,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditHumanActionContext, EpochBackfillActivationOutcome,
-    EpochBackfillCompletionKind, EpochBackfillDeferredReason, EpochBackfillExecutionSeam,
-    EpochBackfillReplayScope, EpochStallBackfillTrigger, RelayRegistration,
-    SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
-    SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
+    AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditRecord,
+    EpochBackfillActivationOutcome, EpochBackfillCompletionKind, EpochBackfillDeferredReason,
+    EpochBackfillExecutionSeam, EpochBackfillReplayScope, EpochStallBackfillTrigger,
+    ForensicRecorder, RelayRegistration, SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES,
+    SubscriptionRefusalCategory, SubscriptionRefusalEntry, SubscriptionRefusalOutcome,
+    SubscriptionRefusalRoute,
 };
 use transport_nostr_adapter::{
     SUBSCRIPTION_REFUSAL_REPORT_LIMIT, SubscriptionRefusalDisposition, SubscriptionRouteKind,
@@ -95,17 +96,34 @@ fn epoch_backfill_terminal_event_kind(
 
 impl AppClient {
     pub(crate) fn audit_v5_enabled(&self) -> bool {
-        self.runtime.session().audit_v5_enabled()
+        self.audit.records_v5()
     }
 
-    /// Drain only current-operation events into the installed recorder. The
-    /// session assigns the same source/session/sequence as engine audit rows.
+    /// Record one app audit row into this client's clone of the recorder, so
+    /// it shares the engine rows' writer, session and sequence. `group_ref`
+    /// is the group id's hex, as on engine rows.
+    pub(crate) fn record_audit_event(
+        &self,
+        group_id: Option<&GroupId>,
+        context: Option<AuditEventContext>,
+        kind: AuditEventKind,
+    ) {
+        let mut record = AuditRecord::new(
+            group_id.map(|group_id| hex::encode(group_id.as_slice())),
+            kind,
+        );
+        record.context = context;
+        self.audit.record(record);
+    }
+
+    /// Drain only current-operation events into the installed recorder. They
+    /// get the same source/session/sequence as engine audit rows.
     pub(crate) fn flush_live_v5_events(&mut self) {
         let Some(probe) = &mut self.audit_v5_probe else {
             return;
         };
         for (group_ref, event) in probe.take_live_events() {
-            self.runtime.session().record_v5_event(group_ref, event);
+            self.audit.record_v5_event(group_ref, event);
         }
     }
 
@@ -211,6 +229,7 @@ impl AppClient {
             AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
                 ("send_message", None)
             }
+            AppMessageIntent::Sticker { .. } => ("send_sticker", None),
             AppMessageIntent::Reply { .. } => ("reply_message", None),
             AppMessageIntent::Edit { .. } => ("edit_message", None),
             AppMessageIntent::Reaction { .. } => ("react", None),
@@ -234,6 +253,7 @@ impl AppClient {
             | AppMessageIntent::AgentOperation { .. }
             | AppMessageIntent::GroupSystem { .. }
             | AppMessageIntent::PushTokenUpdate { .. }
+            | AppMessageIntent::PushTokenList { .. }
             | AppMessageIntent::PushTokenRemoval { .. } => return None,
         };
         Some(Self::local_human_action_context(
@@ -256,7 +276,7 @@ impl AppClient {
         let Some(action) = context.human_action.as_ref() else {
             return;
         };
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             Some(group_id),
             Some(context.clone()),
             AuditEventKind::HumanAction {
@@ -279,7 +299,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
         context: &AuditEventContext,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.record_human_action(
             group_id,
@@ -321,7 +341,7 @@ impl AppClient {
                 accepted: outcome.accepted,
             })
             .collect();
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             None,
             None,
             AuditEventKind::SubscriptionRebuild {
@@ -365,7 +385,7 @@ impl AppClient {
                 count: report.count,
             })
             .collect();
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             None,
             None,
             AuditEventKind::SubscriptionRefused {
@@ -394,7 +414,7 @@ impl AppClient {
         cursor_before_secs: Option<u64>,
         cursor_after_secs: Option<u64>,
     ) {
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             None,
             None,
             AuditEventKind::SyncDrain {
@@ -421,7 +441,7 @@ impl AppClient {
         trigger: EpochStallBackfillTrigger,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             Some(group_id),
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillArmed {
@@ -438,7 +458,7 @@ impl AppClient {
         retry_ordinal: u64,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillStarted {
@@ -457,9 +477,7 @@ impl AppClient {
         context: &AuditEventContext,
     ) {
         let kind = epoch_backfill_terminal_event_kind(succeeded, terminal);
-        self.runtime
-            .session()
-            .record_audit_event(Some(group_id), Some(context.clone()), kind);
+        self.record_audit_event(Some(group_id), Some(context.clone()), kind);
     }
 
     pub(crate) fn record_epoch_stall_backfill_deferred(
@@ -468,7 +486,7 @@ impl AppClient {
         retry_ordinal: u64,
         context: &AuditEventContext,
     ) {
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             None,
             Some(context.clone()),
             AuditEventKind::EpochStallBackfillDeferred {
@@ -494,7 +512,7 @@ impl AppClient {
         stalled_epoch: u64,
         arms: u32,
     ) {
-        self.runtime.session().record_audit_event(
+        self.record_audit_event(
             Some(group_id),
             None,
             AuditEventKind::EpochStallBackfillEscalated {
@@ -506,12 +524,16 @@ impl AppClient {
     }
 
     /// Apply the audit-logging switch to this live session by swapping the
-    /// recorder in place: a file-backed recorder when `enabled`, or a no-op
-    /// recorder when off. Dropping the prior recorder flushes and closes any
-    /// file it held, so no session reopen is required.
+    /// recorder in place for every clone: a file-backed recorder when
+    /// `enabled`, or a no-op recorder when off. The swap closes any file the
+    /// prior recorder held before it returns, so no session reopen is required.
     pub(crate) fn set_audit_recording(&mut self, enabled: bool) {
+        let slot = self.app.audit_recorder_slot(&self.state.label);
+        let mut registration = slot.lock().unwrap_or_else(|p| p.into_inner());
         let recorder = self.app.build_audit_recorder(&self.state.label, enabled);
-        self.runtime.session_mut().set_audit_recorder(recorder);
+        self.audit.swap(recorder);
+        *registration = Some(self.audit.downgrade());
+        drop(registration);
         if enabled {
             if self.audit_v5_enabled() && self.audit_v5_probe.is_none() {
                 self.audit_v5_probe = Some(super::audit_v5_probe::WelcomeProbe::live());
@@ -523,11 +545,13 @@ impl AppClient {
     }
 
     /// Used only after the account worker observes an explicit graceful
-    /// shutdown signal. Dropping a client on another path never emits stop.
+    /// shutdown signal. Writes the stop row, then closes the file for every
+    /// clone of the recorder, so nothing that outlives the worker can append
+    /// to it. Dropping a client on another path never emits stop; its file
+    /// closes when the client, which holds every clone, is dropped.
     pub(crate) fn finish_audit_recording(&self) {
-        self.runtime.session().finish_audit_v5_recording(
-            marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown,
-        );
+        self.audit
+            .finish(marmot_forensics::v5::RecordingStopReason::CleanRuntimeShutdown);
     }
 
     /// Rotate the live forensic recorder iff it is the one appending to
@@ -543,7 +567,7 @@ impl AppClient {
         &self,
         path: &std::path::Path,
     ) -> Result<bool, AppError> {
-        if self.runtime.session().audit_log_path().as_deref() == Some(path) {
+        if self.audit.audit_log_path().as_deref() == Some(path) {
             // The requester may have been cancelled after queueing this worker
             // command. Fence the destructive rotation where it actually runs,
             // independent of the requester's mutation guard.
@@ -552,7 +576,7 @@ impl AppClient {
                 .app
                 .audit_export_lifecycle
                 .mutate_account(&account.account_id_hex);
-            self.runtime.session().rotate_audit_log()?;
+            self.audit.rotate()?;
             Ok(true)
         } else {
             Ok(false)
@@ -805,7 +829,7 @@ pub(super) fn refusal_category(
     }
 }
 
-fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects) -> Vec<String> {
+fn audit_message_ids_from_effects(effects: &marmot_session::AccountDeviceEffects) -> Vec<String> {
     effects
         .reports
         .iter()
@@ -930,5 +954,31 @@ mod tests {
             schema_valid_message_ids(ids),
             vec![VALID.to_string(), upper]
         );
+    }
+
+    #[test]
+    fn sticker_send_is_a_local_human_action() {
+        use crate::messages::AppMessageIntent;
+
+        let sticker = AppMessageIntent::Sticker {
+            sticker_ref: crate::AppStickerRef {
+                pack_coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+                shortcode: "wave".to_owned(),
+                plaintext_sha256: "11".repeat(32),
+            },
+        };
+        let action = super::AppClient::message_human_action_context(&sticker)
+            .and_then(|context| context.human_action)
+            .expect("a sticker send is a human action");
+        assert_eq!(action.action, "send_sticker");
+        assert_eq!(action.origin, "local_user");
+        assert_eq!(action.target_count, None);
+
+        let machine = AppMessageIntent::StreamStart {
+            stream_id: vec![1],
+            parent_message_id: None,
+            quic_candidates: Vec::new(),
+        };
+        assert!(super::AppClient::message_human_action_context(&machine).is_none());
     }
 }

@@ -16,7 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
-  [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
+  [KeyPackage inventory](#keypackage-inventory), [KeyPackage selection](#keypackage-selection),
   [invitation lookup outcomes](#invitation-lookup-outcomes),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
@@ -25,7 +25,9 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
-  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [turning on account devices](#turning-on-account-devices),
+  [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
@@ -180,7 +182,7 @@ started/completed counters, five outcomes, histogram and live gauges. Hosts repo
 the actual outcome; merely leaving a scope does not establish success. These
 completed-duration reports have no live observation, so their live gauges are zero.
 Hosts should record every stage they can observe, and only those. Nested stages overlap and
-must not be summed. See the [operation definitions](../marmot-app/src/app_telemetry.rs) and
+must not be summed. See the [operation definitions](../marmot-observability/src/app_telemetry.rs) and
 [metric catalog](../../docs/marmot-architecture/telemetry.md#registered-host-stage-metrics).
 
 Use typed presentation, capability, deletion and group-system fields rather than parsing English
@@ -240,7 +242,7 @@ The reference's names, signatures and source-line links are checked against sour
 
 ## Runtime options and client label
 
-`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `secretStore` and
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `devicePlatform`, `secretStore` and
 `attachmentAcquisitionMode` with the required [`deployment`](#deployment) in `Marmot.newWithConfiguration`.
 Every other field is optional in generated Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
@@ -279,7 +281,8 @@ Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
 `MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
 Supply the name on every host runtime construction, including background and
 notification-extension entry points (which retain their frozen cursor policy).
-Absent or whitespace-only names omit the tag. New initial publications and normal
+Absent, whitespace-only and over-long names (more than 64 bytes of UTF-8 once
+trimmed) omit the tag; MDK never truncates one. New initial publications and normal
 rotations carry the configured label. Existing events are not republished, and
 already-signed pending publications retry with their original tags even if the
 configuration changes.
@@ -293,8 +296,7 @@ and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 Every constructor requires a `MarmotDeploymentFfi`: `MarmotOptions.deployment` has no default, and the other
 constructors take it as their last argument. It holds the services a deployment's users rely on: the
 recovery-operated relays, discovery indexers, new-group media servers, group- and profile-image servers, Open
-Ranking, the KeyPackage client preference, the moderation label namespace, and the keychain service used when no
-`secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
+Ranking, the moderation label namespace, and the keychain service used when no `secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
 differs. White Noise apps pass `marmotDeploymentWhiteNoise()` in every entry point, including background and
 notification-extension runtimes. Never change `keychainService` for an existing install: secrets stored under the old
 name are stranded.
@@ -303,8 +305,8 @@ Nothing an unset value configures falls back to White Noise's services. With no 
 carry no encrypted-media component and stay text-only. With no group-image server, setting or fetching an encrypted
 group image fails; with no profile-image server, `uploadProfileImage` needs an explicit server. No recovery relays
 means every route's history needs all its relays to certify, no discovery indexers means onboarding searches the
-discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, no KeyPackage client
-preference leaves candidates unranked by client tag, and no moderation label namespace leaves reporting unconfigured. The neutral keychain service
+discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, and no moderation label namespace leaves reporting
+unconfigured. The neutral keychain service
 is `org.marmot-protocol.mdk`.
 
 ```swift
@@ -686,44 +688,23 @@ remains retained. Empty bootstrap relays remain network-enabled. After a
 mutation, re-read the local inventory instead of applying an out-of-order
 refresh.
 
-## KeyPackage client preference
+## KeyPackage selection
 
-Invitation discovery temporarily ranks KeyPackages by the deployment's client preference:
-`keyPackagePreferredClients` first, then untagged/other clients, then `keyPackageLastClients`.
-White Noise's deployment prefers `whitenoise` and ranks `amethyst` last; `marmotDeploymentNeutral()` sets no
-preference. Names are trimmed and matched case-insensitively, exactly (not by
-substring). These are advisory labels, never proof of a particular application.
-Only valid packages compatible with the proposed/existing group qualify. Within a
-tier, the existing recency order applies. A last-ranked client remains selectable when no
-higher-priority compatible package is available. A replacement in a publication
-slot supersedes the old package before ranking; one package per account is selected.
-The ranking comes from the [deployment](#deployment); the publication label is set separately (see
-[runtime options](#runtime-options-and-client-label)).
-Compatibility alone cannot identify a client that publishes usable packages but does not process Welcomes.
+Creating a group or inviting adds every device of each recipient account, and the group shows the account as one
+member with its `deviceCount`. MDK reads the account's KeyPackages and KeyPackage deletion requests from relays, then
+adds every valid, compatible package published in the last 30 days, at most 20 per account; with none that recent, it
+adds the single best valid one. Each publication slot (`d` tag) contributes at most one package: the slot's newest
+publication supersedes older ones even when it is invalid or deleted, so an older package never comes back. A package
+a deletion request covers, by slot address or by event id, is skipped. Packages not marked last-resort rank first,
+then the most recently published, then the lower KeyPackageRef. Packages sharing a leaf signature key (one device
+publishing in several slots) count once. The `client` tag never affects selection; it is only a publication label
+(see [runtime options](#runtime-options-and-client-label)).
 
-Client ranking and slot supersession also apply to directory lookup (including
-`wn-cli key-package`) and composition prewarm, without target-group requirements. A
-malformed current publication never revives an older package in the same slot.
-If no usable slot remains, prewarm reports failure while retaining successfully
-discovered routes for other members. Its success must not imply readiness based
-on superseded material. Bounded batch results are not exhaustive, so rejected
-candidates still permit a per-account fallback fetch. A lower-priority batch
-winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
-batch limit, even if it returned fewer records than requested: relays may impose
-lower caps. Already observed replacements remain authoritative during the refetch.
-This adds a per-author request for each lower-priority batch winner. A preferred-client
-winner already has the highest tier in a newest-first prefix, so it skips that
-request. Both paths remain bounded discovery: neither guarantees completeness
-when a relay omits newer events instead of returning a newest-first prefix.
-If that supplementary fetch fails, a still-valid, compatible package from the
-current batch remains usable; previously cached packages are never substituted.
-Prewarm skips preference-only refetches because it only checks existence.
-Prewarm checks discovery readiness only; it has no proposed group configuration
-and does not guarantee capability compatibility. Final creation/invitation checks
-the actual group's requirements. Device-aware delivery in
-[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
-replacement for this temporary client ranking.
-
+Directory lookup (including `wn-cli key-package`) returns the best package of the same selection. Composition prewarm
+checks existence from a batched read. Create and invite read each account on its own, because a read bounded across
+accounts cannot prove that it saw every slot. If that read fails, valid, compatible packages from the batch remain
+usable; previously cached packages are never substituted. Prewarm has no proposed group configuration, so it does not
+guarantee capability compatibility; creation and invitation check the actual group's requirements.
 
 ## Invitation lookup outcomes
 
@@ -873,6 +854,8 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
+`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 461, 473, 475 and 476 included. Those
+are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 
 
 ## Device-local membership events
@@ -884,6 +867,48 @@ notification effects before host delivery; these events create no system row.
 Use them to refresh presentation, and handle the new variants when regenerating
 Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
 terminal-copy recovery through the managed scheduler.
+
+## Queued sends the group refuses
+
+A send made while the group settles reports `AcceptedPending`, and MDK sends it
+once the group settles. If the settled group refuses it (the user stopped being
+an admin meanwhile, or the change no longer applies), MDK drops it and emits
+`GroupEventKindFfi::QueuedIntentRefused { intent_id_hex, intent_kind, reason }`
+for that group. Nothing retries it: tell the user, who may try again. `reason`
+is a stable tag such as `not_group_admin`.
+
+## Members are accounts
+
+An account can have several devices in one group, each its own MLS leaf. Member
+rows, rosters, member-id pages and conversation snapshots list each account once,
+and `member_count`, admin counts, last-admin checks and direct-chat detection count
+accounts: a 1:1 chat stays a 1:1 whatever devices either person uses. A member row's
+`device_count` is how many of that account's devices are in the group; nothing else
+about another account's devices reaches the bindings. A group-system row marks only
+an account's first device joining or its last device leaving.
+
+## Turning on account devices
+
+A group can require `marmot.group.account-devices.v1`, after which a member's own devices
+may add and remove each other there without an admin. A new group requires it on its
+own when every founding device supports it. An existing group gets it only through
+`enable_account_devices(account_ref, group_id_hex)`: one admin Commit, sent only when
+the user asks, which no member can ever undo. MDK never turns it on by itself.
+
+Before offering the action, call `account_devices_activation(account_ref, group_id_hex)`.
+Offer it only on `Eligible`. Otherwise say why: `NotAdmin`, `AlreadyEnabled`,
+`LegacyGroup`, `MembersNeedUpdate` (some device in the group runs a client without
+support; it becomes eligible as those clients update and refresh their leaves),
+`DevicesNeedReplacement` (some device's leaf carries data under the component's id
+that another client wrote; an update does not clear it, so that device has to replace
+its leaf or leave and be added again) or `DeviceLimitExceeded`. The answer is about the
+whole group and never names which members or devices hold it back; a non-admin only
+ever learns `NotAdmin`. It is advisory: `enable_account_devices` checks again and fails
+with `MarmotKitError::AccountDevicesActivationRefused` and the same reason. When the
+group is still settling incoming changes, the call checks the current state, then
+waits for the group to settle and checks once more before committing. If that second
+check refuses, the activation is dropped rather than retried, so read
+`account_devices_activation` again to show the outcome.
 
 ## Group-system previews
 
@@ -959,6 +984,132 @@ minutes returns the same `report_id`. Each account may send 20 reports per hour
 reports. The C ABI mirrors these calls. See the
 [wire format](../../docs/marmot-architecture/moderation-reports.md).
 
+## Linked devices
+
+`linked_devices(account_ref)` returns this account's own devices as `LinkedDeviceFfi` records, read from the roster of
+the device group this device trusts, for a Devices screen:
+
+- This device comes first (`is_this_device`), then the rest by `linked_at`. Every entry is this account's own device.
+- `slot_id_hex` is the device's KeyPackage slot, the handle later device actions take. `label`, `client` and
+  `platform` are empty until set; `linked_by_slot_id_hex` is `None` for the device that founded the group.
+- Each device writes its own `client` and `platform`: its `clientName` and `devicePlatform` options (a short name
+  such as `iOS`), trimmed, and empty when blank or over 64 bytes. It writes them with its next KeyPackage
+  announcement in the device group, so they appear after its next maintenance pass.
+- `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds. Each running device sends one
+  in the device group at most once an hour; each is dated when it was created or, if earlier, when this device read
+  it. It is `None` for this device and for a sibling none of whose heartbeats has counted yet.
+- `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
+  or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
+  `Inactive` is the roster's own mark.
+- The list is empty until this device trusts a device group (a single-device account has none), and in every release
+  build until the roster's spec lands.
+- The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
+  device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
+  with no visible change.
+
+`rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one included, with
+one roster commit in the device group:
+
+- Only the label changes. It is at most 64 bytes of UTF-8; an empty label clears it.
+- It is refused with nothing sent (`DeviceGroupRefused`) in release builds, for a label that is too long, without a
+  device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
+  in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
+  change.
+- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
+  won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+
+### This device unlinked
+
+When another of the account's devices removes this one with `remove_linked_device`, the account stops on this device
+once it reads the removal, and nothing more is sent from it (mdk#2628):
+
+- `MarmotEventFfi::DeviceUnlinked { account_id_hex, account_label }` fires once, after the account is signed out. From
+  then on the account's `AccountSummaryFfi` has `unlinked` and `signed_out` set, and both stay set.
+- Show that this device was unlinked from the account, and stop showing its local history.
+- Signing in to it, logging in to it or importing its key fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
+  account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
+  sign-in that links this device anew.
+
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, it announces each KeyPackage in its own roster entry before publishing it, so
+a device group that can't take that Commit holds the refresh back. `key_package_refresh_overdue(account_ref)` is true
+once the KeyPackage this device would publish is still unannounced and its slot's newest publication is a week old.
+Inviters stop treating the device as fresh at 30 days, so tell the user. A routine refresh never shows, and neither
+does one that is announced but failing at the relays. Re-read on `MarmotEventFfi::KeyPackageRefreshOverdueChanged`,
+which carries no device or group identities and also fires once each time the account's worker opens or reconnects.
+It is false in every release build until the roster's spec lands.
+
+## Unrecognized sign-ins
+
+`unrecognized_sign_ins(account_ref)` returns sign-ins of this account that this device does not recognize as
+`UnrecognizedSignInFfi` records, for a "Was this you?" prompt:
+
+- Each is a fresh, valid KeyPackage of the account in a slot that neither this device nor its device group's roster
+  knows. The earliest to appear comes first.
+- `before_this_device` means this device's first check found it, so it was signed in before this device: ask whether
+  the user still has it, with `last_seen_at`. For any other, ask whether it was them, with `client` and
+  `appeared_at`. `client` is display only.
+- `state` is `Prompt`, `NotNow`, or `LinkedElsewhere`/`RejectedElsewhere` when another device answered while the
+  prompt waited here. `linked_by_slot_id_hex` names the linking device for `LinkedElsewhere`.
+- `answer_sign_in(account_ref, slot_id_hex, response)` takes `NotNow`, `Reject` or `Dismiss`. `Reject` drops the sign-in
+  from this device's list and records its slot as rejected in the device group's roster; with no device group yet, it
+  waits on this device. On another device, a new sign-in whose prompt still waits there turns `RejectedElsewhere` and
+  stays until `Dismiss`; one put off with `NotNow`, or found before that device, leaves its list. `Dismiss` only ends a
+  prompt another device answered. Linking one is device pairing's.
+- The account checks at open, every six hours, and soon after one of its KeyPackages arrives live.
+  `check_sign_ins(account_ref)` checks now and returns the list after the check.
+- Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
+  account's worker opens or reconnects, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
+- `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
+  sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
+  raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
+  (`sign_ins_unchecked`) and once this device trusts a device group (`device_group_exists`). `started_fresh` says
+  whether the device did so and still has no device group: say that only chats it is invited to from now on are here.
+  Re-read it after `start_fresh` and on `LinkedDevicesChanged`.
+
+## Compromise warning
+
+`compromise_warning(account_ref)` returns the account's open compromise warning on this device as
+`CompromiseWarningItemFfi` records, the earliest gathered first. An empty list means no warning is open:
+
+- Each item means someone holding the account's signing key, or a session with its remote signer, published where the
+  account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on this device or another;
+  `ForeignOwnSlotKeyPackage` is a KeyPackage this device found in its own slot that it did not make, with its
+  `key_package_ref_hex`. Only the device that found it warns of it, and it has replaced it. `slot_id_hex` and
+  `occurred_at` say where and when.
+- Later releases add reasons. Show one the app does not know as a generic one.
+- The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another
+  device warns here too. Rejections already in the first roster this device trusts count as seen: the user saw them on
+  the devices that were there. A rejected sign-in leaves the warning once its slot is linked as a device.
+- `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
+  closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
+- The app writes the wording, and never says the account's devices stopped them.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
+  account's worker opens, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
+
+## Linking a new device
+
+Linking a new device of the account shows the same seven emoji on both devices, and each user confirms. Every call
+returns a `DeviceLinkSnapshotFfi`, and every call is refused in release builds until the pairing and device-group specs
+land:
+
+- The new device calls `start_device_link(account_ref)` and shows `new_device`: `WaitingForAnswer` (ask the user to
+  open the app on a device already signed in), then `Comparing` with the code. Offer "They match"
+  (`confirm_device_link_match`) and cancel (`cancel_device_link`). It then shows `WaitingForOtherDevice`, `Joining`,
+  and `Linked`, or `Ended` with a reason.
+- A device already signed in shows each entry in `prompts`. `Comparing` shows the code; offer a label field, "Add to
+  all my chats" and "Bring chat history" (both on by default), Link device (`link_device`) and Not now
+  (`decline_device_link`). After Link device it shows `Linking` until the new device's first change in the device group
+  arrives, then `Linked`; with none within an hour, the device is removed again and both sides show `LinkFailed`.
+  Other states say why Link isn't offered, or `AddedElsewhere`: "<device_label> was added by <added_by_label>".
+- Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
+- `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
+  which carries no device, session or group identities. It also fires once each time the account's worker opens or
+  reconnects, which ends any link in progress.
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that
@@ -988,6 +1139,14 @@ epoch, a later startup's incremental comparison, or a new explicit repair. Expli
 full-history repair remains available and can still complete parked history that its
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
+
+`account_recovery_status(account_ref)` returns `AccountRecoveryStatusFfi`: the groups whose
+history is still being fetched (`catching_up_group_ids_hex`), whether the inbox's is
+(`inbox_catching_up`), and every notice as `history_notices` lists them. Show the first two
+as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery
+runner owns history (mdk#2660) nothing is ever catching up, and neither that event nor
+`HistoryNoticeCauseFfi::UnprovenHistory` (the runner could not prove a route's history and
+stopped retrying it) is produced; handle both in exhaustive switches now.
 
 While unresolved epoch-gap recovery covers a group's current local epoch, the group may
 have moved past this device. Group changes (invite, remove, admin changes, profile, image,

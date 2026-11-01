@@ -17,7 +17,9 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
-use crate::app_components::{AppComponentData, AppComponentId};
+use crate::app_components::{
+    AccountEntryV1, AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId,
+};
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
@@ -25,7 +27,7 @@ use crate::error::EngineError;
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
-use crate::transport::TransportMessage;
+use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::TransportEndpoint;
 use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
@@ -116,6 +118,19 @@ impl Hash for KeyPackage {
     }
 }
 
+/// One epoch of a group as this device holds it: its number, and a digest of
+/// its MLS epoch authenticator. Two branches of a fork can reach the same
+/// number; their authenticators differ, so a pin read on one branch never
+/// matches the other. Read it with [`CgkaEngine::epoch_pin`]; pin an
+/// application message to it with
+/// [`SendIntent::AppMessage::expected_epoch`](SendIntent::AppMessage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochPin {
+    pub epoch: EpochId,
+    /// SHA-256 of the epoch's MLS epoch authenticator.
+    pub identity: [u8; 32],
+}
+
 /// Application's intent when calling [`CgkaEngine::send`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
@@ -128,7 +143,7 @@ pub enum SendIntent {
         /// An encrypted-media `imeta` reference is the case today: recipients
         /// derive the media key from the epoch of the message that delivers
         /// the tag, so ciphertext produced at epoch N is unreadable when the
-        /// tag ships at N+1.
+        /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
         /// retain the intent while the group's epoch is unsettled and encrypt
@@ -136,20 +151,24 @@ pub enum SendIntent {
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
-        /// time if convergence moved the epoch during the send. Nothing is
-        /// persisted or published in either case.
+        /// time if the send's own convergence moved the group off the pinned
+        /// [`EpochPin`]: to another epoch, or to another branch at the same
+        /// number. Nothing is persisted or published in either case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     },
     /// Invite new members via their KeyPackages.
+    ///
+    /// A package from a device already in the group, or a second package
+    /// from one device, is skipped; an invite that adds no device fails.
     Invite {
         group_id: GroupId,
         key_packages: Vec<KeyPackage>,
         /// Admins granted in the same invite commit as the Adds.
         ///
-        /// Each id must be among the invited members. Empty keeps the
-        /// add-only commit. The current admin set is preserved and these
-        /// invitees are appended.
+        /// Each id must be an invited account with no device already in the
+        /// group. Empty keeps the add-only commit. The current admin set is
+        /// preserved and these invitees are appended.
         #[serde(default)]
         initial_admins: Vec<MemberId>,
     },
@@ -157,6 +176,71 @@ pub enum SendIntent {
     RemoveMembers {
         group_id: GroupId,
         members: Vec<MemberId>,
+    },
+    /// Add devices of this device's own account, without admin authority, in
+    /// a group that requires `marmot.group.account-devices.v1`
+    /// (account-devices-v1.md, "Same-account operations").
+    ///
+    /// The caller supplies every KeyPackage: each must belong to this
+    /// device's account, advertise everything the group requires, and keep
+    /// the account within the leaf limit. The caller must have authenticated
+    /// each one as a device its user approved; the engine never selects an
+    /// own-account KeyPackage itself ("Sender rules"). Each added device gets
+    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    AddOwnAccountDevices {
+        group_id: GroupId,
+        key_packages: Vec<KeyPackage>,
+    },
+    /// Remove other devices of this device's own account, without admin
+    /// authority, in a group that requires
+    /// `marmot.group.account-devices.v1`.
+    ///
+    /// Each device is named by its leaf's signature key, the
+    /// [`Member::credential`](crate::group::Member) bytes reported for that
+    /// leaf. This device leaves through [`Self::Leave`] instead.
+    RemoveOwnAccountDevices {
+        group_id: GroupId,
+        leaf_signature_keys: Vec<Vec<u8>>,
+    },
+    /// Add a newly linked device of this account to the account's device
+    /// group and write its roster entry, in one admin Commit (mdk#2628 item
+    /// 3.3b, D21). That Commit is the link's approval.
+    ///
+    /// `key_package` is the one KeyPackage device pairing confirmed: it must
+    /// belong to this device's account and advertise everything the group
+    /// requires. `roster_update` is a `marmot.account.device-roster.v1`
+    /// update with exactly one operation, setting the device entry of a slot
+    /// the roster does not list yet, whose announced KeyPackage is
+    /// `key_package`'s `KeyPackageRef`. The group must require the roster.
+    /// The added device gets its Welcome as an [`Self::Invite`]'s devices do,
+    /// except that it is never published from `deliver_until` on, in Unix
+    /// seconds: the end of the new device's wait for it (D40).
+    LinkDevice {
+        group_id: GroupId,
+        key_package: KeyPackage,
+        roster_update: Vec<u8>,
+        deliver_until: Timestamp,
+    },
+    /// Remove a device from the account's device group, with its roster
+    /// entry, in one admin Commit: a device whose link failed (mdk#2628 item
+    /// 3.3b, D40), or a linked device the user removed or that signed out
+    /// (3.6b). For a failed link, only the device that approved it sends it,
+    /// once the new device made no Commit in the device group by the link's
+    /// deadline.
+    ///
+    /// `leaf_signature_key` names the device's leaf, as
+    /// [`Member::credential`](crate::group::Member) reports it: another leaf
+    /// of this device's account. The Commit removes that leaf only if the
+    /// group's tree still has it, so an entry whose leaf is already gone is
+    /// still removed. `roster_update` is a `marmot.account.device-roster.v1`
+    /// update that removes the device entry of a slot the roster lists. A
+    /// removal also sets that slot's rejected-slot record with reason
+    /// `removed` and the `tag_signature_key` the entry had; a failed link
+    /// removes the entry alone. Like a link, it is never queued.
+    UnlinkDevice {
+        group_id: GroupId,
+        leaf_signature_key: Vec<u8>,
+        roster_update: Vec<u8>,
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
@@ -176,6 +260,39 @@ pub enum SendIntent {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
     },
+    /// Replace the entry of `slot` in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetDevice`, while
+    /// the roster still holds `expected` there (mdk#2628 3.6).
+    ///
+    /// `SetDevice` replaces an entry whole, so an entry computed from an
+    /// older read would put back every field changed since. The engine
+    /// compares the slot's entry with `expected` each time it prepares the
+    /// Commit: on a direct send once the send has settled the group's
+    /// convergence input, when a queued copy is drained, and when it re-issues
+    /// the intent after a lost fork. Any other entry, or none, refuses it with
+    /// [`EngineError::DeviceEntryChanged`] and nothing is staged.
+    ReplaceDeviceEntry {
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: Box<DeviceEntryV1>,
+        entry: Box<DeviceEntryV1>,
+    },
+    /// Replace the account entry in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetAccount`, while
+    /// the roster still holds `expected` there (mdk#2628 4.4a): the backup
+    /// writer and the recovery key's public half.
+    ///
+    /// `SetAccount` replaces the entry whole, so it is compared like
+    /// [`Self::ReplaceDeviceEntry`]: each time the engine prepares the Commit,
+    /// on a direct send or a re-issue after a lost fork. Any other entry
+    /// refuses it with [`EngineError::AccountEntryChanged`] and nothing is
+    /// staged. A send is never queued: while the group would queue it,
+    /// [`EngineError::AccountEntryUnsettled`] refuses it and nothing is kept.
+    ReplaceAccountEntry {
+        group_id: GroupId,
+        expected: Box<AccountEntryV1>,
+        entry: Box<AccountEntryV1>,
+    },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {
         group_id: GroupId,
@@ -185,6 +302,18 @@ pub enum SendIntent {
     /// Install `marmot.group.lifecycle.v1 = active` and require the component
     /// in one admin Commit for a compatible existing group.
     EnableDisbanding { group_id: GroupId },
+    /// Require `marmot.group.account-devices.v1` in an existing group, in one
+    /// admin Commit (account-devices-v1.md, "Activation in an existing
+    /// group"). Only ever sent because the user asked: the engine never turns
+    /// it on by itself.
+    ///
+    /// Refused with [`crate::error::EngineError::AccountDevicesActivationRefused`]
+    /// (or [`crate::error::EngineError::NotGroupAdmin`]) before anything is
+    /// staged, when the group already requires the component, is on the
+    /// legacy profile, or has a leaf that does not advertise it or an account
+    /// over the leaf limit. The checks run against the state the Commit is
+    /// prepared on, so an intent queued behind other work sees that work.
+    EnableAccountDevices { group_id: GroupId },
     /// Persist the irreversible local intent to terminate the group. Preparing
     /// and publishing the terminal Commit is driven asynchronously from this
     /// durable request.
@@ -293,7 +422,8 @@ pub enum SendResult {
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes
-    /// stable.
+    /// stable. If that state refuses it, the engine drops it and announces
+    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
     Queued {
         group_id: GroupId,
         intent_id: MessageId,
@@ -580,12 +710,31 @@ pub enum GroupEvent {
     LocalGroupCopyRestored {
         group_id: GroupId,
     },
+    /// A queued intent was dropped unsent: once the group settled, the
+    /// settled state refused it, as it would have refused the same intent
+    /// sent directly (the sender is no longer an admin, a precondition no
+    /// longer holds, the change is not valid on that state). The engine does
+    /// not prepare it again; the user may ask again (mdk#2694).
+    QueuedIntentRefused {
+        group_id: GroupId,
+        /// The id [`SendResult::Queued`] returned for the intent.
+        intent_id: MessageId,
+        /// Stable name of the intent's kind, such as `update_group_data`.
+        intent_kind: String,
+        /// Stable, privacy-safe name of the refusal: the
+        /// [`EngineError::privacy_safe_kind`](crate::error::EngineError::privacy_safe_kind)
+        /// of the error the preparation returned, such as `not_group_admin`.
+        reason: String,
+    },
     /// Device destinations invalidated by an actual canonical state transition.
     /// Derived from the live pre-apply tree and the final selected tree, rather
     /// than replaying removals from an already-applied common prefix.
     GroupMemberLeavesRemoved {
         group_id: GroupId,
         epoch: EpochId,
+        /// Removed device destinations, for MDK's own push-token cleanup.
+        /// `marmot-app` empties this list before hosts receive the event, so
+        /// no leaf index reaches a host.
         leaves: Vec<GroupMemberLeaf>,
         /// Accounts with no surviving leaf. Only these lose their tombstones.
         departed_members: Vec<MemberId>,
@@ -619,6 +768,13 @@ pub enum GroupEvent {
         /// sender-controlled wall clock.
         message_id: MessageId,
         sender: MemberId,
+        /// The MLS leaf that sent the message at `epoch`; `sender` names only
+        /// its account, which may hold several leaves. `None` on the
+        /// moderation-authority retry rail and for events stored before it was
+        /// recorded. A device destination: `marmot-app` clears it before
+        /// hosts receive the event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_leaf_index: Option<u32>,
         epoch: EpochId,
         payload: Vec<u8>,
         /// Retention policy resolved from the authenticated MLS source epoch.
@@ -1138,8 +1294,44 @@ pub trait CgkaEngine: Send + Sync {
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
 
+    /// The group's [`EpochPin`]: its epoch and the branch it reached that
+    /// epoch on. While a commit of this device awaits its publication, that
+    /// is the commit's epoch, whose secrets [`Self::group_context`] exports;
+    /// the pin matches the group once the commit merges.
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError>;
+
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;
+
+    /// This device's MLS signature public key. In this engine it is the
+    /// `signature_key` of every leaf the device creates, in every group, since
+    /// the signer is made once per account-device and never rotated; the
+    /// protocol does not require that (mdk#2628 D33). So it is also this
+    /// device's leaf key in the device group, which device pairing names in
+    /// the existing device's confirmation even before the group exists
+    /// (mdk#2628 D28).
+    fn own_signature_key(&self) -> Vec<u8>;
+
+    /// Expect the Welcome into the account's device group that a confirmed
+    /// device link names; the new device records it before it sends its own
+    /// confirmation (mdk#2628 D28, D30, D41). Until `expires_at` the engine
+    /// joins `group_id` only through a Welcome into a group that requires the
+    /// device roster, sent by the leaf whose signature key is
+    /// `sender_signature_key`, that adds this device by the KeyPackage whose
+    /// `KeyPackageRef` is `key_package_ref`, and that join consumes the
+    /// expectation. It refuses every other Welcome into that group id, every
+    /// Welcome into another group that adds this device by that KeyPackage,
+    /// and every Welcome into a group that requires the device roster that no
+    /// expectation names, with [`EngineError::UnexpectedDeviceGroupWelcome`].
+    /// Replaces an earlier expectation for the same group.
+    fn expect_device_group_welcome(
+        &mut self,
+        expectation: &crate::storage::DeviceGroupWelcomeExpectation,
+    ) -> Result<(), EngineError>;
+
+    /// Drop the expectation for `group_id`, when its link is withdrawn or its
+    /// wait ends. Whether there was one.
+    fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> Result<bool, EngineError>;
 
     /// Produce a fresh KeyPackage suitable for publishing to a KeyPackage
     /// directory. Expiry and refresh scheduling live above the engine.

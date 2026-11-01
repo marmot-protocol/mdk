@@ -1,0 +1,1692 @@
+use async_trait::async_trait;
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
+use cgka_traits::error::{EngineError, PeelerError};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::KeyPackageBundleStorage;
+use cgka_traits::transport::{
+    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use marmot_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use nostr::prelude::FinalizeEvent;
+use std::io::Write;
+use std::sync::Arc;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
+
+const SESSION_PROMOTION_FIXTURE: &[u8] = include_bytes!("../fixtures/session-promotion-v1.bin");
+const SESSION_PROMOTION_GROUP_ID_HEX: &str = "1d3ce58153822ac936ba83eba9cb87db";
+
+fn deterministic_nostr_keys(name: &[u8]) -> nostr::prelude::Keys {
+    use sha2::{Digest, Sha256};
+    let mut counter = 0u64;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-session-test-identity-v1");
+        hasher.update(name);
+        hasher.update(counter.to_be_bytes());
+        let secret = hasher.finalize();
+        if let Ok(keys) = nostr::prelude::Keys::parse(&hex::encode(secret)) {
+            return keys;
+        }
+        counter += 1;
+    }
+}
+
+#[derive(Clone)]
+struct NostrAccountIdentityProofSigner {
+    keys: nostr::prelude::Keys,
+}
+
+impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match session test key".into());
+        }
+        let event = request
+            .proof_event()
+            .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
+        request.signature_from_signed_event(event)
+    }
+}
+
+fn hash_id(bytes: &[u8]) -> MessageId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+struct MockPeeler;
+
+#[async_trait]
+impl TransportPeeler for MockPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::MlsMessage {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                created_at: None,
+                bytes: msg.payload.clone(),
+                key_package_event_id: None,
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("session-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
+        Ok(TransportMessage {
+            id: hash_id(&id_material),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("session-test".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        })
+    }
+}
+
+fn config(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> SessionConfig {
+    let keys = deterministic_nostr_keys(identity);
+    SessionConfig::new(
+        path,
+        SqlCipherKey::new(key.as_secret_str()).unwrap(),
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+    )
+    .legacy_compatibility_profile()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .feature_registry(FeatureRegistry::new())
+}
+
+/// mdk#2323: a host that opened the session's connection can close it at a
+/// known instant. The session then fails closed rather than reopening.
+#[tokio::test]
+async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("host-opened session key").unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let keys = deterministic_nostr_keys(b"alice");
+    let host_open = std::time::Duration::from_secs(3);
+    let config = SessionConfig::with_storage(
+        storage.clone(),
+        host_open,
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+    )
+    .legacy_compatibility_profile()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .feature_registry(FeatureRegistry::new());
+    let mut session = AccountDeviceSession::open(config).unwrap();
+    // Open telemetry still covers the storage open the host did itself.
+    let timings = session.open_timings();
+    assert!(timings.storage_open >= host_open && timings.total >= host_open);
+
+    session.fresh_key_package().await.unwrap();
+    assert_eq!(
+        storage.stored_key_package_bundles().unwrap().len(),
+        1,
+        "the session writes through the host's connection"
+    );
+
+    storage.closer().close().unwrap();
+    assert!(
+        session.fresh_key_package().await.is_err(),
+        "the session must stop with the host's connection, not reopen storage"
+    );
+    assert!(storage.is_closed());
+}
+
+fn selfremove_registry() -> FeatureRegistry {
+    let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03",
+        },
+    );
+    registry
+}
+
+#[tokio::test]
+async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("cutover.sqlite");
+    let key = SqlCipherKey::new("strict cutover key").unwrap();
+    let identity = b"strict-cutover";
+
+    let mut legacy = AccountDeviceSession::open(config(&database_path, &key, identity)).unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    drop(legacy);
+
+    let keys = deterministic_nostr_keys(identity);
+    let current_config = || {
+        SessionConfig::new(
+            &database_path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            keys.public_key().to_bytes().to_vec(),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: keys.clone(),
+        }))
+    };
+
+    let current = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
+    drop(current);
+
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
+    drop(storage);
+
+    let reopened = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(reopened.new_protocol_profile(), ProtocolProfile::Current);
+    drop(reopened);
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
+}
+
+fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
+    match msg.envelope {
+        TransportEnvelope::Welcome { .. } => msg,
+        TransportEnvelope::GroupMessage { .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+    }
+}
+
+fn welcome_for(welcomes: &[TransportMessage], recipient: &MemberId) -> TransportMessage {
+    welcomes
+        .iter()
+        .find(|msg| {
+            matches!(
+                &msg.envelope,
+                TransportEnvelope::Welcome { recipient: r } if r == recipient
+            )
+        })
+        .cloned()
+        .expect("welcome for recipient")
+}
+
+fn app_payload_for(sender: &AccountDeviceSession, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
+    MarmotAppEvent::new(
+        hex::encode(sender.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        content,
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+fn only_received_message_id(events: &[GroupEvent]) -> MessageId {
+    let [GroupEvent::MessageReceived { message_id, .. }] = events else {
+        panic!("expected exactly one received-message event");
+    };
+    assert_eq!(message_id.as_slice().len(), 32);
+    message_id.clone()
+}
+
+#[tokio::test]
+async fn session_reopens_encrypted_sqlite_group_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let bob_path = dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("session lifecycle key").unwrap();
+
+    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+    let mut bob = AccountDeviceSession::open(config(&bob_path, &key, b"bob")).unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-backed".into(),
+            description: "account-device lifecycle".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    let pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => {
+            assert_eq!(welcomes.len(), 1);
+            *pending
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+
+    let confirmed = alice.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        confirmed.events,
+        vec![GroupEvent::GroupCreated {
+            group_id: created.group_id.clone()
+        }]
+    );
+    assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(alice.own_leaf_index(&created.group_id).unwrap(), 0);
+
+    drop(alice);
+
+    let reopened = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+    assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(reopened.own_leaf_index(&created.group_id).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    fixture.write_all(SESSION_PROMOTION_FIXTURE).unwrap();
+    fixture.flush().unwrap();
+    let database_path = fixture.path().to_owned();
+    let key = SqlCipherKey::new("session promotion facade key").unwrap();
+    let group_id = GroupId::new(hex::decode(SESSION_PROMOTION_GROUP_ID_HEX).unwrap());
+    let mut session = AccountDeviceSession::open(config(&database_path, &key, b"alice-promotion"))
+        .expect("session is ready before maintenance promotion");
+
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let progress = session.promote_legacy_message_rows(1).unwrap();
+    assert_eq!(progress.promoted, 1);
+    assert!(!progress.has_more);
+    assert_eq!(session.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(session.members(&group_id).unwrap().len(), 2);
+    let post_promotion_payload = app_payload_for(&session, b"usable after promotion");
+    session
+        .send(SendIntent::AppMessage {
+            group_id,
+            payload: post_promotion_payload,
+            expected_epoch: None,
+        })
+        .await
+        .expect("promotion preserves public session behavior");
+}
+
+#[tokio::test]
+async fn current_founding_creation_is_immediately_stable_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-current.sqlite");
+    let bob_path = dir.path().join("bob-current.sqlite");
+    let key = SqlCipherKey::new("session current founding key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(&bob_path, &key, b"bob-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "current-founding".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created.effects.publish.as_slice() {
+        [PublishWork::FoundingGroupCreated { welcomes }] if welcomes.len() == 1 => {
+            welcomes[0].clone()
+        }
+        other => panic!("expected one founding Welcome and no pending commit, got {other:?}"),
+    };
+    assert_eq!(
+        created.effects.events,
+        vec![GroupEvent::GroupCreated {
+            group_id: created.group_id.clone()
+        }]
+    );
+    assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(
+        alice.stored_sent_welcome(&welcome.id).unwrap().0,
+        created.group_id
+    );
+
+    bob.ingest(welcome).await.unwrap();
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&bob, b"invitee first message"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let message = match sent.publish.as_slice() {
+        [PublishWork::ApplicationMessage { msg, .. }] => route(msg.clone(), &created.group_id),
+        other => panic!("expected invitee application publish work, got {other:?}"),
+    };
+    let received = alice.ingest(message).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
+                    *authority
+                }
+                _ => unreachable!(),
+            },
+            group_id: created.group_id.clone(),
+            message_id,
+            epoch: EpochId(1),
+            sender: bob.self_id(),
+            sender_leaf_index: Some(1),
+            payload: app_payload_for(&bob, b"invitee first message"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
+            encrypted_media_secret: None,
+        }]
+    );
+
+    drop(alice);
+    let reopened = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn session_ingest_surfaces_join_and_app_message_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session app event key").unwrap();
+    let mut alice =
+        AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
+            .unwrap();
+    let mut bob =
+        AccountDeviceSession::open(config(dir.path().join("bob.sqlite"), &key, b"bob")).unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-events".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let welcome_id = welcome.id.clone();
+    let joined = bob.ingest(welcome).await.unwrap();
+    assert_eq!(
+        joined.effects.events,
+        vec![GroupEvent::GroupJoined {
+            group_id: created.group_id.clone(),
+            via_welcome: welcome_id,
+            explicitly_confirmed: false,
+            welcomer: Some(alice.self_id()),
+        }]
+    );
+
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&alice, b"hello through session"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let app_msg = match &sent.publish[0] {
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
+        other => panic!("expected application publish work, got {other:?}"),
+    };
+    let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
+    assert_eq!(
+        received.outcome,
+        cgka_traits::ingest::IngestOutcome::Processed
+    );
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
+                    *authority
+                }
+                _ => unreachable!(),
+            },
+            group_id: created.group_id,
+            message_id,
+            epoch: EpochId(1),
+            sender: alice.self_id(),
+            sender_leaf_index: Some(0),
+            payload: app_payload_for(&alice, b"hello through session"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
+            encrypted_media_secret: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn reopened_creator_can_send_valid_group_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let bob_path = dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("session reopened signer key").unwrap();
+    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+    let mut bob = AccountDeviceSession::open(config(&bob_path, &key, b"bob")).unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-reopened-signer".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    drop(alice);
+    let mut alice = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
+
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&alice, b"hello after restart"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let app_msg = match &sent.publish[0] {
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
+        other => panic!("expected application publish work, got {other:?}"),
+    };
+    let received = bob.ingest(app_msg).await.unwrap();
+    let message_id = only_received_message_id(&received.effects.events);
+    assert_eq!(
+        received.outcome,
+        cgka_traits::ingest::IngestOutcome::Processed
+    );
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            authority: match &sent.publish[0] {
+                PublishWork::ApplicationMessage { authority, .. } => {
+                    assert!(
+                        authority.is_none(),
+                        "ordinary chat does not need moderation authority"
+                    );
+                    *authority
+                }
+                _ => unreachable!(),
+            },
+            group_id: created.group_id,
+            message_id,
+            epoch: EpochId(1),
+            sender: alice.self_id(),
+            sender_leaf_index: Some(0),
+            payload: app_payload_for(&alice, b"hello after restart"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
+            encrypted_media_secret: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn session_ingest_schedules_auto_publish_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session auto publish key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(dir.path().join("alice.sqlite"), &key, b"alice")
+            .feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(dir.path().join("bob.sqlite"), &key, b"bob").feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-auto-publish".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: created.group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let proposal = match &leave.publish[0] {
+        PublishWork::Proposal { msg, .. } => route(msg.clone(), &created.group_id),
+        other => panic!("expected proposal publish work, got {other:?}"),
+    };
+
+    let ingested = alice.ingest(proposal).await.unwrap();
+    assert_eq!(
+        ingested.outcome,
+        cgka_traits::ingest::IngestOutcome::Processed
+    );
+    assert_eq!(
+        ingested.effects.pending_convergence,
+        vec![created.group_id.clone()]
+    );
+    assert!(
+        !ingested
+            .effects
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
+        "auto publish work should wait for the convergence timer, got {:?}",
+        ingested.effects.publish
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    let advanced = alice.advance_convergence(&created.group_id).await.unwrap();
+    assert!(
+        advanced
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::AutoPublish { .. })),
+        "expected delayed auto publish work, got {:?}",
+        advanced.publish
+    );
+}
+
+#[tokio::test]
+async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session selfremove reproposal key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(dir.path().join("alice.sqlite"), &key, b"alice")
+            .feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(dir.path().join("bob.sqlite"), &key, b"bob").feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-selfremove-reproposal".into(),
+            description: "".into(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: created.group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        leave
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        "initial leave should publish a SelfRemove proposal"
+    );
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: created.group_id.clone(),
+            name: Some("still includes bob".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match &rename.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let buffered = bob.ingest(route(commit, &created.group_id)).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+
+    bob.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    })
+    .expect("convergence policy accepted");
+    let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+    assert!(
+        advanced
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        "expected auto SelfRemove re-proposal publish work, got {:?}",
+        advanced.publish
+    );
+
+    let blocked = bob
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&bob, b"still leaving"),
+            expected_epoch: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            blocked,
+            Err(marmot_session::SessionError::Engine(
+                EngineError::InvalidTransition(_)
+            ))
+        ),
+        "durable leave request should block app sends after re-proposal; got {blocked:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_advance_convergence_releases_queued_outbound_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session convergence key").unwrap();
+    let mut alice =
+        AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
+            .unwrap();
+    let mut bob =
+        AccountDeviceSession::open(config(dir.path().join("bob.sqlite"), &key, b"bob")).unwrap();
+    let mut carol =
+        AccountDeviceSession::open(config(dir.path().join("carol.sqlite"), &key, b"carol"))
+            .unwrap();
+    let mut david =
+        AccountDeviceSession::open(config(dir.path().join("david.sqlite"), &key, b"david"))
+            .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let carol_key_package = carol.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "session-convergence".into(),
+            description: "".into(),
+            members: vec![bob_key_package, carol_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes.clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let carol_welcome = welcome_for(&welcomes, &carol.self_id());
+    carol.ingest(carol_welcome).await.unwrap();
+
+    let david_key_package = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: created.group_id.clone(),
+            key_packages: vec![david_key_package],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let commit = match &invite.publish[0] {
+        PublishWork::GroupEvolution { msg, .. } => route(msg.clone(), &created.group_id),
+        other => panic!("expected group evolution publish work, got {other:?}"),
+    };
+    let buffered = carol.ingest(commit).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+
+    // Pin a long settlement-quiescence window before the queued send. The
+    // outbound intent is only queued while convergence reports `Syncing`,
+    // which holds only while `now_ms - last_input_ms < settlement_quiescence_ms`.
+    // With the default 1s window this test silently depended on under ~1s of
+    // wall-clock elapsing between buffering the commit and sending; under a
+    // loaded nextest shard that window blew past 1s, convergence settled
+    // early, and the message published instead of queuing (issue #296).
+    // A large explicit window makes the queue path deterministic regardless of
+    // scheduling jitter; the reset to 0 below deterministically releases it.
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 3_600_000,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let queued_payload = app_payload_for(&carol, b"queued by session");
+    let queued_app_event_id = cgka_traits::MarmotAppEvent::decode(&queued_payload)
+        .expect("queued app event decodes")
+        .id;
+    let queued = carol
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: queued_payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued.queued.len(), 1);
+    assert!(queued.publish.is_empty());
+    let queued_intent = queued.queued[0].clone();
+
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    // Background convergence is a cooperative quantum, not a drain-to-completion API.
+    // Under CI load it can adopt epoch 2 and exhaust its 500ms budget before draining
+    // the queued intent. Follow the scheduled continuation as the runtime worker does.
+    // Check the deadline between complete calls; never cancel a live MLS/storage step.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued outbound work did not publish within the convergence deadline"
+        );
+        if !advanced.publish.is_empty() {
+            break;
+        }
+        assert!(
+            advanced.pending_convergence.contains(&created.group_id),
+            "queued outbound work must publish or schedule another convergence quantum"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        advanced = carol.advance_convergence(&created.group_id).await.unwrap();
+    }
+
+    assert_eq!(carol.epoch(&created.group_id).unwrap(), EpochId(2));
+    assert!(
+        advanced.publish.iter().any(|work| {
+            matches!(
+                work,
+                PublishWork::ApplicationMessage {
+                    queued_intent: Some(regenerated),
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
+                    ..
+                } if regenerated == &queued_intent
+                    && group_id == &created.group_id
+                    && app_event_id == &queued_app_event_id
+                    && *source_epoch == EpochId(2)
+                    && *retention
+                        == cgka_traits::AppMessageRetentionDecision::new(1_700_000_000, 0)
+            )
+        }),
+        "expected queued application message to retain its durable intent handle, got {:?}",
+        advanced.publish
+    );
+    assert!(advanced.queued.is_empty());
+}
+
+/// The admin policy component value naming `admins` as the group's admins.
+fn admin_policy(admins: &[MemberId]) -> Vec<u8> {
+    let mut admins = admins
+        .iter()
+        .map(|admin| admin.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    admins.sort();
+    let admin_bytes = admins.concat();
+    let mut out = Vec::new();
+    cgka_traits::app_components::encode_quic_varint(admin_bytes.len() as u64, &mut out);
+    out.extend_from_slice(&admin_bytes);
+    out
+}
+
+/// A queued admin change the settled group refuses no longer fails
+/// convergence: the session's effects announce it to the host, and nothing
+/// stays queued (mdk#2694).
+#[tokio::test]
+async fn session_advance_convergence_announces_a_refused_queued_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("session refused queued key").unwrap();
+    let mut alice =
+        AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
+            .unwrap();
+    let mut carol =
+        AccountDeviceSession::open(config(dir.path().join("carol.sqlite"), &key, b"carol"))
+            .unwrap();
+
+    let carol_key_package = carol.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "refused-queued".into(),
+            description: "".into(),
+            members: vec![carol_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (pending, welcomes) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes.clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .ingest(welcome_for(&welcomes, &carol.self_id()))
+        .await
+        .unwrap();
+
+    // Alice leaves only herself an admin; carol queues a rename behind it.
+    let demotion = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![cgka_traits::app_components::AppComponentData {
+                component_id: cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: admin_policy(&[alice.self_id()]),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match &demotion.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    // Hold convergence open while carol queues; see
+    // `session_advance_convergence_releases_queued_outbound_work`.
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 3_600_000,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let buffered = carol.ingest(route(commit, &group_id)).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    let queued = carol
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("renamed by a demoted admin".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued.queued.len(), 1);
+    let refused = queued.queued[0].clone();
+
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut events = Vec::new();
+    loop {
+        let advanced = carol
+            .advance_convergence(&group_id)
+            .await
+            .expect("a refused queued intent must not fail convergence");
+        assert!(advanced.publish.is_empty(), "{:?}", advanced.publish);
+        events.extend(advanced.events);
+        if !carol.has_queued_outbound_intents(&group_id).unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refused intent was not retired within the convergence deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let refusals = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::QueuedIntentRefused {
+                group_id,
+                intent_id,
+                intent_kind,
+                reason,
+            } => Some((group_id, intent_id, intent_kind.as_str(), reason.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refusals,
+        vec![(
+            &refused.group_id,
+            &refused.intent_id,
+            "update_group_data",
+            "not_group_admin"
+        )]
+    );
+}
+
+#[test]
+fn open_rejects_invalid_convergence_policy_before_storage_open() {
+    // mdk#970 / PR review: policy must fail closed before durable open work.
+    // A mismatched app window is rejected in every build; use a path that does
+    // not exist so a late failure would be a storage error rather than policy.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never-created.sqlite");
+    assert!(!missing.exists(), "fixture path must not exist before open");
+    let key = SqlCipherKey::new("policy reject key").unwrap();
+    let result = AccountDeviceSession::open(
+        config(&missing, &key, b"policy-reject").convergence_policy(CanonicalizationPolicy {
+            app_message_past_epoch_limit: 1,
+            ..CanonicalizationPolicy::default()
+        }),
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("invalid policy must fail before storage open"),
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("convergence policy"),
+        "expected policy error, got {message}"
+    );
+    assert!(
+        !missing.exists(),
+        "rejected open must not create the database file"
+    );
+}
+
+/// A disband request is intent persistence, not Commit preparation, so its
+/// batch carries no publish work and no events.
+///
+/// `Engine::do_send` short-circuits `SendIntent::Disband` straight to
+/// `do_request_disband` before any commit or queue machinery runs, and
+/// `collect_effects` maps the resulting `SendResult::DisbandRequested` to
+/// nothing. That is what makes the app layer's publish gate provably vacuous on
+/// `AppClient::disband_group`: with an always-empty `publish`, that seam can
+/// never produce a `PublishFailure` to gate on. The disband Commit is prepared
+/// later by `prepare_pending_disband` on the convergence seam, which does
+/// publish and does gate. Pin the emptiness here so that if the engine ever
+/// gives a disband request publish work of its own, this fails loudly and the
+/// gate decision at that seam gets made deliberately rather than by omission.
+#[tokio::test]
+async fn a_disband_request_carries_no_publish_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-disband.sqlite");
+    let key = SqlCipherKey::new("session disband request key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-disband").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "disband-publish-vacuity".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+
+    // Disbanding is only requestable once lifecycle-v1 is installed and Active,
+    // so land that Commit first.
+    let enabled = alice
+        .send(SendIntent::EnableDisbanding {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    // A solo group merges that install without staging publish work; a Commit
+    // only appears once there is another member to publish it to.
+    assert!(enabled.publish.is_empty());
+    let _ = alice.drain();
+
+    let requested = alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        requested.publish.is_empty(),
+        "a disband request must stage no Commit and publish nothing, got {:?}",
+        requested.publish
+    );
+    assert!(
+        requested.events.is_empty(),
+        "a disband request must emit no events of its own, got {:?}",
+        requested.events
+    );
+    assert_eq!(
+        requested.pending_convergence,
+        vec![group_id.clone()],
+        "the request must schedule the convergence pass that prepares its Commit"
+    );
+    // The control: the request really did take `do_request_disband`'s full
+    // path, so the emptiness above is vacuity by design and not a no-op send.
+    assert!(
+        matches!(
+            alice.disband_request(&group_id).unwrap(),
+            Some(cgka_traits::storage::DisbandRequest {
+                status: cgka_traits::storage::DisbandRequestStatus::Pending,
+                ..
+            })
+        ),
+        "the disband request must be durably persisted as Pending"
+    );
+}
+
+#[tokio::test]
+async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_store() {
+    use cgka_traits::storage::GroupStorage;
+    use cgka_traits::{GroupLifecycleState, StorageProvider};
+    use marmot_session::SessionError;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("authority.sqlite");
+    let key = SqlCipherKey::new("authority session fixture").unwrap();
+    let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: "authority".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group = created.group_id;
+    let PublishWork::GroupCreated { pending, .. } = created.effects.publish[0] else {
+        panic!("legacy founding commit");
+    };
+    assert_eq!(
+        session.group_authority(&group).unwrap().lifecycle,
+        GroupLifecycleState::PendingPublish
+    );
+    session.confirm_published(pending).await.unwrap();
+    let foreign = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let original = foreign.get_group(&group).unwrap();
+    let before = session
+        .with_group_authority_snapshot(&group, |storage, authority| -> Result<_, SessionError> {
+            // Commit through a second connection after authority pinned the
+            // snapshot. Both the callback store and nested engine capture must
+            // retain the old record, which would fail with separate snapshots.
+            let mut changed = original.clone();
+            changed.removed = true;
+            foreign.put_group(&changed)?;
+            assert_eq!(session.group_authority(&group)?, authority);
+            let record = storage.with_read_snapshot(|same| same.get_group(&group))?;
+            assert_eq!(record.epoch, authority.facts.epoch);
+            assert_eq!(record.members.len(), authority.facts.member_count);
+            assert!(authority.facts.is_admin);
+            assert!(!record.removed);
+            assert!(
+                storage.put_group(&changed).is_err(),
+                "host writes must be rejected"
+            );
+            Ok(authority)
+        })
+        .unwrap();
+    assert_eq!(before.lifecycle, GroupLifecycleState::Stable);
+    assert!(session.group_authority(&group).unwrap().facts.removed);
+    foreign.put_group(&original).unwrap();
+    drop(foreign);
+    drop(session);
+    let mut reopened =
+        AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();
+    let mut called = false;
+    let result =
+        reopened.with_group_authority_snapshot(&group, |_, _| -> Result<(), SessionError> {
+            called = true;
+            Ok(())
+        });
+    assert!(matches!(
+        result,
+        Err(SessionError::Engine(EngineError::GroupNotHydrated(_)))
+    ));
+    assert!(
+        !called,
+        "an unvalidated startup seed must not be combined with account rows"
+    );
+    assert!(reopened.ensure_group_hydrated(&group).unwrap());
+    assert_eq!(reopened.group_authority(&group).unwrap(), before);
+}
+
+async fn create_confirmed_group(session: &mut AccountDeviceSession, name: &str) -> GroupId {
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: name.into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupCreated { pending, .. } = created.effects.publish[0] else {
+        panic!("legacy founding commit");
+    };
+    session.confirm_published(pending).await.unwrap();
+    created.group_id
+}
+
+fn record_id(kind: &str, group_id: &GroupId) -> MessageId {
+    let mut id = kind.as_bytes().to_vec();
+    id.extend_from_slice(group_id.as_slice());
+    MessageId::new(id)
+}
+
+/// One stored record of each group-scoped kind for `group_id`. The evolution
+/// is confirmed, so hydration does not try to restore it.
+fn group_account_records(
+    group_id: &GroupId,
+) -> (
+    cgka_traits::maintenance::GroupMaintenanceState,
+    cgka_traits::maintenance::MaintenanceObligation,
+    cgka_traits::maintenance::DurableGroupEvolution,
+) {
+    use cgka_traits::maintenance::{
+        DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState,
+        MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    };
+    let state = GroupMaintenanceState {
+        group_id: group_id.clone(),
+        enrolled_at: Some(Timestamp(10)),
+        periodic_enrolled: true,
+        last_own_leaf_rotation_at: Some(Timestamp(10)),
+        next_periodic_rotation_at: Some(Timestamp(1_000)),
+        leaf_refresh_due_at: None,
+        post_join_history: None,
+    };
+    let obligation = MaintenanceObligation {
+        id: record_id("obligation", group_id),
+        group_id: group_id.clone(),
+        trigger: MaintenanceTrigger::Periodic,
+        phase: MaintenancePhase::Quiet,
+        created_at: Timestamp(10),
+        operational_target_at: None,
+        overdue: false,
+        eose_deadline_at: None,
+        grace_until: None,
+        quiet_since: Some(Timestamp(10)),
+        own_leaf_baseline_hash: None,
+        sampled_jitter_ms: 0,
+        not_before: None,
+        attempt_count: 0,
+        semantic_rearm_count: 0,
+        last_failure_code: None,
+    };
+    let evolution = DurableGroupEvolution {
+        id: record_id("evolution", group_id),
+        group_id: group_id.clone(),
+        source_epoch: EpochId(0),
+        target_epoch: EpochId(1),
+        phase: GroupEvolutionPhase::Confirmed,
+        semantic: GroupEvolutionSemantic::SelfUpdate {
+            trigger: MaintenanceTrigger::Periodic,
+            obligation_id: Some(obligation.id.clone()),
+        },
+        own_leaf_before_hash: None,
+        removal_members: vec![],
+        signed_message_id: None,
+        pending_ref: None,
+    };
+    (state, obligation, evolution)
+}
+
+/// Rule 4 of mdk#2602: only the engine decides whether a group is live. The
+/// group-scoped account records live on the session's storage handle, but
+/// each of their accessors, the write included, asks the engine first. A
+/// quarantined group fails with `UnknownGroup` and a seeded-but-unhydrated one
+/// with the retryable `GroupNotHydrated`, before storage is touched, even
+/// though both have stored records. A live group gets its stored records.
+#[tokio::test]
+async fn group_scoped_account_records_answer_only_for_live_groups() {
+    use cgka_traits::GroupCapabilities;
+    use cgka_traits::group::Group;
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use marmot_session::{SessionError, SessionResult};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Liveness {
+        Live,
+        Unhydrated,
+        Quarantined,
+    }
+
+    fn expect<T: std::fmt::Debug + PartialEq>(
+        accessor: &str,
+        group_id: &GroupId,
+        liveness: Liveness,
+        result: SessionResult<T>,
+        stored: T,
+    ) {
+        match (liveness, result) {
+            (Liveness::Live, Ok(value)) => assert_eq!(value, stored, "{accessor} on a live group"),
+            (
+                Liveness::Unhydrated,
+                Err(SessionError::Engine(EngineError::GroupNotHydrated(id))),
+            )
+            | (Liveness::Quarantined, Err(SessionError::Engine(EngineError::UnknownGroup(id)))) => {
+                assert_eq!(&id, group_id, "{accessor} names the gated group");
+            }
+            (liveness, result) => panic!("{accessor} on a {liveness:?} group gave {result:?}"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account-records.sqlite");
+    let key = SqlCipherKey::new("account records liveness key").unwrap();
+    let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
+    let live = create_confirmed_group(&mut session, "live").await;
+    let unhydrated = create_confirmed_group(&mut session, "unhydrated").await;
+    drop(session);
+
+    // A Marmot group record with no OpenMLS state quarantines on hydration.
+    let quarantined = GroupId::new(b"account-records-without-openmls-state".to_vec());
+    let groups = [
+        (live.clone(), Liveness::Live),
+        (unhydrated.clone(), Liveness::Unhydrated),
+        (quarantined.clone(), Liveness::Quarantined),
+    ];
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        storage
+            .put_group(&Group {
+                id: quarantined.clone(),
+                name: "quarantined".into(),
+                description: String::new(),
+                members: Vec::new(),
+                epoch: EpochId(3),
+                required_capabilities: GroupCapabilities::default(),
+                protocol_profile: ProtocolProfile::Legacy,
+                removed: false,
+                unrecoverable: false,
+                disbanded: None,
+                join_epoch: EpochId(0),
+                local_copy_install_epoch: EpochId(0),
+                local_copy_welcome_created_at: None,
+            })
+            .unwrap();
+        for (group_id, _) in &groups {
+            let (state, obligation, evolution) = group_account_records(group_id);
+            storage.put_group_maintenance(&state).unwrap();
+            storage.put_maintenance_obligation(&obligation).unwrap();
+            storage.put_group_evolution(&evolution).unwrap();
+        }
+    }
+
+    let mut session =
+        AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();
+    session.ensure_group_hydrated(&live).unwrap();
+    session.ensure_group_hydrated(&quarantined).unwrap();
+    assert_eq!(session.unhydrated_group_ids(), vec![unhydrated.clone()]);
+    assert_eq!(
+        session
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id)
+            .collect::<Vec<_>>(),
+        vec![quarantined.clone()]
+    );
+    assert!(session.live_group_ids().unwrap().contains(&live));
+
+    let observer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for (group_id, liveness) in &groups {
+        let (state, obligation, evolution) = group_account_records(group_id);
+        expect(
+            "group_maintenance",
+            group_id,
+            *liveness,
+            session.group_maintenance(group_id),
+            Some(state.clone()),
+        );
+        expect(
+            "maintenance_obligations_for_group",
+            group_id,
+            *liveness,
+            session.maintenance_obligations_for_group(group_id),
+            vec![obligation],
+        );
+        expect(
+            "group_evolutions_for_group",
+            group_id,
+            *liveness,
+            session.group_evolutions_for_group(group_id),
+            vec![evolution],
+        );
+
+        let rescheduled = cgka_traits::maintenance::GroupMaintenanceState {
+            next_periodic_rotation_at: Some(Timestamp(2_000)),
+            ..state.clone()
+        };
+        expect(
+            "put_group_maintenance",
+            group_id,
+            *liveness,
+            session.put_group_maintenance(&rescheduled),
+            (),
+        );
+        // A gated write must not reach storage.
+        let written = match liveness {
+            Liveness::Live => rescheduled,
+            Liveness::Unhydrated | Liveness::Quarantined => state,
+        };
+        assert_eq!(
+            observer.group_maintenance(group_id).unwrap(),
+            Some(written),
+            "put_group_maintenance on a {liveness:?} group"
+        );
+    }
+}
+
+/// Every account-record accessor, against a store the host closed, fails
+/// with the engine's storage failure of kind `Closed`, whichever layer met
+/// it (mdk#2602, rules 1 and 2).
+#[tokio::test]
+async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
+    use cgka_traits::maintenance::{
+        DurableTransportFanout, KeyPackageLifecycleState, MaintenancePhase,
+        PeriodicMaintenancePolicy,
+    };
+    use cgka_traits::storage::StorageError;
+    use cgka_traits::{TransportEndpoint, TransportPublishTarget};
+    use marmot_session::{SessionError, SessionResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("closed-records.sqlite");
+    let key = SqlCipherKey::new("closed account records key").unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let keys = deterministic_nostr_keys(b"alice");
+    let config = SessionConfig::with_storage(
+        storage.clone(),
+        std::time::Duration::ZERO,
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+    )
+    .legacy_compatibility_profile()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .feature_registry(FeatureRegistry::new());
+    let mut session = AccountDeviceSession::open(config).unwrap();
+    // A live group, so the group-scoped accessors pass the liveness check
+    // and reach storage.
+    let group_id = create_confirmed_group(&mut session, "closed").await;
+    let (state, obligation, evolution) = group_account_records(&group_id);
+    let lifecycle = KeyPackageLifecycleState {
+        stable_slot_id: "closed-slot".into(),
+        phase: MaintenancePhase::Complete,
+        current_key_package: None,
+        current_key_package_ref: None,
+        current_not_before: None,
+        current_not_after: None,
+        authored_event_id: None,
+        authored_event_created_at: None,
+        authored_signed_event: None,
+        publication_targets: Vec::new(),
+        refresh_at: None,
+        upgrade_rotation_recorded: false,
+        generation_revision: 0,
+        last_consumed_key_package_ref: None,
+        last_consumed_at: None,
+        retained_private_material: Vec::new(),
+        pending_replacement: None,
+        unusable_artifact_replaced_by: None,
+        slot_withdrawn_at: None,
+    };
+    let fanout_id = record_id("fanout", &group_id);
+    let fanout = DurableTransportFanout {
+        id: fanout_id.clone(),
+        group_id: Some(group_id.clone()),
+        evolution_id: None,
+        exact_message: TransportMessage {
+            id: fanout_id.clone(),
+            payload: vec![1],
+            timestamp: Timestamp(10),
+            causal_deps: vec![],
+            source: TransportSource("session-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: vec![],
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+        targets: Vec::new(),
+        required_acks: 1,
+        evolution_confirmed: false,
+        possible_exposure: false,
+        created_at: Timestamp(10),
+        bounded_until: None,
+    };
+
+    storage.closer().close().unwrap();
+
+    let rows: Vec<(&str, SessionResult<()>)> = vec![
+        (
+            "key_package_lifecycle",
+            session.key_package_lifecycle().map(drop),
+        ),
+        (
+            "put_key_package_lifecycle",
+            session.put_key_package_lifecycle(&lifecycle),
+        ),
+        (
+            "group_maintenance",
+            session.group_maintenance(&group_id).map(drop),
+        ),
+        (
+            "put_group_maintenance",
+            session.put_group_maintenance(&state),
+        ),
+        (
+            "put_maintenance_obligation",
+            session.put_maintenance_obligation(&obligation),
+        ),
+        (
+            "maintenance_obligation",
+            session.maintenance_obligation(&obligation.id).map(drop),
+        ),
+        (
+            "maintenance_obligations",
+            session.maintenance_obligations().map(drop),
+        ),
+        (
+            "maintenance_obligations_for_group",
+            session
+                .maintenance_obligations_for_group(&group_id)
+                .map(drop),
+        ),
+        (
+            "delete_maintenance_obligation",
+            session.delete_maintenance_obligation(&obligation.id),
+        ),
+        ("group_evolutions", session.group_evolutions().map(drop)),
+        (
+            "group_evolutions_for_group",
+            session.group_evolutions_for_group(&group_id).map(drop),
+        ),
+        (
+            "put_group_evolution",
+            session.put_group_evolution(&evolution),
+        ),
+        (
+            "put_transport_fanout",
+            session.put_transport_fanout(&fanout),
+        ),
+        (
+            "transport_fanout",
+            session.transport_fanout(&fanout_id).map(drop),
+        ),
+        ("transport_fanouts", session.transport_fanouts().map(drop)),
+        (
+            "delete_transport_fanout",
+            session.delete_transport_fanout(&fanout_id),
+        ),
+        (
+            "periodic_maintenance_policy",
+            session.periodic_maintenance_policy().map(drop),
+        ),
+        (
+            "put_periodic_maintenance_policy",
+            session.put_periodic_maintenance_policy(PeriodicMaintenancePolicy::Disabled),
+        ),
+    ];
+    assert_eq!(rows.len(), 18, "one row per account-record accessor");
+    let mismatched: Vec<_> = rows
+        .iter()
+        .filter(|(_, result)| {
+            !matches!(
+                result,
+                Err(SessionError::Engine(EngineError::Storage(
+                    StorageError::Closed(_)
+                )))
+            )
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "accessors that did not report the engine's closed-storage failure: {mismatched:?}"
+    );
+}
