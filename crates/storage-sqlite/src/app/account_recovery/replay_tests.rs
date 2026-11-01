@@ -91,6 +91,12 @@ fn native_global_placement_fence() {
             .state,
         RecoveryObligationState::Pending
     );
+    // Attempt zero never checkpoints: a native goal completes only through
+    // its placement.
+    assert_serialization(
+        app.checkpoint_recovery_obligation(&fence, 0, ticket.id, &[], RecoveryEligibility::Retry),
+        "invalid recovery scope checkpoint",
+    );
     assert!(
         !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
             .unwrap()

@@ -493,7 +493,7 @@ mod tests {
             .unwrap()
             .execute_cached(
                 "UPDATE account_recovery_comparison SET plan_format=?1,plan_payload=?2 WHERE singleton=1",
-                params![LEGACY_PLAN_FORMAT, serde_json::to_vec(payload).unwrap()],
+                params![1, serde_json::to_vec(payload).unwrap()],
             )
             .unwrap();
     }
@@ -511,6 +511,76 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    /// The stored plan's format numbers and field names are a persisted
+    /// format: a format 2 plan an earlier build wrote decodes field by field,
+    /// and the same plan at format 1 is validated but not trusted.
+    #[test]
+    fn a_stored_format_2_plan_decodes_field_by_field() {
+        let s = storage();
+        let payload = serde_json::json!({
+            "fence": {
+                "loss_revision": 1,
+                "route_revision": 2,
+                "inventory_revision": 3,
+                "obligations": [[vec![9u8; 16], 4]],
+            },
+            "routes": [{
+                "scope_id": 0,
+                "route_kind": 1,
+                "route_role": 0,
+                "group_id": [10],
+                "transport_group_id": vec![7u8; 32],
+                "since_seconds": 5,
+                "until_seconds": 6,
+                "known_event_id": vec![8u8; 32],
+                "inventory_floor": 4,
+                "required_endpoints": ["wss://a"],
+                "admitted_endpoints": ["wss://a", "wss://b"],
+            }],
+            "retry_routes": [0],
+        });
+        let stored = |format: i64| {
+            s.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE account_recovery_comparison SET plan_format=?1,plan_payload=?2
+                     WHERE singleton=1",
+                    params![format, serde_json::to_vec(&payload).unwrap()],
+                )
+                .unwrap();
+            s.app_storage().recovery_comparison().unwrap().plan
+        };
+        let plan = stored(2).unwrap();
+        assert_eq!(
+            plan.fence,
+            RecoveryRevisionFence {
+                loss_revision: 1,
+                route_revision: 2,
+                inventory_revision: 3,
+                obligations: vec![([9; 16], 4)],
+            }
+        );
+        assert!(
+            plan.routes
+                == vec![RecoveryScopePlan {
+                    scope_id: 0,
+                    route_kind: 1,
+                    route_role: 0,
+                    group_id: Some(vec![10]),
+                    transport_group_id: Some([7; 32]),
+                    since_seconds: Some(5),
+                    until_seconds: 6,
+                    known_event_id: Some([8; 32]),
+                    inventory_floor: Some(4),
+                    required_endpoints: vec!["wss://a".into()],
+                    admitted_endpoints: vec!["wss://a".into(), "wss://b".into()],
+                }]
+        );
+        assert_eq!(plan.retry_routes, vec![0]);
+        assert_eq!(plan.live_since_seconds, None);
+        assert!(stored(1).is_none());
     }
 
     #[test]

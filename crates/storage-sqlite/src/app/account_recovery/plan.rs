@@ -3025,11 +3025,12 @@ mod tests {
     #[test]
     fn unversioned_goal_expansion_and_unknown_formats_fail_closed() {
         let (store, fence, attempt, id) = fixture();
-        store
+        let token = store
             .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let mut additional = plan(&["a", "b"]);
         additional.scope_id = 1;
         assert_serialization(
@@ -3063,6 +3064,99 @@ mod tests {
             ),
             "unsupported recovery scope format",
         );
+        // Every read fails closed: a checkpoint does not decode the row as
+        // the format it knows and complete, and the owner's view errors
+        // rather than skipping the scope.
+        assert_serialization(
+            store.app_storage().checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[checkpoint(&token, vec![covered("a"), covered("b")])],
+                RecoveryEligibility::Retry,
+            ),
+            "unsupported recovery scope format",
+        );
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+        assert_serialization(
+            store.app_storage().recovery_scope_snapshots(id),
+            "invalid recovery scope checkpoint",
+        );
+    }
+
+    /// An obligation with no installed plan never qualifies: its placeholder
+    /// scope fails it closed, so loss nobody fetched is never completed.
+    #[test]
+    fn an_obligation_with_no_installed_plan_never_qualifies() {
+        let (store, fence, attempt, id) = fixture();
+        let app = store.app_storage();
+        assert!(
+            !app.checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[],
+                RecoveryEligibility::Retry
+            )
+            .unwrap()
+        );
+        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
+    }
+
+    /// A capture taken before the evidence grew never acknowledges, even with
+    /// a current fence and obligation revision: it would delete loss the
+    /// completion did not prove. A fresh capture does.
+    #[test]
+    fn a_stale_loss_capture_never_acknowledges() {
+        for use_snapshot in [false, true] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
+            app.ensure_account_projection("alice").unwrap();
+            app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+            let capture = || {
+                (
+                    app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                        .unwrap(),
+                    app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                        .unwrap(),
+                )
+            };
+            let stale = capture();
+            app.mark_account_delivery_recovery("alice", 1, 2).unwrap();
+            let fence = app.recovery_revision_fence().unwrap();
+            let id = fence.obligations[0].0;
+            let attempt = app
+                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+                .unwrap()
+                .unwrap()
+                .attempt_serial;
+            qualify_loss(&store, &fence, attempt, id);
+            let acknowledge = |(watermarks, snapshot): (
+                Vec<crate::RecoveryLossWatermark>,
+                crate::RecoveryLossSnapshot,
+            )| {
+                if use_snapshot {
+                    app.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                } else {
+                    app.acknowledge_recovery_loss(&fence, id, &watermarks)
+                }
+                .unwrap()
+            };
+            assert!(!acknowledge(stale));
+            assert_eq!(
+                app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(acknowledge(capture()));
+        }
     }
 
     fn qualify_loss(

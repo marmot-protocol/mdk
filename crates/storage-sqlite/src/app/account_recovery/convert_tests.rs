@@ -979,6 +979,97 @@ fn a_pending_explicit_repair_rearms_every_unit_last() {
     );
 }
 
+/// The step marker and the disposition codes persist across builds: the
+/// marker counts the steps run, in this order, and each count is stored under
+/// its disposition's number (0 pending, 1 parked, 2 dismissed, 3 settled). A
+/// build that reorders the steps or renumbers a disposition resumes a
+/// half-converted database at the wrong step or reports its counts under the
+/// wrong heading.
+#[test]
+fn each_step_stores_its_marker_and_counts_by_value() {
+    let store = v0_14_0();
+    let routes = routes();
+    let app = store.app_storage();
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        app.convert_recovery_steps(&input(&routes), 1).unwrap();
+        let conn = store.lock().unwrap();
+        let step: i64 = conn
+            .query_row("SELECT step FROM account_recovery_conversion", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let counts = conn
+            .prepare(
+                "SELECT cause, disposition, obligations FROM account_recovery_conversion_counts
+                 ORDER BY cause, disposition",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(conn);
+        let loss = app.converted_recovery_loss().unwrap().len();
+        seen.push((step, goal(&store, &group(B)), counts, loss));
+    }
+    // Quarantine starts B's standing goal, Dismissed counts the incremental
+    // history, Loss converts both causes' loss and lowers the goal to the
+    // queue loss's bound, Parked counts the explicit repair and the
+    // notification loss and lowers it to the repair's window, Pending counts
+    // the queue loss and the native replay, Settled the satisfied loss.
+    let (dismissed, parked) = ((5, 2, 1), [(3, 1, 1), (6, 1, 1)]);
+    let after_parked = vec![parked[0], dismissed, parked[1]];
+    let after_pending = vec![(0, 0, 1), parked[0], dismissed, parked[1], (7, 0, 1)];
+    let mut settled = after_pending.clone();
+    settled.insert(1, (0, 3, 1));
+    assert_eq!(
+        seen,
+        vec![
+            (1, Some(W + 20_000), vec![], 0),
+            (2, Some(W + 20_000), vec![dismissed], 0),
+            (3, Some(W + 500), vec![dismissed], 2),
+            (4, Some(W), after_parked, 2),
+            (5, Some(W), after_pending, 2),
+            (6, Some(W), settled, 2),
+        ]
+    );
+}
+
+/// A dismissal on a route the account has left retires nothing there, so a
+/// rejoined route's history is owed again; on a current route the same
+/// dismissal retires its window.
+#[test]
+fn a_dismissal_on_a_route_the_account_left_retires_nothing() {
+    let mut rows = v0_14_0_rows();
+    rows.push_str("INSERT INTO cgka_groups (id, epoch, record) VALUES (x'0c', 1, x'00');");
+    rows.push_str(&scope(
+        5,
+        2,
+        Some((C, 0x0C)),
+        (W - 1000, NOW - 10_000),
+        &payload(&[PLAN_R1], &[], false),
+    ));
+    let store = at_v0_14_0(&rows);
+    convert(&store).unwrap();
+    let app = store.app_storage();
+    assert!(app.recovery_unit(&group(C), R1).unwrap().is_none());
+    assert!(app.recovery_unit_spans(&group(C), R1).unwrap().is_empty());
+    assert_eq!(
+        app.recovery_unit_spans(&group(A), R1).unwrap()[0],
+        crate::RecoveryUnitSpan {
+            range: range(W, W + 499),
+            retired: Some(RecoverySpanRetirement::Dismissed),
+        }
+    );
+}
+
 /// Input the conversion cannot trust changes nothing: routing without the
 /// inbox (not hydrated), a duplicate route, an empty relay, or a floor
 /// after now.

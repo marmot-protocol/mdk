@@ -1635,6 +1635,31 @@ mod tests {
         }
     }
 
+    /// Account-wide loss below a route's settled floor lowers that floor with
+    /// its goal, so the next prune parks what the route owes from the loss
+    /// up, not only from the old floor.
+    #[test]
+    fn account_wide_loss_lowers_the_floor_the_next_prune_parks_from() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let route = group(1);
+        let routes = [(route.clone(), vec![RELAY_A.to_owned()])];
+        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 100)
+            .unwrap();
+        prove(&app, &[&route], 1);
+        app.prune_recovery_coverage(500, &routes).unwrap();
+        assert!(app.recovery_coverage_remainders().unwrap().is_empty());
+        lose(&app, 41, 1, 200, None);
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(app.recovery_coverage_goal(&route).unwrap(), Some(200));
+        app.prune_recovery_coverage(600, &routes).unwrap();
+        let parked = app.recovery_coverage_remainders().unwrap();
+        assert_eq!(parked.len(), 1);
+        assert!(parked[0].route == route);
+        assert_eq!(parked[0].range, range(200, 599));
+    }
+
     /// A restored generation's new drops arrive under a fresh token, so they
     /// import as new loss: the obligation moves, and only the routes they
     /// name lose coverage until one names none.

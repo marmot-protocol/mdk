@@ -257,6 +257,69 @@ fn a_broken_unit_without_a_probe_keeps_its_park_whatever_it_answers() {
     assert_eq!(app.recovery_unit_spans(&route, RELAY).unwrap(), spans);
 }
 
+/// The integers a unit and its spans store are a persisted format: unit
+/// state 0 active, 1 broken, 2 retired; broken reason 0 no progress, 1
+/// refused; span kind 0 parked, 1 retired, with reason 0 dismissed and 1
+/// route gone. A build that renumbers one reads every stored row wrong.
+#[test]
+fn units_and_spans_store_their_codes_by_value() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let app = storage.app_storage();
+    let routes = [group(1), group(2), group(3), group(4), group(5)];
+    for route in &routes {
+        owing(&app, route, NOW - 1_000, (NOW - 1_000, NOW - 501));
+    }
+    break_unit(&app, &routes[0], NOW);
+    settle(&app, &routes[1], RELAY, RecoveryUnitOutcome::Refused, NOW);
+    let revision = break_unit(&app, &routes[2], NOW).park.unwrap().revision;
+    assert!(
+        app.dismiss_recovery_route_park(&routes[2], revision)
+            .unwrap()
+    );
+    break_unit(&app, &routes[3], NOW);
+    app.retire_gone_recovery_units(&routes[3], None, NOW)
+        .unwrap();
+    settle(&app, &routes[4], RELAY, RecoveryUnitOutcome::Advanced, NOW);
+    let conn = storage.lock().unwrap();
+    let stored: Vec<_> = routes
+        .iter()
+        .map(|route| {
+            let id = route.storage_key().1;
+            let unit = conn
+                .query_row(
+                    "SELECT state, broken_reason FROM account_recovery_units
+                     WHERE route_id = ?1 AND relay = ?2",
+                    params![id, RELAY],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .unwrap();
+            let spans = conn
+                .prepare(
+                    "SELECT kind, reason FROM account_recovery_unit_spans
+                     WHERE route_id = ?1 AND relay = ?2 ORDER BY kind, since_seconds",
+                )
+                .unwrap()
+                .query_map(params![id, RELAY], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (unit, spans)
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        vec![
+            ((1, Some(0)), vec![(0, None)]),
+            ((1, Some(1)), vec![(0, None)]),
+            ((2, None), vec![(1, Some(0))]),
+            ((2, None), vec![(1, Some(1))]),
+            ((0, None), vec![]),
+        ]
+    );
+}
+
 /// Each answer without progress doubles the backoff from its base, and the
 /// budget's last one breaks the unit and parks what it still owes.
 #[test]
