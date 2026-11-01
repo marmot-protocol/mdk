@@ -1,4 +1,5 @@
 //! Consumer-visible tests of the native goal's limited admission authority.
+use super::tests::{assert_backend, assert_serialization};
 use super::*;
 
 fn native(app: &SqliteAppStorage, generation: u8) -> RecoveryDemandTicket {
@@ -65,35 +66,6 @@ fn prepare(
 }
 
 #[test]
-fn native_plan_issued_sources() {
-    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let ticket = native(&app, 1);
-    assert!(app.recovery_scope_snapshots(ticket.id).unwrap().is_empty());
-    let plans = [
-        scope(41, 0, 10, PeerAdmission::Granted),
-        scope(77, 3, 20, PeerAdmission::Granted),
-    ];
-    let (fence, tokens) = prepare(&app, ticket, &plans);
-    let stored = app.recovery_scope_snapshots(ticket.id).unwrap();
-    assert!(stored.iter().map(|scope| &scope.plan).eq(plans.iter()));
-    assert!(native(&app, 1) == ticket);
-    assert!(
-        app.checkpoint_replay_admission(
-            &fence,
-            ticket,
-            RecoveryReplayPlacement::Placed,
-            &[admission(&tokens[0]), admission(&tokens[1])]
-        )
-        .unwrap()
-    );
-    assert!(
-        app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
-            .unwrap()
-    );
-    assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
-}
-
-#[test]
 fn native_global_placement_fence() {
     let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let ticket = native(&app, 1);
@@ -118,6 +90,12 @@ fn native_global_placement_fence() {
             .unwrap()
             .state,
         RecoveryObligationState::Pending
+    );
+    // Attempt zero never checkpoints: a native goal completes only through
+    // its placement.
+    assert_serialization(
+        app.checkpoint_recovery_obligation(&fence, 0, ticket.id, &[], RecoveryEligibility::Retry),
+        "invalid recovery scope checkpoint",
     );
     assert!(
         !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
@@ -197,6 +175,11 @@ fn native_unserved_park_resumes() {
         app.park_unserved_native_replay(&fence, ticket, &tokens)
             .unwrap()
     );
+    // Parking charges no loss.
+    assert_eq!(
+        app.recovery_revision_fence().unwrap().loss_revision,
+        fence.loss_revision
+    );
     let parked = app.parked_recovery_obligations().unwrap();
     assert_eq!(parked.len(), 1);
     assert!(parked[0].ticket == ticket);
@@ -231,16 +214,6 @@ fn native_unserved_park_resumes() {
         .unwrap()
     );
     assert_eq!(app.recovery_retry_state().unwrap(), retry);
-    for cause in [
-        RecoveryLossCause::Queue,
-        RecoveryLossCause::NotificationConsumer,
-    ] {
-        assert!(
-            app.recovery_loss_watermarks("alice", cause)
-                .unwrap()
-                .is_empty()
-        );
-    }
 }
 
 #[test]
@@ -662,7 +635,16 @@ fn native_all_scopes_need_a_peer() {
         scope(0, 0, 10, PeerAdmission::Granted),
         scope(1, 1, 20, PeerAdmission::Refused),
     ];
+    // A native goal installs the owner's scopes at attempt 0.
+    assert!(app.recovery_scope_snapshots(ticket.id).unwrap().is_empty());
     let (fence, tokens) = prepare(&app, ticket, &plans);
+    assert!(
+        app.recovery_scope_snapshots(ticket.id)
+            .unwrap()
+            .iter()
+            .map(|scope| &scope.plan)
+            .eq(plans.iter())
+    );
     assert!(
         !app.checkpoint_replay_admission(
             &fence,
@@ -854,14 +836,14 @@ fn native_is_not_history_proof() {
             !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
                 .unwrap()
         );
-        assert!(
+        assert_serialization(
             app.install_recovery_scope_plan(
                 &fence,
                 0,
                 ticket.id,
-                &[scope(0, 0, 20, PeerAdmission::Granted)]
-            )
-            .is_err()
+                &[scope(0, 0, 20, PeerAdmission::Granted)],
+            ),
+            "invalid recovery scope checkpoint",
         );
     }
     let tokens = app
@@ -917,14 +899,14 @@ fn native_admission_rolls_back() {
          WHEN NEW.state=1 BEGIN SELECT RAISE(ABORT,'injected'); END",
         )
         .unwrap();
-    assert!(
+    assert_backend(
         app.checkpoint_replay_admission(
             &fence,
             ticket,
             RecoveryReplayPlacement::Placed,
-            &[admission(&tokens[0])]
-        )
-        .is_err()
+            &[admission(&tokens[0])],
+        ),
+        "injected",
     );
     assert!(!app.recovery_scope_snapshots(ticket.id).unwrap()[0].replay_admitted);
     assert!(
@@ -1020,7 +1002,7 @@ fn native_grant_is_limited() {
 fn native_reopen_keeps_floor() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("native-recovery.sqlite");
-    let key = crate::SqlCipherKey::new("native recovery reopen").unwrap();
+    let key = crate::SqlCipherKey::raw([0x71; 32]);
     let plans = [
         scope(0, 3, 10, PeerAdmission::Granted),
         scope(1, 0, 20, PeerAdmission::Granted),

@@ -51,6 +51,7 @@ pub(crate) fn forget_kept_recovery_key(conn: &rusqlite::Connection) -> StorageRe
 #[cfg(test)]
 mod tests {
     use crate::SqliteAccountStorage;
+    use cgka_traits::storage::StorageError;
 
     #[test]
     fn the_kept_key_is_replaced_and_forgotten() {
@@ -71,8 +72,15 @@ mod tests {
         let account = SqliteAccountStorage::in_memory().unwrap();
         let store = account.app_storage();
         for key in [vec![], vec![1; 256]] {
-            assert!(store.keep_recovery_key(&key).is_err());
+            assert!(matches!(
+                store.keep_recovery_key(&key),
+                Err(StorageError::Backend(message)) if message.contains("CHECK constraint failed")
+            ));
         }
         assert_eq!(store.kept_recovery_key().unwrap(), None);
+        for key in [vec![1], vec![2; 255]] {
+            store.keep_recovery_key(&key).unwrap();
+            assert_eq!(store.kept_recovery_key().unwrap(), Some(key));
+        }
     }
 }

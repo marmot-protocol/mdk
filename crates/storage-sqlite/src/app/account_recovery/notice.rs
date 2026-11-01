@@ -618,7 +618,7 @@ mod tests {
     fn retirement_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retire.sqlite");
-        let key = SqlCipherKey::new("history notice retirement").unwrap();
+        let key = SqlCipherKey::raw([0x51; 32]);
         let (id, ticket) = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             let app = store.app_storage();
