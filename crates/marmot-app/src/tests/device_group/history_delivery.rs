@@ -23,15 +23,16 @@ use cgka_traits::storage::SiblingAddStorage as _;
 use sha2::{Digest as _, Sha256};
 use storage_sqlite::{ParkedBundle, SqliteAppStorage};
 
-/// A Blossom server on loopback: an upload keeps the blob by its SHA-256 and
-/// a fetch serves it. Uploads fail while `refuse_uploads` is set.
-struct LocalBlossom {
-    url: String,
-    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    refuse_uploads: Arc<AtomicBool>,
+/// A Blossom server on loopback: an upload keeps the blob by its SHA-256, a
+/// fetch serves it and a delete drops it. Uploads fail while
+/// `refuse_uploads` is set.
+pub(super) struct LocalBlossom {
+    pub(super) url: String,
+    pub(super) blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub(super) refuse_uploads: Arc<AtomicBool>,
 }
 
-fn local_blossom() -> LocalBlossom {
+pub(super) fn local_blossom() -> LocalBlossom {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let blobs = Arc::<Mutex<HashMap<String, Vec<u8>>>>::default();
@@ -101,6 +102,10 @@ fn serve_blossom(
             Some(blob) => respond("200 OK", blob),
             None => respond("404 Not Found", b""),
         },
+        (Some("DELETE"), Some(path)) => match blobs.lock().unwrap().remove(&path[1..]) {
+            Some(_) => respond("200 OK", b""),
+            None => respond("404 Not Found", b""),
+        },
         _ => respond("405 Method Not Allowed", b""),
     };
     let _ = reader.get_mut().write_all(&response);
@@ -120,7 +125,7 @@ async fn use_blossom(client: &mut AppClient, chat: &GroupId, locator_kind: &str,
         .unwrap();
 }
 
-fn storage(app: &MarmotApp) -> SqliteAppStorage {
+pub(super) fn storage(app: &MarmotApp) -> SqliteAppStorage {
     app.account_storage("alice").unwrap().app_storage()
 }
 
@@ -128,7 +133,7 @@ fn published_count(relay: &ScriptedPushRelayClient) -> usize {
     relay.published_events.lock().unwrap().len()
 }
 
-async fn send_text(client: &mut AppClient, chat: &GroupId, content: &str) -> String {
+pub(super) async fn send_text(client: &mut AppClient, chat: &GroupId, content: &str) -> String {
     client
         .send_app_event(
             chat,

@@ -220,12 +220,12 @@ impl BackupPass {
     /// and when the newest pointer does not open.
     async fn fetch_pointer(&self) -> Result<Vec<PointerEntry>, AppError> {
         let address = backup_address(&self.key);
-        let mut query = DirectoryEventQuery::new(
+        let query = DirectoryEventQuery::address(
             KIND_BACKUP_POINTER,
-            vec![self.account_id_hex.clone()],
+            &self.account_id_hex,
+            address.clone(),
             POINTER_FETCH_LIMIT,
         );
-        query.reference = Some(('d', address.clone()));
         let outcome = self
             .app
             .relay_plane

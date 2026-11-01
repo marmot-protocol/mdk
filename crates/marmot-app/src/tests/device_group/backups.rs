@@ -18,7 +18,7 @@ use openmls_rust_crypto::RustCrypto;
 use std::sync::Mutex;
 
 /// The words at `shown`'s confirm positions, in order.
-fn answers(shown: &RecoveryWords) -> Vec<String> {
+pub(super) fn answers(shown: &RecoveryWords) -> Vec<String> {
     shown
         .confirm_positions
         .iter()
@@ -27,7 +27,7 @@ fn answers(shown: &RecoveryWords) -> Vec<String> {
 }
 
 /// The entropy `shown`'s words carry, read back through their checksum.
-fn entropy_of(shown: &RecoveryWords) -> [u8; 16] {
+pub(super) fn entropy_of(shown: &RecoveryWords) -> [u8; 16] {
     Mnemonic::parse_in(Language::English, shown.words.join(" "))
         .unwrap()
         .to_entropy()
@@ -36,7 +36,7 @@ fn entropy_of(shown: &RecoveryWords) -> [u8; 16] {
 }
 
 /// The recovery key pair `shown`'s words derive: (public, private).
-fn key_pair_of(shown: &RecoveryWords) -> (Vec<u8>, Vec<u8>) {
+pub(super) fn key_pair_of(shown: &RecoveryWords) -> (Vec<u8>, Vec<u8>) {
     let pair = derive_recovery_key_pair(&RustCrypto::default(), &entropy_of(shown)).unwrap();
     (pair.public, pair.private.to_vec())
 }
