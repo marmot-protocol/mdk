@@ -7369,10 +7369,22 @@ async fn cut_capture_keeps_complete_source() {
         async move { adapter.capture_replay(&account, plan, cut).await.unwrap() }
     });
     wait_snapshot(&stalled_hold).await;
-    // The healthy relay's completed range waits on its stalled peer.
+    // The paused clock moves only once every task is idle, so by the cut the
+    // healthy relay has finished its range and waits on its stalled peer.
     assert_no_delivery(&adapter).await;
     cut.cancel();
     assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Cancelled);
+    {
+        let status = adapter.take_replay_status(&account).await;
+        assert!(
+            status
+                .sources()
+                .any(|source| source.endpoints().any(|endpoint| {
+                    same_relay(endpoint.endpoint(), &healthy) && !endpoint.admitted()
+                })),
+            "the cut source stays owed to the next grant"
+        );
+    }
 
     let live = group_event_at(
         "live frame after the stored page",

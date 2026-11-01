@@ -8730,63 +8730,71 @@ mod batch_tests {
         assert!(coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
     }
 
+    /// A failed or cut older tag discards its MLS group's whole unit, the
+    /// finished newer tag included: neither may release the newer suffix.
     #[tokio::test]
     async fn failed_tag_discards_prefix() {
-        let (mut coverage, old, losses) = replay_coverage(1);
-        coverage.remove_subscription(&old);
-        losses.pending.lock().unwrap().clear();
-        let account = MemberId::new(vec![0xA1; 32]);
-        let group = GroupId::new(vec![0; 16]);
-        let endpoint = TransportEndpoint("wss://a.example".into());
-        let batch = NostrSubscription::GroupBatch {
-            account_id: account,
-            routes: vec![
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![1; 32],
-                },
-                GroupBatchRoute {
-                    group_id: group.clone(),
-                    transport_group_id: vec![2; 32],
-                },
-            ],
-            endpoints: vec![endpoint],
-            since: Some(Timestamp(100)),
-            attempt: SubscriptionAttempt::INITIAL,
-            batch: 1,
-        };
-        let id = batch.subscription_id();
-        coverage.add_subscription(
-            id.clone(),
-            &batch,
-            HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
-            &HashMap::new(),
-        );
-        let paging = paging_for(&mut coverage, &id);
-        let routes = paging.window.per_route();
-        assert!(coverage.start_route(&paging, &routes[0]));
-        let delivery = group_delivery(&id, group, vec![1; 32], 7);
-        let (tx, _rx) = mpsc::channel(1);
-        coverage
-            .stage_delivery(delivery, Some(RelayIndex(2)), ReplayInput::Page, &tx)
-            .unwrap();
-        assert!(coverage.finish_route(&paging, &routes[0]));
-        assert!(
-            coverage.take_ready_deliveries().is_empty(),
-            "the retained tag still owns older input"
-        );
-        assert!(coverage.start_route(&paging, &routes[1]));
-        coverage.fail_route(&paging, &routes[1]);
-        assert!(
-            coverage.take_ready_deliveries().is_empty(),
-            "a failed older tag cannot release the newer suffix"
-        );
-        assert_eq!(coverage.buffered_items, 0);
-        assert!(
-            losses.pending.lock().unwrap().is_empty(),
-            "the capture's own discarded re-fetch charges no loss"
-        );
-        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
+        for cut in [false, true] {
+            let (mut coverage, old, losses) = replay_coverage(1);
+            coverage.remove_subscription(&old);
+            losses.pending.lock().unwrap().clear();
+            let account = MemberId::new(vec![0xA1; 32]);
+            let group = GroupId::new(vec![0; 16]);
+            let endpoint = TransportEndpoint("wss://a.example".into());
+            let batch = NostrSubscription::GroupBatch {
+                account_id: account,
+                routes: vec![
+                    GroupBatchRoute {
+                        group_id: group.clone(),
+                        transport_group_id: vec![1; 32],
+                    },
+                    GroupBatchRoute {
+                        group_id: group.clone(),
+                        transport_group_id: vec![2; 32],
+                    },
+                ],
+                endpoints: vec![endpoint],
+                since: Some(Timestamp(100)),
+                attempt: SubscriptionAttempt::INITIAL,
+                batch: 1,
+            };
+            let id = batch.subscription_id();
+            coverage.add_subscription(
+                id.clone(),
+                &batch,
+                HashMap::from([(RelayIndex(2), RelayReplay::Awaiting)]),
+                &HashMap::new(),
+            );
+            let paging = paging_for(&mut coverage, &id);
+            let routes = paging.window.per_route();
+            assert!(coverage.start_route(&paging, &routes[0]));
+            let delivery = group_delivery(&id, group, vec![1; 32], 7);
+            let (tx, _rx) = mpsc::channel(1);
+            coverage
+                .stage_delivery(delivery, Some(RelayIndex(2)), ReplayInput::Page, &tx)
+                .unwrap();
+            assert!(coverage.finish_route(&paging, &routes[0]));
+            assert!(
+                coverage.take_ready_deliveries().is_empty(),
+                "the retained tag still owns older input"
+            );
+            if cut {
+                coverage.stop_capture(&id, RelayIndex(2));
+            } else {
+                assert!(coverage.start_route(&paging, &routes[1]));
+                coverage.fail_route(&paging, &routes[1]);
+            }
+            assert!(
+                coverage.take_ready_deliveries().is_empty(),
+                "a failed older tag cannot release the newer suffix (cut: {cut})"
+            );
+            assert_eq!(coverage.buffered_items, 0);
+            assert!(
+                losses.pending.lock().unwrap().is_empty(),
+                "the capture's own discarded re-fetch charges no loss"
+            );
+            assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(2)].boundary_admitted);
+        }
     }
 
     fn group_delivery(
