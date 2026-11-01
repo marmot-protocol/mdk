@@ -319,25 +319,36 @@ fn withdrawals_apply_to_a_row_whose_tags_no_longer_decode() {
             Some(LOCAL_PUBLISH_FAILED_REASON),
         ),
     ];
-    for (name, withdraw, reason) in cases {
+    let modifiers = [
+        ("delete", MARMOT_APP_EVENT_KIND_DELETE, ""),
+        ("edit", MARMOT_APP_EVENT_KIND_EDIT, "edited"),
+    ];
+    for ((case, withdraw, reason), (modifier, kind, text)) in cases
+        .into_iter()
+        .flat_map(|case| modifiers.map(|modifier| (case, modifier)))
+    {
+        let name = format!("{case}, damaged {modifier}");
         let store = SqliteAccountStorage::in_memory().unwrap();
         let app = store.app_storage();
         for (id, at, text) in [("bystander", 9, "unrelated"), ("target", 10, "original")] {
             app.record_app_event(&chat(id, at, text)).unwrap();
         }
-        let mut damaged = targeting(
-            "damaged",
-            MARMOT_APP_EVENT_KIND_EDIT,
-            "target",
-            11,
-            "edited",
-        );
+        let mut damaged = targeting("damaged", kind, "target", 11, text);
         damaged.origin_commit_id = Some("commit".to_owned());
-        if name == "terminal sweep" {
+        if case == "terminal sweep" {
             damaged.direction = "sent".to_owned();
             damaged.source_message_id_hex = None;
         }
         app.record_app_event(&damaged).unwrap();
+        let quote = vec![vec![QUOTE_REF_TAG.to_owned(), "target".to_owned()]];
+        app.record_app_event(&event(
+            "reply",
+            MARMOT_APP_EVENT_KIND_CHAT,
+            quote,
+            12,
+            "reply",
+        ))
+        .unwrap();
         if reason.is_none() {
             app.invalidate_app_events_by_origin_commit(
                 "commit",
@@ -352,15 +363,19 @@ fn withdrawals_apply_to_a_row_whose_tags_no_longer_decode() {
             .unwrap_or_else(|| panic!("{name}: no row matched"));
 
         // The damaged tags no longer name the target, yet a withdrawal takes
-        // the edit off it and live subscribers still hear of it. Nothing
-        // changes on a revival: the edit applied neither before nor after.
+        // the delete or edit off it, and live subscribers hear why each row
+        // changed: the target was reprojected (not a reaction added) and the
+        // reply's preview of it changed. Nothing changes on a revival: the
+        // modifier applied neither before nor after.
         let upserts = update
             .changes
             .iter()
             .filter_map(|change| match change {
-                TimelineMessageChange::Upsert { message, .. } => {
-                    Some((message.message_id_hex.as_str(), message.plaintext.as_str()))
-                }
+                TimelineMessageChange::Upsert { message, trigger } => Some((
+                    message.message_id_hex.as_str(),
+                    message.plaintext.as_str(),
+                    trigger.clone(),
+                )),
                 TimelineMessageChange::Remove { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -370,8 +385,19 @@ fn withdrawals_apply_to_a_row_whose_tags_no_longer_decode() {
             .map(|message| message.message_id_hex.as_str())
             .collect::<Vec<_>>();
         if reason.is_some() {
-            assert_eq!(upserts, [("target", "original")], "{name}");
-            assert_eq!(messages, ["target"], "{name}");
+            assert_eq!(
+                upserts,
+                [
+                    (
+                        "target",
+                        "original",
+                        TimelineUpdateTrigger::MessageEditedOrReprojected
+                    ),
+                    ("reply", "reply", TimelineUpdateTrigger::ReplyPreviewChanged),
+                ],
+                "{name}"
+            );
+            assert_eq!(messages, ["target", "reply"], "{name}");
         } else {
             assert_eq!(upserts, [], "{name}");
             assert_eq!(messages, Vec::<&str>::new(), "{name}");
@@ -696,14 +722,17 @@ fn poll_tally_skips_a_response_whose_tags_no_longer_decode() {
 }
 
 // A row stays out of a history bundle when its content no longer hashes to its
-// id; a damaged row decoded to no tags is one such row.
+// id; a damaged row decoded to no tags is one such row, unless it had none.
 #[test]
 fn history_export_leaves_out_a_row_whose_tags_no_longer_decode() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     let sender = hex::encode([1; 32]);
-    let rows = [("healthy", 10), ("damaged", 11)].map(|(text, at)| {
-        let tags = vec![vec!["t".to_owned(), text.to_owned()]];
+    let rows = [("healthy", 10), ("damaged", 11), ("untagged", 12)].map(|(text, at)| {
+        let tags = match text {
+            "untagged" => Vec::new(),
+            _ => vec![vec!["t".to_owned(), text.to_owned()]],
+        };
         let kind = MARMOT_APP_EVENT_KIND_CHAT;
         let signed = MarmotAppEvent::new(sender.clone(), at, kind, tags.clone(), text);
         let mut row = event(&signed.id, kind, tags, at, text);
@@ -715,6 +744,7 @@ fn history_export_leaves_out_a_row_whose_tags_no_longer_decode() {
         app.record_app_event(row).unwrap();
     }
     damage_tags(&app, &rows[1].message_id_hex);
+    damage_tags(&app, &rows[2].message_id_hex);
 
     let page = app
         .history_export_page(&group(), None, 100, 10)
@@ -729,6 +759,7 @@ fn history_export_leaves_out_a_row_whose_tags_no_longer_decode() {
         [
             (rows[0].message_id_hex.as_str(), true),
             (rows[1].message_id_hex.as_str(), false),
+            (rows[2].message_id_hex.as_str(), true),
         ]
     );
 }

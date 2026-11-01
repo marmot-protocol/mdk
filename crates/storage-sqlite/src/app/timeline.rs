@@ -1055,8 +1055,7 @@ impl SqliteAppStorage {
             // Already-invalidated rows are excluded so a replayed or duplicate
             // withdrawal event is a no-op: it neither rewrites the recorded
             // invalidation reason nor produces a redundant projection update.
-            let mut tags_damaged = false;
-            let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+            let rows: Vec<_> = {
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT group_id_hex, message_id_hex, kind, tags_json
@@ -1065,10 +1064,13 @@ impl SqliteAppStorage {
                     )
                     .storage()?;
                 stmt.query_map(params![origin_commit_id], |row| {
-                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                    let tags = decode_app_event_tags(row, 3)?;
-                    tags_damaged |= tags.is_none();
-                    Ok((row.get(0)?, row.get(1)?, kind, tags.unwrap_or_default()))
+                    let kind: u64 = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        kind,
+                        decode_app_event_tags(row, 3)?,
+                    ))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
@@ -1078,6 +1080,19 @@ impl SqliteAppStorage {
             else {
                 return Ok(None);
             };
+            let tags_damaged = rows.iter().any(|(.., tags)| tags.is_none());
+            let rows = rows
+                .into_iter()
+                .map(|(row_group_id_hex, message_id_hex, kind, tags)| {
+                    let tags = decoded_or_recovered_tags_tx(
+                        &conn,
+                        &row_group_id_hex,
+                        &message_id_hex,
+                        tags,
+                    )?;
+                    Ok((row_group_id_hex, message_id_hex, kind, tags))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
             // Collect the set of timeline message ids affected across all matched
             // rows so we can diff before/after for the change set.
             let mut affected_message_ids = BTreeSet::new();
@@ -1182,8 +1197,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut tags_damaged = false;
-            let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+            let rows: Vec<_> = {
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT group_id_hex, message_id_hex, kind, tags_json
@@ -1196,10 +1210,13 @@ impl SqliteAppStorage {
                 stmt.query_map(
                     params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
                     |row| {
-                        let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                        let tags = decode_app_event_tags(row, 3)?;
-                        tags_damaged |= tags.is_none();
-                        Ok((row.get(0)?, row.get(1)?, kind, tags.unwrap_or_default()))
+                        let kind: u64 = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            kind,
+                            decode_app_event_tags(row, 3)?,
+                        ))
                     },
                 )
                 .storage()?
@@ -1210,6 +1227,19 @@ impl SqliteAppStorage {
             else {
                 return Ok(None);
             };
+            let tags_damaged = rows.iter().any(|(.., tags)| tags.is_none());
+            let rows = rows
+                .into_iter()
+                .map(|(row_group_id_hex, message_id_hex, kind, tags)| {
+                    let tags = decoded_or_recovered_tags_tx(
+                        &conn,
+                        &row_group_id_hex,
+                        &message_id_hex,
+                        tags,
+                    )?;
+                    Ok((row_group_id_hex, message_id_hex, kind, tags))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
             let mut affected_message_ids = BTreeSet::new();
             for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
                 affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
@@ -1362,8 +1392,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut tags_damaged = false;
-            let rows: Vec<(String, u64, Vec<Vec<String>>)> = {
+            let rows: Vec<_> = {
                 let mut stmt = conn
                     .prepare_cached(
                         "SELECT message_id_hex, kind, tags_json
@@ -1375,10 +1404,12 @@ impl SqliteAppStorage {
                     )
                     .storage()?;
                 stmt.query_map(params![group_id_hex], |row| {
-                    let kind = row.get::<_, i64>(1)?.try_into().unwrap_or_default();
-                    let tags = decode_app_event_tags(row, 2)?;
-                    tags_damaged |= tags.is_none();
-                    Ok((row.get(0)?, kind, tags.unwrap_or_default()))
+                    let kind: u64 = row.get::<_, i64>(1)?.try_into().unwrap_or_default();
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        kind,
+                        decode_app_event_tags(row, 2)?,
+                    ))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
@@ -1387,6 +1418,15 @@ impl SqliteAppStorage {
             if rows.is_empty() {
                 return Ok(None);
             }
+            let tags_damaged = rows.iter().any(|(.., tags)| tags.is_none());
+            let rows = rows
+                .into_iter()
+                .map(|(message_id_hex, kind, tags)| {
+                    let tags =
+                        decoded_or_recovered_tags_tx(&conn, group_id_hex, &message_id_hex, tags)?;
+                    Ok((message_id_hex, kind, tags))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
             let mut affected_message_ids = BTreeSet::new();
             for (message_id_hex, kind, tags) in &rows {
                 affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
@@ -1475,7 +1515,7 @@ impl SqliteAppStorage {
                 return Ok(None);
             };
             let tags_damaged = tags.is_none();
-            let tags = tags.unwrap_or_default();
+            let tags = decoded_or_recovered_tags_tx(&conn, &group_id_hex, &message_id_hex, tags)?;
             let mut affected_message_ids = affected_timeline_message_ids_for_parts_tx(
                 &conn,
                 &group_id_hex,
@@ -2110,10 +2150,7 @@ fn app_event_projection_parts_tx(
     let Some((kind, tags)) = row else {
         return Ok(None);
     };
-    let tags = match tags {
-        Some(tags) => tags,
-        None => recovered_app_event_tags_tx(tx, group_id_hex, message_id_hex)?,
-    };
+    let tags = decoded_or_recovered_tags_tx(tx, group_id_hex, message_id_hex, tags)?;
     Ok(Some((kind, tags)))
 }
 
@@ -2767,6 +2804,20 @@ fn recovered_app_event_tags_tx(
     Ok(tags)
 }
 
+/// A row's decoded tags, or what [`recovered_app_event_tags_tx`] finds of them
+/// when they no longer decode.
+fn decoded_or_recovered_tags_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    tags: Option<Vec<Vec<String>>>,
+) -> StorageResult<Vec<Vec<String>>> {
+    match tags {
+        Some(tags) => Ok(tags),
+        None => recovered_app_event_tags_tx(tx, group_id_hex, message_id_hex),
+    }
+}
+
 /// Whether a stored `app_events.tags_json` no longer decodes.
 fn app_event_tags_damaged_tx(
     tx: &Connection,
@@ -3271,8 +3322,9 @@ fn timeline_changes_for_invalidation(
 /// seen per `(message_id, variant)` so live subscribers receive one update per
 /// affected message.
 /// Every row of a group's materialized timeline. A withdrawal diffs them all
-/// when a withdrawn row's tags no longer decode: they cannot name the rows it
-/// changed, and the withdrawal rebuilds the whole group anyway.
+/// when a withdrawn row's tags no longer decode: what survives of them cannot
+/// name every row it changed, and the withdrawal rebuilds the whole group
+/// anyway.
 fn group_timeline_message_ids_tx(
     tx: &Connection,
     group_id_hex: &str,
