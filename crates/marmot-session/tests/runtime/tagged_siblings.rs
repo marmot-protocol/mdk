@@ -326,9 +326,9 @@ mod tagged_siblings {
         }
     }
 
-    /// `adder` carries `owed` as a 461 in `device_group`, as the app sends it,
-    /// and marks it delivered once the message is published. Returns the
-    /// message.
+    /// `adder` carries `owed` as a 461 in `device_group`, pinned to the
+    /// group's epoch and branch as the app sends it, and marks it delivered
+    /// once the message is published. Returns the message.
     pub(super) async fn carry(
         adder: &mut Device,
         device_group: &GroupId,
@@ -349,12 +349,13 @@ mod tagged_siblings {
                 .unwrap()
         );
         let before = group_messages(adder).len();
+        let pin = adder.runtime.epoch_pin(device_group).unwrap();
         let effects = adder
             .runtime
             .send(SendIntent::AppMessage {
                 group_id: device_group.clone(),
                 payload: event.encode().unwrap(),
-                expected_epoch: None,
+                expected_epoch: Some(pin),
             })
             .await
             .unwrap();
