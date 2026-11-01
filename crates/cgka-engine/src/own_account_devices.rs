@@ -529,7 +529,8 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => return Ok(false),
             Err(error) => return Err(EngineError::Storage(error)),
         };
-        if record.state != MessageState::Sent {
+        let previous = record.state;
+        if previous != MessageState::Sent {
             return Ok(false);
         }
         let Ok(StoredMessagePayload::OutboundSiblingWelcome {
@@ -553,6 +554,19 @@ impl<S: StorageProvider> Engine<S> {
         .encode()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         self.storage.put_message(&record)?;
+        // Its state moves as an invite Welcome's does, with the same row.
+        if record.state != previous {
+            self.audit_group(
+                &record.group_id,
+                crate::audit_helpers::message_state_transition_event(
+                    hex::encode(id.as_slice()),
+                    Some(previous),
+                    record.state,
+                    Some(record.epoch),
+                    "state_update",
+                ),
+            );
+        }
         Ok(true)
     }
 

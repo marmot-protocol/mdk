@@ -35,7 +35,22 @@ pub(super) fn roster_device(account: &[u8]) -> Device {
 /// [`roster_device`] over `storage`, as a reopened session builds it. The
 /// caller hydrates its groups.
 pub(super) fn roster_device_on(storage: SqliteAccountStorage, account: &[u8]) -> Device {
-    build_roster_device(storage, account, None, Box::<MockPeeler>::default())
+    build_roster_device(storage, account, None, Box::<MockPeeler>::default(), None)
+}
+
+/// [`roster_device_on`] with its forensic rows going to `recorder`.
+pub(super) fn recorded_roster_device_on(
+    storage: SqliteAccountStorage,
+    account: &[u8],
+    recorder: Box<dyn marmot_forensics::ForensicRecorder>,
+) -> Device {
+    build_roster_device(
+        storage,
+        account,
+        None,
+        Box::<MockPeeler>::default(),
+        Some(recorder),
+    )
 }
 
 /// [`roster_device`] with `peeler` in place of the [`MockPeeler`].
@@ -48,6 +63,7 @@ pub(super) fn roster_device_with_peeler(
         account,
         None,
         peeler,
+        None,
     )
 }
 
@@ -58,6 +74,7 @@ fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Devi
         account,
         Some(clock),
         Box::<MockPeeler>::default(),
+        None,
     )
 }
 
@@ -66,6 +83,7 @@ fn build_roster_device(
     account: &[u8],
     clock: Option<&ManualConvergenceClock>,
     peeler: Box<dyn TransportPeeler>,
+    recorder: Option<Box<dyn marmot_forensics::ForensicRecorder>>,
 ) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend([
@@ -82,6 +100,9 @@ fn build_roster_device(
         .peeler(peeler);
     if let Some(clock) = clock {
         builder = builder.convergence_clock(std::sync::Arc::new(clock.clone()));
+    }
+    if let Some(recorder) = recorder {
+        builder = builder.recorder(recorder);
     }
     let engine = builder.build().unwrap();
     Device { engine, storage }

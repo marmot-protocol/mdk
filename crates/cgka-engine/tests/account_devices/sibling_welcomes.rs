@@ -22,6 +22,7 @@ use cgka_traits::engine::KeyPackageSource;
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
+use std::sync::{Arc, Mutex};
 
 /// `device`'s sibling Welcome rows in `gid`.
 fn sibling_rows(device: &Device, gid: &GroupId) -> Vec<(MessageState, StoredMessagePayload)> {
@@ -141,6 +142,84 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
     let [(MessageState::Processed, _)] = &sibling_rows(&m.bob, &gid)[..] else {
         panic!("one delivered sibling Welcome")
     };
+}
+
+/// The forensic rows naming one message's state changes.
+#[derive(Clone, Default)]
+struct StateRows(Arc<Mutex<Vec<(String, Option<String>, String, Option<u64>)>>>);
+
+impl StateRows {
+    fn of(&self, id: &MessageId) -> Vec<(Option<String>, String, Option<u64>)> {
+        let id = hex::encode(id.as_slice());
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(msg_id, ..)| *msg_id == id)
+            .map(|(_, previous, new, epoch)| (previous.clone(), new.clone(), *epoch))
+            .collect()
+    }
+}
+
+impl marmot_forensics::ForensicRecorder for StateRows {
+    fn record(&self, record: marmot_forensics::AuditRecord) {
+        if let marmot_forensics::AuditEventKind::MessageStateChanged {
+            msg_id,
+            previous_state,
+            new_state,
+            epoch,
+            ..
+        } = record.kind
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((msg_id, previous_state, new_state, epoch));
+        }
+    }
+}
+
+/// A delivered sibling Welcome writes the forensic row an invite Welcome's
+/// state change writes: from sent to processed, at its epoch. Carrying it
+/// and clearing a failed carrier change no state and write none.
+#[tokio::test]
+async fn a_delivered_sibling_welcome_writes_its_state_row() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let state_rows = StateRows::default();
+    let mut bob = super::device_roster::recorded_roster_device_on(
+        storage,
+        b"bob",
+        Box::new(state_rows.clone()),
+    );
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    let [owed_now] = &owed(&bob)[..] else {
+        panic!("one owed sibling Welcome")
+    };
+    let id = owed_now.id.clone();
+    let epoch = bob.storage.get_message(&id).unwrap().epoch.0;
+
+    assert!(bob.engine.carry_sibling_welcome(&id, b"first").unwrap());
+    assert!(
+        bob.engine
+            .sibling_welcome_send_failed(&id, b"first")
+            .unwrap()
+    );
+    assert!(bob.engine.carry_sibling_welcome(&id, b"second").unwrap());
+    assert!(state_rows.of(&id).is_empty());
+    assert!(
+        bob.engine
+            .sibling_welcome_delivered(&id, b"second")
+            .unwrap()
+    );
+    assert_eq!(
+        state_rows.of(&id),
+        vec![(Some("sent".into()), "processed".into(), Some(epoch))]
+    );
 }
 
 /// A sibling Welcome is owed until its KeyPackage expires, when the sibling
