@@ -12318,6 +12318,9 @@ async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
 
     let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
 
+    // A signed-out account signs out on its own at once: no sibling went
+    // unasked.
+    assert!(!outcome.siblings_not_reached);
     assert_eq!(outcome.key_packages_deleted, 1);
     assert!(outcome.key_package_failures.is_empty());
     assert!(outcome.local_cleanup.completed);

@@ -45,8 +45,8 @@ pub use session::RECOVERY_ENTROPY_LEN;
 pub use session::{
     AccountIdentityProofRequest, AccountIdentityProofSigner, CanonicalGroupMembership,
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,
-    KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex, WelcomeWithdrawal,
-    application_message_len, durably_owned_key_packages, key_package_metadata,
+    KeyPackageRequirements, OwedSiblingWelcome, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex,
+    WelcomeWithdrawal, application_message_len, durably_owned_key_packages, key_package_metadata,
 };
 pub use session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,

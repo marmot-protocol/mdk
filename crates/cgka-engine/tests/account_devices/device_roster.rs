@@ -15,18 +15,20 @@
 //! account-devices tests.
 
 use super::activation::{buffer_unsettled, queued_intents};
+use super::send_intents::queue;
 use super::*;
 use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
     AccountEntryV1, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, NOSTR_ROUTING_COMPONENT_ID,
+    RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
+    encode_device_roster_v1,
 };
 use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport};
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 
 /// A device of `account` that advertises the device roster beside
-/// account-devices.
+/// account-devices, and Nostr routing, so its chats can name relays.
 pub(super) fn roster_device(account: &[u8]) -> Device {
     roster_device_on(SqliteAccountStorage::in_memory_for_test().unwrap(), account)
 }
@@ -67,7 +69,11 @@ fn build_roster_device(
     peeler: Box<dyn TransportPeeler>,
 ) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
-    supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        NOSTR_ROUTING_COMPONENT_ID,
+    ]);
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))
@@ -1380,6 +1386,35 @@ async fn an_account_entry_replacement_is_refused_rather_than_queued() {
     };
     phone.engine.confirm_published(pending).await.unwrap();
     assert_eq!(roster_of(&phone, &gid).account, account(1, 8));
+}
+
+/// An account entry replacement made while an intent waits in the group's
+/// queue is refused the same way, and the waiting intent is kept (mdk#2842).
+#[tokio::test]
+async fn an_account_entry_replacement_behind_a_queued_intent_is_refused() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    queue(
+        &phone,
+        &gid,
+        b"waiting",
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+    );
+
+    let refused = phone.engine.send(set_account(&phone, &gid, 1, 8)).await;
+    assert!(
+        matches!(&refused, Err(EngineError::AccountEntryUnsettled { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert_eq!(queued_intents(&phone, &gid).len(), 1);
 }
 
 /// The convergence input a send settles first can change the account entry

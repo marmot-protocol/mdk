@@ -1,8 +1,8 @@
 use crate::base::connection::CachedSql;
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
-    base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, tags_from_json,
-    u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, u64_to_i64, unix_now_ms,
+    unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::MessageId;
@@ -674,35 +674,6 @@ impl SqliteAppStorage {
                     "DELETE FROM account_recovery_obligations
                      WHERE cause = 1 AND group_id = ?1 AND stalled_epoch = ?2",
                     params![group_id, stalled_epoch],
-                )
-                .storage()?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Retire these groups' recovery intents whatever epoch they were armed at.
-    ///
-    /// A group this device is terminal in keeps no intent at any epoch, so the
-    /// stored epoch is not part of the key here. Use
-    /// [`Self::clear_epoch_backfill_intents`] instead when a replay completed
-    /// and a concurrent newer arm must survive.
-    pub fn clear_epoch_backfill_intents_for_groups(
-        &self,
-        group_ids_hex: &[String],
-    ) -> StorageResult<()> {
-        if group_ids_hex.is_empty() {
-            return Ok(());
-        }
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            for group_id_hex in group_ids_hex {
-                let group_id = hex::decode(group_id_hex).map_err(|error| {
-                    StorageError::Serialization(format!("invalid epoch backfill group id: {error}"))
-                })?;
-                conn.execute_cached(
-                    "DELETE FROM account_recovery_obligations WHERE cause = 1 AND group_id = ?1",
-                    params![group_id],
                 )
                 .storage()?;
             }
@@ -1691,27 +1662,6 @@ impl SqliteAppStorage {
             }
             Ok(stamped)
         })
-    }
-
-    /// Clear a local-delete marker only when `message_id` belongs to this group
-    /// and was durably inserted after the deletion frontier. Exact or rewrapped
-    /// historical replay resolves to an older existing row and stays suppressed.
-    pub fn clear_local_group_deletion_frontier_if_message_is_newer(
-        &self,
-        group_id_hex: &str,
-        message_id: &MessageId,
-    ) -> StorageResult<bool> {
-        let group_id = hex::decode(group_id_hex).map_err(|error| {
-            StorageError::Serialization(format!("invalid local group id: {error}"))
-        })?;
-        Ok(self
-            .lock()?
-            .execute_cached(
-                crate::cross::views::CLEAR_DELETION_FRONTIER_IF_OLDER_SQL,
-                params![group_id_hex, message_id.as_slice(), group_id],
-            )
-            .storage()?
-            > 0)
     }
 
     /// Return whether `message_id` belongs to `group_id_hex` and was durably
@@ -3372,62 +3322,6 @@ impl SqliteAppStorage {
             .storage()
     }
 
-    pub fn remove_group_push_token(
-        &self,
-        group_id_hex: &str,
-        member_id_hex: &str,
-        platform: u8,
-        token_fingerprint: &str,
-        server_pubkey_hex: &str,
-    ) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "DELETE FROM group_push_tokens
-                 WHERE group_id_hex = ?1
-                   AND member_id_hex = ?2
-                   AND platform = ?3
-                   AND token_fingerprint = ?4
-                   AND server_pubkey_hex = ?5",
-                params![
-                    group_id_hex,
-                    member_id_hex,
-                    i64::from(platform),
-                    token_fingerprint,
-                    server_pubkey_hex,
-                ],
-            )
-            .storage()?;
-        Ok(())
-    }
-
-    /// Local cleanup when a member leaves the group: drop every live record and
-    /// every tombstone for that member, per the spec's member-cleanup rule. The
-    /// member is gone, so no relayed record for them can ever verify against
-    /// current membership again, which is why the durable tombstones are safe to
-    /// clear here (and only here).
-    pub fn remove_group_push_tokens_for_member(
-        &self,
-        group_id_hex: &str,
-        member_id_hex: &str,
-    ) -> StorageResult<()> {
-        self.connection.with_transaction(|| -> StorageResult<()> {
-            let conn = self.lock()?;
-            conn.execute_cached(
-                "DELETE FROM group_push_tokens
-                 WHERE group_id_hex = ?1 AND member_id_hex = ?2",
-                params![group_id_hex, member_id_hex],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "DELETE FROM group_push_token_tombstones
-                 WHERE group_id_hex = ?1 AND member_id_hex = ?2",
-                params![group_id_hex, member_id_hex],
-            )
-            .storage()?;
-            Ok(())
-        })
-    }
-
     /// Remove destinations for departed device leaves in one transaction. A
     /// surviving sibling keeps the account's anti-resurrection tombstones.
     pub fn remove_group_push_tokens_for_leaves(
@@ -4090,9 +3984,7 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         sender: row.get(3)?,
         plaintext: row.get(4)?,
         kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(6)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(err))
-        })?,
+        tags: crate::app::timeline::app_event_tags(row, 6)?,
         source_epoch: row
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),

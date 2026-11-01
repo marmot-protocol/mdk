@@ -63,8 +63,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
   - `runtime/sign_in_rejection.rs` — the host's rejected sign-ins (mdk#2628 3.2) as `not_me` rejected slots, in one
-    roster update behind the same gate (`reject_device_slots`). A slot the merged roster already holds, as a device or
-    a rejected slot, is left out: a rejection never replaces an entry.
+    roster update behind the same gate (`reject_device_slots`), which refuses a `removed` record. The lone `removed`
+    record a deciding device makes after a failed link's undo (mdk#2761) goes only through `record_removed_slot`, as
+    `SendIntent::RecordRemovedSlot`, which the engine never queues or re-issues. A slot the merged roster already
+    holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
@@ -80,7 +82,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
-    caller's drain. The request and hand-off checks read device tags through `member_device_tag_claim_at`.
+    caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one
+    (3.5b-2), for the app's 461 sender. The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

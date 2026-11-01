@@ -508,6 +508,7 @@ mod tests {
     #[test]
     fn a_slot_the_first_check_returned_was_here_first_whenever_it_counts() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        // The first read takes the baseline but records no sign-in yet.
         assert!(
             !store
                 .record_sign_in_check(&SignInCheck {
@@ -519,6 +520,9 @@ mod tests {
                 })
                 .unwrap()
         );
+        assert_eq!(store.sign_in_baseline().unwrap(), Some(100));
+        assert!(store.sign_ins().unwrap().is_empty());
+
         assert!(check(
             &store,
             &[observed("aa", 150, "e1"), observed("bb", 150, "e2")],

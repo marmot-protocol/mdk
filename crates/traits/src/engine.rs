@@ -73,6 +73,14 @@ pub struct KeyPackage {
     pub protocol_profile: ProtocolProfile,
 }
 
+/// A private KeyPackage a sibling device handed over, with the roster slot of
+/// that sibling ([`SendIntent::AddOwnAccountDevices`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiblingKeyPackage {
+    pub slot: DeviceSlotId,
+    pub key_package: KeyPackage,
+}
+
 impl KeyPackage {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
@@ -146,8 +154,9 @@ pub enum SendIntent {
         /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
-        /// retain the intent while the group's epoch is unsettled and encrypt
-        /// it under whatever epoch the group lands on. A pinned message has
+        /// retain the intent while the group's epoch is unsettled, or behind
+        /// an earlier send still queued for the group, and encrypt it under
+        /// whatever epoch the group lands on. A pinned message has
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
@@ -177,19 +186,23 @@ pub enum SendIntent {
         group_id: GroupId,
         members: Vec<MemberId>,
     },
-    /// Add devices of this device's own account, without admin authority, in
-    /// a group that requires `marmot.group.account-devices.v1`
+    /// Add sibling devices of this device's own account, without admin
+    /// authority, in a group that requires `marmot.group.account-devices.v1`
     /// (account-devices-v1.md, "Same-account operations").
     ///
-    /// The caller supplies every KeyPackage: each must belong to this
-    /// device's account, advertise everything the group requires, and keep
-    /// the account within the leaf limit. The caller must have authenticated
-    /// each one as a device its user approved; the engine never selects an
+    /// The caller supplies every KeyPackage, each a private one a sibling
+    /// handed over, named with that sibling's roster slot (device-group.md,
+    /// "Sibling Welcomes"). Each must belong to this device's account, carry a
+    /// device tag that reads as that slot in the trusted device group's
+    /// roster, name no publication, advertise everything the group requires,
+    /// and keep the account within the leaf limit. The caller must have taken
+    /// each from the KeyPackages handed to it; the engine never selects an
     /// own-account KeyPackage itself ("Sender rules"). Each added device gets
-    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    /// a sibling Welcome, owed once the Commit confirms and sent in the device
+    /// group, never through the transport binding.
     AddOwnAccountDevices {
         group_id: GroupId,
-        key_packages: Vec<KeyPackage>,
+        siblings: Vec<SiblingKeyPackage>,
     },
     /// Remove other devices of this device's own account, without admin
     /// authority, in a group that requires
@@ -240,6 +253,20 @@ pub enum SendIntent {
     UnlinkDevice {
         group_id: GroupId,
         leaf_signature_key: Vec<u8>,
+        roster_update: Vec<u8>,
+    },
+    /// Record a slot of the account's device group as `removed`, alone
+    /// (mdk#2761): the record a device whose user decided a removal makes
+    /// once a failed link's undo took that slot's entry. `roster_update` is a
+    /// `marmot.account.device-roster.v1` update of exactly one
+    /// `SetRejectedSlot`, with reason `removed` and a `tag_signature_key`,
+    /// for a slot the roster lists neither as a device nor as a rejected
+    /// slot. Like a link, it is never queued, and a lost fork never re-issues
+    /// it: once a roster state the device applied held the record, the device
+    /// does not make it again, so only its caller decides whether to send it
+    /// again.
+    RecordRemovedSlot {
+        group_id: GroupId,
         roster_update: Vec<u8>,
     },
     /// Leave the group via MIP-03 SelfRemove.
@@ -420,10 +447,15 @@ pub enum SendResult {
         authority: Option<crate::app_event::AppMessageAuthority>,
     },
     /// The engine accepted the local intent but did not publish anything
-    /// yet because the group has unresolved convergence input. The intent
-    /// will be regenerated from the canonical state when the group becomes
-    /// stable. If that state refuses it, the engine drops it and announces
-    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
+    /// yet because the group has unresolved convergence input, or an earlier
+    /// send to the group is still queued: a send never goes ahead of one
+    /// queued before it, though one queued admin change may take the drain's
+    /// first attempt after a convergence pass. The intent will be regenerated
+    /// from the canonical state when the group becomes stable, after those
+    /// queued before it. If that state refuses it, the engine drops it and
+    /// announces [`GroupEvent::QueuedIntentRefused`] with this `intent_id`;
+    /// if that state already holds the change, the engine drops it with
+    /// nothing to publish and the drain returns [`SendResult::NoChange`].
     Queued {
         group_id: GroupId,
         intent_id: MessageId,

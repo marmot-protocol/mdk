@@ -124,6 +124,11 @@ impl AppClient {
                 "dropping imported history events that fail their checks",
             );
         }
+        // Until the next seam, storage may hold no names (a new connection)
+        // or old ones: give it the roster's, so these rows name their source.
+        if self.linked_devices_changed {
+            self.refresh_device_labels();
+        }
         self.app.import_account_app_events(
             &self.state.label,
             &group_id_hex,

@@ -162,6 +162,17 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's recovery status may have changed: re-read
     /// `account_recovery_status`. Carries no group identities. Not raised
     /// until the recovery runner owns history (mdk#2660).
@@ -565,6 +576,13 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             } => Self::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::ChatHistoryImportsChanged {
+                account_id_hex,
+                account_label,
+            } => Self::ChatHistoryImportsChanged {
                 account_id_hex,
                 account_label,
             },

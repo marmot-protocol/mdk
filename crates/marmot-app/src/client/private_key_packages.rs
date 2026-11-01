@@ -48,11 +48,20 @@
 //!   asked. It goes once it can never join: its carrier withdrawn, its
 //!   KeyPackage used or expired, or the chat forgotten or disbanded. A full
 //!   stash makes room for a new Welcome by dropping its oldest held one.
+//! - Adding a sibling to a chat (3.5b) leaves the engine owing it a sibling
+//!   Welcome, built from a KeyPackage that sibling handed over. Once the
+//!   Add's Commit is published, and in each maintenance pass, this device
+//!   sends each owed one as a 461 in the trusted device group, while its own
+//!   leaf there is tagged. It records the 461's app event id on the Welcome
+//!   before the send, so one Welcome is never carried twice at once. The
+//!   Welcome is delivered once a drain reports that 461 published, and owed
+//!   again once it reached no one, for the next pass to send in a new 461.
+//!   Delivered means one relay took it; nothing sends it again (3.5e).
 
 use base64::Engine as _;
-use cgka_traits::app_components::{
-    DeviceSlotId, NOSTR_ROUTING_MAX_RELAYS, validate_nostr_relay_url,
-};
+use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
+use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
+use cgka_traits::error::EngineError;
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
@@ -60,12 +69,12 @@ use cgka_traits::{
     Timestamp,
 };
 use marmot_session::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, SiblingWelcome, private_key_package_stock,
-    validate_received_private_key_package,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
+    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
@@ -200,8 +209,9 @@ impl AppClient {
 
     /// Admit a sibling Welcome that adds this device to a chat, for
     /// [`Self::stash_sibling_welcome`] to keep. Beyond a hand-off's checks,
-    /// its relays must be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay
-    /// URLs, and its KeyPackage one this device issued to the sender and
+    /// its relays must pass [`valid_sibling_welcome_relays`] (one to 16
+    /// relay URLs distinct once parsed, the rule the sender's Add checks
+    /// too), and its KeyPackage one this device issued to the sender and
     /// still holds; the join checks that KeyPackage again. An error is a
     /// read that failed, which the caller retries rather than drop the
     /// Welcome.
@@ -658,6 +668,214 @@ impl AppClient {
             }))
     }
 
+    /// Add the sibling in `sibling` to `chat` with a KeyPackage it handed
+    /// this device, then send the sibling Welcome the Add leaves owed once
+    /// its Commit is published. The engine refuses the Add, writing nothing,
+    /// unless both devices are tagged in the trusted device group and the
+    /// chat names its relays; it checks a queued Add again at drain, and a
+    /// refusal there retires the queued Add with its KeyPackage. The
+    /// KeyPackage is spent either way and never handed back: an error after
+    /// the engine took the Add reads the same as a refusal, and a KeyPackage
+    /// returned then could reach two Welcomes. Upkeep asks the sibling for
+    /// more.
+    // 3.5c calls this; until then only tests do.
+    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
+    pub(crate) async fn add_sibling_to_chat(
+        &mut self,
+        chat: &GroupId,
+        sibling: &DeviceSlotId,
+    ) -> Result<(), AppError> {
+        let key_package = self
+            .take_private_key_package(sibling)?
+            .ok_or(AppError::DeviceGroupRefused("no_private_key_package"))?;
+        let audit_context = Self::local_human_action_context(
+            "add_own_account_devices",
+            vec!["members"],
+            Vec::new(),
+            Some(1),
+        );
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::AddOwnAccountDevices {
+                    group_id: chat.clone(),
+                    siblings: vec![SiblingKeyPackage {
+                        slot: *sibling,
+                        key_package,
+                    }],
+                },
+                audit_context,
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
+        let held = self.epoch_gap_held_groups()?;
+        self.send_owed_sibling_welcomes(&held).await;
+        Ok(())
+    }
+
+    /// Send each sibling Welcome this device owes as a 461 in the trusted
+    /// device group; a failure waits for the next pass.
+    pub(crate) async fn send_owed_sibling_welcomes(&mut self, held: &[GroupId]) {
+        if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
+            return;
+        }
+        if let Err(error) = self.try_send_owed_sibling_welcomes(held).await {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "send_owed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(),
+                "could not send owed sibling Welcomes"
+            );
+        }
+    }
+
+    /// Nothing goes out until this device's own leaf is tagged, since its
+    /// sibling would refuse it. Each 461 is pinned to the epoch whose tag was
+    /// read: the engine encrypts it under that epoch or refuses it before
+    /// writing anything, and never queues it behind a commit that may change
+    /// the tag. A refused one leaves its Welcome owed, with no carrier, and
+    /// the pass stops there; the next pass reads the tag again. A Welcome
+    /// carried by a 461 this process sent waits for that 461's outcome; one
+    /// carried before the app last stopped is sent again, since its 461 may
+    /// never have left. One from a slot other than this device's, or to a
+    /// device the roster no longer lists, waits until it expires.
+    async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
+        let Some(exchange) = self.device_group_exchange()? else {
+            return Ok(());
+        };
+        if held.contains(&exchange.group_id) || !exchange.tagged {
+            return Ok(());
+        }
+        let mut sent = 0usize;
+        for owed in self
+            .runtime
+            .owed_sibling_welcomes(Timestamp(unix_now_seconds()))?
+        {
+            if let Some(carrier) = &owed.carrier
+                && (self.sibling_welcome_carriers.contains(carrier)
+                    || !self
+                        .runtime
+                        .sibling_welcome_send_failed(&owed.id, carrier)?)
+            {
+                continue;
+            }
+            let Ok(welcome) = SiblingWelcome::decode(&owed.content) else {
+                continue;
+            };
+            if welcome.from != exchange.own_slot || !exchange.is_sibling(&welcome.to) {
+                continue;
+            }
+            let event = self.device_group_event(
+                KIND_SIBLING_WELCOME,
+                base64::engine::general_purpose::STANDARD.encode(&owed.content),
+            )?;
+            let carrier = hex::decode(&event.id)?;
+            if !self.runtime.carry_sibling_welcome(&owed.id, &carrier)? {
+                continue;
+            }
+            self.sibling_welcome_carriers.insert(carrier.clone());
+            // A 461 whose send failed, or whose outcome is unknown after an
+            // error, leaves the Welcome owed again: a second 461 for it
+            // joins nothing twice.
+            let result = self
+                .send_device_group_event_at(&exchange.group_id, event, Some(exchange.pin))
+                .await;
+            if matches!(result, Ok(true)) {
+                sent += 1;
+                continue;
+            }
+            self.sibling_welcome_carriers.remove(&carrier);
+            self.runtime
+                .sibling_welcome_send_failed(&owed.id, &carrier)?;
+            // Refused before anything was encrypted: the epoch moved or is
+            // about to, so the tag read is stale; the next pass reads it again.
+            if let Err(error) = &result
+                && matches!(
+                    error.as_engine_error(),
+                    Some(
+                        EngineError::AppMessageEpochUnsettled { .. }
+                            | EngineError::AppMessageEpochMismatch { .. }
+                    )
+                )
+            {
+                break;
+            }
+            result?;
+        }
+        if sent > 0 {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                method = "send_owed_sibling_welcomes",
+                sent,
+                "sent sibling Welcomes"
+            );
+        }
+        Ok(())
+    }
+
+    /// Settle every sibling Welcome a 461 in `effects` carried: delivered
+    /// once published, owed again once it reached no one. A 461 goes only
+    /// to the device group this device tags from, so effects from other
+    /// groups read nothing. Each carrier leaves the in-flight set before the
+    /// engine settles it, so one whose settling fails reads as carried
+    /// before this run and the next pass sends its Welcome again.
+    pub(crate) fn settle_sibling_welcome_carriers(
+        &mut self,
+        effects: &marmot_session::AccountDeviceEffects,
+    ) {
+        let Some(device_group) = self.runtime.device_tag_group() else {
+            return;
+        };
+        let carrier = |group_id: &GroupId, app_event_id: &str| {
+            (group_id == device_group)
+                .then(|| hex::decode(app_event_id).ok())
+                .flatten()
+        };
+        let published: Vec<Vec<u8>> = effects
+            .published_app_messages
+            .iter()
+            .filter_map(|message| carrier(&message.group_id, &message.app_event_id))
+            .collect();
+        let failed: Vec<Vec<u8>> = effects
+            .failed_app_messages
+            .iter()
+            .filter_map(|message| carrier(&message.group_id, &message.app_event_id))
+            .collect();
+        if published.is_empty() && failed.is_empty() {
+            return;
+        }
+        for carrier in published.iter().chain(&failed) {
+            self.sibling_welcome_carriers.remove(carrier);
+        }
+        let result = self
+            .runtime
+            .owed_sibling_welcomes(Timestamp(0))
+            .map_err(AppError::from)
+            .and_then(|owed| {
+                for owed in owed {
+                    let Some(carrier) = owed.carrier else {
+                        continue;
+                    };
+                    if published.contains(&carrier) {
+                        self.runtime.sibling_welcome_delivered(&owed.id, &carrier)?;
+                    } else if failed.contains(&carrier) {
+                        self.runtime
+                            .sibling_welcome_send_failed(&owed.id, &carrier)?;
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "settle_sibling_welcome_carriers",
+                error_kind = error.privacy_safe_kind(),
+                "could not settle sibling Welcome carriers"
+            );
+        }
+    }
+
     /// Need `want` usable KeyPackages from `issuer`, a burst for adding it to
     /// many chats (3.5). A larger need than before is asked for at the next
     /// upkeep, not an hour after the last request.
@@ -698,17 +916,4 @@ impl AppClient {
             .delete_received_private_key_packages_from(&hex::encode(sibling))?;
         Ok(())
     }
-}
-
-/// Whether `relays` is a sibling Welcome's valid relay list: one to
-/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated once parsed.
-/// Parsing folds host case, a default port and an empty path, so two
-/// spellings of one relay count as a repeat.
-fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
-    let mut parsed = BTreeSet::new();
-    (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
-        && relays.iter().all(|relay| {
-            validate_nostr_relay_url(relay).is_ok()
-                && url::Url::parse(relay).is_ok_and(|url| parsed.insert(url))
-        })
 }

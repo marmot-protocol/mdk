@@ -1314,6 +1314,7 @@ impl SqliteAppStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::account_recovery::tests::{assert_backend, assert_serialization};
 
     fn fixture() -> (SqliteAccountStorage, RecoveryRevisionFence, u64, [u8; 16]) {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -1780,11 +1781,16 @@ mod tests {
                     &fence,
                     attempt,
                     id,
-                    &[checkpoint(&token, vec![covered("a"), failed])],
+                    &[checkpoint(&token, vec![covered("a"), failed.clone()])],
                     RecoveryEligibility::Retry
                 )
                 .unwrap(),
             "a best-effort relay's gap never withholds the certificate"
+        );
+        assert!(
+            store.app_storage().recovery_scope_snapshots(id).unwrap()[0].checkpoints
+                == vec![covered("a"), failed],
+            "the best-effort relay's checkpoint is kept"
         );
 
         let (store, fence, attempt, id) = fixture();
@@ -1809,18 +1815,16 @@ mod tests {
                 .unwrap(),
             "a required relay that was never admitted cannot vouch"
         );
-        assert!(
-            store
-                .app_storage()
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    id,
-                    &[checkpoint(&token, vec![covered("d")])],
-                    RecoveryEligibility::Retry
-                )
-                .is_err(),
-            "a checkpoint names only a required or admitted relay"
+        // A checkpoint names only a required or admitted relay.
+        assert_serialization(
+            store.app_storage().checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[checkpoint(&token, vec![covered("d")])],
+                RecoveryEligibility::Retry,
+            ),
+            "invalid recovery scope checkpoint",
         );
     }
 
@@ -1995,6 +1999,18 @@ mod tests {
             .install_recovery_scope_plan(&fence, attempt, ticket.id, &goals)
             .unwrap()
             .unwrap();
+        // Predicate 1 ignores endpoint coverage, even from every required
+        // relay that would certify history.
+        assert!(
+            !app.checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                ticket.id,
+                &[checkpoint(&tokens[0], vec![covered("a"), covered("b")])],
+                RecoveryEligibility::Retry
+            )
+            .unwrap()
+        );
         let updates = tokens
             .iter()
             .map(|t| {
@@ -2136,11 +2152,11 @@ mod tests {
             .attempt_serial;
         let mut missing_placeholder = plan(&["a", "b"]);
         missing_placeholder.scope_id = 1;
-        assert!(
-            store
-                .install_recovery_scope_plan(&fence, attempt, ticket.id, &[missing_placeholder])
-                .is_err(),
-            "a complete installed plan must explicitly resolve every existing scope, including placeholder zero"
+        // A complete installed plan must explicitly resolve every existing
+        // scope, including placeholder zero.
+        assert_serialization(
+            store.install_recovery_scope_plan(&fence, attempt, ticket.id, &[missing_placeholder]),
+            "invalid recovery scope checkpoint",
         );
         assert!(
             store
@@ -2522,17 +2538,17 @@ mod tests {
             }
             let before_failure = store.app_storage().recovery_revision_fence().unwrap();
             store.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_invalidation BEFORE UPDATE ON account_recovery_scopes BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-            assert!(
+            assert_backend(
                 store
                     .app_storage()
                     .record_reconciliation_items(std::iter::once((
                         &TransportReconciliationRoute::Inbox,
                         &TransportReconciliationItem {
                             event_id: [9; 32],
-                            created_at: now + 1
-                        }
-                    )))
-                    .is_err()
+                            created_at: now + 1,
+                        },
+                    ))),
+                "injected",
             );
             assert_eq!(
                 store.app_storage().recovery_revision_fence().unwrap(),
@@ -2919,17 +2935,15 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(
-            store
-                .app_storage()
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    id,
-                    &[checkpoint(&token, vec![covered("a"), covered("b")])],
-                    RecoveryEligibility::Retry
-                )
-                .is_err()
+        assert_backend(
+            store.app_storage().checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[checkpoint(&token, vec![covered("a"), covered("b")])],
+                RecoveryEligibility::Retry,
+            ),
+            "injected",
         );
         store
             .lock()
@@ -2988,7 +3002,7 @@ mod tests {
                 "injected domain persistence failure".into(),
             ))
         });
-        assert!(result.is_err());
+        assert_serialization(result, "injected domain persistence failure");
         assert!(
             !store
                 .app_storage()
@@ -3011,128 +3025,146 @@ mod tests {
     #[test]
     fn unversioned_goal_expansion_and_unknown_formats_fail_closed() {
         let (store, fence, attempt, id) = fixture();
-        store
+        let token = store
             .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let mut additional = plan(&["a", "b"]);
         additional.scope_id = 1;
-        assert!(
-            store
-                .app_storage()
-                .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"]), additional])
-                .is_err()
+        assert_serialization(
+            store.app_storage().install_recovery_scope_plan(
+                &fence,
+                attempt,
+                id,
+                &[plan(&["a", "b"]), additional],
+            ),
+            "recovery scopes expanded without a new revision",
         );
         let mut widened = plan(&["a", "b"]);
         widened.until_seconds = 11;
-        assert!(
+        assert_serialization(
             store
                 .app_storage()
-                .install_recovery_scope_plan(&fence, attempt, id, &[widened])
-                .is_err()
+                .install_recovery_scope_plan(&fence, attempt, id, &[widened]),
+            "recovery goal changed without a new revision",
         );
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_scopes SET scope_format = 2")
             .unwrap();
+        assert_serialization(
+            store.app_storage().install_recovery_scope_plan(
+                &fence,
+                attempt,
+                id,
+                &[plan(&["a", "b"])],
+            ),
+            "unsupported recovery scope format",
+        );
+        // Every read fails closed: a checkpoint does not decode the row as
+        // the format it knows and complete, and the owner's view errors
+        // rather than skipping the scope.
+        assert_serialization(
+            store.app_storage().checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[checkpoint(&token, vec![covered("a"), covered("b")])],
+                RecoveryEligibility::Retry,
+            ),
+            "unsupported recovery scope format",
+        );
         assert!(
             store
                 .app_storage()
-                .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
-                .is_err()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+        assert_serialization(
+            store.app_storage().recovery_scope_snapshots(id),
+            "invalid recovery scope checkpoint",
         );
     }
 
+    /// An obligation with no installed plan never qualifies: its placeholder
+    /// scope fails it closed, so loss nobody fetched is never completed.
     #[test]
-    fn maintenance_boundary_is_independent_from_history_and_known_event_predicates() {
+    fn an_obligation_with_no_installed_plan_never_qualifies() {
         let (store, fence, attempt, id) = fixture();
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE account_recovery_obligations SET predicate = 2 WHERE id = ?1",
-                [id.as_slice()],
+        let app = store.app_storage();
+        assert!(
+            !app.checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                id,
+                &[],
+                RecoveryEligibility::Retry
             )
-            .unwrap();
-        let token = store
-            .app_storage()
-            .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a"])])
             .unwrap()
-            .unwrap()
-            .remove(0);
-        let mut boundary = covered("a");
-        boundary.exhaustive = false;
-        boundary.admission_complete = false;
-        boundary.outcome = RecoveryScopeOutcome::Partial;
-        assert!(
-            store
-                .app_storage()
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    id,
-                    &[checkpoint(&token, vec![boundary])],
-                    RecoveryEligibility::Retry
-                )
-                .unwrap()
         );
-
-        let (store, fence, attempt, id) = fixture();
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE account_recovery_obligations SET predicate = 1 WHERE id = ?1",
-                [id.as_slice()],
-            )
-            .unwrap();
-        let mut known = plan(&["a"]);
-        known.known_event_id = Some([7; 32]);
-        let mut alternate = known.clone();
-        alternate.scope_id = 1;
-        alternate.required_endpoints = vec!["b".into()];
-        alternate.admitted_endpoints = vec!["b".into()];
-        let token = store
-            .app_storage()
-            .install_recovery_scope_plan(&fence, attempt, id, &[known, alternate])
-            .unwrap()
-            .unwrap()
-            .remove(0);
-        assert!(
-            !store
-                .app_storage()
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    id,
-                    &[checkpoint(&token, vec![covered("a")])],
-                    RecoveryEligibility::Retry
-                )
-                .unwrap()
-        );
-        let mut retained = checkpoint(&token, vec![]);
-        retained.retained_known_event = true;
-        assert!(
-            store
-                .app_storage()
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    id,
-                    &[retained],
-                    RecoveryEligibility::Retry
-                )
-                .unwrap()
-        );
+        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
     }
+
+    /// A capture taken before the evidence grew never acknowledges, even with
+    /// a current fence and obligation revision: it would delete loss the
+    /// completion did not prove. A fresh capture does.
+    #[test]
+    fn a_stale_loss_capture_never_acknowledges() {
+        for use_snapshot in [false, true] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
+            app.ensure_account_projection("alice").unwrap();
+            app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+            let capture = || {
+                (
+                    app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                        .unwrap(),
+                    app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                        .unwrap(),
+                )
+            };
+            let stale = capture();
+            app.mark_account_delivery_recovery("alice", 1, 2).unwrap();
+            let fence = app.recovery_revision_fence().unwrap();
+            let id = fence.obligations[0].0;
+            let attempt = app
+                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+                .unwrap()
+                .unwrap()
+                .attempt_serial;
+            qualify_loss(&store, &fence, attempt, id);
+            let acknowledge = |(watermarks, snapshot): (
+                Vec<crate::RecoveryLossWatermark>,
+                crate::RecoveryLossSnapshot,
+            )| {
+                if use_snapshot {
+                    app.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                } else {
+                    app.acknowledge_recovery_loss(&fence, id, &watermarks)
+                }
+                .unwrap()
+            };
+            assert!(!acknowledge(stale));
+            assert_eq!(
+                app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(acknowledge(capture()));
+        }
+    }
+
     fn qualify_loss(
         store: &SqliteAccountStorage,
         fence: &RecoveryRevisionFence,
         attempt: u64,
         id: [u8; 16],
-    ) {
+    ) -> RecoveryScopeToken {
         let token = store
             .app_storage()
             .install_recovery_scope_plan(fence, attempt, id, &[plan(&["a", "b"])])
@@ -3151,44 +3183,7 @@ mod tests {
                 )
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn interrupted_plane_ack_rearms_on_open_without_forgiving_retry_cost() {
-        let (store, fence, attempt, id) = fixture();
-        let retry = store.app_storage().recovery_retry_state().unwrap();
-        qualify_loss(&store, &fence, attempt, id);
-        assert_eq!(
-            store
-                .app_storage()
-                .restore_unacknowledged_recovery_loss()
-                .unwrap(),
-            1
-        );
-        assert!(
-            store
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(store.app_storage().recovery_retry_state().unwrap(), retry);
-        assert!(
-            store
-                .app_storage()
-                .recovery_revision_fence()
-                .unwrap()
-                .obligations[0]
-                .1
-                > fence.obligations[0].1
-        );
-        assert_eq!(
-            store
-                .app_storage()
-                .restore_unacknowledged_recovery_loss()
-                .unwrap(),
-            0
-        );
+        token
     }
 
     #[test]
@@ -3287,7 +3282,7 @@ mod tests {
             BEGIN SELECT RAISE(ABORT,'injected'); END;",
                 )
                 .unwrap();
-            assert!(acknowledge().is_err());
+            assert_backend(acknowledge(), "injected");
             store
                 .lock()
                 .unwrap()
@@ -3413,8 +3408,8 @@ mod tests {
     fn file_reopen_restores_completion_guard_and_frozen_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recovery.sqlite");
-        let key = crate::SqlCipherKey::new("recovery scope reopen test").unwrap();
-        let (fence, retry, id) = {
+        let key = crate::SqlCipherKey::raw([0x61; 32]);
+        let (fence, retry, id, token) = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             let app = store.app_storage();
             app.ensure_account_projection("alice").unwrap();
@@ -3425,17 +3420,24 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let id = fence.obligations[0].0;
-            qualify_loss(&store, &fence, retry.attempt_serial, id);
-            (fence, retry, id)
+            let token = qualify_loss(&store, &fence, retry.attempt_serial, id);
+            (fence, retry, id, token)
         };
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key)
             .unwrap()
             .app_storage();
         let scopes = reopened.recovery_scope_snapshots(id).unwrap();
         assert_eq!(scopes.len(), 1);
-        assert_eq!(scopes[0].plan.until_seconds, 10);
-        assert_eq!(scopes[0].checkpoints.len(), 2);
+        assert!(scopes[0].plan == plan(&["a", "b"]));
+        assert!(scopes[0].token == token);
+        assert!(scopes[0].checkpoints == vec![covered("a"), covered("b")]);
+        // The completion no plane acknowledged rearms once, under a higher
+        // revision, keeping its retry cost.
         assert_eq!(reopened.restore_unacknowledged_recovery_loss().unwrap(), 1);
+        assert!(
+            reopened.recovery_revision_fence().unwrap().obligations[0].1 > fence.obligations[0].1
+        );
+        assert_eq!(reopened.restore_unacknowledged_recovery_loss().unwrap(), 0);
         assert_eq!(reopened.recovery_retry_state().unwrap(), retry);
         assert!(
             reopened
@@ -3483,6 +3485,11 @@ mod tests {
                     RecoveryEligibility::Retry
                 )
                 .unwrap()
+        );
+        assert!(
+            store.app_storage().recovery_scope_snapshots(id).unwrap()[0].checkpoints
+                == vec![covered("a")],
+            "the late evidence was accepted"
         );
         let current = store.app_storage().recovery_revision_fence().unwrap();
         let next = store

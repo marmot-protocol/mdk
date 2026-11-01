@@ -8,6 +8,12 @@ name: CI
 # master pushes only refresh the Rust caches pull requests and merge groups
 # restore: GitHub scopes a cache saved by a merge-group run to its temporary
 # branch. Those pushes run only when an input of the rust-cache key changes.
+#
+# GitHub evicts the least recently used caches once a repository passes 10 GB,
+# so that budget holds only the caches saved here and the wn-agent darwin
+# builds, which wait for the shared macOS runners. Other workflows build without
+# a cache or restore one of these with `save-if: false`;
+# scripts/test_ci_workflow_policy.py checks it.
 on:
   pull_request:
   push:

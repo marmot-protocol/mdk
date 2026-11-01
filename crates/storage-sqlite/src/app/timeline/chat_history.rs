@@ -13,6 +13,65 @@ use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
 use zeroize::Zeroizing;
 
+/// The device a chat history was imported from (mdk#2628 4.2d).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryImportSource {
+    /// The device's roster slot, 64 lowercase hex characters.
+    pub device_slot_id_hex: String,
+    /// The device's name as [`SqliteAppStorage::set_device_labels`] last gave
+    /// it: empty when it has none, is no longer on the roster, or none was
+    /// given since the database opened.
+    pub device_label: String,
+}
+
+impl HistoryImportSource {
+    pub(crate) fn new(slot: &[u8], label: Option<String>) -> Self {
+        Self {
+            device_slot_id_hex: hex::encode(slot),
+            device_label: label.unwrap_or_default(),
+        }
+    }
+}
+
+/// The name of an imported row's source, or NULL for a row that arrived
+/// live or a source no name was given for. Reads `timeline`.
+pub(crate) const TIMELINE_IMPORT_LABEL_SQL: &str = "(SELECT label.label FROM app_event_imports imported JOIN temp.device_labels label ON label.slot = imported.source_slot WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
+
+/// The per-connection counter [`SqliteAppStorage::watch_history_imports`]
+/// keeps: every row added to or removed from `app_event_imports` (a cascade
+/// from `app_events` included), every change to a parked history delivery
+/// and every change to `temp.device_labels` bumps it, inside the writing
+/// transaction. TEMP, so nothing is stored.
+const WATCH_HISTORY_IMPORTS_SQL: &str = "
+CREATE TEMP TABLE IF NOT EXISTS history_import_changes (n INTEGER NOT NULL);
+INSERT INTO temp.history_import_changes (n)
+    SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM temp.history_import_changes);
+CREATE TEMP TRIGGER IF NOT EXISTS history_import_added AFTER INSERT ON main.app_event_imports
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_import_removed AFTER DELETE ON main.app_event_imports
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_parked AFTER INSERT ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_deferred AFTER UPDATE ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_dropped AFTER DELETE ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_added AFTER INSERT ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_changed AFTER UPDATE ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_removed AFTER DELETE ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+";
+
+/// The latest history import into one chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestHistoryImport {
+    pub group_id_hex: String,
+    pub source: HistoryImportSource,
+    pub imported_at: u64,
+}
+
 /// One app event of a chat in chat order, as a history bundle sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryExportRow {
@@ -218,8 +277,9 @@ impl SqliteAppStorage {
     /// A row stays out when branch selection withdrew it, its retention
     /// expired by `now`, it is local to this device (group-system rows, and
     /// this device's sends no relay accepted), its content no longer matches
-    /// its id (a scrubbed control), or it is a deleted or removed message or
-    /// targets one. A deletion or removal itself goes in.
+    /// its id (a scrubbed control, or stored tags that no longer decode), or it
+    /// is a deleted or removed message or targets one. A deletion or removal
+    /// itself goes in.
     pub fn history_export_page(
         &self,
         group_id_hex: &str,
@@ -284,7 +344,7 @@ impl SqliteAppStorage {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        app_event_tags(row, 6)?,
                         row.get::<_, Option<i64>>(7)?,
                         row.get::<_, Option<bool>>(8)?,
                         row.get::<_, bool>(9)?,
@@ -298,14 +358,8 @@ impl SqliteAppStorage {
             .map(
                 |(id, epoch, at, sender, plaintext, kind, tags, retention, grant, left_out)| {
                     let created_at = i64_to_u64(at)?;
-                    let event = MarmotAppEvent::new(
-                        sender,
-                        created_at,
-                        i64_to_u64(kind)?,
-                        tags_from_json(tags)
-                            .map_err(|err| StorageError::Backend(err.to_string()))?,
-                        plaintext,
-                    );
+                    let event =
+                        MarmotAppEvent::new(sender, created_at, i64_to_u64(kind)?, tags, plaintext);
                     let event = (!left_out && event.id == id).then(|| -> StorageResult<_> {
                         Ok(HistoryExportEvent {
                             event,
@@ -321,6 +375,105 @@ impl SqliteAppStorage {
                     })
                 },
             )
+            .collect()
+    }
+
+    /// Count, on this connection, every change chat history imports read:
+    /// imported rows, parked deliveries and device names (see
+    /// [`Self::history_imports_generation`]). Idempotent; the count starts at
+    /// zero and is not stored.
+    pub fn watch_history_imports(&self) -> StorageResult<()> {
+        self.lock()?
+            .execute_batch(WATCH_HISTORY_IMPORTS_SQL)
+            .storage()
+    }
+
+    /// How many changes chat history imports read since
+    /// [`Self::watch_history_imports`]; equal counts mean nothing they read
+    /// changed. Fails before the first watch.
+    pub fn history_imports_generation(&self) -> StorageResult<u64> {
+        let generation = self
+            .lock()?
+            .query_row_cached("SELECT n FROM temp.history_import_changes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .storage()?;
+        i64_to_u64(generation)
+    }
+
+    /// Replace the device names imported rows resolve their source against
+    /// with `labels`, by roster slot; the last name given for a slot wins.
+    /// Kept in memory for this connection only, so every open starts with
+    /// none. The same names again write nothing, so they change no
+    /// [`Self::history_imports_generation`].
+    pub fn set_device_labels(&self, labels: &[(DeviceSlotId, String)]) -> StorageResult<()> {
+        let wanted: BTreeMap<Vec<u8>, String> = labels
+            .iter()
+            .map(|(slot, label)| (slot.as_slice().to_vec(), label.clone()))
+            .collect();
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let held = conn
+                .prepare_cached("SELECT slot, label FROM temp.device_labels")
+                .storage()?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .storage()?
+                .collect::<Result<BTreeMap<Vec<u8>, String>, _>>()
+                .storage()?;
+            if held == wanted {
+                return Ok(());
+            }
+            conn.execute_cached("DELETE FROM temp.device_labels", [])
+                .storage()?;
+            for (slot, label) in labels {
+                conn.execute_cached(
+                    "INSERT OR REPLACE INTO temp.device_labels (slot, label) VALUES (?1, ?2)",
+                    params![slot.as_slice(), label],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Each chat's latest history import: when it landed and the device it
+    /// came from. Of two sources importing in the same second, which nothing
+    /// orders, the greater slot is named.
+    pub fn latest_history_imports(&self) -> StorageResult<Vec<LatestHistoryImport>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT latest.group_id_hex, latest.source_slot, label.label, latest.imported_at
+                 FROM (SELECT group_id_hex, source_slot, imported_at,
+                              ROW_NUMBER() OVER (PARTITION BY group_id_hex
+                                                 ORDER BY imported_at DESC, source_slot DESC)
+                                  AS rank
+                       FROM app_event_imports) latest
+                 LEFT JOIN temp.device_labels label ON label.slot = latest.source_slot
+                 WHERE latest.rank = 1
+                 ORDER BY latest.group_id_hex",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(group_id_hex, slot, label, imported_at)| {
+                Ok(LatestHistoryImport {
+                    group_id_hex,
+                    source: HistoryImportSource::new(&slot, label),
+                    imported_at: i64_to_u64(imported_at)?,
+                })
+            })
             .collect()
     }
 
@@ -975,5 +1128,116 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    // mdk#2628 4.2d: an imported row names its source by the name last given
+    // for it on this connection, and a live row names none. Each chat's
+    // latest import reads the same way.
+    #[test]
+    fn an_imported_row_names_its_source_by_the_name_last_given() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let (phone, laptop) = (DeviceSlotId::from([7; 32]), DeviceSlotId::from([8; 32]));
+        let live = chat(1, 3, 30, "live");
+        let first = chat(2, 1, 10, "first");
+        let second = chat(2, 2, 20, "second");
+        s.record_app_event(&live).unwrap();
+        let named = |slot: DeviceSlotId, label: &str| HistoryImportSource {
+            device_slot_id_hex: hex::encode(slot),
+            device_label: label.to_owned(),
+        };
+        let source = |id: &str| {
+            s.timeline_message(GROUP, id)
+                .unwrap()
+                .unwrap()
+                .imported_from
+        };
+        let latest = || s.latest_history_imports().unwrap();
+
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        let outcome = s
+            .import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        let [TimelineMessageChange::Upsert { message, .. }] = outcome.update.changes.as_slice()
+        else {
+            panic!("one upsert");
+        };
+        assert_eq!(message.imported_from, Some(named(phone, "Phone")));
+        s.import_app_events(GROUP, &laptop, &[imported(&second, Vec::new())], NOW + 1)
+            .unwrap();
+
+        assert_eq!(source(&live.message_id_hex), None);
+        assert_eq!(source(&second.message_id_hex), Some(named(laptop, "")));
+        let page = s
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some(GROUP.to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.imported_from.clone())
+                .collect::<Vec<_>>(),
+            [Some(named(phone, "Phone")), Some(named(laptop, "")), None]
+        );
+        assert_eq!(
+            latest(),
+            [LatestHistoryImport {
+                group_id_hex: GROUP.to_owned(),
+                source: named(laptop, ""),
+                imported_at: NOW + 1,
+            }]
+        );
+
+        // The names given next replace them all.
+        s.set_device_labels(&[(laptop, "Laptop".to_owned())])
+            .unwrap();
+        assert_eq!(source(&first.message_id_hex), Some(named(phone, "")));
+        assert_eq!(latest()[0].source, named(laptop, "Laptop"));
+    }
+
+    // mdk#2628 4.2d: the watch counts every change chat history imports read,
+    // a cascade from `app_events` included. Two sources importing in the same
+    // second name the greater slot.
+    #[test]
+    fn the_history_import_watch_counts_every_change_it_reads() {
+        let account = SqliteAccountStorage::in_memory().unwrap();
+        let s = account.app_storage();
+        assert!(s.history_imports_generation().is_err(), "nothing watched");
+        s.watch_history_imports().unwrap();
+        s.watch_history_imports().unwrap();
+        let generation = || s.history_imports_generation().unwrap();
+        assert_eq!(generation(), 0);
+        let (phone, laptop) = (DeviceSlotId::from([7; 32]), DeviceSlotId::from([8; 32]));
+        let first = chat(2, 1, 10, "first");
+        let second = chat(2, 2, 20, "second");
+
+        s.import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        let imported_once = generation();
+        assert!(imported_once > 0);
+        s.import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        assert_eq!(generation(), imported_once, "a held row adds nothing");
+        s.import_app_events(GROUP, &laptop, &[imported(&second, Vec::new())], NOW)
+            .unwrap();
+        assert!(generation() > imported_once);
+        assert_eq!(
+            s.latest_history_imports().unwrap()[0]
+                .source
+                .device_slot_id_hex,
+            hex::encode(laptop)
+        );
+
+        let unnamed = generation();
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        let named = generation();
+        assert!(named > unnamed);
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        assert_eq!(generation(), named, "the same names write nothing");
+
+        let held = generation();
+        account.delete_local_group_data(GROUP).unwrap();
+        assert!(generation() > held, "the wipe's cascade counts");
+        assert!(s.latest_history_imports().unwrap().is_empty());
     }
 }

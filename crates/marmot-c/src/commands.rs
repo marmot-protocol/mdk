@@ -59,6 +59,7 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
+use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
 use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
@@ -790,6 +791,16 @@ c_cmd! {
     /// `marmot_linked_device_list_free`.
     async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
 
+    /// List the held chats whose history from another of this account's
+    /// devices is arriving or has arrived: `Receiving` while a delivery
+    /// waits to be imported, with `retrying` once an attempt to get its
+    /// bundle failed, then `Imported` with the device it came from and when. Empty
+    /// while device groups are off. Re-read on the
+    /// `ChatHistoryImportsChanged` event, which also fires when a source
+    /// device is renamed or removed. Free with
+    /// `marmot_chat_history_import_list_free`.
+    async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
+
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user
     /// while it is. Always false until this device trusts a device group,
@@ -814,10 +825,10 @@ c_cmd! {
     /// device whose link is not made yet. Re-read on the
     /// `LinkedDevicesChanged` event.
     async fn marmot_remove_linked_device(account_ref: str, slot_id_hex: str) -> unit = remove_linked_device;
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero while device groups are off. Not evented:
-    /// read it when showing the device list.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has (removed, or no longer listed by its device group), because
+    /// the chat doesn't take a same-account removal; a chat admin can remove it.
+    /// Zero while device groups are off. Not evented: read it when showing the device list.
     async fn marmot_removed_device_leftover_chats(account_ref: str) -> scalar(u32) = removed_device_leftover_chats;
 
     /// List the sign-ins of this account that this device does not

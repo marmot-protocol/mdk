@@ -29,6 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
+use crate::client::sign_out::SiblingSignOut;
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -1038,6 +1039,10 @@ async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
     }
 }
 
+/// How often `sign_out_and_wipe` checks whether its `leaving` commit is
+/// confirmed (mdk#2628 D67).
+const SIGN_OUT_LEAVING_POLL: Duration = Duration::from_millis(250);
+
 fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
     *stopping.borrow()
 }
@@ -1066,7 +1071,9 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Number of active MLS groups this account successfully left.
+    /// Number of active MLS groups this account successfully left. A chat
+    /// this device is no longer in, its copy removed or disbanded, is
+    /// neither left nor reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
@@ -1078,6 +1085,19 @@ pub struct WipeOutcome {
     /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
     /// secret-store nsec, ephemeral relay/subscription state) completed.
     pub local_cleanup: LocalCleanupReport,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings, and each of these chats takes a same-account removal from a
+    /// sibling that is in it (mdk#2628 D67).
+    #[serde(default)]
+    pub groups_left_to_siblings: u32,
+    /// This device could not ask its siblings to take it out within about
+    /// 30 seconds, so it tried to leave every chat itself; one it could not
+    /// leave is in `group_leave_failures`. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
+    #[serde(default)]
+    pub siblings_not_reached: bool,
 }
 
 /// A failed attempt to leave a single MLS group during the wipe.
@@ -1595,6 +1615,17 @@ pub enum MarmotAppEvent {
     /// progress. Carries no device, session or group identities, and may
     /// fire with no visible change.
     DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
         account_id_hex: String,
         account_label: String,
     },
@@ -2532,6 +2563,21 @@ impl MarmotAppRuntime {
         self.accounts.linked_devices(account_ref).await
     }
 
+    /// The held chats whose history from another of this account's devices
+    /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
+    /// delivery waits to be imported, with `retrying` once an attempt to
+    /// get its bundle failed, then `Imported` with the device it came from and when.
+    /// Facts only: an empty history sends nothing, and an expired delivery
+    /// leaves nothing. Empty while device groups are off. Refresh on
+    /// `ChatHistoryImportsChanged`; a device's name follows
+    /// `LinkedDevicesChanged`.
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        self.accounts.chat_history_imports(account_ref).await
+    }
+
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first. While it is,
     /// the device keeps its old KeyPackage in its slot, and after 30 days
@@ -2674,11 +2720,13 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero until this device trusts a device group, and
-    /// always zero in release builds until the device group's spec lands.
-    /// Read it when showing the device list; it is not evented.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has, because the chat doesn't take a same-account removal; a
+    /// chat admin can remove it. The device is one this account removed, or
+    /// one its device group stopped listing, as after a failed link. Zero
+    /// until this device trusts a device group, and always zero in release
+    /// builds until the device group's spec lands. Read it when showing the
+    /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
             .removed_device_leftover_chats(account_ref)
@@ -4594,6 +4642,15 @@ impl MarmotAppRuntime {
     /// device and from the relays the engine controls publishing to.
     ///
     /// Stages run in the order the spec (mdk#478) mandates:
+    /// 0. Signing out through siblings (mdk#2628 D67), when this device
+    ///    trusts a device group, its link is made and another device that is
+    ///    not leaving is listed: commit its own roster entry as `leaving` and
+    ///    wait about 30 seconds for that commit to be confirmed. Once it is,
+    ///    stage 1 skips each chat a sibling takes this device out of
+    ///    (`groups_left_to_siblings`); if it is not, stage 1 leaves every
+    ///    chat and `siblings_not_reached` is set. From here on a removal
+    ///    from the device group does not unlink this device, and no
+    ///    maintenance pass or pairing drive runs.
     /// 1. Best-effort leave for every active MLS group. Failures are collected
     ///    per group and do not abort the wipe. This MUST happen while MLS state
     ///    still exists — once the session DB is wiped the engine can no longer
@@ -4630,8 +4687,10 @@ impl MarmotAppRuntime {
     /// - Stages 1 and 2 are network-bound; their per-target failures are
     ///   surfaced for the app's partial-failure sheet and never block local
     ///   cleanup.
-    /// - An unlinked account (`ManagedAccount::unlinked`) skips stages 1 and
-    ///   2: its device group already removed this device.
+    /// - An unlinked account (`ManagedAccount::unlinked`) skips stages 0, 1
+    ///   and 2: its device group already removed this device.
+    /// - This device never leaves its device group: its account is that
+    ///   group's only admin, so a sibling removes it there.
     /// - Every account that can sign — local or external-signer — can be
     ///   wiped. Only tracked-only (npub) accounts are rejected. An external
     ///   signer that is unavailable at wipe time degrades stages 1 and 2 to
@@ -4654,12 +4713,24 @@ impl MarmotAppRuntime {
 
         let mut outcome = WipeOutcome::default();
 
-        // An unlinked device skips stages 1 and 2. Its device group removed
+        // From here until the wipe returns, the device group's removal of
+        // this device does not unlink it: the sign-out finishes what it has
+        // left. The mark drops with this future, finished or cancelled.
+        let _signing_out = (!account.unlinked)
+            .then(|| self.accounts.app.begin_signing_out(&account.account_id_hex));
+
+        // An unlinked device skips stages 0 to 2. Its device group removed
         // it: its siblings took its leaves out of the chats that allow it and
         // deleted its slot, and the account stays in every chat through them,
         // so a leave here would speak for an account that is not leaving
         // (mdk#2628 D67).
         if !account.unlinked {
+            // Stage 0: ask the siblings to take this device out of the chats
+            // they can, and of its device group.
+            let left_to_siblings = self
+                .sign_out_through_siblings(account_ref, &mut outcome)
+                .await;
+
             // Stage 1: best-effort leave for every active MLS group. We read the
             // group set directly from the in-memory account state (no relay round
             // trip). We attempt the leave for *every* group with local MLS
@@ -4684,8 +4755,13 @@ impl MarmotAppRuntime {
                     Vec::new()
                 }
             };
+            let storage = self.accounts.app.account_storage(&account.label).ok();
             for group in groups {
                 let group_id_hex = group.group_id_hex.clone();
+                if left_to_siblings.contains(&group_id_hex) {
+                    outcome.groups_left_to_siblings += 1;
+                    continue;
+                }
                 let group_id = match hex::decode(&group_id_hex) {
                     Ok(bytes) => GroupId::new(bytes),
                     Err(_) => {
@@ -4696,6 +4772,15 @@ impl MarmotAppRuntime {
                         continue;
                     }
                 };
+                // A chat whose copy here is removed or disbanded holds no
+                // leaf of this device to leave: a sibling or an admin
+                // already took it out, maybe while this sign-out waited.
+                if storage.as_ref().is_some_and(|storage| {
+                    cgka_traits::storage::GroupStorage::get_group(storage, &group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                }) {
+                    continue;
+                }
                 match self.leave_group(account_ref, &group_id).await {
                     Ok(_) => outcome.groups_left += 1,
                     Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
@@ -4735,6 +4820,85 @@ impl MarmotAppRuntime {
         }
 
         Ok(outcome)
+    }
+
+    /// Ask this device's siblings to take it out of the account's groups
+    /// (mdk#2628 D67): commit its own roster entry as `leaving`, and wait
+    /// about 30 seconds for that commit to be confirmed. Returns the chats a
+    /// sibling takes it out of, as hex group ids, which stage 1 does not
+    /// leave. Empty when it signs out on its own, and when the commit was not
+    /// confirmed in time, which `siblings_not_reached` reports.
+    ///
+    /// One deadline covers all of it, the worker's start included, and it is
+    /// polled first: once it has passed, no answer is taken, a confirmation
+    /// included, however busy the worker is. Dropping the attempt there is
+    /// safe at each await. A worker start left unsettled is reaped and
+    /// replaced by the next lookup. A step in flight runs to its end on the
+    /// worker, ahead of stage 1's leaves, and stores nothing when it
+    /// confirms; its only network wait is its `leaving` commit's publish,
+    /// which the Nostr relay plane gives up on after 20 seconds.
+    async fn sign_out_through_siblings(
+        &self,
+        account_ref: &str,
+        outcome: &mut WipeOutcome,
+    ) -> HashSet<String> {
+        // Without device groups no sibling can take this device out.
+        if !self.accounts.app.device_groups_enabled() {
+            return HashSet::new();
+        }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            left_to_siblings = self.ask_siblings_to_sign_out(account_ref) => left_to_siblings,
+        }
+    }
+
+    /// Take steps of signing out through siblings until one confirms the
+    /// `leaving` commit or finds this device signs out on its own; the
+    /// caller's deadline ends it otherwise. A step that fails is taken
+    /// again, so a passing error does not cost the sibling path. An account
+    /// whose worker cannot take commands at all, signed out without a wipe
+    /// or with no external signer registered, signs out on its own at once.
+    async fn ask_siblings_to_sign_out(&self, account_ref: &str) -> HashSet<String> {
+        if let Err(err) = self.accounts.worker_commands(account_ref).await {
+            tracing::info!(
+                target: "marmot_app::runtime",
+                method = "ask_siblings_to_sign_out",
+                error_kind = err.privacy_safe_kind(),
+                "no worker to take sign-out steps; signing out on its own"
+            );
+            return HashSet::new();
+        }
+        let mut logged = false;
+        loop {
+            match self
+                .accounts
+                .sign_out_through_siblings_step(account_ref)
+                .await
+            {
+                Ok(SiblingSignOut::Confirmed { left_to_siblings }) => {
+                    return left_to_siblings.into_iter().collect();
+                }
+                Ok(SiblingSignOut::OnItsOwn) => return HashSet::new(),
+                Ok(SiblingSignOut::Pending) => {}
+                Err(err) => {
+                    if !logged {
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "ask_siblings_to_sign_out",
+                            error_kind = err.privacy_safe_kind(),
+                            "could not take a sign-out step; retrying"
+                        );
+                        logged = true;
+                    }
+                }
+            }
+            sleep(SIGN_OUT_LEAVING_POLL).await;
+        }
     }
 
     /// Read the selected account's current published kind-0 profile through the

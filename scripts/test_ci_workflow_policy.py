@@ -295,6 +295,37 @@ class MergeGatePolicyTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((state / "calls").read_text().splitlines(), expected)
 
+
+class CacheBudgetPolicyTests(unittest.TestCase):
+    def test_only_ci_and_the_wn_agent_darwin_builds_save_rust_caches(self):
+        # GitHub evicts the least recently used caches past 10 GB. Another
+        # saving workflow would push out the caches CI restores (ci.yml header).
+        saving = set()
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+            for step in workflow.read_text().split("\n      - ")[1:]:
+                if "uses: Swatinem/rust-cache@" not in step:
+                    continue
+                save_if = re.search(r"(?m)^          save-if: (.+)$", step)
+                # rust-cache saves unless save-if says otherwise.
+                save_if = save_if.group(1) if save_if else "true"
+                with self.subTest(workflow=workflow.name, step=step.splitlines()[0]):
+                    if save_if == "false":
+                        continue
+                    saving.add(workflow.name)
+                    # Pull requests and merge groups only restore.
+                    self.assertEqual(save_if, "${{ github.ref == 'refs/heads/master' }}")
+                    if workflow.name == "wn-agent-binaries.yml":
+                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
+        self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
+
+    def test_binding_packages_build_from_a_clean_target_directory(self):
+        for workflow in ("bindings.yaml", "bindings-profile.yml", "c-bindings.yml"):
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertNotIn("Swatinem/rust-cache", text)
+                self.assertNotIn("actions/cache", text)
+
+
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
     core, _, pre = version.partition("-")

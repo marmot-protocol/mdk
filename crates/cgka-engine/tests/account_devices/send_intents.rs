@@ -5,14 +5,22 @@
 //! same-account, stamps it `ordinary`, carries its proposals by value and
 //! leaves the proposal store alone; every other request is refused before
 //! anything is recorded or published. From the receivers' side, every member
-//! and sibling accepts the Commit, an added device joins through its Welcome,
-//! and a removed one sees its removal. Fair scheduling gives a queued
+//! and sibling accepts the Commit, an added device joins through its sibling
+//! Welcome, and a removed one sees its removal. An Add sends a sibling Welcome
+//! through the device group, so it goes through only in test-policy builds. Fair scheduling gives a queued
 //! same-account intent the one preparation attempt an admin intent gets, and
 //! never a self-update or a Leave.
 
+#[cfg(feature = "test-policy-overrides")]
+use super::device_roster::{roster_device_on, slot};
+#[cfg(feature = "test-policy-overrides")]
+use super::tagged_siblings::{
+    assert_joins_from, chat_device, handed, owed, routed_members, siblings, tagged_devices,
+};
 use super::*;
 use cgka_traits::convergence_pass::ConvergencePassPhase;
 use cgka_traits::storage::{ConvergencePassStorage, OutboundIntentStorage, QueuedOutboundIntent};
+#[cfg(feature = "test-policy-overrides")]
 use openmls::prelude::ProposalOrRefType;
 
 pub(super) fn pending_proposals(device: &Device, gid: &GroupId) -> usize {
@@ -21,7 +29,7 @@ pub(super) fn pending_proposals(device: &Device, gid: &GroupId) -> usize {
 
 /// What a refused intent must leave as it was.
 #[derive(Debug, PartialEq)]
-struct Untouched {
+pub(super) struct Untouched {
     epoch: u64,
     stable: bool,
     staged: bool,
@@ -30,7 +38,7 @@ struct Untouched {
 }
 
 impl Untouched {
-    fn of(device: &Device, gid: &GroupId) -> Self {
+    pub(super) fn of(device: &Device, gid: &GroupId) -> Self {
         Self {
             epoch: device.engine.epoch(gid).unwrap().0,
             stable: device
@@ -56,6 +64,7 @@ async fn key_package_without_account_devices(account: &[u8]) -> KeyPackage {
 
 /// Put an Add of `kp` in `device`'s OpenMLS proposal store, where a replayed
 /// proposal waits for a Commit.
+#[cfg(feature = "test-policy-overrides")]
 pub(super) fn store_pending_add(device: &Device, gid: &GroupId, kp: &KeyPackage) {
     let crypto = RustCrypto::default();
     let provider =
@@ -69,11 +78,12 @@ pub(super) fn store_pending_add(device: &Device, gid: &GroupId, kp: &KeyPackage)
 /// carries its own proposals by value and nothing else, and the pending
 /// proposal stays where it was while the Commit is staged, after its publish
 /// fails, and after a refused intent.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn own_account_intents_leave_pending_proposals_alone() {
-    let mut m = members(true).await;
+    let (mut m, mut new) = siblings(1).await;
     let gid = m.gid.clone();
-    let dave_kp = device(b"dave", true)
+    let dave_kp = chat_device(b"dave")
         .engine
         .fresh_key_package()
         .await
@@ -81,7 +91,7 @@ async fn own_account_intents_leave_pending_proposals_alone() {
     store_pending_add(&m.bob, &gid, &dave_kp);
     assert_eq!(pending_proposals(&m.bob, &gid), 1);
 
-    let laptop_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let laptop_kp = handed(&mut new[0], slot(2), slot(1));
     let sibling = signature_key(&m.bob_sibling, &gid);
     for (intent, adds, removes) in [
         (add_own_devices(&gid, vec![laptop_kp]), 1, 0),
@@ -112,7 +122,7 @@ async fn own_account_intents_leave_pending_proposals_alone() {
     assert_refused(
         m.bob
             .engine
-            .send(add_own_devices(&gid, vec![dave_kp]))
+            .send(add_own_devices(&gid, vec![unnamed(dave_kp)]))
             .await,
         "belongs to another account",
     );
@@ -122,9 +132,10 @@ async fn own_account_intents_leave_pending_proposals_alone() {
 /// While each Commit's publish is pending, `members()` shows bob's devices as
 /// the Commit leaves them, each added device included although it shares
 /// bob's account. A failed publish puts them back.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn members_show_a_pending_own_account_commit_until_its_publish_fails() {
-    let mut m = members(true).await;
+    let (mut m, mut new) = siblings(2).await;
     let gid = m.gid.clone();
     let bob_id = m.bob.engine.self_id();
     let bob_devices = |device: &Device| {
@@ -142,11 +153,11 @@ async fn members_show_a_pending_own_account_commit_until_its_publish_fails() {
     let before = bob_devices(&m.bob);
     assert_eq!(before.len(), 2);
 
-    let laptop_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
-    let tablet_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let laptop_kp = handed(&mut new[0], slot(2), slot(1));
+    let tablet_kp = handed(&mut new[1], slot(3), slot(1));
     let mut with_added = before.clone();
-    with_added.extend([&laptop_kp, &tablet_kp].map(|kp| {
-        parse_key_package(kp)
+    with_added.extend([&laptop_kp, &tablet_kp].map(|sibling| {
+        parse_key_package(&sibling.key_package)
             .leaf_node()
             .signature_key()
             .as_slice()
@@ -179,10 +190,11 @@ async fn members_show_a_pending_own_account_commit_until_its_publish_fails() {
 /// bob adds a new device of his account, then removes his other device. Each
 /// Commit is `ordinary` in bob's stamp and in every receiver's replay; the
 /// other members and bob's siblings accept it, the new device joins through
-/// its Welcome, and the removed device sees its removal.
+/// its sibling Welcome, and the removed device sees its removal.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn own_account_intents_reach_every_member_and_sibling() {
-    let mut m = members(true).await;
+    let (mut m, mut new) = siblings(1).await;
     let gid = m.gid.clone();
     let bob_id = m.bob.engine.self_id();
     let bob_leaves = |device: &Device| {
@@ -195,8 +207,8 @@ async fn own_account_intents_reach_every_member_and_sibling() {
             .count()
     };
 
-    let mut laptop = device(b"bob", true);
-    let laptop_kp = laptop.engine.fresh_key_package().await.unwrap();
+    let mut laptop = new.remove(0);
+    let laptop_kp = handed(&mut laptop, slot(2), slot(1));
     let SendResult::GroupEvolution {
         msg,
         welcomes,
@@ -220,10 +232,11 @@ async fn own_account_intents_reach_every_member_and_sibling() {
         CommitOrderingPriority::Ordinary,
     )
     .await;
-    let [welcome] = &welcomes[..] else {
-        panic!("one Welcome per added KeyPackage, got {}", welcomes.len())
+    assert!(welcomes.is_empty(), "{welcomes:?}");
+    let [welcome] = &owed(&m.bob)[..] else {
+        panic!("one sibling Welcome per added KeyPackage")
     };
-    assert_joins(&mut laptop, welcome, &gid, &m.bob).await;
+    assert_joins_from(&mut laptop, welcome, &gid, &m.bob).await;
     assert_eq!(bob_leaves(&m.alice), 3);
 
     let sibling = signature_key(&m.bob_sibling, &gid);
@@ -243,11 +256,13 @@ async fn own_account_intents_reach_every_member_and_sibling() {
 }
 
 /// An admin's own-device intent is same-account too, and `ordinary`.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn an_admins_own_account_intent_is_ordinary() {
-    let mut m = members(true).await;
+    let (alice, mut new, _) = tagged_devices(b"alice", 1).await;
+    let mut m = routed_members(alice, chat_device(b"bob")).await;
     let gid = m.gid.clone();
-    let kp = new_sibling_key_package(&mut m.alice, b"alice").await;
+    let kp = handed(&mut new[0], slot(2), slot(1));
     let add = send_commit(&mut m.alice, add_own_devices(&gid, vec![kp]), &gid).await;
     assert_priorities(
         &m.alice,
@@ -270,7 +285,12 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
     let gid = m.gid.clone();
     let before = Untouched::of(&m.bob, &gid);
     let bob_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
-    assert_not_required(m.bob.engine.send(add_own_devices(&gid, vec![bob_kp])).await);
+    assert_not_required(
+        m.bob
+            .engine
+            .send(add_own_devices(&gid, vec![unnamed(bob_kp)]))
+            .await,
+    );
     let sibling = signature_key(&m.bob_sibling, &gid);
     assert_not_required(
         m.bob
@@ -284,7 +304,7 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
     assert_not_required(
         m.alice
             .engine
-            .send(add_own_devices(&gid, vec![alice_kp]))
+            .send(add_own_devices(&gid, vec![unnamed(alice_kp)]))
             .await,
     );
     assert_eq!(Untouched::of(&m.alice, &gid), before);
@@ -301,21 +321,21 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
     let template = m.bob.engine.fresh_key_package().await.unwrap();
     // bob has two leaves, so 19 more break the limit.
     let over_limit: Vec<_> = (0..MAX_LEAVES_PER_ACCOUNT - 1)
-        .map(|_| sibling_key_package(&template, b"bob"))
+        .map(|_| unnamed(sibling_key_package(&template, b"bob")))
         .collect();
     let limit_error = format!("an account holds more than {MAX_LEAVES_PER_ACCOUNT} leaves");
     let unknown_key = vec![0x5c; 32];
     for (intent, reason) in [
         (
-            add_own_devices(&gid, vec![dave_kp.clone()]),
+            add_own_devices(&gid, vec![unnamed(dave_kp.clone())]),
             "belongs to another account",
         ),
         (
             add_own_devices(
                 &gid,
                 vec![
-                    new_sibling_key_package(&mut m.bob, b"bob").await,
-                    dave_kp.clone(),
+                    unnamed(new_sibling_key_package(&mut m.bob, b"bob").await),
+                    unnamed(dave_kp.clone()),
                 ],
             ),
             "belongs to another account",
@@ -341,7 +361,7 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
     let refused = m
         .bob
         .engine
-        .send(add_own_devices(&gid, vec![missing]))
+        .send(add_own_devices(&gid, vec![unnamed(missing)]))
         .await;
     assert!(
         matches!(
@@ -360,12 +380,13 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
 /// Restart keeps the publish lifecycle's rules: a staged same-account Add is
 /// rolled back at open like an Invite, and a staged same-account Remove is
 /// kept like any removal-bearing Commit.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn restart_treats_own_account_intents_like_invites_and_removals() {
-    let mut m = members(true).await;
+    let (mut m, mut new) = siblings(1).await;
     let gid = m.gid.clone();
     let epoch = m.bob.engine.epoch(&gid).unwrap();
-    let kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let kp = handed(&mut new[0], slot(2), slot(1));
     let staged = m.bob.engine.send(add_own_devices(&gid, vec![kp])).await;
     assert!(matches!(staged, Ok(SendResult::GroupEvolution { .. })));
     assert_eq!(m.bob.engine.members(&gid).unwrap().len(), 5);
@@ -396,27 +417,18 @@ async fn restart_treats_own_account_intents_like_invites_and_removals() {
 
 /// Drop `device`'s engine and open a new one on the same storage, hydrating
 /// every stored group as a session open does.
+#[cfg(feature = "test-policy-overrides")]
 fn restart(device: Device, account: &[u8]) -> Device {
     let Device { engine, storage } = device;
     drop(engine);
-    let mut supported: Vec<_> = default_group_components().into_iter().collect();
-    supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
-    let mut engine = EngineBuilder::new(storage.clone())
-        .identity(pad32(account))
-        .account_identity_proof_signer(proof_signer(account))
-        .protocol_profile(ProtocolProfile::Current)
-        .feature_registry(registry())
-        .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
-        .build()
-        .unwrap();
-    engine.hydrate_all_stored_groups().unwrap();
-    Device { engine, storage }
+    let mut device = roster_device_on(storage, account);
+    device.engine.hydrate_all_stored_groups().unwrap();
+    device
 }
 
 // ── Fair scheduling (mdk#2628 D6) ───────────────────────────────────────────
 
-fn queue(device: &Device, gid: &GroupId, id: &[u8], intent: SendIntent) {
+pub(super) fn queue(device: &Device, gid: &GroupId, id: &[u8], intent: SendIntent) {
     device
         .storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
@@ -485,20 +497,18 @@ async fn holds_the_slot(
 /// With inbound input waiting, a queued same-account intent gets the one
 /// preparation attempt after a pass settles in `Stable`, as an admin intent
 /// does, and inbound input proceeds after it.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn a_queued_same_account_intent_gets_the_fairness_attempt() {
     for removes in [true, false] {
-        let mut m = members(true).await;
+        let (mut m, mut new) = siblings(1).await;
         let gid = m.gid.clone();
         let first = inbound_self_update(&mut m).await;
         let second = inbound_self_update(&mut m).await;
         let intent = if removes {
             remove_own_devices(&gid, vec![signature_key(&m.bob_sibling, &gid)])
         } else {
-            add_own_devices(
-                &gid,
-                vec![new_sibling_key_package(&mut m.bob, b"bob").await],
-            )
+            add_own_devices(&gid, vec![handed(&mut new[0], slot(2), slot(1))])
         };
         assert!(holds_the_slot(&mut m.bob, &gid, first, second, vec![intent]).await);
 
@@ -563,7 +573,7 @@ async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt
             &gid,
             first,
             second,
-            vec![add_own_devices(&gid, vec![own_device])]
+            vec![add_own_devices(&gid, vec![unnamed(own_device)])]
         )
         .await
     );
@@ -626,7 +636,7 @@ async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt
             &gid,
             first,
             second,
-            vec![add_own_devices(&gid, vec![own_device]), rename]
+            vec![add_own_devices(&gid, vec![unnamed(own_device)]), rename]
         )
         .await
     );
@@ -665,7 +675,7 @@ async fn a_queued_add_of_a_device_already_in_the_group_is_retired() {
         &m.bob,
         &gid,
         b"queued-0",
-        add_own_devices(&gid, vec![present]),
+        add_own_devices(&gid, vec![unnamed(present)]),
     );
     let self_update = SendIntent::SelfUpdate {
         group_id: gid.clone(),

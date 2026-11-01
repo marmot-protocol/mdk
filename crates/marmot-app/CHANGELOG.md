@@ -10,6 +10,38 @@
 - `AppError` adds `GroupCreateAdminNotMember` for founding admin references
   outside the founding membership. Update exhaustive error matches.
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
+  link is made and the roster lists another device that is not leaving. It
+  commits its own roster entry as `leaving` and waits up to about 30
+  seconds, however busy the account is, for that commit to be confirmed,
+  then leaves only the chats no sibling takes
+  it out of, deletes its slot and wipes. `WipeOutcome` adds
+  `groups_left_to_siblings`, the chats it left to them, and
+  `siblings_not_reached`, set when it could not ask them in time and tried
+  to leave every chat itself, reporting any it could not in
+  `group_leave_failures`. A device
+  that finds a sibling `leaving` removes it after a random delay of up to 30
+  seconds, as if its user had. A device removed while it signs out is not
+  unlinked. A chat this device is no longer in, its copy removed or
+  disbanded, is neither left nor reported in `group_leave_failures`. A wipe
+  of an account whose worker cannot run, signed out or with no external
+  signer registered, does not wait on its siblings. Struct literals add the
+  new fields.
+
+- Hosts can show chat history from another of the account's devices
+  (mdk#2628 item 4.2d, D78). `TimelineMessageRecord` adds `imported_from`,
+  the device an imported row came from (`HistoryImportSource`: its slot and
+  its roster name now, empty for an unnamed or removed device), so a host
+  draws "Imported from <device>" where rows change from imported to live.
+  `MarmotAppRuntime::chat_history_imports` lists each held chat whose history
+  is `Receiving` (with `retrying` once an attempt to get its bundle failed)
+  or `Imported`, and `MarmotAppEvent` adds `ChatHistoryImportsChanged {
+  account_id_hex, account_label }`, which fires whenever that list's answer
+  changes. Row names are resolved when rows are read and follow
+  `LinkedDevicesChanged`. Only behind `dev_device_groups`. Exhaustive
+  matches and struct literals add the new arm and field.
+
 - The device roster no longer holds rejected KeyPackages, and kind 462 is no
   longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
   changed under the same component id, so existing development device groups
@@ -67,6 +99,11 @@
 
 ### Added
 
+- A device adds a sibling to a chat with a private KeyPackage that sibling
+  handed it, and sends the sibling Welcome in the device group as a 461 once
+  the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
+  relay is sent again by the next maintenance pass. Only behind
+  `dev_device_groups`; nothing outside tests adds a sibling yet.
 - `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
   `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
   the recovery words an account's backups will be sealed to, and turn backups
@@ -561,6 +598,22 @@
 
 ### Fixed
 
+- A device cleans up after every device its device group's roster stops
+  listing, not only one whose `removed` record it still reads (mdk#2761):
+  it removes that device's tagged leaves from chats that take a
+  same-account Remove and discards the private KeyPackages exchanged with
+  its slot. That covers a record dropped before this device acted on it,
+  including while it was away, a link that failed after the new device set
+  its tag signature key, and a made link a later branch dropped. It reads
+  those leaves by every tag signature key a roster it applied listed for
+  the slot in the last 30 days, and only once the device group is settled.
+  Untagged leaves stay, and `removed_device_leftover_chats` counts the chats
+  that take no same-account Remove and keep such a leaf. When a failed
+  link's undo takes the entry of a device the user decided to remove, the deciding device commits its
+  `removed` record alone, so siblings that never saw its key clean up too.
+  It makes that record once: not again after a roster state it applied held
+  it, even across a restart or after branch selection dropped it.
+  Release builds hold no device group.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

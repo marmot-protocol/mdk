@@ -10,7 +10,7 @@
 //! released seconds and routed loss. Both are written as SQL, the way those
 //! builds left the rows.
 
-use super::convert::FAIL_STEP;
+use super::tests::assert_serialization;
 use super::*;
 use crate::base::migrations::run_through;
 use crate::{
@@ -18,11 +18,11 @@ use crate::{
     RecoveryConvertedObligations, RecoveryLossCause, RecoveryLossWatermark, RecoveryRelayCaps,
     RecoverySpanRetirement, RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitPolicy,
     RecoveryUnitState, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
-    TransportReconciliationRoute, open_hardened_sqlcipher,
+    SqliteStorageOptions, TransportReconciliationRoute, open_hardened_sqlcipher,
 };
 use rusqlite::types::Value;
 
-const KEY: &str = "mdk recovery conversion fixture key";
+const KEY: [u8; 32] = [0x7c; 32];
 const NOW: u64 = 10_000_000;
 /// The retained window's floor.
 const W: u64 = NOW - 1_000_000;
@@ -354,32 +354,48 @@ fn nightly_rows() -> String {
     sql
 }
 
-/// Write an encrypted account database at `version` (the last migration
-/// applied) holding `rows`, then open it through the production open path,
-/// which migrates it to the current schema.
-fn fixture(directory: &tempfile::TempDir, version: i64, rows: &str) -> SqliteAccountStorage {
-    let path = directory.path().join("account.sqlite3");
-    {
-        let key = SqlCipherKey::new(KEY).unwrap();
-        let mut conn = rusqlite::Connection::open(&path).unwrap();
-        open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::live_cache()).unwrap();
-        run_through(&mut conn, version).unwrap();
-        conn.execute_batch(rows).unwrap();
-    }
-    reopen(directory)
+/// An account database at schema 116 holding `rows`, migrated to the current
+/// schema by the runner every production open uses.
+fn at_v0_14_0(rows: &str) -> SqliteAccountStorage {
+    let mut conn = Connection::open_in_memory().unwrap();
+    run_through(&mut conn, 116).unwrap();
+    conn.execute_batch(rows).unwrap();
+    SqliteAccountStorage::from_connection_with_options(conn, SqliteStorageOptions::default())
+        .unwrap()
 }
 
-fn reopen(directory: &tempfile::TempDir) -> SqliteAccountStorage {
-    let key = SqlCipherKey::new(KEY).unwrap();
-    SqliteAccountStorage::open_encrypted(directory.path().join("account.sqlite3"), &key).unwrap()
+/// An account database at the current schema holding `rows`.
+fn at_nightly(rows: &str) -> SqliteAccountStorage {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().execute_batch(rows).unwrap();
+    store
 }
 
-fn v0_14_0(directory: &tempfile::TempDir) -> SqliteAccountStorage {
-    fixture(directory, 116, &v0_14_0_rows())
+fn v0_14_0() -> SqliteAccountStorage {
+    at_v0_14_0(&v0_14_0_rows())
 }
 
-fn nightly(directory: &tempfile::TempDir) -> SqliteAccountStorage {
-    fixture(directory, i64::MAX, &nightly_rows())
+fn nightly() -> SqliteAccountStorage {
+    at_nightly(&nightly_rows())
+}
+
+fn open(directory: &std::path::Path) -> SqliteAccountStorage {
+    SqliteAccountStorage::open_encrypted(directory.join("account.sqlite3"), &SqlCipherKey::raw(KEY))
+        .unwrap()
+}
+
+/// Fail step `step` where its transaction would commit: the marker update is
+/// each step's last write. The TEMP trigger dies with the connection.
+fn fail_step(store: &SqliteAccountStorage, step: usize) {
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER fail_step BEFORE UPDATE OF step ON account_recovery_conversion
+             WHEN OLD.step = {step}
+             BEGIN SELECT RAISE(ABORT, 'injected conversion failure'); END;"
+        ))
+        .unwrap();
 }
 
 /// Every table the conversion reads or writes, row by row in a canonical
@@ -528,8 +544,7 @@ fn evidence(store: &SqliteAccountStorage) -> Vec<Vec<Value>> {
 /// the part below it and nothing parks into a remainder.
 #[test]
 fn a_v0_14_0_database_converts_every_row_kind() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = v0_14_0(&directory);
+    let store = v0_14_0();
     let app = store.app_storage();
     let untouched_before = untouched(&store);
     assert!(app.recovery_conversion_pending().unwrap());
@@ -684,8 +699,7 @@ fn a_v0_14_0_database_converts_every_row_kind() {
 /// rest into remainders.
 #[test]
 fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = nightly(&directory);
+    let store = nightly();
     let app = store.app_storage();
     let untouched_before = untouched(&store);
 
@@ -836,15 +850,38 @@ fn a_nightly_database_quarantines_the_shadow_ledger_and_converts_every_row_kind(
 }
 
 /// A crash inside any step leaves exactly what the steps before it wrote,
-/// and the next run ends where an uninterrupted conversion does.
-fn a_crash_at_each_step_resumes_to_the_same_result(
-    build: fn(&tempfile::TempDir) -> SqliteAccountStorage,
-) {
+/// and the next process ends where an uninterrupted conversion does. A
+/// finished conversion does nothing when run again, even after its report and
+/// notice change were acknowledged and the ledger moved on.
+fn a_crash_at_each_step_resumes_to_the_same_result(version: i64, rows: &str) {
     let routes = routes();
+    // One encrypted file at `version`, migrated by the production open; each
+    // run below starts from its own copy.
+    let template = tempfile::tempdir().unwrap();
+    {
+        let mut conn = Connection::open(template.path().join("account.sqlite3")).unwrap();
+        open_hardened_sqlcipher(
+            &conn,
+            &SqlCipherKey::raw(KEY),
+            SqlCipherHardening::live_cache(),
+        )
+        .unwrap();
+        run_through(&mut conn, version).unwrap();
+        conn.execute_batch(rows).unwrap();
+    }
+    drop(open(template.path()));
+    let copy = || {
+        let directory = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(template.path()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), directory.path().join(entry.file_name())).unwrap();
+        }
+        let store = open(directory.path());
+        (directory, store)
+    };
     // What each step starts from, stepping one transaction at a time.
     let (starts, reference) = {
-        let directory = tempfile::tempdir().unwrap();
-        let store = build(&directory);
+        let (_directory, store) = copy();
         let mut starts = Vec::new();
         for _ in 0..6 {
             starts.push(dump(&store));
@@ -857,52 +894,15 @@ fn a_crash_at_each_step_resumes_to_the_same_result(
         (starts, dump(&store))
     };
     {
-        let directory = tempfile::tempdir().unwrap();
-        let store = build(&directory);
+        let (_directory, store) = copy();
         convert(&store).unwrap();
         assert_eq!(dump(&store), reference, "one run equals one step at a time");
-    }
-    for (step, start) in starts.iter().enumerate() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = build(&directory);
-        FAIL_STEP.set(Some(step));
-        let crashed = convert(&store);
-        FAIL_STEP.set(None);
-        assert!(crashed.is_err(), "step {step}");
-        assert_eq!(&dump(&store), start, "step {step} rolled back whole");
-        assert!(store.app_storage().recovery_conversion_pending().unwrap());
-        // The next process resumes from the marker.
-        drop(store);
-        let store = reopen(&directory);
         convert(&store).unwrap();
-        assert_eq!(dump(&store), reference, "resumed after step {step}");
-    }
-}
-
-#[test]
-fn a_crash_converting_a_v0_14_0_database_resumes_to_the_same_result() {
-    a_crash_at_each_step_resumes_to_the_same_result(v0_14_0);
-}
-
-#[test]
-fn a_crash_converting_a_nightly_database_resumes_to_the_same_result() {
-    a_crash_at_each_step_resumes_to_the_same_result(nightly);
-}
-
-/// A finished conversion does nothing when run again, even after its report
-/// and notice change were acknowledged and the ledger moved on.
-#[test]
-fn running_the_conversion_twice_changes_nothing() {
-    for build in [
-        v0_14_0 as fn(&tempfile::TempDir) -> SqliteAccountStorage,
-        nightly,
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let store = build(&directory);
-        convert(&store).unwrap();
-        let once = dump(&store);
-        convert(&store).unwrap();
-        assert_eq!(dump(&store), once);
+        assert_eq!(
+            dump(&store),
+            reference,
+            "a finished conversion runs no step"
+        );
 
         let app = store.app_storage();
         app.acknowledge_recovery_conversion_report().unwrap();
@@ -911,23 +911,52 @@ fn running_the_conversion_twice_changes_nothing() {
             .unwrap();
         let acknowledged = dump(&store);
         convert(&store).unwrap();
-        assert_eq!(dump(&store), acknowledged);
+        assert_eq!(
+            dump(&store),
+            acknowledged,
+            "nothing runs after acknowledgment"
+        );
         assert!(app.recovery_conversion_report().unwrap().is_none());
     }
+    for (step, start) in starts.iter().enumerate() {
+        let (directory, store) = copy();
+        fail_step(&store, step);
+        let crashed = convert(&store);
+        assert!(
+            matches!(crashed, Err(StorageError::Backend(ref message)) if message.contains("injected conversion failure")),
+            "step {step}: {crashed:?}"
+        );
+        assert_eq!(&dump(&store), start, "step {step} rolled back whole");
+        assert!(store.app_storage().recovery_conversion_pending().unwrap());
+        // The next process resumes from the marker.
+        drop(store);
+        let store = open(directory.path());
+        convert(&store).unwrap();
+        assert_eq!(dump(&store), reference, "resumed after step {step}");
+    }
+}
+
+#[test]
+fn a_crash_converting_a_v0_14_0_database_resumes_to_the_same_result() {
+    a_crash_at_each_step_resumes_to_the_same_result(116, &v0_14_0_rows());
+}
+
+#[test]
+fn a_crash_converting_a_nightly_database_resumes_to_the_same_result() {
+    a_crash_at_each_step_resumes_to_the_same_result(i64::MAX, &nightly_rows());
 }
 
 /// A pending explicit repair becomes the runner's re-arm, after every other
 /// step: parked relays are active again and dismissed ranges owed again.
 #[test]
 fn a_pending_explicit_repair_rearms_every_unit_last() {
-    let directory = tempfile::tempdir().unwrap();
     let mut rows = v0_14_0_rows();
     rows.push_str(&format!(
         "UPDATE account_recovery_obligations SET eligibility = 0, parked_at_ms = NULL
          WHERE id = {};",
         id(4)
     ));
-    let store = fixture(&directory, 116, &rows);
+    let store = at_v0_14_0(&rows);
     let app = store.app_storage();
     convert(&store).unwrap();
 
@@ -950,13 +979,103 @@ fn a_pending_explicit_repair_rearms_every_unit_last() {
     );
 }
 
+/// The step marker and the disposition codes persist across builds: the
+/// marker counts the steps run, in this order, and each count is stored under
+/// its disposition's number (0 pending, 1 parked, 2 dismissed, 3 settled). A
+/// build that reorders the steps or renumbers a disposition resumes a
+/// half-converted database at the wrong step or reports its counts under the
+/// wrong heading.
+#[test]
+fn each_step_stores_its_marker_and_counts_by_value() {
+    let store = v0_14_0();
+    let routes = routes();
+    let app = store.app_storage();
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        app.convert_recovery_steps(&input(&routes), 1).unwrap();
+        let conn = store.lock().unwrap();
+        let step: i64 = conn
+            .query_row("SELECT step FROM account_recovery_conversion", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let counts = conn
+            .prepare(
+                "SELECT cause, disposition, obligations FROM account_recovery_conversion_counts
+                 ORDER BY cause, disposition",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(conn);
+        let loss = app.converted_recovery_loss().unwrap().len();
+        seen.push((step, goal(&store, &group(B)), counts, loss));
+    }
+    // Quarantine starts B's standing goal, Dismissed counts the incremental
+    // history, Loss converts both causes' loss and lowers the goal to the
+    // queue loss's bound, Parked counts the explicit repair and the
+    // notification loss and lowers it to the repair's window, Pending counts
+    // the queue loss and the native replay, Settled the satisfied loss.
+    let (dismissed, parked) = ((5, 2, 1), [(3, 1, 1), (6, 1, 1)]);
+    let after_parked = vec![parked[0], dismissed, parked[1]];
+    let after_pending = vec![(0, 0, 1), parked[0], dismissed, parked[1], (7, 0, 1)];
+    let mut settled = after_pending.clone();
+    settled.insert(1, (0, 3, 1));
+    assert_eq!(
+        seen,
+        vec![
+            (1, Some(W + 20_000), vec![], 0),
+            (2, Some(W + 20_000), vec![dismissed], 0),
+            (3, Some(W + 500), vec![dismissed], 2),
+            (4, Some(W), after_parked, 2),
+            (5, Some(W), after_pending, 2),
+            (6, Some(W), settled, 2),
+        ]
+    );
+}
+
+/// A dismissal on a route the account has left retires nothing there, so a
+/// rejoined route's history is owed again; on a current route the same
+/// dismissal retires its window.
+#[test]
+fn a_dismissal_on_a_route_the_account_left_retires_nothing() {
+    let mut rows = v0_14_0_rows();
+    rows.push_str("INSERT INTO cgka_groups (id, epoch, record) VALUES (x'0c', 1, x'00');");
+    rows.push_str(&scope(
+        5,
+        2,
+        Some((C, 0x0C)),
+        (W - 1000, NOW - 10_000),
+        &payload(&[PLAN_R1], &[], false),
+    ));
+    let store = at_v0_14_0(&rows);
+    convert(&store).unwrap();
+    let app = store.app_storage();
+    assert!(app.recovery_unit(&group(C), R1).unwrap().is_none());
+    assert!(app.recovery_unit_spans(&group(C), R1).unwrap().is_empty());
+    assert_eq!(
+        app.recovery_unit_spans(&group(A), R1).unwrap()[0],
+        crate::RecoveryUnitSpan {
+            range: range(W, W + 499),
+            retired: Some(RecoverySpanRetirement::Dismissed),
+        }
+    );
+}
+
 /// Input the conversion cannot trust changes nothing: routing without the
 /// inbox (not hydrated), a duplicate route, an empty relay, or a floor
 /// after now.
 #[test]
 fn invalid_input_converts_nothing() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = v0_14_0(&directory);
+    let store = v0_14_0();
     let before = dump(&store);
     let mut duplicate = routes();
     duplicate.push(duplicate[1].clone());
@@ -964,21 +1083,21 @@ fn invalid_input_converts_nothing() {
     empty_relay[0].required_relays.push(String::new());
     let without_inbox = routes()[1..].to_vec();
     for routes in [duplicate, empty_relay, without_inbox] {
-        assert!(
+        assert_serialization(
             store
                 .app_storage()
-                .convert_recovery_obligations(&input(&routes))
-                .is_err()
+                .convert_recovery_obligations(&input(&routes)),
+            "invalid recovery conversion",
         );
     }
     let routes = routes();
     let mut late_floor = input(&routes);
     late_floor.retention_floor_seconds = NOW + 1;
-    assert!(
+    assert_serialization(
         store
             .app_storage()
-            .convert_recovery_obligations(&late_floor)
-            .is_err()
+            .convert_recovery_obligations(&late_floor),
+        "invalid recovery conversion",
     );
     assert_eq!(dump(&store), before);
 }
@@ -999,8 +1118,7 @@ fn only_loss_parks_below_the_window_floor() {
         v0_14_0_rows()
     );
     for (rows, parked) in [(unknown_bound, true), (no_live_loss, false)] {
-        let directory = tempfile::tempdir().unwrap();
-        let store = fixture(&directory, 116, &rows);
+        let store = at_v0_14_0(&rows);
         convert(&store).unwrap();
         let remainders = store
             .app_storage()
@@ -1045,8 +1163,7 @@ const POLICY: RecoveryUnitPolicy = RecoveryUnitPolicy {
 /// nowhere parks it again under a newer notice.
 #[test]
 fn a_converted_park_rearms_once_on_known_caps_and_parks_again_without_progress() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = v0_14_0(&directory);
+    let store = v0_14_0();
     let app = store.app_storage();
     convert(&store).unwrap();
     let notices = |app: &SqliteAppStorage| {
@@ -1138,8 +1255,7 @@ fn a_converted_park_rearms_once_on_known_caps_and_parks_again_without_progress()
 /// still at the converted count: newer loss stays for the import.
 #[test]
 fn converted_loss_is_reclaimed_only_as_converted() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = v0_14_0(&directory);
+    let store = v0_14_0();
     let app = store.app_storage();
     let queue = converted_loss(RecoveryLossCause::Queue, &[(3, 2), (5, 4), (7, 3)]);
     let notification = converted_loss(RecoveryLossCause::NotificationConsumer, &[(9, 2)]);
@@ -1200,8 +1316,7 @@ fn unimported_loss_is_stamped_with_a_new_loss_revision() {
              WHERE cause = 0 AND marker_token = 7;",
         v0_14_0_rows()
     );
-    let directory = tempfile::tempdir().unwrap();
-    let store = fixture(&directory, 116, &rows);
+    let store = at_v0_14_0(&rows);
     let app = store.app_storage();
     let read = |store: &SqliteAccountStorage| {
         let conn = store.lock().unwrap();
@@ -1241,7 +1356,7 @@ fn unimported_loss_is_stamped_with_a_new_loss_revision() {
         .unwrap();
     assert!(app.reclaim_converted_recovery_loss(&queue).unwrap());
     let ((_, acknowledged), ..) = read(&store);
-    assert!(acknowledged >= after);
+    assert_eq!(acknowledged, after);
 }
 
 /// Loss that named its routes reaches only them, as an import charges it: a
@@ -1268,8 +1383,7 @@ fn routed_loss_reaches_only_its_routes() {
             &payload(&[PLAN_R2], &[], false)
         ),
     );
-    let directory = tempfile::tempdir().unwrap();
-    let store = fixture(&directory, i64::MAX, &rows);
+    let store = at_nightly(&rows);
     let app = store.app_storage();
     convert(&store).unwrap();
 
@@ -1333,8 +1447,7 @@ fn a_routed_bound_below_the_unrouted_floor_reaches_only_its_route() {
         own = W - 300,
         b = hex32(B),
     );
-    let directory = tempfile::tempdir().unwrap();
-    let store = fixture(&directory, i64::MAX, &rows);
+    let store = at_nightly(&rows);
     let app = store.app_storage();
     convert(&store).unwrap();
 
@@ -1377,8 +1490,7 @@ fn loss_below_the_window_parks_what_old_coverage_proved() {
         bound = W - 1000,
         below = W - 1,
     );
-    let directory = tempfile::tempdir().unwrap();
-    let store = fixture(&directory, i64::MAX, &rows);
+    let store = at_nightly(&rows);
     let app = store.app_storage();
     convert(&store).unwrap();
     for relay in [R1, R2] {

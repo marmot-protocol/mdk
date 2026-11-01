@@ -1082,6 +1082,19 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ChatHistoryImports { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -1211,6 +1224,21 @@ impl AccountManager {
                 slot_id_hex,
                 respond,
             })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    /// One step of signing out through siblings (mdk#2628 D67), run in the
+    /// account's worker so deliveries keep settling between steps.
+    pub(crate) async fn sign_out_through_siblings_step(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::client::sign_out::SiblingSignOut, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SignOutThroughSiblingsStep { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await

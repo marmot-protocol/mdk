@@ -413,6 +413,11 @@ impl AppClient {
     }
 
     pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
+        // A device signing out announces no push token; its retries stop
+        // until the sign-out ends (mdk#2628 D67).
+        if self.signing_out() {
+            return false;
+        }
         let snapshots_pending = self.send_owed_push_snapshots().await;
         let shares_pending = self.retry_pending_push_registration_shares().await;
         // After the shares: one sent after a join window ends is the announce.

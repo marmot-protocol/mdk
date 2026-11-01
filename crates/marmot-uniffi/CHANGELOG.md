@@ -4,6 +4,27 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first records in the device group that it is leaving, which can take about
+  30 seconds, and leaves those devices the chats they can take it out of.
+  `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
+  which says it could not ask them in time and tried to leave every chat
+  itself, reporting any it could not in `group_leave_failures`; tell the
+  user. The call now keeps running when the host cancels it, so a
+  sign-out that has asked its siblings always finishes. Regenerate bindings
+  with the matching native library.
+
+- `TimelineMessageRecordFfi` adds `imported_from: Option<HistoryImportSourceFfi>`,
+  the device an imported row came from, and `MarmotEventFfi` adds
+  `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628
+  item 4.2d). New `chat_history_imports(account_ref)` lists each held chat's
+  history from another device as `ChatHistoryImportFfi`: `Receiving`, with
+  `retrying` once an attempt to get its bundle failed, or `Imported` with
+  its source and time. An
+  empty `device_label` means "another device". Only behind
+  `dev_device_groups`. Exhaustive matches add the new arm.
+
 - `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
   `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
   found in its own slot that it did not make, which only this device warns
@@ -167,6 +188,10 @@
 
 ### Changed
 
+- `removed_device_leftover_chats` also counts chats that keep the leaf of a
+  device the account's device group stopped listing without a removal, such
+  as after a failed link (mdk#2761). Release builds hold no device group, so
+  it stays zero there.
 - `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
   475 and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's

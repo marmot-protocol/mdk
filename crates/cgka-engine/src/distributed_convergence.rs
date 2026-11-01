@@ -2420,6 +2420,12 @@ impl<S: StorageProvider> Engine<S> {
                     &output.announced_key_packages,
                     self.wall_clock.now(),
                 )?;
+                crate::roster_tag_keys::record_tag_keys(
+                    storage,
+                    group_id,
+                    &output.roster_tag_keys,
+                    self.wall_clock.now(),
+                )?;
                 let application_events =
                     Self::application_replay_events(group_id, &output.observations)?;
                 for event in &application_events {

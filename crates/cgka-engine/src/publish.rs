@@ -205,6 +205,12 @@ impl<S: StorageProvider> Engine<S> {
                         &mls_group,
                         self.wall_clock.now(),
                     )?;
+                    crate::roster_tag_keys::record_roster_tag_keys(
+                        storage,
+                        &group_id,
+                        &mls_group,
+                        self.wall_clock.now(),
+                    )?;
                     // This device owes each sibling the Commit added the
                     // group's history (mdk#2628 D76), recorded with the
                     // membership that owes it.

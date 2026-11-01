@@ -16,6 +16,7 @@ mod device_link;
 mod directory;
 mod draft;
 mod group;
+mod history_import;
 mod history_notice;
 mod linked_device;
 mod local_submissions;

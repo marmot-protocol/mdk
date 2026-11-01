@@ -16,7 +16,7 @@ pub use cgka_engine::account_identity_proof::{
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
-pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
+pub use cgka_engine::engine::{OwedSiblingWelcome, WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
@@ -47,7 +47,9 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
+use cgka_traits::storage::{
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, RosterTagKey, StorageError,
+};
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::SiblingWelcomeJoin;
@@ -1059,6 +1061,18 @@ impl AccountDeviceSession {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> SessionResult<Vec<Vec<u8>>> {
+        Ok(self
+            .engine
+            .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)
+    }
+
     pub fn app_component(
         &self,
         group_id: &GroupId,
@@ -1389,6 +1403,30 @@ impl AccountDeviceSession {
             "sibling Welcome ingested"
         );
         Ok(outcome)
+    }
+
+    /// See [`cgka_engine::Engine::owed_sibling_welcomes`].
+    pub fn owed_sibling_welcomes(&self, now: Timestamp) -> SessionResult<Vec<OwedSiblingWelcome>> {
+        Ok(self.engine.owed_sibling_welcomes(now)?)
+    }
+
+    /// See [`cgka_engine::Engine::carry_sibling_welcome`].
+    pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.carry_sibling_welcome(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_delivered`].
+    pub fn sibling_welcome_delivered(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_delivered(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_send_failed`].
+    pub fn sibling_welcome_send_failed(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_send_failed(id, carrier)?)
     }
 
     pub async fn advance_convergence(
@@ -1997,6 +2035,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }
 }

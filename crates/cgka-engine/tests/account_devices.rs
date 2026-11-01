@@ -40,7 +40,7 @@ use cgka_traits::app_components::{
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
-    SendResult, WelcomeMetadata,
+    SendResult, SiblingKeyPackage, WelcomeMetadata,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
@@ -115,6 +115,24 @@ mod device_tag;
 #[cfg(feature = "test-policy-overrides")]
 #[path = "account_devices/announced_key_packages.rs"]
 mod announced_key_packages;
+
+// The rosters a device applied record the tag signature keys they listed
+// (mdk#2761).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/roster_tag_keys.rs"]
+mod roster_tag_keys;
+
+// Adding a sibling to a chat sends it a sibling Welcome through the device
+// group, so a same-account Add goes through only in test-policy builds
+// (mdk#2628 3.5b).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/sibling_welcomes.rs"]
+mod sibling_welcomes;
+
+// The setup every test that adds a sibling to a chat shares.
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/tagged_siblings.rs"]
+mod tagged_siblings;
 
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
@@ -305,11 +323,19 @@ fn device_with_peeler(
     advertises_account_devices: bool,
     peeler: Box<dyn TransportPeeler>,
 ) -> Device {
+    let extra: &[u16] = if advertises_account_devices {
+        &[ACCOUNT_DEVICES_COMPONENT_ID]
+    } else {
+        &[]
+    };
+    device_advertising(account, extra, peeler)
+}
+
+/// [`device`] advertising `extra` components beside the defaults.
+fn device_advertising(account: &[u8], extra: &[u16], peeler: Box<dyn TransportPeeler>) -> Device {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
-    if advertises_account_devices {
-        supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
-    }
+    supported.extend(extra.iter().copied());
     let engine = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))
@@ -1775,10 +1801,20 @@ fn signature_key(device: &Device, gid: &GroupId) -> Vec<u8> {
         .to_vec()
 }
 
-fn add_own_devices(gid: &GroupId, key_packages: Vec<KeyPackage>) -> SendIntent {
+/// A same-account Add of `siblings`.
+fn add_own_devices(gid: &GroupId, siblings: Vec<SiblingKeyPackage>) -> SendIntent {
     SendIntent::AddOwnAccountDevices {
         group_id: gid.clone(),
-        key_packages,
+        siblings,
+    }
+}
+
+/// `key_package` named as the sibling at a slot no roster lists, for an Add
+/// refused before its slot is read.
+fn unnamed(key_package: KeyPackage) -> SiblingKeyPackage {
+    SiblingKeyPackage {
+        slot: [0xee; 32],
+        key_package,
     }
 }
 

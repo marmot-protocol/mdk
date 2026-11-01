@@ -86,6 +86,7 @@ mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
 mod history_delivery;
+pub(crate) mod history_imports;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -98,6 +99,7 @@ mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
 pub(crate) mod sign_ins;
+pub(crate) mod sign_out;
 mod small_state;
 mod sync;
 #[cfg(test)]
@@ -851,6 +853,9 @@ pub struct AppClient {
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.
     pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
+    /// The siblings this client found `leaving`, by slot, and when it
+    /// decides to remove each: after its own random delay (mdk#2628 D67).
+    pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
@@ -880,6 +885,15 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    /// The client just opened, so the device-group seams announce
+    /// `ChatHistoryImportsChanged` once whatever the answer (mdk#2628 4.2d).
+    pub(crate) chat_history_imports_changed: bool,
+    /// Storage's count of changes chat history imports read, and a hash of
+    /// the held chats, when the answer was last read; none before the first
+    /// read on this client.
+    pub(crate) history_imports_inputs: Option<(u64, u64)>,
+    /// The chat history imports last announced.
+    pub(crate) listed_history_imports: Vec<history_imports::ChatHistoryImport>,
     /// The device group removed this device after its link was made, and the
     /// account is marked unlinked (mdk#2628 D67). The account worker stops at
     /// its next turn and asks the runtime to deactivate the account.
@@ -1049,6 +1063,10 @@ pub struct AppClient {
     /// Welcomes already announced as pending by this process, so a Welcome
     /// that keeps failing on each maintenance pass is announced once.
     pub(crate) announced_welcome_failures: HashSet<MessageId>,
+    /// The 461s this process sent to carry sibling Welcomes, until each
+    /// settles. A carrier the engine holds that is not here was in flight
+    /// when the app last stopped, so its Welcome is owed again.
+    pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1514,6 +1532,14 @@ impl AppClient {
                 marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
             ));
         }
+        // A device its device group removed while it signs out sends only
+        // what its sign-out has left (mdk#2628 D67).
+        if self.hold_removed_sign_out_publishing()? {
+            let summary = self
+                .runtime
+                .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
+            return Ok(maintenance_run_summary_from_account(summary));
+        }
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
             self.discard_expired_sibling_key_packages();
@@ -1565,6 +1591,7 @@ impl AppClient {
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
+        self.send_owed_sibling_welcomes(&held).await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
@@ -2025,7 +2052,12 @@ impl AppClient {
         // Current kind 10002 write relays; the runtime adds every relay the
         // slot was published to.
         self.refresh_routing()?;
-        Ok(self.runtime.withdraw_key_package_slot().await?)
+        // The slot's deletion is a step of a sign-out, which may go out
+        // after a removal held the rest back (mdk#2628 D67).
+        let sign_out_step = self.sign_out_step_permit()?;
+        Ok(sign_out_step
+            .run(self.runtime.withdraw_key_package_slot())
+            .await?)
     }
 
     /// Fetch current relay KeyPackages for the composition roster without
@@ -3809,20 +3841,25 @@ impl AppClient {
 
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
-        // queue the current registration update as compensation.
-        let removed_registration = self
-            .drain_push_registration_removal_before_departure(group_id)
-            .await?;
+        // queue the current registration update as compensation. A device
+        // removed while it signs out sends only its SelfRemove (mdk#2628 D67).
+        let sign_out_step = self.sign_out_step_permit()?;
+        let removed_while_signing_out = sign_out_step.held();
+        let removed_registration = if removed_while_signing_out {
+            None
+        } else {
+            self.drain_push_registration_removal_before_departure(group_id)
+                .await?
+        };
         let effects = match async {
             self.sync_runtime_groups_for_send("leave_group").await?;
-            let effects = self
-                .runtime
-                .send_with_audit_context(
+            let effects = sign_out_step
+                .run(self.runtime.send_with_audit_context(
                     SendIntent::Leave {
                         group_id: group_id.clone(),
                     },
                     audit_context.clone(),
-                )
+                ))
                 .await?;
             self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
                 .await?;
@@ -3832,13 +3869,15 @@ impl AppClient {
         {
             Ok(effects) => effects,
             Err(err) => {
-                self.compensate_group_push_registration_removal(
-                    group_id,
-                    removed_registration.as_ref(),
-                );
-                let _ = self
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                if !removed_while_signing_out {
+                    self.compensate_group_push_registration_removal(
+                        group_id,
+                        removed_registration.as_ref(),
+                    );
+                    let _ = self
+                        .retry_pending_push_registration_shares_best_effort()
+                        .await;
+                }
                 return Err(err);
             }
         };

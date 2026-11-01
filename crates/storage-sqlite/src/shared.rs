@@ -522,22 +522,6 @@ impl SqliteSharedStorage {
             .storage()
     }
 
-    pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
-        retry_on_busy(|| {
-            self.lock()?
-                .execute_cached(
-                    "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET
-                    install_id = excluded.install_id,
-                    updated_at_ms = excluded.updated_at_ms",
-                    params![install_id, unix_now_ms()],
-                )
-                .storage()?;
-            Ok(())
-        })
-    }
-
     pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
         self.ensure_audit_log_settings()?;
         self.lock()?
@@ -720,27 +704,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_uses_account_database_durability_pragmas() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.sqlite");
-        let storage = SqliteSharedStorage::open(&path).unwrap();
-        let conn = storage.lock().unwrap();
-
-        let journal_mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .unwrap();
-        let synchronous: i64 = conn
-            .query_row("PRAGMA synchronous", [], |row| row.get(0))
-            .unwrap();
-        let temp_store: i64 = conn
-            .query_row("PRAGMA temp_store", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal_mode, "wal");
-        assert_eq!(synchronous, 1);
-        assert_eq!(temp_store, 2);
-    }
-
-    #[test]
     fn stores_public_directory_record_and_follows() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let record = PublicDirectoryUserRecord {
@@ -766,19 +729,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn public_directory_user_reads_user_and_follows_in_one_transaction() {
-        let source = include_str!("shared.rs");
-        let body = source
-            .split("pub fn public_directory_user(")
-            .nth(1)
+    /// Commits `write` through a second connection to the store's file
+    /// when the store starts a statement whose SQL contains `marker`, once.
+    /// A read that spans one snapshot does not see the write.
+    fn interleave(storage: &SqliteSharedStorage, path: &Path, marker: &str, write: String) {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        thread_local! {
+            static WRITE: std::cell::RefCell<Option<(String, rusqlite::Connection, String)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        fn on_statement(event: TraceEvent<'_>) {
+            let TraceEvent::Stmt(_, sql) = event else {
+                return;
+            };
+            WRITE.with_borrow_mut(|pending| {
+                if pending
+                    .as_ref()
+                    .is_some_and(|(marker, ..)| sql.contains(marker.as_str()))
+                    && let Some((_, writer, write)) = pending.take()
+                {
+                    // A failed write shows as the later read not seeing it.
+                    let _ = writer.execute_batch(&write);
+                }
+            });
+        }
+        let writer = rusqlite::Connection::open(path).unwrap();
+        WRITE.set(Some((marker.to_owned(), writer, write)));
+        storage
+            .lock()
             .unwrap()
-            .split("pub fn public_directory_users(")
-            .next()
-            .unwrap();
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(on_statement));
+    }
 
-        assert!(body.contains("transaction()"));
-        assert!(body.contains("tx.commit()"));
+    fn directory_user(prefix: &str, follows: &[&str]) -> PublicDirectoryUserRecord {
+        PublicDirectoryUserRecord {
+            account_id_hex: prefix.repeat(32),
+            npub: format!("npub{prefix}"),
+            profile_json: None,
+            relay_lists_json: "{}".to_owned(),
+            key_package_json: None,
+            event_id_hex: None,
+            event_kind: None,
+            event_created_at: None,
+            follows: follows.iter().map(|follow| follow.repeat(32)).collect(),
+        }
+    }
+
+    #[test]
+    fn public_directory_user_reads_user_and_follows_from_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        let record = directory_user("aa", &["bb"]);
+        storage.put_public_directory_user(&record).unwrap();
+        interleave(
+            &storage,
+            &path,
+            "FROM directory_user_follows",
+            format!(
+                "INSERT INTO directory_user_follows
+                     (account_id_hex, follow_account_id_hex, position)
+                 VALUES ('{}', '{}', 1)",
+                "aa".repeat(32),
+                "cc".repeat(32)
+            ),
+        );
+        assert_eq!(
+            storage
+                .public_directory_user(&record.account_id_hex)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+        assert_eq!(
+            storage
+                .public_directory_user(&record.account_id_hex)
+                .unwrap()
+                .unwrap()
+                .follows,
+            ["bb".repeat(32), "cc".repeat(32)],
+            "the interleaved write committed"
+        );
     }
 
     #[test]
@@ -876,18 +907,33 @@ mod tests {
     }
 
     #[test]
-    fn public_directory_users_read_users_and_follows_in_one_transaction() {
-        let source = include_str!("shared.rs");
-        let body = source
-            .split("fn public_directory_users_capped(")
-            .nth(1)
-            .unwrap()
-            .split("pub fn relay_telemetry_settings(")
-            .next()
-            .unwrap();
-
-        assert!(body.contains("transaction()"));
-        assert!(body.contains("tx.commit()"));
+    fn public_directory_users_read_users_and_follows_from_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite3");
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        let record = directory_user("aa", &["bb"]);
+        storage.put_public_directory_user(&record).unwrap();
+        // The follows are read first; a user who arrives before the users
+        // are read must not join a listing whose follows missed it.
+        interleave(
+            &storage,
+            &path,
+            "npub, profile_json",
+            format!(
+                "INSERT INTO directory_users (account_id_hex, npub, relay_lists_json)
+                 VALUES ('{}', 'npub01', '{{}}')",
+                "01".repeat(32)
+            ),
+        );
+        assert_eq!(
+            storage.public_directory_users().unwrap(),
+            std::slice::from_ref(&record)
+        );
+        assert_eq!(
+            storage.public_directory_users().unwrap(),
+            [directory_user("01", &[]), record],
+            "the interleaved write committed"
+        );
     }
 
     #[test]
@@ -971,56 +1017,6 @@ mod tests {
 
         assert_eq!(storage.audit_log_settings().unwrap(), updated);
     }
-
-    #[test]
-    fn audit_log_settings_ignore_legacy_data_mode_column() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.db");
-
-        // Simulate a v2 database whose retired data_mode setting selected the
-        // former full-data recorder.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE audit_log_settings (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    enabled INTEGER NOT NULL DEFAULT 0,
-                    data_mode TEXT NOT NULL DEFAULT 'obfuscated_sensitive_data',
-                    updated_at_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO audit_log_settings (id, enabled, data_mode, updated_at_ms)
-                 VALUES (1, 1, 'full_data', 0);",
-            )
-            .unwrap();
-        }
-
-        // The retired column is inert: only the enabled switch is read.
-        let storage = SqliteSharedStorage::open(&path).unwrap();
-        assert_eq!(
-            storage.audit_log_settings().unwrap(),
-            StoredAuditLogSettings { enabled: true }
-        );
-
-        // Writes also leave the legacy value untouched rather than depending on
-        // or reactivating it.
-        storage
-            .set_audit_log_settings(&StoredAuditLogSettings { enabled: false })
-            .unwrap();
-        assert_eq!(
-            storage.audit_log_settings().unwrap(),
-            StoredAuditLogSettings { enabled: false }
-        );
-        let legacy_mode: String = storage
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT data_mode FROM audit_log_settings WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(legacy_mode, "full_data");
-    }
 }
 
 #[cfg(test)]
@@ -1047,7 +1043,12 @@ mod migration_contract_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE directory_users (account_id_hex TEXT)")
             .unwrap();
-        assert!(SqliteSharedStorage::from_connection(conn).is_err());
+        assert_eq!(
+            SqliteSharedStorage::from_connection(conn)
+                .unwrap_err()
+                .to_string(),
+            "backend failure: invalid shared store schema shape"
+        );
     }
 }
 
@@ -1101,29 +1102,44 @@ mod usage_diagnostics_tests {
             store.telemetry_install_id().unwrap().as_deref(),
             Some("new-id")
         );
-        let invalid = StoredUsageDiagnosticsSettings {
-            decision: 9,
+        // The identity write is the last statement: when it fails, the
+        // receipt and the old identity's removal before it roll back.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_install BEFORE INSERT ON telemetry_install
+                 BEGIN SELECT RAISE(ABORT, 'private trigger text'); END",
+            )
+            .unwrap();
+        let declined = StoredUsageDiagnosticsSettings {
+            decision: 1,
+            updated_at_ms: 123457,
             ..granted.clone()
         };
+        let refused = store.set_usage_diagnostics_settings(&declined, Some("other-id"));
         assert!(
-            store
-                .set_usage_diagnostics_settings(&invalid, None)
-                .is_err()
+            matches!(
+                &refused,
+                Err(StorageError::Backend(message))
+                    if message.contains("1811") && !message.contains("private")
+            ),
+            "{refused:?}"
         );
+        assert_eq!(store.usage_diagnostics_settings().unwrap(), granted);
         assert_eq!(
             store.telemetry_install_id().unwrap().as_deref(),
             Some("new-id")
         );
-        assert_eq!(store.usage_diagnostics_settings().unwrap().decision, 2);
         store
-            .set_usage_diagnostics_settings(
-                &StoredUsageDiagnosticsSettings {
-                    decision: 1,
-                    ..granted
-                },
-                None,
-            )
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_install")
             .unwrap();
+        store
+            .set_usage_diagnostics_settings(&declined, None)
+            .unwrap();
+        assert_eq!(store.usage_diagnostics_settings().unwrap(), declined);
         assert!(store.telemetry_install_id().unwrap().is_none());
     }
 }

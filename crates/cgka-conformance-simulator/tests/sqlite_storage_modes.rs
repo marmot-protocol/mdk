@@ -59,8 +59,12 @@ async fn encrypted_file_restart_closes_reopens_and_hydrates_group_state() {
     let inspection = rusqlite::Connection::open(&path).expect("open inspection connection");
     let inspection_key =
         SqlCipherKey::new("conformance explicit file key").expect("inspection SQLCipher key");
-    open_hardened_sqlcipher(&inspection, &inspection_key, SqlCipherHardening::default())
-        .expect("key inspection connection");
+    open_hardened_sqlcipher(
+        &inspection,
+        &inspection_key,
+        SqlCipherHardening::cipher_only(),
+    )
+    .expect("key inspection connection");
     let journal_mode: String = inspection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("read journal mode");

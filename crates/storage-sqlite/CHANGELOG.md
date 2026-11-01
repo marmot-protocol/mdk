@@ -4,6 +4,35 @@
 
 ### Breaking changes
 
+- Methods with no caller outside their own tests are gone (mdk#2816):
+  `SqliteAppStorage::remove_group_push_token`,
+  `remove_group_push_tokens_for_member` (use
+  `remove_group_push_tokens_for_leaves` with the member as departed),
+  `clear_epoch_backfill_intents_for_groups`,
+  `clear_local_group_deletion_frontier_if_message_is_newer`,
+  `record_app_event_refreshing_moderation_grant` and its `_with_retention`
+  variant (nothing replaces a stored grant any more: re-recording keeps it,
+  and `record_app_event_with_source` decides it once from the source's
+  authority and never again), `avatar_acquisition_state`
+  (read `AvatarAssetPresentation::acquisition`) and `release_media_reference`
+  (removal releases a slot's reference); `AvatarFileImage::byte_len`,
+  `DatabaseAvatar::byte_len`, `SqliteSharedStorage::set_telemetry_install_id`
+  and `impl Default for SqlCipherHardening` (use
+  `SqlCipherHardening::cipher_only`).
+- Imported timeline rows name their source device (mdk#2628 item 4.2d).
+  `TimelineMessageRecord` adds `imported_from: Option<HistoryImportSource>`,
+  read from `app_event_imports`, with the device's name from
+  `set_device_labels`, which marmot-app gives from the roster. The names live
+  in a TEMP table each account connection creates at open, so nothing is
+  stored and every open starts with none; no migration. `latest_history_imports`
+  reads each chat's latest import (of two sources importing in the same
+  second, the greater slot) and `parked_history_chats` each chat parked
+  deliveries name, with whether a fetch failed. `watch_history_imports` starts
+  a per-connection TEMP count of every change those reads see, imports,
+  cascade deletes, parked deliveries and device names alike, and
+  `history_imports_generation` reads it; `set_device_labels` writes only when
+  the names differ.
+
 - Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
   It adds `backup_recovery_key`, at most one row: the public half of the
   recovery key that words confirmed while this device trusts no device group
@@ -134,6 +163,17 @@
   `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
   with their group, and are pruned after 30 days or past 16 per slot. Nothing
   writes them unless device groups are on.
+- Migration 0145 fills schema 145 (mdk#2761). It adds
+  `cgka_roster_tag_keys`: one row per tag signature key a device-group roster
+  this device applied listed for a slot, in a device entry or a `removed`
+  record, with when it last applied one that did, the order it applied them
+  in (`seen_seq`), and whether one listed it in a `removed` record
+  (`held_as_removed`). `SqliteAccountStorage` implements the new
+  `RosterTagKeyStorage`. Rows survive a branch-selection
+  rewind, go with their group, and are pruned after 30 days or past 4 per
+  slot; a slot's newest row held as removed is kept past the 4, so the slot
+  stays known to have held its `removed` record. Nothing writes them unless
+  device groups are on.
 - Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
   It adds `device_removals`, one row per device this device's user removed
   from the account's device group, written before anything is committed, with
@@ -429,6 +469,12 @@
 - A queued proposal or proposal-queue ref list that fails to decode in the
   MessagePack value encoding clears the group's proposal queue, as a
   corrupt JSON row already did, instead of failing group load.
+- A transaction SQLite rolled back by itself (a full disk, an I/O error or
+  out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`, a failed
+  `COMMIT`) no longer marks the account's connection unusable until the
+  account reopens. The caller gets the failure's own error, so a full disk
+  reaches it as `StorageError::Capacity`, and the rest of that transaction,
+  inside or after a savepoint, fails instead of committing write by write.
 
 ## 0.14.0 - 2026-10-23
 

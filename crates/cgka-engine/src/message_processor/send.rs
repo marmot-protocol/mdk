@@ -123,11 +123,8 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
-            SendIntent::AddOwnAccountDevices {
-                group_id,
-                key_packages,
-            } => {
-                self.do_send_add_own_account_devices(group_id, key_packages)
+            SendIntent::AddOwnAccountDevices { group_id, siblings } => {
+                self.do_send_add_own_account_devices(group_id, siblings)
                     .await
             }
             SendIntent::RemoveOwnAccountDevices {
@@ -188,6 +185,13 @@ impl<S: StorageProvider> Engine<S> {
                 roster_update,
             } => {
                 self.do_send_unlink_device(group_id, leaf_signature_key, roster_update)
+                    .await
+            }
+            SendIntent::RecordRemovedSlot {
+                group_id,
+                roster_update,
+            } => {
+                self.do_send_record_removed_slot(group_id, roster_update)
                     .await
             }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),

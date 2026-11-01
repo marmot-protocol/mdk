@@ -50,7 +50,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::base::migrations::{MIGRATIONS, run, run_through};
+    use crate::base::migrations::run_through;
     use rusqlite::Connection;
 
     type ParkedRow = (
@@ -81,7 +81,7 @@ mod tests {
              VALUES ('01', 'aa', 5, 6, 2);",
         )
         .unwrap();
-        run(&mut conn, MIGRATIONS).unwrap();
+        run_through(&mut conn, 166).unwrap();
 
         let parked = conn
             .prepare(
@@ -152,10 +152,18 @@ mod tests {
                  VALUES ('c', '03', 'cc', x'05', {bundle}, {blossom}, 30, {fetch_due_at})"
             ))
         };
-        assert!(park("x'06'", "'https://b.example/'", "30").is_err());
-        assert!(park("NULL", "NULL", "NULL").is_err());
-        assert!(park("NULL", "'https://b.example/'", "NULL").is_err());
-        assert!(park("x'06'", "NULL", "30").is_err());
+        for (bundle, blossom, fetch_due_at) in [
+            ("x'06'", "'https://b.example/'", "30"),
+            ("NULL", "NULL", "NULL"),
+            ("NULL", "'https://b.example/'", "NULL"),
+            ("x'06'", "NULL", "30"),
+        ] {
+            let refused = park(bundle, blossom, fetch_due_at).unwrap_err();
+            assert!(
+                refused.to_string().starts_with("CHECK constraint failed"),
+                "{bundle} {blossom} {fetch_due_at}: {refused}"
+            );
+        }
         park("NULL", "'https://b.example/'", "30").unwrap();
     }
 }

@@ -346,8 +346,8 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point; `shutdownAndClose()` keeps
-  running regardless. Generated Swift waits for the call to finish even when its `Task` is
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
+  `signOutAndWipe()` keep running regardless. Generated Swift waits for the call to finish even when its `Task` is
   cancelled.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
@@ -1007,6 +1007,13 @@ the device group this device trusts, for a Devices screen:
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
+Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
+`chat_history_imports(account_ref)` lists each held chat's history as `Receiving` (`retrying` once an attempt to get its
+bundle failed) or `Imported`. The list is empty and the event silent in every release build until the roster's spec
+lands. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
+`device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`, which fires whenever its answer
+changes, a source device's rename or removal included; re-read rows on `LinkedDevicesChanged` for their new names.
+
 `rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one included, with
 one roster commit in the device group:
 
@@ -1029,6 +1036,21 @@ once it reads the removal, and nothing more is sent from it (mdk#2628):
 - Signing in to it, logging in to it or importing its key fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
   account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
   sign-in that links this device anew.
+
+### Signing out with linked devices
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too (mdk#2628):
+
+- It first records in the device group that it is leaving and waits for that to settle, which can take about 30
+  seconds; show progress. It then leaves only the chats no other device can take it out of, deletes its KeyPackage
+  slot and wipes. The other devices remove it from the device group and from the rest.
+- `WipeOutcomeFfi.groups_left_to_siblings` counts the chats it left to the other devices; `groups_left` counts those it
+  left itself.
+- When it can't ask them in time, it tries to leave every chat itself, reporting any it can't in
+  `group_leave_failures`, and sets `siblings_not_reached`. Tell the user their other devices couldn't be asked, and
+  that those devices may still list this one until the user removes it from one of them.
+- The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
 ### Overdue KeyPackage refresh
 
@@ -1324,7 +1346,7 @@ builder, toolchain, profile and features. CI transfers inputs only within the sa
 workflow run. Apple assembly checks required files before replacing an existing
 bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
 See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
-for the build-only benchmark workflow and cache-warming procedure.
+for the build-only benchmark workflow.
 
 ## Kotlin / Android
 
@@ -1423,15 +1445,15 @@ Android target compilation, NDK checks and native linking are deferred unless
 explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
-Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it.
+Candidate builds use no Cargo cache, so
+every run compiles from a clean target directory.
 The workflow has no schedule of its own. The
 [nightly release](../../release.md#nightly-builds) builds and validates the
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It does not run `test-native-archive.py` or refresh this
-workflow's cache seeds; matching `master` pushes do both.
+for three hours. It does not run `test-native-archive.py`; matching `master`
+pushes do.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

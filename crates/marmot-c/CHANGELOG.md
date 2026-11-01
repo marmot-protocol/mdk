@@ -9,6 +9,22 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `marmot_sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first asks them to take it out, which can block for about 30 seconds, and
+  leaves them the chats they can. `MarmotWipeOutcome` gains trailing
+  `groups_left_to_siblings` and `siblings_not_reached`. The struct layout
+  changed: use matching regenerated headers and libraries.
+
+- `MarmotTimelineMessageRecord` adds a nullable `imported_from`
+  (`MarmotHistoryImportSource`), and `MarmotEvent` adds
+  `MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED`, last, so earlier tags keep
+  their values (mdk#2628 item 4.2d). New
+  `marmot_chat_history_imports` writes a `MarmotChatHistoryImportList` (free
+  with `marmot_chat_history_import_list_free`) whose tagged
+  `MarmotChatHistoryImportState` is `Receiving` or `Imported`. Use matching
+  regenerated headers and libraries.
+
 - `MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE` is now
   `MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, with the
   same value (mdk#2628 D74, 3.7b): a KeyPackage this device found in its own
@@ -146,6 +162,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_removed_device_leftover_chats` also counts chats that keep the leaf
+  of a device the account's device group stopped listing without a removal,
+  such as after a failed link (mdk#2761). Release builds hold no device
+  group, so it stays zero there.
 - `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
   461, 473, 475 and 476 as reserved, and one received in a chat makes no
   timeline row, message or notification (mdk#2628). They are read only in

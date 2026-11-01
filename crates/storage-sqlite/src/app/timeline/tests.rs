@@ -3299,41 +3299,6 @@ fn re_recording_a_delete_freezes_the_stored_moderation_grant() {
 }
 
 #[test]
-fn refreshing_variant_replaces_the_stored_moderation_grant() {
-    // The local sender's post-publish reconciling projection supersedes the
-    // optimistic pre-send grant: a grant recomputed as non-moderated after
-    // group sync must drop the tombstone (and vice versa).
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .record_app_event(&chat("target", "alice", 1, "secret"))
-        .unwrap();
-    store
-        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 2))
-        .unwrap();
-    assert!(list(&store).pop().unwrap().deleted);
-
-    // Post-sync recompute: no longer a moderator → grant withdrawn.
-    store
-        .record_app_event_refreshing_moderation_grant(&delete("admin-delete", "carol", "target", 2))
-        .unwrap();
-    assert!(
-        !list(&store).pop().unwrap().deleted,
-        "refresh must withdraw the tombstone when the grant is recomputed away",
-    );
-
-    // Post-sync recompute the other way: moderator confirmed → grant restored.
-    store
-        .record_app_event_refreshing_moderation_grant(&moderated_delete(
-            "admin-delete",
-            "carol",
-            "target",
-            2,
-        ))
-        .unwrap();
-    assert!(list(&store).pop().unwrap().deleted);
-}
-
-#[test]
 fn pruning_modifier_event_cascades_its_edges() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();

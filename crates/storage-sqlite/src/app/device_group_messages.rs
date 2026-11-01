@@ -253,21 +253,29 @@ mod tests {
             Some(475)
         );
 
-        for index in 0..MAX_DEVICE_GROUP_MESSAGES {
-            store
-                .record_device_group_message(
-                    "aa",
-                    &format!("e{index}"),
-                    Some(&format!("n{index}")),
-                    476,
-                    9 * DAY,
-                )
-                .unwrap();
-        }
+        // Fill to one under the cap, all newer than `m2`; the record that
+        // follows reaches the cap and drops the oldest rows.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                 INSERT INTO device_group_messages
+                     (group_id_hex, app_event_id, message_id_hex, kind, recorded_at)
+                 SELECT 'aa', 'e' || i, 'n' || i, 476, ?2 FROM n",
+                params![MAX_DEVICE_GROUP_MESSAGES - 1, u64_to_i64(9 * DAY).unwrap()],
+            )
+            .unwrap();
+        store
+            .record_device_group_message("aa", "e0", Some("n0"), 476, 9 * DAY)
+            .unwrap();
+        assert_eq!(store.device_group_message_kind("aa", "m1").unwrap(), None);
         assert_eq!(store.device_group_message_kind("aa", "m2").unwrap(), None);
-        assert_eq!(
-            store.device_group_message_kind("aa", "n0").unwrap(),
-            Some(476)
-        );
+        for kept in ["n0", "n1"] {
+            assert_eq!(
+                store.device_group_message_kind("aa", kept).unwrap(),
+                Some(476)
+            );
+        }
     }
 }
