@@ -94,6 +94,8 @@ pub(crate) struct RelayTrafficSessionV1 {
     upstream_messages: BTreeMap<String, u64>,
     downstream_messages: BTreeMap<String, u64>,
     events: BTreeMap<String, RelayEventDeliveryV1>,
+    /// Each open subscription's `REQ`, by subscription id.
+    subscriptions: BTreeMap<String, RelayDeliveryPath>,
     history_requests: Vec<HistoryRequestV1>,
     inboxes: BTreeSet<String>,
     undecoded_frames: u64,
@@ -108,6 +110,65 @@ pub struct RelayEventDeliveryV1 {
     /// The event's own `created_at`, in seconds.
     #[serde(default)]
     pub created_at: u64,
+    /// Deliveries by the [`RelayDeliveryPath`] of the subscription that
+    /// carried them.
+    #[serde(default)]
+    pub via_ids: u64,
+    #[serde(default)]
+    pub via_window: u64,
+    #[serde(default)]
+    pub via_paged_window: u64,
+    #[serde(default)]
+    pub via_maintenance: u64,
+    #[serde(default)]
+    pub via_live: u64,
+    /// The path of its first delivery on this connection, and when, on the
+    /// scale of [`HistoryRequestV1::at_ms`].
+    #[serde(default)]
+    pub first: Option<(RelayDeliveryPath, u64)>,
+}
+
+/// What a subscription's `REQ` asked for. Both recovery owners fetch over the
+/// account's one connection, with ids and unlimited windows alike, so a path
+/// names a request shape, not an owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDeliveryPath {
+    /// Event ids.
+    Ids,
+    /// A window (a filter with an `until`) without a `limit`: owner capture
+    /// pages and the runner's sweeps.
+    Window,
+    /// A window with a `limit`: epoch-gap pages and the reconciliation set.
+    PagedWindow,
+    /// A group's maintenance subscription, which returns the group's stored
+    /// events from its floor and then live ones.
+    Maintenance,
+    /// Any other subscription, which also returns stored events first.
+    Live,
+}
+
+impl RelayDeliveryPath {
+    fn of(items: &[serde_json::Value]) -> Self {
+        let has = |field: &str| {
+            items
+                .iter()
+                .skip(2)
+                .any(|filter| filter.get(field).is_some())
+        };
+        let subscription = items.get(1).and_then(serde_json::Value::as_str);
+        if has("ids") {
+            Self::Ids
+        } else if has("until") && has("limit") {
+            Self::PagedWindow
+        } else if has("until") {
+            Self::Window
+        } else if subscription.is_some_and(|id| id.starts_with("marmot:group-maintenance:")) {
+            Self::Maintenance
+        } else {
+            Self::Live
+        }
+    }
 }
 
 type Traffic = Arc<Mutex<Vec<RelayTrafficSessionV1>>>;
@@ -240,6 +301,7 @@ fn record_message(
     session: &mut RelayTrafficSessionV1,
     message: &[u8],
     upstream: bool,
+    at_ms: u64,
 ) -> Option<Vec<serde_json::Value>> {
     let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(message) else {
         session.undecoded_frames += 1;
@@ -255,16 +317,36 @@ fn record_message(
     let refused = verb == "OK" && items.get(2) == Some(&serde_json::Value::Bool(false));
     let key = if refused { "OK-refused" } else { verb };
     *verbs.entry(key.to_owned()).or_default() += 1;
+    let subscription = items.get(1).and_then(serde_json::Value::as_str);
+    if upstream
+        && verb == "REQ"
+        && let Some(subscription) = subscription
+    {
+        let asked = RelayDeliveryPath::of(&items);
+        session.subscriptions.insert(subscription.to_owned(), asked);
+    }
     if !upstream
         && verb == "EVENT"
         && let Some(event) = items.get(2)
         && let Some(id) = event["id"].as_str()
     {
+        let asked = subscription.and_then(|subscription| session.subscriptions.get(subscription));
+        let asked = asked.copied();
         let delivery = session.events.entry(id.to_owned()).or_default();
         delivery.kind = u16::try_from(event["kind"].as_u64().unwrap_or_default()).unwrap_or(0);
         delivery.created_at = event["created_at"].as_u64().unwrap_or_default();
         delivery.count += 1;
         delivery.bytes += message.len() as u64;
+        if let Some(asked) = asked {
+            *match asked {
+                RelayDeliveryPath::Ids => &mut delivery.via_ids,
+                RelayDeliveryPath::Window => &mut delivery.via_window,
+                RelayDeliveryPath::PagedWindow => &mut delivery.via_paged_window,
+                RelayDeliveryPath::Maintenance => &mut delivery.via_maintenance,
+                RelayDeliveryPath::Live => &mut delivery.via_live,
+            } += 1;
+            delivery.first.get_or_insert((asked, at_ms));
+        }
     }
     Some(items)
 }
@@ -438,14 +520,15 @@ struct Upstream<'a> {
     opened: bool,
 }
 
-/// Forward one direction, recording its bytes and completed messages. The
-/// client side passes its requests through its gate.
+/// Forward one direction, recording its bytes and completed messages on
+/// `clock`'s time. The client side passes its requests through its gate.
 async fn pump(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
     traffic: &Traffic,
     index: usize,
     client: Option<Upstream<'_>>,
+    clock: &Gate,
 ) -> io::Result<()> {
     let opened = client.is_some_and(|client| client.opened);
     let mut tap = FrameTap {
@@ -476,7 +559,7 @@ async fn pump(
         };
         to.write_all(&forward).await?;
         let (messages, undecoded) = tap.feed(bytes);
-        let at_ms = gate.map_or(0, Gate::elapsed_ms);
+        let at_ms = clock.elapsed_ms();
         let mut sessions = traffic.lock().expect("relay traffic lock poisoned");
         let session = &mut sessions[index];
         if upstream {
@@ -486,7 +569,7 @@ async fn pump(
         }
         session.undecoded_frames += undecoded;
         for message in &messages {
-            let Some(items) = record_message(session, message, upstream) else {
+            let Some(items) = record_message(session, message, upstream, at_ms) else {
                 continue;
             };
             if upstream {
@@ -669,8 +752,8 @@ impl RelayFaultProxy {
                             let client_read = std::io::Cursor::new(rest).chain(client_read);
                             let client = Upstream { gate: &gate, opened: head.is_some() };
                             let _ = tokio::try_join!(
-                                pump(client_read, relay_write, &traffic, index, Some(client)),
-                                pump(relay_read, client_write, &traffic, index, None),
+                                pump(client_read, relay_write, &traffic, index, Some(client), &gate),
+                                pump(relay_read, client_write, &traffic, index, None, &gate),
                             );
                         });
                     }
@@ -750,6 +833,15 @@ impl RelayFaultProxy {
                 merged.created_at = delivery.created_at;
                 merged.count += delivery.count;
                 merged.bytes += delivery.bytes;
+                merged.via_ids += delivery.via_ids;
+                merged.via_window += delivery.via_window;
+                merged.via_paged_window += delivery.via_paged_window;
+                merged.via_maintenance += delivery.via_maintenance;
+                merged.via_live += delivery.via_live;
+                // Sessions merge in order, so the earliest one's first stays.
+                if merged.first.is_none() {
+                    merged.first = delivery.first;
+                }
             }
         }
         total.history_requests.sort_by_key(|request| request.at_ms);
@@ -982,7 +1074,7 @@ mod tests {
             let (messages, undecoded) = tap.feed(chunk);
             session.undecoded_frames += undecoded;
             for message in messages {
-                record_message(&mut session, &message, false);
+                record_message(&mut session, &message, false, 0);
             }
         }
         assert_eq!(
@@ -999,6 +1091,7 @@ mod tests {
             count: 1,
             bytes: event.len() as u64,
             created_at: 1_700_000_000,
+            ..RelayEventDeliveryV1::default()
         };
         assert_eq!(session.events["ab"], expected);
         assert_eq!(session.undecoded_frames, 1);
@@ -1014,6 +1107,66 @@ mod tests {
         };
         assert_eq!(broken.feed(&[0x81, 127, 0xff, 0, 0, 0, 0, 0, 0, 0]).1, 1);
         assert!(broken.feed(&frame(0x81, b"[]", None)).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deliveries_are_counted_by_the_request_shape_that_carried_them() {
+        let requests = [
+            r#"["REQ","fetch",{"kinds":[445]},{"ids":["ab"]}]"#,
+            r##"["REQ","page",{"#h":["g"],"until":5}]"##,
+            r##"["REQ","gap",{"#h":["g"],"until":5,"limit":500}]"##,
+            r##"["REQ","marmot:group-maintenance:1",{"#h":["g"],"since":1}]"##,
+            r##"["REQ","live",{"#h":["g"],"since":10}]"##,
+        ];
+        let event = |subscription: &str, id: &str| {
+            format!(r#"["EVENT","{subscription}",{{"id":"{id}","kind":445,"created_at":7}}]"#)
+        };
+        let record = |deliveries: &[(&str, &str, u64)]| {
+            let mut session = RelayTrafficSessionV1::default();
+            for request in requests {
+                record_message(&mut session, request.as_bytes(), true, 0);
+            }
+            for (subscription, id, at_ms) in deliveries {
+                let message = event(subscription, id);
+                record_message(&mut session, message.as_bytes(), false, *at_ms);
+            }
+            session
+        };
+        let first = record(&[
+            ("live", "ab", 30),
+            ("fetch", "ab", 40),
+            ("page", "ab", 50),
+            ("gap", "cd", 10),
+            ("marmot:group-maintenance:1", "cd", 20),
+            // A subscription this connection never asked for names no path.
+            ("closed", "cd", 5),
+        ]);
+        let ab = &first.events["ab"];
+        let cd = &first.events["cd"];
+        assert_eq!(
+            (ab.via_ids, ab.via_window, ab.via_live, ab.count),
+            (1, 1, 1, 3)
+        );
+        assert_eq!(ab.first, Some((RelayDeliveryPath::Live, 30)));
+        assert_eq!(
+            (cd.via_paged_window, cd.via_maintenance, cd.count),
+            (1, 1, 3)
+        );
+        assert_eq!(cd.first, Some((RelayDeliveryPath::PagedWindow, 10)));
+
+        // Connections merge in order: counts add, and the earliest
+        // connection's first delivery stays.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = RelayFaultProxy::start(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let second = record(&[("fetch", "ab", 1)]);
+        proxy.traffic.lock().unwrap().extend([first, second]);
+        let merged = proxy.traffic_since(0, true).events;
+        assert_eq!((merged["ab"].via_ids, merged["ab"].count), (2, 4));
+        assert_eq!(merged["ab"].first, Some((RelayDeliveryPath::Live, 30)));
+        let later = proxy.traffic_since(1, true).events;
+        assert_eq!(later["ab"].first, Some((RelayDeliveryPath::Ids, 1)));
     }
 
     fn masked(payload: &str) -> Vec<u8> {

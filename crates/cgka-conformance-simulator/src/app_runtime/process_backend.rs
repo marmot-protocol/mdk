@@ -1,5 +1,6 @@
 //! Public app API bridge; the scenario coordinator never opens child storage.
 use super::process_io::{ProcessClient, WireError};
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::{
     AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppMessageQuery,
@@ -7,6 +8,7 @@ use marmot_app::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub(super) enum ParticipantApp {
@@ -80,7 +82,91 @@ pub(super) struct Init {
     pub immediate_maintenance: bool,
     pub create_identity: bool,
 }
+/// Every record in the forensic audit files, one JSON value per line.
+fn read_audit_records(files: &[marmot_app::AuditLogFile]) -> Result<Vec<Value>, AppError> {
+    let mut records = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file.path)?;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            records.push(serde_json::from_str(line)?);
+        }
+    }
+    Ok(records)
+}
+
+async fn audit_records(runtime: &MarmotAppRuntime) -> Result<Vec<Value>, AppError> {
+    let files = runtime.audit_log_files()?;
+    tokio::task::spawn_blocking(move || read_audit_records(&files))
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?
+}
+
+/// Count the queued intents the engine refuses at drain, from `events`, until
+/// the runtime closes.
+fn tally_queued_intent_refusals(
+    mut events: tokio::sync::broadcast::Receiver<marmot_app::MarmotAppEvent>,
+    refusals: Arc<Mutex<super::QueuedIntentRefusals>>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(marmot_app::MarmotAppEvent::GroupEvent(event)) => {
+                    if let GroupEvent::QueuedIntentRefused {
+                        intent_kind,
+                        reason,
+                        ..
+                    } = event.event
+                    {
+                        let mut refusals = refusals.lock().expect("refusal tally lock");
+                        let key = format!("{intent_kind}:{reason}");
+                        *refusals.by_kind_and_reason.entry(key).or_default() += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(missed)) => {
+                    refusals.lock().expect("refusal tally lock").lagged_events += missed;
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 impl ParticipantRuntime {
+    pub async fn set_audit_log(&self, enabled: bool) -> Result<(), AppError> {
+        match self {
+            Self::Local(r) => r
+                .set_audit_log_settings(marmot_app::AuditLogSettings { enabled })
+                .await
+                .map(drop),
+            Self::Remote(p) => p
+                .call_async("set_audit_log", json!([enabled]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
+    pub async fn audit_records(&self) -> Result<Vec<Value>, AppError> {
+        match self {
+            Self::Local(r) => audit_records(r).await,
+            Self::Remote(p) => p
+                .call_async("audit_records", json!([]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
+    pub async fn queued_intent_refusals(&self) -> Result<super::QueuedIntentRefusals, AppError> {
+        match self {
+            // The harness doesn't tally an in-process participant's events.
+            Self::Local(_) => Err(AppError::Io(std::io::Error::other(
+                "queued intent refusals are tallied in participant processes",
+            ))),
+            Self::Remote(p) => p
+                .call_async("queued_intent_refusals", json!([]))
+                .await
+                .map_err(WireError::app),
+        }
+    }
     pub fn drain_events(&self) -> Result<EventSummary, AppError> {
         match self {
             Self::Local(_) => Ok(EventSummary::default()),
@@ -468,6 +554,7 @@ pub(super) struct ParticipantServer {
     pub app: MarmotApp,
     pub runtime: MarmotAppRuntime,
     pub events: tokio::sync::broadcast::Receiver<marmot_app::MarmotAppEvent>,
+    refusals: Arc<Mutex<super::QueuedIntentRefusals>>,
 }
 fn args<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, WireError> {
     serde_json::from_value(value)
@@ -528,11 +615,14 @@ impl ParticipantServer {
             }
         };
         let events = runtime.subscribe();
+        let refusals = Arc::default();
+        tally_queued_intent_refusals(runtime.subscribe(), Arc::clone(&refusals));
         Ok((
             Self {
                 app,
                 runtime,
                 events,
+                refusals,
             },
             account,
         ))
@@ -585,6 +675,20 @@ impl ParticipantServer {
             "account_recovery_status" => {
                 let (account,): (String,) = args(arguments)?;
                 value(r.account_recovery_status(&account).await?)
+            }
+            "set_audit_log" => {
+                let (enabled,): (bool,) = args(arguments)?;
+                r.set_audit_log_settings(marmot_app::AuditLogSettings { enabled })
+                    .await?;
+                value(())
+            }
+            "audit_records" => {
+                let _: [Value; 0] = args(arguments)?;
+                value(audit_records(r).await?)
+            }
+            "queued_intent_refusals" => {
+                let _: [Value; 0] = args(arguments)?;
+                value(self.refusals.lock().expect("refusal tally lock").clone())
             }
             "confirm_group_rejoin" => {
                 let (account, welcome, token): (String, MessageId, Vec<u8>) = args(arguments)?;

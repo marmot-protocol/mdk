@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cgka_conformance_simulator::app_runtime::HistoryRequestV1;
+use cgka_conformance_simulator::app_runtime::{HistoryRequestV1, RelayDeliveryPath};
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
 };
@@ -137,18 +137,48 @@ async fn settle_maintenance(
     wait_for("post-join maintenance", Duration::from_secs(600), settled).await
 }
 
+/// How one send completed, for the report.
+#[derive(Clone)]
+struct Sent {
+    payload: String,
+    /// The relay publications the send reported; none when the app queued
+    /// it for a later drain.
+    published: usize,
+    /// The app message id the send named, queued or not.
+    app_id: Option<String>,
+    /// A `transport_closed` refusal answered by finding the message in the
+    /// sender's own timeline.
+    shown_after_closed: bool,
+}
+
+impl Sent {
+    fn how(&self) -> &'static str {
+        match (self.published, self.shown_after_closed) {
+            (_, true) => "shown_after_closed",
+            (0, false) => "queued",
+            (_, false) => "published",
+        }
+    }
+}
+
 /// Send once, repeating a `transport_closed` refusal only while the sender's
 /// own timeline lacks the message.
-async fn send(probe: &AppRuntimeProbe, group: &GroupId, payload: &str) -> Result<(), String> {
+async fn send(probe: &AppRuntimeProbe, group: &GroupId, payload: &str) -> Result<Sent, String> {
+    let sent = |published, app_id, shown_after_closed| Sent {
+        payload: payload.to_owned(),
+        published,
+        app_id,
+        shown_after_closed,
+    };
     for _ in 0..20 {
-        match probe.send_message(group, payload).await {
-            Ok(_) => return Ok(()),
+        match probe.send_message_receipt(group, payload).await {
+            Ok((published, ids)) => return Ok(sent(published, ids.into_iter().next(), false)),
             Err(error) if error.message.ends_with("transport_closed") => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let recent = probe.chat_view(group, Some(1_024)).await;
                 let (_, recent) = recent.map_err(|error| error.to_string())?;
                 if recent.iter().any(|text| text == payload) {
-                    return Ok(());
+                    return Ok(sent(0, None, true));
                 }
             }
             Err(error) => return Err(format!("sending {payload}: {error}")),
@@ -166,7 +196,7 @@ async fn publish(
     group: &GroupId,
     prefix: &str,
     count: usize,
-) -> TestResult<Vec<String>> {
+) -> TestResult<Vec<Sent>> {
     let mut lanes = tokio::task::JoinSet::new();
     for (lane, sender) in SENDERS.iter().enumerate() {
         let (probe, group) = (subject.probe(sender)?, group.clone());
@@ -175,17 +205,22 @@ async fn publish(
             .map(|index| format!("{prefix}{index:05}"))
             .collect::<Vec<_>>();
         lanes.spawn(async move {
+            let mut sent = Vec::with_capacity(payloads.len());
             for payload in &payloads {
-                send(&probe, &group, payload).await?;
+                sent.push(send(&probe, &group, payload).await?);
             }
-            Ok::<_, String>(payloads)
+            Ok::<_, String>(sent)
         });
     }
-    let mut payloads = Vec::with_capacity(count);
+    let mut sent = Vec::with_capacity(count);
     while let Some(lane) = lanes.join_next().await {
-        payloads.extend(lane??);
+        sent.extend(lane??);
     }
-    Ok(payloads)
+    Ok(sent)
+}
+
+fn payloads(sent: &[Sent]) -> Vec<String> {
+    sent.iter().map(|sent| sent.payload.clone()).collect()
 }
 
 /// Each endpoint's proxy clock now.
@@ -655,6 +690,415 @@ async fn timeline_view(
     }))
 }
 
+fn tally<T: Ord>(items: impl IntoIterator<Item = T>) -> BTreeMap<T, usize> {
+    let mut counts = BTreeMap::new();
+    for item in items {
+        *counts.entry(item).or_default() += 1;
+    }
+    counts
+}
+
+/// A forensic audit record's event and its fields. The app writes v5, which
+/// keeps it under `event`; v4 kept it under `kind`.
+fn audit_event(record: &Value) -> &Value {
+    record.get("event").unwrap_or(&record["kind"])
+}
+
+/// Audit rows of one kind, such as `ingest_outcome`, in record order.
+fn audit_rows<'a>(audit: &'a [Value], kind: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
+    audit
+        .iter()
+        .map(audit_event)
+        .filter(move |row| row["type"] == kind)
+}
+
+/// An audit field that v5 writes as a decimal string and v4 as a number.
+fn audit_number(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+/// Put audit records in the order they were written, across files and the
+/// runtime's reopening.
+fn audit_order(records: &mut [Value]) {
+    let key = |record: &Value| {
+        let at = audit_number(&record["wall_time_ms"]).unwrap_or_default();
+        (at, audit_number(&record["seq"]).unwrap_or_default())
+    };
+    records.sort_by_key(key);
+}
+
+/// The audit's reference to a message id given in hex: v5 hashes each one.
+fn audit_message_ref(id_hex: &str) -> Option<String> {
+    let bytes = hex::decode(id_hex).ok()?;
+    let reference = marmot_forensics::v5::EngineMessageRef::from_message_id(&bytes).ok()?;
+    Some(reference.as_str().to_owned())
+}
+
+/// A row's `what`, qualified by its `why` when it has one: both are fixed
+/// labels, never ids.
+fn audit_label(row: &Value, what: &str, why: Option<&str>) -> String {
+    let what = row[what].as_str().unwrap_or("unnamed");
+    match why.and_then(|why| row[why].as_str()) {
+        Some(why) => format!("{what}:{why}"),
+        None => what.to_owned(),
+    }
+}
+
+/// What bob's audit says about inbound messages over the run, by kind and
+/// reason. An ingest outcome doesn't say whether the message was a chat
+/// message or a commit.
+fn audit_summary(audit: &[Value]) -> Value {
+    let rows = |kind| audit_rows(audit, kind);
+    json!({
+        "records": audit.len(),
+        "by_type": tally(audit.iter().filter_map(|record| audit_event(record)["type"].as_str())),
+        "ingest_outcomes": tally(rows("ingest_outcome").map(|row| audit_label(row, "outcome_kind", Some("stale_reason")))),
+        "ingest_errors": tally(rows("ingest_error").map(|row| audit_label(row, "error_kind", None))),
+        "message_states": tally(rows("message_state_changed").map(|row| audit_label(row, "new_state", Some("reason")))),
+        "peeler_outcomes": tally(rows("peeler_outcome").map(|row| audit_label(row, "outcome", Some("error_kind")))),
+    })
+}
+
+/// Every sender in the loop: the backlog's, then alice with the live ticks.
+const LANES: [&str; 4] = ["s1", "s2", "s3", "alice"];
+
+/// Alice's live messages in the loop.
+const TICK_PREFIX: &str = "tick-";
+/// How the relay delivered an event to bob, by the `REQ` that carried it
+/// ([`RelayDeliveryPath`]): event ids, an unlimited window, a limited window,
+/// a group maintenance subscription, or any other subscription. A path is a
+/// request shape; both owners send ids and unlimited windows.
+const PATHS: [&str; 5] = ["ids", "window", "paged_window", "maintenance", "live"];
+
+fn path_label(path: RelayDeliveryPath) -> &'static str {
+    match path {
+        RelayDeliveryPath::Ids => PATHS[0],
+        RelayDeliveryPath::Window => PATHS[1],
+        RelayDeliveryPath::PagedWindow => PATHS[2],
+        RelayDeliveryPath::Maintenance => PATHS[3],
+        RelayDeliveryPath::Live => PATHS[4],
+    }
+}
+
+/// A message's sender (its lane in [`LANES`]) and its position among that
+/// sender's messages, in the order the journey sent them. This is not its
+/// generation in the sender's ratchet: a send that queues behind a pending
+/// commit is encrypted after later direct sends (mdk#2842), and only the
+/// sender's audit shows the order it encrypted them in.
+fn send_position(payload: &str) -> Option<(usize, usize)> {
+    let index = payload.rsplit('-').next()?.parse::<usize>().ok()?;
+    if payload.starts_with(TICK_PREFIX) {
+        return Some((SENDERS.len(), index));
+    }
+    Some((index % SENDERS.len(), index / SENDERS.len()))
+}
+
+/// What bob's audit recorded for one send's event.
+#[derive(Clone, Default)]
+struct Seen {
+    received: usize,
+    entries: usize,
+    outcomes: Vec<String>,
+    errors: Vec<String>,
+    states: Vec<String>,
+    /// Bob first deferred it: its peel failed until a later re-peel.
+    deferred: bool,
+}
+
+/// Bob's audit rows for each send's event. The audit names an inbound message
+/// by the event that carried it.
+fn bob_seen(events: &[Option<String>], audit: &[Value]) -> Vec<Seen> {
+    let mut by_ref = BTreeMap::new();
+    for (index, id) in events.iter().enumerate() {
+        if let Some(id) = id {
+            by_ref.insert(id.clone(), index);
+            if let Some(reference) = audit_message_ref(id) {
+                by_ref.insert(reference, index);
+            }
+        }
+    }
+    let mut seen = vec![Seen::default(); events.len()];
+    for row in audit.iter().map(audit_event) {
+        let message = row.get("message_ref").unwrap_or(&row["msg_id"]);
+        let index = message.as_str().and_then(|id| by_ref.get(id));
+        let Some(&index) = index else { continue };
+        let seen = &mut seen[index];
+        match row["type"].as_str() {
+            Some("transport_received") => seen.received += 1,
+            Some("ingest_entry") => seen.entries += 1,
+            Some("ingest_outcome") => {
+                seen.outcomes
+                    .push(audit_label(row, "outcome_kind", Some("stale_reason")));
+            }
+            Some("ingest_error") => seen.errors.push(audit_label(row, "error_kind", None)),
+            Some("message_state_changed") => {
+                seen.states
+                    .push(audit_label(row, "new_state", Some("reason")));
+                seen.deferred |= row["new_state"] == "peel_deferred";
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// The relay event that carried each send, from its sender's own timeline.
+/// A receiver's timeline names a different source id, which no relay holds.
+async fn carrying_events(
+    subject: &AppRuntimeHarness,
+    group: &GroupId,
+    sent: &[Sent],
+) -> TestResult<Vec<Option<String>>> {
+    let mut events = vec![None; sent.len()];
+    for (lane, sender) in LANES.iter().enumerate() {
+        let asked = sent
+            .iter()
+            .enumerate()
+            .filter(|(_, sent)| send_position(&sent.payload).is_some_and(|(at, _)| at == lane));
+        let asked = asked
+            .filter_map(|(index, sent)| Some((index, sent.app_id.clone()?)))
+            .collect::<Vec<_>>();
+        let ids = asked.iter().map(|(_, id)| id.clone()).collect();
+        let sources = subject.probe(sender)?.message_sources(group, ids).await?;
+        for ((index, _), source) in asked.into_iter().zip(sources) {
+            events[index] = source;
+        }
+    }
+    Ok(events)
+}
+
+/// Where the backlog went, as counts and send positions, never ids. For every
+/// send: how it completed, and how many of the events it published the relay
+/// holds and bob's audit names (the controls). How the relay delivered the
+/// events to bob's connections since he came back, by [`PATHS`]: all of them,
+/// and the first on each relay. Per sender: how many messages bob deferred
+/// and how many of each he lacks. For each message bob's timeline lacks:
+/// which other members show it, whether bob holds it only as an invalidated
+/// tombstone, how its send completed, how the relay delivered its event to
+/// bob, and what bob's audit recorded for it. `per_send` repeats the
+/// delivery for every send with its event's audit ref, a hash, so the saved
+/// audits can be read offline.
+async fn delivery_view(
+    subject: &AppRuntimeHarness,
+    bob: &AppRuntimeProbe,
+    group: &GroupId,
+    backlog: &[Sent],
+    ticks: &[String],
+    bob_sessions: &[u64],
+    audit: &[Value],
+) -> TestResult<Value> {
+    // Alice's ticks join the backlog, each named by her own app message id.
+    let alice_ids = subject.probe("alice")?.chat_message_ids(group).await?;
+    let alice_ids = alice_ids.into_iter().collect::<BTreeMap<_, _>>();
+    let tick = |payload: &String| Sent {
+        payload: payload.clone(),
+        published: 1,
+        app_id: alice_ids.get(payload).cloned(),
+        shown_after_closed: false,
+    };
+    let sent = backlog.iter().cloned().chain(ticks.iter().map(tick));
+    let sent = sent.collect::<Vec<_>>();
+    let sent = sent.as_slice();
+    let distinct = |texts: Vec<String>| texts.into_iter().collect::<BTreeSet<_>>();
+    let held = distinct(bob.chat_view(group, None).await?.1);
+    let lacks = |sent: &Sent| !held.contains(&sent.payload);
+    let payload_index = sent
+        .iter()
+        .enumerate()
+        .map(|(index, sent)| (sent.payload.as_str(), index));
+    let payload_index = payload_index.collect::<BTreeMap<_, _>>();
+    let missing = sent.iter().filter(|sent| lacks(sent)).collect::<Vec<_>>();
+    let count_in = |texts: &BTreeSet<String>| {
+        missing
+            .iter()
+            .filter(|sent| texts.contains(&sent.payload))
+            .count()
+    };
+    let mut shown_by = BTreeMap::new();
+    for member in ["alice"].into_iter().chain(SENDERS) {
+        let chat = subject.probe(member)?.chat_view(group, None).await?.1;
+        shown_by.insert(member, count_in(&distinct(chat)));
+    }
+    let invalidated = count_in(&distinct(bob.invalidated_chat(group).await?));
+    let events = carrying_events(subject, group, sent).await?;
+    let relay = subject.relay_publication_ids().await?;
+    let relay = relay.into_iter().map(|(id, _)| id).collect::<BTreeSet<_>>();
+    // Per event: deliveries by path, the paths of its first delivery on each
+    // relay, the earliest of those deliveries on the proxies' clock, and the
+    // event's `created_at`.
+    let mut to_bob = BTreeMap::<String, ([u64; PATHS.len()], BTreeSet<&str>)>::new();
+    let mut timing = BTreeMap::<String, (Option<u64>, u64)>::new();
+    for endpoint in subject.relay_traffic(bob_sessions, true).await? {
+        for (id, delivery) in endpoint.events {
+            let (at, created) = timing.entry(id.clone()).or_default();
+            if let Some((_, first_at)) = delivery.first {
+                *at = Some(at.map_or(first_at, |at| at.min(first_at)));
+            }
+            *created = delivery.created_at;
+            let (via, first) = to_bob.entry(id).or_default();
+            let counts = [
+                delivery.via_ids,
+                delivery.via_window,
+                delivery.via_paged_window,
+                delivery.via_maintenance,
+                delivery.via_live,
+            ];
+            for (total, count) in via.iter_mut().zip(counts) {
+                *total += count;
+            }
+            first.extend(delivery.first.map(|(path, _)| path_label(path)));
+        }
+    }
+    let index_of = |sent: &Sent| payload_index[sent.payload.as_str()];
+    let delivered = |sent: &Sent| {
+        events[index_of(sent)]
+            .as_ref()
+            .and_then(|id| to_bob.get(id))
+    };
+    let via = |sent: &Sent| delivered(sent).map_or([0; PATHS.len()], |(via, _)| *via);
+    // The paths that delivered it, joined, or "never".
+    let path = |sent: &Sent| {
+        let via = via(sent);
+        let named = PATHS.iter().zip(via).filter(|(_, count)| *count > 0);
+        let named = named.map(|(name, _)| *name).collect::<Vec<_>>();
+        if named.is_empty() {
+            "never".to_owned()
+        } else {
+            named.join("+")
+        }
+    };
+    let first = |sent: &Sent| {
+        let first = delivered(sent).map(|(_, first)| first.iter().copied().collect::<Vec<_>>());
+        first
+            .filter(|first| !first.is_empty())
+            .map_or("never".to_owned(), |first| first.join("+"))
+    };
+    let seen = bob_seen(&events, audit);
+    let (backlog, ticks) = sent.split_at(backlog.len());
+    let audited = seen[..backlog.len()]
+        .iter()
+        .filter(|seen| seen.entries > 0)
+        .count();
+    let mut by_sender = BTreeMap::new();
+    for (lane, sender) in LANES.iter().enumerate() {
+        let sends = sent
+            .iter()
+            .zip(&seen)
+            .filter(|(sent, _)| send_position(&sent.payload).is_some_and(|(at, _)| at == lane));
+        let sends = sends.collect::<Vec<_>>();
+        by_sender.insert(
+            *sender,
+            json!({
+                "sends": sends.len(),
+                "missing": sends.iter().filter(|(sent, _)| lacks(sent)).count(),
+                "deferred": sends.iter().filter(|(_, seen)| seen.deferred).count(),
+                "deferred_missing": sends.iter().filter(|(sent, seen)| seen.deferred && lacks(sent)).count(),
+            }),
+        );
+    }
+    let missing_detail = sent.iter().zip(&seen).filter(|(sent, _)| lacks(sent)).map(
+        |(sent, seen)| {
+            let (lane, position) = send_position(&sent.payload).unwrap_or((usize::MAX, usize::MAX));
+            json!({
+                "sender": LANES.get(lane),
+                "position": position,
+                "how": sent.how(),
+                "relay_to_bob": PATHS.iter().copied().zip(via(sent)).collect::<BTreeMap<_, _>>(),
+                "first_path": first(sent),
+                "received": seen.received,
+                "entries": seen.entries,
+                "outcomes": tally(seen.outcomes.iter()),
+                "errors": tally(seen.errors.iter()),
+                "states": tally(seen.states.iter()),
+                "deferred": seen.deferred,
+            })
+        },
+    );
+    let event_counts = |sent: &[&Sent]| {
+        let ids = sent
+            .iter()
+            .filter_map(|sent| events[index_of(sent)].as_ref());
+        let ids = ids.collect::<Vec<_>>();
+        json!({
+            "found": ids.len(),
+            "on_relay": ids.iter().filter(|id| relay.contains(**id)).count(),
+        })
+    };
+    let all = backlog.iter().collect::<Vec<_>>();
+    // Local evidence for reading bob's audit offline: each send's lane and
+    // position, its event's audit ref (a hash), and how it reached bob.
+    let per_send = sent.iter().map(|sent| {
+        let (lane, position) = send_position(&sent.payload).unwrap_or((usize::MAX, usize::MAX));
+        let event = events[index_of(sent)].as_deref();
+        let reference = event.and_then(audit_message_ref);
+        let (first_at_ms, created_at) = event
+            .and_then(|id| timing.get(id))
+            .copied()
+            .unwrap_or_default();
+        json!({
+            "sender": LANES.get(lane),
+            "position": position,
+            "how": sent.how(),
+            "audit_ref": reference,
+            "created_at": created_at,
+            "first_at_ms": first_at_ms,
+            "paths": PATHS.iter().copied().zip(via(sent)).collect::<BTreeMap<_, _>>(),
+            "first_path": first(sent),
+            "missing": lacks(sent),
+        })
+    });
+    Ok(json!({
+        "per_send": per_send.collect::<Vec<_>>(),
+        "sends": {
+            "by_how": tally(backlog.iter().map(Sent::how)),
+            "events": event_counts(&all),
+            "in_bob_audit": audited,
+            "relay_to_bob": tally(backlog.iter().map(path)),
+            "first_path_to_bob": tally(backlog.iter().map(first)),
+            "ticks": ticks.len(),
+            "ticks_relay_to_bob": tally(ticks.iter().map(path)),
+            "ticks_first_path_to_bob": tally(ticks.iter().map(first)),
+        },
+        "by_sender": by_sender,
+        "missing": {
+            "count": missing.len(),
+            "shown_by": shown_by,
+            "invalidated_at_bob": invalidated,
+            "by_how": tally(missing.iter().map(|sent| sent.how())),
+            "events": event_counts(&missing),
+            "relay_to_bob": tally(missing.iter().map(|sent| path(sent))),
+            "first_path_to_bob": tally(missing.iter().map(|sent| first(sent))),
+            "each": missing_detail.collect::<Vec<_>>(),
+        },
+    }))
+}
+
+/// The queued intents each other member's engine refused at drain: its
+/// process's tally of `QueuedIntentRefused` events (by intent kind and reason,
+/// with the events it missed by lagging) and the refusal rows in its forensic
+/// audit, which it saves to `out`. Refusing a plain chat message in a healthy
+/// group is never right.
+async fn refusals_view(subject: &AppRuntimeHarness, out: &Path) -> TestResult<Value> {
+    let mut by_member = BTreeMap::new();
+    for member in ["alice"].into_iter().chain(SENDERS) {
+        let probe = subject.probe(member)?;
+        let tally = probe.queued_intent_refusals().await?;
+        let audit = probe.finish_audit_log().await?;
+        // Local evidence: the sender side of what bob saw.
+        save(out, &format!("{member}-audit.json"), &audit)?;
+        let rows = audit_rows(&audit, "rejection")
+            .filter(|row| row["reason"] == "queued_outbound_intent_refused_on_settled_state")
+            .count();
+        let refusals = json!({
+            "events": tally.by_kind_and_reason,
+            "lagged_events": tally.lagged_events,
+            "audit_rows": rows,
+        });
+        by_member.insert(member, refusals);
+    }
+    Ok(json!(by_member))
+}
+
 /// Whether the runner reports nothing left to fetch and nothing parked, read
 /// after one of its attempts since `trace_from` (trace clock). The status
 /// lists nothing until a runner has surveyed, and keeps its last survey's
@@ -732,16 +1176,24 @@ pub(super) async fn stalled_relay_loop() {
         let group = create(subject, "loop", &clients).await?;
         settle_maintenance(subject, &clients, std::slice::from_ref(&group)).await?;
         note(started, "group created and settled");
+        // Kept in each app's settings, so bob's reopened runtime records too.
+        for member in &clients {
+            subject.probe(member)?.start_audit_log().await?;
+        }
         subject.set_online("bob", false).await?;
-        let backlog = publish(subject, &group, "loop-", LOOP_MESSAGES).await?;
+        let sent = publish(subject, &group, "loop-", LOOP_MESSAGES).await?;
+        let backlog = payloads(&sent);
         note(started, "backlog published");
         subject.stall_relay_history(1, true).await?;
         let clocks = relay_clocks(subject).await?;
+        // Every connection from here on is bob's: the others keep theirs.
+        let traffic = subject.relay_traffic(&[u64::MAX, u64::MAX], false).await?;
+        let bob_sessions = traffic.iter().map(|relay| relay.next_session).collect::<Vec<_>>();
         let t0 = Instant::now();
         let trace_t0 = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
         let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
-        let live = Live::start(alice, bob.clone(), group.clone(), Duration::from_secs(2), "tick-");
+        let live = Live::start(alice, bob.clone(), group.clone(), Duration::from_secs(2), TICK_PREFIX);
         let mut recovered = None;
         while t0.elapsed() < LOOP_WINDOW {
             if recovered.is_none() {
@@ -755,11 +1207,28 @@ pub(super) async fn stalled_relay_loop() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         let (ticks, live_visibility) = live.finish().await?;
+        let sent_ticks = ticks.clone();
         let status = bob.account_recovery_status().await?;
         let mut expected = backlog.clone();
         expected.extend(ticks);
         let complete = holds_exactly(&bob, &group, &expected).await?;
         let timeline = timeline_view(&bob, &group, &expected).await?;
+        // Report-only: a read that fails leaves its error in the report.
+        let mut audit = bob.finish_audit_log().await.map_err(|error| error.to_string());
+        if let Ok(records) = &mut audit {
+            audit_order(records);
+        }
+        let records = audit.as_deref().unwrap_or_default();
+        let mut delivery =
+            delivery_view(subject, &bob, &group, &sent, &sent_ticks, &bob_sessions, records).await;
+        // Kept apart from the report: per send, and bob's own rows.
+        if let Ok(view) = &mut delivery
+            && let Some(per_send) = view.as_object_mut().and_then(|view| view.remove("per_send"))
+        {
+            save(out, "bob-sends.json", &per_send)?;
+        }
+        save(out, "bob-audit.json", &records)?;
+        let refusals = refusals_view(subject, out).await;
         let history = history_since(subject, &clocks).await?;
         let route = bob.nostr_route(&group).await?.ok_or("bob holds no route")?;
         let labels = BTreeMap::from([(route.clone(), "loop".to_owned())]);
@@ -781,6 +1250,9 @@ pub(super) async fn stalled_relay_loop() {
             "recovered_seconds": recovered,
             "timeline_exact": complete,
             "timeline": timeline,
+            "delivery": delivery.unwrap_or_else(|error| json!({"error": error.to_string()})),
+            "bob_audit": audit.as_deref().map_or_else(|error| json!({"error": error}), audit_summary),
+            "refusals": refusals.unwrap_or_else(|error| json!({"error": error.to_string()})),
             "live_visibility_ms": live_visibility,
             "stalled_endpoint_bursts": starts.len(),
             "stalled_bursts_per_minute": {
@@ -860,7 +1332,7 @@ pub(super) async fn owed_history() {
         // The owed backlog, while bob is stopped.
         subject.set_online("bob", false).await?;
         let backlog_started = Instant::now();
-        let mut expected = publish(subject, &busy, "owed-", OWED_MESSAGES).await?;
+        let mut expected = payloads(&publish(subject, &busy, "owed-", OWED_MESSAGES).await?);
         let backlog_seconds = backlog_started.elapsed().as_secs_f64();
         note(started, "backlog published");
 

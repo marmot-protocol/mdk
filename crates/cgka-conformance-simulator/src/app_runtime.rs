@@ -30,7 +30,8 @@ mod process_server;
 #[cfg(test)]
 mod strfry_process_scale;
 pub use crate::relay_fault_proxy::{
-    HistoryRequestV1, PRODUCTION_RELAY_INFORMATION, RelayEventDeliveryV1, RelayTrafficV1,
+    HistoryRequestV1, PRODUCTION_RELAY_INFORMATION, RelayDeliveryPath, RelayEventDeliveryV1,
+    RelayTrafficV1,
 };
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
@@ -187,6 +188,18 @@ struct Topology {
     runner_owns_debt: bool,
 }
 
+/// Queued intents a participant's engine refused at drain and retired
+/// (`GroupEvent::QueuedIntentRefused`, mdk#2694). Its process counts them from
+/// a subscription of its own, so no reader's pace drops one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct QueuedIntentRefusals {
+    /// By `intent_kind:reason`, both fixed labels.
+    pub by_kind_and_reason: BTreeMap<String, usize>,
+    /// App events the tally missed by falling behind the channel; when
+    /// nonzero, the counts are a lower bound.
+    pub lagged_events: u64,
+}
+
 /// Public runtime commands and committed projection reads for one
 /// participant, callable concurrently. It holds no private state.
 #[derive(Clone)]
@@ -279,6 +292,112 @@ impl AppRuntimeProbe {
             Ok::<_, AppError>((name, chat))
         });
         read.await.map_err(environment_error)?.map_err(app_error)
+    }
+
+    /// Send like [`Self::send_message`], returning the relay publications
+    /// the send reported (none when the app queued it for a later drain) and
+    /// the app message ids it names, which it names queued or not.
+    pub async fn send_message_receipt(
+        &self,
+        group: &GroupId,
+        payload: &str,
+    ) -> Result<(usize, Vec<String>), SubjectError> {
+        let bytes = payload.as_bytes().to_vec();
+        let receipt = self
+            .runtime
+            .send_message(&self.account_id, group, bytes)
+            .await;
+        receipt
+            .map(|receipt| (receipt.published, receipt.message_ids))
+            .map_err(app_error)
+    }
+
+    /// The id of the event that carried each app message, from this
+    /// member's timeline; `None` where it holds no such message or no source.
+    pub async fn message_sources(
+        &self,
+        group: &GroupId,
+        message_ids: Vec<String>,
+    ) -> Result<Vec<Option<String>>, SubjectError> {
+        let (runtime, account) = (self.runtime.clone(), self.account_id.clone());
+        let group_id_hex = hex::encode(group.as_slice());
+        let read = tokio::task::spawn_blocking(move || {
+            let mut sources = Vec::with_capacity(message_ids.len());
+            for message in &message_ids {
+                let record = runtime.timeline_message(&account, &group_id_hex, message)?;
+                sources.push(record.and_then(|record| record.source_message_id_hex));
+            }
+            Ok::<_, AppError>(sources)
+        });
+        read.await.map_err(environment_error)?.map_err(app_error)
+    }
+
+    /// Each chat message's plaintext and app message id.
+    pub async fn chat_message_ids(
+        &self,
+        group: &GroupId,
+    ) -> Result<Vec<(String, String)>, SubjectError> {
+        let (app, account) = (self.app.clone(), self.account_id.clone());
+        let query = AppMessageQuery {
+            group_id_hex: Some(hex::encode(group.as_slice())),
+            kinds: None,
+            limit: None,
+        };
+        let read = tokio::task::spawn_blocking(move || {
+            let chat = app
+                .messages_with_query(&account, query)?
+                .into_iter()
+                .filter(|m| m.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT)
+                .map(|m| (m.plaintext, m.message_id_hex))
+                .collect();
+            Ok::<_, AppError>(chat)
+        });
+        read.await.map_err(environment_error)?.map_err(app_error)
+    }
+
+    /// Chat plaintexts that convergence keeps only as invalidated
+    /// losing-branch tombstones, which [`Self::chat_view`] leaves out.
+    pub async fn invalidated_chat(&self, group: &GroupId) -> Result<Vec<String>, SubjectError> {
+        let (app, account) = (self.app.clone(), self.account_id.clone());
+        let query = AppMessageQuery {
+            group_id_hex: Some(hex::encode(group.as_slice())),
+            kinds: None,
+            limit: None,
+        };
+        let read = tokio::task::spawn_blocking(move || {
+            let invalidated = app
+                .messages_with_query(&account, query)?
+                .into_iter()
+                .filter(|m| {
+                    m.invalidated && m.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                })
+                .map(|m| m.plaintext)
+                .collect();
+            Ok::<_, AppError>(invalidated)
+        });
+        read.await.map_err(environment_error)?.map_err(app_error)
+    }
+
+    /// Turn on this participant's forensic audit log. Read it back with
+    /// [`Self::finish_audit_log`].
+    pub async fn start_audit_log(&self) -> Result<(), SubjectError> {
+        self.runtime.set_audit_log(true).await.map_err(app_error)
+    }
+
+    /// Turn the forensic audit log off, which flushes and closes its files,
+    /// and return every record in them as one JSON value per line.
+    pub async fn finish_audit_log(&self) -> Result<Vec<serde_json::Value>, SubjectError> {
+        self.runtime.set_audit_log(false).await.map_err(app_error)?;
+        self.runtime.audit_records().await.map_err(app_error)
+    }
+
+    /// The queued intents this participant's engine refused at drain, as its
+    /// process tallies them (participant processes only).
+    pub async fn queued_intent_refusals(&self) -> Result<QueuedIntentRefusals, SubjectError> {
+        self.runtime
+            .queued_intent_refusals()
+            .await
+            .map_err(app_error)
     }
 
     /// The group's current Nostr routing id in lowercase hex, its `#h` on

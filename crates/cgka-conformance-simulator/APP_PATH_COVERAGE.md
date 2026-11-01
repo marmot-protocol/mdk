@@ -142,7 +142,12 @@ switch-over.
   arrives, and that the stalled endpoint, attempted in the first half of the window, sees at most one burst of
   history requests every two minutes in the second, and requests in at most four of its eight minutes (requests
   that never pause make one long burst). On 0.14.0 an attempt came about every 30 seconds for as long as
-  the app ran.
+  the app ran. Every member's forensic audit is on for the run. The report says, as counts, how each send
+  completed, which request shape the relay delivered each event to bob by (event ids, a window, a paged window, a
+  maintenance or a live subscription), and, for any message bob lacks, which other members show it, whether bob
+  holds it only invalidated, whether the relay holds its event, and bob's audited outcome for it. It also tallies
+  bob's inbound outcomes and each member's refused queued intents. The evidence directory keeps each member's audit
+  and a per-send delivery list keyed by audit refs (hashes), for reading a miss offline.
 - `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
