@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use super::backups::{answers, entropy_of, key_pair_of};
 use super::devices::exchange;
@@ -502,13 +503,60 @@ async fn a_dropped_backup_is_deleted_later_unless_the_pointer_lists_it_again() {
     phone.drive_backup_pass().await;
     let listed = pointer(&relay, &key);
     assert_eq!(ids(&listed[1..]), vec![written[2].0.id.clone()]);
-    assert_eq!(condemned(&phone, &key), &written[0].1 | &written[1].1);
+    let dropped = &written[0].1 | &written[1].1;
+    assert_eq!(condemned(&phone, &key), dropped);
+
+    // No relay answers in full: nothing is deleted.
+    relay
+        .unfinished_directory_reads
+        .store(true, Ordering::SeqCst);
+    deletes_due_now(&phone, &key);
+    phone.drive_backup_pass().await;
+    assert_eq!(condemned(&phone, &key), dropped);
+    assert!(held(&blossom).is_superset(&dropped));
+    assert!(blossom.deleters.lock().unwrap().is_empty());
+
+    relay
+        .unfinished_directory_reads
+        .store(false, Ordering::SeqCst);
     deletes_due_now(&phone, &key);
     phone.drive_backup_pass().await;
     assert_eq!(
         held(&blossom),
         &written[2].1 | &blobs_of(&blossom, &listed[0], &key)
     );
+    let account = phone
+        .app
+        .account_home()
+        .account(&phone.state.label)
+        .unwrap()
+        .account_id_hex;
+    let deleters = blossom.deleters.lock().unwrap().clone();
+    assert_eq!(deleters, vec![account; dropped.len()]);
+}
+
+/// A listed backup whose head does not match its locator has no index to
+/// read, so retention keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_that_does_not_match_its_locator_keeps_its_backup() {
+    let blossom = local_blossom();
+    let (devices, _chat, words) = lone_writer(&blossom).await;
+    let (mut phone, relay, key) = (devices.phone, devices.relay, words.public);
+    phone.drive_backup_pass().await;
+    age_backups(&phone, &relay, &key, 2 * DAY).await;
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    let mut listed = pointer(&relay, &key);
+    assert_eq!(listed.len(), 2);
+    for entry in &mut listed {
+        entry.written_at -= 2 * DAY;
+    }
+    listed[1].head.size += 1;
+    publish_pointer(&phone, &relay, &key, listed.clone()).await;
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    assert_eq!(ids(&pointer(&relay, &key)[1..]), ids(&listed));
+    assert!(condemned(&phone, &key).is_empty());
 }
 
 /// A new pointer replaces the one its pass fetched, though another device
@@ -634,6 +682,53 @@ async fn a_sibling_takes_over_a_quiet_or_leaving_writer() {
     .await;
     devices.phone.drive_backup_takeover().await;
     assert_eq!(writer(&devices.phone), Some(phone_slot));
+}
+
+/// A device that stops writing abandons the run whose pointer no relay
+/// accepted, so a later pass deletes its blobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_former_writer_abandons_its_unlisted_run() {
+    let blossom = local_blossom();
+    let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
+    let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
+    let start = devices.relay.published_events.lock().unwrap().len();
+    let mut cursors = (start, start);
+    devices.relay.fail_publishes_of_kind(KIND_BACKUP_POINTER);
+    devices.phone.drive_backup_pass().await;
+    let uploaded = held(&blossom);
+    assert!(!uploaded.is_empty());
+
+    let ledger = storage(&devices.laptop_app);
+    ledger
+        .note_backup_writer(&words.public, &laptop_slot, 0)
+        .unwrap();
+    ledger
+        .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
+        .unwrap();
+    due_now(&devices.laptop);
+    devices.laptop.drive_backup_pass().await;
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        &group,
+        &mut cursors,
+    )
+    .await;
+    assert_eq!(
+        roster(&devices.phone, &group).account.backup_writer,
+        Some(laptop_slot)
+    );
+
+    due_now(&devices.phone);
+    devices.phone.drive_backup_pass().await;
+    assert!(
+        storage(&devices.phone_app)
+            .backup_runs()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(condemned(&devices.phone, &words.public), uploaded);
 }
 
 static STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());

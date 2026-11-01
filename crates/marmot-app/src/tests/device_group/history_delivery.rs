@@ -24,12 +24,14 @@ use sha2::{Digest as _, Sha256};
 use storage_sqlite::{ParkedBundle, SqliteAppStorage};
 
 /// A Blossom server on loopback: an upload keeps the blob by its SHA-256, a
-/// fetch serves it and a delete drops it. Uploads fail while
-/// `refuse_uploads` is set.
+/// fetch serves it and a delete drops it, once a valid BUD-11 delete
+/// authorization for that blob allows it; `deleters` records who signed
+/// each. Uploads fail while `refuse_uploads` is set.
 pub(super) struct LocalBlossom {
     pub(super) url: String,
     pub(super) blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub(super) refuse_uploads: Arc<AtomicBool>,
+    pub(super) deleters: Arc<Mutex<Vec<String>>>,
 }
 
 pub(super) fn local_blossom() -> LocalBlossom {
@@ -37,27 +39,53 @@ pub(super) fn local_blossom() -> LocalBlossom {
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let blobs = Arc::<Mutex<HashMap<String, Vec<u8>>>>::default();
     let refuse_uploads = Arc::<AtomicBool>::default();
-    let (served, refused) = (blobs.clone(), refuse_uploads.clone());
+    let deleters = Arc::<Mutex<Vec<String>>>::default();
+    let (served, refused, signed) = (blobs.clone(), refuse_uploads.clone(), deleters.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (served, refused) = (served.clone(), refused.clone());
-            std::thread::spawn(move || serve_blossom(stream, &served, &refused));
+            let (served, refused, signed) = (served.clone(), refused.clone(), signed.clone());
+            std::thread::spawn(move || serve_blossom(stream, &served, &refused, &signed));
         }
     });
     LocalBlossom {
         url,
         blobs,
         refuse_uploads,
+        deleters,
     }
+}
+
+/// Who signed `authorization`, when it is a valid BUD-11 token to delete
+/// blob `hash`.
+fn delete_authorizer(authorization: &str, hash: &str) -> Option<String> {
+    use ::nostr::prelude::Event;
+    use base64::Engine as _;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(authorization.strip_prefix("Nostr ")?)
+        .ok()?;
+    let event = Event::from_json(json).ok()?;
+    event.verify().ok()?;
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|tag| match tag.as_slice() {
+            [key, value, ..] if key == name => Some(value.clone()),
+            _ => None,
+        })
+    };
+    (event.kind.as_u16() == 24242
+        && tag("t").as_deref() == Some("delete")
+        && tag("x").as_deref() == Some(hash))
+    .then(|| event.pubkey.to_hex())
 }
 
 fn serve_blossom(
     stream: std::net::TcpStream,
     blobs: &Mutex<HashMap<String, Vec<u8>>>,
     refuse_uploads: &AtomicBool,
+    deleters: &Mutex<Vec<String>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut request = String::new();
+    let mut authorization = String::new();
     let mut len = 0;
     loop {
         let mut line = String::new();
@@ -69,10 +97,12 @@ fn serve_blossom(
         }
         if request.is_empty() {
             request = line;
-        } else if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            len = value.trim().parse().unwrap_or(0);
+        } else if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = value.trim().to_owned();
+            }
         }
     }
     let mut body = vec![0; len];
@@ -102,9 +132,15 @@ fn serve_blossom(
             Some(blob) => respond("200 OK", blob),
             None => respond("404 Not Found", b""),
         },
-        (Some("DELETE"), Some(path)) => match blobs.lock().unwrap().remove(&path[1..]) {
-            Some(_) => respond("200 OK", b""),
-            None => respond("404 Not Found", b""),
+        (Some("DELETE"), Some(path)) => match delete_authorizer(&authorization, &path[1..]) {
+            None => respond("401 Unauthorized", b""),
+            Some(signer) => {
+                deleters.lock().unwrap().push(signer);
+                match blobs.lock().unwrap().remove(&path[1..]) {
+                    Some(_) => respond("200 OK", b""),
+                    None => respond("404 Not Found", b""),
+                }
+            }
         },
         _ => respond("405 Method Not Allowed", b""),
     };

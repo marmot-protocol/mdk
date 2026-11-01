@@ -645,6 +645,8 @@ fn a_pointer_that_breaks_the_format_is_refused_whole() {
     upper.id = upper.id.to_uppercase();
     let mut short = entry(2, 20, SERVER);
     short.id.truncate(30);
+    let mut oversized = entry(3, 20, SERVER);
+    oversized.head.size = MAX_BACKUP_HEAD_BYTES as u64 + 1;
     for broken in [
         fine.replacen(r#""v":1"#, r#""v":2"#, 1),
         fine.replacen(r#""v":1,"#, "", 1),
@@ -653,6 +655,7 @@ fn a_pointer_that_breaks_the_format_is_refused_whole() {
         listing(vec![entry(1, 20, SERVER), entry(1, 10, SERVER)]),
         listing(vec![upper]),
         listing(vec![short]),
+        listing(vec![oversized]),
         listing(vec![entry(1, MAX_INTEGER + 1, SERVER)]),
         listing(vec![entry(1, 10, "https://blossom.example")]),
         listing(

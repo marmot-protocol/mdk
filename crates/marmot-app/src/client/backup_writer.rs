@@ -7,15 +7,18 @@
 //! recovery key. A pass runs from maintenance, once due, on the media lane:
 //!
 //! 1. [`AppClient::prepare_backup_pass`], on the worker, reads the key and
-//!    the writer, forgets the ledger under any other key, and abandons a run
-//!    that stopped before its head.
+//!    the writer and, once a pass is due, forgets the ledger under any other
+//!    key and abandons a run that stopped before its head.
 //! 2. [`BackupPass::run`], off the worker, fetches the pointer from a relay
 //!    that answers in full and deletes condemned blobs whose backup it does
-//!    not list. While this device writes, it publishes again a run no relay
-//!    accepted yet, or, once the newest listed backup is a day old, uploads a
-//!    new one, each blob recorded in the ledger before its upload. It builds
-//!    the pointer that lists the run, by retention, and condemns the blobs
-//!    of the backups that pointer drops.
+//!    not list. A run the pointer lists counts; one past its day, or any
+//!    once this device no longer writes, is abandoned. While this device
+//!    writes, it publishes again a run no relay accepted yet, or, once the
+//!    newest listed backup is a day old, uploads a new one, each blob
+//!    recorded in the ledger before its upload. It builds the pointer that
+//!    lists the run, by retention, and condemns the blobs of the backups
+//!    that pointer drops. Ledger, sealing and hashing work runs on the
+//!    blocking pool.
 //! 3. [`AppClient::finish_backup_pass`], on the worker, checks that this
 //!    device still writes under the same key, then signs and publishes the
 //!    pointer. A backup counts only once a relay accepts its pointer. Until
@@ -50,10 +53,12 @@ use super::AppClient;
 use super::chat_history::{ExportedBundle, export_history, newest_bundles_start};
 use crate::backup_archive::{
     ArchiveKey, BACKUP_ID_LEN, BackupHead, BackupIndex, BackupPointer, BlobLocator, IndexBlob,
-    ListedBackup, MAX_BACKUP_HEAD_BYTES, PointerEntry, backup_address, new_backup_id, retain,
-    seal_backup_bundle, seal_backup_small_state,
+    ListedBackup, MAX_BACKUP_HEAD_BYTES, PointerEntry, SealedBlob, backup_address, new_backup_id,
+    retain, seal_backup_bundle, seal_backup_small_state,
 };
-use crate::history_bundle::{ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, is_chat_hex};
+use crate::history_bundle::{
+    ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle, is_chat_hex,
+};
 use crate::history_delivery::{MAX_BLOSSOM_BUNDLES, blossom_server_for_endpoint};
 use crate::media::{
     BlossomHttpTransport, delete_blossom_blob, fetch_history_blob, upload_blossom_blob,
@@ -96,6 +101,16 @@ fn backup_error(reason: &'static str) -> AppError {
     AppError::DeviceGroupRefused(reason)
 }
 
+/// Run `f` on the blocking pool: SQLite, AEAD and hashing on a runtime
+/// thread would stall every account's tasks.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| AppError::BlockingTask("backup pass failed".into()))?
+}
+
 /// The account's recovery key, and whether this device writes under it.
 struct BackupRole {
     key: Vec<u8>,
@@ -111,8 +126,10 @@ pub(crate) struct BackupPass {
     account_id_hex: String,
     storage: SqliteAccountStorage,
     key: Vec<u8>,
-    /// What this device writes, while it is the writer and the deployment
-    /// has a Blossom server.
+    /// Whether this device is the writer under `key`.
+    writes: bool,
+    /// What this device writes, while it is the writer, the deployment has
+    /// a Blossom server and something can be sealed to `key`.
     write: Option<BackupWrite>,
     started_at: u64,
     servers: Vec<String>,
@@ -162,51 +179,20 @@ impl BackupPass {
         let (listed, replaces) = self.fetch_pointer().await?;
         self.delete_condemned(&listed).await;
         let newest = listed.first().map(|entry| entry.written_at);
-        let Some(write) = &self.write else {
-            return Ok(PassReport {
-                newest,
-                pointer: None,
-            });
-        };
-        let storage = self.storage.app_storage();
         let now = unix_now_seconds();
-        // A run the pointer lists counts already; one past its day is
-        // abandoned, and the newest left is published again.
-        let mut pending = None;
-        for run in storage.backup_runs()? {
-            let Some(head) = run.head else {
-                continue;
-            };
-            if listed
-                .iter()
-                .any(|entry| entry.id == hex::encode(run.backup_id))
+        let (entry, index) = match (self.settle_runs(&listed, now).await?, &self.write) {
+            (Some(entry), _) => (entry, None),
+            (None, Some(write))
+                if newest.is_none_or(|at| now >= at.saturating_add(BACKUP_INTERVAL_SECS)) =>
             {
-                storage.finish_backup_run(&run.backup_id)?;
-            } else if head.publish_until <= now {
-                storage.abandon_backup_run(&run.backup_id, now, now + DELETE_AFTER_SECS)?;
-            } else {
-                let locator = BlobLocator {
-                    sha256: head.sha256,
-                    size: head.size,
-                    server: head.server,
-                };
-                let entry = PointerEntry::new(&run.backup_id, run.written_at, locator);
-                if let Some(older) = pending.replace((run.backup_id, entry)) {
-                    storage.abandon_backup_run(&older.0, now, now + DELETE_AFTER_SECS)?;
-                }
+                let (entry, index) = self.write_backup(write, now).await?;
+                (entry, Some(index))
             }
-        }
-        let (entry, index) = match pending {
-            Some((_, entry)) => (entry, None),
-            None if newest.is_some_and(|at| now < at.saturating_add(BACKUP_INTERVAL_SECS)) => {
+            (None, _) => {
                 return Ok(PassReport {
                     newest,
                     pointer: None,
                 });
-            }
-            None => {
-                let (entry, index) = self.write_backup(write, now).await?;
-                (entry, Some(index))
             }
         };
         let pointer = self.listing(listed, replaces, entry, index, now).await?;
@@ -214,6 +200,57 @@ impl BackupPass {
             newest,
             pointer: Some(pointer),
         })
+    }
+
+    /// Run `f` on this pass's ledger, on the blocking pool.
+    async fn ledger<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&SqliteAccountStorage) -> Result<T, AppError> + Send + 'static,
+    ) -> Result<T, AppError> {
+        let storage = self.storage.clone();
+        blocking(move || f(&storage)).await
+    }
+
+    /// Settle the runs that have their head by the fetched pointer: a run
+    /// it lists counts already; one past its day, or any while this device
+    /// does not write, is abandoned. The newest left is the run to publish
+    /// again, and any older one is abandoned.
+    async fn settle_runs(
+        &self,
+        listed: &[PointerEntry],
+        now: u64,
+    ) -> Result<Option<PointerEntry>, AppError> {
+        let listed = listed
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>();
+        let writes = self.writes;
+        self.ledger(move |storage| {
+            let storage = storage.app_storage();
+            let mut pending = None;
+            for run in storage.backup_runs()? {
+                let Some(head) = run.head else {
+                    continue;
+                };
+                if listed.contains(&hex::encode(run.backup_id)) {
+                    storage.finish_backup_run(&run.backup_id)?;
+                } else if !writes || head.publish_until <= now {
+                    storage.abandon_backup_run(&run.backup_id, now, now + DELETE_AFTER_SECS)?;
+                } else {
+                    let locator = BlobLocator {
+                        sha256: head.sha256,
+                        size: head.size,
+                        server: head.server,
+                    };
+                    let entry = PointerEntry::new(&run.backup_id, run.written_at, locator);
+                    if let Some(older) = pending.replace((run.backup_id, entry)) {
+                        storage.abandon_backup_run(&older.0, now, now + DELETE_AFTER_SECS)?;
+                    }
+                }
+            }
+            Ok(pending.map(|(_, entry)| entry))
+        })
+        .await
     }
 
     /// The backups the account's pointer under this key lists, newest first,
@@ -260,8 +297,15 @@ impl BackupPass {
     /// names its backup: then it is the pointer's again, and forgotten. A
     /// failed delete waits longer each time and is given up after a week.
     async fn delete_condemned(&self, listed: &[PointerEntry]) {
-        let storage = self.storage.app_storage();
-        let Ok(due) = storage.due_condemned_backup_blobs(&self.key, self.started_at) else {
+        let (key, started_at) = (self.key.clone(), self.started_at);
+        let Ok(due) = self
+            .ledger(move |storage| {
+                Ok(storage
+                    .app_storage()
+                    .due_condemned_backup_blobs(&key, started_at)?)
+            })
+            .await
+        else {
             return;
         };
         let listed = listed
@@ -283,16 +327,26 @@ impl BackupPass {
                 .is_ok()
             };
             let now = unix_now_seconds();
-            let settled = if deleted || now >= blob.condemned_at.saturating_add(DELETE_FOR_SECS) {
-                storage.forget_condemned_backup_blob(&blob.sha256, &blob.server)
-            } else {
+            let forget = deleted || now >= blob.condemned_at.saturating_add(DELETE_FOR_SECS);
+            if !forget {
                 failed += 1;
-                storage.defer_condemned_backup_blob(
-                    &blob.sha256,
-                    &blob.server,
-                    delete_retry_at(now, blob.attempts),
-                )
-            };
+            }
+            let retry_at = delete_retry_at(now, blob.attempts);
+            let settled = self
+                .ledger(move |storage| {
+                    let storage = storage.app_storage();
+                    if forget {
+                        storage.forget_condemned_backup_blob(&blob.sha256, &blob.server)?;
+                    } else {
+                        storage.defer_condemned_backup_blob(
+                            &blob.sha256,
+                            &blob.server,
+                            retry_at,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
             if settled.is_err() {
                 break;
             }
@@ -315,18 +369,22 @@ impl BackupPass {
         write: &BackupWrite,
         now: u64,
     ) -> Result<(PointerEntry, BackupIndex), AppError> {
-        let storage = self.storage.app_storage();
         let id = new_backup_id();
-        let archive_key = ArchiveKey::generate();
-        storage.begin_backup_run(&id, &self.key, now)?;
+        let archive_key = Arc::new(ArchiveKey::generate());
+        let key = self.key.clone();
+        self.ledger(move |storage| Ok(storage.app_storage().begin_backup_run(&id, &key, now)?))
+            .await?;
         let mut index = BackupIndex::new(now, &write.writer);
         for chat in &write.chats {
             let mut after = self.newest_bundles_start(chat).await?;
             for _ in 0..MAX_BLOSSOM_BUNDLES {
-                let Some(bundle) = self.export(chat, after.take()).await? else {
+                let number = index.next_blob_number()?;
+                let Some((bundle, sealed)) = self
+                    .export_sealed(chat, after.take(), &archive_key, number)
+                    .await?
+                else {
                     break;
                 };
-                let sealed = seal_backup_bundle(&archive_key, index.next_blob_number()?, &bundle)?;
                 let server = self
                     .upload(&id, sealed.ciphertext.clone(), &sealed.sha256)
                     .await?;
@@ -334,37 +392,51 @@ impl BackupPass {
                 after = Some(bundle.to);
             }
         }
-        let items = {
-            let storage = self.storage.app_storage();
-            tokio::task::spawn_blocking(move || storage.small_state_items())
-                .await
-                .map_err(|_| AppError::BlockingTask("backup export failed".into()))??
+        let small_state = {
+            let archive_key = archive_key.clone();
+            self.ledger(move |storage| {
+                let items = storage.app_storage().small_state_items()?;
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                seal_backup_small_state(&archive_key, &items).map(Some)
+            })
+            .await?
         };
-        if !items.is_empty() {
-            let sealed = seal_backup_small_state(&archive_key, &items)?;
+        if let Some(sealed) = small_state {
             let server = self
                 .upload(&id, sealed.ciphertext.clone(), &sealed.sha256)
                 .await?;
             index.small_state = Some(BlobLocator::new(&sealed, server));
         }
-        let head = BackupHead::seal(id, &archive_key, &self.key, &index)?.encode();
-        let sha256: [u8; 32] = Sha256::digest(&head).into();
+        let (head, sha256) = {
+            let (key, index) = (self.key.clone(), index.clone());
+            blocking(move || {
+                let head = BackupHead::seal(id, &archive_key, &key, &index)?.encode();
+                let sha256: [u8; 32] = Sha256::digest(&head).into();
+                Ok((head, sha256))
+            })
+            .await?
+        };
         let size = head.len() as u64;
         let server = self.upload(&id, head, &sha256).await?;
-        storage.record_backup_run_head(
-            &id,
-            &BackupRunHead {
-                sha256: hex::encode(sha256),
-                size,
-                server: server.clone(),
-                publish_until: now.saturating_add(REPUBLISH_FOR_SECS),
-            },
-        )?;
         let locator = BlobLocator {
             sha256: hex::encode(sha256),
             size,
             server,
         };
+        let run_head = BackupRunHead {
+            sha256: locator.sha256.clone(),
+            size,
+            server: locator.server.clone(),
+            publish_until: now.saturating_add(REPUBLISH_FOR_SECS),
+        };
+        self.ledger(move |storage| {
+            Ok(storage
+                .app_storage()
+                .record_backup_run_head(&id, &run_head)?)
+        })
+        .await?;
         Ok((PointerEntry::new(&id, now, locator), index))
     }
 
@@ -376,12 +448,19 @@ impl BackupPass {
         blob: Vec<u8>,
         sha256: &[u8; 32],
     ) -> Result<String, AppError> {
-        let storage = self.storage.app_storage();
         let hash = hex::encode(sha256);
         let blob = Bytes::from(blob);
         let mut last = backup_error("backup_no_blossom");
         for server in &self.servers {
-            storage.record_backup_run_blob(id, &hash, server)?;
+            let (id, record_hash, record_server) = (*id, hash.clone(), server.clone());
+            self.ledger(move |storage| {
+                Ok(storage.app_storage().record_backup_run_blob(
+                    &id,
+                    &record_hash,
+                    &record_server,
+                )?)
+            })
+            .await?;
             match upload_blossom_blob(
                 server,
                 blob.clone(),
@@ -402,11 +481,11 @@ impl BackupPass {
     }
 
     async fn newest_bundles_start(&self, chat: &GroupId) -> Result<Option<ChatPosition>, AppError> {
-        let (storage, chat) = (self.storage.clone(), chat.clone());
+        let chat = chat.clone();
         let allow_loopback_http = self.allow_loopback_http;
-        tokio::task::spawn_blocking(move || {
+        self.ledger(move |storage| {
             newest_bundles_start(
-                &storage,
+                storage,
                 &chat,
                 &hex::encode(chat.as_slice()),
                 HISTORY_BUNDLE_MAX_PLAINTEXT,
@@ -415,35 +494,41 @@ impl BackupPass {
             )
         })
         .await
-        .map_err(|_| AppError::BlockingTask("backup export failed".into()))?
     }
 
-    async fn export(
+    /// The bundle after `after` in `chat`, and its blob, sealed as blob
+    /// `number` under `archive_key`.
+    async fn export_sealed(
         &self,
         chat: &GroupId,
         after: Option<ChatPosition>,
-    ) -> Result<Option<crate::history_bundle::HistoryBundle>, AppError> {
-        let (storage, chat) = (self.storage.clone(), chat.clone());
+        archive_key: &Arc<ArchiveKey>,
+        number: u32,
+    ) -> Result<Option<(HistoryBundle, SealedBlob)>, AppError> {
+        let (chat, archive_key) = (chat.clone(), archive_key.clone());
         let allow_loopback_http = self.allow_loopback_http;
-        tokio::task::spawn_blocking(move || {
-            Ok(export_history(
-                &storage,
+        self.ledger(move |storage| {
+            export_history(
+                storage,
                 &chat,
                 &hex::encode(chat.as_slice()),
                 after.as_ref(),
                 HISTORY_BUNDLE_MAX_PLAINTEXT,
                 allow_loopback_http,
             )?
-            .map(|ExportedBundle { bundle, .. }| bundle))
+            .map(|ExportedBundle { bundle, .. }| {
+                let sealed = seal_backup_bundle(&archive_key, number, &bundle)?;
+                Ok((bundle, sealed))
+            })
+            .transpose()
         })
         .await
-        .map_err(|_| AppError::BlockingTask("backup export failed".into()))?
     }
 
     /// The pointer listing `own` among `listed`, by retention at `now`, to
-    /// replace the one made at `replaces`. The blobs of each backup it drops are condemned first: if the pointer
-    /// never lands, the fetched one still lists them, and no delete touches
-    /// a listed backup's blobs.
+    /// replace the one made at `replaces`. The blobs of each backup it drops
+    /// are condemned first: if the pointer never lands, the fetched one still
+    /// lists them, and no delete touches a listed backup's blobs.
     async fn listing(
         &self,
         listed: Vec<PointerEntry>,
@@ -466,18 +551,29 @@ impl BackupPass {
             index,
         });
         let (kept, dropped) = retain(backups, now);
-        let storage = self.storage.app_storage();
-        for backup in &dropped {
-            let mut id = [0_u8; BACKUP_ID_LEN];
-            hex::decode_to_slice(&backup.entry.id, &mut id)
-                .map_err(|_| backup_error("backup_format"))?;
-            let blobs = backup
-                .locators()
-                .into_iter()
-                .map(|locator| (locator.sha256, locator.server))
-                .collect::<Vec<_>>();
-            storage.condemn_backup_blobs(&self.key, &id, &blobs, now, now + DELETE_AFTER_SECS)?;
-        }
+        let condemned = dropped
+            .iter()
+            .map(|backup| {
+                let mut id = [0_u8; BACKUP_ID_LEN];
+                hex::decode_to_slice(&backup.entry.id, &mut id)
+                    .map_err(|_| backup_error("backup_format"))?;
+                let blobs = backup
+                    .locators()
+                    .into_iter()
+                    .map(|locator| (locator.sha256, locator.server))
+                    .collect::<Vec<_>>();
+                Ok((id, blobs))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let key = self.key.clone();
+        self.ledger(move |storage| {
+            let storage = storage.app_storage();
+            for (id, blobs) in &condemned {
+                storage.condemn_backup_blobs(&key, id, blobs, now, now + DELETE_AFTER_SECS)?;
+            }
+            Ok(())
+        })
+        .await?;
         let content = BackupPointer::new(kept.into_iter().map(|backup| backup.entry).collect())
             .seal(&self.key)?;
         let mut run = [0_u8; BACKUP_ID_LEN];
@@ -504,11 +600,19 @@ impl BackupPass {
         )
         .await
         .ok()?;
-        let head = BackupHead::decode(&bytes).ok()?;
-        if hex::encode(head.id) != entry.id {
+        if bytes.len() as u64 != entry.head.size {
             return None;
         }
-        head.open_index(&self.key).ok()
+        let (key, id) = (self.key.clone(), entry.id.clone());
+        blocking(move || {
+            let head = BackupHead::decode(&bytes)?;
+            if hex::encode(head.id) != id {
+                return Err(backup_error("backup_format"));
+            }
+            head.open_index(&key)
+        })
+        .await
+        .ok()
     }
 }
 
@@ -609,9 +713,7 @@ impl AppClient {
         schedule: BackupSchedule,
     ) -> Result<Option<BackupPass>, AppError> {
         let storage = account.app_storage();
-        let role = self.backup_role()?;
-        storage.forget_backups_except(role.as_ref().map(|role| role.key.as_slice()))?;
-        let Some(role) = role else {
+        let Some(role) = self.backup_role()? else {
             return Ok(None);
         };
         let now = unix_now_seconds();
@@ -621,6 +723,7 @@ impl AppClient {
         if schedule.next_pass_at > now && !deletes_due {
             return Ok(None);
         }
+        storage.forget_backups_except(Some(&role.key))?;
         // No pass is running, so a run without its head stopped short.
         for run in storage.backup_runs()? {
             if run.head.is_none() {
@@ -658,6 +761,7 @@ impl AppClient {
             account_id_hex: summary.account_id_hex,
             storage: account,
             key: role.key,
+            writes: role.writes,
             write,
             started_at: now,
             servers,
@@ -733,10 +837,17 @@ impl AppClient {
             return Ok(pointer.written_at.saturating_add(BACKUP_INTERVAL_SECS));
         }
         if role.as_ref().is_some_and(|role| role.writes) {
-            return Ok(report
+            // Due a day after the newest backup. A writer that could not
+            // write one waits a day too, rather than asking relays each
+            // minute.
+            let due = report
                 .newest
-                .map_or(now, |at| at.saturating_add(BACKUP_INTERVAL_SECS))
-                .max(now.saturating_add(PASS_RETRY_SECS)));
+                .map_or(0, |at| at.saturating_add(BACKUP_INTERVAL_SECS));
+            return Ok(if due > now {
+                due
+            } else {
+                now.saturating_add(BACKUP_INTERVAL_SECS)
+            });
         }
         if role.is_some() {
             self.take_over_a_quiet_writer(key, report.newest, now)

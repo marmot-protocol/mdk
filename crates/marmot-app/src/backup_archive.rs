@@ -685,7 +685,8 @@ impl BackupPointer {
     /// missing, extra or repeated member, another version, more than
     /// [`MAX_POINTER_BACKUPS`] backups, an id that is not 32 lowercase
     /// hexadecimal characters or is listed twice, a backup listed before a
-    /// newer one, or a head that is no blob a backup may name.
+    /// newer one, or a head that is no blob a backup may name or is longer
+    /// than [`MAX_BACKUP_HEAD_BYTES`].
     pub(crate) fn open(content: &str, recovery_public_key: &[u8]) -> Result<Self, AppError> {
         if content.len() > MAX_POINTER_CONTENT_BYTES {
             return Err(backup_error("backup_too_large"));
@@ -717,6 +718,7 @@ impl BackupPointer {
                     && ids.insert(entry.id.as_str())
                     && entry.written_at <= MAX_INTEGER
                     && entry.head.is_well_formed()
+                    && entry.head.size <= MAX_BACKUP_HEAD_BYTES as u64
             })
             && pointer
                 .backups
