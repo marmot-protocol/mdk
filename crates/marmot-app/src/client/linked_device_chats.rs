@@ -19,6 +19,8 @@
 //!   from before its link under another key. That chat gets a second
 //!   leaf, whose 461 the device holds while its own copy is active (D72): a
 //!   stated limit.
+//! - A device this device's user decided to remove gets no Add while that
+//!   removal waits to commit, or after branch selection drops it.
 //! - A chat with this device's commit queued, in flight or settling waits for
 //!   a later pass, so an Add is never doubled.
 //! - Before a chat takes a KeyPackage, the engine checks the Add against the
@@ -162,22 +164,29 @@ impl AppClient {
     /// The devices whose links this device approved and decided made less
     /// than [`LINK_CHAT_ADD_SECS`] ago, in this device group, that the roster
     /// lists as active and linked by this device, with "add to all my chats"
-    /// on and their tag signature key set.
+    /// on and their tag signature key set. A device this device's user
+    /// decided to remove is none of them, while its removal waits to commit
+    /// or is made again.
     fn devices_to_add_to_chats(
         &self,
         exchange: &Exchange,
         now: u64,
     ) -> Result<Vec<NewDevice>, AppError> {
         let group_id_hex = hex::encode(exchange.group_id.as_slice());
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let removing = storage
+            .device_removals()?
+            .into_iter()
+            .filter(|removal| removal.group_id_hex == group_id_hex)
+            .map(|removal| removal.slot_hex)
+            .collect::<std::collections::HashSet<_>>();
+        Ok(storage
             .device_links()?
             .into_iter()
             .filter(|link| {
                 link.outcome == DeviceLinkOutcome::Linked
                     && link.group_id_hex == group_id_hex
+                    && !removing.contains(&link.slot_hex)
                     && link
                         .decided_at
                         .is_some_and(|at| now < at.saturating_add(LINK_CHAT_ADD_SECS))

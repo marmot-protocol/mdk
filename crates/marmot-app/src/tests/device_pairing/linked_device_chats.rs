@@ -165,6 +165,41 @@ async fn a_new_device_without_add_to_all_my_chats_is_added_to_none() {
     assert!(!chats.iter().any(|chat| joined(&laptop, chat)));
 }
 
+/// A device the phone's user decided to remove gets no Add from the phone
+/// while that removal waits to commit, though its link is made and the
+/// phone holds its KeyPackages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_being_removed_is_added_to_no_chat() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    // The phone asks for the laptop's KeyPackages, and holds them, before
+    // any add pass of its own runs.
+    for _ in 0..3 {
+        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+        phone.client.sibling_key_package_upkeep(&[]).await;
+        deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+        laptop.client.run_due_maintenance().await.unwrap();
+    }
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    assert!(held_from(&phone, &laptop) > 0);
+    phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_device_removal(
+            &hex::encode(group.as_slice()),
+            &laptop.slot_hex(),
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+
+    phone.client.add_linked_devices_to_chats(&[]).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+}
+
 /// A chat whose relays a sibling Welcome cannot carry takes no same-account
 /// Add: the phone counts it, never takes a KeyPackage for it, and adds the
 /// laptop to its other chat.
