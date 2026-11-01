@@ -32,7 +32,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     app::encrypted_media_secrets::{
-        encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
+        encrypted_media_component_ids, encrypted_media_secret_reference_epochs_for_message_tx,
+        replace_encrypted_media_secret_references_for_parts_tx,
         replace_encrypted_media_secret_references_tx,
         retire_unreferenced_encrypted_media_secret_epochs_tx,
     },
@@ -52,6 +53,7 @@ use cgka_traits::{
     PollDefinition, PollOptionResult, PollProjection, PollVote, PollVotePage, parse_poll,
     parse_poll_response, validate_poll_response,
 };
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -473,6 +475,9 @@ struct PrunedAppEvent {
     kind: u64,
     source_epoch: Option<u64>,
     tags: Vec<Vec<String>>,
+    /// The stored tags no longer decode, so `tags` is empty and cannot name
+    /// the row's targets or media.
+    tags_damaged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1050,6 +1055,7 @@ impl SqliteAppStorage {
             // Already-invalidated rows are excluded so a replayed or duplicate
             // withdrawal event is a no-op: it neither rewrites the recorded
             // invalidation reason nor produces a redundant projection update.
+            let mut tags_damaged = false;
             let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
                     .prepare_cached(
@@ -1060,14 +1066,9 @@ impl SqliteAppStorage {
                     .storage()?;
                 stmt.query_map(params![origin_commit_id], |row| {
                     let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                    Ok((row.get(0)?, row.get(1)?, kind, tags))
+                    let tags = decode_app_event_tags(row, 3)?;
+                    tags_damaged |= tags.is_none();
+                    Ok((row.get(0)?, row.get(1)?, kind, tags.unwrap_or_default()))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
@@ -1089,6 +1090,9 @@ impl SqliteAppStorage {
                     tags,
                 )?);
             }
+            if tags_damaged {
+                affected_message_ids.extend(group_timeline_message_ids_tx(&conn, &group_id_hex)?);
+            }
             let before =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             conn.execute_cached(
@@ -1099,7 +1103,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
-            let messages =
+            let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             // One change set covers all invalidated rows. Each invalidated row's own
             // message id anchors its change; pass each in turn and merge.
@@ -1114,6 +1118,9 @@ impl SqliteAppStorage {
                 ));
             }
             dedup_timeline_changes(&mut changes);
+            if tags_damaged {
+                retain_changed_messages(&mut messages, &changes);
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex,
                 messages,
@@ -1175,6 +1182,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let mut tags_damaged = false;
             let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
                     .prepare_cached(
@@ -1189,14 +1197,9 @@ impl SqliteAppStorage {
                     params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
                     |row| {
                         let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(err),
-                            )
-                        })?;
-                        Ok((row.get(0)?, row.get(1)?, kind, tags))
+                        let tags = decode_app_event_tags(row, 3)?;
+                        tags_damaged |= tags.is_none();
+                        Ok((row.get(0)?, row.get(1)?, kind, tags.unwrap_or_default()))
                     },
                 )
                 .storage()?
@@ -1217,6 +1220,9 @@ impl SqliteAppStorage {
                     tags,
                 )?);
             }
+            if tags_damaged {
+                affected_message_ids.extend(group_timeline_message_ids_tx(&conn, &group_id_hex)?);
+            }
             let before =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             conn.execute(
@@ -1229,7 +1235,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
-            let messages =
+            let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             let mut changes = Vec::new();
             for (_, message_id_hex, kind, tags) in &rows {
@@ -1242,6 +1248,9 @@ impl SqliteAppStorage {
                 ));
             }
             dedup_timeline_changes(&mut changes);
+            if tags_damaged {
+                retain_changed_messages(&mut messages, &changes);
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex,
                 messages,
@@ -1353,6 +1362,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let mut tags_damaged = false;
             let rows: Vec<(String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
                     .prepare_cached(
@@ -1366,14 +1376,9 @@ impl SqliteAppStorage {
                     .storage()?;
                 stmt.query_map(params![group_id_hex], |row| {
                     let kind = row.get::<_, i64>(1)?.try_into().unwrap_or_default();
-                    let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                    Ok((row.get(0)?, kind, tags))
+                    let tags = decode_app_event_tags(row, 2)?;
+                    tags_damaged |= tags.is_none();
+                    Ok((row.get(0)?, kind, tags.unwrap_or_default()))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
@@ -1392,6 +1397,9 @@ impl SqliteAppStorage {
                     tags,
                 )?);
             }
+            if tags_damaged {
+                affected_message_ids.extend(group_timeline_message_ids_tx(&conn, group_id_hex)?);
+            }
             let before =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             conn.execute_cached(
@@ -1405,7 +1413,7 @@ impl SqliteAppStorage {
             )
             .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, group_id_hex)?;
-            let messages =
+            let mut messages =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             let mut changes = Vec::new();
             for (message_id_hex, kind, tags) in &rows {
@@ -1418,6 +1426,9 @@ impl SqliteAppStorage {
                 ));
             }
             dedup_timeline_changes(&mut changes);
+            if tags_damaged {
+                retain_changed_messages(&mut messages, &changes);
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex: group_id_hex.to_owned(),
                 messages,
@@ -1448,30 +1459,33 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let row: Option<(String, String, u64, Vec<Vec<String>>)> = conn
+            let row = conn
                 .query_row_cached(select_sql, lookup_params, |row| {
-                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                    Ok((row.get(0)?, row.get(1)?, kind, tags))
+                    let kind: u64 = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        kind,
+                        decode_app_event_tags(row, 3)?,
+                    ))
                 })
                 .optional()
                 .storage()?;
             let Some((group_id_hex, message_id_hex, kind, tags)) = row else {
                 return Ok(None);
             };
-            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+            let tags_damaged = tags.is_none();
+            let tags = tags.unwrap_or_default();
+            let mut affected_message_ids = affected_timeline_message_ids_for_parts_tx(
                 &conn,
                 &group_id_hex,
                 &message_id_hex,
                 kind,
                 &tags,
             )?;
+            if tags_damaged {
+                affected_message_ids.extend(group_timeline_message_ids_tx(&conn, &group_id_hex)?);
+            }
             let before =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             // The UPDATE shares the lookup predicate and appends `reason` last.
@@ -1480,10 +1494,13 @@ impl SqliteAppStorage {
             conn.execute_cached(update_sql, update_params.as_slice())
                 .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
-            let messages =
+            let mut messages =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             let changes =
                 timeline_changes_for_invalidation(&message_id_hex, kind, &tags, &before, &messages);
+            if tags_damaged {
+                retain_changed_messages(&mut messages, &changes);
+            }
             Ok(Some(TimelineProjectionUpdate {
                 group_id_hex,
                 messages,
@@ -1776,8 +1793,20 @@ fn secure_prune_selected_app_events_tx(
                 .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        // A damaged row's tags cannot say whether it carried encrypted media;
+        // the references they wrote while they still decoded can.
+        let carries_encrypted_media = if event.tags_damaged {
+            !encrypted_media_secret_reference_epochs_for_message_tx(
+                tx,
+                group_id_hex,
+                &event.message_id_hex,
+            )?
+            .is_empty()
+        } else {
+            !encrypted_media_component_ids(&event.tags).is_empty()
+        };
         if event.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && !encrypted_media_component_ids(&event.tags).is_empty()
+            && carries_encrypted_media
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -1789,6 +1818,17 @@ fn secure_prune_selected_app_events_tx(
             event.kind,
             &event.tags,
         )?);
+        if event.tags_damaged {
+            // A damaged row's tags no longer name its targets, but the edges
+            // recorded while they still decoded do, and the per-row projection
+            // reads those: scrub and reproject them as a healthy row's would be,
+            // so an expired edit's text cannot survive on its target.
+            let targets = modifier_edge_targets_tx(tx, group_id_hex, &event.message_id_hex)?;
+            if event.kind == MARMOT_APP_EVENT_KIND_EDIT {
+                retained_edit_targets.extend(targets.iter().cloned());
+            }
+            affected_message_ids.extend(targets);
+        }
     }
 
     let roots = pruned_message_ids.clone();
@@ -2065,14 +2105,7 @@ fn app_event_projection_parts_tx(
         params![group_id_hex, message_id_hex],
         |row| {
             let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
-            let tags = tags_from_json(row.get::<_, String>(1)?).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            })?;
-            Ok((kind, tags))
+            Ok((kind, app_event_tags(row, 1)?))
         },
     )
     .optional()
@@ -2638,23 +2671,7 @@ fn app_events_before_cutoff_tx(
         .storage()?;
     stmt.query_map(
         params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-        |row| {
-            let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            })?;
-            Ok(PrunedAppEvent {
-                message_id_hex: row.get(0)?,
-                kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
-                source_epoch: row
-                    .get::<_, Option<i64>>(2)?
-                    .and_then(|value| value.try_into().ok()),
-                tags,
-            })
-        },
+        pruned_app_event_from_row,
     )
     .storage()?
     .collect::<Result<Vec<_>, _>>()
@@ -2676,22 +2693,47 @@ fn expired_app_events_tx(
              ORDER BY retention_expires_at, message_id_hex, insert_order",
         )
         .storage()?;
-    stmt.query_map(params![group_id_hex, u64_to_i64(now)?], |row| {
-        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
-        })?;
-        Ok(PrunedAppEvent {
-            message_id_hex: row.get(0)?,
-            kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
-            source_epoch: row
-                .get::<_, Option<i64>>(2)?
-                .and_then(|value| value.try_into().ok()),
-            tags,
-        })
-    })
+    stmt.query_map(
+        params![group_id_hex, u64_to_i64(now)?],
+        pruned_app_event_from_row,
+    )
     .storage()?
     .collect::<Result<Vec<_>, _>>()
     .storage()
+}
+
+/// The targets `message_modifier_edges` holds for one modifier: its `e` tags as
+/// they were when it was recorded.
+fn modifier_edge_targets_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    modifier_message_id_hex: &str,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT target_message_id_hex FROM message_modifier_edges
+             WHERE group_id_hex = ?1 AND modifier_message_id_hex = ?2",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex, modifier_message_id_hex], |row| {
+        row.get(0)
+    })
+    .storage()?
+    .collect::<Result<_, _>>()
+    .storage()
+}
+
+fn pruned_app_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrunedAppEvent> {
+    let tags = decode_app_event_tags(row, 3)?;
+    Ok(PrunedAppEvent {
+        message_id_hex: row.get(0)?,
+        kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+        source_epoch: row
+            .get::<_, Option<i64>>(2)?
+            .and_then(|value| value.try_into().ok()),
+        tags_damaged: tags.is_none(),
+        tags: tags.unwrap_or_default(),
+    })
 }
 
 fn scrub_app_event_rows_by_ids_tx(
@@ -3167,6 +3209,37 @@ fn timeline_changes_for_invalidation(
 /// sets can overlap (e.g. a shared reply-preview target). Keep the first change
 /// seen per `(message_id, variant)` so live subscribers receive one update per
 /// affected message.
+/// Every row of a group's materialized timeline. A withdrawal diffs them all
+/// when a withdrawn row's tags no longer decode: they cannot name the rows it
+/// changed, and the withdrawal rebuilds the whole group anyway.
+fn group_timeline_message_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = tx
+        .prepare_cached("SELECT message_id_hex FROM message_timeline WHERE group_id_hex = ?1")
+        .storage()?;
+    stmt.query_map(params![group_id_hex], |row| row.get(0))
+        .storage()?
+        .collect::<Result<_, _>>()
+        .storage()
+}
+
+/// After a whole-group diff, keep only the rows that changed.
+fn retain_changed_messages(
+    messages: &mut Vec<TimelineMessageRecord>,
+    changes: &[TimelineMessageChange],
+) {
+    let changed = changes
+        .iter()
+        .filter_map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => Some(message.message_id_hex.as_str()),
+            TimelineMessageChange::Remove { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    messages.retain(|message| changed.contains(message.message_id_hex.as_str()));
+}
+
 fn dedup_timeline_changes(changes: &mut Vec<TimelineMessageChange>) {
     let mut seen = HashSet::new();
     changes.retain(|change| {
@@ -3336,14 +3409,7 @@ fn modifier_target_message_id_tx(
             params![group_id_hex, message_id_hex],
             |row| {
                 let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
-                let tags = tags_from_json(row.get::<_, String>(1)?).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                Ok((kind, tags))
+                Ok((kind, app_event_tags(row, 1)?))
             },
         )
         .optional()
@@ -4036,10 +4102,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         sender: row.get(5)?,
         plaintext: row.get(6)?,
         kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        // Timeline rows are a rebuildable projection. Degrade a corrupt source
-        // tag blob to no tags so one damaged row cannot poison every rebuild
-        // for the group; this matches the tolerant unread/search read paths.
-        tags: tags_from_json(row.get::<_, String>(8)?).unwrap_or_default(),
+        tags: app_event_tags(row, 8)?,
         recorded_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         invalidated: row.get::<_, i64>(11)? != 0,
@@ -4055,13 +4118,7 @@ fn poll_response_candidate_from_row(
         group_id_hex: row.get(0)?,
         message_id_hex: row.get(1)?,
         sender: row.get(2)?,
-        tags: tags_from_json(row.get::<_, String>(3)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        tags: app_event_tags(row, 3)?,
         recorded_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
     })
 }
@@ -4572,6 +4629,31 @@ fn tags_json(tags: &[Vec<String>]) -> StorageResult<String> {
     serde_json::to_string(tags).map_err(|err| StorageError::Serialization(err.to_string()))
 }
 
+/// Decode a stored `app_events.tags_json`, or `None` when it is not a tag
+/// array. Every writer serializes a typed tag list, so `None` is on-disk damage.
+fn decode_app_event_tags(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<Vec<Vec<String>>>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(json) | ValueRef::Blob(json) => serde_json::from_slice(json).ok(),
+        ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+    })
+}
+
+/// Readers of `app_events.tags_json` treat a damaged one as no tags, as the
+/// group rebuild always has (mdk#1043): the row keeps its kind and content but
+/// names no target, media or poll, so whatever its tags would have driven skips
+/// it rather than guess. Failing instead would let one damaged row block its
+/// group's rebuild, withdrawals, terminal sweep, retention erasure, history
+/// export and message reads.
+pub(crate) fn app_event_tags(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Vec<Vec<String>>> {
+    Ok(decode_app_event_tags(row, index)?.unwrap_or_default())
+}
+
 fn optional_value_json(value: &Option<Value>) -> StorageResult<Option<String>> {
     value
         .as_ref()
@@ -4602,5 +4684,7 @@ fn reaction_summary_from_json(json: String) -> Result<TimelineReactionSummary, s
     serde_json::from_str(&json)
 }
 
+#[cfg(test)]
+mod damaged_tag_tests;
 #[cfg(test)]
 mod tests;

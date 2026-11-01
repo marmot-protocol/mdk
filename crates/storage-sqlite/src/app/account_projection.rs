@@ -1,8 +1,8 @@
 use crate::base::connection::CachedSql;
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
-    base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, tags_from_json,
-    u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, u64_to_i64, unix_now_ms,
+    unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::MessageId;
@@ -4090,9 +4090,7 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         sender: row.get(3)?,
         plaintext: row.get(4)?,
         kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(6)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(err))
-        })?,
+        tags: crate::app::timeline::app_event_tags(row, 6)?,
         source_epoch: row
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
