@@ -19,6 +19,7 @@ use cgka_traits::engine::SendIntent;
 use marmot_session::DeviceRosterEdit;
 use storage_sqlite::DeviceGroupTrust;
 
+mod backup_writer;
 mod backups;
 mod chat_kinds;
 mod devices;
@@ -30,10 +31,19 @@ mod removal;
 mod sign_out;
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
+    device_group_app_on(dir, relay, MarmotDeployment::white_noise())
+}
+
+fn device_group_app_on(
+    dir: &tempfile::TempDir,
+    relay: Arc<ScriptedPushRelayClient>,
+    deployment: MarmotDeployment,
+) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
         MarmotAppConfig::white_noise()
+            .with_deployment(deployment)
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
             .with_dev_device_groups(true)
@@ -55,6 +65,11 @@ pub(super) struct Devices {
 }
 
 pub(super) async fn phone_and_laptop() -> Devices {
+    phone_and_laptop_on(MarmotDeployment::white_noise()).await
+}
+
+/// [`phone_and_laptop`] under `deployment`.
+pub(super) async fn phone_and_laptop_on(deployment: MarmotDeployment) -> Devices {
     let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let home = AccountHome::open(dirs[0].path());
     let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -67,8 +82,8 @@ pub(super) async fn phone_and_laptop() -> Devices {
         .import_account("alice", &secret)
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let phone_app = device_group_app_at(&dirs[0], relay.clone());
-    let laptop_app = device_group_app_at(&dirs[1], relay.clone());
+    let phone_app = device_group_app_on(&dirs[0], relay.clone(), deployment.clone());
+    let laptop_app = device_group_app_on(&dirs[1], relay.clone(), deployment);
     for app in [&phone_app, &laptop_app] {
         remember_test_member_inbox(app, &alice_id, "wss://relay.example");
     }

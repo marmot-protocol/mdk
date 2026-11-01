@@ -26,6 +26,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   ask it instead of matching `Engine(..)` or `Session(..)`.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
+- `recovery_key.rs` — `seal_to_recovery_key` without a session (mdk#2628 4.4b): the engine's sealing under the
+  engine's own stateless crypto provider, for a backup written off the account worker.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
   `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
@@ -63,8 +65,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
   - `runtime/sign_in_rejection.rs` — the host's rejected sign-ins (mdk#2628 3.2) as `not_me` rejected slots, in one
-    roster update behind the same gate (`reject_device_slots`). A slot the merged roster already holds, as a device or
-    a rejected slot, is left out: a rejection never replaces an entry.
+    roster update behind the same gate (`reject_device_slots`), which refuses a `removed` record. The lone `removed`
+    record a deciding device makes after a failed link's undo (mdk#2761) goes only through `record_removed_slot`, as
+    `SendIntent::RecordRemovedSlot`, which the engine never queues or re-issues. A slot the merged roster already
+    holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this

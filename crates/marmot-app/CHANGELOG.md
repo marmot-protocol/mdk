@@ -98,6 +98,21 @@
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
   relay is sent again by the next maintenance pass. Only behind
   `dev_device_groups`; nothing outside tests adds a sibling yet.
+- The backup writer writes the account's backup once a day (mdk#2628 item
+  4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
+  as blobs on the deployment's Blossom servers under a fresh archive key, and
+  a head that seals that key to the recovery key and indexes the blobs for
+  the key's public half. A kind 30078 backup pointer, addressed and encrypted
+  under the public half, lists the kept backups: the newest two and any older
+  one still the last to hold some of a chat's history, at most 16. A backup
+  counts only once a relay accepts its pointer; one no relay accepts is
+  published again for a day, then abandoned. Blobs of dropped or abandoned
+  backups are deleted (BUD-02) while the pointer fetched in that pass lists
+  no backup they belong to. A device takes over writing when the writer
+  leaves the roster or is leaving, or lists nothing for a week, through the
+  roster's compare-and-set. Runs from maintenance, only behind
+  `dev_device_groups`. Enabling it outside dev needs the White Noise relays
+  to accept kind 30078 (D50); today they refuse it.
 - `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
   `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
   the recovery words an account's backups will be sealed to, and turn backups
@@ -592,6 +607,22 @@
 
 ### Fixed
 
+- A device cleans up after every device its device group's roster stops
+  listing, not only one whose `removed` record it still reads (mdk#2761):
+  it removes that device's tagged leaves from chats that take a
+  same-account Remove and discards the private KeyPackages exchanged with
+  its slot. That covers a record dropped before this device acted on it,
+  including while it was away, a link that failed after the new device set
+  its tag signature key, and a made link a later branch dropped. It reads
+  those leaves by every tag signature key a roster it applied listed for
+  the slot in the last 30 days, and only once the device group is settled.
+  Untagged leaves stay, and `removed_device_leftover_chats` counts the chats
+  that take no same-account Remove and keep such a leaf. When a failed
+  link's undo takes the entry of a device the user decided to remove, the deciding device commits its
+  `removed` record alone, so siblings that never saw its key clean up too.
+  It makes that record once: not again after a roster state it applied held
+  it, even across a restart or after branch selection dropped it.
+  Release builds hold no device group.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

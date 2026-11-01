@@ -188,6 +188,10 @@
 
 ### Changed
 
+- `removed_device_leftover_chats` also counts chats that keep the leaf of a
+  device the account's device group stopped listing without a removal, such
+  as after a failed link (mdk#2761). Release builds hold no device group, so
+  it stays zero there.
 - `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
   475 and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's

@@ -97,6 +97,7 @@ mod directory_tests;
 mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
+mod backup_archive;
 mod error;
 #[cfg(any(test, feature = "test-support"))]
 pub mod error_kind_table;

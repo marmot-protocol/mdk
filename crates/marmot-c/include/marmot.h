@@ -8234,10 +8234,10 @@ MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client,
                                          const char *slot_id_hex);
 
 /**
- * How many chats this device is in still hold a device this account
- * removed, because the chat doesn't take a same-account removal; a chat
- * admin can remove it. Zero while device groups are off. Not evented:
- * read it when showing the device list.
+ * How many chats this device is in still hold a device this account no
+ * longer has (removed, or no longer listed by its device group), because
+ * the chat doesn't take a same-account removal; a chat admin can remove it.
+ * Zero while device groups are off. Not evented: read it when showing the device list.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

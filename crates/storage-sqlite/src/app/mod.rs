@@ -5,6 +5,7 @@ pub(crate) mod account_recovery;
 pub(crate) mod attachment_acquisition;
 pub(crate) mod attachment_history;
 pub(crate) mod avatar_cache;
+pub(crate) mod backup_ledger;
 pub(crate) mod backup_recovery_key;
 pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;

@@ -825,10 +825,10 @@ c_cmd! {
     /// device whose link is not made yet. Re-read on the
     /// `LinkedDevicesChanged` event.
     async fn marmot_remove_linked_device(account_ref: str, slot_id_hex: str) -> unit = remove_linked_device;
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero while device groups are off. Not evented:
-    /// read it when showing the device list.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has (removed, or no longer listed by its device group), because
+    /// the chat doesn't take a same-account removal; a chat admin can remove it.
+    /// Zero while device groups are off. Not evented: read it when showing the device list.
     async fn marmot_removed_device_leftover_chats(account_ref: str) -> scalar(u32) = removed_device_leftover_chats;
     /// How many chats this device is in can't take any device of this
     /// account, linked or not: they don't require

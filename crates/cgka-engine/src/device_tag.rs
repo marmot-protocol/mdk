@@ -25,7 +25,7 @@ use cgka_traits::app_components::{
     encode_device_tag_content_v1, encode_device_tag_signed_content_v1, encode_device_tag_v1,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{RosterTagKey, StorageProvider};
 use cgka_traits::types::GroupId;
 use openmls::group::{MlsGroup, StagedCommit};
 use openmls::messages::proposals::Proposal;
@@ -400,6 +400,47 @@ fn read_entry(entry: &[u8], leaf_signature_key: &[u8], roster: &DeviceRosterV1) 
     DeviceTagClaim::Unclaimed
 }
 
+/// The slot `leaf`'s device tag reads as under `leaf_tag_key`, when one of
+/// `keys` names that slot and its key verifies the tag. Reads against tag
+/// signature keys this device remembers a roster listing (mdk#2761) rather
+/// than against the current roster, so a device the roster no longer lists
+/// is still recognized. Like [`device_tag_claim`], only for leaves of the
+/// reader's own account.
+pub(crate) fn device_tag_reads_as_one_of(
+    leaf: &LeafNode,
+    leaf_tag_key: &[u8; 32],
+    keys: &[RosterTagKey],
+) -> Option<DeviceSlotId> {
+    let entry = leaf
+        .extensions()
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_TAG_COMPONENT_ID))?;
+    entry_reads_as_one_of(entry, leaf.signature_key().as_slice(), leaf_tag_key, keys)
+}
+
+fn entry_reads_as_one_of(
+    entry: &[u8],
+    leaf_signature_key: &[u8],
+    leaf_tag_key: &[u8; 32],
+    keys: &[RosterTagKey],
+) -> Option<DeviceSlotId> {
+    let content = open_entry(entry, leaf_signature_key, leaf_tag_key)?;
+    let signed = sign_content(&content.slot, leaf_signature_key);
+    keys.iter()
+        .filter(|key| key.slot == content.slot)
+        .any(|key| {
+            VERIFY_CRYPTO
+                .verify_signature(
+                    SignatureScheme::ED25519,
+                    &signed,
+                    &key.tag_signature_key,
+                    &content.signature,
+                )
+                .is_ok()
+        })
+        .then_some(content.slot)
+}
+
 fn open_entry(
     entry: &[u8],
     leaf_signature_key: &[u8],
@@ -546,6 +587,38 @@ mod tests {
         assert_eq!(
             read_entry(&spec_tag(), &LEAF_SIGNATURE_KEY, &roster),
             DeviceTagClaim::Unclaimed
+        );
+    }
+
+    /// A remembered key reads a leaf as its slot with no roster at all; a
+    /// key remembered for another slot, another key for the slot, or another
+    /// account's `leaf_tag_key` does not.
+    #[test]
+    fn a_remembered_key_reads_a_leaf_as_its_slot() {
+        let remembered = |slot, tag_signature_key| RosterTagKey {
+            slot,
+            tag_signature_key,
+            held_as_removed: false,
+        };
+        let reads = |leaf_tag_key: &[u8; 32], keys: &[RosterTagKey]| {
+            entry_reads_as_one_of(&spec_tag(), &LEAF_SIGNATURE_KEY, leaf_tag_key, keys)
+        };
+        let other_key = remembered(SLOT, vec![0x01; 32]);
+        assert_eq!(
+            reads(
+                &LEAF_TAG_KEY,
+                &[other_key.clone(), remembered(SLOT, tag_public_key())]
+            ),
+            Some(SLOT)
+        );
+        assert_eq!(
+            reads(&LEAF_TAG_KEY, &[remembered([0x12; 32], tag_public_key())]),
+            None
+        );
+        assert_eq!(reads(&LEAF_TAG_KEY, &[other_key]), None);
+        assert_eq!(
+            reads(&[0x34; 32], &[remembered(SLOT, tag_public_key())]),
+            None
         );
     }
 

@@ -3957,7 +3957,7 @@ Remove another of this account's devices, by its `slot_id_hex` from `marmot_link
 MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *client, const char *account_ref, uint32_t *out);
 ```
 
-How many chats this device is in still hold a device this account removed, because the chat does not take a same-account removal; a chat admin can remove it. Zero while device groups are off. Not evented: read it when showing the device list.
+How many chats this device is in still hold a device this account no longer has, because the chat does not take a same-account removal; a chat admin can remove it. That device is one this account removed, or one its device group stopped listing, as after a failed link. Zero while device groups are off. Not evented: read it when showing the device list.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotremoved_device_leftover_chats) · [Header contract](include/marmot.h#L8248)
 

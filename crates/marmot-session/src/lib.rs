@@ -10,6 +10,7 @@
 
 mod error;
 mod key_package;
+mod recovery_key;
 mod routing;
 mod runtime;
 mod session;
@@ -21,6 +22,7 @@ pub use key_package::{
     KeyPackagePublishReceipt, KeyPackagePublisher, KeyPackageSlotWithdrawal,
     NoopKeyPackagePublisher,
 };
+pub use recovery_key::seal_to_recovery_key;
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
     AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, AccountIngestPhase,

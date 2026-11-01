@@ -125,6 +125,33 @@ pub(crate) fn encode_small_state_update(
         .collect()
 }
 
+/// Every item in `items` in an update's form, without the update's size
+/// limit: a backup's small-state blob (`backup_archive.rs`). An item that
+/// breaks the item rules is left out.
+pub(crate) fn encode_small_state_items(items: &[SmallStateItem]) -> String {
+    let body = items
+        .iter()
+        .filter(|item| item.is_valid())
+        .map(encode_item)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{UPDATE_START}{body}{UPDATE_END}")
+}
+
+/// The items [`encode_small_state_items`] wrote, read as an update's are,
+/// from content of at most `limit` bytes. Unlike an update, it may hold none.
+#[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
+pub(crate) fn decode_small_state_items(
+    content: &str,
+    limit: usize,
+) -> Result<Vec<SmallStateItem>, AppError> {
+    let object = small_state_object_within(content, &["v", "items"], limit)?;
+    Ok(decode_items(&object)?
+        .iter()
+        .filter_map(decode_item)
+        .collect())
+}
+
 /// One item, members in the order the wire form gives them.
 fn encode_item(item: &SmallStateItem) -> String {
     let mut encoded = format!(
@@ -279,7 +306,15 @@ pub(crate) fn broadcast_due(
 /// The content's object, when it is one with exactly `members`, no object in
 /// it repeating a member name, no longer than the limit, at version 1.
 fn small_state_object(content: &str, members: &[&str]) -> Result<Map<String, Value>, AppError> {
-    if content.len() > MAX_SMALL_STATE_CONTENT_BYTES {
+    small_state_object_within(content, members, MAX_SMALL_STATE_CONTENT_BYTES)
+}
+
+fn small_state_object_within(
+    content: &str,
+    members: &[&str],
+    limit: usize,
+) -> Result<Map<String, Value>, AppError> {
+    if content.len() > limit {
         return Err(malformed());
     }
     match serde_json::from_str::<Distinct>(content) {
