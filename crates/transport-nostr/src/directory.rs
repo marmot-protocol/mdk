@@ -27,6 +27,9 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 /// queries is split into several REQs on the same connection (mdk#2269).
 const DIRECTORY_MAX_FILTERS_PER_REQ: usize = 3;
 
+/// The addressable kinds (NIP-01), whose events one `d` value addresses.
+const ADDRESSABLE_KINDS: std::ops::Range<u64> = 30_000..40_000;
+
 /// Stable errors for a bounded, isolated relay inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryInspectionError {
@@ -257,11 +260,17 @@ impl DirectoryEventQuery {
     }
 
     /// One author's publications in one KeyPackage slot, the `d` value of
-    /// kind `30443`. Unlike a read of the author's whole account, a busy
-    /// account cannot page the slot out.
+    /// kind `30443`.
     pub fn key_package_slot(author: &str, slot: String, limit: usize) -> Self {
-        let mut query = Self::new(KIND_MARMOT_KEY_PACKAGE, vec![author.to_owned()], limit);
-        query.reference = Some(('d', slot));
+        Self::address(KIND_MARMOT_KEY_PACKAGE, author, slot, limit)
+    }
+
+    /// One author's publications at one address: the `d` value `d` of the
+    /// addressable kind `kind`. Unlike a read of the author's whole account,
+    /// a busy account cannot page the address out.
+    pub fn address(kind: u64, author: &str, d: String, limit: usize) -> Self {
+        let mut query = Self::new(kind, vec![author.to_owned()], limit);
+        query.reference = Some(('d', d));
         query
     }
 
@@ -273,11 +282,11 @@ impl DirectoryEventQuery {
                 Err("invalid directory since constraint".into())
             };
         };
-        if self.kind == KIND_MARMOT_KEY_PACKAGE && *name == 'd' {
+        if ADDRESSABLE_KINDS.contains(&self.kind) && *name == 'd' {
             return if self.authors.len() == 1 && self.since.is_none() && !value.is_empty() {
                 Ok(())
             } else {
-                Err("invalid key package slot query".into())
+                Err("invalid address query".into())
             };
         }
         if self.kind == 5
@@ -1943,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn key_package_slot_query_matches_only_its_author_and_slot() {
+    fn an_address_query_matches_only_its_author_kind_and_address() {
         use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
         let (alice, bob) = (Keys::generate(), Keys::generate());
         let author = alice.public_key().to_hex();
@@ -1964,12 +1973,17 @@ mod tests {
         );
         assert!(validated_directory_event(&publication(&bob, 30443, &slot), &query).is_none());
         assert!(validated_directory_event(&publication(&alice, 1, &slot), &query).is_none());
+        let app_data = DirectoryEventQuery::address(30078, &author, slot.clone(), 4);
+        assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![app_data.clone()]).is_ok());
+        assert!(validated_directory_event(&publication(&alice, 30078, &slot), &app_data).is_some());
+        assert!(validated_directory_event(&publication(&alice, 30443, &slot), &app_data).is_none());
         let mut two_authors = query.clone();
         two_authors.authors.push(bob.public_key().to_hex());
         let mut bounded = query.clone();
         bounded.since = Some(1);
         let empty = DirectoryEventQuery::key_package_slot(&author, String::new(), 4);
-        for invalid in [two_authors, bounded, empty] {
+        let not_addressable = DirectoryEventQuery::address(10002, &author, slot.clone(), 4);
+        for invalid in [two_authors, bounded, empty, not_addressable] {
             assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
         }
     }

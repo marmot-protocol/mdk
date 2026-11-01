@@ -26,6 +26,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   ask it instead of matching `Engine(..)` or `Session(..)`.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
+- `recovery_key.rs` — `seal_to_recovery_key` without a session (mdk#2628 4.4b): the engine's sealing under the
+  engine's own stateless crypto provider, for a backup written off the account worker.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
   `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,

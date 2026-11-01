@@ -27,6 +27,8 @@ use marmot_observability::PerformanceRecorder;
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long one Blossom delete may take.
+const BLOSSOM_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_BLOSSOM_ERROR_BODY_BYTES: u64 = 1024;
 pub(crate) const MAX_BLOSSOM_DESCRIPTOR_BYTES: u64 = 16 * 1024;
@@ -510,7 +512,9 @@ async fn upload_blossom_body(
     require_descriptor_digest_and_size: bool,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
-    let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "upload", "Upload Blob")
+            .await?;
     let upload_transport = BlossomHttpTransport {
         kind: MediaHttpKind::Upload,
         ..transport.clone()
@@ -584,6 +588,43 @@ async fn upload_blossom_body(
         ));
     }
     Ok(url)
+}
+
+/// Deletes the blob `blob_hash_hex` from `server` (BUD-02 `DELETE
+/// /<sha256>`), authorized as the signer's account, through the dial-safe
+/// transport. A server that no longer holds it has deleted it.
+pub(crate) async fn delete_blossom_blob(
+    server: &str,
+    blob_hash_hex: &str,
+    signer: &dyn MarmotNostrSigner,
+    transport: &BlossomHttpTransport,
+) -> Result<(), AppError> {
+    let (mut url, server_host) = blossom_upload_endpoint(server)?;
+    url.set_path(blob_hash_hex);
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "delete", "Delete Blob")
+            .await?;
+    let transport = BlossomHttpTransport {
+        kind: MediaHttpKind::Upload,
+        ..transport.clone()
+    };
+    let response = transport
+        .client_for_url(&url)
+        .await?
+        .delete(url)
+        .timeout(BLOSSOM_DELETE_TIMEOUT)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .send()
+        .await
+        .map_err(reqwest_blob_error)?;
+    let status = response.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(AppError::BlobStore(format!(
+        "delete returned HTTP {}",
+        status.as_u16()
+    )))
 }
 
 async fn blossom_upload_status_error(response: reqwest::Response) -> AppError {
@@ -2075,15 +2116,19 @@ pub(crate) fn blossom_content_hash_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// A kind 24242 authorization for the BUD-01 `verb` on `encrypted_hash_hex`
+/// at `server_host`, with `content` as its human-readable description.
 async fn blossom_authorization_header(
     signer: &dyn MarmotNostrSigner,
     server_host: &str,
     encrypted_hash_hex: &str,
+    verb: &str,
+    content: &str,
 ) -> Result<String, AppError> {
     let now = unix_now_seconds();
     let expiration = now + BLOSSOM_UPLOAD_AUTH_TTL.as_secs();
     let tags = [
-        Tag::parse(["t", "upload"]),
+        Tag::parse(["t", verb]),
         Tag::parse(["expiration", &expiration.to_string()]),
         Tag::parse(["x", encrypted_hash_hex]),
         Tag::parse(["server", server_host]),
@@ -2095,7 +2140,7 @@ async fn blossom_authorization_header(
         .get_public_key()
         .await
         .map_err(|err| crate::external_signer_error(err, "Blossom auth public key"))?;
-    let mut unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
+    let mut unsigned = EventBuilder::new(Kind::Custom(24242), content)
         .tags(tags)
         .custom_created_at(NostrTimestamp::from(now))
         .finalize_unsigned(public_key);

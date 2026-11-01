@@ -22,6 +22,9 @@ cgka-traits.workspace = true
 futures.workspace = true
 hex.workspace = true
 marmot-forensics.workspace = true
+# Seals a backup's archive key off the account worker, under the engine's own
+# stateless provider.
+openmls_rust_crypto.workspace = true
 rand.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
@@ -38,7 +41,6 @@ nostr.workspace = true
 # built with raw OpenMLS, because the engine refuses to send one.
 openmls.workspace = true
 openmls_basic_credential.workspace = true
-openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

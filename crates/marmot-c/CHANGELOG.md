@@ -162,6 +162,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- The NIP-46 connection asks for `sign_event:30078` too: the account's
+  backup pointer (mdk#2628 item 4.4b).
 - `marmot_removed_device_leftover_chats` also counts chats that keep the leaf
   of a device the account's device group stopped listing without a removal,
   such as after a failed link (mdk#2761). Release builds hold no device
