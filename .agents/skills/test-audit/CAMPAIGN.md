@@ -157,8 +157,13 @@ each group:
   an error or rollback path with a visible effect, or an edge case of a public
   method. Add a test at the owning layer and show it fail under a matching
   mutation.
-- `X` dead: no production caller anywhere in the workspace, bindings
-  included. File an issue or delete it in its own change, not in a lane.
+- `X` dead: no production caller. For code only this repository can reach
+  (private items, and `pub` items no binding or host exports), grep the whole
+  workspace. Exported surface (a UniFFI or C ABI export, an API that host apps
+  or integrations link, a CLI command) has callers outside the repository: it
+  is dead only when its owner confirms that no supported consumer uses it, so
+  until then mark it `T` or `U` with the reason. File an issue or delete it in
+  its own change, not in a lane.
 - `U` untested on purpose: defensive code that cannot run, such as an
   impossible match arm or an invariant `expect`, or reachable code with no
   contract worth a test, such as a `Debug` impl that prints fields as they
