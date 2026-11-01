@@ -4792,7 +4792,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         outcome: &mut WipeOutcome,
     ) -> HashSet<String> {
-        let deadline = Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
         let mut asked = false;
         loop {
             match self
@@ -4819,7 +4819,7 @@ impl MarmotAppRuntime {
                     }
                 }
             }
-            if Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 outcome.siblings_not_reached = true;
                 return HashSet::new();
             }

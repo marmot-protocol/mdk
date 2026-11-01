@@ -307,13 +307,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   that deactivation. `MarmotApp::client`, `sign_in_account`, `run_due_maintenance`, both logins, a
   key import and both onboarding starts refuse an unlinked account, before anything is written or sent;
   `sign_out_and_wipe` of one skips leaving chats and deleting the slot. Signing out through siblings
-  (`client/sign_out.rs`, D67(2)) is only `sign_out_and_wipe`'s: it marks the account signing out on the app
-  (`begin_signing_out`) before any step, and while that mark is set the removal note does nothing (a device removed
-  while signing out is not unlinked and is told nothing), and neither a maintenance pass nor the pairing drive runs,
-  so only its own steps go out. Each step runs as a worker command so deliveries settle between steps: commit the own
-  entry as `leaving` through `edit_device_roster_entry`, then, once the device group is quiet with it on the selected
-  branch, name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot
-  and another leaf's as a listed device that is not `leaving`). Never leave the device group itself: the account is
+  (`client/sign_out.rs`, D67(2)) is only `sign_out_and_wipe`'s: it holds a `SigningOut` mark on the app from before
+  any step until the wipe returns or is dropped. While it is set the removal note does nothing (a device removed while
+  signing out is not unlinked and is told nothing), the pairing drive does not run and push token gossip stops. Once
+  the removal is stored (`removed_while_signing_out`), no maintenance pass runs and leaves drain no push token removal,
+  so only the sign-out's SelfRemoves and slot deletion go out. Keep the removed device-group copy until the wipe: a
+  sign-out that is cancelled or fails then leaves the removal for the next pairing drive to note as an unlink. Each
+  step runs as a worker command so deliveries settle between steps: commit the own entry as `leaving` through
+  `edit_device_roster_entry`, then, once it reads `leaving` on a stable device group with no convergence input left,
+  name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot and
+  another leaf's as a listed device that is not `leaving`). Never leave the device group itself: the account is
   its only admin. A sibling decides a `leaving` device's removal (`decide_leaving_siblings`) only on a stable device
   group with no pending convergence input, after its own random delay of up to 30 seconds, and records it as a user's
   removal would be, so the removal path carries it out. A later link's Welcome into that group is a

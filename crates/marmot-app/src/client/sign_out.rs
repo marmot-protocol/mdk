@@ -18,9 +18,13 @@
 //! one when they do.
 //!
 //! While an account signs out here, its device group's removal of this
-//! device does not unlink it: the sign-out only sends what it has left, its
-//! SelfRemoves and its slot's deletion. No maintenance pass or pairing drive
-//! runs meanwhile, so nothing else goes out.
+//! device does not unlink it, the pairing drive does not run and its push
+//! token gossip stops. Once that removal lands, no maintenance pass runs
+//! either, and its leaves send no push token removal, so the sign-out sends
+//! only what it has left: its SelfRemoves and its slot's deletion. The
+//! removed device-group copy stays, inert, until the wipe deletes it, so a
+//! sign-out that is cancelled or fails leaves the removal stored and the
+//! next pairing drive unlinks the device.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -105,7 +109,7 @@ impl crate::MarmotApp {
     }
 
     /// Test hook: wait `wait` for the `leaving` commit instead.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn set_sign_out_leaving_wait(&self, wait: Duration) {
         *self
             .test_sign_out_leaving_wait
@@ -133,13 +137,20 @@ impl AppClient {
     /// then sends only its remaining SelfRemoves and its slot's deletion
     /// (D67): no push token removal before a leave.
     pub(crate) fn removed_while_signing_out(&self) -> Result<bool, AppError> {
-        Ok(self.signing_out() && self.app.removed_device_group(&self.state.label)?.is_some())
+        #[cfg(feature = "unreleased-device-pairing")]
+        return Ok(
+            self.signing_out() && self.app.removed_device_group(&self.state.label)?.is_some()
+        );
+        // Without device groups no device group removes this device.
+        #[cfg(not(feature = "unreleased-device-pairing"))]
+        Ok(false)
     }
 
     /// Move signing out through siblings one step on: commit this device's
     /// own entry as `leaving` when the device group takes a commit, then
-    /// report it confirmed once the device group is quiet with the entry
-    /// `leaving` on the selected branch. The caller repeats it until it is
+    /// report it confirmed once the entry reads `leaving` on the selected
+    /// branch: the device group is stable with no convergence input left,
+    /// so a relay accepted the commit and no other branch is pending. The caller repeats it until it is
     /// confirmed or about 30 seconds have passed. A commit that fails is
     /// logged and sent again on the next step.
     pub(crate) async fn sign_out_through_siblings_step(
@@ -169,7 +180,11 @@ impl AppClient {
             self.commit_leaving(&group_id, &own_slot).await;
             return Ok(SiblingSignOut::Pending);
         }
-        if !self.group_quiet(&group_id)? {
+        if !matches!(
+            self.runtime.epoch_state(&group_id),
+            Some(EpochState::Stable { .. })
+        ) || self.runtime.has_pending_convergence_inputs(&group_id)?
+        {
             return Ok(SiblingSignOut::Pending);
         }
         Ok(SiblingSignOut::Confirmed {
@@ -354,7 +369,7 @@ impl AppClient {
 
     /// Test hook: date every pending decision `secs` earlier, as a wait that
     /// long would.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn backdate_leaving_siblings(&mut self, secs: u64) {
         for decide_at in self.leaving_siblings.values_mut() {
             *decide_at = decide_at.saturating_sub(secs);

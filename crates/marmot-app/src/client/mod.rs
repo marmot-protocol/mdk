@@ -1518,9 +1518,9 @@ impl AppClient {
                 marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
             ));
         }
-        // A device signing out sends only what its sign-out has left
-        // (mdk#2628 D67).
-        if self.signing_out() {
+        // A device its device group removed while it signs out sends only
+        // what its sign-out has left (mdk#2628 D67).
+        if self.removed_while_signing_out()? {
             let summary = self
                 .runtime
                 .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;

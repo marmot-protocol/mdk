@@ -9,6 +9,7 @@ use super::removal::{chat_with_both, pending_removals, published_count};
 use super::*;
 use crate::client::sign_out::SiblingSignOut;
 use crate::notifications::PushPlatform;
+use marmot_session::DeviceRosterEdit;
 
 fn account_id_hex(app: &MarmotApp) -> String {
     app.account_home().account("alice").unwrap().account_id_hex
@@ -38,7 +39,7 @@ async fn decide_after_delay(phone: &mut AppClient, phone_app: &MarmotApp, laptop
 
 /// The laptop signs out through the phone. It commits its own entry as
 /// `leaving`, and once that commit is confirmed it leaves the chat both are
-/// in to the phone. A maintenance pass while it signs out sends nothing. The
+/// in to the phone. The
 /// phone sees the laptop `leaving` and, after its delay, removes it from the
 /// device group and from the chat, recording the slot as `removed` at the
 /// time it decided.
@@ -72,13 +73,6 @@ async fn a_device_signs_out_through_its_sibling() {
     let entry = &roster(&laptop, &group).devices[&laptop_slot];
     assert_eq!(entry.status, DeviceStatusV1::Leaving);
     assert!(entry.tag_signature_key.is_some(), "every other field stays");
-    let published = published_count(&relay);
-    laptop.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        published_count(&relay),
-        published,
-        "no maintenance runs while signing out"
-    );
 
     deliver_new(&mut phone, &relay, &mut phone_cursor).await;
     phone.sync().await.unwrap();
@@ -217,9 +211,11 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 /// The laptop starts signing out, then the phone's user removes it. The
 /// removal reaches the laptop, which is not unlinked and is told nothing:
 /// its account's publishing is not stopped, so it can still delete its own
-/// slot. It sends nothing else: leaving a chat its account administers
-/// takes an admin-policy update it may no longer commit, so the leave fails
-/// without the push token removal a leave sends first.
+/// slot. It sends nothing else: no maintenance pass or push token retry
+/// runs, and leaving a chat its account administers takes an admin-policy
+/// update it may no longer commit, so the leave fails without the push
+/// token removal a leave sends first. When its sign-out ends without a wipe,
+/// the next pairing drive finds the stored removal and unlinks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_removed_while_signing_out_is_not_unlinked() {
     let (devices, group) = tagging_devices().await;
@@ -246,7 +242,7 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
         .unwrap();
     let mut laptop_cursor = published_count(&relay);
     let account_id_hex = account_id_hex(&laptop_app);
-    let _laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex);
+    let laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex);
 
     phone
         .remove_linked_device(&hex::encode(slot_of(&laptop)))
@@ -265,6 +261,12 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     );
 
     let published = published_count(&relay);
+    laptop.run_due_maintenance().await.unwrap();
+    assert!(
+        !laptop
+            .retry_pending_push_registration_shares_best_effort()
+            .await
+    );
     assert!(matches!(
         laptop.leave_group(&notes).await,
         Err(AppError::Account(marmot_session::AccountError::Session(
@@ -281,6 +283,48 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
         published_count(&relay) > published,
         "its slot's deletion goes out"
     );
+
+    drop(laptop_signing_out);
+    laptop
+        .drive_device_pairing_at(crate::unix_now_seconds())
+        .await;
+    assert!(laptop.device_unlinked());
+}
+
+/// A sibling's `leaving` entry without its tag signature key is never
+/// decided: no device may remove an entry that has none. The phone sets the
+/// laptop's entry, whose first commit has not landed, to `leaving`, as a
+/// faulty device might.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leaving_entry_without_its_key_is_not_removed() {
+    let (mut devices, group) = linked_devices().await;
+    let laptop_slot = slot_of(&devices.laptop);
+    assert!(
+        roster(&devices.phone, &group).devices[&laptop_slot]
+            .tag_signature_key
+            .is_none()
+    );
+    assert!(matches!(
+        devices
+            .phone
+            .runtime
+            .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+                entry.status = DeviceStatusV1::Leaving;
+            })
+            .await
+            .unwrap(),
+        DeviceRosterEdit::Committed(_)
+    ));
+    assert_eq!(
+        status_of(&devices.phone, &group, &devices.laptop),
+        DeviceStatusV1::Leaving
+    );
+
+    devices.phone.decide_leaving_siblings().unwrap();
+    devices.phone.backdate_leaving_siblings(31);
+    devices.phone.decide_leaving_siblings().unwrap();
+    assert!(devices.phone.leaving_siblings.is_empty());
+    assert_eq!(pending_removals(&devices.phone_app), 0);
 }
 
 /// `sign_out_and_wipe` on a running laptop: its `leaving` commit is
@@ -338,8 +382,9 @@ async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
 }
 
 /// The laptop's `leaving` commit cannot go out, so it is not confirmed in
-/// time: the laptop leaves every chat itself and says its siblings could not
-/// be asked.
+/// time: the laptop says its siblings could not be asked and leaves every
+/// chat itself, reporting the one its account administers as one it could
+/// not leave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     let (mut devices, _group) = tagging_devices().await;
@@ -366,17 +411,13 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
     assert!(outcome.siblings_not_reached);
     assert_eq!(outcome.groups_left_to_siblings, 0);
-    assert_eq!(
-        outcome.groups_left as usize + outcome.group_leave_failures.len(),
-        1,
-        "it tried to leave the chat itself"
-    );
-    assert!(
-        outcome
-            .group_leave_failures
-            .iter()
-            .all(|failure| failure.group_id_hex == hex::encode(chat.as_slice()))
-    );
+    // Its account administers the chat, so it cannot leave it itself: the
+    // chat keeps its leaf and is reported to its user.
+    assert_eq!(outcome.groups_left, 0);
+    let [failure] = outcome.group_leave_failures.as_slice() else {
+        panic!("one chat it could not leave: {outcome:?}");
+    };
+    assert_eq!(failure.group_id_hex, hex::encode(chat.as_slice()));
     assert!(outcome.local_cleanup.completed);
     runtime.shutdown().await;
 }
