@@ -2659,7 +2659,9 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
-    let pinned_epoch = alice.epoch(&group_id).unwrap();
+    let pin = alice.epoch_pin(&group_id).unwrap();
+    let pinned_epoch = pin.epoch;
+    assert_eq!(pinned_epoch, alice.epoch(&group_id).unwrap());
 
     let SendResult::GroupEvolution { pending, .. } = alice
         .send(SendIntent::SelfUpdate {
@@ -2670,13 +2672,17 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
     else {
         panic!("self-update stages a group evolution")
     };
+    // While the commit is pending, the pin names the commit's epoch, whose
+    // secrets the group context exports.
+    let staged = alice.epoch_pin(&group_id).unwrap();
+    assert_eq!(staged.epoch.0, pinned_epoch.0 + 1);
 
     let payload = app_payload_for(&alice, "media bound to the pre-commit epoch");
     let refused = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(pinned_epoch),
+            expected_epoch: Some(pin),
         })
         .await;
     assert!(
@@ -2699,13 +2705,18 @@ async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publis
 
     // The refusal left the group usable: a message pinned to the settled
     // epoch encrypts under exactly that epoch.
-    let settled_epoch = alice.epoch(&group_id).unwrap();
+    let settled = alice.epoch_pin(&group_id).unwrap();
+    assert_eq!(
+        settled, staged,
+        "a pin read while the commit was pending must match once it merges"
+    );
+    let settled_epoch = settled.epoch;
     let payload = app_payload_for(&alice, "re-derived for the new epoch");
     let sent = alice
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(settled_epoch),
+            expected_epoch: Some(settled),
         })
         .await
         .unwrap();
@@ -2729,7 +2740,8 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
     let mut alice = build(b"alice");
     let mut bob = build_with_clock(b"bob", bob_clock.clone());
     let group_id = group_with_bob(&mut alice, &mut bob).await;
-    let pinned_epoch = bob.epoch(&group_id).unwrap();
+    let pin = bob.epoch_pin(&group_id).unwrap();
+    let pinned_epoch = pin.epoch;
 
     let SendResult::GroupEvolution {
         msg: commit,
@@ -2757,7 +2769,7 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
             payload,
-            expected_epoch: Some(pinned_epoch),
+            expected_epoch: Some(pin),
         })
         .await;
     let folded_epoch = bob.epoch(&group_id).unwrap();
@@ -2790,6 +2802,127 @@ async fn epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_comm
         matches!(
             sent,
             SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == folded_epoch
+        ),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_the_same_epoch() {
+    // The fold can also leave the epoch number where it was: a retained rival
+    // commit from the same source epoch wins branch selection inside the
+    // send's own preflight and replaces this device's commit. The group is
+    // still at the pinned number, on another branch whose key schedule the
+    // pinned payload was not bound to. The pin's identity must refuse it.
+    let (winner_id, loser_id) = if pad32(b"same-epoch-a") < pad32(b"same-epoch-b") {
+        (b"same-epoch-a".as_slice(), b"same-epoch-b".as_slice())
+    } else {
+        (b"same-epoch-b".as_slice(), b"same-epoch-a".as_slice())
+    };
+    let loser_clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut winner = build_with_clock(winner_id, ManualConvergenceClock::new(1_000, 10_000));
+    let mut loser = build_with_clock(loser_id, loser_clock.clone());
+    let mut carol = build(b"same-epoch-carol");
+    let mut dave = build(b"same-epoch-dave");
+
+    let loser_kp = loser.fresh_key_package().await.unwrap();
+    let (group_id, created) = winner
+        .create_group(CreateGroupRequest {
+            name: "same-epoch rival".into(),
+            description: String::new(),
+            members: vec![loser_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // Both commits below are privileged, so they order by committer
+            // identity and the winner's sorts first.
+            initial_admins: vec![loser.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("expected a staged group creation")
+    };
+    winner.confirm_published(pending).await.unwrap();
+    for welcome in welcomes {
+        loser.join_welcome(welcome).await.unwrap();
+    }
+    let source_epoch = loser.epoch(&group_id).unwrap();
+
+    let invite = async |engine: &mut _, key_package| {
+        let SendResult::GroupEvolution { msg, pending, .. } = CgkaEngine::send(
+            engine,
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![key_package],
+                initial_admins: vec![],
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("an invite stages a group evolution")
+        };
+        CgkaEngine::confirm_published(engine, pending)
+            .await
+            .unwrap();
+        msg
+    };
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    invite(&mut loser, carol_kp).await;
+    let rival = invite(&mut winner, dave_kp).await;
+
+    // The loser pins the epoch its own commit reached, then holds the rival
+    // as retained convergence input.
+    let pin = loser.epoch_pin(&group_id).unwrap();
+    assert_eq!(pin.epoch.0, source_epoch.0 + 1);
+    assert_ne!(
+        pin,
+        winner.epoch_pin(&group_id).unwrap(),
+        "two branches at one epoch number must not share a pin"
+    );
+    loser.ingest(rival).await.unwrap();
+    assert_eq!(loser.epoch_pin(&group_id).unwrap(), pin);
+    loser_clock.advance_ms(1_000);
+
+    let payload = app_payload_for(&loser, "media bound to the losing branch");
+    let refused = loser
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(pin),
+        })
+        .await;
+    let selected = loser.epoch_pin(&group_id).unwrap();
+    assert_eq!(
+        selected,
+        winner.epoch_pin(&group_id).unwrap(),
+        "the send must have selected the rival branch before preparing"
+    );
+    assert_eq!(selected.epoch, pin.epoch);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AppMessageEpochMismatch { expected, current })
+                if expected == pin.epoch && current == pin.epoch
+        ),
+        "expected a same-number epoch mismatch, got {refused:?}"
+    );
+
+    // Nothing was prepared: a message pinned to the selected branch goes out
+    // under it.
+    let payload = app_payload_for(&loser, "re-derived for the selected branch");
+    let sent = loser
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: Some(selected),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent,
+            SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == selected.epoch
         ),
         "{sent:?}"
     );

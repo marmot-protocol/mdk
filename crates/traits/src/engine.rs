@@ -118,6 +118,19 @@ impl Hash for KeyPackage {
     }
 }
 
+/// One epoch of a group as this device holds it: its number, and a digest of
+/// its MLS epoch authenticator. Two branches of a fork can reach the same
+/// number; their authenticators differ, so a pin read on one branch never
+/// matches the other. Read it with [`CgkaEngine::epoch_pin`]; pin an
+/// application message to it with
+/// [`SendIntent::AppMessage::expected_epoch`](SendIntent::AppMessage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochPin {
+    pub epoch: EpochId,
+    /// SHA-256 of the epoch's MLS epoch authenticator.
+    pub identity: [u8; 32],
+}
+
 /// Application's intent when calling [`CgkaEngine::send`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
@@ -130,7 +143,7 @@ pub enum SendIntent {
         /// An encrypted-media `imeta` reference is the case today: recipients
         /// derive the media key from the epoch of the message that delivers
         /// the tag, so ciphertext produced at epoch N is unreadable when the
-        /// tag ships at N+1.
+        /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
         /// retain the intent while the group's epoch is unsettled and encrypt
@@ -138,10 +151,11 @@ pub enum SendIntent {
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
-        /// time if convergence moved the epoch during the send. Nothing is
-        /// persisted or published in either case.
+        /// time if the send's own convergence moved the group off the pinned
+        /// [`EpochPin`]: to another epoch, or to another branch at the same
+        /// number. Nothing is persisted or published in either case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     },
     /// Invite new members via their KeyPackages.
     ///
@@ -1279,6 +1293,12 @@ pub trait CgkaEngine: Send + Sync {
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
+
+    /// The group's [`EpochPin`]: its epoch and the branch it reached that
+    /// epoch on. While a commit of this device awaits its publication, that
+    /// is the commit's epoch, whose secrets [`Self::group_context`] exports;
+    /// the pin matches the group once the commit merges.
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError>;
 
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;

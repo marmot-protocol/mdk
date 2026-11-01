@@ -866,6 +866,10 @@ where
         Ok(self.session.exporter_secret(group_id, label, length)?)
     }
 
+    pub fn epoch_pin(&self, group_id: &GroupId) -> AccountResult<cgka_traits::EpochPin> {
+        Ok(self.session.epoch_pin(group_id)?)
+    }
+
     pub fn exporter_secret_with_epoch(
         &self,
         group_id: &GroupId,

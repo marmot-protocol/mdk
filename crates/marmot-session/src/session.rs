@@ -34,8 +34,8 @@ use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
 };
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
-    SendIntent, SendResult, SupersededIntentReport,
+    CgkaEngine, CreateGroupRequest, EpochPin, GroupEvent, GroupHydrationQuarantineReason,
+    KeyPackage, SendIntent, SendResult, SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
@@ -1094,6 +1094,12 @@ impl AccountDeviceSession {
         context
             .exporter_secret(label, length)
             .ok_or_else(|| EngineError::Other(format!("missing exporter secret for label {label}")))
+    }
+
+    /// The group's epoch and the branch it is on, for pinning an epoch-bound
+    /// application message.
+    pub fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError> {
+        self.engine.epoch_pin(group_id)
     }
 
     pub fn exporter_secret_with_epoch(

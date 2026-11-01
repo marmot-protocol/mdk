@@ -1615,10 +1615,12 @@ async fn check_restored_tip(
     }
     let payload = app_payload("after replay");
     if matches!(capacity, OutboundCapacity::Available) {
+        let pin = alice.epoch_pin(&group_id).unwrap();
+        assert_eq!(pin.epoch, EpochId(source_epoch + 1));
         let pinned = alice
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
-                expected_epoch: Some(EpochId(source_epoch + 1)),
+                expected_epoch: Some(pin),
                 payload: payload.clone(),
             })
             .await;

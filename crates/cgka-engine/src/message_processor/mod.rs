@@ -894,7 +894,7 @@ impl<S: StorageProvider> Engine<S> {
             } = &intent
             {
                 return Err(EngineError::AppMessageEpochUnsettled {
-                    expected: *expected,
+                    expected: expected.epoch,
                 });
             }
             // A link never waits in the queue (device-group.md, "Linking a
