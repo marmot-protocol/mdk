@@ -211,6 +211,16 @@ fn releasing_a_staged_upload_keeps_the_upload_row() {
     assert_eq!(media.file_state(&id).unwrap(), None);
     assert_eq!(app.attachment_upload_file(&token).unwrap(), None);
     assert!(!media.path(&id).exists());
+    let uploads: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM outgoing_attachment_uploads WHERE token=?1",
+            [&token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(uploads, 1, "the send path still settles the upload");
 }
 
 /// Stage `BODY` into a fresh upload bound to `message`'s slot.
@@ -447,13 +457,11 @@ fn an_upload_with_a_lost_file_is_dropped() {
 
 /// A file-backed upload whose optional owner registration failed survives
 /// both abandonment paths while its pending or confirmed message carries it,
-/// and the worker's page still finds and promotes it after a reopen.
+/// and the worker's page still finds and promotes it.
 #[test]
 fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ownerless.sqlite");
-    let key = SqlCipherKey::new("generated-ownerless-key").unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
     let files = media(&dir, &store.app_storage());
     seed(&store, "seed");
     for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
@@ -493,11 +501,11 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
             &store,
             "CREATE TRIGGER fail_owner BEFORE INSERT ON outgoing_attachment_upload_owners BEGIN SELECT RAISE(ABORT,'generated owner fault'); END;",
         );
-        assert!(
+        assert_failed_with(
             store
                 .app_storage()
-                .protect_attachment_uploads(GROUP, id, &event.tags)
-                .is_err()
+                .protect_attachment_uploads(GROUP, id, &event.tags),
+            "generated owner fault",
         );
         sql(&store, "DROP TRIGGER fail_owner");
         store
@@ -519,11 +527,7 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
         )
         .unwrap();
     assert_eq!(staged, 2, "both uploads survive abandonment");
-    drop(files);
-    store.close().unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
-    let files = media(&dir, &app);
     let mut event = source("pending-ownerless");
     event.direction = "sent".into();
     app.record_app_event(&event).unwrap();

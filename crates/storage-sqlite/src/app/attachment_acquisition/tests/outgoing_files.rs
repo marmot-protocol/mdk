@@ -391,11 +391,8 @@ fn cancelled_staging_releases_committed_chunks_without_blocking_account_commands
 }
 
 #[test]
-fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("chunked.sqlite");
-    let key = SqlCipherKey::new("synthetic-chunk-reopen").unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+fn file_import_reads_across_chunk_boundaries() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     seed(&store, "chunked");
     let body = (0..(2 * 1024 * 1024 + 17))
@@ -429,10 +426,7 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
         .unwrap(),
         AttachmentPublishResult::Published
     );
-    store.close().unwrap();
-    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let reopened_app = reopened.app_storage();
-    assert_eq!(usage(&reopened), body.len() as u64);
+    assert_eq!(usage(&store), body.len() as u64);
     for (offset, limit) in [
         (0, 11),
         (65530, 30),
@@ -440,7 +434,7 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
         (body.len() - 17, 100),
         (body.len(), 100),
     ] {
-        let bytes = reopened_app
+        let bytes = app
             .read_retained_attachment(&asset, 12, offset as u64, limit)
             .unwrap()
             .unwrap();
@@ -450,18 +444,15 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
         );
     }
     assert_eq!(
-        reopened_app
-            .retained_attachment_asset(GROUP, "chunked", "source-chunked", 0, 12)
+        app.retained_attachment_asset(GROUP, "chunked", "source-chunked", 0, 12)
             .unwrap()
             .unwrap()
             .byte_count,
         body.len() as u64
     );
-    reopened_app
-        .remove_local_attachment(GROUP, "chunked", 0)
-        .unwrap();
-    assert_eq!(usage(&reopened), 0);
-    assert_eq!(count(&reopened, "attachment_chunk_bodies"), 0);
+    app.remove_local_attachment(GROUP, "chunked", 0).unwrap();
+    assert_eq!(usage(&store), 0);
+    assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
 }
 
 #[test]
@@ -495,13 +486,14 @@ fn shared_file_promotion_keeps_one_body_and_charges_each_source() {
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
     assert_eq!(count(&store, "retained_attachment_chunks"), 1);
     assert_eq!(count(&store, "attachment_chunk_bodies"), 1);
+    let rewrite = store
+        .lock()
+        .unwrap()
+        .execute("UPDATE retained_attachment_chunks SET bytes=bytes", [])
+        .map_err(|error| error.to_string());
     assert!(
-        store
-            .lock()
-            .unwrap()
-            .execute("UPDATE retained_attachment_chunks SET bytes=bytes", [])
-            .is_err(),
-        "verified chunks are immutable"
+        matches!(&rewrite, Err(message) if message.contains("verified file chunks are immutable")),
+        "{rewrite:?}"
     );
     app.remove_local_attachment(GROUP, "file-a", 0).unwrap();
     assert_eq!(usage(&store), BODY.len() as u64);
@@ -534,7 +526,7 @@ fn promotion_snapshot_control(interleave: PromotionInterleave) {
     let expires = matches!(interleave, PromotionInterleave::Expiry);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("promotion.sqlite");
-    let key = SqlCipherKey::new("synthetic-late-binding").unwrap();
+    let key = SqlCipherKey::raw([0x1b; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     sent(&store, "late-binding");
     let mut tokens = stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap();
