@@ -66,11 +66,6 @@ jobs:
         with:
           tool: just
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-
       - name: Prepare private evidence roots
         run: |
           install -d -m 700 \
@@ -272,12 +267,6 @@ jobs:
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: app-catalog
 
       - name: Run generated canaries and selected seed-7 catalog
         timeout-minutes: 150
