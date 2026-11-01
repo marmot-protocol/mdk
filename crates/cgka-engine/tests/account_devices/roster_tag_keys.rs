@@ -78,7 +78,10 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
 
     // The committer records when its Commit is confirmed, a receiver when it
     // applies it: a device entry's key and a `removed` record's alike.
-    for intent in [set_key(&gid, 2, "Laptop", 0xb2), record_removed(&gid, 3, 0xb3)] {
+    for intent in [
+        set_key(&gid, 2, "Laptop", 0xb2),
+        record_removed(&gid, 3, 0xb3),
+    ] {
         let commit = send_commit(&mut phone, intent, &gid).await;
         assert_accepted(&mut laptop, &commit, &gid).await;
     }
@@ -118,7 +121,11 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
         .unwrap();
     assert_eq!(result.accepted_commits.len(), 2, "{result:?}");
     assert_eq!(laptop.engine.epoch(&gid).unwrap().0, before + 2);
-    assert!(!roster_of(&laptop, &gid).rejected_slots.contains_key(&slot(3)));
+    assert!(
+        !roster_of(&laptop, &gid)
+            .rejected_slots
+            .contains_key(&slot(3))
+    );
     let mut expected = before_pass;
     expected.insert(tag_key(3, 0xc3));
     assert_eq!(recorded(&laptop, &gid), expected);

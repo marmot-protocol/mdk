@@ -1870,11 +1870,17 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             )
             .unwrap();
         unlist_without_record(&mut phone, &group, laptop_slot).await;
+        let epoch = phone.runtime.group_record(&group).unwrap().epoch;
 
         phone.run_due_maintenance().await.unwrap();
         let record = roster(&phone, &group).rejected_slots.remove(&laptop_slot);
         if !recorded {
             assert_eq!(record, None, "{days_ago} days");
+            assert_eq!(
+                phone.runtime.group_record(&group).unwrap().epoch,
+                epoch,
+                "nothing is committed for it"
+            );
             continue;
         }
         assert_eq!(
