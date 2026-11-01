@@ -169,3 +169,28 @@ fn retry_after(value: &str, now: u64) -> Option<u64> {
             .map(|date| (date.timestamp().max(0) as u64).saturating_sub(now))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::retry_after;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_dates_without_retrying_before_the_requested_time() {
+        for (header, delay) in [
+            ("0", Some(0)),
+            ("1", Some(1)),
+            ("300", Some(300)),
+            ("301", Some(301)),
+            ("18446744073709551615", Some(u64::MAX)),
+            ("Thu, 01 Jan 1970 00:30:05 +0000", Some(5)),
+            ("Thu, 01 Jan 1970 00:29:59 +0000", Some(0)),
+            ("Wed, 31 Dec 1969 23:59:59 +0000", Some(0)),
+            ("18446744073709551616", None),
+            ("-1", None),
+            ("tomorrow", None),
+            ("", None),
+        ] {
+            assert_eq!(retry_after(header, 1800), delay, "{header}");
+        }
+    }
+}

@@ -167,6 +167,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, _active, _state, batch) = prepared();
     for (status, body, expected) in [
+        (200, "{}", AuditOtlpSendResult::Complete),
         (409, "{}", AuditOtlpSendResult::Partial),
         (503, "{}", AuditOtlpSendResult::Retryable),
         (429, "{}", AuditOtlpSendResult::Retryable),
@@ -194,6 +195,20 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         );
         task.await.unwrap();
     }
+    // Each reply has a complete, correctly framed `{}` body. Rejection must
+    // come from the strict success headers, not a truncated transport body.
+    for response in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: identity\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    ] {
+        let (endpoint, task) = service(response.to_vec()).await;
+        let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+        assert_eq!(sender.send(batch.clone()).await, AuditOtlpSendResult::Blocked);
+        task.await.unwrap();
+    }
     let (endpoint, task) = service(reply(503, &"x".repeat(2048))).await;
     let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
     assert_eq!(
@@ -203,6 +218,18 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     task.await.unwrap();
     assert_eq!(AuditOtlpSendResult::Unknown.for_finish(), None);
     assert_eq!(AuditOtlpSendResult::Blocked.for_finish(), None);
+    assert_eq!(
+        AuditOtlpSendResult::Complete.for_finish(),
+        Some(ReceiverResult::Complete)
+    );
+    assert_eq!(
+        AuditOtlpSendResult::Partial.for_finish(),
+        Some(ReceiverResult::Partial)
+    );
+    assert_eq!(
+        AuditOtlpSendResult::Retryable.for_finish(),
+        Some(ReceiverResult::Retryable)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -221,6 +248,8 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+    let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         read_request(&mut stream).await;
@@ -228,12 +257,31 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
             .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 9\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        headers_sent.send(()).unwrap();
+        released.await.unwrap();
     });
-    let mut sender =
-        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-    sender.timeout = Duration::from_millis(50);
-    assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Partial);
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+    let mut send = tokio::spawn(async move { sender.send(batch).await });
+    let ready = tokio::time::timeout(Duration::from_secs(5), headers_received).await;
+    if !matches!(ready, Ok(Ok(()))) {
+        send.abort();
+        task.abort();
+    }
+    ready
+        .expect("collector must receive the request and send headers")
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut send).await;
+    if result.is_err() {
+        send.abort();
+        task.abort();
+    }
+    assert_eq!(
+        result
+            .expect("a parsed 409 must not await its withheld body")
+            .unwrap(),
+        AuditOtlpSendResult::Partial
+    );
+    release.send(()).unwrap();
     task.await.unwrap();
 
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
@@ -337,32 +385,62 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
     task.await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the test pause Tokio time after the real HTTP handshake.
+#[tokio::test(flavor = "current_thread")]
 async fn timeout_after_acceptance_is_unknown() {
     crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
+    let token = batch.token.clone();
+    let original = batch.bodies.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+    let (accepted, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_request(&mut stream).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        accepted.send(()).unwrap();
+        released.await.unwrap();
         request
     });
-    let mut sender =
-        AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-    sender.timeout = Duration::from_millis(50);
-    assert_eq!(sender.send(batch).await, AuditOtlpSendResult::Unknown);
+    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+    let send = tokio::spawn(async move { sender.send(batch).await });
+    let ready = tokio::time::timeout(Duration::from_secs(5), observed).await;
+    if !matches!(ready, Ok(Ok(()))) {
+        send.abort();
+        task.abort();
+    }
+    ready
+        .expect("the collector must accept the request before its timeout")
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(1), send)
+            .await
+            .expect("the 30-second request timeout must have fired")
+            .unwrap(),
+        AuditOtlpSendResult::Unknown
+    );
+    release.send(()).unwrap();
     task.await.unwrap();
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
-    assert!(matches!(
-        owner.prepare_once().unwrap(),
-        Preparation::Batch(_)
-    ));
+    let Preparation::Batch(replay) = owner.prepare_once().unwrap() else {
+        panic!("timed-out range must remain replayable");
+    };
+    assert_eq!(replay.token, token);
+    assert_eq!(replay.bodies, original);
 }
 
-#[test]
-fn endpoint_and_batch_limits_are_checked_before_network() {
+#[tokio::test]
+async fn endpoint_and_batch_limits_are_checked_before_network() {
+    assert_eq!(MAX_RECORDS, 96);
+    assert_eq!(MAX_BODY_BYTES, 65_535);
+    assert_eq!(MAX_WIRE_BYTES, 1_048_576);
+    let endpoint = "https://example.org/v1/logs";
+    let sender = AuditOtlpSender::new(TEST_DESTINATION, endpoint, "token").unwrap();
+    assert_eq!(crate::wiring::audit_destination(&sender), TEST_DESTINATION);
+    assert_eq!(format!("{sender:?}"), "AuditOtlpSender { redacted }");
     for endpoint in [
         "http://example.org/v1/logs",
         "http://127.0.0.1/v1/logs",
@@ -388,24 +466,114 @@ fn endpoint_and_batch_limits_are_checked_before_network() {
     assert!(
         AuditOtlpSender::new(TEST_DESTINATION, "https://example.org/v1/logs", "\r\ntoken").is_err()
     );
+    for token in ["non-ascii-ü", "token\0", "token\u{7f}"] {
+        let error = AuditOtlpSender::new(TEST_DESTINATION, endpoint, token).unwrap_err();
+        assert_eq!(error, AuditOtlpSenderConfigError);
+        assert_eq!(error.to_string(), "invalid audit OTLP sender configuration");
+        assert_eq!(format!("{error:?}"), "AuditOtlpSenderConfigError");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+    let destination = "d".repeat(256);
+    let boundary_sender = AuditOtlpSender::new(&destination, endpoint, "token").unwrap();
+    assert_eq!(
+        crate::wiring::audit_destination(&boundary_sender),
+        destination
+    );
+    for destination in [String::new(), "d".repeat(257)] {
+        assert_eq!(
+            AuditOtlpSender::new(destination, endpoint, "token").unwrap_err(),
+            AuditOtlpSenderConfigError
+        );
+    }
     let (_dir, _active, _state, batch) = prepared();
-    let mut invalid = batch.clone();
-    invalid.bodies[0].extend_from_slice(b"extra");
-    assert!(encode_batch(invalid).is_none());
-    let mut empty = batch.clone();
-    empty.bodies.clear();
-    assert!(encode_batch(empty).is_none());
+    assert!(sender.request_body_bytes(&batch).is_some());
+    assert_eq!(boundary_sender.request_body_bytes(&batch), None);
+    assert_eq!(
+        boundary_sender.send(batch.clone()).await,
+        AuditOtlpSendResult::Blocked
+    );
+    for bodies in [
+        vec![],
+        vec![b"{}".to_vec()],
+        vec![b"\n".to_vec()],
+        vec![b"{\r}\n".to_vec()],
+        vec![b"{}\n{}\n".to_vec()],
+        vec![vec![0xff, b'\n']],
+    ] {
+        let invalid = DeliveryBatch {
+            bodies,
+            ..batch.clone()
+        };
+        assert_eq!(sender.request_body_bytes(&invalid), None);
+        assert_eq!(
+            sender.send(invalid.clone()).await,
+            AuditOtlpSendResult::Blocked
+        );
+        assert!(encode_batch(invalid).is_none());
+    }
+    let mut max_records = batch.clone();
+    max_records.bodies = vec![batch.bodies[0].clone(); MAX_RECORDS];
+    assert!(encode_batch(max_records).is_some());
     let mut too_many = batch.clone();
     too_many.bodies = vec![batch.bodies[0].clone(); MAX_RECORDS + 1];
     assert!(encode_batch(too_many).is_none());
-    let mut too_large = batch;
-    too_large.bodies[0] = vec![b'a'; MAX_BODY_BYTES + 1];
-    too_large.bodies[0].push(b'\n');
+    // Use a real recorder row with a larger ordinary intent string. Every
+    // boundary row remains UTF-8 JSON with exactly one trailing LF.
+    let mut row: serde_json::Value = serde_json::from_slice(batch.bodies.last().unwrap()).unwrap();
+    row["kind"]["intent_kind"] = "".into();
+    let empty_row_bytes = serde_json::to_vec(&row).unwrap().len();
+    let sized_line = |body_bytes: usize| {
+        let mut row = row.clone();
+        row["kind"]["intent_kind"] = "x".repeat(body_bytes - empty_row_bytes).into();
+        let mut line = serde_json::to_vec(&row).unwrap();
+        assert_eq!(line.len(), body_bytes);
+        line.push(b'\n');
+        line
+    };
+    let mut max_body = batch.clone();
+    max_body.bodies = vec![sized_line(MAX_BODY_BYTES)];
+    assert!(encode_batch(max_body).is_some());
+    let mut too_large = batch.clone();
+    too_large.bodies = vec![sized_line(MAX_BODY_BYTES + 1)];
     assert!(encode_batch(too_large).is_none());
+
+    // Count the independently specified restricted-envelope framing and JSON
+    // string escaping, rather than getting the expected ceiling from encode_batch.
+    let wire_len = |bodies: &[Vec<u8>]| {
+        br#"{"resourceLogs":[{"scopeLogs":[{"scope":{"name":"marmot.audit"},"logRecords":["#.len()
+            + br#"]}]}]}"#.len()
+            + bodies.len() * (br#"{"body":{"stringValue":"#.len() + b"}}".len())
+            + bodies.len().saturating_sub(1)
+            + bodies
+                .iter()
+                .map(|line| {
+                    serde_json::to_vec(
+                        std::str::from_utf8(line.strip_suffix(b"\n").unwrap()).unwrap(),
+                    )
+                    .unwrap()
+                    .len()
+                })
+                .sum::<usize>()
+    };
+    let mut boundary = batch;
+    boundary.bodies = vec![sized_line(MAX_BODY_BYTES); 16];
+    let excess = wire_len(&boundary.bodies) - MAX_WIRE_BYTES;
+    boundary.bodies[15] = sized_line(MAX_BODY_BYTES - excess);
+    assert_eq!(wire_len(&boundary.bodies), MAX_WIRE_BYTES);
+    assert_eq!(sender.request_body_bytes(&boundary), Some(MAX_WIRE_BYTES));
+    assert_eq!(
+        encode_batch(boundary.clone()).unwrap().len(),
+        MAX_WIRE_BYTES
+    );
+    boundary.bodies[15] = sized_line(MAX_BODY_BYTES - excess + 1);
+    assert_eq!(wire_len(&boundary.bodies), MAX_WIRE_BYTES + 1);
+    assert_eq!(sender.request_body_bytes(&boundary), None);
+    assert_eq!(sender.send(boundary).await, AuditOtlpSendResult::Blocked);
 }
 
 /// Run explicitly where the pinned Python receiver dependency is available.
 /// It feeds this sender's actual wire bytes into #1997's reference validator.
+/// `cargo test -p marmot-observability --locked --lib audit_otlp_sender::tests::reference_receiver_accepts_exact_sender_wire -- --exact --ignored`
 #[test]
 #[ignore = "requires uv and the #1997 Python reference receiver"]
 fn reference_receiver_accepts_exact_sender_wire() {
@@ -425,14 +593,15 @@ fn reference_receiver_accepts_exact_sender_wire() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(&wire).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
-        "reference receiver rejected sender wire"
+        "reference receiver rejected sender wire: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, original);
 }

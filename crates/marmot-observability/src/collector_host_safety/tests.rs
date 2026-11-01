@@ -93,8 +93,8 @@ async fn literal_ips_use_the_same_classifier_without_dns() {
         })
         .await
         .unwrap();
-        assert_eq!(pin.addrs.len(), 1);
-        assert_eq!(pin.addrs[0].port(), 443);
+        let expected_ip: IpAddr = host.trim_matches(['[', ']']).parse().unwrap();
+        assert_eq!(pin.addrs, vec![SocketAddr::new(expected_ip, 443)]);
     }
     for host in [
         "10.0.0.1",
@@ -225,4 +225,50 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
             .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+// The builder is a process-wide OnceLock. A subprocess preserves the same
+// isolation under cargo test's shared process and nextest's per-test process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clients_fail_closed_until_the_first_builder_policy_is_installed() {
+    const CHILD: &str = "MDK_COLLECTOR_BUILDER_POLICY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let pin = resolve("https://collector.example/v1/metrics", &["8.8.8.8"])
+            .await
+            .unwrap();
+        assert!(pin.build_client().is_err());
+
+        hand_in_http_builder(|_| Err("sensitive proxy configuration"));
+        let error = pin.build_client().unwrap_err();
+        assert_eq!(error.to_string(), "collector request failed");
+        assert_eq!(format!("{error:?}"), "CollectorRequestError");
+
+        // A later permissive registration cannot replace the original policy.
+        hand_in_http_builder(|builder| Ok(builder.no_proxy()));
+        assert!(pin.build_client().is_err());
+        return;
+    }
+    let output = tokio::task::spawn_blocking(|| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "collector_host_safety::tests::clients_fail_closed_until_the_first_builder_policy_is_installed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+        "the isolated policy test must actually execute"
+    );
 }
