@@ -245,16 +245,20 @@ fn a_broken_unit_without_a_probe_keeps_its_park_whatever_it_answers() {
     let broken = break_unit(&app, &route, NOW);
     let spans = app.recovery_unit_spans(&route, RELAY).unwrap();
     assert!(!spans.is_empty());
-    let still = settle(
-        &app,
-        &route,
-        RELAY,
-        RecoveryUnitOutcome::NothingOwed,
-        NOW + 10,
-    );
-    assert_eq!(still.state, broken.state);
-    assert_eq!(still.park, broken.park);
-    assert_eq!(app.recovery_unit_spans(&route, RELAY).unwrap(), spans);
+    for (outcome, at) in [
+        (RecoveryUnitOutcome::NothingOwed, NOW + 10),
+        (RecoveryUnitOutcome::NoProgress, NOW + 20),
+        (RecoveryUnitOutcome::Refused, NOW + 30),
+    ] {
+        let still = settle(&app, &route, RELAY, outcome, at);
+        assert_eq!(still.state, broken.state, "{outcome:?}");
+        assert_eq!(still.park, broken.park, "{outcome:?}");
+        assert_eq!(
+            app.recovery_unit_spans(&route, RELAY).unwrap(),
+            spans,
+            "{outcome:?}"
+        );
+    }
 }
 
 /// The integers a unit and its spans store are a persisted format: unit
