@@ -223,11 +223,12 @@ their only proof, and for new assertions that cannot fail, such as a
 rejection row production never reaches.
 
 Check each finding's premise before acting on it. Run the test a reviewer
-says cannot pass, build the target it says does not compile, and apply the
-mutation it says no test catches. In one `storage-sqlite` round, three
-reviewer blockers fell to a single test run or `cargo check`. Reject a
-finding only with that evidence, and give it to the reviewer in the next
-round.
+says cannot pass and build the target it says does not compile, both with
+the features the crate's CI job uses (`cargo check -p <crate> --all-targets`
+builds test targets; a plain `cargo check` does not). Apply the mutation it
+says no test catches. In one `storage-sqlite` round, three reviewer blockers
+fell to a single test run or `cargo check --tests`. Reject a finding only
+with that evidence, and give it to the reviewer in the next round.
 
 For each consolidated or restored contract, mutate the production owner once
 by hand (flip a comparison, drop a guard, skip a write), confirm the keeper
