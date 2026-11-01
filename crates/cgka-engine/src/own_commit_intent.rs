@@ -44,8 +44,10 @@ impl<S: StorageProvider> Engine<S> {
     /// The kind and authoring baseline to retain for an intent that is about
     /// to stage a group evolution, or `None` for intents that never need
     /// re-issue (application messages, leaves, self-updates, same-account
-    /// Adds and Removes, enabling disbanding or account-devices, linking a
-    /// device, disband).
+    /// Adds and Removes, enabling disbanding or account-devices, linking or
+    /// unlinking a device, a removed slot's lone record, disband). The lone
+    /// record must not come back after a lost fork once a state this device
+    /// applied held it (mdk#2761), so only its caller makes it again.
     pub(crate) fn own_commit_recording(
         &self,
         intent: &SendIntent,
@@ -97,6 +99,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::EnableAccountDevices { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
+            | SendIntent::RecordRemovedSlot { .. }
             | SendIntent::Disband { .. } => None,
         })
     }

@@ -163,6 +163,17 @@
   `AnnouncedKeyPackageStorage`. Rows survive a branch-selection rewind, go
   with their group, and are pruned after 30 days or past 16 per slot. Nothing
   writes them unless device groups are on.
+- Migration 0145 fills schema 145 (mdk#2761). It adds
+  `cgka_roster_tag_keys`: one row per tag signature key a device-group roster
+  this device applied listed for a slot, in a device entry or a `removed`
+  record, with when it last applied one that did, the order it applied them
+  in (`seen_seq`), and whether one listed it in a `removed` record
+  (`held_as_removed`). `SqliteAccountStorage` implements the new
+  `RosterTagKeyStorage`. Rows survive a branch-selection
+  rewind, go with their group, and are pruned after 30 days or past 4 per
+  slot; a slot's newest row held as removed is kept past the 4, so the slot
+  stays known to have held its `removed` record. Nothing writes them unless
+  device groups are on.
 - Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
   It adds `device_removals`, one row per device this device's user removed
   from the account's device group, written before anything is committed, with

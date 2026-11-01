@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-30
+updated: 2026-11-01
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -92,6 +92,12 @@ only telemetry, a closed operation and timing metadata, never a client or storag
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
 | `cgka_announced_key_packages` | One row per (group, slot, KeyPackageRef) a device-group roster this device applied announced, so it grows only with commits that change an announcement; at most 16 per group slot (`ANNOUNCED_KEY_PACKAGES_PER_SLOT`). | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ANNOUNCED_KEY_PACKAGE_RETENTION_SECS`) and each slot's rows past its 16 most recently seen. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
+
+### `cgka-engine` roster tag keys (`src/roster_tag_keys.rs`, `storage-sqlite` `src/protocol/storage/roster_tag_keys.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `cgka_roster_tag_keys` | One row per (group, slot, tag signature key) a device-group roster this device applied listed, in a device entry or a `removed` record (`held_as_removed`, kept once set). A slot gets one key per link of it, so it grows only with links; at most 4 per group slot (`ROSTER_TAG_KEYS_PER_SLOT`), plus the slot's newest row held as removed, so at most 5. | A repeat sighting renews a row. Every write prunes rows last seen more than 30 days ago (`ROSTER_TAG_KEY_RETENTION_SECS`) and each slot's rows past its 4 most recently seen, except its newest row held as removed, in the order this device applied the states that listed them (`seen_seq`), not by the clock. Deleting the group cascades. A branch-selection rewind keeps them: they sit outside snapshots on purpose. |
 
 ### `storage-sqlite` compromise warning (`src/app/compromise_warning.rs`)
 

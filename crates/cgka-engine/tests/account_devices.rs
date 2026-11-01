@@ -116,6 +116,12 @@ mod device_tag;
 #[path = "account_devices/announced_key_packages.rs"]
 mod announced_key_packages;
 
+// The rosters a device applied record the tag signature keys they listed
+// (mdk#2761).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/roster_tag_keys.rs"]
+mod roster_tag_keys;
+
 // Adding a sibling to a chat sends it a sibling Welcome through the device
 // group, so a same-account Add goes through only in test-policy builds
 // (mdk#2628 3.5b).

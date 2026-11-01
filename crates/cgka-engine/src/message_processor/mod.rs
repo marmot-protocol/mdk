@@ -907,10 +907,13 @@ impl<S: StorageProvider> Engine<S> {
             // link drained after that would add a device that never joins.
             // The caller retries while the new device still waits. Its undo
             // is not queued either: the app decides it from the roster it
-            // read, and retries it until it lands.
+            // read, and retries it until it lands. Nor is a removed slot's
+            // lone record, which only its caller makes again (mdk#2761).
             if matches!(
                 &intent,
-                SendIntent::LinkDevice { .. } | SendIntent::UnlinkDevice { .. }
+                SendIntent::LinkDevice { .. }
+                    | SendIntent::UnlinkDevice { .. }
+                    | SendIntent::RecordRemovedSlot { .. }
             ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
@@ -4212,6 +4215,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4238,6 +4242,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::EnableAccountDevices { .. }
         | SendIntent::LinkDevice { .. }
         | SendIntent::UnlinkDevice { .. }
+        | SendIntent::RecordRemovedSlot { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

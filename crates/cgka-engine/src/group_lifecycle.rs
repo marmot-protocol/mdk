@@ -908,6 +908,12 @@ impl<S: StorageProvider> Engine<S> {
                             &mls_group,
                             enrolled_at,
                         )?;
+                        crate::roster_tag_keys::record_roster_tag_keys(
+                            storage,
+                            &group_id,
+                            &mls_group,
+                            enrolled_at,
+                        )?;
 
                         for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
                             let payload = StoredMessagePayload::outbound_welcome(
@@ -1794,6 +1800,9 @@ impl<S: StorageProvider> Engine<S> {
             }
             storage.put_group(&group_record)?;
             crate::announced_key_packages::record_roster_announcements(
+                storage, &group_id, &mls_group, joined_at,
+            )?;
+            crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
             )?;
             if local_state_is_stale {

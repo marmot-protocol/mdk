@@ -187,6 +187,13 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_unlink_device(group_id, leaf_signature_key, roster_update)
                     .await
             }
+            SendIntent::RecordRemovedSlot {
+                group_id,
+                roster_update,
+            } => {
+                self.do_send_record_removed_slot(group_id, roster_update)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (

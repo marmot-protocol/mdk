@@ -31,7 +31,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
+use cgka_traits::storage::{LeaveRequest, RosterTagKey, StorageError, StorageProvider};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -3878,6 +3878,39 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         roster: &DeviceRosterV1,
     ) -> Result<Vec<(Vec<u8>, DeviceTagClaim)>, EngineError> {
+        self.read_other_own_account_leaves(group_id, |leaf| {
+            Some(crate::device_tag::device_tag_claim(leaf, roster))
+        })
+    }
+
+    /// Every other leaf of this device's account in `group_id`'s current
+    /// tree whose device tag reads, under `leaf_tag_key`, as the slot of one
+    /// of `keys` and verifies under that pair's key, as its signature key.
+    /// `keys` are tag signature keys this device remembers a roster listing
+    /// (mdk#2761), so the leaves of a device the roster no longer lists are
+    /// still found. This device's own leaf is left out.
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        Ok(self
+            .read_other_own_account_leaves(group_id, |leaf| {
+                crate::device_tag::device_tag_reads_as_one_of(leaf, leaf_tag_key, keys)
+            })?
+            .into_iter()
+            .map(|(signature_key, _)| signature_key)
+            .collect())
+    }
+
+    /// `read` of each leaf of this device's account in `group_id` other than
+    /// its own, by signature key, where `read` gives a value.
+    fn read_other_own_account_leaves<T>(
+        &self,
+        group_id: &GroupId,
+        read: impl Fn(&openmls::prelude::LeafNode) -> Option<T>,
+    ) -> Result<Vec<(Vec<u8>, T)>, EngineError> {
         self.with_live_mls_group(group_id, |mls_group| {
             let own_leaf = mls_group.own_leaf_index();
             Ok(mls_group
@@ -3891,10 +3924,7 @@ impl<S: StorageProvider> Engine<S> {
                 })
                 .filter_map(|member| {
                     let leaf = mls_group.public_group().leaf(member.index)?;
-                    Some((
-                        member.signature_key,
-                        crate::device_tag::device_tag_claim(leaf, roster),
-                    ))
+                    Some((member.signature_key, read(leaf)?))
                 })
                 .collect())
         })
