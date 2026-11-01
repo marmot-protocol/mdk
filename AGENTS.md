@@ -54,6 +54,7 @@ before adding behavior or bindings.
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 | Releases | `release.md` |
+| Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
 | Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
 
 ## Landing changes
