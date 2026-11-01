@@ -2177,7 +2177,7 @@ impl MarmotApp {
             linked_devices_changed: true,
             inactive_siblings: None,
             leaving_siblings: HashMap::new(),
-            removed_records_made_alone: std::collections::HashSet::new(),
+            removed_records_seen: std::collections::HashSet::new(),
             pending_recovery_words: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,

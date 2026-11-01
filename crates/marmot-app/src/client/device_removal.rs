@@ -236,6 +236,10 @@ impl AppClient {
         // account's device, so it is left alone.
         let record = roster.rejected_slots.get(&slot);
         let not_me = record.is_some_and(|record| record.reason == RejectedSlotReasonV1::NotMe);
+        if record.is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed) {
+            self.removed_records_seen
+                .insert((removal.group_id_hex.clone(), removal.slot_hex.clone()));
+        }
         let withdrawn = async {
             if !not_me
                 && removal.slot_withdrawn_at.is_none()
@@ -271,9 +275,11 @@ impl AppClient {
     ///
     /// Only while the decision is under 30 days old, so a record the expiry
     /// pass drops is not made again; the undo comes about an hour after the
-    /// link, which comes before the decision. At most once a run, so a
-    /// sibling whose clock drops the record early does not trade commits
-    /// with this device. Sent only while the device group is settled and
+    /// link, which comes before the decision. Only until this device has
+    /// seen the record in its trusted roster this run, so a sibling whose
+    /// clock drops the record early does not trade commits with this device,
+    /// while a send that went nowhere, or whose Commit failed or was rolled
+    /// back, is made again. Sent only while the device group is settled and
     /// can take a commit from this device; otherwise a later pass retries.
     async fn record_removal_alone(
         &mut self,
@@ -282,12 +288,12 @@ impl AppClient {
         removal: &DeviceRemovalRecord,
     ) -> Result<(), AppError> {
         let now = unix_now_seconds();
-        let made = (removal.group_id_hex.clone(), removal.slot_hex.clone());
+        let seen = (removal.group_id_hex.clone(), removal.slot_hex.clone());
         if removal
             .requested_at
             .saturating_add(REMOVED_RECORD_LIFETIME_SECS)
             <= now
-            || self.removed_records_made_alone.contains(&made)
+            || self.removed_records_seen.contains(&seen)
             || !self.device_group_settled(group_id)
             || !self.group_quiet(group_id)?
         {
@@ -317,9 +323,16 @@ impl AppClient {
             .runtime
             .reject_device_slots(group_id, &held, vec![(*slot, record)], context)
             .await?;
-        self.removed_records_made_alone.insert(made);
-        self.linked_devices_changed = true;
         self.observe_drained_session_events(&effects).await?;
+        let recorded = self
+            .trusted_device_roster()?
+            .filter(|(trusted, _)| trusted == group_id)
+            .and_then(|(_, roster)| roster.rejected_slots.get(slot).cloned())
+            .is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed);
+        if recorded {
+            self.removed_records_seen.insert(seen);
+            self.linked_devices_changed = true;
+        }
         Ok(())
     }
 
@@ -460,8 +473,9 @@ impl AppClient {
         roster: &DeviceRosterV1,
     ) -> Result<GoneDevices, AppError> {
         let mut gone = GoneDevices::default();
+        let own_slot = self.own_slot().ok();
         for (slot, record) in &roster.rejected_slots {
-            if record.reason != RejectedSlotReasonV1::Removed {
+            if record.reason != RejectedSlotReasonV1::Removed || Some(*slot) == own_slot {
                 continue;
             }
             gone.slots.insert(*slot);
@@ -475,7 +489,6 @@ impl AppClient {
         // An unsettled group may still bring a listed device back, so only
         // its settled roster says a remembered key's device is gone.
         if self.device_group_settled(group_id) {
-            let own_slot = self.own_slot().ok();
             for key in self.remembered_tag_keys(group_id)? {
                 if !roster.devices.contains_key(&key.slot) && Some(key.slot) != own_slot {
                     gone.slots.insert(key.slot);

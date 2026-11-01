@@ -286,6 +286,20 @@ async fn removing_a_device_takes_it_out_of_the_device_group_and_its_chats() {
         deletions,
         "a finished removal sends nothing more"
     );
+
+    // A sibling whose clock runs ahead drops the record early. The phone has
+    // seen it, so it does not commit it again on its own (mdk#2761).
+    commit_roster(
+        &mut phone,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveRejectedSlot(
+            laptop_slot_bytes,
+        )],
+    )
+    .await;
+    let epoch = phone.runtime.group_record(&group).unwrap().epoch;
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(phone.runtime.group_record(&group).unwrap().epoch, epoch);
 }
 
 /// A device that did not decide a removal cleans up after it all the same.
@@ -1838,9 +1852,10 @@ async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered
 /// remove, and it writes no `removed` record. The deciding device commits
 /// that record alone, with the tag signature key it remembers for the slot
 /// and the decision's time, so devices that never applied a roster listing
-/// the key learn it (mdk#2761). It does so once a run: a sibling whose clock
-/// drops the record early gets no second one. A decision 30 days old makes
-/// no record, since the next expiry pass would drop it.
+/// the key learn it (mdk#2761). Once the phone has seen the record it does
+/// not make it again this run: a sibling whose clock drops it early gets no
+/// second one. A decision 30 days old makes no record, since the next expiry
+/// pass would drop it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_a_failed_link_undid_is_recorded_alone() {
     for (days_ago, recorded) in [(0, true), (31, false)] {
