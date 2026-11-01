@@ -198,7 +198,15 @@ has a caught mutation.
 ## 6. Cutover
 
 Change shared harnesses and support modules first, on their own, so lanes do
-not collide. Then edit each lane on its own branch and worktree. With each
+not collide. Then edit each lane on its own branch and worktree.
+
+Check each ledger row against the code before applying it. When the row is
+wrong, or you cannot tell, keep the test and record why. Moving a test to a
+cheaper store keeps every reopen and second-connection read it had (the
+storage rule in SKILL.md's Cost section): two `storage-sqlite` lanes dropped
+reopens they judged incidental, and both reviewers flagged it.
+
+With each
 lane, add its step 5 tests, delete the seams it unlocks, update the routing
 listed in SKILL.md's validation section, and update the test file maps in the
 crate's `AGENTS.md` files. Put
@@ -213,6 +221,14 @@ Before a lane leaves your machine, have an independent read-only reviewer
 compare the deleted tests with the keepers. It looks for contracts that lost
 their only proof, and for new assertions that cannot fail, such as a
 rejection row production never reaches.
+
+Check each finding's premise before acting on it. Run the test a reviewer
+says cannot pass and build the target it says does not compile, both with
+the features the crate's CI job uses (`cargo check -p <crate> --all-targets`
+builds test targets; a plain `cargo check` does not). Apply the mutation it
+says no test catches. In one `storage-sqlite` round, three reviewer blockers
+fell to a single test run or `cargo check --tests`. Reject a finding only
+with that evidence, and give it to the reviewer in the next round.
 
 For each consolidated or restored contract, mutate the production owner once
 by hand (flip a comparison, drop a guard, skip a write), confirm the keeper
