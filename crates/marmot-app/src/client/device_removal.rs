@@ -489,10 +489,15 @@ impl AppClient {
             }
         }
         // An unsettled group may still bring a listed device back, so only
-        // its settled roster says a remembered key's device is gone.
+        // its settled roster says a remembered key's device is gone. A device
+        // that cannot read its own slot cannot tell its own keys apart, so it
+        // reads none.
+        let Some(own_slot) = own_slot else {
+            return Ok(gone);
+        };
         if self.device_group_settled(group_id) {
             for key in self.remembered_tag_keys(group_id)? {
-                if !roster.devices.contains_key(&key.slot) && Some(key.slot) != own_slot {
+                if !roster.devices.contains_key(&key.slot) && key.slot != own_slot {
                     gone.slots.insert(key.slot);
                     gone.keys.insert(key);
                 }

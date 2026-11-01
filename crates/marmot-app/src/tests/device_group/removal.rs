@@ -102,6 +102,58 @@ pub(super) async fn chat_with_both(devices: &mut Devices) -> GroupId {
     chat
 }
 
+/// The phone founds a chat with Bob, whose KeyPackage does not advertise
+/// account-devices, so the chat does not require it, and adds the laptop's
+/// tagged KeyPackage; the laptop joins. No device can remove the laptop's
+/// leaf from it with a same-account removal.
+async fn chat_without_account_devices(devices: &mut Devices) -> (tempfile::TempDir, GroupId) {
+    let dir = tempfile::tempdir().unwrap();
+    let bob = AccountHome::open(dir.path()).create_account("bob").unwrap();
+    let bob_app = device_group_app_at(&dir, devices.relay.clone());
+    let components = bob_app
+        .supported_app_component_ids()
+        .into_iter()
+        .filter(|id| *id != ACCOUNT_DEVICES_COMPONENT_ID)
+        .collect();
+    let mut bob_key_package =
+        crate::tests::fresh_key_package_with_components(&bob_app, &bob, false, components).await;
+    // The Welcome names the event that served the KeyPackage; Bob never
+    // reads it.
+    bob_key_package.source = Some(cgka_traits::engine::KeyPackageSource {
+        event_id: MessageId::new(vec![0x55; 32]),
+    });
+    let mut laptop_cursor = published_count(&devices.relay);
+    let laptop_key_package = published_key_package(&mut devices.laptop, &devices.relay).await;
+    let route = NostrRoutingV1::new([0x44; 32], vec!["wss://relay.example".to_owned()]).unwrap();
+    let (chat, effects) = devices
+        .phone
+        .runtime
+        .create_group(cgka_traits::engine::CreateGroupRequest {
+            name: "legacy".into(),
+            description: String::new(),
+            members: vec![bob_key_package, laptop_key_package],
+            required_features: Vec::new(),
+            app_components: vec![cgka_traits::app_components::AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(&route).unwrap(),
+            }],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    devices
+        .phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    devices.phone.refresh_group(&chat);
+    assert!(!devices.phone.group_requires_account_devices(&chat).unwrap());
+    deliver_new(&mut devices.laptop, &devices.relay, &mut laptop_cursor).await;
+    devices.laptop.sync().await.unwrap();
+    devices.laptop.accept_group_invite(&chat).unwrap();
+    (dir, chat)
+}
+
 /// Commit the removal of the device in `slot` on `phone` as a removal
 /// another device decided reaches it: the commit alone, with no decision
 /// recorded here and no clean-up run.
@@ -1774,11 +1826,14 @@ async fn a_device_its_roster_records_as_removed_never_refills_its_slot() {
 /// and while the device group is unsettled, which could still list the
 /// laptop again, nothing is cleaned up. Once it settles, the phone discards
 /// the private KeyPackages it issued the laptop and removes the laptop's
-/// leaf from the chat. Only a deciding device deletes the slot.
+/// leaf from the chat. A chat that takes no same-account removal keeps the
+/// leaf, and the leftover count reports it. Only a deciding device deletes
+/// the slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered_key() {
     let (mut devices, group) = tagging_devices().await;
     let chat = chat_with_both(&mut devices).await;
+    let (_bob_dir, leftover) = chat_without_account_devices(&mut devices).await;
     let Devices {
         _dirs,
         relay,
@@ -1799,6 +1854,7 @@ async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered
         chat_claims(&phone, &chat, &group),
         [DeviceTagClaim::Device(laptop_slot)]
     );
+    assert_eq!(phone.removed_device_leftover_chats().unwrap(), 0);
 
     unlist_without_record(&mut phone, &group, laptop_slot).await;
     assert_eq!(
@@ -1841,6 +1897,13 @@ async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered
         chat_claims(&phone, &chat, &group).is_empty(),
         "the laptop's chat leaf is gone"
     );
+    // The chat that takes no same-account removal keeps the laptop's leaf,
+    // and the count reports it, with no `removed` record to read it by.
+    assert_eq!(
+        chat_claims(&phone, &leftover, &group),
+        [DeviceTagClaim::Unclaimed]
+    );
+    assert_eq!(phone.removed_device_leftover_chats().unwrap(), 1);
     assert_eq!(
         slot_deletions(&relay, &account_id_hex, &own_slot(&laptop)),
         0

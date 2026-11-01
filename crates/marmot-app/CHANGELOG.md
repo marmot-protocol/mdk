@@ -601,8 +601,9 @@
   its tag signature key, and a made link a later branch dropped. It reads
   those leaves by every tag signature key a roster it applied listed for
   the slot in the last 30 days, and only once the device group is settled.
-  Untagged leaves stay. When a failed link's undo takes the entry of a
-  device the user decided to remove, the deciding device commits its
+  Untagged leaves stay, and `removed_device_leftover_chats` counts the chats
+  that take no same-account Remove and keep such a leaf. When a failed
+  link's undo takes the entry of a device the user decided to remove, the deciding device commits its
   `removed` record alone, so siblings that never saw its key clean up too.
   It makes that record once: not again after a roster state it applied held
   it, even across a restart.
