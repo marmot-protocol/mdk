@@ -565,3 +565,22 @@ fn a_migration_loses_to_a_newer_image() {
     );
     assert_eq!(f.read_file(&owner), Some(vec![4; 1_200]));
 }
+
+/// A refresh that fetched the same bytes commits through the owner's own
+/// file: the reference stays, the revision moves on and the file still reads.
+#[test]
+fn an_unchanged_refresh_keeps_its_file_and_moves_the_revision_on() {
+    let f = Fixture::new();
+    let owner = f.bind("chat:aa");
+    let bytes = body(19, 2_000);
+    let id = file_of(f.publish(&owner, 0, &bytes));
+    assert_eq!(f.publish(&owner, 1, &bytes), PublishOutcome::Existing(id));
+    let status = f.app().avatar_status(&owner, NOW).unwrap();
+    assert_eq!(
+        (status.availability, status.content_revision),
+        (AvatarAvailability::Ready, 2)
+    );
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 1);
+    assert_eq!(f.files_on_disk(), 1);
+    assert_eq!(f.read_file(&owner), Some(bytes));
+}

@@ -462,3 +462,120 @@ fn references_require_ready_files_and_repointing_releases_the_old_file() {
     assert_eq!(store.file_state(&old).unwrap(), None);
     assert_eq!(store.file_state(&new).unwrap(), Some(FileState::Ready));
 }
+
+fn count(harness: &SqliteHarness, sql: &str, params: impl rusqlite::Params) -> i64 {
+    harness
+        .storage
+        .lock()
+        .unwrap()
+        .query_row(sql, params, |r| r.get(0))
+        .unwrap()
+}
+
+fn read(store: &MediaStore<SqliteMediaCatalog>, id: &FileId, len: usize) -> Vec<u8> {
+    let mut out = vec![0; len];
+    assert_eq!(store.read_at(id, 0, &mut out).unwrap(), Some(len));
+    out
+}
+
+/// Reads `content`, running `during` once before the first byte.
+struct During<'a> {
+    during: Option<Box<dyn FnOnce() + 'a>>,
+    content: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for During<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(during) = self.during.take() {
+            during();
+        }
+        self.content.read(out)
+    }
+}
+
+/// Another publication of the same content became ready while this one
+/// wrote its file. The ready commit drops its own row and attaches that
+/// twin, whose key the other slot still needs, rather than marking it lost.
+#[test]
+fn a_twin_ready_before_the_commit_is_attached_not_lost() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let body = b"the same picture, sent twice".to_vec();
+    let twin = std::cell::Cell::new(None);
+    let mut reader = During {
+        during: Some(Box::new(|| {
+            twin.set(Some(publish(&harness, &store, 1, &body)));
+        })),
+        content: Cursor::new(body.clone()),
+    };
+    let outcome = store
+        .publish(
+            harness.target(0).as_ref(),
+            Category::Retained,
+            &mut reader,
+            body.len() as u64,
+            Sha256::digest(&body).into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    let twin = twin.get().expect("the twin was published during the write");
+    assert_eq!(outcome, PublishOutcome::Existing(twin));
+    assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Ready));
+    assert_eq!(count(&harness, "SELECT count(*) FROM media_files", []), 1);
+    assert_eq!(
+        count(
+            &harness,
+            "SELECT count(*) FROM media_file_refs WHERE file_id=?1",
+            [twin.as_bytes().as_slice()]
+        ),
+        2,
+        "both slots reference the twin"
+    );
+    assert_eq!(read(&store, &twin, body.len()), body);
+}
+
+/// A ready file found missing is marked lost, and its key is wiped with it.
+#[test]
+fn a_lost_file_keeps_no_key() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let id = publish(&harness, &store, 9, b"gone");
+    std::fs::remove_file(store.path(&id)).unwrap();
+    assert_eq!(store.read_at(&id, 0, &mut [0; 4]).unwrap(), None);
+    let (state, key): (i64, Vec<u8>) = harness
+        .storage
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state,file_key FROM media_files WHERE id=?1",
+            [id.as_bytes().as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state, key), (STATE_LOST, vec![0; 32]));
+}
+
+/// Publishing a slot's current content again reuses the file and leaves the
+/// slot's reference in place: dropping and re-adding it would release the
+/// file before the new reference could point at it.
+#[test]
+fn republishing_a_slots_content_keeps_its_reference() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let id = publish(&harness, &store, 9, b"same");
+    let again = store
+        .publish(
+            harness.target(9).as_ref(),
+            Category::Retained,
+            &mut Cursor::new(b"same"),
+            4,
+            Sha256::digest(b"same").into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(again, PublishOutcome::Existing(id));
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Ready));
+    assert_eq!(read(&store, &id, 4), b"same");
+}
