@@ -3868,6 +3868,17 @@ struct GroupReplay {
     restored: HashSet<[u8; 32]>,
 }
 
+impl GroupReplay {
+    /// Whether the source finished every route stream it has in this group:
+    /// its pages prove that range, whatever later happens to its REQ.
+    fn finished(&self, id: &str, relay: RelayIndex) -> bool {
+        self.streams
+            .iter()
+            .filter(|(owner, _)| owner.request.as_ref() == id && owner.relay == relay)
+            .all(|(_, stream)| stream.phase == ReplayAdmission::Complete)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ReplayOwner {
     request: Arc<str>,
@@ -5474,11 +5485,7 @@ impl AccountReplayCoverage {
             .flatten()
             .filter_map(|group_id| self.groups.get(group_id).map(|group| (group_id, group)))
             .flat_map(|(group_id, group)| {
-                let complete = group
-                    .streams
-                    .iter()
-                    .filter(|(owner, _)| owner.request.as_ref() == id && owner.relay == relay)
-                    .all(|(_, stream)| stream.phase == ReplayAdmission::Complete);
+                let complete = group.finished(id, relay);
                 group
                     .streams
                     .keys()
@@ -5840,13 +5847,7 @@ impl AccountReplayCoverage {
             // A group unit this source finished is proven: it releases once
             // its cut peers stop holding the group, ahead of later live input
             // (mdk#2835). Only unfinished units discard their bodies.
-            .filter(|(_, group)| {
-                !group
-                    .streams
-                    .iter()
-                    .filter(|(owner, _)| owner.request.as_ref() == id && owner.relay == relay)
-                    .all(|(_, stream)| stream.phase == ReplayAdmission::Complete)
-            })
+            .filter(|(_, group)| !group.finished(id, relay))
             .flat_map(|(group_id, group)| {
                 group
                     .streams
@@ -5949,6 +5950,9 @@ impl AccountReplayCoverage {
         let owners = self
             .groups
             .iter()
+            // The REQ stops streaming; a range the source already finished
+            // stays proven, as after a cut.
+            .filter(|(_, group)| !group.finished(id, relay))
             .flat_map(|(group_id, group)| {
                 group
                     .streams
@@ -8998,6 +9002,37 @@ mod batch_tests {
             Some(&NostrNotificationLossFloor::Since(100)),
             "a refusal retires the source without the capture"
         );
+    }
+
+    /// A group unit the cut capture finished keeps its body while a waiting
+    /// peer holds the group, and so does a terminal `CLOSED` that retires the
+    /// source meanwhile: the pages proved that range, not the REQ (mdk#2835).
+    #[tokio::test(start_paused = true)]
+    async fn refused_source_keeps_finished_unit() {
+        let (mut coverage, id, losses) = replay_coverage(1);
+        let (tx, _rx) = mpsc::channel(4);
+        let paging = paging_for(&mut coverage, &id);
+        let routes = paging.window.per_route();
+        assert!(coverage.start_route(&paging, &routes[0]));
+        coverage
+            .stage_delivery(
+                group_delivery(&id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
+                Some(RelayIndex(2)),
+                ReplayInput::Page,
+                &tx,
+            )
+            .unwrap();
+        assert!(coverage.finish_route(&paging, &routes[0]));
+        coverage.stop_capture(&id, RelayIndex(2));
+        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
+        assert_eq!(
+            coverage.buffered_items, 1,
+            "the waiting peer still holds the finished unit"
+        );
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let released = coverage.take_ready_deliveries();
+        assert_eq!(released.len(), 1, "the peer's EOSE releases it");
+        assert!(losses.pending.lock().unwrap().is_empty());
     }
 
     /// A body the unfinished capture fetched itself discards without loss even
