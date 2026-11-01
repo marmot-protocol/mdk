@@ -59,11 +59,21 @@ pub(super) async fn found_routed_group(
     founder: &mut Device,
     joiners: &mut [&mut Device],
 ) -> GroupId {
+    found_group_routed_through(founder, joiners, &[RELAY]).await
+}
+
+/// [`found_routed_group`], routed through `relays`.
+pub(super) async fn found_group_routed_through(
+    founder: &mut Device,
+    joiners: &mut [&mut Device],
+    relays: &[&str],
+) -> GroupId {
     let mut key_packages = Vec::new();
     for joiner in joiners.iter_mut() {
         key_packages.push(joiner.engine.fresh_key_package().await.unwrap());
     }
-    let routing = NostrRoutingV1::new([0x43; 32], vec![RELAY.into()]).unwrap();
+    let relays = relays.iter().map(|relay| relay.to_string()).collect();
+    let routing = NostrRoutingV1::new([0x43; 32], relays).unwrap();
     let (gid, created) = founder
         .engine
         .create_group(CreateGroupRequest {

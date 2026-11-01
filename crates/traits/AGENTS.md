@@ -31,7 +31,7 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `src/app_components/mod.rs` | Shared component ids, schema-name strings, length limits, `AppComponentData`, `AppComponentSet`; re-exports everything so `cgka_traits::app_components::*` paths are unchanged. |
 | `src/app_components/codec.rs` | QUIC-varint / var-bytes primitives and the `ComponentsList` encoder. |
 | `src/app_components/host_safety.rs` | Canonical public-IP / loopback host classifiers shared by app-component URL policy and media SSRF guards. |
-| `src/app_components/routing.rs` | `NostrRoutingV1` state and codec. |
+| `src/app_components/routing.rs` | `NostrRoutingV1` state and codec; the relay URL profile check and the sibling Welcome relay-list rule (`valid_sibling_welcome_relays`), which both the sender's Add and the receiver's admission apply. |
 | `src/app_components/profile.rs` | `GroupProfileV1` state and codec. |
 | `src/app_components/blossom_image.rs` | `GroupBlossomImageV1` state, codec, and Marmot media-type canonicalization. |
 | `src/app_components/encrypted_media.rs` | Frozen `EncryptedMediaPolicyV1` / `BlobStoreEndpointV1` state, codec, and endpoint-URL validation. |

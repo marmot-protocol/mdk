@@ -29,7 +29,7 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::DeviceSlotId;
+use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
 use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -46,9 +46,6 @@ use tls_codec::Serialize as _;
 
 const ADD: &str = "AddOwnAccountDevices";
 const REMOVE: &str = "RemoveOwnAccountDevices";
-
-/// The most relays a sibling Welcome names (device-group.md, "Message").
-const MAX_SIBLING_WELCOME_RELAYS: usize = 16;
 
 /// What every sibling Welcome of one Add carries besides its own fields,
 /// settled before anything is staged.
@@ -410,8 +407,10 @@ impl<S: StorageProvider> Engine<S> {
             .into_iter()
             .map(|relay| relay.0)
             .collect();
-        if !(1..=MAX_SIBLING_WELCOME_RELAYS).contains(&relays.len()) {
-            return Err(refused("the chat must name one to 16 relays"));
+        if !valid_sibling_welcome_relays(&relays) {
+            return Err(refused(
+                "the chat must name one to 16 relays, none repeated once parsed",
+            ));
         }
         Ok(SiblingWelcomePlan {
             from: own.slot(),

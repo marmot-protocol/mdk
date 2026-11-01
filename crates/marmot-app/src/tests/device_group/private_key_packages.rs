@@ -11,6 +11,7 @@ use cgka_traits::app_components::DeviceSlotId;
 use cgka_traits::app_components::NOSTR_ROUTING_MAX_RELAYS;
 use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
 use cgka_traits::storage::IssuedPrivateKeyPackage;
+use marmot_session::CanonicalizationPolicy;
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
     MAX_HAND_OFF_KEY_PACKAGES, PrivateKeyPackageHandOff, PrivateKeyPackageRequest, PublishWork,
@@ -1510,4 +1511,114 @@ async fn a_sibling_welcome_waits_for_its_commit() {
     assert_eq!(stashed(&devices.phone), 1);
     devices.phone.run_due_maintenance().await.unwrap();
     assert!(devices.phone.state_group_record(&chat).is_some());
+}
+
+/// An Add the engine refuses spends its KeyPackage too, and never hands it
+/// back: a chat routed through two spellings of one relay, which the phone
+/// would read as one, takes no sibling, and nothing is published or owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sibling_add_spends_its_key_package() {
+    let (mut devices, _) = tagging_devices().await;
+    let chat = devices
+        .laptop
+        .create_group_with_options(
+            "chat",
+            &[],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![
+                    "wss://relay.example".to_owned(),
+                    "wss://relay.example/".to_owned(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let phone_slot = slot(&devices.phone);
+    let stock = received_from(&devices.laptop, &phone_slot).len();
+    let before = devices.relay.published_events.lock().unwrap().len();
+    let error = devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("none repeated once parsed"),
+        "{error}"
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+    assert_eq!(devices.relay.published_events.lock().unwrap().len(), before);
+    assert!(owed(&devices.laptop).is_empty());
+}
+
+/// An Add queued behind the chat's convergence spends its KeyPackage
+/// whatever the drain makes of it: with the laptop no longer tagged by the
+/// time bob's Commit settles, the drain refuses the Add, and the KeyPackage
+/// is not handed back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
+    let (mut devices, _) = tagging_devices().await;
+    let bob_id = AccountHome::open(devices._dirs[1].path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    remember_test_member_inbox(&devices.laptop_app, &bob_id, "wss://relay.example");
+    let mut bob = devices.laptop_app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let chat = devices
+        .laptop
+        .create_group("chat", &[&bob_id])
+        .await
+        .unwrap();
+    deliver_all(&mut bob, &devices.relay).await;
+    bob.accept_group_invite(&chat).unwrap();
+
+    let settling = |ms| CanonicalizationPolicy {
+        settlement_quiescence_ms: ms,
+        ..CanonicalizationPolicy::default()
+    };
+    devices
+        .laptop
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(3_600_000))
+        .unwrap();
+    let mut cursor = devices.relay.published_events.lock().unwrap().len();
+    bob.runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: chat.clone(),
+        })
+        .await
+        .unwrap();
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    let phone_slot = slot(&devices.phone);
+    let stock = received_from(&devices.laptop, &phone_slot).len();
+    devices
+        .laptop
+        .add_sibling_to_chat(&chat, &phone_slot)
+        .await
+        .unwrap();
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&chat)
+            .unwrap()
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+
+    let session = devices.laptop.runtime.session_mut();
+    session.set_device_tag_group(None).unwrap();
+    session.set_convergence_policy(settling(0)).unwrap();
+    devices.laptop.retry_group_convergence(&chat).await.unwrap();
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_queued_outbound_intents(&chat)
+            .unwrap()
+    );
+    assert_eq!(devices.laptop.runtime.members(&chat).unwrap().len(), 2);
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
+    assert!(owed(&devices.laptop).is_empty());
 }

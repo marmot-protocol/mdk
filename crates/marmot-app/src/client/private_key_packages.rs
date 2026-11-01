@@ -59,9 +59,7 @@
 //!   Delivered means one relay took it; nothing sends it again (3.5e).
 
 use base64::Engine as _;
-use cgka_traits::app_components::{
-    DeviceSlotId, NOSTR_ROUTING_MAX_RELAYS, validate_nostr_relay_url,
-};
+use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
 use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
@@ -76,7 +74,7 @@ use marmot_session::{
     PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
     SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
@@ -211,8 +209,9 @@ impl AppClient {
 
     /// Admit a sibling Welcome that adds this device to a chat, for
     /// [`Self::stash_sibling_welcome`] to keep. Beyond a hand-off's checks,
-    /// its relays must be one to [`NOSTR_ROUTING_MAX_RELAYS`] distinct relay
-    /// URLs, and its KeyPackage one this device issued to the sender and
+    /// its relays must pass [`valid_sibling_welcome_relays`] (one to 16
+    /// relay URLs distinct once parsed, the rule the sender's Add checks
+    /// too), and its KeyPackage one this device issued to the sender and
     /// still holds; the join checks that KeyPackage again. An error is a
     /// read that failed, which the caller retries rather than drop the
     /// Welcome.
@@ -917,17 +916,4 @@ impl AppClient {
             .delete_received_private_key_packages_from(&hex::encode(sibling))?;
         Ok(())
     }
-}
-
-/// Whether `relays` is a sibling Welcome's valid relay list: one to
-/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated once parsed.
-/// Parsing folds host case, a default port and an empty path, so two
-/// spellings of one relay count as a repeat.
-fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
-    let mut parsed = BTreeSet::new();
-    (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
-        && relays.iter().all(|relay| {
-            validate_nostr_relay_url(relay).is_ok()
-                && url::Url::parse(relay).is_ok_and(|url| parsed.insert(url))
-        })
 }

@@ -336,11 +336,33 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
             .engine
             .send(add_own_devices(&unrouted, vec![laptop.clone()]))
             .await,
-        "the chat must name one to 16 relays",
+        "the chat must name one to 16 relays, none repeated once parsed",
     );
     assert_eq!(
         (Untouched::of(&m.bob, &unrouted), rows(&m.bob, &unrouted)),
         unrouted_before
+    );
+
+    // A chat that names one relay twice, spelled two ways: the sibling's
+    // admission parses them as one and would refuse the Welcome.
+    let mut alice = chat_device(b"alice");
+    let twice = found_group_routed_through(
+        &mut alice,
+        &mut [&mut m.bob],
+        &[RELAY, &format!("{RELAY}/")],
+    )
+    .await;
+    let twice_before = (Untouched::of(&m.bob, &twice), rows(&m.bob, &twice));
+    assert_refused(
+        m.bob
+            .engine
+            .send(add_own_devices(&twice, vec![laptop.clone()]))
+            .await,
+        "none repeated once parsed",
+    );
+    assert_eq!(
+        (Untouched::of(&m.bob, &twice), rows(&m.bob, &twice)),
+        twice_before
     );
 
     send_commit(
