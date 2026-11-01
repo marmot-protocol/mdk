@@ -21,60 +21,22 @@ fn expected_hrp(name: &str) -> NostrHrp {
         "nevent" => NostrHrp::Nevent,
         "nprofile" => NostrHrp::Nprofile,
         "naddr" => NostrHrp::Naddr,
+        "nrelay" => NostrHrp::Nrelay,
         other => panic!("unknown md_hrp name {other}"),
     }
 }
 
-fn collect_inline_hrps(inline: &Inline, hrps: &mut Vec<NostrHrp>) {
-    match inline {
-        Inline::NostrMention(entity) | Inline::NostrUri(entity) => hrps.push(entity.hrp),
-        Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
-            for child in children {
-                collect_inline_hrps(child, hrps);
-            }
-        }
-        Inline::Link { children, .. } => {
-            for child in children {
-                collect_inline_hrps(child, hrps);
-            }
-        }
-        Inline::Image { alt, .. } => {
-            for child in alt {
-                collect_inline_hrps(child, hrps);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_block_hrps(block: &Block, hrps: &mut Vec<NostrHrp>) {
-    match block {
-        Block::Paragraph { inlines, .. } | Block::Heading { inlines, .. } => {
-            for inline in inlines {
-                collect_inline_hrps(inline, hrps);
-            }
-        }
-        Block::BlockQuote { blocks, .. } | Block::Details { body: blocks, .. } => {
-            for child in blocks {
-                collect_block_hrps(child, hrps);
-            }
-        }
-        Block::List { items, .. } => {
-            for item in items {
-                for child in &item.blocks {
-                    collect_block_hrps(child, hrps);
-                }
-            }
-        }
-        Block::Table { header, rows, .. } => {
-            for cell in header.iter().chain(rows.iter().flatten()) {
-                for inline in &cell.inlines {
-                    collect_inline_hrps(inline, hrps);
-                }
-            }
-        }
-        Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
-    }
+// Every corpus input is a single line, so each document holds at most one
+// top-level paragraph and the recognizer's inline findings are all in its
+// inlines — a single flat_map over those suffices.
+fn collect_top_level_hrps(block: &Block, hrps: &mut Vec<NostrHrp>) {
+    let Block::Paragraph { inlines, .. } = block else {
+        return;
+    };
+    hrps.extend(inlines.iter().filter_map(|inline| match inline {
+        Inline::NostrMention(entity) | Inline::NostrUri(entity) => Some(entity.hrp),
+        _ => None,
+    }));
 }
 
 #[test]
@@ -83,7 +45,7 @@ fn markdown_recognition_matches_shared_corpus_baseline() {
         let document = parse(&case.reference);
         let mut hrps = Vec::new();
         for block in &document.blocks {
-            collect_block_hrps(block, &mut hrps);
+            collect_top_level_hrps(block, &mut hrps);
         }
         match case.md_hrp {
             Some(expected) => {

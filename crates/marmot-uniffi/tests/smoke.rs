@@ -376,13 +376,7 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
                     .unwrap_or_else(|_| panic!("case {} should normalize", case.name));
                 assert_eq!(normalized.member_ref, expected, "case {}", case.name);
                 assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
-                // The npub round-trips through the resolved account id, which
-                // equals the canonical ACCOUNT_ID for every profile row but
-                // not for the bare event-id hex row.
-                let expected_npub = kit
-                    .npub(expected.to_owned())
-                    .unwrap_or_else(|| panic!("case {} account id has no npub", case.name));
-                assert_eq!(normalized.npub, expected_npub, "case {}", case.name);
+                assert_eq!(normalized.npub, NPUB, "case {}", case.name);
                 assert_eq!(
                     kit.account_id_hex(case.reference).as_deref(),
                     Some(expected),
