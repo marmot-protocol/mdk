@@ -98,6 +98,21 @@
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
   relay is sent again by the next maintenance pass. Only behind
   `dev_device_groups`; nothing outside tests adds a sibling yet.
+- The backup writer writes the account's backup once a day (mdk#2628 item
+  4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
+  as blobs on the deployment's Blossom servers under a fresh archive key, and
+  a head that seals that key to the recovery key and indexes the blobs for
+  the key's public half. A kind 30078 backup pointer, addressed and encrypted
+  under the public half, lists the kept backups: the newest two and any older
+  one still the last to hold some of a chat's history, at most 16. A backup
+  counts only once a relay accepts its pointer; one no relay accepts is
+  published again for a day, then abandoned. Blobs of dropped or abandoned
+  backups are deleted (BUD-02) while the pointer fetched in that pass lists
+  no backup they belong to. A device takes over writing when the writer
+  leaves the roster or is leaving, or lists nothing for a week, through the
+  roster's compare-and-set. Runs from maintenance, only behind
+  `dev_device_groups`. Enabling it outside dev needs the White Noise relays
+  to accept kind 30078 (D50); today they refuse it.
 - `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
   `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
   the recovery words an account's backups will be sealed to, and turn backups

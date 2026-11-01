@@ -162,6 +162,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- The NIP-46 connection asks for `sign_event:30078` too: the account's
+  backup pointer (mdk#2628 item 4.4b).
 - `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
   461, 473, 475 and 476 as reserved, and one received in a chat makes no
   timeline row, message or notification (mdk#2628). They are read only in
