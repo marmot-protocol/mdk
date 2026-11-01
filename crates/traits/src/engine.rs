@@ -154,8 +154,9 @@ pub enum SendIntent {
         /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
-        /// retain the intent while the group's epoch is unsettled and encrypt
-        /// it under whatever epoch the group lands on. A pinned message has
+        /// retain the intent while the group's epoch is unsettled, or behind
+        /// an earlier send still queued for the group, and encrypt it under
+        /// whatever epoch the group lands on. A pinned message has
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
@@ -252,6 +253,20 @@ pub enum SendIntent {
     UnlinkDevice {
         group_id: GroupId,
         leaf_signature_key: Vec<u8>,
+        roster_update: Vec<u8>,
+    },
+    /// Record a slot of the account's device group as `removed`, alone
+    /// (mdk#2761): the record a device whose user decided a removal makes
+    /// once a failed link's undo took that slot's entry. `roster_update` is a
+    /// `marmot.account.device-roster.v1` update of exactly one
+    /// `SetRejectedSlot`, with reason `removed` and a `tag_signature_key`,
+    /// for a slot the roster lists neither as a device nor as a rejected
+    /// slot. Like a link, it is never queued, and a lost fork never re-issues
+    /// it: once a roster state the device applied held the record, the device
+    /// does not make it again, so only its caller decides whether to send it
+    /// again.
+    RecordRemovedSlot {
+        group_id: GroupId,
         roster_update: Vec<u8>,
     },
     /// Leave the group via MIP-03 SelfRemove.
@@ -432,10 +447,15 @@ pub enum SendResult {
         authority: Option<crate::app_event::AppMessageAuthority>,
     },
     /// The engine accepted the local intent but did not publish anything
-    /// yet because the group has unresolved convergence input. The intent
-    /// will be regenerated from the canonical state when the group becomes
-    /// stable. If that state refuses it, the engine drops it and announces
-    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
+    /// yet because the group has unresolved convergence input, or an earlier
+    /// send to the group is still queued: a send never goes ahead of one
+    /// queued before it, though one queued admin change may take the drain's
+    /// first attempt after a convergence pass. The intent will be regenerated
+    /// from the canonical state when the group becomes stable, after those
+    /// queued before it. If that state refuses it, the engine drops it and
+    /// announces [`GroupEvent::QueuedIntentRefused`] with this `intent_id`;
+    /// if that state already holds the change, the engine drops it with
+    /// nothing to publish and the drain returns [`SendResult::NoChange`].
     Queued {
         group_id: GroupId,
         intent_id: MessageId,

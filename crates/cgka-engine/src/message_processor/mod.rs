@@ -24,6 +24,7 @@ enum OutboundQueueReason {
     ForegroundBudgetExhausted,
     SelfRemoveAutoCommit,
     ReplayRotation,
+    EarlierIntentQueued,
     ExplicitQueueRequest,
 }
 
@@ -35,6 +36,7 @@ impl OutboundQueueReason {
             Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
             Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
             Self::ReplayRotation => "replay_rotation",
+            Self::EarlierIntentQueued => "earlier_intent_queued",
             Self::ExplicitQueueRequest => "explicit_queue_request",
         };
         tracing::debug!(
@@ -207,9 +209,12 @@ pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 64 * 1024 * 1024;
 /// recovery path.
 ///
 /// Capacity is reclaimed on confirmation, not on drain. A drained row is
-/// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
-/// intent, inside `confirm_published` — so a payload that was prepared and
-/// published but never acknowledged still holds its slot and stays in flight.
+/// deleted by `confirm_queued_outbound_intent` — or, for a group-state
+/// intent, inside `confirm_published` — or when its preparation leaves
+/// nothing to publish: the settled state refused it (mdk#2694) or already
+/// holds the change (mdk#2842; a failed delete leaves it for the next drain).
+/// A payload that was prepared and published but never acknowledged still
+/// holds its slot and stays in flight.
 /// A definite retry clears that in-flight association so the next drain
 /// re-prepares it. A group whose transport keeps failing therefore sits at the
 /// cap: its rows keep being re-attempted, but nothing frees a slot until a
@@ -902,10 +907,13 @@ impl<S: StorageProvider> Engine<S> {
             // link drained after that would add a device that never joins.
             // The caller retries while the new device still waits. Its undo
             // is not queued either: the app decides it from the roster it
-            // read, and retries it until it lands.
+            // read, and retries it until it lands. Nor is a removed slot's
+            // lone record, which only its caller makes again (mdk#2761).
             if matches!(
                 &intent,
-                SendIntent::LinkDevice { .. } | SendIntent::UnlinkDevice { .. }
+                SendIntent::LinkDevice { .. }
+                    | SendIntent::UnlinkDevice { .. }
+                    | SendIntent::RecordRemovedSlot { .. }
             ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
@@ -1257,9 +1265,28 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
+                // The settled state already holds the change, and with nothing
+                // to publish no confirmation will retire the record. Kept, it
+                // would wait forever and hold every later send behind it. If
+                // the delete fails, the record stays for the next drain to
+                // retire: failing this one would drop what it has prepared.
+                SendResult::NoChange { .. } => {
+                    if self
+                        .storage
+                        .delete_queued_outbound_intent(&record.id)
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "cgka_engine::message_processor",
+                            method = "converge_and_drain_with_deadline",
+                            error_kind = "queued_no_change_retirement",
+                            "could not retire a queued intent that drained to no change"
+                        );
+                        self.schedule_pending_convergence_group(group_id);
+                    }
+                }
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
-                | SendResult::NoChange { .. }
                 | SendResult::DisbandRequested { .. }
                 | SendResult::Queued { .. } => {}
             }
@@ -1451,9 +1478,40 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
             return Ok(Some(OutboundQueueReason::ReplayRotation));
         }
-        self.stage_due_self_remove_auto_commit(group_id, now_ms)
-            .await
-            .map(|staged| staged.then_some(OutboundQueueReason::SelfRemoveAutoCommit))
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(Some(OutboundQueueReason::SelfRemoveAutoCommit));
+        }
+        // A send never goes ahead of one queued earlier for the same group
+        // (mdk#2842). Prepared now, an application message would take the
+        // sender's next generation while the queued ones wait for the
+        // scheduled drain, so their generations would run against send order.
+        // A member reading the group's history in `created_at` order, which
+        // is send order, would then reach the drained messages first and
+        // could step that sender's ratchet past its out-of-order window,
+        // losing the messages that went ahead. A group change going ahead
+        // would apply before a message sent ahead of it. So this send queues
+        // behind them, or is refused by the intents that never queue, and the
+        // drain prepares all of them in queue order.
+        Ok(self
+            .has_queued_intent_awaiting_preparation(group_id)?
+            .then_some(OutboundQueueReason::EarlierIntentQueued))
+    }
+
+    /// Whether an intent queued for `group_id` still waits for the drain to
+    /// prepare it. One the drain prepared and the host has not yet confirmed
+    /// or retried is in flight, not waiting: its generation is already taken.
+    fn has_queued_intent_awaiting_preparation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| !self.queued_outbound_intent_in_flight(group_id, &record.id)))
     }
 
     /// Settle authenticated input and give current-fingerprint deferred rows
@@ -4157,6 +4215,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4183,6 +4242,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::EnableAccountDevices { .. }
         | SendIntent::LinkDevice { .. }
         | SendIntent::UnlinkDevice { .. }
+        | SendIntent::RecordRemovedSlot { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

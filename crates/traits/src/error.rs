@@ -158,7 +158,8 @@ pub enum EngineError {
 
     /// An application message pinned to `expected` arrived while the group's
     /// epoch is unsettled: a publication this client staged still awaits its
-    /// outcome, or retained convergence input is not yet applied. Ordinary
+    /// outcome, retained convergence input is not yet applied, or an earlier
+    /// send still waits in the outbound queue, which no send overtakes. Ordinary
     /// messages are retained and encrypted at drain time under whatever epoch
     /// the group lands on; a pinned message cannot be, so it is refused
     /// instead of queued. Nothing was persisted. Retry once the group settles
@@ -168,14 +169,17 @@ pub enum EngineError {
     )]
     AppMessageEpochUnsettled { expected: EpochId },
 
-    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice)
-    /// or [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
+    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice),
+    /// [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
+    /// or [`SendIntent::RecordRemovedSlot`](crate::engine::SendIntent::RecordRemovedSlot)
     /// refused instead of queued, because the device group has a Commit in
-    /// flight or convergence input still unsettled. Nothing was persisted.
+    /// flight, convergence input still unsettled or an earlier send still
+    /// queued. Nothing was persisted.
     /// A link never waits in the outbound queue: the new device stops waiting
     /// for its Welcome, and a link sent after that would add a device that
     /// never joins. Retry once the group settles, while the new device still
-    /// waits. An unlink is retried the same way, until it lands.
+    /// waits. An unlink is retried the same way, until it lands, and a
+    /// removed slot's record while its caller still makes it.
     #[error("linking a device refused while the device group is unsettled")]
     LinkDeviceUnsettled { group_id: GroupId },
 

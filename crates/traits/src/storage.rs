@@ -1055,6 +1055,60 @@ pub trait AnnouncedKeyPackageStorage {
     ) -> StorageResult<Vec<AnnouncedKeyPackage>>;
 }
 
+// ── RosterTagKeyStorage ────────────────────────────────────────────────────
+
+/// A tag signature key a device-group roster listed for one of its slots, in
+/// the slot's device entry or its `removed` record (mdk#2761).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RosterTagKey {
+    /// The device's KeyPackage slot, the Nostr `d` its roster entry is keyed
+    /// by.
+    pub slot: [u8; 32],
+    pub tag_signature_key: Vec<u8>,
+    /// Whether a roster state listed it in the slot's `removed` record. A
+    /// recorded key keeps this once any state this device applied did, so
+    /// the app knows a `removed` record for the slot was held even after it
+    /// went (mdk#2761, "The removal Commit").
+    pub held_as_removed: bool,
+}
+
+/// How long a tag signature key is kept after the last roster state this
+/// device applied that listed it: as long as a `removed` record lasts, so a
+/// device the roster stopped listing stays recognizable for that long by
+/// this device's own clock.
+pub const ROSTER_TAG_KEY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// How many tag signature keys each slot of a group keeps, newest first. A
+/// slot holds one per link of it. Its newest key held as removed is kept
+/// besides, so a slot keeps at most one more.
+pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
+
+/// Every tag signature key a device-group roster this device held listed, by
+/// group and slot (mdk#2761). The engine records each roster state it
+/// applies; nothing in the engine reads them back. The app reads them to
+/// clean up after a device whose key the roster no longer lists.
+pub trait RosterTagKeyStorage {
+    /// Record `keys` as seen in `group_id`'s roster at `seen_at`, in the
+    /// order this device applied the roster states that listed them: a key
+    /// later in `keys`, or in a later call, is more recently seen, whatever
+    /// the clock says. A pair already recorded keeps the later of the two
+    /// times, and is held as removed once either sighting was.
+    fn record_roster_tag_keys(
+        &self,
+        group_id: &GroupId,
+        keys: &[RosterTagKey],
+        seen_at: u64,
+    ) -> StorageResult<()>;
+    /// Drop every key last seen before `before`, and each group slot's keys
+    /// beyond its `per_slot` most recently seen, except the slot's most
+    /// recently seen key held as removed: that one goes only by time, so the
+    /// slot stays known to have held its `removed` record.
+    fn prune_roster_tag_keys(&self, before: u64, per_slot: usize) -> StorageResult<()>;
+    /// What `group_id`'s rosters listed, last seen at or after `since`: by
+    /// slot, and within a slot the most recently seen first.
+    fn roster_tag_keys(&self, group_id: &GroupId, since: u64) -> StorageResult<Vec<RosterTagKey>>;
+}
+
 // ── SiblingAddStorage ──────────────────────────────────────────────────────
 
 /// A sibling device this device's own confirmed Commit added to a group
@@ -1289,6 +1343,12 @@ pub trait StorageProvider:
     /// Optional store of the KeyPackages device-group rosters announced
     /// (mdk#2628 D31 item 7). A backend without one records none.
     fn announced_key_package_storage(&self) -> Option<&dyn AnnouncedKeyPackageStorage> {
+        None
+    }
+
+    /// Optional store of the tag signature keys device-group rosters listed
+    /// (mdk#2761). A backend without one records none.
+    fn roster_tag_key_storage(&self) -> Option<&dyn RosterTagKeyStorage> {
         None
     }
 

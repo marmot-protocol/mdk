@@ -2471,9 +2471,9 @@ Remove another of this account's devices, by its `slot_id_hex` from `linked_devi
 pub async fn removed_device_leftover_chats( &self, account_ref: String, ) -> Result<u32, MarmotKitError>
 ```
 
-How many chats this device is in still hold a device this account removed, because the chat does not take a same-account removal. A chat admin can remove that device; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
+How many chats this device is in still hold a device this account no longer has, because the chat does not take a same-account removal. That device is one this account removed, or one its device group stopped listing, as after a failed link. A chat admin can remove it; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L93)
+[Source](src/commands/linked_device.rs#L95)
 
 </details>
 

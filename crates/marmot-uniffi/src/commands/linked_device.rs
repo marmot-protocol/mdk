@@ -85,11 +85,13 @@ impl Marmot {
             .await?)
     }
 
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero until this device trusts a device group,
-    /// and always zero in release builds until the device group's spec
-    /// lands. Read it when showing the device list; it is not evented.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has, because the chat doesn't take a same-account removal; a
+    /// chat admin can remove it. The device is one this account removed, or
+    /// one its device group stopped listing, as after a failed link. Zero
+    /// until this device trusts a device group, and always zero in release
+    /// builds until the device group's spec lands. Read it when showing the
+    /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(
         &self,
         account_ref: String,

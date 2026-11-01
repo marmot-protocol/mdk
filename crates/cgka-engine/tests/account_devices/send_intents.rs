@@ -428,7 +428,7 @@ fn restart(device: Device, account: &[u8]) -> Device {
 
 // ── Fair scheduling (mdk#2628 D6) ───────────────────────────────────────────
 
-fn queue(device: &Device, gid: &GroupId, id: &[u8], intent: SendIntent) {
+pub(super) fn queue(device: &Device, gid: &GroupId, id: &[u8], intent: SendIntent) {
     device
         .storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {

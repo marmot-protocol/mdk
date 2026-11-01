@@ -54,6 +54,8 @@ mod encrypted_media_source_secret;
 mod historical_application_sender;
 #[path = "distributed_convergence/phantom_own_commit_branch.rs"]
 mod phantom_own_commit_branch;
+#[path = "distributed_convergence/queued_send_order.rs"]
+mod queued_send_order;
 #[path = "distributed_convergence/refused_queued_intents.rs"]
 mod refused_queued_intents;
 mod support;

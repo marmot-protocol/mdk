@@ -299,6 +299,8 @@ mod migration_0142_sticker_asset_history;
 mod migration_0143_device_activity;
 #[path = "migrations/0144_announced_key_packages.rs"]
 mod migration_0144_announced_key_packages;
+#[path = "migrations/0145_roster_tag_keys.rs"]
+mod migration_0145_roster_tag_keys;
 #[path = "migrations/0146_device_removals.rs"]
 mod migration_0146_device_removals;
 #[path = "migrations/0147_device_removed_membership.rs"]
@@ -1203,6 +1205,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0144_announced_key_packages",
         suspend_foreign_keys: &[],
         apply: migration_0144_announced_key_packages::apply,
+    },
+    Migration {
+        version: 145,
+        name: "0145_roster_tag_keys",
+        suspend_foreign_keys: &[],
+        apply: migration_0145_roster_tag_keys::apply,
     },
     Migration {
         version: 146,
