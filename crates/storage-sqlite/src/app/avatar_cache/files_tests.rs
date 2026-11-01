@@ -7,10 +7,12 @@ use super::*;
 use crate::app::avatar_cache::{
     AvatarAvailability, AvatarCacheUsage, AvatarImage, AvatarPublishResult,
 };
-use crate::{DatabaseAvatarBody, SqlCipherKey, SqliteAccountStorage, SqliteMediaCatalog};
+use crate::{DatabaseAvatarBody, SqliteAccountStorage, SqliteMediaCatalog};
 
 const NOW: u64 = 1_000;
 
+/// An in-memory account database beside a media root on disk: no test here
+/// reopens the database.
 struct Fixture {
     _dir: tempfile::TempDir,
     store: SqliteAccountStorage,
@@ -26,9 +28,7 @@ fn body(seed: u8, len: usize) -> Vec<u8> {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x5a; 32])).unwrap();
-        let store =
-            SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let media = MediaStore::new(
             dir.path().join(MEDIA_DIRECTORY),
             SqliteMediaCatalog::new(store.app_storage()),
@@ -436,8 +436,7 @@ fn a_store_reset_drops_cache_files() {
     assert_eq!(f.files_on_disk(), 0);
 }
 
-/// Clearing the cache or deleting the owning chat's rows releases the files
-/// to the sweep.
+/// Clearing the cache releases its files to the sweep.
 #[test]
 fn clearing_the_cache_releases_its_files() {
     let f = Fixture::new();

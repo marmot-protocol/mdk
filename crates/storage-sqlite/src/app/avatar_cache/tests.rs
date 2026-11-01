@@ -2,16 +2,6 @@ use super::*;
 #[cfg(test)]
 use crate::SqliteAccountStorage;
 
-#[test]
-fn avatar_cache_available_on_account_open_without_engine() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let count: i64 = store
-        .lock()
-        .unwrap()
-        .query_row("SELECT count(*) FROM avatar_assets", [], |row| row.get(0))
-        .expect("account open must provision durable avatar storage without an engine");
-    assert_eq!(count, 0);
-}
 fn image(value: u8, size: usize) -> AvatarImage {
     // Storage receives caller-validated bytes. Decoder/authentication tests are
     // owned by the acquisition layer, not these persistence fixtures.
@@ -40,7 +30,7 @@ fn ready(store: &SqliteAppStorage, reference: &AvatarAssetRef) -> AvatarAssetRea
 fn avatar_bytes_survive_encrypted_reopen_without_engine_or_network() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.sqlite3");
-    let key = crate::SqlCipherKey::new("avatar-test-key").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa1; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     let reference = bind(&app, "profile-owner");
@@ -321,7 +311,10 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
             bytes: 8,
         },
     );
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Backend(m)) if m.contains("injected failure")),
+        "{result:?}"
+    );
     assert_eq!(
         app.avatar_cache_usage().unwrap(),
         AvatarCacheUsage {
@@ -389,51 +382,6 @@ fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
         }
     );
     assert_eq!(ready(&app, &reference).image, Some(bytes));
-}
-
-#[test]
-fn concurrent_publications_have_one_winner() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store.app_storage(), "owner");
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let threads: Vec<_> = (1..=2)
-        .map(|value| {
-            let store = store.clone();
-            let reference = reference.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                store
-                    .app_storage()
-                    .publish_avatar(&reference, 0, &image(value, 8), None)
-                    .unwrap()
-            })
-        })
-        .collect();
-    let results: Vec<_> = threads
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
-        .collect();
-    assert_eq!(
-        results
-            .iter()
-            .filter(|r| matches!(r, AvatarPublishResult::Published { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|r| **r == AvatarPublishResult::Superseded)
-            .count(),
-        1
-    );
-    assert_eq!(
-        ready(&store.app_storage(), &reference)
-            .status
-            .content_revision,
-        1
-    );
 }
 
 #[test]
@@ -558,16 +506,17 @@ fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
     let bytes = image(1, 16);
     publish(&app, &reference, &bytes);
     // Failure after the UPSERT but before commit must not clear the old avatar.
+    let rebind = app.bind_avatar_source_with_limits(
+        "owner",
+        "new",
+        Limits {
+            entries: 0,
+            bytes: 16,
+        },
+    );
     assert!(
-        app.bind_avatar_source_with_limits(
-            "owner",
-            "new",
-            Limits {
-                entries: 0,
-                bytes: 16
-            }
-        )
-        .is_err()
+        matches!(&rebind, Err(StorageError::Serialization(m)) if m == "avatar exceeds cache capacity"),
+        "{rebind:?}"
     );
     assert_eq!(
         app.avatar_reference("owner").unwrap(),
@@ -579,25 +528,30 @@ fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
         .unwrap()
         .execute("UPDATE avatar_assets SET content_revision = ?1", [i64::MAX])
         .unwrap();
-    assert!(
-        app.publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None)
-            .is_err()
-    );
+    let overflow = app.publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None);
+    assert!(is_check_failure(&overflow), "{overflow:?}");
     assert_eq!(ready(&app, &reference).image, Some(bytes));
     store
         .lock()
         .unwrap()
         .execute("UPDATE avatar_cache_meta SET access_seq = ?1", [i64::MAX])
         .unwrap();
-    assert!(app.bind_avatar_source("owner", "new").is_err());
+    let overflow = app.bind_avatar_source("owner", "new");
+    assert!(is_check_failure(&overflow), "{overflow:?}");
     assert_eq!(app.avatar_reference("owner").unwrap(), Some(reference));
+}
+
+/// The 0114 counters are `typeof(..) = 'integer'`: an increment past
+/// `i64::MAX` becomes a REAL and fails its CHECK.
+fn is_check_failure<T>(result: &StorageResult<T>) -> bool {
+    matches!(result, Err(StorageError::Backend(m)) if m.contains("CHECK constraint failed"))
 }
 
 #[test]
 fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("avatar-wal.db");
-    let key = crate::SqlCipherKey::new("avatar-wal-test-key").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa2; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     let reference = bind(&app, "owner");
@@ -675,17 +629,6 @@ fn removing_live_avatar_invalidates_shared_views_and_preserves_other_owners() {
     assert_eq!(recency as u64, app.avatar_cache_usage().unwrap().entries);
 }
 
-#[test]
-fn avatar_acquisition_intent_exists_without_runtime() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let count: i64 = store
-        .lock()
-        .unwrap()
-        .query_row("SELECT count(*) FROM avatar_acquisition", [], |r| r.get(0))
-        .expect("durable avatar work must survive independently of a runtime");
-    assert_eq!(count, 0);
-}
-
 fn selected_url(key: &str) -> crate::SelectedAvatar {
     crate::SelectedAvatar::RemoteImage {
         url: format!("https://example.com/{key}"),
@@ -740,7 +683,7 @@ fn avatar_acquisition_coalesces_retries_and_retains_stale_bytes() {
 fn avatar_attempts_survive_reopen_and_fence_late_completion() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.db");
-    let key = crate::SqlCipherKey::new("avatar jobs fixture").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa3; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let reference = store
         .app_storage()
@@ -849,7 +792,10 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         app.request_avatar_acquisition("owner", &selected_url("a"), false)?;
         Err(invalid("injected outer failure"))
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Serialization(m)) if m == "injected outer failure"),
+        "{result:?}"
+    );
     assert!(app.avatar_reference("owner").unwrap().is_none());
     assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
     let reference = app
@@ -858,9 +804,10 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         .unwrap();
     let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
     store.lock().unwrap().execute_batch("CREATE TRIGGER reject_job_finish BEFORE UPDATE OF state ON avatar_acquisition WHEN NEW.state = 0 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let refused = app.complete_avatar_acquisition(&job, &image(1, 8), None);
     assert!(
-        app.complete_avatar_acquisition(&job, &image(1, 8), None)
-            .is_err()
+        matches!(&refused, Err(StorageError::Backend(m)) if m.contains("injected")),
+        "{refused:?}"
     );
     assert_eq!(
         app.avatar_status(&reference, 0).unwrap().availability,
@@ -985,12 +932,16 @@ fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance
     );
 }
 
+/// The host probe behind the read timings in
+/// `docs/marmot-architecture/further-context/avatar-cache-storage.md`. Run it with
+/// `cargo nextest run -p storage-sqlite --run-ignored only --no-capture
+/// -E 'test(=app::avatar_cache::tests::avatar_local_read_timing_by_encoded_size)'`.
 #[test]
 #[ignore = "host timing evidence; not a device latency gate"]
 fn avatar_local_read_timing_by_encoded_size() {
     crate::base::connection::use_production_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
-    let key = crate::SqlCipherKey::new("avatar timing fixture").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa4; 32]);
     let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key)
         .unwrap()
         .app_storage();

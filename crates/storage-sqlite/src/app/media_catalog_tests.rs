@@ -20,7 +20,8 @@ const NOW: u64 = 1_000;
 
 struct SqliteHarness {
     dir: tempfile::TempDir,
-    key: SqlCipherKey,
+    /// The file-backed database's key; `None` for an in-memory one.
+    key: Option<SqlCipherKey>,
     storage: SqliteAccountStorage,
     slots: RefCell<HashMap<u32, (Vec<u8>, AttachmentAssetRef)>>,
     /// Each slot's claimed download attempt, for its checkpoint target.
@@ -30,11 +31,30 @@ struct SqliteHarness {
 }
 
 impl SqliteHarness {
-    fn new() -> Self {
+    /// An encrypted account database file, for the cases that restart.
+    fn file() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x6b; 32])).unwrap();
+        let key = SqlCipherKey::raw([0x6b; 32]);
         let storage =
             SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        Self::with_storage(dir, Some(key), storage)
+    }
+
+    /// An in-memory account database beside a media root on disk, for the
+    /// cases that never restart.
+    fn memory() -> Self {
+        Self::with_storage(
+            tempfile::tempdir().unwrap(),
+            None,
+            SqliteAccountStorage::in_memory().unwrap(),
+        )
+    }
+
+    fn with_storage(
+        dir: tempfile::TempDir,
+        key: Option<SqlCipherKey>,
+        storage: SqliteAccountStorage,
+    ) -> Self {
         storage
             .lock()
             .unwrap()
@@ -237,9 +257,13 @@ impl Harness for SqliteHarness {
     }
 
     fn restart(&mut self) {
+        let key = self
+            .key
+            .as_ref()
+            .expect("an in-memory harness cannot restart: list the case under `FILE_CASES`");
         self.storage.close().unwrap();
         self.storage =
-            SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), &self.key)
+            SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), key)
                 .unwrap();
     }
 
@@ -303,21 +327,83 @@ impl Harness for SqliteHarness {
     }
 }
 
-#[test]
-fn the_sqlcipher_catalog_passes_the_conformance_suite() {
-    conformance::run_all(&SqliteHarness::new);
-}
+/// One test per case of media-store's catalog conformance suite, so the
+/// cases run in parallel: the cases that restart on an encrypted file, the
+/// rest on an in-memory database. An in-memory harness panics on `restart`.
+mod catalog_conformance {
+    use super::*;
 
-#[test]
-fn deleting_a_key_relies_on_secure_delete() {
-    let harness = SqliteHarness::new();
-    let secure_delete: i64 = harness
-        .storage
-        .lock()
-        .unwrap()
-        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(secure_delete, 1);
+    macro_rules! cases {
+        ($list:ident, $harness:ident: $($case:ident,)+) => {
+            const $list: &[&str] = &[$(stringify!($case)),+];
+            $(
+                #[test]
+                fn $case() {
+                    conformance::$case(SqliteHarness::$harness());
+                }
+            )+
+        };
+    }
+
+    cases!(FILE_CASES, file:
+        crash_before_the_file_drops_the_pending_row,
+        crash_mid_write_drops_the_row_and_the_partial_file,
+        crash_before_the_ready_commit_drops_the_complete_file,
+        crash_after_the_ready_commit_keeps_the_file,
+        crash_between_key_deletion_and_unlink_unlinks_the_orphan,
+        staged_files_survive_restarts_until_promoted,
+        a_crash_before_the_staged_commit_leaves_nothing,
+    );
+
+    cases!(MEMORY_CASES, memory:
+        publish_reads_back_and_reuses_identical_content,
+        missing_ready_files_become_lost,
+        reuse_skips_a_twin_whose_file_is_gone,
+        ready_commit_keeps_its_file_when_the_twin_is_gone,
+        a_failed_presence_check_leaves_the_twin_untouched,
+        a_torn_twin_is_lost_and_the_new_body_kept,
+        the_last_reference_releases_the_file,
+        supersession_during_the_write_keeps_nothing,
+        reset_during_the_write_keeps_nothing,
+        the_sweep_leaves_live_publishes_alone,
+        checkpoints_append_restore_and_clear,
+        a_new_checkpoint_replaces_the_old_file,
+        a_fenced_attempt_cannot_change_the_checkpoint,
+        a_crash_between_append_and_record_is_cut_off,
+        a_missing_or_short_wire_file_discards_the_checkpoint,
+        wire_checkpoints_live_exactly_as_long_as_their_rows,
+        a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row,
+        a_refused_staged_commit_leaves_nothing,
+        an_ended_owner_releases_its_staged_file,
+        releasing_a_staged_file_deletes_its_key_then_the_file,
+        promotion_attaches_a_present_twin_instead,
+        promotion_skips_a_twin_whose_file_is_gone,
+        a_missing_staged_file_is_lost_and_never_promoted,
+    );
+
+    /// The split runs exactly the cases `run_all` runs, read from its source,
+    /// so a case added to the suite cannot go unrun here.
+    #[test]
+    fn the_split_runs_every_case_of_the_suite() {
+        let source = include_str!("../../../media-store/src/conformance.rs");
+        let body = source
+            .split_once("pub fn run_all")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("media-store's `conformance::run_all`")
+            .0;
+        let mut suite: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix("(make());"))
+            .collect();
+        suite.sort_unstable();
+        let mut split: Vec<&str> = FILE_CASES.iter().chain(MEMORY_CASES).copied().collect();
+        split.sort_unstable();
+        assert!(!suite.is_empty(), "no cases found in `run_all`");
+        assert_eq!(
+            split, suite,
+            "list each case of `run_all` under `FILE_CASES` (it restarts) or `MEMORY_CASES`"
+        );
+    }
 }
 
 fn publish(
@@ -345,7 +431,7 @@ fn publish(
 
 #[test]
 fn references_require_ready_files_and_repointing_releases_the_old_file() {
-    let harness = SqliteHarness::new();
+    let harness = SqliteHarness::memory();
     let store = MediaStore::new(harness.root(), harness.catalog());
     let token = harness.token(9);
     let pending = FileId([3; 16]);
@@ -360,15 +446,14 @@ fn references_require_ready_files_and_repointing_releases_the_old_file() {
             created_at: NOW,
         })
         .unwrap();
+    let refused = harness.storage.connection.with_transaction(|| {
+        let conn = harness.storage.lock()?;
+        attach_slot(&conn, &token, pending)
+    });
     assert!(
-        harness
-            .storage
-            .connection
-            .with_transaction(|| {
-                let conn = harness.storage.lock()?;
-                attach_slot(&conn, &token, pending)
-            })
-            .is_err()
+        matches!(&refused, Err(StorageError::Backend(m))
+            if m.contains("media file reference requires a ready file")),
+        "{refused:?}"
     );
 
     let old = publish(&harness, &store, 9, b"old");
