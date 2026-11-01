@@ -830,6 +830,16 @@ c_cmd! {
     /// the chat doesn't take a same-account removal; a chat admin can remove it.
     /// Zero while device groups are off. Not evented: read it when showing the device list.
     async fn marmot_removed_device_leftover_chats(account_ref: str) -> scalar(u32) = removed_device_leftover_chats;
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves. Once a
+    /// link this device approved is made, the new device is added to this
+    /// device's other chats when its "add to all my chats" setting is on. A
+    /// chat admin can turn the component on; removing a device frees its
+    /// leaves. Zero while device groups are off. Not evented: read it when
+    /// showing the device list.
+    async fn marmot_chats_closed_to_linked_devices(account_ref: str) -> scalar(u32) = chats_closed_to_linked_devices;
 
     /// List the sign-ins of this account that this device does not
     /// recognize, the earliest to appear first. Always empty in release

@@ -2475,6 +2475,18 @@ How many chats this device is in still hold a device this account no longer has,
 
 [Source](src/commands/linked_device.rs#L95)
 
+### `Marmot::chats_closed_to_linked_devices`
+
+**Current.**
+
+```rust
+pub async fn chats_closed_to_linked_devices( &self, account_ref: String, ) -> Result<u32, MarmotKitError>
+```
+
+How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, name no relays a sibling Welcome can carry, or already hold this account's limit of 20 leaves. Once a link this device approved is made, MDK adds the new device to this device's other chats by itself when its "add to all my chats" setting is on; these chats are passed over. A chat admin can turn the component on; removing a device frees its leaves. Show the count beside the device list, as "N chats can't add your other devices". Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
+
+[Source](src/commands/linked_device.rs#L116)
+
 </details>
 
 <details>

@@ -8250,6 +8250,27 @@ MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *cli
                                                   uint32_t *out);
 
 /**
+ * How many chats this device is in can't take any device of this
+ * account, linked or not: they don't require
+ * `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+ * can carry, or already hold this account's limit of 20 leaves. Once a
+ * link this device approved is made, the new device is added to this
+ * device's other chats when its "add to all my chats" setting is on. A
+ * chat admin can turn the component on; removing a device frees its
+ * leaves. Zero while device groups are off. Not evented: read it when
+ * showing the device list.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   uint32_t *out);
+
+/**
  * List the sign-ins of this account that this device does not
  * recognize, the earliest to appear first. Always empty in release
  * builds until the roster's spec lands. Re-read on the

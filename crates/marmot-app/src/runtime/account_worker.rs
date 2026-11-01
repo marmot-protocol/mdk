@@ -534,6 +534,9 @@ pub(crate) enum AccountWorkerCommand {
     RemovedDeviceLeftoverChats {
         respond: oneshot::Sender<Result<u32, AppError>>,
     },
+    ChatsClosedToLinkedDevices {
+        respond: oneshot::Sender<Result<u32, AppError>>,
+    },
     SignOutThroughSiblingsStep {
         respond: oneshot::Sender<Result<crate::client::sign_out::SiblingSignOut, AppError>>,
     },
@@ -6282,6 +6285,15 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ChatsClosedToLinkedDevices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.chats_closed_to_linked_devices(),
             );
             true
         }),

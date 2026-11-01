@@ -2733,6 +2733,23 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves (mdk#2628
+    /// item 3.5c). Once a link this device approved is made, the new device
+    /// is added to this device's other chats when its "add to all my chats"
+    /// setting is on. A chat admin can turn the component on; removing a
+    /// device frees its leaves.
+    /// Zero until this device trusts a device group, and always zero in
+    /// release builds until the device group's spec lands. Read it when
+    /// showing the device list; it is not evented.
+    pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
+        self.accounts
+            .chats_closed_to_linked_devices(account_ref)
+            .await
+    }
+
     /// Make new recovery words for the account's backups (mdk#2628 item
     /// 4.4a), in place of any not yet confirmed. Show the 12 words once, then
     /// ask for the words at `confirm_positions` and pass them to

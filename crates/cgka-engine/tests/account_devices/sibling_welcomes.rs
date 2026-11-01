@@ -12,16 +12,19 @@
 //! again. A direct send's refusal comes before anything is written; so does a
 //! queued one's, checked before the queue, and the drain checks it again.
 
-use super::device_roster::{key_package_ref, slot};
+use super::device_roster::{key_package_ref, roster_device, slot};
 use super::device_tag::hold_slot;
 use super::send_intents::Untouched;
 use super::tagged_siblings::*;
 use super::*;
 use cgka_engine::private_key_packages::SiblingWelcome;
+use cgka_traits::app_components::DEVICE_ROSTER_COMPONENT_ID;
 use cgka_traits::engine::KeyPackageSource;
+use cgka_traits::error::SiblingAddRefusal;
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
+use std::sync::{Arc, Mutex};
 
 /// `device`'s sibling Welcome rows in `gid`.
 fn sibling_rows(device: &Device, gid: &GroupId) -> Vec<(MessageState, StoredMessagePayload)> {
@@ -143,6 +146,88 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
     };
 }
 
+/// A forensic state row: the message id, the state it left, the state it
+/// entered and its epoch.
+type StateRow = (String, Option<String>, String, Option<u64>);
+
+/// The forensic rows naming one message's state changes.
+#[derive(Clone, Default)]
+struct StateRows(Arc<Mutex<Vec<StateRow>>>);
+
+impl StateRows {
+    fn of(&self, id: &MessageId) -> Vec<(Option<String>, String, Option<u64>)> {
+        let id = hex::encode(id.as_slice());
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(msg_id, ..)| *msg_id == id)
+            .map(|(_, previous, new, epoch)| (previous.clone(), new.clone(), *epoch))
+            .collect()
+    }
+}
+
+impl marmot_forensics::ForensicRecorder for StateRows {
+    fn record(&self, record: marmot_forensics::AuditRecord) {
+        if let marmot_forensics::AuditEventKind::MessageStateChanged {
+            msg_id,
+            previous_state,
+            new_state,
+            epoch,
+            ..
+        } = record.kind
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((msg_id, previous_state, new_state, epoch));
+        }
+    }
+}
+
+/// A delivered sibling Welcome writes the forensic row an invite Welcome's
+/// state change writes: from sent to processed, at its epoch. Carrying it
+/// and clearing a failed carrier change no state and write none.
+#[tokio::test]
+async fn a_delivered_sibling_welcome_writes_its_state_row() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let state_rows = StateRows::default();
+    let mut bob = super::device_roster::recorded_roster_device_on(
+        storage,
+        b"bob",
+        Box::new(state_rows.clone()),
+    );
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    let [owed_now] = &owed(&bob)[..] else {
+        panic!("one owed sibling Welcome")
+    };
+    let id = owed_now.id.clone();
+    let epoch = bob.storage.get_message(&id).unwrap().epoch.0;
+
+    assert!(bob.engine.carry_sibling_welcome(&id, b"first").unwrap());
+    assert!(
+        bob.engine
+            .sibling_welcome_send_failed(&id, b"first")
+            .unwrap()
+    );
+    assert!(bob.engine.carry_sibling_welcome(&id, b"second").unwrap());
+    assert!(state_rows.of(&id).is_empty());
+    assert!(
+        bob.engine
+            .sibling_welcome_delivered(&id, b"second")
+            .unwrap()
+    );
+    assert_eq!(
+        state_rows.of(&id),
+        vec![(Some("sent".into()), "processed".into(), Some(epoch))]
+    );
+}
+
 /// A sibling Welcome is owed until its KeyPackage expires, when the sibling
 /// drops the key. From then on nothing sends it; its row stays as it is, as
 /// an invite Welcome's does past its deadline.
@@ -242,6 +327,8 @@ async fn a_sibling_welcome_fails_with_its_commit() {
 /// Each sibling Add the sender cannot back with a sibling Welcome is refused
 /// before anything is written: the chat's rows, record and epoch stay as they
 /// were, and no Commit is left staged, so a valid Add still goes through.
+/// The pre-check a host runs before it takes a KeyPackage names each refusal
+/// of one sibling, writing nothing either, and passes the valid Add.
 #[tokio::test]
 async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     let (bob, mut new, device_gid) = tagged_devices(b"bob", 2).await;
@@ -277,9 +364,20 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
             .unwrap()
             .with_protocol_profile(ProtocolProfile::Current),
     };
+    // Its profile is not the chat's.
+    let legacy = SiblingKeyPackage {
+        key_package: laptop
+            .key_package
+            .clone()
+            .with_protocol_profile(ProtocolProfile::Legacy),
+        ..laptop.clone()
+    };
     let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
     let assert_untouched = |bob: &Device| {
         assert_eq!((Untouched::of(bob, &gid), rows(bob, &gid)), before);
+    };
+    let pre_check = |bob: &Device, chat: &GroupId, sibling: &SiblingKeyPackage| {
+        bob.engine.sibling_add_refusal(chat, sibling).unwrap()
     };
     for (siblings, reason) in [
         (
@@ -295,7 +393,19 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
         (vec![named(&laptop, 9)], "not tagged as the sender's"),
         (vec![untagged], "not tagged as the sender's"),
         (vec![last_resort], "last resort"),
+        (
+            vec![legacy],
+            "says Legacy, but its decoded account proof is Current",
+        ),
     ] {
+        if let [sibling] = &siblings[..] {
+            assert_eq!(
+                pre_check(&m.bob, &gid, sibling),
+                Some(SiblingAddRefusal::KeyPackage),
+                "{reason}"
+            );
+            assert_untouched(&m.bob);
+        }
         assert_refused(
             m.bob.engine.send(add_own_devices(&gid, siblings)).await,
             reason,
@@ -306,6 +416,10 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     // bob is not tagged: his slot is not in the roster, or he names no
     // device group.
     hold_slot(&m.bob, slot(9));
+    assert_eq!(
+        pre_check(&m.bob, &gid, &laptop),
+        Some(SiblingAddRefusal::NotTagged)
+    );
     assert_refused(
         m.bob
             .engine
@@ -316,6 +430,10 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     assert_untouched(&m.bob);
     hold_slot(&m.bob, slot(1));
     m.bob.engine.set_device_tag_group(None).unwrap();
+    assert_eq!(
+        pre_check(&m.bob, &gid, &laptop),
+        Some(SiblingAddRefusal::NotTagged)
+    );
     assert_refused(
         m.bob
             .engine
@@ -331,6 +449,12 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     let bob_kp = m.bob.engine.fresh_key_package().await.unwrap();
     let unrouted = found_group(&mut alice, vec![bob_kp], true, &mut [&mut m.bob]).await;
     let unrouted_before = (Untouched::of(&m.bob, &unrouted), rows(&m.bob, &unrouted));
+    for refusal in [
+        pre_check(&m.bob, &unrouted, &laptop),
+        m.bob.engine.chat_sibling_add_refusal(&unrouted).unwrap(),
+    ] {
+        assert_eq!(refusal, Some(SiblingAddRefusal::ChatRelays));
+    }
     assert_refused(
         m.bob
             .engine
@@ -353,6 +477,12 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     )
     .await;
     let twice_before = (Untouched::of(&m.bob, &twice), rows(&m.bob, &twice));
+    for refusal in [
+        pre_check(&m.bob, &twice, &laptop),
+        m.bob.engine.chat_sibling_add_refusal(&twice).unwrap(),
+    ] {
+        assert_eq!(refusal, Some(SiblingAddRefusal::ChatRelays));
+    }
     assert_refused(
         m.bob
             .engine
@@ -365,6 +495,68 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
         twice_before
     );
 
+    // A chat that does not require 0x800d takes no same-account Add.
+    let mut alice = chat_device(b"alice");
+    let bob_kp = m.bob.engine.fresh_key_package().await.unwrap();
+    let legacy_chat = found_group(&mut alice, vec![bob_kp], false, &mut [&mut m.bob]).await;
+    let legacy_before = (
+        Untouched::of(&m.bob, &legacy_chat),
+        rows(&m.bob, &legacy_chat),
+    );
+    for refusal in [
+        pre_check(&m.bob, &legacy_chat, &laptop),
+        m.bob.engine.chat_sibling_add_refusal(&legacy_chat).unwrap(),
+    ] {
+        assert_eq!(refusal, Some(SiblingAddRefusal::AccountDevicesNotRequired));
+    }
+    assert_not_required(
+        m.bob
+            .engine
+            .send(add_own_devices(&legacy_chat, vec![laptop.clone()]))
+            .await,
+    );
+    assert_eq!(
+        (
+            Untouched::of(&m.bob, &legacy_chat),
+            rows(&m.bob, &legacy_chat)
+        ),
+        legacy_before
+    );
+
+    // A chat where bob's account holds as many leaves as it may.
+    let mut alice = chat_device(b"alice");
+    let template = m.bob.engine.fresh_key_package().await.unwrap();
+    let full = found_group_routed_with(
+        &mut alice,
+        &mut [&mut m.bob],
+        (1..MAX_LEAVES_PER_ACCOUNT)
+            .map(|_| sibling_key_package(&template, b"bob"))
+            .collect(),
+        &[RELAY],
+    )
+    .await;
+    let full_before = (Untouched::of(&m.bob, &full), rows(&m.bob, &full));
+    for refusal in [
+        pre_check(&m.bob, &full, &laptop),
+        m.bob.engine.chat_sibling_add_refusal(&full).unwrap(),
+    ] {
+        assert_eq!(refusal, Some(SiblingAddRefusal::AccountLeaves));
+    }
+    assert_refused(
+        m.bob
+            .engine
+            .send(add_own_devices(&full, vec![laptop.clone()]))
+            .await,
+        &limit_error(),
+    );
+    assert_eq!(
+        (Untouched::of(&m.bob, &full), rows(&m.bob, &full)),
+        full_before
+    );
+
+    assert_eq!(pre_check(&m.bob, &gid, &laptop), None);
+    assert_eq!(m.bob.engine.chat_sibling_add_refusal(&gid).unwrap(), None);
+    assert_untouched(&m.bob);
     send_commit(
         &mut m.bob,
         add_own_devices(&gid, vec![laptop, tablet]),
@@ -372,6 +564,43 @@ async fn a_sibling_add_refused_for_its_welcome_writes_nothing() {
     )
     .await;
     assert_eq!(owed(&m.bob).len(), 2);
+}
+
+/// A sibling whose KeyPackage does not advertise everything the chat
+/// requires, as an older app's would not, cannot be added there. The
+/// pre-check names it before a host takes the KeyPackage, though the chat
+/// itself takes same-account Adds, and the send refuses it, writing nothing.
+#[tokio::test]
+async fn a_sibling_add_the_chat_requires_more_for_is_named_by_the_pre_check() {
+    let older = device_advertising(
+        b"bob",
+        &[ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+    );
+    let (bob, mut new, _) = tag_devices(vec![roster_device(b"bob"), older]).await;
+    let mut m = routed_members(chat_device(b"alice"), bob).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    let before = (Untouched::of(&m.bob, &gid), rows(&m.bob, &gid));
+
+    assert_eq!(m.bob.engine.chat_sibling_add_refusal(&gid).unwrap(), None);
+    assert_eq!(
+        m.bob.engine.sibling_add_refusal(&gid, &sibling).unwrap(),
+        Some(SiblingAddRefusal::KeyPackage)
+    );
+    let refused = m
+        .bob
+        .engine
+        .send(add_own_devices(&gid, vec![sibling]))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::MissingRequiredCapabilities { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!((Untouched::of(&m.bob, &gid), rows(&m.bob, &gid)), before);
 }
 
 /// A same-account Add sent while the chat's convergence is pending is

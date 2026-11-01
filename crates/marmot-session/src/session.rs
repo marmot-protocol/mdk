@@ -1772,6 +1772,23 @@ impl AccountDeviceSession {
         self.engine.account_devices_activation_refusal(group_id)
     }
 
+    /// See [`cgka_engine::engine::Engine::sibling_add_refusal`].
+    pub fn sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+        sibling: &cgka_traits::engine::SiblingKeyPackage,
+    ) -> Result<Option<cgka_traits::error::SiblingAddRefusal>, EngineError> {
+        self.engine.sibling_add_refusal(group_id, sibling)
+    }
+
+    /// See [`cgka_engine::engine::Engine::chat_sibling_add_refusal`].
+    pub fn chat_sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<cgka_traits::error::SiblingAddRefusal>, EngineError> {
+        self.engine.chat_sibling_add_refusal(group_id)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.engine.acknowledge_disband_failure(group_id)
     }

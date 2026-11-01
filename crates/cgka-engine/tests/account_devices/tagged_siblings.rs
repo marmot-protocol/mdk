@@ -31,7 +31,12 @@ pub(super) fn chat_device(account: &[u8]) -> Device {
 /// group, whose id it returns: the first at slot 1 and each of the others at
 /// the slot after, every one tagged.
 pub(super) async fn tagged_devices(account: &[u8], new: usize) -> (Device, Vec<Device>, GroupId) {
-    let mut devices: Vec<Device> = (0..=new).map(|_| roster_device(account)).collect();
+    tag_devices((0..=new).map(|_| roster_device(account)).collect()).await
+}
+
+/// [`tagged_devices`] of `devices`, one account's, at most three.
+pub(super) async fn tag_devices(mut devices: Vec<Device>) -> (Device, Vec<Device>, GroupId) {
+    let new = devices.len() - 1;
     let labels = [(1, "Phone"), (2, "Laptop"), (3, "Tablet")];
     let (first, rest) = devices.split_first_mut().unwrap();
     let mut joiners: Vec<&mut Device> = rest.iter_mut().collect();
@@ -68,10 +73,22 @@ pub(super) async fn found_group_routed_through(
     joiners: &mut [&mut Device],
     relays: &[&str],
 ) -> GroupId {
+    found_group_routed_with(founder, joiners, Vec::new(), relays).await
+}
+
+/// [`found_group_routed_through`] with the leaves of `others` too, after the
+/// joiners' leaves. Nothing joins from them.
+pub(super) async fn found_group_routed_with(
+    founder: &mut Device,
+    joiners: &mut [&mut Device],
+    others: Vec<KeyPackage>,
+    relays: &[&str],
+) -> GroupId {
     let mut key_packages = Vec::new();
     for joiner in joiners.iter_mut() {
         key_packages.push(joiner.engine.fresh_key_package().await.unwrap());
     }
+    key_packages.extend(others);
     let relays = relays.iter().map(|relay| relay.to_string()).collect();
     let routing = NostrRoutingV1::new([0x43; 32], relays).unwrap();
     let (gid, created) = founder

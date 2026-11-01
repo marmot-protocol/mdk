@@ -435,7 +435,7 @@ impl AppClient {
                 first_error.get_or_insert(error);
             }
         }
-        for chat_id in self.chats_to_clean_up() {
+        for chat_id in self.sibling_commit_chats() {
             let removal = match self.gone_device_leaves_in(&chat_id, &roster, &gone) {
                 Ok(keys) if keys.is_empty() => continue,
                 Ok(keys) => self.remove_own_account_leaves(&chat_id, keys).await,
@@ -465,7 +465,7 @@ impl AppClient {
         };
         let gone = self.gone_devices(&group_id, &roster)?;
         let mut leftovers = 0u32;
-        for chat_id in self.chats_to_clean_up() {
+        for chat_id in self.sibling_commit_chats() {
             if !self
                 .gone_device_leaves_in(&chat_id, &roster, &gone)?
                 .is_empty()
@@ -543,11 +543,12 @@ impl AppClient {
         )
     }
 
-    /// The chats this device is in that may hold a removed device's leaves:
-    /// not the device group, nor a chat that has ended or is quarantined.
-    /// Chats not hydrated yet are left to a later pass rather than hydrated
-    /// here, ahead of the background order.
-    fn chats_to_clean_up(&self) -> Vec<GroupId> {
+    /// The chats this device is in that may take a commit about its own
+    /// account's devices, removing a gone device's leaves or adding a new
+    /// one: not the device group, nor a chat that has ended or is
+    /// quarantined. Chats not hydrated yet are left to a later pass rather
+    /// than hydrated here, ahead of the background order.
+    pub(super) fn sibling_commit_chats(&self) -> Vec<GroupId> {
         let unhydrated = self
             .runtime
             .unhydrated_group_ids()

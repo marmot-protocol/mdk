@@ -286,12 +286,17 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged adder, a chat
     that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
     refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
-    by then.
+    by then. The read-only pre-check a host runs before it takes a KeyPackage (`sibling_add_refusal`,
+    `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
+    included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
+    invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
-  - **Owns:** No tests. Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how
-    the gated same-account tests in `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a
-    sibling: tagged devices, a chat that names relays, and a join through the sibling Welcome the Add owes.
+  - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
+    `found_group_routed_with`, `handed`, `assert_joins_from`) are how the gated same-account tests in
+    `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a sibling: tagged devices, a chat
+    that names relays, optionally with further leaves of an account, and a join through the sibling Welcome the Add
+    owes.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
