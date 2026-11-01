@@ -171,7 +171,9 @@
   (`held_as_removed`). `SqliteAccountStorage` implements the new
   `RosterTagKeyStorage`. Rows survive a branch-selection
   rewind, go with their group, and are pruned after 30 days or past 4 per
-  slot. Nothing writes them unless device groups are on.
+  slot; a slot's newest row held as removed is kept past the 4, so the slot
+  stays known to have held its `removed` record. Nothing writes them unless
+  device groups are on.
 - Migration 0146 advances account storage to schema 146 (mdk#2628 item 3.6b).
   It adds `device_removals`, one row per device this device's user removed
   from the account's device group, written before anything is committed, with

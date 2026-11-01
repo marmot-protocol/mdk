@@ -50,12 +50,17 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         conn.execute_cached(
             "DELETE FROM cgka_roster_tag_keys WHERE rowid IN (
                  SELECT rowid FROM (
-                     SELECT rowid, ROW_NUMBER() OVER (
-                         PARTITION BY group_id, slot
-                         ORDER BY seen_seq DESC
-                     ) AS newest
+                     SELECT rowid, held_as_removed,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY group_id, slot
+                             ORDER BY seen_seq DESC
+                         ) AS newest,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY group_id, slot, held_as_removed
+                             ORDER BY seen_seq DESC
+                         ) AS newest_of_its_kind
                      FROM cgka_roster_tag_keys
-                 ) WHERE newest > ?1
+                 ) WHERE newest > ?1 AND NOT (held_as_removed AND newest_of_its_kind = 1)
              )",
             params![u64_to_i64(per_slot as u64)?],
         )
@@ -198,6 +203,35 @@ mod tests {
             store.roster_tag_keys(&gid(1), 0).unwrap(),
             vec![key(1, 4), key(2, 14), key(3, 1), key(3, 3)]
         );
+        // A slot's newest key held as removed outlasts newer keys past the
+        // cap, so the slot stays known to have held its `removed` record; an
+        // older one does not, and neither outlasts the time bound.
+        let held = |n| RosterTagKey {
+            held_as_removed: true,
+            ..key(4, n)
+        };
+        store
+            .record_roster_tag_keys(
+                &gid(1),
+                &[held(1), held(2), key(4, 3), key(4, 4), key(4, 5)],
+                500,
+            )
+            .unwrap();
+        store.prune_roster_tag_keys(400, 2).unwrap();
+        assert_eq!(
+            store.roster_tag_keys(&gid(1), 0).unwrap(),
+            vec![
+                key(1, 4),
+                key(2, 14),
+                key(3, 1),
+                key(3, 3),
+                key(4, 5),
+                key(4, 4),
+                held(2)
+            ]
+        );
+        store.prune_roster_tag_keys(600, 2).unwrap();
+        assert!(store.roster_tag_keys(&gid(1), 0).unwrap().is_empty());
     }
 
     /// A branch-selection rewind keeps the keys the dropped branch listed; a

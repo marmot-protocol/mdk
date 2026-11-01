@@ -1079,7 +1079,8 @@ pub struct RosterTagKey {
 pub const ROSTER_TAG_KEY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// How many tag signature keys each slot of a group keeps, newest first. A
-/// slot holds one per link of it.
+/// slot holds one per link of it. Its newest key held as removed is kept
+/// besides, so a slot keeps at most one more.
 pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
 
 /// Every tag signature key a device-group roster this device held listed, by
@@ -1099,7 +1100,9 @@ pub trait RosterTagKeyStorage {
         seen_at: u64,
     ) -> StorageResult<()>;
     /// Drop every key last seen before `before`, and each group slot's keys
-    /// beyond its `per_slot` most recently seen.
+    /// beyond its `per_slot` most recently seen, except the slot's most
+    /// recently seen key held as removed: that one goes only by time, so the
+    /// slot stays known to have held its `removed` record.
     fn prune_roster_tag_keys(&self, before: u64, per_slot: usize) -> StorageResult<()>;
     /// What `group_id`'s rosters listed, last seen at or after `since`: by
     /// slot, and within a slot the most recently seen first.

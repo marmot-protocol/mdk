@@ -1938,5 +1938,33 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
                 .contains_key(&laptop_slot),
             "the record is made once"
         );
+        // Four later states list newer keys for the slot, then it is unlisted
+        // again. The key the record carried is no longer among the slot's
+        // four newest, and still the record is not made again.
+        for key in 2..=5 {
+            let entry = DeviceEntryV1 {
+                tag_signature_key: Some(vec![key; 32]),
+                ..entry.clone()
+            };
+            commit_roster(
+                &mut phone,
+                &group,
+                vec![DeviceRosterOperationV1::SetDevice(laptop_slot, entry)],
+            )
+            .await;
+        }
+        commit_roster(
+            &mut phone,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveDevice(laptop_slot)],
+        )
+        .await;
+        phone.run_due_maintenance().await.unwrap();
+        assert!(
+            !roster(&phone, &group)
+                .rejected_slots
+                .contains_key(&laptop_slot),
+            "newer keys past the cap leave the record made once"
+        );
     }
 }
