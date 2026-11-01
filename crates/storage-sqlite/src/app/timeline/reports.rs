@@ -1166,6 +1166,11 @@ mod tests {
         record(&s_app, &removal(4, 1));
         let current = s_app.reported_message(&id(99), &id(1)).unwrap().unwrap();
         assert!(current.deleted && current.plaintext.is_empty());
+        // It reads past blocks only for a reported message, so it is never a
+        // by-id read of any other message from a blocked sender.
+        record(&s_app, &event(6, 10, 9, vec![], "never reported"));
+        assert!(s_app.timeline_message(&id(99), &id(6)).unwrap().is_none());
+        assert!(s_app.reported_message(&id(99), &id(6)).unwrap().is_none());
     }
     #[test]
     fn new_kind_five_is_author_only_but_existing_legacy_tombstones_survive() {
@@ -1333,6 +1338,37 @@ mod tests {
         s.invalidate_app_event_by_source(&id(2), "withdrawn")
             .unwrap();
         assert!(s.timeline_message(&id(99), &id(1)).unwrap().is_none());
+
+        // The evidence kept for an expired kind-5 is scrubbed to its target
+        // reference and kind: no relay hint, marker, or text-bearing tag.
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let mut author_delete = event(
+            5,
+            10,
+            5,
+            vec![
+                vec!["e".into(), id(1), "relay".into(), "marker".into()],
+                vec!["k".into(), "9".into()],
+                vec!["alt".into(), "the deleted text".into()],
+            ],
+            "",
+        );
+        author_delete.recorded_at = 2;
+        for e in [target(), author_delete] {
+            record(&s, &e);
+        }
+        s.secure_prune_app_events_before(&id(99), 3, &id(10), &|_, _| false)
+            .unwrap();
+        assert_eq!(
+            raw(&s.lock().unwrap(), &id(99), &id(5))
+                .unwrap()
+                .expect("deletion evidence is kept")
+                .tags,
+            vec![
+                vec!["e".to_owned(), id(1)],
+                vec!["k".to_owned(), "9".to_owned()]
+            ]
+        );
     }
     fn imported(e: &StoredAppEvent, grant: Option<bool>) -> crate::ImportedAppEvent {
         crate::ImportedAppEvent {

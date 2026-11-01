@@ -1132,6 +1132,7 @@ fn invalidate_by_origin_commit_tombstones_all_rows_from_one_commit() {
     assert!(changed_ids.contains(&"losing-added"));
     assert!(changed_ids.contains(&"losing-admin"));
     assert!(!changed_ids.contains(&"winning-added"));
+    assert_eq!(changed_ids.len(), 2, "one change per withdrawn row");
 
     // Rows are kept (tombstoned), not deleted; both losing rows carry the
     // invalidation status while the winning row stays live.
@@ -1380,6 +1381,7 @@ fn revalidating_an_origin_commit_revives_only_branch_selection_withdrawals() {
     assert!(changed_ids.contains(&"parked-admin"));
     assert!(!changed_ids.contains(&"other-added"));
     assert!(!changed_ids.contains(&"sibling-added"));
+    assert_eq!(changed_ids.len(), 2, "one change per revived row");
 
     let rows = list(&store);
     let status = |id: &str| {
@@ -2612,6 +2614,15 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         moderation_grant: false,
     };
 
+    let tagless = StoredAppEvent {
+        message_id_hex: "tagless".to_owned(),
+        source_message_id_hex: Some("source-tagless".to_owned()),
+        tags: Vec::new(),
+        recorded_at: 3,
+        received_at: 3,
+        ..start.clone()
+    };
+
     store.record_app_event(&start).unwrap();
     store.record_app_event(&final_event).unwrap();
 
@@ -2656,6 +2667,37 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
             .and_then(Value::as_str),
         Some("finalized")
     );
+
+    // Every invalidation, revival and prune rebuilds the whole group, which
+    // must reproject the stream exactly as recording did.
+    store
+        .rebuild_message_timeline_for_group(&"11".repeat(32))
+        .unwrap();
+    assert_eq!(list(&store), messages);
+
+    // An invalidated start stays a tombstone, not a live stream.
+    store
+        .invalidate_app_event_by_source("source-start", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+    let start = list(&store)
+        .into_iter()
+        .find(|message| message.message_id_hex == "start")
+        .expect("invalidated start kept as a tombstone");
+    assert_eq!(start.invalidation_status.as_deref(), Some("LosingBranch"));
+
+    // A start without a stream tag has no row on either path.
+    store.record_app_event(&tagless).unwrap();
+    let has_tagless = |store: &SqliteAppStorage| {
+        list(store)
+            .iter()
+            .any(|message| message.message_id_hex == "tagless")
+    };
+    assert!(!has_tagless(&store));
+    store
+        .rebuild_message_timeline_for_group(&"11".repeat(32))
+        .unwrap();
+    assert!(!has_tagless(&store));
 }
 
 #[test]
@@ -2886,6 +2928,38 @@ fn reaction_source_invalidation_returns_changed_target_projection() {
 }
 
 #[test]
+fn invalidating_a_reaction_retraction_restores_the_reaction() {
+    // A rewind that withdraws the delete which retracted a reaction brings the
+    // reaction back, and live screens learn it as a reaction added.
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&delete("retract", "bob", "reaction-1", 3))
+        .unwrap();
+    assert!(list(&store)[0].reactions.by_emoji.is_empty());
+
+    let update = store
+        .invalidate_app_event_by_source("source-retract", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::ReactionAdded,
+            message,
+        }] if message.message_id_hex == "target"
+            && message.reactions.by_emoji.get("+").map(Vec::as_slice)
+                == Some(["bob".to_owned()].as_slice())
+    ));
+}
+
+#[test]
 fn orphan_reaction_invalidation_does_not_remove_missing_target() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
@@ -3049,6 +3123,16 @@ fn reaction_deleted_by_its_sender_is_excluded_but_other_sender_does_not_retract(
         message.reactions.user_reactions.len(),
         1,
         "a delete by a different sender must not retract the reaction"
+    );
+    // Every invalidation and rewind rebuilds the group, which applies the
+    // same author rule.
+    store
+        .rebuild_message_timeline_for_group(&"11".repeat(32))
+        .unwrap();
+    assert_eq!(
+        list(&store).pop().unwrap().reactions.user_reactions.len(),
+        1,
+        "a rebuild must not let a different sender retract the reaction"
     );
 
     // The reaction author's own delete retracts it.
@@ -3378,12 +3462,50 @@ fn sweeping_a_terminal_group_invalidates_only_its_own_unpublished_sends() {
     store
         .record_app_event(&pending_sent(&live_group, "other-group-held", 14))
         .unwrap();
+    // Two held reactions on one received row: one live update for it, not two.
+    for (id, emoji) in [("held-like", "+"), ("held-wave", "wave")] {
+        store
+            .record_app_event(&StoredAppEvent {
+                source_message_id_hex: None,
+                direction: "sent".to_owned(),
+                ..reaction(id, "self", "received", 15, emoji)
+            })
+            .unwrap();
+    }
+    let reactions_on_received = |store: &SqliteAppStorage| {
+        list(store)
+            .into_iter()
+            .find(|row| row.message_id_hex == "received")
+            .map(|row| row.reactions.user_reactions.len())
+    };
+    assert_eq!(reactions_on_received(&store), Some(2));
 
     let update = store
         .invalidate_pending_sent_app_events_for_group(&dead_group, "local_publish_failed")
         .unwrap()
         .expect("held rows should produce an update");
     assert_eq!(update.group_id_hex, dead_group);
+    // Live screens learn of every swept send, once per affected row.
+    let mut changed = BTreeMap::<&str, usize>::new();
+    for change in &update.changes {
+        let TimelineMessageChange::Upsert { message, .. } = change else {
+            panic!("the sweep keeps tombstones, it never removes a row");
+        };
+        *changed.entry(message.message_id_hex.as_str()).or_default() += 1;
+        match message.message_id_hex.as_str() {
+            "held-a" | "held-b" => assert_eq!(
+                message.invalidation_status.as_deref(),
+                Some("local_publish_failed")
+            ),
+            "received" => assert!(message.reactions.user_reactions.is_empty()),
+            other => panic!("the sweep reported an unaffected row: {other}"),
+        }
+    }
+    assert_eq!(
+        changed,
+        BTreeMap::from([("held-a", 1), ("held-b", 1), ("received", 1)])
+    );
+    assert_eq!(reactions_on_received(&store), Some(0));
 
     let status = |group_id_hex: &str, id: &str| {
         store
@@ -4062,6 +4184,58 @@ fn pruning_accepted_edit_reverts_surviving_target_and_history() {
             .versions
             .is_empty()
     );
+
+    // The mirror case: an expiring message takes every edit of it along, even
+    // one recorded after the cutoff, because the edit holds its new text.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.record_app_event(&chat("expiring", "alice", 10, "original"))
+        .unwrap();
+    app.record_app_event(&edit("late-edit", "alice", "expiring", 100, "new text"))
+        .unwrap();
+    assert_eq!(
+        app.prune_app_events_before(&group, 50, "local", &|_, _| false)
+            .unwrap(),
+        2
+    );
+    let conn = store.lock().unwrap();
+    let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+    assert_eq!(
+        count("SELECT COUNT(*) FROM app_events WHERE message_id_hex = 'late-edit'"),
+        0
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM message_modifier_edges WHERE modifier_message_id_hex = 'late-edit'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn secure_prune_hands_the_host_only_well_formed_media_hashes() {
+    // The host deletes cached files named by these hashes, and a peer writes
+    // the imeta values, so only 64-hex values, lowercased, may reach it.
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut message = chat("media", "alice", 10, "");
+    message.tags = ["../../x".to_owned(), "abc".to_owned(), "AB".repeat(32)]
+        .into_iter()
+        .map(|hash| {
+            vec![
+                "imeta".to_owned(),
+                "m image/png".to_owned(),
+                format!("ciphertext_sha256 {hash}"),
+            ]
+        })
+        .collect();
+    store.record_app_event(&message).unwrap();
+
+    let pruned = store
+        .secure_prune_app_events_before(&"11".repeat(32), 50, "local", &|_, _| false)
+        .unwrap();
+
+    assert_eq!(pruned.pruned_messages, 1);
+    assert_eq!(pruned.media_ciphertext_sha256, vec!["ab".repeat(32)]);
 }
 
 #[test]

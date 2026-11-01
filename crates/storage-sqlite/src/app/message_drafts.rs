@@ -912,8 +912,42 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .media_attachments,
-            vec![second, first]
+            vec![second.clone(), first.clone()]
         );
+
+        // A new recording under a kept id replaces the stored bytes and
+        // metadata, in place and when the list is also reordered.
+        let rerecorded_second = StoredMessageDraftAttachment {
+            file_name: "second-take.m4a".to_owned(),
+            plaintext: vec![2, 2],
+            duration_seconds: Some(2.0),
+            waveform_samples: vec![0.5],
+            ..second
+        };
+        let rerecorded_first = StoredMessageDraftAttachment {
+            plaintext: vec![3, 3, 3],
+            waveform_samples: vec![0.25, 0.75],
+            ..first.clone()
+        };
+        for attachments in [
+            vec![rerecorded_second.clone(), first.clone()],
+            vec![rerecorded_first, rerecorded_second],
+        ] {
+            let revision = app.selected_message_draft(&group_id_hex).unwrap().revision;
+            app.save_message_draft(&group_id_hex, "draft", None, &attachments)
+                .unwrap();
+            assert_eq!(
+                app.message_draft(&group_id_hex)
+                    .unwrap()
+                    .unwrap()
+                    .media_attachments,
+                attachments
+            );
+            assert_ne!(
+                app.selected_message_draft(&group_id_hex).unwrap().revision,
+                revision
+            );
+        }
     }
 
     #[test]
