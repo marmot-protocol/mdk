@@ -4,6 +4,19 @@
 
 ### Breaking changes
 
+- Methods with no caller outside their own tests are gone (mdk#2816):
+  `SqliteAppStorage::remove_group_push_token`,
+  `remove_group_push_tokens_for_member` (use
+  `remove_group_push_tokens_for_leaves` with the member as departed),
+  `clear_epoch_backfill_intents_for_groups`,
+  `clear_local_group_deletion_frontier_if_message_is_newer`,
+  `record_app_event_refreshing_moderation_grant` and its `_with_retention`
+  variant (use `record_app_event_with_source`), `avatar_acquisition_state`
+  (read `AvatarAssetPresentation::acquisition`) and `release_media_reference`
+  (removal releases a slot's reference); `AvatarFileImage::byte_len`,
+  `DatabaseAvatar::byte_len`, `SqliteSharedStorage::set_telemetry_install_id`
+  and `impl Default for SqlCipherHardening` (use
+  `SqlCipherHardening::cipher_only`).
 - Imported timeline rows name their source device (mdk#2628 item 4.2d).
   `TimelineMessageRecord` adds `imported_from: Option<HistoryImportSource>`,
   read from `app_event_imports`, with the device's name from

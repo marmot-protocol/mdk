@@ -774,14 +774,16 @@ fn avatar_attempts_survive_reopen_and_fence_late_completion() {
 
 #[test]
 fn avatar_source_replacement_eviction_and_blocked_failures_do_not_refill() {
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let account = SqliteAccountStorage::in_memory().unwrap();
+    let owner = seeded_chat_owner(&account);
+    let store = account.app_storage();
     let a = store
-        .request_avatar_acquisition("chat:group", &selected_url("a"), false)
+        .request_avatar_acquisition(&owner, &selected_url("a"), false)
         .unwrap()
         .unwrap();
     let job = store.claim_avatar_acquisition(0).unwrap().unwrap();
     let b = store
-        .request_avatar_acquisition("chat:group", &selected_url("b"), false)
+        .request_avatar_acquisition(&owner, &selected_url("b"), false)
         .unwrap()
         .unwrap();
     assert_ne!(a, b);
@@ -795,7 +797,7 @@ fn avatar_source_replacement_eviction_and_blocked_failures_do_not_refill() {
     let current = store.claim_avatar_acquisition(0).unwrap().unwrap();
     store.fail_avatar_acquisition(&current, 0, false).unwrap();
     assert_eq!(
-        store.avatar_acquisition_state(&b).unwrap(),
+        presented_acquisition(&store, "b"),
         Some(AvatarAcquisitionState::Blocked)
     );
     assert!(
@@ -820,7 +822,7 @@ fn avatar_source_replacement_eviction_and_blocked_failures_do_not_refill() {
         .unwrap();
     store.resume_avatar_acquisition().unwrap();
     store.bootstrap_avatar_acquisition().unwrap();
-    assert!(store.avatar_reference("chat:group").unwrap().is_none());
+    assert!(store.avatar_reference(&owner).unwrap().is_none());
     assert!(
         store
             .claim_avatar_acquisition(u32::MAX as u64)
@@ -858,17 +860,19 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         app.avatar_status(&reference, 0).unwrap().availability,
         AvatarAvailability::Missing
     );
-    assert_eq!(
-        app.avatar_acquisition_state(&reference).unwrap(),
-        Some(AvatarAcquisitionState::Fetching)
-    );
     store
         .lock()
         .unwrap()
         .execute_batch("DROP TRIGGER reject_job_finish;")
         .unwrap();
-    app.complete_avatar_acquisition(&job, &image(1, 8), None)
-        .unwrap();
+    assert!(
+        matches!(
+            app.complete_avatar_acquisition(&job, &image(1, 8), None)
+                .unwrap(),
+            AvatarPublishResult::Published { .. }
+        ),
+        "the refused completion left its attempt current"
+    );
 }
 
 #[test]
@@ -909,6 +913,31 @@ fn avatar_visible_priority_and_corruption_repair_are_durable() {
 fn seed_avatar_group(store: &SqliteAccountStorage) {
     store.lock().unwrap().execute_batch("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES('group', 'fixture', '', 7, 2);
     INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES('group', 19, 7);").unwrap();
+}
+
+/// Seeds `group` and returns the avatar owner key of its chat, so a test can
+/// read the job's state the way the screen does ([`presented_acquisition`]).
+fn seeded_chat_owner(store: &SqliteAccountStorage) -> String {
+    seed_avatar_group(store);
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT 'chat:' || lower(hex(presentation_row_epoch)) FROM chat_list_rows
+             WHERE group_id_hex = 'group'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// The acquisition state the screen shows for `group`'s chat avatar `source`.
+fn presented_acquisition(store: &SqliteAppStorage, source: &str) -> Option<AvatarAcquisitionState> {
+    store
+        .avatar_target_presentation("group", None, &selected_url(source), 0)
+        .unwrap()
+        .expect("the chat presents an avatar")
+        .acquisition
 }
 
 #[test]
@@ -1091,9 +1120,11 @@ fn avatar_idle_maintenance_needs_no_write_transaction() {
 
 #[test]
 fn avatar_retry_budget_enters_daily_probes_and_recovers() {
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let reference = store
-        .request_avatar_acquisition("owner", &selected_url("a"), false)
+    let account = SqliteAccountStorage::in_memory().unwrap();
+    let owner = seeded_chat_owner(&account);
+    let store = account.app_storage();
+    store
+        .request_avatar_acquisition(&owner, &selected_url("a"), false)
         .unwrap()
         .unwrap();
     for n in 0..16 {
@@ -1102,14 +1133,15 @@ fn avatar_retry_budget_enters_daily_probes_and_recovers() {
         store.fail_avatar_acquisition(&job, now, true).unwrap();
     }
     assert_eq!(
-        store.avatar_acquisition_state(&reference).unwrap(),
-        Some(AvatarAcquisitionState::RetryScheduled)
+        presented_acquisition(&store, "a"),
+        Some(AvatarAcquisitionState::RetryScheduled),
+        "an exhausted budget probes daily; it never blocks"
     );
     let due = 15 * 3600 + 86400;
     // Restart and repeated visible demand must preserve the full cooldown.
     store.resume_avatar_acquisition().unwrap();
     store
-        .request_avatar_acquisition("owner", &selected_url("a"), true)
+        .request_avatar_acquisition(&owner, &selected_url("a"), true)
         .unwrap();
     assert!(store.claim_avatar_acquisition(due - 1).unwrap().is_none());
     let probe = store.claim_avatar_acquisition(due).unwrap().unwrap();
@@ -1153,7 +1185,7 @@ fn avatar_retry_budget_enters_daily_probes_and_recovers() {
             .is_some()
     );
     store
-        .request_avatar_acquisition("owner", &selected_url("new"), false)
+        .request_avatar_acquisition(&owner, &selected_url("new"), false)
         .unwrap();
     assert!(store.claim_avatar_acquisition(0).unwrap().is_some());
 }

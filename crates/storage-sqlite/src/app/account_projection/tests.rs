@@ -831,55 +831,6 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
 }
 
 #[test]
-fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    insert_protocol_group_marker(&store, &[0xaa]);
-    insert_protocol_group_marker(&store, &[0xbb]);
-
-    let aa_epoch_8 = StoredEpochBackfillIntent {
-        group_id_hex: "aa".to_owned(),
-        stalled_epoch: 8,
-    };
-    let bb_epoch_3 = StoredEpochBackfillIntent {
-        group_id_hex: "bb".to_owned(),
-        stalled_epoch: 3,
-    };
-    app.arm_epoch_backfill_intents(&[aa_epoch_8, bb_epoch_3.clone()])
-        .unwrap();
-
-    app.clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
-        .unwrap();
-    assert_eq!(
-        app.pending_epoch_backfill_intents().unwrap(),
-        vec![bb_epoch_3.clone()],
-        "clearing by group retires that group and leaves every other group armed"
-    );
-
-    // The stored epoch is not part of the key: re-arm at a different epoch and
-    // the same by-group clear still retires it.
-    app.arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
-        group_id_hex: "aa".to_owned(),
-        stalled_epoch: 41,
-    }])
-    .unwrap();
-    app.clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
-        .unwrap();
-    assert_eq!(
-        app.pending_epoch_backfill_intents().unwrap(),
-        vec![bb_epoch_3.clone()],
-        "a by-group clear is not epoch-sensitive"
-    );
-
-    app.clear_epoch_backfill_intents_for_groups(&[]).unwrap();
-    assert_eq!(
-        app.pending_epoch_backfill_intents().unwrap(),
-        vec![bb_epoch_3],
-        "an empty slice clears nothing"
-    );
-}
-
-#[test]
 fn pending_confirmation_group_invites_reads_only_pending_outlines() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     // One applied member group, one pending invite with a welcomer, one
@@ -3564,21 +3515,6 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         Some(repeated_frontier),
         "the check leaves the frontier for the caller's save to clear"
     );
-
-    // `clear_local_group_deletion_frontier_if_message_is_newer` has no
-    // production caller; these probes go with it.
-    assert!(
-        !app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
-            .unwrap()
-    );
-    assert_eq!(
-        app.local_group_deletion_frontier("aa").unwrap(),
-        Some(repeated_frontier)
-    );
-    assert!(
-        app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &fresh_message_id)
-            .unwrap()
-    );
 }
 
 #[test]
@@ -4240,26 +4176,6 @@ fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
     let stored = store.group_push_tokens(&g).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].owner_ts, 250);
-}
-
-#[test]
-fn member_cleanup_clears_tokens_and_tombstones() {
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let g = "aa".repeat(32);
-    let m = "bb".repeat(32);
-    store
-        .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 0, 200, "r2"))
-        .unwrap();
-    // Departed member: both the (empty) live set and the durable tombstone go.
-    store.remove_group_push_tokens_for_member(&g, &m).unwrap();
-    // With the tombstone gone, an old record could apply again — which is safe
-    // because the member is no longer in the group and verify_push_gossip would
-    // drop it upstream. Here we just confirm the tombstone no longer blocks.
-    assert!(
-        store
-            .apply_group_push_token(&push_token(&g, &m, 10, "d1"))
-            .unwrap()
-    );
 }
 
 /// A tombstone keeps the removal's fingerprint and signature, so it can be

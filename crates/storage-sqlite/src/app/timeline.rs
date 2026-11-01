@@ -537,10 +537,10 @@ impl SqliteAppStorage {
         &self,
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        // Default path freezes an existing row's moderation_grant on conflict
-        // (see the upsert below): a re-received or relay-echoed delete must not
-        // have its honored verdict recomputed against later admin state.
-        self.record_app_event_inner(event, false, None, None)
+        // An existing row's moderation_grant is frozen on conflict (see the
+        // upsert below): a re-received or relay-echoed delete must not have
+        // its honored verdict recomputed against later admin state.
+        self.record_app_event_inner(event, None, None)
     }
 
     /// Record an app event together with the normalized retention decision
@@ -550,28 +550,7 @@ impl SqliteAppStorage {
         event: &StoredAppEvent,
         retention: Option<AppMessageRetentionDecision>,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, false, retention, None)
-    }
-
-    /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
-    /// replaced with this event's value instead of frozen. Retained for callers
-    /// using the legacy optimistic-grant reconciliation API. Source-aware
-    /// callers should use [`Self::record_app_event_with_source`] instead.
-    pub fn record_app_event_refreshing_moderation_grant(
-        &self,
-        event: &StoredAppEvent,
-    ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, true, None, None)
-    }
-
-    /// Legacy grant reconciliation with retention; see
-    /// [`Self::record_app_event_refreshing_moderation_grant`].
-    pub fn record_app_event_refreshing_moderation_grant_with_retention(
-        &self,
-        event: &StoredAppEvent,
-        retention: Option<AppMessageRetentionDecision>,
-    ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, true, retention, None)
+        self.record_app_event_inner(event, retention, None)
     }
 
     /// Finalize an optimistic local row from the exact MLS state that encrypted
@@ -687,7 +666,6 @@ impl SqliteAppStorage {
     fn record_app_event_inner(
         &self,
         event: &StoredAppEvent,
-        refresh_moderation_grant: bool,
         retention: Option<AppMessageRetentionDecision>,
         authority: Option<Option<cgka_traits::app_event::AppMessageAuthority>>,
     ) -> StorageResult<TimelineProjectionUpdate> {
@@ -764,7 +742,7 @@ impl SqliteAppStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
-                    moderation_grant = CASE WHEN ?16 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
+                    moderation_grant = app_events.moderation_grant,
                     retention_seconds = COALESCE(app_events.retention_seconds, excluded.retention_seconds),
                     retention_expires_at = CASE
                         WHEN app_events.retention_seconds IS NULL THEN excluded.retention_expires_at
@@ -807,7 +785,6 @@ impl SqliteAppStorage {
                         .and_then(|decision| decision.expires_at)
                         .map(u64_to_i64)
                         .transpose()?,
-                    refresh_moderation_grant,
                 ],
             )
             .storage()?;

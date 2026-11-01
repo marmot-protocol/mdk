@@ -69,17 +69,6 @@ pub(crate) const GROUP_ROUTE_IDS_SQL: &str = "SELECT transport_group_id
                          FROM cgka_transport_group_routes
                          WHERE group_id = ?1";
 
-/// Clears a group's local-deletion frontier (`?1`) when the engine stored
-/// message `?2` of group `?3` after it.
-pub(crate) const CLEAR_DELETION_FRONTIER_IF_OLDER_SQL: &str =
-    "DELETE FROM local_group_deletion_frontiers
-                 WHERE group_id_hex = ?1
-                   AND message_insert_order < (
-                       SELECT insert_order
-                       FROM cgka_messages
-                       WHERE id = ?2 AND group_id = ?3
-                   )";
-
 /// Whether the engine stored message `?1` of group `?2` after insert order `?3`.
 pub(crate) const MESSAGE_NEWER_THAN_FRONTIER_SQL: &str = "SELECT EXISTS(
                     SELECT 1

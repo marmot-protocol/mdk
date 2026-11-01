@@ -1643,12 +1643,6 @@ impl SqlCipherHardening {
     }
 }
 
-impl Default for SqlCipherHardening {
-    fn default() -> Self {
-        Self::cipher_only()
-    }
-}
-
 /// Apply SQLCipher hardening to `connection` and key it, in the order the
 /// PRAGMAs require to take effect: `cipher_compatibility` and
 /// `cipher_memory_security` are set **before** `PRAGMA key`, then the privacy

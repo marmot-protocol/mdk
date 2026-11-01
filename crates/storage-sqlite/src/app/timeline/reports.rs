@@ -191,7 +191,7 @@ impl SqliteAppStorage {
         retention: Option<AppMessageRetentionDecision>,
         authority: Option<AppMessageAuthority>,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, false, retention, Some(authority))
+        self.record_app_event_inner(event, retention, Some(authority))
     }
     pub fn finalize_app_event_authority(
         &self,
