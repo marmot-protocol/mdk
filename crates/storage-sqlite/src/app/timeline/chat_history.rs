@@ -13,6 +13,38 @@ use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
 use zeroize::Zeroizing;
 
+/// The device a chat history was imported from (mdk#2628 4.2d).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryImportSource {
+    /// The device's roster slot, 64 lowercase hex characters.
+    pub device_slot_id_hex: String,
+    /// The device's name as [`SqliteAppStorage::set_device_labels`] last gave
+    /// it: empty when it has none, is no longer on the roster, or none was
+    /// given since the database opened.
+    pub device_label: String,
+}
+
+impl HistoryImportSource {
+    pub(crate) fn new(slot: &[u8], label: Option<String>) -> Self {
+        Self {
+            device_slot_id_hex: hex::encode(slot),
+            device_label: label.unwrap_or_default(),
+        }
+    }
+}
+
+/// The name of an imported row's source, or NULL for a row that arrived
+/// live or a source no name was given for. Reads `timeline`.
+pub(crate) const TIMELINE_IMPORT_LABEL_SQL: &str = "(SELECT label.label FROM app_event_imports imported JOIN temp.device_labels label ON label.slot = imported.source_slot WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
+
+/// The latest history import into one chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestHistoryImport {
+    pub group_id_hex: String,
+    pub source: HistoryImportSource,
+    pub imported_at: u64,
+}
+
 /// One app event of a chat in chat order, as a history bundle sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryExportRow {
@@ -321,6 +353,62 @@ impl SqliteAppStorage {
                     })
                 },
             )
+            .collect()
+    }
+
+    /// Replace the device names imported rows resolve their source against
+    /// with `labels`, by roster slot. Kept in memory for this connection
+    /// only, so every open starts with none.
+    pub fn set_device_labels(&self, labels: &[(DeviceSlotId, String)]) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute_cached("DELETE FROM temp.device_labels", [])
+                .storage()?;
+            for (slot, label) in labels {
+                conn.execute_cached(
+                    "INSERT OR REPLACE INTO temp.device_labels (slot, label) VALUES (?1, ?2)",
+                    params![slot.as_slice(), label],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Each chat's latest history import: when it landed and the device it
+    /// came from.
+    pub fn latest_history_imports(&self) -> StorageResult<Vec<LatestHistoryImport>> {
+        let conn = self.lock()?;
+        // SQLite takes the bare columns from the row holding the maximum.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT imported.group_id_hex, imported.source_slot, label.label,
+                        MAX(imported.imported_at)
+                 FROM app_event_imports imported
+                 LEFT JOIN temp.device_labels label ON label.slot = imported.source_slot
+                 GROUP BY imported.group_id_hex ORDER BY imported.group_id_hex",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(|(group_id_hex, slot, label, imported_at)| {
+                Ok(LatestHistoryImport {
+                    group_id_hex,
+                    source: HistoryImportSource::new(&slot, label),
+                    imported_at: i64_to_u64(imported_at)?,
+                })
+            })
             .collect()
     }
 
@@ -960,5 +1048,70 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    // mdk#2628 4.2d: an imported row names its source by the name last given
+    // for it on this connection, and a live row names none. Each chat's
+    // latest import reads the same way.
+    #[test]
+    fn an_imported_row_names_its_source_by_the_name_last_given() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let (phone, laptop) = (DeviceSlotId::from([7; 32]), DeviceSlotId::from([8; 32]));
+        let live = chat(1, 3, 30, "live");
+        let first = chat(2, 1, 10, "first");
+        let second = chat(2, 2, 20, "second");
+        s.record_app_event(&live).unwrap();
+        let named = |slot: DeviceSlotId, label: &str| HistoryImportSource {
+            device_slot_id_hex: hex::encode(slot),
+            device_label: label.to_owned(),
+        };
+        let source = |id: &str| {
+            s.timeline_message(GROUP, id)
+                .unwrap()
+                .unwrap()
+                .imported_from
+        };
+        let latest = || s.latest_history_imports().unwrap();
+
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        let outcome = s
+            .import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        let [TimelineMessageChange::Upsert { message, .. }] = outcome.update.changes.as_slice()
+        else {
+            panic!("one upsert");
+        };
+        assert_eq!(message.imported_from, Some(named(phone, "Phone")));
+        s.import_app_events(GROUP, &laptop, &[imported(&second, Vec::new())], NOW + 1)
+            .unwrap();
+
+        assert_eq!(source(&live.message_id_hex), None);
+        assert_eq!(source(&second.message_id_hex), Some(named(laptop, "")));
+        let page = s
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some(GROUP.to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.imported_from.clone())
+                .collect::<Vec<_>>(),
+            [Some(named(phone, "Phone")), Some(named(laptop, "")), None]
+        );
+        assert_eq!(
+            latest(),
+            [LatestHistoryImport {
+                group_id_hex: GROUP.to_owned(),
+                source: named(laptop, ""),
+                imported_at: NOW + 1,
+            }]
+        );
+
+        // The names given next replace them all.
+        s.set_device_labels(&[(laptop, "Laptop".to_owned())])
+            .unwrap();
+        assert_eq!(source(&first.message_id_hex), Some(named(phone, "")));
+        assert_eq!(latest()[0].source, named(laptop, "Laptop"));
     }
 }

@@ -493,6 +493,9 @@ pub(crate) enum AccountWorkerCommand {
     LinkedDevices {
         respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
     },
+    ChatHistoryImports {
+        respond: oneshot::Sender<Result<Vec<crate::ChatHistoryImport>, AppError>>,
+    },
     KeyPackageRefreshOverdue {
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
@@ -2421,9 +2424,16 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
-                        // A fetched history imports messages; show them now,
-                        // not at the next maintenance pass.
+                        // A fetched history imports messages; show them, and
+                        // the chat's history state, now, not at the next
+                        // maintenance pass.
                         publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        publish_device_group_changes(
                             &mut client,
                             &events,
                             &account_id_hex,
@@ -6134,6 +6144,15 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::ChatHistoryImports { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.chat_history_imports(),
+            );
+            true
+        }),
         AccountWorkerCommand::KeyPackageRefreshOverdue { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
@@ -8442,12 +8461,14 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call, one
-/// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
-/// overdue-refresh answer, and one `DeviceLinkChanged` for a change in
-/// linking a new device. Both the account-level seam and the applied-summary
-/// seam drain them, so startup, reconnect, maintenance and every command and
-/// delivery announce them.
+/// device-group trust since the last call, after giving storage the roster's
+/// device names again; one `KeyPackageRefreshOverdueChanged` for a
+/// maintenance pass that changed the overdue-refresh answer; one
+/// `DeviceLinkChanged` for a change in linking a new device; and one
+/// `ChatHistoryImportsChanged` for a change in chat history from another
+/// device. Both the account-level seam and the applied-summary seam drain
+/// them, so startup, reconnect, maintenance and every command and delivery
+/// announce them.
 fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -8455,6 +8476,7 @@ fn publish_device_group_changes(
     account_label: &str,
 ) {
     if client.take_linked_devices_changed() {
+        client.refresh_device_labels();
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
@@ -8468,6 +8490,12 @@ fn publish_device_group_changes(
     }
     if client.take_device_link_changed() {
         let _ = events.send(MarmotAppEvent::DeviceLinkChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_chat_history_imports_changed() {
+        let _ = events.send(MarmotAppEvent::ChatHistoryImportsChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });

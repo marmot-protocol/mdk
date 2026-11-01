@@ -722,6 +722,7 @@ impl AppClient {
                         "a parked history delivery was refused"
                     );
                     storage.drop_parked_history_delivery(&parked.app_event_id)?;
+                    self.chat_history_imports_changed = true;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -734,6 +735,7 @@ impl AppClient {
                         &parked.app_event_id,
                         blossom_retry_at(unix_now_seconds(), parked_fetch_attempts(&parked)),
                     )?;
+                    self.chat_history_imports_changed |= parked_fetch_attempts(&parked) == 0;
                 }
             }
         }
@@ -801,6 +803,8 @@ impl AppClient {
             );
             return false;
         }
+        // Settled, or retrying for the first time: either reads differently.
+        self.chat_history_imports_changed |= progressed || parked_fetch_attempts(&parked) == 0;
         progressed
     }
 
@@ -891,6 +895,7 @@ impl AppClient {
                 bundle,
                 received_at: now,
             })?;
+        self.chat_history_imports_changed = true;
         Ok(())
     }
 
@@ -901,7 +906,9 @@ impl AppClient {
     /// the next.
     fn import_parked_history_deliveries(&mut self) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        storage.expire_history_deliveries(unix_now_seconds())?;
+        if storage.expire_history_deliveries(unix_now_seconds())? > 0 {
+            self.chat_history_imports_changed = true;
+        }
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
@@ -936,6 +943,7 @@ impl AppClient {
                     Err(error) => return Err(error),
                 }
                 storage.drop_parked_history_delivery(&parked.app_event_id)?;
+                self.chat_history_imports_changed = true;
             }
         }
         Ok(())
@@ -991,6 +999,7 @@ impl AppClient {
     ) -> Result<(), AppError> {
         if let Some(update) = self.import_history_bundle(chat, from, key, hash, bundle)? {
             self.pending_projection_updates.push(update);
+            self.chat_history_imports_changed = true;
         }
         Ok(())
     }

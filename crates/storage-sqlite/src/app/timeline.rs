@@ -9,7 +9,8 @@ mod edits;
 mod opening;
 mod presentation;
 pub use chat_history::{
-    AppEventImport, HistoryExportEvent, HistoryExportRow, ImportedAppEvent, ImportedFileKey,
+    AppEventImport, HistoryExportEvent, HistoryExportRow, HistoryImportSource, ImportedAppEvent,
+    ImportedFileKey, LatestHistoryImport,
 };
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
@@ -20,6 +21,11 @@ pub use opening::{
 pub use presentation::ConversationPresentationPage;
 
 use crate::app::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;
+
+/// The slot of the device a timeline row was imported from, or NULL for a
+/// row that arrived live.
+use chat_history::TIMELINE_IMPORT_LABEL_SQL;
+const TIMELINE_IMPORT_SOURCE_SQL: &str = "(SELECT imported.source_slot FROM app_event_imports imported WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
 use crate::base::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -278,6 +284,11 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+    /// The device this row came from in a chat history it sent (mdk#2628
+    /// 4.2d); `None` for a row that arrived live. A host draws "Imported
+    /// from" where rows change from imported to live.
+    #[serde(default)]
+    pub imported_from: Option<HistoryImportSource>,
 }
 
 impl std::fmt::Debug for TimelineMessageRecord {
@@ -3374,7 +3385,9 @@ fn timeline_records_by_ids_tx(
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
-                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
+                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -3636,7 +3649,9 @@ fn timeline_query_sql(
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
-                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
+                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -4066,7 +4081,9 @@ fn visible_timeline_record(
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
-                (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
+                (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
+                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM visible_message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
@@ -4157,6 +4174,15 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
                     Box::new(e),
                 )
             })?,
+        imported_from: row
+            .get::<_, Option<Vec<u8>>>("imported_source_slot")?
+            .map(|slot| -> rusqlite::Result<_> {
+                Ok(HistoryImportSource::new(
+                    &slot,
+                    row.get("imported_source_label")?,
+                ))
+            })
+            .transpose()?,
     })
 }
 

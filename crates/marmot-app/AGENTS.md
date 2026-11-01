@@ -38,7 +38,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -241,6 +241,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   ciphertext; a failed upload, send or fetch waits and tries again, and a row that fails to prepare waits alone
   rather than block the rest. A chat with no Blossom endpoint forgets such a history. Only a refusal drops a
   received delivery: any other error fails the projection so it is read again.
+- Show imported history only as facts (mdk#2628 4.2d, D78, `src/client/history_imports.rs`). A row's source device
+  comes from storage (`imported_from`), its name resolved at read time from the TEMP `device_labels` table: give
+  storage the roster's names (`refresh_device_labels`) wherever `LinkedDevicesChanged` is drained, never store them.
+  `chat_history_imports` lists held chats only, from parked deliveries and the latest import; set
+  `chat_history_imports_changed` wherever a delivery parks, imports rows, is dropped or expires, or first fails to
+  fetch, and drain it at the device-group seams, including after a history fetch completes.
 - Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
   device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
   send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one

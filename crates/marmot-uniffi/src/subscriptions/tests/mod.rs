@@ -41,6 +41,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        imported_from: None,
     }
 }
 

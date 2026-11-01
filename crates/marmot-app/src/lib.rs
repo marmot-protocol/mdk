@@ -233,6 +233,7 @@ pub use client::device_pairing::{
     DeviceLinkChoices, DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt,
     DeviceLinkPromptState, DeviceLinkSnapshot, NewDeviceLinkState,
 };
+pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
 pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
@@ -336,10 +337,10 @@ pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
     ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
-    select_reusable_direct_conversation,
+    HistoryImportSource, MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, TimelineReactionSummary, TimelineReplyPreview,
+    TimelineUserReaction, select_reusable_direct_conversation,
 };
 #[cfg(test)]
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
@@ -2168,6 +2169,7 @@ impl MarmotApp {
             compromise_warning_changed: true,
             compromise_warning_gather_due: true,
             device_link_changed: true,
+            chat_history_imports_changed: true,
             device_unlinked: false,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),

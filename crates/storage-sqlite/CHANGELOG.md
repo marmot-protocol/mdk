@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- Imported timeline rows name their source device (mdk#2628 item 4.2d).
+  `TimelineMessageRecord` adds `imported_from: Option<HistoryImportSource>`,
+  read from `app_event_imports`, with the device's name from
+  `set_device_labels`, which marmot-app gives from the roster. The names live
+  in a TEMP table each account connection creates at open, so nothing is
+  stored and every open starts with none; no migration. `latest_history_imports`
+  reads each chat's latest import and `parked_history_chats` each chat parked
+  deliveries name, with whether a fetch failed. `expire_history_deliveries` now
+  returns how many parked deliveries went, not every row.
+
 - Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
   It adds `backup_recovery_key`, at most one row: the public half of the
   recovery key that words confirmed while this device trusts no device group

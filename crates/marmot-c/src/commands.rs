@@ -59,6 +59,7 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
+use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
 use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
@@ -789,6 +790,16 @@ c_cmd! {
     /// `LinkedDevicesChanged` event. Free with
     /// `marmot_linked_device_list_free`.
     async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
+
+    /// List the held chats whose history from another of this account's
+    /// devices is arriving or has arrived: `Receiving` while a delivery
+    /// waits for its chat or bundle, with `retrying` once fetching one
+    /// failed, then `Imported` with the device it came from and when. Empty
+    /// while device groups are off. Re-read on the
+    /// `ChatHistoryImportsChanged` event; a device's name follows
+    /// `LinkedDevicesChanged`. Free with
+    /// `marmot_chat_history_import_list_free`.
+    async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
 
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user

@@ -2413,6 +2413,18 @@ List this account's own devices for a Devices screen, from the roster of the dev
 
 [Source](src/commands/linked_device.rs#L16)
 
+### `Marmot::chat_history_imports`
+
+**Current.**
+
+```rust
+pub async fn chat_history_imports( &self, account_ref: String, ) -> Result<Vec<ChatHistoryImportFfi>, MarmotKitError>
+```
+
+List the held chats whose history from another of this account's devices is arriving or has arrived, for progress beside each chat after a link ("Book club: history imported"). `Receiving` means a delivery arrived and waits for this device to join its chat or fetch its bundle from the chat's media server; `retrying` turns on once a fetch failed, and it is tried again later. `Imported` names the device the latest import came from (`device_slot_id_hex`, and `device_label`, its name now) and when, in Unix seconds. A chat with a delivery still waiting reads `Receiving` even after an earlier import. Only facts are listed: a chat with no history to bring sends nothing, so no chat ever waits for one, and a delivery that expired after a week leaves nothing behind. A delivery for a chat this device does not hold yet is left out until it joins, since a host cannot name that chat. Empty while device groups are off. Refresh on `MarmotEventFfi::ChatHistoryImportsChanged`; a device's new name comes with `LinkedDevicesChanged`, and an empty `device_label` means "another device". The same source names each imported row in `TimelineMessageRecordFfi.imported_from`: draw "Imported from <device>" where rows change from imported to live. Runs on the account worker, with no network I/O.
+
+[Source](src/commands/history_import.rs#L18)
+
 ### `Marmot::key_package_refresh_overdue`
 
 **Current.**
@@ -5147,4 +5159,3 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 [Source](src/deployment.rs#L90)
 
 </details>
-

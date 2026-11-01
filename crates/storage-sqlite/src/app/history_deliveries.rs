@@ -40,6 +40,14 @@ pub struct ParkedHistoryDelivery {
     pub received_at: u64,
 }
 
+/// A chat that parked deliveries name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedHistoryChat {
+    pub group_id_hex: String,
+    /// A fetch of one of its Blossom deliveries failed.
+    pub retrying: bool,
+}
+
 /// What a parked delivery carries of its bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParkedBundle {
@@ -420,6 +428,27 @@ impl SqliteAppStorage {
             .storage()
     }
 
+    /// Each chat parked deliveries name, and whether a fetch for one of them
+    /// failed.
+    pub fn parked_history_chats(&self) -> StorageResult<Vec<ParkedHistoryChat>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT group_id_hex, MAX(fetch_attempts > 0) FROM history_deliveries_parked
+                 GROUP BY group_id_hex ORDER BY group_id_hex",
+            )
+            .storage()?;
+        stmt.query_map([], |row| {
+            Ok(ParkedHistoryChat {
+                group_id_hex: row.get(0)?,
+                retrying: row.get(1)?,
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+    }
+
     /// The deliveries parked for the chat `group_id_hex`, oldest first.
     pub fn parked_history_deliveries(
         &self,
@@ -492,30 +521,26 @@ impl SqliteAppStorage {
     }
 
     /// Drop owed, sent and parked deliveries a week old at `now`. Returns how
-    /// many went.
+    /// many parked ones went, since a host shows those.
     pub fn expire_history_deliveries(&self, now: u64) -> StorageResult<usize> {
         let before = u64_to_i64(now.saturating_sub(HISTORY_DELIVERY_RETENTION_SECS))?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let owed = conn
-                .execute_cached(
-                    "DELETE FROM history_deliveries_owed WHERE owed_at < ?1",
-                    params![before],
-                )
-                .storage()?;
-            let sent = conn
-                .execute_cached(
-                    "DELETE FROM history_delivery_sends WHERE recorded_at < ?1",
-                    params![before],
-                )
-                .storage()?;
-            let parked = conn
-                .execute_cached(
-                    "DELETE FROM history_deliveries_parked WHERE received_at < ?1",
-                    params![before],
-                )
-                .storage()?;
-            Ok(owed + sent + parked)
+            conn.execute_cached(
+                "DELETE FROM history_deliveries_owed WHERE owed_at < ?1",
+                params![before],
+            )
+            .storage()?;
+            conn.execute_cached(
+                "DELETE FROM history_delivery_sends WHERE recorded_at < ?1",
+                params![before],
+            )
+            .storage()?;
+            conn.execute_cached(
+                "DELETE FROM history_deliveries_parked WHERE received_at < ?1",
+                params![before],
+            )
+            .storage()
         })
     }
 }
@@ -687,10 +712,19 @@ mod tests {
         );
         assert_eq!(store.due_parked_history_fetches(12, 1).unwrap().len(), 1);
         assert!(store.due_parked_history_fetches(10, 8).unwrap().is_empty());
+        let chats = |retrying: [bool; 2]| {
+            [("aa", retrying[0]), ("bb", retrying[1])].map(|(chat, retrying)| ParkedHistoryChat {
+                group_id_hex: chat.into(),
+                retrying,
+            })
+        };
+        assert_eq!(store.parked_history_chats().unwrap(), chats([false; 2]));
 
         store.defer_parked_history_fetch("e2", 70).unwrap();
         // An inline delivery has no fetch to defer.
         store.defer_parked_history_fetch("e1", 70).unwrap();
+        // One failed fetch marks its chat as retrying.
+        assert_eq!(store.parked_history_chats().unwrap(), chats([true, false]));
         assert_eq!(
             store.due_parked_history_fetches(69, 8).unwrap(),
             [located("e3", "bb", 11)]
@@ -752,7 +786,7 @@ mod tests {
         store
             .record_history_delivery_send("e1", "aa", "s1", DAY)
             .unwrap();
-        assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 3);
+        assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 1);
         assert!(store.owe_history_delivery_again("e1").unwrap().is_none());
         assert_eq!(
             store.unsent_history_deliveries().unwrap()[0].group_id_hex,

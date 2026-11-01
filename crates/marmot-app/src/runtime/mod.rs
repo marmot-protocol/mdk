@@ -1598,6 +1598,17 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// Chat history from another of this account's devices may have changed
+    /// as hosts read it: re-read `chat_history_imports`. Fires when a
+    /// delivery arrives to wait for its chat or bundle, when one is imported
+    /// or dropped, and when fetching one first fails, and once each time the
+    /// account's worker opens or reconnects. Carries no chat or device
+    /// identities, and may fire with no visible change. A device's new name
+    /// comes with `LinkedDevicesChanged` instead.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's device group removed this device after its link was
     /// made, so the account stopped here and is signed out for good: re-read
     /// `accounts` and show the device-level notice. Fires once, after the
@@ -2530,6 +2541,21 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
         self.accounts.linked_devices(account_ref).await
+    }
+
+    /// The held chats whose history from another of this account's devices
+    /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
+    /// delivery waits for its chat or bundle, with `retrying` once fetching
+    /// one failed, then `Imported` with the device it came from and when.
+    /// Facts only: an empty history sends nothing, and an expired delivery
+    /// leaves nothing. Empty while device groups are off. Refresh on
+    /// `ChatHistoryImportsChanged`; a device's name follows
+    /// `LinkedDevicesChanged`.
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        self.accounts.chat_history_imports(account_ref).await
     }
 
     /// Whether this device's KeyPackage refresh is overdue because its device
