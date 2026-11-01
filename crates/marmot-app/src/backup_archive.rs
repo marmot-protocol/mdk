@@ -45,6 +45,28 @@
 //! archive key sealed. Anyone holding the public half reads the index: the
 //! account's devices, current and former, see which chats and stretches a
 //! backup holds and where its blobs are. Only the words open a blob.
+//!
+//! The account's backup pointer under a recovery key lists the backups it
+//! keeps there, newest first, at most [`MAX_POINTER_BACKUPS`]:
+//!
+//! ```text
+//! pointer = {"v":1,"backups":[E,...]}
+//! E       = {"id":"<32 hex>","written_at":t,"head":L}
+//! ```
+//!
+//! Its `d` tag and its key come from the public half too, so whoever reads
+//! an index reads the pointer, and only they find it:
+//!
+//! ```text
+//! pointer prk = HKDF-Extract(salt = "marmot backup pointer v1",
+//!                            IKM = recovery public key)
+//! address     = hex(HKDF-Expand(pointer prk, "marmot backup address", 32))
+//! pointer key = HKDF-Expand(pointer prk, "marmot backup pointer key" || nonce, 32)
+//! content     = base64(nonce || ChaCha20-Poly1305(pointer key, zero nonce, pointer))
+//! ```
+//!
+//! `nonce` is 32 fresh random bytes for each pointer, so each pointer key
+//! is one-use too; the AAD is "marmot backup pointer v1".
 
 use std::fmt;
 
@@ -88,6 +110,18 @@ const INDEX_SALT: &[u8] = b"marmot backup index v1";
 const INDEX_AAD: &[u8] = b"marmot backup index v1";
 /// The sealed archive key's context starts with what it is for.
 const SEAL_PURPOSE: &[u8] = b"marmot backup v1";
+/// How many backups a pointer lists at most.
+pub(crate) const MAX_POINTER_BACKUPS: usize = 16;
+/// The longest pointer content, base64 included: well under the 64 KiB a
+/// relay with default limits takes.
+const MAX_POINTER_CONTENT_BYTES: usize = 56 * 1024;
+const POINTER_SALT: &[u8] = b"marmot backup pointer v1";
+const ADDRESS_INFO: &[u8] = b"marmot backup address";
+const POINTER_KEY_INFO: &[u8] = b"marmot backup pointer key";
+/// The AAD of a pointer's content.
+const POINTER_AAD: &[u8] = b"marmot backup pointer v1";
+/// The random bytes each pointer's key is derived with.
+const POINTER_NONCE_LEN: usize = 32;
 
 /// A backup's archive key: fresh for each backup and the source of every
 /// blob's key. Only its head holds it, sealed; it is never stored.
@@ -571,6 +605,222 @@ impl BackupHead {
     pub(crate) fn sealed_archive_key(&self) -> (Vec<u8>, &[u8]) {
         (seal_context(&self.id, &self.index), &self.sealed_key)
     }
+}
+
+/// One backup a pointer lists: its id, when it was written and where its
+/// head is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PointerEntry {
+    pub(crate) id: String,
+    pub(crate) written_at: u64,
+    pub(crate) head: BlobLocator,
+}
+
+impl PointerEntry {
+    pub(crate) fn new(id: &[u8; BACKUP_ID_LEN], written_at: u64, head: BlobLocator) -> Self {
+        Self {
+            id: hex::encode(id),
+            written_at,
+            head,
+        }
+    }
+}
+
+/// The backups an account keeps under one recovery key, newest first:
+/// the content of its backup pointer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackupPointer {
+    pub(crate) v: u64,
+    pub(crate) backups: Vec<PointerEntry>,
+}
+
+impl BackupPointer {
+    /// A pointer listing `backups`, newest first.
+    pub(crate) fn new(mut backups: Vec<PointerEntry>) -> Self {
+        backups.sort_by(|a, b| b.written_at.cmp(&a.written_at).then(b.id.cmp(&a.id)));
+        Self {
+            v: BACKUP_VERSION,
+            backups,
+        }
+    }
+
+    /// The pointer's content, encrypted under a fresh key the recovery
+    /// key's public half derives. Refused with `backup_too_large` past
+    /// [`MAX_POINTER_BACKUPS`] or [`MAX_POINTER_CONTENT_BYTES`].
+    pub(crate) fn seal(&self, recovery_public_key: &[u8]) -> Result<String, AppError> {
+        if self.backups.len() > MAX_POINTER_BACKUPS {
+            return Err(backup_error("backup_too_large"));
+        }
+        let plaintext = serde_json::to_vec(self).map_err(|_| backup_error("backup_format"))?;
+        let mut nonce = [0_u8; POINTER_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = cipher(&pointer_key(recovery_public_key, &nonce))
+            .encrypt(
+                &Nonce::default(),
+                Payload {
+                    msg: &plaintext,
+                    aad: POINTER_AAD,
+                },
+            )
+            .map_err(|_| backup_error("backup_seal"))?;
+        let mut sealed = nonce.to_vec();
+        sealed.extend_from_slice(&ciphertext);
+        let content = BASE64_STANDARD.encode(sealed);
+        if content.len() > MAX_POINTER_CONTENT_BYTES {
+            return Err(backup_error("backup_too_large"));
+        }
+        Ok(content)
+    }
+
+    /// Open a pointer's content with the recovery key's public half,
+    /// refusing it whole when it does not open or breaks the format: a
+    /// missing, extra or repeated member, another version, more than
+    /// [`MAX_POINTER_BACKUPS`] backups, an id that is not 32 lowercase
+    /// hexadecimal characters or is listed twice, a backup listed before a
+    /// newer one, or a head that is no blob a backup may name.
+    pub(crate) fn open(content: &str, recovery_public_key: &[u8]) -> Result<Self, AppError> {
+        if content.len() > MAX_POINTER_CONTENT_BYTES {
+            return Err(backup_error("backup_too_large"));
+        }
+        let sealed = BASE64_STANDARD
+            .decode(content)
+            .map_err(|_| backup_error("backup_format"))?;
+        if sealed.len() < POINTER_NONCE_LEN {
+            return Err(backup_error("backup_format"));
+        }
+        let (nonce, ciphertext) = sealed.split_at(POINTER_NONCE_LEN);
+        let plaintext = cipher(&pointer_key(recovery_public_key, nonce))
+            .decrypt(
+                &Nonce::default(),
+                Payload {
+                    msg: ciphertext,
+                    aad: POINTER_AAD,
+                },
+            )
+            .map_err(|_| backup_error("backup_decrypt"))?;
+        let pointer: Self =
+            serde_json::from_slice(&plaintext).map_err(|_| backup_error("backup_format"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        let well_formed = pointer.v == BACKUP_VERSION
+            && pointer.backups.len() <= MAX_POINTER_BACKUPS
+            && pointer.backups.iter().all(|entry| {
+                entry.id.len() == BACKUP_ID_LEN * 2
+                    && is_lower_hex(&entry.id)
+                    && ids.insert(entry.id.as_str())
+                    && entry.written_at <= MAX_INTEGER
+                    && entry.head.is_well_formed()
+            })
+            && pointer
+                .backups
+                .windows(2)
+                .all(|pair| pair[0].written_at >= pair[1].written_at);
+        if !well_formed {
+            return Err(backup_error("backup_format"));
+        }
+        Ok(pointer)
+    }
+}
+
+/// The `d` tag of the account's backup pointer under a recovery key:
+/// anyone with the key's public half derives it.
+pub(crate) fn backup_address(recovery_public_key: &[u8]) -> String {
+    let mut address = [0_u8; 32];
+    Hkdf::<Sha256>::new(Some(POINTER_SALT), recovery_public_key)
+        .expand(ADDRESS_INFO, &mut address)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hex::encode(address)
+}
+
+/// A listed backup, with its index when its head was read and opened.
+#[derive(Clone, Debug)]
+pub(crate) struct ListedBackup {
+    pub(crate) entry: PointerEntry,
+    pub(crate) index: Option<BackupIndex>,
+}
+
+impl ListedBackup {
+    /// Every blob of the backup this device knows: its head, and with an
+    /// index, its small state and bundles.
+    pub(crate) fn locators(&self) -> Vec<BlobLocator> {
+        let mut locators = vec![self.entry.head.clone()];
+        if let Some(index) = &self.index {
+            locators.extend(index.small_state.clone());
+            locators.extend(index.blobs().map(|(_, _, blob)| blob.locator()));
+        }
+        locators
+    }
+}
+
+/// Split `listed` into the backups a pointer keeps, newest first, and the
+/// ones it drops, at `now`. Kept are the newest two; any older one whose
+/// head was not read; and any older one that holds, for some chat, an
+/// unexpired stretch starting before every newer kept backup's earliest
+/// for that chat, or a chat none of them holds. At most
+/// [`MAX_POINTER_BACKUPS`] are kept, the newest.
+pub(crate) fn retain(
+    mut listed: Vec<ListedBackup>,
+    now: u64,
+) -> (Vec<ListedBackup>, Vec<ListedBackup>) {
+    listed.sort_by(|a, b| {
+        b.entry
+            .written_at
+            .cmp(&a.entry.written_at)
+            .then(b.entry.id.cmp(&a.entry.id))
+    });
+    let mut kept: Vec<ListedBackup> = Vec::new();
+    let mut dropped = Vec::new();
+    for backup in listed {
+        let keep = kept.len() < 2
+            || backup
+                .index
+                .as_ref()
+                .is_none_or(|index| holds_an_older_stretch(index, &kept, now));
+        if keep && kept.len() < MAX_POINTER_BACKUPS {
+            kept.push(backup);
+        } else {
+            dropped.push(backup);
+        }
+    }
+    (kept, dropped)
+}
+
+/// Whether `index` holds, for some chat, an unexpired stretch that starts
+/// before every one of `newer`'s for that chat.
+fn holds_an_older_stretch(index: &BackupIndex, newer: &[ListedBackup], now: u64) -> bool {
+    index.chats.iter().any(|chat| {
+        let Some(from) = earliest_unexpired(chat, now) else {
+            return false;
+        };
+        newer
+            .iter()
+            .filter_map(|backup| backup.index.as_ref())
+            .flat_map(|index| index.chats.iter())
+            .filter(|held| held.chat == chat.chat)
+            .filter_map(|held| earliest_unexpired(held, now))
+            .all(|newer_from| from < newer_from)
+    })
+}
+
+/// Where `chat`'s earliest stretch not yet expired at `now` starts.
+fn earliest_unexpired(chat: &IndexChat, now: u64) -> Option<&ChatPosition> {
+    chat.blobs
+        .iter()
+        .filter(|blob| blob.expires.is_none_or(|at| at > now))
+        .map(|blob| &blob.from)
+        .min()
+}
+
+/// The key a pointer's content is encrypted under, for its `nonce`.
+fn pointer_key(recovery_public_key: &[u8], nonce: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0_u8; 32]);
+    let mut info = POINTER_KEY_INFO.to_vec();
+    info.extend_from_slice(nonce);
+    Hkdf::<Sha256>::new(Some(POINTER_SALT), recovery_public_key)
+        .expand(&info, key.as_mut_slice())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    key
 }
 
 /// The context the archive key is sealed with: the purpose, the backup id

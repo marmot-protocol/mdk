@@ -4,6 +4,7 @@ use cgka_engine::recovery_key::{
     RECOVERY_ENTROPY_LEN, derive_recovery_key_pair, open_with_recovery_key,
 };
 use cgka_traits::MarmotAppEvent;
+use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use openmls_rust_crypto::RustCrypto;
 use storage_sqlite::{ReadPosition, SmallStateValue, SmallStateVersion};
@@ -365,9 +366,17 @@ fn the_keys_derive_as_the_published_vectors() {
             index_key(&public_key, &[2; BACKUP_ID_LEN]),
             "18da5e74bcd81f43d7e6639dfcc464515f380d6ce016496e07597f2a78ff6ffa",
         ),
+        (
+            pointer_key(&public_key, &[3; POINTER_NONCE_LEN]),
+            "6ff7b6daf27f4a3077211f77a649015e7b970dd3a181880df03248fffbb2829b",
+        ),
     ] {
         assert_eq!(hex::encode(*key), expected);
     }
+    assert_eq!(
+        backup_address(&public_key),
+        "ca91082df78442521072c16b0ac389d309233ec3aaca978e900e0077f06c7c58"
+    );
 }
 
 #[test]
@@ -546,4 +555,246 @@ fn a_blob_expires_once_everything_in_it_has() {
     let mut empty = bundle(&BOOK_CLUB, vec![bundled(1, 10, None)]);
     empty.events.clear();
     assert_eq!(bundle_expires(&empty), Some(0));
+}
+
+fn entry(id: u8, written_at: u64, server: &str) -> PointerEntry {
+    PointerEntry::new(
+        &[id; BACKUP_ID_LEN],
+        written_at,
+        BlobLocator {
+            sha256: hex::encode([id; 32]),
+            size: 1_000,
+            server: server.into(),
+        },
+    )
+}
+
+/// A pointer's content holding `plaintext` as a pointer is sealed.
+fn sealed_pointer(plaintext: &[u8], recovery_public_key: &[u8]) -> String {
+    let nonce = [3; POINTER_NONCE_LEN];
+    let ciphertext = cipher(&pointer_key(recovery_public_key, &nonce))
+        .encrypt(
+            &Nonce::default(),
+            Payload {
+                msg: plaintext,
+                aad: POINTER_AAD,
+            },
+        )
+        .unwrap();
+    BASE64_STANDARD.encode([nonce.as_slice(), &ciphertext].concat())
+}
+
+/// C4: a pointer listing as many backups as it may, each head on a server
+/// with the longest URL a locator takes, opens to itself and stays well
+/// under the 64 KiB a relay with default limits takes. Only the public
+/// half it was sealed to opens it.
+#[test]
+fn a_full_pointer_opens_to_itself_and_fits_a_default_relay() {
+    let public_key = public_half(&WORDS);
+    let server = format!(
+        "https://blossom.example/{}",
+        "p".repeat(ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN - 24)
+    );
+    assert!(blossom_server_is_valid(&server));
+    let pointer = BackupPointer::new(
+        (0..MAX_POINTER_BACKUPS as u8)
+            .map(|id| entry(id, u64::from(id), &server))
+            .collect(),
+    );
+    assert_eq!(
+        pointer.backups[0].written_at,
+        MAX_POINTER_BACKUPS as u64 - 1
+    );
+
+    let content = pointer.seal(&public_key).unwrap();
+    assert!(content.len() < 64 * 1024 - 1024, "{}", content.len());
+    assert_eq!(BackupPointer::open(&content, &public_key).unwrap(), pointer);
+    assert_eq!(
+        refusal(BackupPointer::open(&content, &public_half(&OTHER_WORDS))),
+        "backup_decrypt"
+    );
+    let mut over = pointer.backups.clone();
+    over.push(entry(0xff, 0, SERVER));
+    assert_eq!(
+        refusal(BackupPointer::new(over).seal(&public_key)),
+        "backup_too_large"
+    );
+}
+
+#[test]
+fn a_pointer_that_breaks_the_format_is_refused_whole() {
+    let public_key = public_half(&WORDS);
+    let listing = |entries: Vec<PointerEntry>| {
+        serde_json::to_string(&BackupPointer {
+            v: 1,
+            backups: entries,
+        })
+        .unwrap()
+    };
+    let fine = listing(vec![entry(2, 20, SERVER), entry(1, 10, SERVER)]);
+    assert!(
+        BackupPointer::open(&sealed_pointer(fine.as_bytes(), &public_key), &public_key).is_ok()
+    );
+    let mut upper = entry(0xab, 20, SERVER);
+    upper.id = upper.id.to_uppercase();
+    let mut short = entry(2, 20, SERVER);
+    short.id.truncate(30);
+    for broken in [
+        fine.replacen(r#""v":1"#, r#""v":2"#, 1),
+        fine.replacen(r#""v":1,"#, "", 1),
+        fine.replacen(r#""v":1"#, r#""v":1,"more":1"#, 1),
+        listing(vec![entry(1, 10, SERVER), entry(2, 20, SERVER)]),
+        listing(vec![entry(1, 20, SERVER), entry(1, 10, SERVER)]),
+        listing(vec![upper]),
+        listing(vec![short]),
+        listing(vec![entry(1, MAX_INTEGER + 1, SERVER)]),
+        listing(vec![entry(1, 10, "https://blossom.example")]),
+        listing(
+            (0..=MAX_POINTER_BACKUPS as u8)
+                .map(|id| entry(id, 0, SERVER))
+                .collect(),
+        ),
+    ] {
+        assert_eq!(
+            refusal(BackupPointer::open(
+                &sealed_pointer(broken.as_bytes(), &public_key),
+                &public_key
+            )),
+            "backup_format",
+            "{broken}"
+        );
+    }
+    assert_eq!(
+        refusal(BackupPointer::open("not base64", &public_key)),
+        "backup_format"
+    );
+}
+
+fn position(at: u64) -> ChatPosition {
+    ChatPosition {
+        epoch: 1,
+        at,
+        id: format!("{at:064x}"),
+    }
+}
+
+/// A listed backup `id`, written at `written_at`, holding for each chat
+/// one blob per `(from, expires)`.
+fn listed(id: u8, written_at: u64, chats: &[(&[u8], &[(u64, Option<u64>)])]) -> ListedBackup {
+    let mut index = BackupIndex::new(written_at, &WRITER);
+    for (chat, blobs) in chats {
+        for (from, expires) in *blobs {
+            let blob = IndexBlob {
+                from: position(*from),
+                to: position(from + 1),
+                expires: *expires,
+                sha256: hex::encode([id; 32]),
+                size: 1,
+                server: SERVER.into(),
+            };
+            index.push_blob(chat, blob).unwrap();
+        }
+    }
+    ListedBackup {
+        entry: entry(id, written_at, SERVER),
+        index: Some(index),
+    }
+}
+
+fn ids(backups: &[ListedBackup]) -> Vec<u8> {
+    backups
+        .iter()
+        .map(|backup| hex::decode(&backup.entry.id).unwrap()[0])
+        .collect()
+}
+
+/// C5: a pointer keeps the newest two backups, and an older one only
+/// while it is the last to hold some of a chat's history: an unexpired
+/// stretch that starts before every newer kept backup's for that chat, or
+/// a chat none of them holds. A backup whose head was not read is kept.
+#[test]
+fn a_pointer_keeps_the_newest_two_and_each_last_holder() {
+    const NOW: u64 = 100;
+    let x: &[u8] = &BOOK_CLUB;
+    let y: &[u8] = &FAMILY;
+    let newest = || {
+        vec![
+            listed(9, 90, &[(x, &[(10, None)])]),
+            listed(8, 80, &[(x, &[(10, None)])]),
+        ]
+    };
+    let unread = |id, written_at| ListedBackup {
+        entry: entry(id, written_at, SERVER),
+        index: None,
+    };
+    for (case, older, kept, dropped) in [
+        (
+            "covered",
+            vec![listed(1, 10, &[(x, &[(10, None), (20, None)])])],
+            vec![9, 8],
+            vec![1],
+        ),
+        (
+            "an earlier stretch",
+            vec![listed(1, 10, &[(x, &[(5, None)])])],
+            vec![9, 8, 1],
+            vec![],
+        ),
+        (
+            "an earlier stretch since expired",
+            vec![listed(1, 10, &[(x, &[(5, Some(NOW)), (10, None)])])],
+            vec![9, 8],
+            vec![1],
+        ),
+        (
+            "an earlier stretch not yet expired",
+            vec![listed(1, 10, &[(x, &[(5, Some(NOW + 1))])])],
+            vec![9, 8, 1],
+            vec![],
+        ),
+        (
+            "a chat no newer backup holds",
+            vec![listed(1, 10, &[(x, &[(10, None)]), (y, &[(50, None)])])],
+            vec![9, 8, 1],
+            vec![],
+        ),
+        (
+            "covered by an older kept backup",
+            vec![
+                listed(2, 20, &[(x, &[(5, None)])]),
+                listed(1, 10, &[(x, &[(5, None)])]),
+            ],
+            vec![9, 8, 2],
+            vec![1],
+        ),
+        (
+            "unread, and not covering",
+            vec![unread(2, 20), listed(1, 10, &[(x, &[(5, None)])])],
+            vec![9, 8, 2, 1],
+            vec![],
+        ),
+    ] {
+        let mut listing = newest();
+        listing.extend(older);
+        listing.reverse();
+        let (kept_now, dropped_now) = retain(listing, NOW);
+        assert_eq!(
+            (ids(&kept_now), ids(&dropped_now)),
+            (kept, dropped),
+            "{case}"
+        );
+    }
+
+    // Past the cap the oldest go, even an unread one.
+    let mut listing = vec![unread(0, 0)];
+    listing.extend((1..=MAX_POINTER_BACKUPS as u8).map(|id| {
+        let chat = [id; 16];
+        listed(id, u64::from(id), &[(&chat, &[(1, None)])])
+    }));
+    let (kept, dropped) = retain(listing, NOW);
+    assert_eq!(
+        ids(&kept),
+        (1..=MAX_POINTER_BACKUPS as u8).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(ids(&dropped), vec![0]);
 }
