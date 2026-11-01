@@ -535,6 +535,62 @@ async fn a_confirmation_after_the_deadline_counts_as_not_reached() {
     runtime.shutdown().await;
 }
 
+/// The deadline covers the worker's start too. A wipe whose account worker
+/// is still opening at the deadline says its siblings were not reached,
+/// though this account would have signed out on its own: the wipe cannot
+/// tell. The start it gave up on is reaped, and the wipe's later stages get
+/// a working worker once the open goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_still_opening_at_the_deadline_counts_as_not_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = device_group_app_at(&dir, relay.clone());
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    // Longer than the worker's first answer once open, so only the
+    // deadline over its start ends the wait.
+    let wait = Duration::from_secs(2);
+    app.set_sign_out_leaving_wait(wait);
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (proceed, proceed_rx) = std::sync::mpsc::channel();
+    app.install_local_open_gate(
+        "alice",
+        crate::AccountStartupStage::SessionOpen,
+        reached_tx,
+        proceed_rx,
+    )
+    .unwrap();
+
+    let mut wipe = Box::pin(runtime.sign_out_and_wipe("alice"));
+    tokio::select! {
+        _ = &mut wipe => panic!("the wipe waits on the worker's start"),
+        () = async {
+            tokio::task::spawn_blocking(move || {
+                reached.recv_timeout(Duration::from_secs(30)).unwrap();
+            })
+            .await
+            .unwrap();
+            // Past the deadline, which started before the open was held.
+            tokio::time::sleep(wait + Duration::from_millis(500)).await;
+        } => {}
+    }
+    proceed.send(()).unwrap();
+    let outcome = wipe.await.unwrap();
+    assert!(outcome.siblings_not_reached);
+    // The slot's deletion runs on the worker that replaced the abandoned
+    // start.
+    assert!(
+        outcome.key_package_failures.is_empty(),
+        "{:?}",
+        outcome.key_package_failures
+    );
+    assert!(outcome.local_cleanup.completed);
+    runtime.shutdown().await;
+}
+
 /// The laptop's `sign_out_and_wipe` sends its `leaving` commit, and the
 /// phone sees it and removes the laptop before the laptop learns that the
 /// commit went out, and out of the chat both are in. The removal reaches

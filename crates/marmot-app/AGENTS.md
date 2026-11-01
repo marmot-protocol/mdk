@@ -319,10 +319,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   step runs as a worker command so deliveries settle between steps: commit the own entry as `leaving` through
   `edit_device_roster_entry`, then, once it reads `leaving` on a stable device group with no convergence input left,
   name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot and
-  another leaf's as a listed device that is not `leaving`). Never leave the device group itself: the account is
-  its only admin. A sibling decides a `leaving` device's removal (`decide_leaving_siblings`) only on a stable device
-  group with no pending convergence input, after its own random delay of up to 30 seconds, and records it as a user's
-  removal would be, so the removal path carries it out. A later link's Welcome into that group is a
+  another leaf's as a listed device that is not `leaving`). One deadline, polled first, bounds all of these steps,
+  the worker's start included: wait on nothing outside it and take no answer after it. Never leave the device group
+  itself: the account is its only admin. A sibling decides a `leaving` device's removal (`decide_leaving_siblings`)
+  only on a stable device group with no pending convergence input, after its own random delay of up to 30 seconds,
+  and records it as a user's removal would be, so the removal path carries it out. A later link's Welcome into that
+  group is a
   first join, held by the engine to the link rather than to the forget's date. A new device never starts a link by a
   KeyPackage it already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so
   a used one would also admit the Welcome that installed the forgotten copy. The start waits for the replacement's

@@ -4798,17 +4798,16 @@ impl MarmotAppRuntime {
     /// about 30 seconds for that commit to be confirmed. Returns the chats a
     /// sibling takes it out of, as hex group ids, which stage 1 does not
     /// leave. Empty when it signs out on its own, and when the commit was not
-    /// confirmed in time, which `siblings_not_reached` reports. A step that
-    /// fails is taken again until then, so a passing error does not cost the
-    /// sibling path, and one that persists ends as not reached. Each step is
-    /// cut off at that deadline too, so the wait stays about 30 seconds
-    /// however busy the worker is: an answer after it, a confirmation
-    /// included, counts as not reached. The worker still finishes a
-    /// step cut off this way before stage 1's leaves; its only network wait
-    /// is its `leaving` commit's publish, which the Nostr relay plane gives
-    /// up on after 20 seconds. An account
-    /// whose worker cannot take commands at all, signed out without a wipe
-    /// or with no external signer registered, signs out on its own at once.
+    /// confirmed in time, which `siblings_not_reached` reports.
+    ///
+    /// One deadline covers all of it, the worker's start included, and it is
+    /// polled first: once it has passed, no answer is taken, a confirmation
+    /// included, however busy the worker is. Dropping the attempt there is
+    /// safe at each await. A worker start left unsettled is reaped and
+    /// replaced by the next lookup. A step in flight runs to its end on the
+    /// worker, ahead of stage 1's leaves, and stores nothing when it
+    /// confirms; its only network wait is its `leaving` commit's publish,
+    /// which the Nostr relay plane gives up on after 20 seconds.
     async fn sign_out_through_siblings(
         &self,
         account_ref: &str,
@@ -4818,28 +4817,40 @@ impl MarmotAppRuntime {
         if !self.accounts.app.device_groups_enabled() {
             return HashSet::new();
         }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            left_to_siblings = self.ask_siblings_to_sign_out(account_ref) => left_to_siblings,
+        }
+    }
+
+    /// Take steps of signing out through siblings until one confirms the
+    /// `leaving` commit or finds this device signs out on its own; the
+    /// caller's deadline ends it otherwise. A step that fails is taken
+    /// again, so a passing error does not cost the sibling path. An account
+    /// whose worker cannot take commands at all, signed out without a wipe
+    /// or with no external signer registered, signs out on its own at once.
+    async fn ask_siblings_to_sign_out(&self, account_ref: &str) -> HashSet<String> {
         if let Err(err) = self.accounts.worker_commands(account_ref).await {
             tracing::info!(
                 target: "marmot_app::runtime",
-                method = "sign_out_through_siblings",
+                method = "ask_siblings_to_sign_out",
                 error_kind = err.privacy_safe_kind(),
                 "no worker to take sign-out steps; signing out on its own"
             );
             return HashSet::new();
         }
-        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
         let mut logged = false;
         loop {
-            let Ok(step) = tokio::time::timeout_at(
-                deadline,
-                self.accounts.sign_out_through_siblings_step(account_ref),
-            )
-            .await
-            else {
-                outcome.siblings_not_reached = true;
-                return HashSet::new();
-            };
-            match step {
+            match self
+                .accounts
+                .sign_out_through_siblings_step(account_ref)
+                .await
+            {
                 Ok(SiblingSignOut::Confirmed { left_to_siblings }) => {
                     return left_to_siblings.into_iter().collect();
                 }
@@ -4849,17 +4860,13 @@ impl MarmotAppRuntime {
                     if !logged {
                         tracing::warn!(
                             target: "marmot_app::runtime",
-                            method = "sign_out_through_siblings",
+                            method = "ask_siblings_to_sign_out",
                             error_kind = err.privacy_safe_kind(),
                             "could not take a sign-out step; retrying"
                         );
                         logged = true;
                     }
                 }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                outcome.siblings_not_reached = true;
-                return HashSet::new();
             }
             sleep(SIGN_OUT_LEAVING_POLL).await;
         }
