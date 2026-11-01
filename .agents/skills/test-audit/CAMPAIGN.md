@@ -60,8 +60,9 @@ otherwise (step 9).
 When shared setup is a large share of the time, fix the harness before the
 ledger, in its own change (step 6). In `storage-sqlite`, the migration replay
 and SQLCipher settings of each test store were about 70% of the crate's and
-the engine's test time. Fixing them first means the ledger judges each test by
-what it asserts, not by setup cost no single test can remove.
+the engine's test time (#2807 fixed both). Fixing them first means the ledger
+judges each test by what it asserts, not by setup cost no single test can
+remove.
 
 Done when every test in scope has a recorded result and the coverage report
 is saved.
@@ -94,7 +95,21 @@ marks.
   sibling table row, a property, or a test at the owning layer.
 - `D` delete: name the proof that remains, or why there is no contract.
 
-Judge each test by its assertions, not its name.
+Judge each test by its assertions, not its name. For every `C` and `D`, quote
+the keeper's assertion lines that check the same behavior, edge cases
+included; step 7 mutates production code against each one. A keeper must
+carry the same risk, not only the same values:
+
+- an in-memory keeper does not absorb a test that drops and reopens the store
+  or reads through a second connection: persistence is its own contract;
+- a keeper that checks selected columns does not absorb one that compares
+  whole rows for each kind of row.
+
+When unsure, mark `R` and say what would decide it. A wrong `C` or `D` costs
+more than a missed one.
+
+The same subagent can do step 5's triage for its lane: it has already read
+the owner.
 
 Done when every test in the lane has a mark and an evidence line.
 
@@ -133,10 +148,13 @@ each group:
   an error or rollback path with a visible effect, or an edge case of a public
   method. Add a test at the owning layer and show it fail under a matching
   mutation.
-- `X` dead: no production caller. File an issue or delete it in its own
-  change, not in a lane.
-- `U` unreachable: defensive code that cannot run, such as an impossible
-  match arm or an invariant `expect`. Leave it untested.
+- `X` dead: no production caller anywhere in the workspace, bindings
+  included. File an issue or delete it in its own change, not in a lane.
+- `U` untested on purpose: defensive code that cannot run, such as an
+  impossible match arm or an invariant `expect`, or reachable code with no
+  contract worth a test, such as a `Debug` impl that prints fields as they
+  are. A `Debug` impl that redacts content, keys or ids is a privacy contract:
+  `T`.
 
 Coverage cannot see a line that runs while nothing asserts its result: a
 persisted integer no test pins, or a trigger whose only probe fails first on
@@ -179,9 +197,10 @@ and every consolidated contract has a caught mutation.
 ## 8. Land
 
 One lane per PR, through `.agents/skills/land-change`. A lane is a diff a
-reviewer can read whole; a crate-wide diff is not. The queue squashes, so
-land the shared-harness PR first and rebase each lane onto master after the
-previous one merges.
+reviewer can read whole; a crate-wide diff is not. Land the shared-harness
+PR first. Lanes that touch disjoint files can be reviewed and queued
+together; the queue squashes, so rebase a lane onto master when one it
+overlaps merges first.
 
 Done when every lane PR is merged.
 

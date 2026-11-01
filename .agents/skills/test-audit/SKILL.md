@@ -69,7 +69,8 @@ check the [retention bar](#retention-bar) first.
   calling the code under test, or a snapshot was accepted without being read.
 - **Vacuous negatives.** `assert!(r.is_err())`, `matches!(r, Err(_))`, or
   `#[should_panic]` without `expected` pass on any error, including the wrong
-  guard. Match the variant or message the intended guard produces.
+  guard. Match the variant the intended guard produces and, where several
+  guards share a variant (`StorageError::Backend`), its message.
 - **Unreachable rejections.** A negative case whose input the production path
   never produces, or that a sibling guard rejects first.
 - **Mocks supplying the asserted behavior.** A mock relay, peeler or clock
@@ -86,6 +87,14 @@ check the [retention bar](#retention-bar) first.
   files that the test compares against another hand-maintained list.
 - **Sleep-to-settle.** A `sleep` before an assertion instead of awaiting the
   produced state, or a flake "fixed" by raising a timeout or adding retries.
+- **Timed races.** A contention or transaction-scope claim staged by holding
+  a lock for a fixed time. A descheduled thread runs the operation after the
+  lock is gone and the test passes without contention. Prove it by behavior:
+  a second connection, a trigger that raises, or a busy handler that observes
+  the wait.
+- **Unpromised order.** Reading an unordered listing by index, or comparing
+  it with a `Vec` in insertion order. Sort or compare as a set unless the API
+  promises the order.
 - **Misleading names.** The name promises behavior the inputs or assertions
   never exercise. Judge a test by its assertions, not its name.
 - **Dead tests.** `#[ignore]` with no recipe, CI lane or documented manual
@@ -129,9 +138,9 @@ the tests do.
 
 - **Acceptable:** a seam that only changes a value the same production path
   reads (a settlement window, retry budget or clock), or that skips cost
-  without changing behavior, like `in_memory_for_test()` skipping SQLCipher
-  memory locking while `cgka-engine/tests/sqlite_storage.rs` keeps the
-  encrypted rail.
+  without changing behavior, like `in_memory_for_test()` copying a template
+  that the same fresh open migrated, while `cgka-engine/tests/sqlite_storage.rs`
+  keeps the encrypted rail.
 - **Not acceptable:** a seam that skips a production step, injects state the
   owner should produce, or exposes internals so a test can assert on them.
   Move the proof to the public boundary and delete the seam together with the
