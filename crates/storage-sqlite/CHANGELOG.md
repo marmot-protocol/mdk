@@ -11,7 +11,9 @@
   `clear_epoch_backfill_intents_for_groups`,
   `clear_local_group_deletion_frontier_if_message_is_newer`,
   `record_app_event_refreshing_moderation_grant` and its `_with_retention`
-  variant (use `record_app_event_with_source`), `avatar_acquisition_state`
+  variant (nothing replaces a stored grant any more: re-recording keeps it,
+  and `record_app_event_with_source` decides it once from the source's
+  authority and never again), `avatar_acquisition_state`
   (read `AvatarAssetPresentation::acquisition`) and `release_media_reference`
   (removal releases a slot's reference); `AvatarFileImage::byte_len`,
   `DatabaseAvatar::byte_len`, `SqliteSharedStorage::set_telemetry_install_id`
