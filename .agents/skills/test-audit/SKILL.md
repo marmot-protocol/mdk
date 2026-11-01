@@ -177,7 +177,12 @@ the tests do.
   Over 30 seconds, it belongs in a dedicated CI job or nextest test group, with the
   reason in the PR.
 - **Storage.** Use in-memory storage unless the contract is about the file,
-  encryption or locking.
+  encryption, locking or what survives a reopen. Never remove a
+  drop-and-reopen or a second-connection read from an existing test, even one
+  that looks incidental: open-time code (startup sweeps, recovery, cleanup)
+  can break what survives a restart, and only those reopens catch it. Cut
+  their cost with a raw SQLCipher key (`SqlCipherKey::raw`) and fewer stores
+  instead.
 
 ## Audit evidence
 
