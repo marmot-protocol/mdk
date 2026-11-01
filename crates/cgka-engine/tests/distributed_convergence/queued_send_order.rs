@@ -78,8 +78,8 @@ async fn a_send_never_overtakes_the_senders_queued_sends() {
             .expect("every prepared message is one of carol's sends")
     };
 
-    for index in 0..QUEUED {
-        let result = send(&mut carol, &group_id, &sends[index]).await;
+    for (index, event) in sends[..QUEUED].iter().enumerate() {
+        let result = send(&mut carol, &group_id, event).await;
         assert!(
             matches!(result, SendResult::Queued { .. }),
             "send {index} waits for the unsettled Commit: {result:?}"
@@ -91,8 +91,8 @@ async fn a_send_never_overtakes_the_senders_queued_sends() {
     clock.advance_ms(V1_MAX_CONVERGENCE_PASS_MS);
     let mut prepared = Vec::new();
     let mut after_settling = Vec::new();
-    for index in QUEUED..QUEUED + AFTER_SETTLING {
-        let result = send(&mut carol, &group_id, &sends[index]).await;
+    for event in &sends[QUEUED..] {
+        let result = send(&mut carol, &group_id, event).await;
         assert_eq!(carol.epoch(&group_id).unwrap(), settled_epoch);
         assert!(!carol.has_pending_convergence_inputs(&group_id).unwrap());
         after_settling.push(matches!(result, SendResult::Queued { .. }));
