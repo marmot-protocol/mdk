@@ -1869,9 +1869,23 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             group,
         ) = tagging_devices().await;
         let laptop_slot = slot_of(&laptop);
-        let tag_signature_key = roster(&phone, &group).devices[&laptop_slot]
-            .tag_signature_key
-            .clone();
+        // Later roster states list another key for the laptop's slot, then
+        // its own again: the record carries the key listed last, not the
+        // one listed first.
+        let entry = roster(&phone, &group).devices[&laptop_slot].clone();
+        let tag_signature_key = entry.tag_signature_key.clone();
+        for key in [Some(vec![0x01; 32]), tag_signature_key.clone()] {
+            let entry = DeviceEntryV1 {
+                tag_signature_key: key,
+                ..entry.clone()
+            };
+            commit_roster(
+                &mut phone,
+                &group,
+                vec![DeviceRosterOperationV1::SetDevice(laptop_slot, entry)],
+            )
+            .await;
+        }
         let decided_at = crate::unix_now_seconds() - days_ago * 24 * 60 * 60 - 60;
         phone_app
             .account_storage("alice")
