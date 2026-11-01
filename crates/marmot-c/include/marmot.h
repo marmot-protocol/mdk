@@ -8255,10 +8255,12 @@ MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *cli
  * `marmot.group.account-devices.v1`, name no relays a sibling Welcome
  * can carry, or already hold this account's limit of 20 leaves. Once a
  * link this device approved is made, the new device is added to this
- * device's other chats when its "add to all my chats" setting is on. A
- * chat admin can turn the component on; removing a device frees its
- * leaves. Zero while device groups are off. Not evented: read it when
- * showing the device list.
+ * device's other chats when its "add to all my chats" setting is on,
+ * for a week after the link. A chat whose requirements the new device's
+ * KeyPackages don't meet is passed over and not counted, so zero does not
+ * mean the new device reaches every chat. A chat admin can turn the
+ * component on; removing a device frees its leaves. Zero while device
+ * groups are off. Not evented: read it when showing the device list.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
