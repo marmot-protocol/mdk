@@ -2545,8 +2545,8 @@ impl MarmotAppRuntime {
 
     /// The held chats whose history from another of this account's devices
     /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
-    /// delivery waits for its chat or bundle, with `retrying` once fetching
-    /// one failed, then `Imported` with the device it came from and when.
+    /// delivery waits to be imported, with `retrying` once an attempt to
+    /// get its bundle failed, then `Imported` with the device it came from and when.
     /// Facts only: an empty history sends nothing, and an expired delivery
     /// leaves nothing. Empty while device groups are off. Refresh on
     /// `ChatHistoryImportsChanged`; a device's name follows

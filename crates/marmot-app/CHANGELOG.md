@@ -10,9 +10,9 @@
   its roster name now, empty for an unnamed or removed device), so a host
   draws "Imported from <device>" where rows change from imported to live.
   `MarmotAppRuntime::chat_history_imports` lists each held chat whose history
-  is `Receiving` (with `retrying` once a fetch failed) or `Imported`, and
-  `MarmotAppEvent` adds `ChatHistoryImportsChanged { account_id_hex,
-  account_label }` to say re-read. Names are resolved when rows are read and
+  is `Receiving` (with `retrying` once an attempt to get its bundle failed)
+  or `Imported`, and `MarmotAppEvent` adds `ChatHistoryImportsChanged {
+  account_id_hex, account_label }` to say re-read. Names are resolved when rows are read and
   follow `LinkedDevicesChanged`. Only behind `dev_device_groups`. Exhaustive
   matches and struct literals add the new arm and field.
 

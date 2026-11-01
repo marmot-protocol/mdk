@@ -438,7 +438,7 @@ to live, and say "another device" for an empty name: a device with no name, one 
 first read the roster. Names are resolved when rows are read, so a rename shows after `LinkedDevicesChanged`.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
-waits for the chat or its bundle; `retrying` once a fetch failed) or `Imported` (the latest import's source and time).
+waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
 It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
 after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
 `MarmotAppEvent::ChatHistoryImportsChanged` says to re-read, and also fires once each time the account's worker opens or

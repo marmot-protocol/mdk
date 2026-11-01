@@ -9,7 +9,8 @@
   `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628
   item 4.2d). New `chat_history_imports(account_ref)` lists each held chat's
   history from another device as `ChatHistoryImportFfi`: `Receiving`, with
-  `retrying` once a fetch failed, or `Imported` with its source and time. An
+  `retrying` once an attempt to get its bundle failed, or `Imported` with
+  its source and time. An
   empty `device_label` means "another device". Only behind
   `dev_device_groups`. Exhaustive matches add the new arm.
 

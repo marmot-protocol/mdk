@@ -793,8 +793,8 @@ c_cmd! {
 
     /// List the held chats whose history from another of this account's
     /// devices is arriving or has arrived: `Receiving` while a delivery
-    /// waits for its chat or bundle, with `retrying` once fetching one
-    /// failed, then `Imported` with the device it came from and when. Empty
+    /// waits to be imported, with `retrying` once an attempt to get its
+    /// bundle failed, then `Imported` with the device it came from and when. Empty
     /// while device groups are off. Re-read on the
     /// `ChatHistoryImportsChanged` event; a device's name follows
     /// `LinkedDevicesChanged`. Free with

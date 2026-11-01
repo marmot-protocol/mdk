@@ -124,12 +124,21 @@ impl AppClient {
                 "dropping imported history events that fail their checks",
             );
         }
-        self.app.import_account_app_events(
+        // Until the next seam, storage may hold no names (a new connection)
+        // or old ones: give it the roster's, so these rows name their source.
+        if self.linked_devices_changed {
+            self.refresh_device_labels();
+        }
+        let (imported, update) = self.app.import_account_app_events(
             &self.state.label,
             &group_id_hex,
             source_slot,
             &importable,
-        )
+        )?;
+        // A new row moves the chat's latest import, even one no timeline row
+        // shows, such as a reaction to a message this device lacks.
+        self.chat_history_imports_changed |= imported > 0;
+        Ok(update)
     }
 
     /// The chat's group id as hex, once this device advertises the roster and

@@ -24,8 +24,9 @@ c_mirror! {
 /// Where a chat's history from another device stands.
 #[repr(C)]
 pub enum MarmotChatHistoryImportState {
-    /// A delivery arrived and waits for its chat or its bundle. `retrying`
-    /// once fetching one of its bundles failed; it is tried again later.
+    /// A delivery arrived and waits to be imported, as while its bundle is
+    /// fetched. `retrying` once an attempt to get one of its bundles failed;
+    /// it is tried again later.
     Receiving { retrying: bool },
     /// Its latest import: the device it came from, and when, in Unix
     /// seconds.

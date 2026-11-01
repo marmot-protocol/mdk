@@ -10,7 +10,9 @@ use crate::history_bundle::{
 };
 use crate::messages::AppMessageIntent;
 use cgka_traits::MarmotAppEvent;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+};
 
 const PHONE_SLOT: [u8; 32] = [0x11; 32];
 
@@ -168,6 +170,46 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
             .unwrap()
             .is_none()
     );
+
+    // A reaction to a message Bob lacks changes no timeline row, yet is a new
+    // imported row that moves the chat's latest import, so hosts are told
+    // (mdk#2628 4.2d).
+    bob.take_chat_history_imports_changed();
+    let orphan = MarmotAppEvent::new(
+        bob_account.account_id_hex.clone(),
+        3,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![vec![EVENT_REF_TAG.to_owned(), "99".repeat(32)]],
+        "+",
+    );
+    let mut reaction_only = HistoryBundle::new(
+        chat.as_slice(),
+        ChatPosition::of(&orphan, 0),
+        ChatPosition::of(&orphan, 0),
+    );
+    reaction_only.events = vec![BundledEvent {
+        event: orphan.clone(),
+        epoch: 0,
+        retention: None,
+        grant: None,
+        keys: None,
+    }];
+    assert!(
+        bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&reaction_only))
+            .unwrap()
+            .is_none(),
+        "no timeline row changed"
+    );
+    assert_eq!(
+        storage
+            .app_event_import_source(&chat_hex, &orphan.id)
+            .unwrap(),
+        Some(PHONE_SLOT)
+    );
+    assert!(bob.take_chat_history_imports_changed());
+    bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&reaction_only))
+        .unwrap();
+    assert!(!bob.take_chat_history_imports_changed(), "nothing new");
 
     // A bundle for another chat, or whose hash its message did not vouch for,
     // is refused whole. An event whose id does not match its content is

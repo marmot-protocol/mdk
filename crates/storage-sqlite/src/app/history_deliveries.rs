@@ -44,7 +44,8 @@ pub struct ParkedHistoryDelivery {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParkedHistoryChat {
     pub group_id_hex: String,
-    /// A fetch of one of its Blossom deliveries failed.
+    /// An attempt to fetch one of its Blossom deliveries failed or was put
+    /// off, and it waits to be tried again.
     pub retrying: bool,
 }
 
@@ -521,26 +522,30 @@ impl SqliteAppStorage {
     }
 
     /// Drop owed, sent and parked deliveries a week old at `now`. Returns how
-    /// many parked ones went, since a host shows those.
+    /// many went.
     pub fn expire_history_deliveries(&self, now: u64) -> StorageResult<usize> {
         let before = u64_to_i64(now.saturating_sub(HISTORY_DELIVERY_RETENTION_SECS))?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            conn.execute_cached(
-                "DELETE FROM history_deliveries_owed WHERE owed_at < ?1",
-                params![before],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "DELETE FROM history_delivery_sends WHERE recorded_at < ?1",
-                params![before],
-            )
-            .storage()?;
-            conn.execute_cached(
-                "DELETE FROM history_deliveries_parked WHERE received_at < ?1",
-                params![before],
-            )
-            .storage()
+            let owed = conn
+                .execute_cached(
+                    "DELETE FROM history_deliveries_owed WHERE owed_at < ?1",
+                    params![before],
+                )
+                .storage()?;
+            let sent = conn
+                .execute_cached(
+                    "DELETE FROM history_delivery_sends WHERE recorded_at < ?1",
+                    params![before],
+                )
+                .storage()?;
+            let parked = conn
+                .execute_cached(
+                    "DELETE FROM history_deliveries_parked WHERE received_at < ?1",
+                    params![before],
+                )
+                .storage()?;
+            Ok(owed + sent + parked)
         })
     }
 }
@@ -723,7 +728,7 @@ mod tests {
         store.defer_parked_history_fetch("e2", 70).unwrap();
         // An inline delivery has no fetch to defer.
         store.defer_parked_history_fetch("e1", 70).unwrap();
-        // One failed fetch marks its chat as retrying.
+        // One deferred fetch marks its chat as retrying.
         assert_eq!(store.parked_history_chats().unwrap(), chats([true, false]));
         assert_eq!(
             store.due_parked_history_fetches(69, 8).unwrap(),
@@ -786,7 +791,7 @@ mod tests {
         store
             .record_history_delivery_send("e1", "aa", "s1", DAY)
             .unwrap();
-        assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 1);
+        assert_eq!(store.expire_history_deliveries(8 * DAY + 1).unwrap(), 3);
         assert!(store.owe_history_delivery_again("e1").unwrap().is_none());
         assert_eq!(
             store.unsent_history_deliveries().unwrap()[0].group_id_hex,

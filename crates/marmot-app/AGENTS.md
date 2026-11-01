@@ -243,10 +243,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   received delivery: any other error fails the projection so it is read again.
 - Show imported history only as facts (mdk#2628 4.2d, D78, `src/client/history_imports.rs`). A row's source device
   comes from storage (`imported_from`), its name resolved at read time from the TEMP `device_labels` table: give
-  storage the roster's names (`refresh_device_labels`) wherever `LinkedDevicesChanged` is drained, never store them.
-  `chat_history_imports` lists held chats only, from parked deliveries and the latest import; set
-  `chat_history_imports_changed` wherever a delivery parks, imports rows, is dropped or expires, or first fails to
-  fetch, and drain it at the device-group seams, including after a history fetch completes.
+  storage the roster's names (`refresh_device_labels`) wherever `LinkedDevicesChanged` is drained, and before an
+  import while `linked_devices_changed` is pending (a new connection starts with none), never store them; never at
+  client open, which must not hydrate the device group. `chat_history_imports` lists held chats only, from parked deliveries and the latest
+  import. `ChatHistoryImportsChanged` comes from `take_chat_history_imports_changed`: an import that added rows sets
+  `chat_history_imports_changed`, and each call compares the held chats' parked deliveries with those last announced,
+  so parking, retrying, dropping, expiring or joining needs no flag of its own. Drain it at the device-group seams,
+  including after a history fetch completes.
 - Heartbeats (mdk#2628 item 3.6, D35) live in `src/client/device_heartbeats.rs`. Send one only from the trusted
   device group, once this device's own leaf reads as its slot, at most once an hour. Record the sent time only once the
   send returns that it went out (published, unresolved or queued), and leave the record alone when it reached no one

@@ -881,11 +881,12 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
-    /// A chat's history from another device may have changed as hosts would
-    /// read it: a delivery parked, imported, retried or dropped, or the
-    /// client just opened. The same seams drain it into one
+    /// A history import added rows, or the client just opened. The same
+    /// seams drain it, with a change in `listed_receiving_chats`, into one
     /// `ChatHistoryImportsChanged` (mdk#2628 4.2d).
     pub(crate) chat_history_imports_changed: bool,
+    /// The held chats with parked history deliveries, as last announced.
+    pub(crate) listed_receiving_chats: Vec<storage_sqlite::ParkedHistoryChat>,
     /// The device group removed this device after its link was made, and the
     /// account is marked unlinked (mdk#2628 D67). The account worker stops at
     /// its next turn and asks the runtime to deactivate the account.

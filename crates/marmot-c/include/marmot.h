@@ -2896,8 +2896,9 @@ typedef struct MarmotHistoryImportSource {
  */
 typedef enum MarmotChatHistoryImportState_Tag {
   /**
-   * A delivery arrived and waits for its chat or its bundle. `retrying`
-   * once fetching one of its bundles failed; it is tried again later.
+   * A delivery arrived and waits to be imported, as while its bundle is
+   * fetched. `retrying` once an attempt to get one of its bundles failed;
+   * it is tried again later.
    */
   MARMOT_CHAT_HISTORY_IMPORT_STATE_RECEIVING,
   /**
@@ -8141,8 +8142,8 @@ MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
 /**
  * List the held chats whose history from another of this account's
  * devices is arriving or has arrived: `Receiving` while a delivery
- * waits for its chat or bundle, with `retrying` once fetching one
- * failed, then `Imported` with the device it came from and when. Empty
+ * waits to be imported, with `retrying` once an attempt to get its
+ * bundle failed, then `Imported` with the device it came from and when. Empty
  * while device groups are off. Re-read on the
  * `ChatHistoryImportsChanged` event; a device's name follows
  * `LinkedDevicesChanged`. Free with
