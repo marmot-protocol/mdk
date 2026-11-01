@@ -3967,7 +3967,7 @@ How many chats this device is in still hold a device this account removed, becau
 MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *client, const char *account_ref, uint32_t *out);
 ```
 
-How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, or name no relays a sibling Welcome can carry. A newly linked device is added to this device's other chats; a chat admin can turn the component on in these. Zero while device groups are off. Not evented: read it when showing the device list.
+How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, name no relays a sibling Welcome can carry, or already hold this account's limit of 20 leaves. A newly linked device is added to this device's other chats; a chat admin can turn the component on in these, and removing a device frees its leaves. Zero while device groups are off. Not evented: read it when showing the device list.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotchats_closed_to_linked_devices) · [Header contract](include/marmot.h#L8255)
 

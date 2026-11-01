@@ -82,6 +82,8 @@ impl AppClient {
         }
     }
 
+    /// Each chat is handled on its own: one that fails never holds the
+    /// others back, and the first failure is returned at the end.
     async fn try_add_linked_devices_to_chats(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
@@ -95,8 +97,18 @@ impl AppClient {
         }
         let chats = self.sibling_commit_chats_in_list_order()?;
         let mut budget = LINK_CHAT_ADDS_PER_PASS;
-        for device in new_devices {
-            let owed = self.chats_owed_to(&exchange.roster, &device, &chats)?;
+        let mut first_error: Option<AppError> = None;
+        'devices: for device in new_devices {
+            let mut owed = Vec::new();
+            for chat in &chats {
+                match self.chat_owed_to(&exchange.roster, &device, chat) {
+                    Ok(true) => owed.push(chat.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
             if owed.is_empty() {
                 continue;
             }
@@ -106,10 +118,15 @@ impl AppClient {
             )?;
             for chat in owed {
                 if budget == 0 {
-                    return Ok(());
+                    break 'devices;
                 }
-                if !self.group_quiet(&chat)? {
-                    continue;
+                match self.group_quiet(&chat) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                 }
                 let Some(key_package) = self.next_private_key_package(&device.slot)? else {
                     break;
@@ -118,21 +135,21 @@ impl AppClient {
                     slot: device.slot,
                     key_package,
                 };
-                if self.runtime.sibling_add_refusal(&chat, &sibling)?.is_some() {
-                    continue;
+                match self.runtime.sibling_add_refusal(&chat, &sibling) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error.into());
+                        continue;
+                    }
                 }
                 budget -= 1;
                 if let Err(error) = self.add_sibling_to_chat(&chat, &device.slot).await {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        method = "try_add_linked_devices_to_chats",
-                        error_kind = error.privacy_safe_kind(),
-                        "could not add a linked device to a chat"
-                    );
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// The devices whose links this device approved and decided made less
@@ -173,31 +190,23 @@ impl AppClient {
             .collect())
     }
 
-    /// The chats of `chats` that don't hold `device` yet and take a
-    /// same-account Add.
-    fn chats_owed_to(
+    /// Whether `chat` takes a same-account Add and doesn't hold `device` yet.
+    fn chat_owed_to(
         &self,
         roster: &DeviceRosterV1,
         device: &NewDevice,
-        chats: &[GroupId],
-    ) -> Result<Vec<GroupId>, AppError> {
-        let mut owed = Vec::new();
-        for chat in chats {
-            if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
-                continue;
-            }
-            let holds = self
-                .runtime
-                .own_account_leaf_claims(chat, roster)?
-                .into_iter()
-                .any(|(key, claim)| {
-                    claim == DeviceTagClaim::Device(device.slot) || key == device.tag_signature_key
-                });
-            if !holds {
-                owed.push(chat.clone());
-            }
+        chat: &GroupId,
+    ) -> Result<bool, AppError> {
+        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
+            return Ok(false);
         }
-        Ok(owed)
+        Ok(!self
+            .runtime
+            .own_account_leaf_claims(chat, roster)?
+            .into_iter()
+            .any(|(key, claim)| {
+                claim == DeviceTagClaim::Device(device.slot) || key == device.tag_signature_key
+            }))
     }
 
     /// [`Self::sibling_commit_chats`], in the order the chat list shows them.
