@@ -145,6 +145,8 @@ struct PendingPointer {
     run: [u8; BACKUP_ID_LEN],
     written_at: u64,
     content: String,
+    /// When the pointer it replaces was made, which it must postdate.
+    replaces: u64,
 }
 
 impl BackupPass {
@@ -157,7 +159,7 @@ impl BackupPass {
     }
 
     async fn pass(&self) -> Result<PassReport, AppError> {
-        let listed = self.fetch_pointer().await?;
+        let (listed, replaces) = self.fetch_pointer().await?;
         self.delete_condemned(&listed).await;
         let newest = listed.first().map(|entry| entry.written_at);
         let Some(write) = &self.write else {
@@ -207,18 +209,19 @@ impl BackupPass {
                 (entry, Some(index))
             }
         };
-        let pointer = self.listing(listed, entry, index, now).await?;
+        let pointer = self.listing(listed, replaces, entry, index, now).await?;
         Ok(PassReport {
             newest,
             pointer: Some(pointer),
         })
     }
 
-    /// The backups the account's pointer under this key lists, newest first:
-    /// none when no relay holds one. Refused unless a relay answered in
-    /// full, since a pointer built from no answer would drop every backup,
-    /// and when the newest pointer does not open.
-    async fn fetch_pointer(&self) -> Result<Vec<PointerEntry>, AppError> {
+    /// The backups the account's pointer under this key lists, newest first,
+    /// and when that pointer was made: none, and zero, when no relay holds
+    /// one. Refused unless a relay answered in full, since a pointer built
+    /// from no answer would drop every backup, and when the newest pointer
+    /// does not open.
+    async fn fetch_pointer(&self) -> Result<(Vec<PointerEntry>, u64), AppError> {
         let address = backup_address(&self.key);
         let query = DirectoryEventQuery::address(
             KIND_BACKUP_POINTER,
@@ -247,9 +250,10 @@ impl BackupPass {
             })
             .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
         let Some(event) = newest else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
-        Ok(BackupPointer::open(&event.content, &self.key)?.backups)
+        let backups = BackupPointer::open(&event.content, &self.key)?.backups;
+        Ok((backups, event.created_at))
     }
 
     /// Delete each condemned blob whose delete is due, unless `listed`
@@ -436,13 +440,14 @@ impl BackupPass {
         .map_err(|_| AppError::BlockingTask("backup export failed".into()))?
     }
 
-    /// The pointer listing `own` among `listed`, by retention at `now`. The
-    /// blobs of each backup it drops are condemned first: if the pointer
+    /// The pointer listing `own` among `listed`, by retention at `now`, to
+    /// replace the one made at `replaces`. The blobs of each backup it drops are condemned first: if the pointer
     /// never lands, the fetched one still lists them, and no delete touches
     /// a listed backup's blobs.
     async fn listing(
         &self,
         listed: Vec<PointerEntry>,
+        replaces: u64,
         own: PointerEntry,
         own_index: Option<BackupIndex>,
         now: u64,
@@ -481,6 +486,7 @@ impl BackupPass {
             run,
             written_at: own.written_at,
             content,
+            replaces,
         })
     }
 
@@ -633,6 +639,13 @@ impl AppClient {
                 "no Blossom server for backups; none written"
             );
             None
+        } else if marmot_session::seal_to_recovery_key(&role.key, &[], &[]).is_none() {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "prepare_backup_pass",
+                "recovery key seals nothing; no backup written"
+            );
+            None
         } else {
             Some(BackupWrite {
                 writer: self.own_slot()?,
@@ -710,7 +723,10 @@ impl AppClient {
                 storage.abandon_backup_run(&pointer.run, now, now + DELETE_AFTER_SECS)?;
                 return Ok(now);
             }
-            if !self.publish_backup_pointer(key, pointer.content).await? {
+            if !self
+                .publish_backup_pointer(key, pointer.content, pointer.replaces)
+                .await?
+            {
                 return Err(backup_error("backup_pointer_refused"));
             }
             storage.finish_backup_run(&pointer.run)?;
@@ -729,9 +745,15 @@ impl AppClient {
         Ok(now.saturating_add(BACKUP_INTERVAL_SECS))
     }
 
-    /// Sign the pointer with `content` and publish it to the account's
-    /// relays. Whether a relay accepted it; the others get it later.
-    async fn publish_backup_pointer(&self, key: &[u8], content: String) -> Result<bool, AppError> {
+    /// Sign the pointer with `content`, later than the one it `replaces`
+    /// (NIP-01 keeps the newer), and publish it to the account's relays.
+    /// Whether a relay accepted it; the others get it later.
+    async fn publish_backup_pointer(
+        &self,
+        key: &[u8],
+        content: String,
+        replaces: u64,
+    ) -> Result<bool, AppError> {
         let summary = self.app.account_home().account(&self.state.label)?;
         let signer = self
             .app
@@ -743,11 +765,12 @@ impl AppClient {
             .sign_replaceable_identity_event(
                 &self.state.label,
                 signer.clone(),
-                &NostrTransportEvent::new_unsigned(
+                &NostrTransportEvent::new_unsigned_at(
                     summary.account_id_hex.clone(),
                     KIND_BACKUP_POINTER,
                     vec![vec!["d".to_owned(), backup_address(key)]],
                     content,
+                    unix_now_seconds().max(replaces.saturating_add(1)),
                 ),
             )
             .await?;

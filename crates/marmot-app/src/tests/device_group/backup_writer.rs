@@ -133,6 +133,17 @@ async fn publish_pointer(
     key: &[u8],
     backups: Vec<PointerEntry>,
 ) {
+    publish_pointer_at(device, relay, key, backups, unix_now_seconds()).await;
+}
+
+/// [`publish_pointer`], made no earlier than `at`.
+async fn publish_pointer_at(
+    device: &AppClient,
+    relay: &ScriptedPushRelayClient,
+    key: &[u8],
+    backups: Vec<PointerEntry>,
+    at: u64,
+) {
     let summary = device
         .app
         .account_home()
@@ -143,11 +154,12 @@ async fn publish_pointer(
         .account_signer_for_summary(&summary)
         .unwrap()
         .as_nostr_signer();
-    let unsigned = NostrTransportEvent::new_unsigned(
+    let unsigned = NostrTransportEvent::new_unsigned_at(
         summary.account_id_hex,
         KIND_BACKUP_POINTER,
         vec![vec!["d".to_owned(), backup_address(key)]],
         BackupPointer::new(backups).seal(key).unwrap(),
+        at,
     );
     let event = device
         .app
@@ -497,6 +509,43 @@ async fn a_dropped_backup_is_deleted_later_unless_the_pointer_lists_it_again() {
         held(&blossom),
         &written[2].1 | &blobs_of(&blossom, &listed[0], &key)
     );
+}
+
+/// A new pointer replaces the one its pass fetched, though another device
+/// whose clock runs a day ahead made that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_pointer_postdates_the_one_it_replaces() {
+    let blossom = local_blossom();
+    let (devices, _chat, words) = lone_writer(&blossom).await;
+    let (mut phone, relay, key) = (devices.phone, devices.relay, words.public);
+    phone.drive_backup_pass().await;
+    let mut first = pointer(&relay, &key);
+    first[0].written_at -= 2 * DAY;
+    let ahead = unix_now_seconds() + DAY;
+    publish_pointer_at(&devices.laptop, &relay, &key, first.clone(), ahead).await;
+
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    let event = pointer_event(&relay, &key).unwrap();
+    assert!(event.created_at > ahead);
+    let listed = BackupPointer::open(&event.content, &key).unwrap().backups;
+    assert_eq!(ids(&listed[1..]), ids(&first));
+}
+
+/// Under a key nothing can be sealed to, the writer uploads nothing and
+/// lists nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_that_seals_nothing_gets_no_backup() {
+    let blossom = local_blossom();
+    let (devices, _chat, _words) = lone_writer(&blossom).await;
+    let mut phone = devices.phone;
+    storage(&devices.phone_app)
+        .keep_recovery_key(&[0x04; 33])
+        .unwrap();
+    due_now(&phone);
+    phone.drive_backup_pass().await;
+    assert!(held(&blossom).is_empty());
+    assert_eq!(pointers_published(&devices.relay), 0);
 }
 
 /// A device with no device group writes under the key it keeps. New words

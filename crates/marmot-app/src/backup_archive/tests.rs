@@ -12,6 +12,12 @@ use storage_sqlite::{ReadPosition, SmallStateValue, SmallStateVersion};
 use super::*;
 use crate::history_bundle::BundledEvent;
 
+/// A change that makes an index invalid.
+type Break = fn(&mut BackupIndex);
+
+/// A listed blob's `(from, expires)`.
+type Stretch = (u64, Option<u64>);
+
 const WORDS: [u8; RECOVERY_ENTROPY_LEN] = [7; RECOVERY_ENTROPY_LEN];
 const OTHER_WORDS: [u8; RECOVERY_ENTROPY_LEN] = [8; RECOVERY_ENTROPY_LEN];
 const WRITER: DeviceSlotId = [0x33; 32];
@@ -32,7 +38,7 @@ fn bundled(epoch: u64, at: u64, retention: Option<u64>) -> BundledEvent {
             at,
             MARMOT_APP_EVENT_KIND_CHAT,
             Vec::new(),
-            &format!("message {at}"),
+            format!("message {at}"),
         ),
         epoch,
         retention,
@@ -447,7 +453,7 @@ fn an_index_that_breaks_the_format_is_refused_whole() {
         index
     );
 
-    let broken: [(&str, fn(&mut BackupIndex)); 10] = [
+    let broken: [(&str, Break); 10] = [
         ("version", |index| index.v = 2),
         ("writer", |index| index.writer = "33".repeat(31)),
         ("chat named twice", |index| {
@@ -680,7 +686,7 @@ fn position(at: u64) -> ChatPosition {
 
 /// A listed backup `id`, written at `written_at`, holding for each chat
 /// one blob per `(from, expires)`.
-fn listed(id: u8, written_at: u64, chats: &[(&[u8], &[(u64, Option<u64>)])]) -> ListedBackup {
+fn listed(id: u8, written_at: u64, chats: &[(&[u8], &[Stretch])]) -> ListedBackup {
     let mut index = BackupIndex::new(written_at, &WRITER);
     for (chat, blobs) in chats {
         for (from, expires) in *blobs {
