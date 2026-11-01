@@ -1512,6 +1512,32 @@ mod tests {
     fn snapshot_reads_latest_process_probe_counters() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        // Register the real process-wide reader in an isolated test process so
+        // neither earlier registrations nor later snapshots can interfere.
+        const CHILD: &str = "MDK_SQLCIPHER_PROBE_COUNTER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app_telemetry::tests::snapshot_reads_latest_process_probe_counters",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+                "the isolated snapshot test must actually execute"
+            );
+            return;
+        }
+
         static RUNS: AtomicU64 = AtomicU64::new(7);
         static SKIPS: AtomicU64 = AtomicU64::new(11);
         fn process_counters() -> (u64, u64) {
