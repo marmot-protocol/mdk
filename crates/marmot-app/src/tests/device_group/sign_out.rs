@@ -476,7 +476,7 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
 /// a confirmation included, so a busy worker does not stretch the wait. The
 /// laptop's entry already reads `leaving`, so the wipe's first step would
 /// confirm it, but that step waits behind a message held at its relay until
-/// the deadline has passed: the laptop leaves every chat itself.
+/// the deadline has passed: the laptop tries to leave every chat itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmation_after_the_deadline_counts_as_not_reached() {
     let (mut devices, group) = tagging_devices().await;

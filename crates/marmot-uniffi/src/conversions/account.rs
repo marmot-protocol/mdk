@@ -333,7 +333,8 @@ pub struct WipeOutcomeFfi {
     /// siblings.
     pub groups_left_to_siblings: u32,
     /// This device could not ask its siblings to take it out within about 30
-    /// seconds, so it left every chat itself. Tell the user its other devices
+    /// seconds, so it tried to leave every chat itself; one it could not
+    /// leave is in `group_leave_failures`. Tell the user its other devices
     /// could not be asked: they may still list it until the user removes it
     /// from one of them.
     pub siblings_not_reached: bool,

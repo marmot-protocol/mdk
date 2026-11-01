@@ -461,7 +461,8 @@ stops on this device: `MarmotAccountSummary.unlinked` and `signed_out` stay set,
 With a linked device that is not signing out too, `marmot_sign_out_and_wipe` first asks the account's other devices
 to take this one out, which can block for about 30 seconds, and leaves them the chats they can.
 `MarmotWipeOutcome.groups_left_to_siblings` counts those chats, and `siblings_not_reached` says it could not ask
-them in time, so it left every chat itself; tell the user. See the
+them in time, so it tried to leave every chat itself, reporting any it could not in `group_leave_failures`; tell the
+user. See the
 [shared contract](../marmot-uniffi/README.md#signing-out-with-linked-devices).
 
 `marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this

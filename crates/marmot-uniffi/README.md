@@ -1040,9 +1040,9 @@ signing out too (mdk#2628):
   slot and wipes. The other devices remove it from the device group and from the rest.
 - `WipeOutcomeFfi.groups_left_to_siblings` counts the chats it left to the other devices; `groups_left` counts those it
   left itself.
-- When it can't ask them in time, it leaves every chat itself and sets `siblings_not_reached`. Tell the user their
-  other devices couldn't be asked, and that those devices may still list this one until the user removes it from one
-  of them.
+- When it can't ask them in time, it tries to leave every chat itself, reporting any it can't in
+  `group_leave_failures`, and sets `siblings_not_reached`. Tell the user their other devices couldn't be asked, and
+  that those devices may still list this one until the user removes it from one of them.
 - The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
 ### Overdue KeyPackage refresh

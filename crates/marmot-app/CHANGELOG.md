@@ -12,8 +12,9 @@
   then leaves only the chats no sibling takes
   it out of, deletes its slot and wipes. `WipeOutcome` adds
   `groups_left_to_siblings`, the chats it left to them, and
-  `siblings_not_reached`, set when it could not ask them in time and left
-  every chat itself. A device
+  `siblings_not_reached`, set when it could not ask them in time and tried
+  to leave every chat itself, reporting any it could not in
+  `group_leave_failures`. A device
   that finds a sibling `leaving` removes it after a random delay of up to 30
   seconds, as if its user had. A device removed while it signs out is not
   unlinked. A chat this device is no longer in, its copy removed or

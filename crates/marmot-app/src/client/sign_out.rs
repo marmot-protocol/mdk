@@ -45,7 +45,7 @@ use crate::{AppError, unix_now_seconds};
 const TARGET: &str = "marmot_app::client::sign_out";
 
 /// About how long `sign_out_and_wipe` waits for this device's `leaving`
-/// commit to be confirmed before it leaves every chat itself.
+/// commit to be confirmed before it tries to leave every chat itself.
 const SIGN_OUT_LEAVING_WAIT: Duration = Duration::from_secs(30);
 
 /// The longest a sibling waits, in seconds, before it decides to remove a
