@@ -21,6 +21,7 @@ canonical [White Noise + Agents quickstart](../../README.md#get-started-white-no
 
 - [What you can do](#what-you-can-do)
 - [First-install checklist](#first-install-checklist)
+- [Inbound attachments](#inbound-attachments)
 - [Install (Claude Code Already Installed)](#install-claude-code-already-installed)
 - [Manual Setup](#manual-setup)
 - [Chat Commands](#chat-commands)
@@ -47,7 +48,7 @@ Progress reactions require a separately configured tool; the harness has none bu
 - **Continue or reset the conversation.** Claude Code keeps a private UUID session for each chat and resumes that exact session. Completed main-conversation assistant text, including messages between tool calls, reaches the phone; reasoning and tool output do not.
   `/new` resets the backend session while retaining the project.
 
-- **Know the file contract.** This adapter accepts text-only prompts. Any attachment batch, including its caption, is rejected before the backend runs. Generated-file return is not implemented.
+- **Know the file contract.** Images (PNG, JPEG, GIF, WebP), PDFs and UTF-8 text files are staged privately for one turn and opened with Claude Code's Read tool; other formats reject the batch. Generated-file return is not implemented. See [Inbound attachments](#inbound-attachments).
 
 Project selection (`/cd`), standing instructions (`/goal`), and recovery
 commands share the [terminal-harness command guide](../../terminal-harness/README.md#chat-commands).
@@ -81,11 +82,34 @@ mode skips the workspace-trust dialog, and `inherit` can deny unanswered
 permission requests. Choose another execution profile only as an explicit
 operator decision, not as an installation workaround.
 
-Use a text-only first phone prompt. This backend rejects any non-empty
-attachment batch before Claude Code starts, including the accompanying text;
-there is no generated-file export or `MEDIA:` handling. The shared harness has
-other backends with file support, but their capabilities are not inherited by
-`wn-claude`. Do not resume its connector-owned UUID in another Claude client.
+Use a text-only first phone prompt. Inbound attachments are described in
+[Inbound attachments](#inbound-attachments); there is no generated-file export
+or `MEDIA:` handling. Do not resume its connector-owned UUID in another Claude
+client.
+
+## Inbound attachments
+
+All attachments from one Marmot message are downloaded in message order, copied
+into one owner-only temporary batch, and passed to one Claude Code turn. The
+connector revalidates every staged file immediately before starting Claude Code
+and appends an ordered JSON manifest to the prompt. The manifest marks
+attachment content and metadata as untrusted data and gives Claude Code the
+private path, connector-sanitized file name, declared media type, detected kind,
+byte size, and source ordinal.
+
+Accepted kinds are selected from file bytes, never from sender-controlled MIME
+strings or extensions: PNG, JPEG, GIF and WebP images, PDFs, and UTF-8 text
+without NUL bytes. Claude Code opens them with its Read tool, which displays
+images and PDFs, so large photos are handled by Claude Code rather than sent
+inline. The batch directory is passed with `--add-dir` for that turn only, so
+the files are readable under every execution profile without changing Claude
+Code settings. The batch is removed after the turn.
+
+Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit,
+or aggregate-size failures reject the complete batch before Claude Code starts;
+no attachment is silently dropped. Recognition is capability routing rather than
+a content-security boundary: short magic signatures can be spoofed, and
+attachment contents remain untrusted.
 
 ## Install (Claude Code Already Installed)
 
@@ -213,8 +237,8 @@ for routing, release compatibility, permissions and uncertain outcomes.
 | `WN_CLAUDE_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_CLAUDE_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
 | `WN_CLAUDE_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
-| `WN_CLAUDE_MAX_ATTACHMENTS` | `8` | Maximum inbound files validated before backend rejection |
-| `WN_CLAUDE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate inbound bytes validated before rejection |
+| `WN_CLAUDE_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
+| `WN_CLAUDE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate plaintext bytes in one inbound batch |
 | `WN_CLAUDE_STATE_PATH` | `$XDG_STATE_HOME/wn-claude/sessions.json` | Group session/workdir map |
 | `WN_CLAUDE_ACTIVATION` | `always` | Only supported activation mode |
 
@@ -248,8 +272,10 @@ The CLI contract and event schema were checked against Claude Code 2.1.270.
 - Completed main-conversation assistant text is returned to Marmot. Raw errors,
   reasoning, tool events, user echoes, subagent messages, partial events, and
   the duplicate terminal `result` text are excluded.
-- Non-empty attachment batches are rejected before Claude Code starts. The
-  accompanying text is not forwarded.
+- Inbound attachments are revalidated before Claude Code starts, limited to
+  images, PDFs and UTF-8 text detected from file bytes, and readable only for
+  the turn through a per-turn `--add-dir` grant. Unsupported batches are
+  rejected without forwarding the accompanying text.
 - Connector state is owner-only, and logs exclude identifiers, paths, prompts,
   responses, session UUIDs, backend output, and key material.
 - A configured control-socket bearer token grants the complete `wn-agent`
