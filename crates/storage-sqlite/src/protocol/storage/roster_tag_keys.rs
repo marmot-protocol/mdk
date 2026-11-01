@@ -158,7 +158,7 @@ mod tests {
             ..key(2, 1)
         };
         store
-            .record_roster_tag_keys(&gid(1), &[held.clone()], 300)
+            .record_roster_tag_keys(&gid(1), std::slice::from_ref(&held), 300)
             .unwrap();
         store
             .record_roster_tag_keys(&gid(1), &[key(2, 1)], 300)
