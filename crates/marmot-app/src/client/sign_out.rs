@@ -19,14 +19,16 @@
 //!
 //! While an account signs out here, its device group's removal of this
 //! device does not unlink it, the pairing drive does not run and its push
-//! token gossip stops. Once that removal lands, no maintenance pass runs
-//! either, and its leaves send no push token removal, so the sign-out sends
-//! only what it has left: its SelfRemoves and its slot's deletion. The
-//! removed device-group copy stays, inert, until the wipe deletes it, so a
-//! sign-out that is cancelled or fails leaves the removal stored and the
-//! next pairing drive unlinks the device.
+//! token gossip stops. Once that removal lands, every publish of the
+//! account is held back at the publish stop but the sign-out's own steps,
+//! its SelfRemoves and its slot's deletion, each under a
+//! [`SignOutStepPermit`]; no maintenance pass runs, and its leaves send no
+//! push token removal. The removed device-group copy stays until the wipe
+//! deletes it, so a sign-out that is cancelled or fails leaves the removal
+//! stored, still held back, and the next pairing drive unlinks the device.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +78,27 @@ impl Drop for SigningOut {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.account_id_hex);
+    }
+}
+
+/// Lets one step of a sign-out publish while a device its device group
+/// removed during the sign-out holds every other publish back; dropping it
+/// holds them back again.
+pub(crate) struct SignOutStepPermit(Option<Arc<AtomicBool>>);
+
+impl SignOutStepPermit {
+    /// Whether publishing was held back: the device was removed while it
+    /// signs out.
+    pub(crate) fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for SignOutStepPermit {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -133,9 +156,9 @@ impl AppClient {
             .signing_out(&hex::encode(self.adapter.account_id().as_slice()))
     }
 
-    /// Whether this device's device group removed it while it signs out. It
-    /// then sends only its remaining SelfRemoves and its slot's deletion
-    /// (D67): no push token removal before a leave.
+    /// Whether this device's device group removed it while it signs out.
+    /// It then sends only its remaining SelfRemoves and its slot's deletion
+    /// (D67).
     pub(crate) fn removed_while_signing_out(&self) -> Result<bool, AppError> {
         #[cfg(feature = "unreleased-device-pairing")]
         return Ok(
@@ -144,6 +167,34 @@ impl AppClient {
         // Without device groups no device group removes this device.
         #[cfg(not(feature = "unreleased-device-pairing"))]
         Ok(false)
+    }
+
+    /// Hold back every publish of this account once its device group
+    /// removed this device while it signs out: only the sign-out's own
+    /// steps, each under a [`SignOutStepPermit`], still go out (D67). The
+    /// hold outlasts a sign-out that ends without a wipe, until the next
+    /// pairing drive notes the removal.
+    pub(crate) fn hold_removed_sign_out_publishing(&self) -> Result<bool, AppError> {
+        let removed = self.removed_while_signing_out()?;
+        if removed {
+            self.app
+                .account_publish_stop(&hex::encode(self.adapter.account_id().as_slice()))
+                .store(true, Ordering::Release);
+        }
+        Ok(removed)
+    }
+
+    /// Let one sign-out step, a SelfRemove or the slot's deletion, publish
+    /// while a removal during the sign-out holds the rest back.
+    pub(crate) fn sign_out_step_permit(&self) -> Result<SignOutStepPermit, AppError> {
+        if !self.hold_removed_sign_out_publishing()? {
+            return Ok(SignOutStepPermit(None));
+        }
+        let stop = self
+            .app
+            .account_publish_stop(&hex::encode(self.adapter.account_id().as_slice()));
+        stop.store(false, Ordering::Release);
+        Ok(SignOutStepPermit(Some(stop)))
     }
 
     /// Move signing out through siblings one step on: commit this device's

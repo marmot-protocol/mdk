@@ -8,6 +8,7 @@
 use super::removal::{chat_with_both, pending_removals, published_count};
 use super::*;
 use crate::client::sign_out::SiblingSignOut;
+use crate::messages::AppMessageIntent;
 use crate::notifications::PushPlatform;
 use marmot_session::DeviceRosterEdit;
 
@@ -209,13 +210,14 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 }
 
 /// The laptop starts signing out, then the phone's user removes it. The
-/// removal reaches the laptop, which is not unlinked and is told nothing:
-/// its account's publishing is not stopped, so it can still delete its own
-/// slot. It sends nothing else: no maintenance pass or push token retry
-/// runs, and leaving a chat its account administers takes an admin-policy
-/// update it may no longer commit, so the leave fails without the push
-/// token removal a leave sends first. When its sign-out ends without a wipe,
-/// the next pairing drive finds the stored removal and unlinks it.
+/// removal reaches the laptop, which is not unlinked and is told nothing.
+/// Every publish of its account is held back but its sign-out's own steps:
+/// it can still delete its own slot, and sends nothing else. A chat message
+/// does not go out, no maintenance pass or push token retry runs, and
+/// leaving a chat its account administers takes an admin-policy update it
+/// may no longer commit, so the leave fails without the push token removal
+/// a leave sends first. When its sign-out ends without a wipe, the next
+/// pairing drive finds the stored removal and unlinks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_removed_while_signing_out_is_not_unlinked() {
     let (devices, group) = tagging_devices().await;
@@ -254,13 +256,24 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     assert!(!laptop.device_unlinked());
     let account = laptop_app.account_home().account("alice").unwrap();
     assert!(!account.unlinked && !account.signed_out);
-    assert!(!laptop_app.account_publishing_stopped(&account_id_hex));
+    assert!(
+        laptop_app.account_publishing_stopped(&account_id_hex),
+        "all but its sign-out is held back"
+    );
     assert_eq!(
         laptop.sign_out_through_siblings_step().await.unwrap(),
         SiblingSignOut::OnItsOwn
     );
 
     let published = published_count(&relay);
+    let _ = laptop
+        .send_app_event(
+            &notes,
+            AppMessageIntent::Chat {
+                content: "after the removal".to_owned(),
+            },
+        )
+        .await;
     laptop.run_due_maintenance().await.unwrap();
     assert!(
         !laptop
@@ -283,6 +296,7 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
         published_count(&relay) > published,
         "its slot's deletion goes out"
     );
+    assert!(laptop_app.account_publishing_stopped(&account_id_hex));
 
     drop(laptop_signing_out);
     laptop

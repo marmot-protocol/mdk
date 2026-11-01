@@ -1520,7 +1520,7 @@ impl AppClient {
         }
         // A device its device group removed while it signs out sends only
         // what its sign-out has left (mdk#2628 D67).
-        if self.removed_while_signing_out()? {
+        if self.hold_removed_sign_out_publishing()? {
             let summary = self
                 .runtime
                 .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
@@ -2037,6 +2037,9 @@ impl AppClient {
         // Current kind 10002 write relays; the runtime adds every relay the
         // slot was published to.
         self.refresh_routing()?;
+        // The slot's deletion is a step of a sign-out, which may go out
+        // after a removal held the rest back (mdk#2628 D67).
+        let _sign_out_step = self.sign_out_step_permit()?;
         Ok(self.runtime.withdraw_key_package_slot().await?)
     }
 
@@ -3796,7 +3799,8 @@ impl AppClient {
         // removal. Drain that durable intent first; if the leave later fails,
         // queue the current registration update as compensation. A device
         // removed while it signs out sends only its SelfRemove (mdk#2628 D67).
-        let removed_while_signing_out = self.removed_while_signing_out()?;
+        let sign_out_step = self.sign_out_step_permit()?;
+        let removed_while_signing_out = sign_out_step.held();
         let removed_registration = if removed_while_signing_out {
             None
         } else {
