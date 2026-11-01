@@ -695,13 +695,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("provenance.db");
                 let key = SqlCipherKey::raw([0x07; 32]);
-                // The reopen proof needs one file per provenance; the reversed
-                // arrival order only needs the rebuild, so it runs in memory.
-                let s = if reverse {
-                    SqliteAccountStorage::in_memory().unwrap()
-                } else {
-                    SqliteAccountStorage::open_encrypted(&path, &key).unwrap()
-                };
+                let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
                 let author = if admin_is_author { 20 } else { 10 };
                 record(&s.app_storage(), &event(1, author, 9, vec![], "original"));
                 let mut complaint = report(5);
@@ -744,14 +738,10 @@ mod tests {
                                 .is_some_and(|p| p.deletion_source == DeletionSource::Admin)
                     }));
                 }
-                let s = if reverse {
-                    s.app_storage()
-                } else {
-                    drop(s);
-                    SqliteAccountStorage::open_encrypted(&path, &key)
-                        .unwrap()
-                        .app_storage()
-                };
+                drop(s);
+                let s = SqliteAccountStorage::open_encrypted(&path, &key)
+                    .unwrap()
+                    .app_storage();
                 for rebuild in [false, true] {
                     if rebuild {
                         s.rebuild_message_timeline_for_group(&id(99)).unwrap();
