@@ -1259,9 +1259,14 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
+                // The settled state already holds the change, and with nothing
+                // to publish no confirmation will retire the record. Kept, it
+                // would wait forever and hold every later send behind it.
+                SendResult::NoChange { .. } => {
+                    self.storage.delete_queued_outbound_intent(&record.id)?;
+                }
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
-                | SendResult::NoChange { .. }
                 | SendResult::DisbandRequested { .. }
                 | SendResult::Queued { .. } => {}
             }

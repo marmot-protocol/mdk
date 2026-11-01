@@ -96,7 +96,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `distributed_convergence/queued_send_order.rs`
   - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
     is queued behind them, so the sender's generations follow its send order and a member reading the history in
-    `created_at` order decrypts every message (mdk#2842).
+    `created_at` order decrypts every message (mdk#2842). Also a queued change the settled state already holds is
+    retired at drain, so it holds no later send.
 
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and

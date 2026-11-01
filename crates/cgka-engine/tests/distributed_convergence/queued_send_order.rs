@@ -176,3 +176,61 @@ async fn a_send_never_overtakes_the_senders_queued_sends() {
         "a send made while earlier ones wait is queued behind them, and the drain publishes it"
     );
 }
+
+/// A queued change the settled state already holds is done at drain: nothing
+/// to publish confirms it, so the drain retires it rather than leave it
+/// waiting forever with every later send queued behind it.
+#[tokio::test]
+async fn a_queued_change_already_made_holds_no_later_send() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "no-change").await;
+    let enable = SendIntent::EnableDisbanding {
+        group_id: group_id.clone(),
+    };
+    let direct = alice.send(enable.clone()).await.unwrap();
+    assert!(
+        matches!(direct, SendResult::NoChange { .. }),
+        "a new group can already be disbanded: {direct:?}"
+    );
+
+    let outbox = alice
+        .queue_app_message(group_id.clone(), app_payload_for(&alice, "from the outbox"))
+        .await
+        .unwrap();
+    assert!(matches!(outbox, SendResult::Queued { .. }), "{outbox:?}");
+    let again = alice.send(enable).await.unwrap();
+    assert!(matches!(again, SendResult::Queued { .. }), "{again:?}");
+
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    let [
+        SendResult::ApplicationMessage { msg, .. },
+        SendResult::NoChange { .. },
+    ] = drained.as_slice()
+    else {
+        panic!("the outbox message, then the change already made: {drained:?}");
+    };
+    let (_, intent_id) = alice
+        .regenerated_queued_intent_for_message(&msg.id)
+        .unwrap();
+    alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+    assert!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let later = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "sent once the queue is done"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(later, SendResult::ApplicationMessage { .. }),
+        "{later:?}"
+    );
+}

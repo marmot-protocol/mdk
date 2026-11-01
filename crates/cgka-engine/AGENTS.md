@@ -448,8 +448,9 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   order. Each encryption takes the sender's next generation, and a member reading history in `created_at` order, which
   is send order, loses any send more than `DEFAULT_OUT_OF_ORDER_TOLERANCE` generations behind one it already read; a
   send ahead of the queue also lets a membership change overtake a message sent before it. A drained message keeps its
-  `created_at`: it is the inner event's, part of its id, and the Nostr binding stamps the outer event with it. Pinned
-  by `tests/distributed_convergence/queued_send_order.rs`.
+  `created_at`: it is the inner event's, part of its id, and the Nostr binding stamps the outer event with it. A
+  queued intent that drains to `NoChange` is retired at once, since no confirmation will. Pinned by
+  `tests/distributed_convergence/queued_send_order.rs`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why
   `converge_stored_openmls_messages*` needs no held-publication gate. Outbound: `should_queue_outbound_intent` settles
   convergence before staging, so an unresolved input diverts the intent to the retention queue and `begin_pending` is
