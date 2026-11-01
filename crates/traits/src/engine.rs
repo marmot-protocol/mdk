@@ -435,10 +435,13 @@ pub enum SendResult {
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input, or an earlier
     /// send to the group is still queued: a send never goes ahead of one
-    /// queued before it. The intent will be regenerated from the canonical
-    /// state when the group becomes stable, after those queued before it. If
-    /// that state refuses it, the engine drops it and announces
-    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
+    /// queued before it, though one queued admin change may take the drain's
+    /// first attempt after a convergence pass. The intent will be regenerated
+    /// from the canonical state when the group becomes stable, after those
+    /// queued before it. If that state refuses it, the engine drops it and
+    /// announces [`GroupEvent::QueuedIntentRefused`] with this `intent_id`;
+    /// if that state already holds the change, the engine drops it with
+    /// nothing to publish and the drain returns [`SendResult::NoChange`].
     Queued {
         group_id: GroupId,
         intent_id: MessageId,

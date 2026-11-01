@@ -177,6 +177,61 @@ async fn a_send_never_overtakes_the_senders_queued_sends() {
     );
 }
 
+/// An intent that never queues is refused, not queued, while an earlier one
+/// waits for the drain, as it is while the group settles: an epoch-pinned
+/// message would otherwise encrypt under whatever epoch the drain finds.
+#[tokio::test]
+async fn a_pinned_send_behind_a_queued_one_is_refused() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "pinned").await;
+    let pin = alice.epoch_pin(&group_id).unwrap();
+    let pinned_epoch = pin.epoch;
+    let pinned_payload = app_payload_for(&alice, "media bound to its epoch");
+    let pinned_send = || SendIntent::AppMessage {
+        group_id: group_id.clone(),
+        payload: pinned_payload.clone(),
+        expected_epoch: Some(pin),
+    };
+
+    let outbox = alice
+        .queue_app_message(group_id.clone(), app_payload_for(&alice, "from the outbox"))
+        .await
+        .unwrap();
+    assert!(matches!(outbox, SendResult::Queued { .. }), "{outbox:?}");
+    let refused = alice.send(pinned_send()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(cgka_traits::error::EngineError::AppMessageEpochUnsettled { expected })
+                if expected == pinned_epoch
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "the refused send left nothing queued"
+    );
+
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    let [SendResult::ApplicationMessage { msg, .. }] = drained.as_slice() else {
+        panic!("the drain prepares only the outbox message: {drained:?}");
+    };
+    let (_, intent_id) = alice
+        .regenerated_queued_intent_for_message(&msg.id)
+        .unwrap();
+    alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+    let sent = alice.send(pinned_send()).await.unwrap();
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { source_epoch, .. } if source_epoch == pinned_epoch),
+        "{sent:?}"
+    );
+}
+
 /// A queued change the settled state already holds is done at drain: nothing
 /// to publish confirms it, so the drain retires it rather than leave it
 /// waiting forever with every later send queued behind it.

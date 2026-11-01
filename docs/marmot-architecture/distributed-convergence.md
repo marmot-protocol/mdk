@@ -101,8 +101,10 @@ stateDiagram-v2
 ```
 
 During `Syncing`, `Resolving`, or `Blocked`, outbound app messages and group changes are queued as local intents. A
-send made after the group settles still queues while an earlier intent waits for the drain, so a group's intents are
-prepared in the order they were made and a sender's generations follow its send order (mdk#2842).
+send made after the group settles still queues while an earlier intent waits for the drain, so a sender's application
+messages are prepared in the order they were made and its generations follow its send order (mdk#2842). Only the
+fairness attempt after a pass, a requested disband and the engine's own maintenance commits let a group change go
+ahead of them.
 App-message intents are encrypted after convergence settles against the selected canonical state. Commit intents are
 regenerated after convergence settles because any pending MLS state
 created before sync may have been based on a stale epoch.

@@ -96,8 +96,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `distributed_convergence/queued_send_order.rs`
   - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
     is queued behind them, so the sender's generations follow its send order and a member reading the history in
-    `created_at` order decrypts every message (mdk#2842). Also a queued change the settled state already holds is
-    retired at drain, so it holds no later send.
+    `created_at` order decrypts every message (mdk#2842). Also an epoch-pinned send behind a queued one is refused,
+    not queued, and a queued change the settled state already holds is retired at drain, so it holds no later send.
 
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
@@ -133,7 +133,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
-    write fails part way through the generic one (mdk#2330). `record_write_atomicity/convergence_pass_retry.rs`: a
+    write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
+    (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
+    prepared (mdk#2842). `record_write_atomicity/convergence_pass_retry.rs`: a
     frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
     current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
     application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit

@@ -1261,9 +1261,23 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 // The settled state already holds the change, and with nothing
                 // to publish no confirmation will retire the record. Kept, it
-                // would wait forever and hold every later send behind it.
+                // would wait forever and hold every later send behind it. If
+                // the delete fails, the record stays for the next drain to
+                // retire: failing this one would drop what it has prepared.
                 SendResult::NoChange { .. } => {
-                    self.storage.delete_queued_outbound_intent(&record.id)?;
+                    if self
+                        .storage
+                        .delete_queued_outbound_intent(&record.id)
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "cgka_engine::message_processor",
+                            method = "converge_and_drain_with_deadline",
+                            error_kind = "queued_no_change_retirement",
+                            "could not retire a queued intent that drained to no change"
+                        );
+                        self.schedule_pending_convergence_group(group_id);
+                    }
                 }
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
