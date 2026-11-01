@@ -425,6 +425,59 @@ fn app_message_reads_return_a_row_whose_tags_no_longer_decode() {
     }
 }
 
+// An expired admin removal stays as a control. Its tags no longer decode, but
+// its edge still names the removed message, which stays hidden and, once it
+// expires too, cannot come back.
+#[test]
+fn secure_prune_of_a_damaged_removal_keeps_its_target_hidden() {
+    use cgka_traits::app_event::AppMessageAuthority;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.ensure_account_projection_with_identity("local", "alice")
+        .unwrap();
+    // A removal names its target by event id.
+    let (target_id, removal_id) = ("66".repeat(32), "77".repeat(32));
+    let mut target = chat(&target_id, 10, "removed");
+    target.sender = "bob".to_owned();
+    app.record_app_event(&target).unwrap();
+    let mut removal = targeting(
+        &removal_id,
+        MARMOT_APP_EVENT_KIND_REMOVE,
+        &target_id,
+        11,
+        r#"{"v":1,"action":"remove"}"#,
+    );
+    removal.moderation_grant = true;
+    let authority = AppMessageAuthority {
+        source_context: [7; 32],
+        moderation_grant: true,
+    };
+    let retention = AppMessageRetentionDecision::new(11, 10);
+    app.record_app_event_with_source(&removal, Some(retention), Some(authority))
+        .unwrap();
+    let hidden = |app: &SqliteAppStorage| {
+        app.timeline_message(&group(), &target_id)
+            .unwrap()
+            .is_none_or(|message| message.deleted)
+    };
+    assert!(hidden(&app));
+    damage_tags(&app, &removal_id);
+
+    app.secure_prune_expired_app_events(&group(), 25, "local", &no_mentions)
+        .unwrap();
+    assert_eq!(
+        stored_ids(&app, "app_events"),
+        [target_id.clone(), removal_id]
+    );
+    assert!(hidden(&app));
+
+    app.secure_prune_app_events_before(&group(), 11, "local", &no_mentions)
+        .unwrap();
+    app.record_app_event(&target).unwrap();
+    assert!(hidden(&app));
+}
+
 // A damaged dismissal names no report, so it is left out of the report's
 // dismissals, and the report list still reads. Damage that is not even text
 // must not fail the read either.
@@ -513,36 +566,45 @@ fn source_retention_finalizes_a_row_whose_tags_no_longer_decode() {
     assert_eq!(message.retention_expires_at, Some(20));
 }
 
-// Deleting a reaction looks up the reaction's own target. A damaged reaction
-// has none, so the delete still records.
+// Deleting a reaction or an edit looks up the modifier's own target. A damaged
+// modifier's tags no longer name it, but its edge does, so the delete records
+// and the target drops the modifier, live and stored.
 #[test]
-fn deleting_a_modifier_whose_tags_no_longer_decode_records_the_delete() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let app = store.app_storage();
-    app.record_app_event(&chat("target", 10, "target")).unwrap();
-    app.record_app_event(&targeting(
-        "reaction",
-        MARMOT_APP_EVENT_KIND_REACTION,
-        "target",
-        11,
-        "+",
-    ))
-    .unwrap();
-    damage_tags(&app, "reaction");
+fn deleting_a_modifier_whose_tags_no_longer_decode_takes_it_off_its_target() {
+    for (kind, text) in [
+        (MARMOT_APP_EVENT_KIND_REACTION, "+"),
+        (MARMOT_APP_EVENT_KIND_EDIT, "edited"),
+    ] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        app.record_app_event(&chat("target", 10, "original"))
+            .unwrap();
+        app.record_app_event(&targeting("modifier", kind, "target", 11, text))
+            .unwrap();
+        damage_tags(&app, "modifier");
 
-    app.record_app_event(&targeting(
-        "delete",
-        MARMOT_APP_EVENT_KIND_DELETE,
-        "reaction",
-        12,
-        "",
-    ))
-    .expect("a damaged delete target must not block the delete");
+        let update = app
+            .record_app_event(&targeting(
+                "delete",
+                MARMOT_APP_EVENT_KIND_DELETE,
+                "modifier",
+                12,
+                "",
+            ))
+            .expect("a damaged delete target must not block the delete");
 
-    assert_eq!(
-        stored_ids(&app, "app_events"),
-        ["delete", "reaction", "target"]
-    );
+        let target = app.timeline_message(&group(), "target").unwrap().unwrap();
+        assert_eq!(target.plaintext, "original", "kind {kind}");
+        assert_eq!(target.edit, None, "kind {kind}");
+        assert!(target.reactions.user_reactions.is_empty(), "kind {kind}");
+        let live = update.changes.iter().find_map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } if message.message_id_hex == "target" => {
+                Some(message.as_ref())
+            }
+            _ => None,
+        });
+        assert_eq!(live, Some(&target), "kind {kind}");
+    }
 }
 
 // A response whose tags no longer decode names no poll, so it is skipped like

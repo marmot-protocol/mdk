@@ -392,8 +392,7 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
         return Ok(());
     }
     if let Some(event) = raw(conn, group, id)? {
-        let tags = event
-            .tags
+        let tags = control_tags(conn, &event)?
             .into_iter()
             .filter_map(|mut tag| {
                 let limit = match (event.kind, tag.first().map(String::as_str)) {
@@ -436,6 +435,19 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
     .storage()?;
     Ok(())
 }
+/// A control's tags. Once they no longer decode, its edges still hold the `e`
+/// tags it carried: all a retained control keeps, and all a removal needs to
+/// keep hiding its target.
+fn control_tags(conn: &Connection, event: &RawAppEvent) -> StorageResult<Vec<Vec<String>>> {
+    if !app_event_tags_damaged_tx(conn, &event.group_id_hex, &event.message_id_hex)? {
+        return Ok(event.tags.clone());
+    }
+    let targets = modifier_edge_targets_tx(conn, &event.group_id_hex, &event.message_id_hex)?;
+    Ok(targets
+        .into_iter()
+        .map(|target| vec![EVENT_REF_TAG.to_owned(), target])
+        .collect())
+}
 pub(super) fn retain_pruned_controls(
     conn: &Connection,
     group: &str,
@@ -447,7 +459,8 @@ pub(super) fn retain_pruned_controls(
             continue;
         };
         if event.kind == 5
-            || (event.kind == 4891 && parse_removal(&event.tags, &event.plaintext).is_some())
+            || (event.kind == 4891
+                && parse_removal(&control_tags(conn, &event)?, &event.plaintext).is_some())
         {
             conn.execute_cached(
                 "INSERT OR IGNORE INTO content_pruned_controls VALUES(?1,?2)",

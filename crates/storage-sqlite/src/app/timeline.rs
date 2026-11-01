@@ -2723,6 +2723,23 @@ fn modifier_edge_targets_tx(
     .storage()
 }
 
+/// Whether a stored `app_events.tags_json` no longer decodes.
+fn app_event_tags_damaged_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    let damaged = tx
+        .query_row_cached(
+            "SELECT tags_json FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |row| Ok(decode_app_event_tags(row, 0)?.is_none()),
+        )
+        .optional()
+        .storage()?;
+    Ok(damaged.unwrap_or(false))
+}
+
 fn pruned_app_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrunedAppEvent> {
     let tags = decode_app_event_tags(row, 3)?;
     Ok(PrunedAppEvent {
@@ -3081,13 +3098,13 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
                     ids.insert(edit.message_id_hex);
                 }
                 reply_preview_targets.insert(target.to_owned());
-                if let Some((kind, modifier_target)) =
-                    modifier_target_message_id_tx(tx, group_id_hex, target)?
+                if let Some((kind, modifier_targets)) =
+                    modifier_target_message_ids_tx(tx, group_id_hex, target)?
                 {
                     if kind == MARMOT_APP_EVENT_KIND_EDIT {
-                        reply_preview_targets.insert(modifier_target.clone());
+                        reply_preview_targets.extend(modifier_targets.iter().cloned());
                     }
-                    ids.insert(modifier_target);
+                    ids.extend(modifier_targets);
                 }
             }
         }
@@ -3396,12 +3413,15 @@ fn reply_message_ids_for_targets_tx(
     Ok(message_ids)
 }
 
-fn modifier_target_message_id_tx(
+/// The kind of a reaction, edit or poll response and the message it targets.
+/// Once its tags no longer decode, its edges still name the targets the row
+/// projection applies it to.
+fn modifier_target_message_ids_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
-) -> StorageResult<Option<(u64, String)>> {
-    let row: Option<(u64, Vec<Vec<String>>)> = tx
+) -> StorageResult<Option<(u64, BTreeSet<String>)>> {
+    let row: Option<(u64, Option<Vec<Vec<String>>>)> = tx
         .query_row_cached(
             "SELECT kind, tags_json
              FROM app_events
@@ -3409,7 +3429,7 @@ fn modifier_target_message_id_tx(
             params![group_id_hex, message_id_hex],
             |row| {
                 let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
-                Ok((kind, app_event_tags(row, 1)?))
+                Ok((kind, decode_app_event_tags(row, 1)?))
             },
         )
         .optional()
@@ -3425,7 +3445,14 @@ fn modifier_target_message_id_tx(
     ) {
         return Ok(None);
     }
-    Ok(tag_value(&tags, EVENT_REF_TAG).map(|target| (kind, target.to_owned())))
+    let targets = match tags {
+        Some(tags) => tag_value(&tags, EVENT_REF_TAG)
+            .map(ToOwned::to_owned)
+            .into_iter()
+            .collect(),
+        None => modifier_edge_targets_tx(tx, group_id_hex, message_id_hex)?,
+    };
+    Ok((!targets.is_empty()).then_some((kind, targets)))
 }
 
 fn timeline_records_by_ids_tx(
