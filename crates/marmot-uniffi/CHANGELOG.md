@@ -4,6 +4,17 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first records in the device group that it is leaving, which can take about
+  30 seconds, and leaves those devices the chats they can take it out of.
+  `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
+  which says it could not ask them in time and tried to leave every chat
+  itself, reporting any it could not in `group_leave_failures`; tell the
+  user. The call now keeps running when the host cancels it, so a
+  sign-out that has asked its siblings always finishes. Regenerate bindings
+  with the matching native library.
+
 - `TimelineMessageRecordFfi` adds `imported_from: Option<HistoryImportSourceFfi>`,
   the device an imported row came from, and `MarmotEventFfi` adds
   `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628

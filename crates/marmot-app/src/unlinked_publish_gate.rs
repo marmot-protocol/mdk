@@ -186,6 +186,23 @@ impl crate::MarmotApp {
     }
 }
 
+tokio::task_local! {
+    /// The publish stop the sign-out step being polled may pass (mdk#2628
+    /// D67). It is set only while that step's own future is polled, so no
+    /// task it spawns and no future polled beside it passes.
+    static SIGN_OUT_STEP: Arc<AtomicBool>;
+}
+
+/// Run `step`, one step of a sign-out that its device group's removal of
+/// this device interrupted, so that its own publishes pass `stop` while the
+/// account's other publishers stay refused.
+pub(crate) async fn publish_as_sign_out_step<F: std::future::Future>(
+    stop: Arc<AtomicBool>,
+    step: F,
+) -> F::Output {
+    SIGN_OUT_STEP.scope(stop, step).await
+}
+
 /// An account publisher that refuses to publish once `unlinked` is set.
 pub(crate) struct UnlinkedPublishGate {
     inner: Arc<dyn NostrRelayClient>,
@@ -197,11 +214,15 @@ impl UnlinkedPublishGate {
         Self { inner, unlinked }
     }
 
-    /// Whether this publish is refused. Read once per publish: a failed
-    /// link's undo lifts the stop (D40), so a batch is refused whole or not
-    /// at all.
+    /// Whether this publish is refused: the stop is set and no sign-out
+    /// step that may pass it is being polled. Read once per publish: a
+    /// failed link's undo lifts the stop (D40), so a batch is refused whole
+    /// or not at all.
     fn stopped(&self) -> bool {
         self.unlinked.load(Ordering::Acquire)
+            && !SIGN_OUT_STEP
+                .try_with(|stop| Arc::ptr_eq(stop, &self.unlinked))
+                .unwrap_or(false)
     }
 }
 

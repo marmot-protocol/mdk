@@ -13,7 +13,7 @@ use crate::tests::sign_ins::{
     publish_two_days_ago, published_at, relay_empties_slot, relay_serves_slot,
 };
 
-fn published_count(relay: &ScriptedPushRelayClient) -> usize {
+pub(super) fn published_count(relay: &ScriptedPushRelayClient) -> usize {
     relay.published_events.lock().unwrap().len()
 }
 
@@ -35,7 +35,7 @@ fn issued_to(client: &AppClient, recipient: &[u8; 32]) -> usize {
         .count()
 }
 
-fn pending_removals(app: &MarmotApp) -> usize {
+pub(super) fn pending_removals(app: &MarmotApp) -> usize {
     app.account_storage("alice")
         .unwrap()
         .app_storage()
@@ -75,7 +75,7 @@ fn slot_deletions(relay: &ScriptedPushRelayClient, account_id_hex: &str, slot: &
 
 /// The phone founds a chat, which requires account-devices, and adds the
 /// laptop's tagged KeyPackage; the laptop joins.
-async fn chat_with_both(devices: &mut Devices) -> GroupId {
+pub(super) async fn chat_with_both(devices: &mut Devices) -> GroupId {
     let chat = devices.phone.create_group("team", &[]).await.unwrap();
     let mut laptop_cursor = published_count(&devices.relay);
     let key_package = published_key_package(&mut devices.laptop, &devices.relay).await;

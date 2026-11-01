@@ -4,6 +4,25 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
+  link is made and the roster lists another device that is not leaving. It
+  commits its own roster entry as `leaving` and waits up to about 30
+  seconds, however busy the account is, for that commit to be confirmed,
+  then leaves only the chats no sibling takes
+  it out of, deletes its slot and wipes. `WipeOutcome` adds
+  `groups_left_to_siblings`, the chats it left to them, and
+  `siblings_not_reached`, set when it could not ask them in time and tried
+  to leave every chat itself, reporting any it could not in
+  `group_leave_failures`. A device
+  that finds a sibling `leaving` removes it after a random delay of up to 30
+  seconds, as if its user had. A device removed while it signs out is not
+  unlinked. A chat this device is no longer in, its copy removed or
+  disbanded, is neither left nor reported in `group_leave_failures`. A wipe
+  of an account whose worker cannot run, signed out or with no external
+  signer registered, does not wait on its siblings. Struct literals add the
+  new fields.
+
 - Hosts can show chat history from another of the account's devices
   (mdk#2628 item 4.2d, D78). `TimelineMessageRecord` adds `imported_from`,
   the device an imported row came from (`HistoryImportSource`: its slot and

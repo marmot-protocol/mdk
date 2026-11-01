@@ -331,7 +331,25 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   signs it out, and only then sends `DeviceUnlinked`, so a host that wipes and signs in again on hearing it never meets
   that deactivation. `MarmotApp::client`, `sign_in_account`, `run_due_maintenance`, both logins, a
   key import and both onboarding starts refuse an unlinked account, before anything is written or sent;
-  `sign_out_and_wipe` of one skips leaving chats and deleting the slot. A later link's Welcome into that group is a
+  `sign_out_and_wipe` of one skips leaving chats and deleting the slot. Signing out through siblings
+  (`client/sign_out.rs`, D67(2)) is only `sign_out_and_wipe`'s: it holds a `SigningOut` mark on the app from before
+  any step until the wipe returns or is dropped. While it is set the removal note does nothing (a device removed while
+  signing out is not unlinked and is told nothing), the pairing drive does not run and push token gossip stops. Once
+  the removal is stored (`removed_while_signing_out`), `hold_removed_sign_out_publishing` sets the account's publish
+  stop, so every publish path is refused at one point. The stop stays set: a leave's send and the slot's deletion pass
+  it only inside `SignOutStepPermit::run`, a task-local scoped to that step's own future, so a spawned task or a future
+  polled beside it is still refused. Never lift the stop for a step. No maintenance pass runs then, and leaves drain no
+  push token removal. Keep the removed device-group copy until the wipe: a sign-out that is cancelled or fails then
+  leaves the removal, still held back, for the next pairing drive to note as an unlink. Each
+  step runs as a worker command so deliveries settle between steps: commit the own entry as `leaving` through
+  `edit_device_roster_entry`, then, once it reads `leaving` on a stable device group with no convergence input left,
+  name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot and
+  another leaf's as a listed device that is not `leaving`). One deadline, polled first, bounds all of these steps,
+  the worker's start included: wait on nothing outside it and take no answer after it. Never leave the device group
+  itself: the account is its only admin. A sibling decides a `leaving` device's removal (`decide_leaving_siblings`)
+  only on a stable device group with no pending convergence input, after its own random delay of up to 30 seconds,
+  and records it as a user's removal would be, so the removal path carries it out. A later link's Welcome into that
+  group is a
   first join, held by the engine to the link rather than to the forget's date. A new device never starts a link by a
   KeyPackage it already joined by (`last_consumed_key_package_ref`): the link binds its Welcome by KeyPackage alone, so
   a used one would also admit the Welcome that installed the forgotten copy. The start waits for the replacement's

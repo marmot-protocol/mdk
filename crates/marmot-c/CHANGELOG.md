@@ -9,6 +9,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `marmot_sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first asks them to take it out, which can block for about 30 seconds, and
+  leaves them the chats they can. `MarmotWipeOutcome` gains trailing
+  `groups_left_to_siblings` and `siblings_not_reached`. The struct layout
+  changed: use matching regenerated headers and libraries.
+
 - `MarmotTimelineMessageRecord` adds a nullable `imported_from`
   (`MarmotHistoryImportSource`), and `MarmotEvent` adds
   `MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED`, last, so earlier tags keep

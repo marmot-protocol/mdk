@@ -534,6 +534,9 @@ pub(crate) enum AccountWorkerCommand {
     RemovedDeviceLeftoverChats {
         respond: oneshot::Sender<Result<u32, AppError>>,
     },
+    SignOutThroughSiblingsStep {
+        respond: oneshot::Sender<Result<crate::client::sign_out::SiblingSignOut, AppError>>,
+    },
     BeginRecoveryWords {
         respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
     },
@@ -6230,6 +6233,11 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = client.remove_linked_device(&slot_id_hex).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SignOutThroughSiblingsStep { respond } => Box::pin(async move {
+            let result = client.sign_out_through_siblings_step().await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
