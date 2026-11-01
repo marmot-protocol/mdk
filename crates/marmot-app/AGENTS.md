@@ -176,11 +176,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (stable, no convergence input left), one the roster lists no device in that has a tag signature key the engine
   remembers (`roster_tag_keys`), read by every such key. Never this device's own slot, and never discard private
   KeyPackages for a slot the roster lists. Leaves are found with `own_account_leaves_tagged_by`, never by an absent
-  claim: an untagged leaf stays (D55). The deciding device commits a lone `removed` record after a failed link's undo
-  only while the decision is under 30 days old, the group is settled and quiet, and no roster state this device applied
-  has held a `removed` record for the slot, as the engine's remembered keys record (`held_as_removed`): a send that went
-  nowhere or failed is made again, a record a sibling's expiry pass or branch selection dropped is not, even within one
-  pass or after a restart.
+  claim: an untagged leaf stays (D55). The deciding device commits a lone `removed` record after a failed link's undo,
+  only through the runtime's `record_removed_slot`, which the engine never queues or re-issues, and only while the
+  decision is under 30 days old, the group is settled and quiet, and no roster state this device applied has held a
+  `removed` record for the slot, as the engine's remembered keys record (`held_as_removed`): a send that went nowhere or
+  failed is made again, a record a sibling's expiry pass or branch selection dropped is not, even within one pass or
+  after a restart.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
   sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,

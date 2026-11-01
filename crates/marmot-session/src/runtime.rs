@@ -6764,6 +6764,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::EnableAccountDevices { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
+            | SendIntent::RecordRemovedSlot { .. }
     )
 }
 

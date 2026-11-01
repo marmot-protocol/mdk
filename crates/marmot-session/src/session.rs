@@ -2035,6 +2035,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }
 }

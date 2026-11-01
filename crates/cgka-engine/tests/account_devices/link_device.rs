@@ -3,7 +3,9 @@
 //! account and writes its roster entry. Every member accepts it, the linked
 //! device joins through its Welcome, a refused link changes nothing, and a
 //! link is never queued. Its undo, `SendIntent::UnlinkDevice` (D40), removes
-//! that device's leaf and entry in one Commit under the same rules.
+//! that device's leaf and entry in one Commit under the same rules, and so
+//! does a removed slot's lone record, `SendIntent::RecordRemovedSlot`
+//! (mdk#2761), which a lost fork never re-issues either.
 
 use super::activation::{buffer_unsettled, queued_intents};
 use super::device_roster::{
@@ -1036,4 +1038,161 @@ async fn an_unlink_is_refused_not_queued_while_a_commit_is_in_flight() {
     phone.engine.confirm_published(pending).await.unwrap();
     send_commit(&mut phone, intent, &gid).await;
     assert!(!roster_of(&phone, &gid).devices.contains_key(&slot(3)));
+}
+
+fn record_removed_slot(gid: &GroupId, operations: Vec<DeviceRosterOperationV1>) -> SendIntent {
+    SendIntent::RecordRemovedSlot {
+        group_id: gid.clone(),
+        roster_update: update(operations),
+    }
+}
+
+/// A removed slot's lone record (mdk#2761) records exactly one slot the
+/// roster holds neither as a device nor as a rejected slot, as `removed`
+/// with a tag signature key; anything else is refused with nothing staged.
+/// Like an unlink, it is refused, not queued, while this device's Commit is
+/// in flight or convergence input is unsettled, so no drain makes it later.
+#[tokio::test]
+async fn a_lone_removed_record_is_checked_and_never_queued() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let commit = send_commit(&mut phone, roster_update(&gid, vec![reject_slot(5)]), &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    let key = || Some(vec![0x44; 32]);
+    let epoch = phone.engine.epoch(&gid).unwrap();
+    let held = roster_of(&phone, &gid);
+
+    let cases = [
+        (
+            vec![removed_slot(3, key()), removed_slot(4, key())],
+            "it must set exactly one rejected slot",
+        ),
+        (
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(2))],
+            "it must set exactly one rejected slot",
+        ),
+        (
+            vec![reject_slot(3)],
+            "it has reason removed and keeps a tag signature key",
+        ),
+        (
+            vec![removed_slot(3, None)],
+            "it has reason removed and keeps a tag signature key",
+        ),
+        (
+            vec![removed_slot(2, key())],
+            "the roster already holds the slot",
+        ),
+        (
+            vec![removed_slot(5, key())],
+            "the roster already holds the slot",
+        ),
+    ];
+    for (operations, reason) in cases {
+        assert_refused(
+            phone
+                .engine
+                .send(record_removed_slot(&gid, operations))
+                .await,
+            reason,
+        );
+    }
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
+    assert_eq!(roster_of(&phone, &gid), held);
+
+    let intent = record_removed_slot(&gid, vec![removed_slot(3, key())]);
+    let assert_unsettled = |refused: Result<SendResult, EngineError>, phone: &Device| {
+        assert!(
+            matches!(&refused, Err(EngineError::LinkDeviceUnsettled { group_id }) if *group_id == gid),
+            "{refused:?}"
+        );
+        assert!(queued_intents(phone, &gid).is_empty());
+    };
+    let self_update = || SendIntent::SelfUpdate {
+        group_id: gid.clone(),
+    };
+    let SendResult::GroupEvolution { msg, pending, .. } =
+        phone.engine.send(self_update()).await.unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    assert_unsettled(phone.engine.send(intent.clone()).await, &phone);
+    phone.engine.confirm_published(pending).await.unwrap();
+    assert_accepted(&mut laptop, &route_to_group(&msg, &gid), &gid).await;
+
+    let update = send_commit(&mut laptop, self_update(), &gid).await;
+    buffer_unsettled(&mut phone, &update).await;
+    assert_unsettled(phone.engine.send(intent.clone()).await, &phone);
+    phone
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 1_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !roster_of(&phone, &gid)
+            .rejected_slots
+            .contains_key(&slot(3))
+    );
+
+    let commit = send_commit(&mut phone, intent, &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
+    for device in [&phone, &laptop] {
+        assert_eq!(
+            roster_of(device, &gid).rejected_slots[&slot(3)].reason,
+            RejectedSlotReasonV1::Removed
+        );
+    }
+}
+
+/// A lone record that loses branch selection is not made again by the
+/// engine, even when the winning branch left the roster as it was: only its
+/// caller decides whether to send it again (mdk#2761).
+#[tokio::test]
+async fn a_lone_removed_record_a_lost_fork_drops_is_not_reissued() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let record = record_removed_slot(&gid, vec![removed_slot(3, Some(vec![0x44; 32]))]);
+    send_commit(&mut phone, record, &gid).await;
+    // The laptop's branch is longer, so it wins.
+    let mut rivals = Vec::new();
+    for _ in 0..2 {
+        let intent = SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        };
+        rivals.push(send_commit(&mut laptop, intent, &gid).await);
+    }
+    for rival in rivals {
+        phone
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, rival, 500)
+            .unwrap();
+    }
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        laptop.engine.epoch(&gid).unwrap()
+    );
+    assert!(
+        !roster_of(&phone, &gid)
+            .rejected_slots
+            .contains_key(&slot(3))
+    );
+
+    let reports = phone
+        .engine
+        .reissue_superseded_own_commits_from_state()
+        .unwrap();
+    assert!(reports.is_empty(), "{reports:?}");
+    assert!(queued_intents(&phone, &gid).is_empty());
+    phone
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 2_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !roster_of(&phone, &gid)
+            .rejected_slots
+            .contains_key(&slot(3))
+    );
 }

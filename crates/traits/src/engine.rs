@@ -254,6 +254,20 @@ pub enum SendIntent {
         leaf_signature_key: Vec<u8>,
         roster_update: Vec<u8>,
     },
+    /// Record a slot of the account's device group as `removed`, alone
+    /// (mdk#2761): the record a device whose user decided a removal makes
+    /// once a failed link's undo took that slot's entry. `roster_update` is a
+    /// `marmot.account.device-roster.v1` update of exactly one
+    /// `SetRejectedSlot`, with reason `removed` and a `tag_signature_key`,
+    /// for a slot the roster lists neither as a device nor as a rejected
+    /// slot. Like a link, it is never queued, and a lost fork never re-issues
+    /// it: once a roster state the device applied held the record, the device
+    /// does not make it again, so only its caller decides whether to send it
+    /// again.
+    RecordRemovedSlot {
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.

@@ -1910,6 +1910,110 @@ async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered
     );
 }
 
+/// Deliver what the relay has to `client` and advance its device group's
+/// convergence `passes` times. The device group is hidden, so convergence
+/// runs through the runtime.
+async fn converge_device_group(
+    client: &mut AppClient,
+    relay: &ScriptedPushRelayClient,
+    cursor: &mut usize,
+    group: &GroupId,
+    passes: usize,
+) {
+    deliver_new(client, relay, cursor).await;
+    for _ in 0..passes {
+        let effects = client.runtime.advance_convergence(group).await.unwrap();
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+    }
+}
+
+/// The lone `removed` record loses a fork: the laptop, whose entry the
+/// roster no longer lists but whose leaf stays, never applied the record and
+/// commits twice from the epoch before it, so its branch is the deeper one
+/// and the phone adopts it. The phone applied the record, so neither the
+/// re-issue of its lost commit nor its next maintenance pass makes the
+/// record again (mdk#2761): only that pass makes it, and only until a state
+/// the phone applied held it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_removed_record_a_fork_drops_is_not_made_again() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            phone_app,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = tagging_devices().await;
+    let laptop_slot = slot_of(&laptop);
+    phone_app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_device_removal(
+            &hex::encode(group.as_slice()),
+            &own_slot(&laptop),
+            crate::unix_now_seconds() - 60,
+        )
+        .unwrap();
+    let mut laptop_cursor = published_count(&relay);
+    commit_roster(
+        &mut phone,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveDevice(laptop_slot)],
+    )
+    .await;
+    converge_device_group(&mut laptop, &relay, &mut laptop_cursor, &group, 1).await;
+    phone.run_due_maintenance().await.unwrap();
+    let mut phone_cursor = published_count(&relay);
+    assert!(
+        roster(&phone, &group)
+            .rejected_slots
+            .contains_key(&laptop_slot),
+        "the phone makes the record"
+    );
+
+    for _ in 0..2 {
+        let effects = laptop
+            .runtime
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap();
+        laptop
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+    }
+    let laptop_epoch = laptop.runtime.group_record(&group).unwrap().epoch;
+    // Adopting the laptop's branch re-issues what the phone lost there; the
+    // maintenance pass after it is where the record would be made again.
+    converge_device_group(&mut phone, &relay, &mut phone_cursor, &group, 8).await;
+    for stage in ["after the fork", "after maintenance"] {
+        if stage == "after maintenance" {
+            phone.run_due_maintenance().await.unwrap();
+            converge_device_group(&mut phone, &relay, &mut phone_cursor, &group, 2).await;
+        }
+        assert!(
+            !roster(&phone, &group)
+                .rejected_slots
+                .contains_key(&laptop_slot),
+            "a record a fork dropped is not made again ({stage})"
+        );
+        assert_eq!(
+            phone.runtime.group_record(&group).unwrap().epoch,
+            laptop_epoch,
+            "the phone is on the laptop's branch and commits nothing ({stage})"
+        );
+    }
+}
+
 /// A failed link's undo can take the entry of a device the user decided to
 /// remove, and it writes no `removed` record. The deciding device commits
 /// that record alone, with the tag signature key it remembers for the slot

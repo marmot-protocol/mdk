@@ -8,7 +8,7 @@ use cgka_traits::app_components::{
     APP_OWNED_APP_COMPONENT_ID_START, AccountEntryV1, AppComponentData, AppComponentId,
     DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
     DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    encode_device_roster_update_v1,
+    RejectedSlotReasonV1, decode_device_roster_update_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -72,6 +72,61 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<SendResult, EngineError> {
         self.do_send_app_data_updates(group_id, updates, Vec::new())
             .await
+    }
+
+    /// Stage a [`cgka_traits::engine::SendIntent::RecordRemovedSlot`]: one
+    /// roster `SetRejectedSlot` with reason `removed` and a tag signature
+    /// key, for a slot the roster lists neither as a device nor as a
+    /// rejected slot (mdk#2761). It goes out as a component update; its
+    /// intent kind is what keeps it out of the queue and out of re-issue.
+    /// Like an unlink, it is refused with
+    /// [`EngineError::LinkDeviceUnsettled`] while a Commit is in flight.
+    pub(crate) async fn do_send_record_removed_slot(
+        &mut self,
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        if self
+            .epoch_manager
+            .state(&group_id)
+            .is_some_and(|state| !matches!(state, EpochState::Stable { .. }))
+        {
+            return Err(EngineError::LinkDeviceUnsettled { group_id });
+        }
+        let update = decode_device_roster_update_v1(&roster_update).map_err(|error| {
+            EngineError::Serialize(format!("invalid device roster update: {error}"))
+        })?;
+        let [DeviceRosterOperationV1::SetRejectedSlot(slot, record)] = update.operations() else {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: it must set exactly one rejected slot".into(),
+            ));
+        };
+        if record.reason != RejectedSlotReasonV1::Removed || record.tag_signature_key.is_none() {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: it has reason removed and keeps a tag signature key"
+                    .into(),
+            ));
+        }
+        let held = self.with_mls_group(&group_id, |mls_group| {
+            Ok(
+                crate::app_components::device_roster_of_group(mls_group).is_some_and(|roster| {
+                    roster.devices.contains_key(slot) || roster.rejected_slots.contains_key(slot)
+                }),
+            )
+        })?;
+        if held {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: the roster already holds the slot".into(),
+            ));
+        }
+        self.do_send_update_app_components(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: roster_update,
+            }],
+        )
+        .await
     }
 
     /// Stage a [`cgka_traits::engine::SendIntent::ReplaceDeviceEntry`]: one

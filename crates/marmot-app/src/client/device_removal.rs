@@ -278,7 +278,9 @@ impl AppClient {
     /// applied it and its drop, or after a restart, while a send that went
     /// nowhere, or whose Commit failed or was rolled back, is made again.
     /// Sent only while the device group is settled and can take a commit from
-    /// this device; otherwise a later pass retries.
+    /// this device; otherwise a later pass retries. The engine neither queues
+    /// the send nor re-issues it after a lost fork, so this pass, behind
+    /// these checks, is the only thing that makes the record.
     async fn record_removal_alone(
         &mut self,
         group_id: &GroupId,
@@ -321,10 +323,17 @@ impl AppClient {
             rejected_at: removal.requested_at,
             tag_signature_key: Some(tag_signature_key),
         };
-        let effects = self
+        let effects = match self
             .runtime
-            .reject_device_slots(group_id, &held, vec![(*slot, record)], context)
-            .await?;
+            .record_removed_slot(group_id, &held, *slot, record, context)
+            .await
+        {
+            Ok(effects) => effects,
+            Err(marmot_session::AccountError::Engine(EngineError::LinkDeviceUnsettled {
+                ..
+            })) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
         self.observe_drained_session_events(&effects).await?;
         if self
             .trusted_device_roster()?
