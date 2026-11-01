@@ -476,7 +476,7 @@ fn anchors_are_scoped_and_limits_and_storage_errors_are_explicit() {
 fn opening_and_retained_tokens_survive_encrypted_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.sqlite");
-    let key = crate::SqlCipherKey::new("08".repeat(32)).unwrap();
+    let key = crate::SqlCipherKey::raw([0x08; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store);
     add(&store.app_storage(), "a", 1, 1);
@@ -538,7 +538,7 @@ fn read_with_concurrent_writer<T>(
 fn opening_read_state_and_history_share_one_wal_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.sqlite");
-    let key = crate::SqlCipherKey::new("09".repeat(32)).unwrap();
+    let key = crate::SqlCipherKey::raw([0x09; 32]);
     let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let reader_app = reader.app_storage();
     seed(&reader);
@@ -553,7 +553,6 @@ fn opening_read_state_and_history_share_one_wal_snapshot() {
                 .app_storage()
                 .mark_timeline_message_read(LOCAL, GROUP, "b", &no_mentions)
                 .unwrap();
-            writer.close().unwrap();
         },
         || open(&reader_app, ConversationOpenTarget::Automatic, 50),
     );
@@ -853,7 +852,7 @@ fn account_capture_rejects_unprepared_state_without_writing() {
 fn account_capture_keeps_all_fields_on_one_snapshot_while_another_connection_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.sqlite");
-    let key = crate::SqlCipherKey::new("0a".repeat(32)).unwrap();
+    let key = crate::SqlCipherKey::raw([0x0a; 32]);
     let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let reader_app = reader.app_storage();
     seed(&reader);
@@ -881,7 +880,6 @@ fn account_capture_keeps_all_fields_on_one_snapshot_while_another_connection_com
                 "UPDATE account_groups SET archived = 1, profile_name = 'new name', admin_keys_hex = 'new admins', pending_confirmation = 1 WHERE group_id_hex = ?1",
                 [GROUP],
             ).unwrap();
-            writer.close().unwrap();
         },
         || {
             reader_app
