@@ -694,8 +694,14 @@ mod tests {
             for reverse in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("provenance.db");
-                let key = SqlCipherKey::new("07".repeat(32)).unwrap();
-                let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                let key = SqlCipherKey::raw([0x07; 32]);
+                // The reopen proof needs one file per provenance; the reversed
+                // arrival order only needs the rebuild, so it runs in memory.
+                let s = if reverse {
+                    SqliteAccountStorage::in_memory().unwrap()
+                } else {
+                    SqliteAccountStorage::open_encrypted(&path, &key).unwrap()
+                };
                 let author = if admin_is_author { 20 } else { 10 };
                 record(&s.app_storage(), &event(1, author, 9, vec![], "original"));
                 let mut complaint = report(5);
@@ -738,10 +744,14 @@ mod tests {
                                 .is_some_and(|p| p.deletion_source == DeletionSource::Admin)
                     }));
                 }
-                drop(s);
-                let s = SqliteAccountStorage::open_encrypted(&path, &key)
-                    .unwrap()
-                    .app_storage();
+                let s = if reverse {
+                    s.app_storage()
+                } else {
+                    drop(s);
+                    SqliteAccountStorage::open_encrypted(&path, &key)
+                        .unwrap()
+                        .app_storage()
+                };
                 for rebuild in [false, true] {
                     if rebuild {
                         s.rebuild_message_timeline_for_group(&id(99)).unwrap();
@@ -1076,7 +1086,11 @@ mod tests {
         let s_app = s.app_storage();
         record(&s_app, &target());
         s.lock().unwrap().execute_batch("CREATE TRIGGER fail_report BEFORE INSERT ON content_reports BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert!(s_app.record_app_event(&report(2)).is_err());
+        let refused = s_app.record_app_event(&report(2));
+        assert!(
+            matches!(&refused, Err(StorageError::Backend(message)) if message == "injected"),
+            "{refused:?}"
+        );
         assert!(raw(&s.lock().unwrap(), &id(99), &id(2)).unwrap().is_none());
         assert!(
             !s_app

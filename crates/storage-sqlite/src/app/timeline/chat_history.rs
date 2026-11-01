@@ -800,6 +800,20 @@ mod tests {
             .unwrap()
     }
 
+    /// Every column of every attachment slot, `slot_json` and `visible` included.
+    fn attachment_rows(s: &SqliteAppStorage) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = s.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT * FROM attachment_history ORDER BY message_id_hex, attachment_index")
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
     // mdk#2628 4.2a: an imported chat message gets attachment slots, under its
     // app event id, and keeps them when the chat's timeline is rebuilt.
     #[test]
@@ -835,9 +849,10 @@ mod tests {
         .unwrap();
         let expected = vec![(photo.message_id_hex.clone(), photo.message_id_hex.clone())];
         assert_eq!(attachment_slots(&s), expected);
+        let imported_rows = attachment_rows(&s);
 
         s.rebuild_message_timeline_for_group(GROUP).unwrap();
-        assert_eq!(attachment_slots(&s), expected);
+        assert_eq!(attachment_rows(&s), imported_rows);
     }
 
     // mdk#2628 4.2a: only one key opens a ciphertext, so the chat keeps the

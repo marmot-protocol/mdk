@@ -132,7 +132,10 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
         assert!(store.app_storage().next_local_submission()?.is_none());
         Err(StorageError::Backend("injected rollback".into()))
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Backend(message)) if message == "injected rollback"),
+        "{result:?}"
+    );
     assert_eq!(
         store
             .app_storage()
@@ -191,20 +194,35 @@ fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() 
     ));
     let other = SqliteAccountStorage::in_memory().unwrap();
     seed(&other);
+    let other_initial = other.app_storage().selected_message_draft(GROUP).unwrap();
+    let other_first = other
+        .app_storage()
+        .save_message_draft_if_revision(&other_initial.revision, "first", None, &[])
+        .unwrap();
+    assert_eq!(
+        (
+            &other_first.revision.group_id_hex,
+            other_first.revision.revision
+        ),
+        (&first.revision.group_id_hex, first.revision.revision),
+        "only the store epoch tells the two revisions apart"
+    );
     assert!(matches!(
         other
             .app_storage()
             .clear_message_draft_if_revision(&first.revision),
         Err(MessageDraftRevisionError::Conflict)
     ));
+    let duplicate = app.save_message_draft_if_revision(
+        &first.revision,
+        "broken",
+        None,
+        &[attachment(), attachment()],
+    );
     assert!(
-        app.save_message_draft_if_revision(
-            &first.revision,
-            "broken",
-            None,
-            &[attachment(), attachment()]
-        )
-        .is_err()
+        matches!(&duplicate, Err(MessageDraftRevisionError::Storage(StorageError::Backend(message)))
+            if message == "UNIQUE constraint failed: message_draft_attachments.group_id_hex, message_draft_attachments.attachment_id"),
+        "{duplicate:?}"
     );
     assert_eq!(
         app.selected_message_draft(GROUP).unwrap().revision,
@@ -300,7 +318,10 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
         Err(StorageError::Backend("rollback".into()))
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Backend(message)) if message == "rollback"),
+        "{result:?}"
+    );
     assert_eq!(
         store
             .app_storage()
@@ -318,7 +339,11 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
     store.lock().unwrap().execute_batch("CREATE TEMP TRIGGER fail_clear BEFORE DELETE ON message_drafts BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
     store
         .with_transaction::<_, StorageError, _>(|s| {
-            assert!(s.put_queued_outbound_intent(&queued(b"payload")).is_err());
+            let refused = s.put_queued_outbound_intent(&queued(b"payload"));
+            assert!(
+                matches!(&refused, Err(StorageError::Backend(message)) if message == "test"),
+                "{refused:?}"
+            );
             Ok(())
         })
         .unwrap();
@@ -420,7 +445,7 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
     for accepted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("draft.sqlite");
-        let key = crate::SqlCipherKey::new("ab".repeat(32)).unwrap();
+        let key = crate::SqlCipherKey::raw([0xab; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
         seed(&store);
@@ -493,9 +518,11 @@ fn revision_exhaustion_fails_without_reusing_tokens_or_changing_draft() {
             [i64::MAX],
         )
         .unwrap();
+    let exhausted = app.save_message_draft_if_revision(&before.revision, "after", None, &[]);
     assert!(
-        app.save_message_draft_if_revision(&before.revision, "after", None, &[])
-            .is_err()
+        matches!(&exhausted, Err(MessageDraftRevisionError::Storage(StorageError::Backend(message)))
+            if message == "CHECK constraint failed: typeof(revision) = 'integer' AND revision >= 0"),
+        "{exhausted:?}"
     );
     let after = app.selected_message_draft(GROUP).unwrap();
     assert_eq!(before.revision, after.revision);
