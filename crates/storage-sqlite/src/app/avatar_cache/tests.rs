@@ -2,16 +2,6 @@ use super::*;
 #[cfg(test)]
 use crate::SqliteAccountStorage;
 
-#[test]
-fn avatar_cache_available_on_account_open_without_engine() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let count: i64 = store
-        .lock()
-        .unwrap()
-        .query_row("SELECT count(*) FROM avatar_assets", [], |row| row.get(0))
-        .expect("account open must provision durable avatar storage without an engine");
-    assert_eq!(count, 0);
-}
 fn image(value: u8, size: usize) -> AvatarImage {
     // Storage receives caller-validated bytes. Decoder/authentication tests are
     // owned by the acquisition layer, not these persistence fixtures.
@@ -40,7 +30,7 @@ fn ready(store: &SqliteAppStorage, reference: &AvatarAssetRef) -> AvatarAssetRea
 fn avatar_bytes_survive_encrypted_reopen_without_engine_or_network() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.sqlite3");
-    let key = crate::SqlCipherKey::new("avatar-test-key").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa1; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     let reference = bind(&app, "profile-owner");
@@ -321,7 +311,10 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
             bytes: 8,
         },
     );
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Backend(m)) if m.contains("injected failure")),
+        "{result:?}"
+    );
     assert_eq!(
         app.avatar_cache_usage().unwrap(),
         AvatarCacheUsage {
@@ -391,6 +384,9 @@ fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     assert_eq!(ready(&app, &reference).image, Some(bytes));
 }
 
+/// Two racing publishes with one expected revision: one wins. The race also
+/// fails if a second thread's transaction does not wait for the first's
+/// (`with_transaction_mode` in `base/connection.rs`).
 #[test]
 fn concurrent_publications_have_one_winner() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -472,9 +468,6 @@ fn bounds_and_errors_do_not_expose_source_or_image_material() {
     }
     let reference = bind(&store, "owner");
     let bytes = image(42, 16);
-    let debug = format!("{reference:?} {bytes:?}");
-    assert!(!debug.contains("42, 42"));
-    assert!(!debug.contains(&hex::encode(&reference.token)));
     assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
     assert!(
         store
@@ -558,16 +551,17 @@ fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
     let bytes = image(1, 16);
     publish(&app, &reference, &bytes);
     // Failure after the UPSERT but before commit must not clear the old avatar.
+    let rebind = app.bind_avatar_source_with_limits(
+        "owner",
+        "new",
+        Limits {
+            entries: 0,
+            bytes: 16,
+        },
+    );
     assert!(
-        app.bind_avatar_source_with_limits(
-            "owner",
-            "new",
-            Limits {
-                entries: 0,
-                bytes: 16
-            }
-        )
-        .is_err()
+        matches!(&rebind, Err(StorageError::Serialization(m)) if m == "avatar exceeds cache capacity"),
+        "{rebind:?}"
     );
     assert_eq!(
         app.avatar_reference("owner").unwrap(),
@@ -579,25 +573,30 @@ fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
         .unwrap()
         .execute("UPDATE avatar_assets SET content_revision = ?1", [i64::MAX])
         .unwrap();
-    assert!(
-        app.publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None)
-            .is_err()
-    );
+    let overflow = app.publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None);
+    assert!(is_check_failure(&overflow), "{overflow:?}");
     assert_eq!(ready(&app, &reference).image, Some(bytes));
     store
         .lock()
         .unwrap()
         .execute("UPDATE avatar_cache_meta SET access_seq = ?1", [i64::MAX])
         .unwrap();
-    assert!(app.bind_avatar_source("owner", "new").is_err());
+    let overflow = app.bind_avatar_source("owner", "new");
+    assert!(is_check_failure(&overflow), "{overflow:?}");
     assert_eq!(app.avatar_reference("owner").unwrap(), Some(reference));
+}
+
+/// The 0114 counters are `typeof(..) = 'integer'`: an increment past
+/// `i64::MAX` becomes a REAL and fails its CHECK.
+fn is_check_failure<T>(result: &StorageResult<T>) -> bool {
+    matches!(result, Err(StorageError::Backend(m)) if m.contains("CHECK constraint failed"))
 }
 
 #[test]
 fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("avatar-wal.db");
-    let key = crate::SqlCipherKey::new("avatar-wal-test-key").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa2; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     let reference = bind(&app, "owner");
@@ -675,17 +674,6 @@ fn removing_live_avatar_invalidates_shared_views_and_preserves_other_owners() {
     assert_eq!(recency as u64, app.avatar_cache_usage().unwrap().entries);
 }
 
-#[test]
-fn avatar_acquisition_intent_exists_without_runtime() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    let count: i64 = store
-        .lock()
-        .unwrap()
-        .query_row("SELECT count(*) FROM avatar_acquisition", [], |r| r.get(0))
-        .expect("durable avatar work must survive independently of a runtime");
-    assert_eq!(count, 0);
-}
-
 fn selected_url(key: &str) -> crate::SelectedAvatar {
     crate::SelectedAvatar::RemoteImage {
         url: format!("https://example.com/{key}"),
@@ -740,7 +728,7 @@ fn avatar_acquisition_coalesces_retries_and_retains_stale_bytes() {
 fn avatar_attempts_survive_reopen_and_fence_late_completion() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.db");
-    let key = crate::SqlCipherKey::new("avatar jobs fixture").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa3; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let reference = store
         .app_storage()
@@ -849,7 +837,10 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         app.request_avatar_acquisition("owner", &selected_url("a"), false)?;
         Err(invalid("injected outer failure"))
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(&result, Err(StorageError::Serialization(m)) if m == "injected outer failure"),
+        "{result:?}"
+    );
     assert!(app.avatar_reference("owner").unwrap().is_none());
     assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
     let reference = app
@@ -858,9 +849,10 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         .unwrap();
     let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
     store.lock().unwrap().execute_batch("CREATE TRIGGER reject_job_finish BEFORE UPDATE OF state ON avatar_acquisition WHEN NEW.state = 0 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let refused = app.complete_avatar_acquisition(&job, &image(1, 8), None);
     assert!(
-        app.complete_avatar_acquisition(&job, &image(1, 8), None)
-            .is_err()
+        matches!(&refused, Err(StorageError::Backend(m)) if m.contains("injected")),
+        "{refused:?}"
     );
     assert_eq!(
         app.avatar_status(&reference, 0).unwrap().availability,
@@ -985,12 +977,16 @@ fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance
     );
 }
 
+/// The host probe behind the read timings in
+/// `docs/marmot-architecture/further-context/avatar-cache-storage.md`. Run it with
+/// `cargo nextest run -p storage-sqlite --run-ignored only --no-capture
+/// -E 'test(=app::avatar_cache::tests::avatar_local_read_timing_by_encoded_size)'`.
 #[test]
 #[ignore = "host timing evidence; not a device latency gate"]
 fn avatar_local_read_timing_by_encoded_size() {
     crate::base::connection::use_production_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
-    let key = crate::SqlCipherKey::new("avatar timing fixture").unwrap();
+    let key = crate::SqlCipherKey::raw([0xa4; 32]);
     let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key)
         .unwrap()
         .app_storage();
@@ -1395,4 +1391,258 @@ fn avatar_screen_and_byte_read_availability_agree_at_freshness_boundary() {
             app.read_avatar(&reference, now).unwrap().status
         );
     }
+}
+
+/// A byte string as `Debug` output could show it: hex, or a derived `Debug`'s
+/// list of numbers.
+fn renderings(bytes: &[u8]) -> [String; 2] {
+    let listed = format!("{bytes:?}");
+    [hex::encode(bytes), listed[1..listed.len() - 1].to_owned()]
+}
+
+/// No avatar type's `Debug` shows a token, attempt, store or row epoch, file
+/// id, owner, member, group, source key, URL or image byte.
+#[test]
+fn avatar_debug_output_hides_identifiers_sources_and_bytes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed_avatar_group(&store);
+    let member = "5e".repeat(32);
+    let selected = crate::SelectedAvatar::RemoteImage {
+        url: "https://example.com/private-avatar".into(),
+        cache_key: "private-cache-key".into(),
+    };
+    let version = crate::ChatPresentationVersion {
+        store_epoch: vec![9; 16],
+        revision: 1,
+    };
+    let reference = app
+        .request_identity_avatar_acquisition("group", &member, &selected, &version)
+        .unwrap()
+        .unwrap();
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    let target = app
+        .avatar_target_presentation("group", Some(&member), &selected, 0)
+        .unwrap()
+        .unwrap()
+        .target;
+    let demand = app.requested_avatar_identities_after("").unwrap().remove(0);
+    let bytes = image(42, 16);
+    app.complete_avatar_acquisition(&job, &bytes, None).unwrap();
+    let held = app.database_held_avatars(1).unwrap().remove(0);
+    let file = AvatarStoredFile {
+        id: media_store::FileId([0xab; 16]),
+        byte_len: 16,
+        format: AvatarImageFormat::Png,
+        width: 16,
+        height: 16,
+    };
+    let (row_epoch, store_epoch): (Vec<u8>, Vec<u8>) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT presentation_row_epoch, store_epoch FROM chat_list_rows
+             CROSS JOIN chat_presentation_meta WHERE group_id_hex = 'group' AND id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let mut hidden = vec![
+        demand.owner.clone(),
+        member.clone(),
+        "\"group\"".to_owned(),
+        "private-avatar".to_owned(),
+        "private-cache-key".to_owned(),
+        "42, 42".to_owned(),
+    ];
+    for secret in [
+        reference.token.as_slice(),
+        job.attempt(),
+        &store_epoch,
+        &row_epoch,
+        file.id.as_bytes(),
+    ] {
+        hidden.extend(renderings(secret));
+    }
+
+    let leaks: Vec<String> = [
+        format!("{reference:?}"),
+        format!("{bytes:?}"),
+        format!("{job:?}"),
+        format!("{target:?}"),
+        format!("{demand:?}"),
+        format!("{file:?}"),
+        format!("{held:?}"),
+    ]
+    .into_iter()
+    .flat_map(|output| {
+        hidden
+            .iter()
+            .filter(|secret| output.contains(secret.as_str()))
+            .map(|secret| format!("{output} shows {secret}"))
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    assert!(leaks.is_empty(), "{leaks:#?}");
+    // Their ids' own Debug output is already opaque, so the byte checks
+    // above cannot see them added: the field names can.
+    assert!(!format!("{file:?}").contains("id:"), "{file:?}");
+    assert!(!format!("{held:?}").contains("reference:"), "{held:?}");
+}
+
+/// A queued job whose descriptor no longer decodes is blocked, so the jobs
+/// behind it are still claimed.
+#[test]
+fn a_malformed_descriptor_is_blocked_and_later_work_still_runs() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let good = app
+        .request_avatar_acquisition("good", &selected_url("good"), false)
+        .unwrap()
+        .unwrap();
+    let bad = bind(&app, "bad");
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO avatar_acquisition(token, descriptor, due, priority) VALUES(?1, x'01', 0, 1)",
+            [&bad.token],
+        )
+        .unwrap();
+    assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
+    let blocked: (i64, Option<i64>) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state, due FROM avatar_acquisition WHERE token = ?1",
+            [&bad.token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(blocked, (4, None));
+    assert_eq!(
+        app.claim_avatar_acquisition(0).unwrap().unwrap().reference,
+        good
+    );
+}
+
+/// Bootstrap drops a chat whose presentation is not ready (presentation
+/// maintenance creates its demand later), 64 chats a pass, and reports a full
+/// pass so the caller runs another.
+#[test]
+fn avatar_bootstrap_drops_unready_chats_a_page_at_a_time() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x < 64)
+             INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count)
+             SELECT printf('g%02d', x), 'fixture', '', 7, 2 FROM n;
+             INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at)
+             SELECT group_id_hex, 19, 7 FROM account_groups;
+             INSERT OR IGNORE INTO avatar_acquisition_bootstrap SELECT group_id_hex FROM chat_list_rows;",
+        )
+        .unwrap();
+    let remaining = || -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM avatar_acquisition_bootstrap",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(remaining(), 65);
+    assert!(app.bootstrap_avatar_acquisition().unwrap(), "a full page");
+    assert_eq!(remaining(), 1);
+    assert!(!app.bootstrap_avatar_acquisition().unwrap());
+    assert_eq!(remaining(), 0);
+    assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
+}
+
+/// Each format is stored as its media type and parsed back on read. A type
+/// that did not parse would read as corrupt and be fetched again forever.
+#[test]
+fn every_avatar_format_round_trips_through_its_stored_media_type() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    for (format, media_type) in [
+        (AvatarImageFormat::Png, "image/png"),
+        (AvatarImageFormat::Jpeg, "image/jpeg"),
+        (AvatarImageFormat::Gif, "image/gif"),
+        (AvatarImageFormat::Webp, "image/webp"),
+    ] {
+        let reference = bind(&app, media_type);
+        let original = AvatarImage::new(vec![1; 8], format, 16, 16).unwrap();
+        publish(&app, &reference, &original);
+        let stored: String = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT media_type FROM avatar_assets WHERE token = ?1",
+                [&reference.token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, media_type);
+        let read = app.read_avatar(&reference, 0).unwrap();
+        assert!(!read.repaired, "{media_type}");
+        assert_eq!(read.image, Some(original), "{media_type}");
+    }
+}
+
+/// Queued work keeps its descriptor as `{"format":1,"value":..}`. A renamed
+/// field would turn every job queued before an upgrade into a blocked one.
+#[test]
+fn queued_avatar_descriptors_keep_their_persisted_envelope() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let reference = app
+        .request_avatar_acquisition("owner", &selected_url("key"), false)
+        .unwrap()
+        .unwrap();
+    let descriptor = || -> String {
+        let bytes: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT descriptor FROM avatar_acquisition WHERE token = ?1",
+                [&reference.token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    assert_eq!(
+        descriptor(),
+        r#"{"format":1,"value":{"RemoteImage":{"url":"https://example.com/key","cache_key":"key"}}}"#
+    );
+
+    // A descriptor an earlier release wrote is claimed as written.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE avatar_acquisition SET descriptor = CAST(?1 AS BLOB)",
+            [r#"{"format":1,"value":{"EncryptedGroupImage":{"image":{"image_hash_hex":"aa","image_key_hex":"bb","image_nonce_hex":"cc","image_upload_key_hex":"dd","media_type":"image/png"},"cache_key":"key"}}}"#],
+        )
+        .unwrap();
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    assert!(
+        job.descriptor
+            == crate::SelectedAvatar::EncryptedGroupImage {
+                image: crate::ChatListAvatar {
+                    image_hash_hex: "aa".into(),
+                    image_key_hex: "bb".into(),
+                    image_nonce_hex: "cc".into(),
+                    image_upload_key_hex: "dd".into(),
+                    media_type: Some("image/png".into()),
+                },
+                cache_key: "key".into(),
+            }
+    );
 }
