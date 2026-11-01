@@ -70,9 +70,9 @@ fn outgoing_owner_batch_rolls_back_late_insert_failure() {
         ),
     );
     let tags = [first, vec!["other".into()], second];
-    assert!(
-        app.protect_attachment_uploads(GROUP, "owner-batch", &tags)
-            .is_err()
+    assert_failed_with(
+        app.protect_attachment_uploads(GROUP, "owner-batch", &tags),
+        "generated owner fault",
     );
     let owner_count = || {
         store
@@ -101,7 +101,7 @@ fn outgoing_owner_batch_rolls_back_late_insert_failure() {
 fn outgoing_staging_survives_restart_and_pending_send_outlives_orphan_ttl() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("outgoing.sqlite");
-    let key = SqlCipherKey::new("outgoing-key").unwrap();
+    let key = SqlCipherKey::raw([0x36; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     store
         .lock()
@@ -233,9 +233,9 @@ fn outgoing_promotion_fault_rolls_back_and_recovers_without_new_demand() {
         &store,
         "CREATE TRIGGER fail_outgoing_publication BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'injected publication failure');END;",
     );
-    assert!(
-        app.promote_attachment_uploads(GROUP, "recover", 12, 10000)
-            .is_err()
+    assert_failed_with(
+        app.promote_attachment_uploads(GROUP, "recover", 12, 10000),
+        "injected publication failure",
     );
     assert_eq!(usage(&store), BODY.len() as u64);
     assert!(
@@ -349,10 +349,12 @@ fn outgoing_confirmation_fences_active_acquisition_and_preserves_removal() {
 /// Expired, invalidated and foreign source metadata cannot adopt uploaded bytes.
 #[test]
 fn outgoing_promotion_respects_expiry_invalidation_epoch_and_account_isolation() {
-    for mutation in [
-        "UPDATE app_events SET retention_expires_at=12",
-        "UPDATE attachment_history SET visible=0",
-        "UPDATE attachment_history SET source_epoch=4",
+    for (mutation, promoted) in [
+        // The unchanged source adopts the bytes: the fixture is sound.
+        ("SELECT 1", 1),
+        ("UPDATE app_events SET retention_expires_at=12", 0),
+        ("UPDATE attachment_history SET visible=0", 0),
+        ("UPDATE attachment_history SET source_epoch=4", 0),
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         sent(&store, "stale");
@@ -363,18 +365,19 @@ fn outgoing_promotion_respects_expiry_invalidation_epoch_and_account_isolation()
                 .app_storage()
                 .promote_attachment_uploads(GROUP, "stale", 12, 10000)
                 .unwrap(),
-            0
+            promoted,
+            "{mutation}"
         );
     }
     let store = SqliteAccountStorage::in_memory().unwrap();
     sent(&store, "foreign");
     let tokens = vec![staged(&store.app_storage(), "foreign")];
-    assert!(
+    assert_failed_with(
         SqliteAccountStorage::in_memory()
             .unwrap()
             .app_storage()
-            .bind_attachment_uploads(&tokens, &[(selected("foreign").slot, digest())])
-            .is_err()
+            .bind_attachment_uploads(&tokens, &[(selected("foreign").slot, digest())]),
+        "outgoing attachment reservation unavailable",
     );
 }
 
@@ -550,9 +553,24 @@ fn blocked_recovery_does_not_scan_staged_content() {
         .unwrap();
     // A corrupt BLOB would fail verification. Stable full-quota passes must not read it.
     sql(&store, "UPDATE outgoing_attachment_uploads SET bytes=x'00'");
+    let staged = usage(&store);
     for now in 12..22 {
         assert_eq!(app.recover_attachment_uploads(now, 64, 1).unwrap(), 0);
     }
+    let quarantined: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM outgoing_attachment_uploads WHERE quarantined=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (usage(&store), quarantined),
+        (staged, 0),
+        "no blocked pass read the staged bytes"
+    );
     assert_eq!(app.recover_attachment_uploads(22, 64, 10000).unwrap(), 0);
     assert_eq!(usage(&store), 0);
 }
@@ -697,7 +715,19 @@ fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
         );
         Err(invalid("generated outer rollback"))
     });
-    assert!(rolled_back.is_err());
+    assert_failed_with(rolled_back, "generated outer rollback");
+    // A callback the rollback kept would run after the next commit, which now
+    // records the message, and would retain its upload.
+    store
+        .connection
+        .with_transaction(|| app.record_app_event(&event).map(drop))
+        .unwrap();
+    assert!(
+        app.retained_attachment_asset(GROUP, "projection", "source-projection", 0, 12)
+            .unwrap()
+            .is_none(),
+        "the rollback discarded the retention callback"
+    );
     sql(
         &store,
         "CREATE TRIGGER fail_optional_copy BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'generated copy fault'); END;",
@@ -748,7 +778,7 @@ fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
 fn ownerless_pending_and_confirmed_uploads_survive_ttl_and_recover() {
     for pending in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new("generated-crash-key").unwrap();
+        let key = SqlCipherKey::raw([0x37; 32]);
         let path = dir.path().join("account.sqlite");
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         seed(&store, "seed");
@@ -819,7 +849,7 @@ fn corrupt_shared_upload_is_quarantined_without_reacquisition() {
 fn ownerless_committed_sources_survive_both_abandonment_paths() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ownerless.sqlite");
-    let key = SqlCipherKey::new("generated-ownerless-key").unwrap();
+    let key = SqlCipherKey::raw([0x39; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "seed");
     for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
@@ -835,11 +865,11 @@ fn ownerless_committed_sources_survive_both_abandonment_paths() {
             &store,
             "CREATE TRIGGER fail_owner BEFORE INSERT ON outgoing_attachment_upload_owners BEGIN SELECT RAISE(ABORT,'generated owner fault'); END;",
         );
-        assert!(
+        assert_failed_with(
             store
                 .app_storage()
-                .protect_attachment_uploads(GROUP, id, &event.tags)
-                .is_err()
+                .protect_attachment_uploads(GROUP, id, &event.tags),
+            "generated owner fault",
         );
         sql(&store, "DROP TRIGGER fail_owner");
         store
@@ -972,9 +1002,9 @@ fn outgoing_staging_blocks_all_network_routes_after_promotion_fault() {
         &store,
         "CREATE TRIGGER fail_bytes BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'generated promotion fault'); END;",
     );
-    assert!(
-        app.promote_attachment_uploads(GROUP, "managed", 12, 10000)
-            .is_err()
+    assert_failed_with(
+        app.promote_attachment_uploads(GROUP, "managed", 12, 10000),
+        "generated promotion fault",
     );
     let policy = AttachmentDownloadPolicy {
         automatic: true,

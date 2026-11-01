@@ -278,6 +278,21 @@ mod tests {
     #[test]
     fn chat_list_preview_bounds_unicode_text_and_summarizes_without_loading_blobs() {
         let (store, row) = fixture();
+        // The SQL byte bound can end inside a scalar; the preview keeps the
+        // complete scalars before it.
+        let content = format!("a{}", "🦀".repeat(CHAT_LIST_DRAFT_PREVIEW_CHARS + 76));
+        store
+            .app_storage()
+            .save_message_draft("11", &content, None, &[])
+            .unwrap();
+        let SelectedChatPreview::Draft(draft) = preview(&store, &row) else {
+            panic!("draft")
+        };
+        assert_eq!(
+            draft.text,
+            format!("a{}", "🦀".repeat(CHAT_LIST_DRAFT_PREVIEW_CHARS - 1))
+        );
+        assert!(draft.text_truncated);
         let content = "🦀".repeat(CHAT_LIST_DRAFT_PREVIEW_CHARS + 100);
         store
             .app_storage()
@@ -305,6 +320,23 @@ mod tests {
         assert!(
             matches!(preview(&store, &row), SelectedChatPreview::Draft(d) if d.text.is_empty() && d.attachment_count == 2)
         );
+        for (media_type, kind) in [
+            ("video/mp4", ChatListAttachmentKind::Video),
+            ("application/pdf", ChatListAttachmentKind::File),
+        ] {
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE message_draft_attachments SET media_type = ?1 WHERE group_id_hex='11'",
+                    [media_type],
+                )
+                .unwrap();
+            let SelectedChatPreview::Draft(draft) = preview(&store, &row) else {
+                panic!("draft")
+            };
+            assert_eq!(draft.attachment_kind, Some(kind), "{media_type}");
+        }
     }
     #[test]
     fn chat_list_actions_do_not_allow_destructive_work_during_departure() {

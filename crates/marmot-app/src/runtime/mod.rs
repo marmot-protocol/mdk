@@ -1618,6 +1618,17 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's device group removed this device after its link was
     /// made, so the account stopped here and is signed out for good: re-read
     /// `accounts` and show the device-level notice. Fires once, after the
@@ -2550,6 +2561,21 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
         self.accounts.linked_devices(account_ref).await
+    }
+
+    /// The held chats whose history from another of this account's devices
+    /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
+    /// delivery waits to be imported, with `retrying` once an attempt to
+    /// get its bundle failed, then `Imported` with the device it came from and when.
+    /// Facts only: an empty history sends nothing, and an expired delivery
+    /// leaves nothing. Empty while device groups are off. Refresh on
+    /// `ChatHistoryImportsChanged`; a device's name follows
+    /// `LinkedDevicesChanged`.
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        self.accounts.chat_history_imports(account_ref).await
     }
 
     /// Whether this device's KeyPackage refresh is overdue because its device

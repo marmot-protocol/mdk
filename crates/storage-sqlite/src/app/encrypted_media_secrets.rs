@@ -552,36 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn unreferenced_non_retired_cached_secret_can_be_served() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .app_storage()
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
-            .unwrap();
-
-        assert_eq!(
-            store
-                .app_storage()
-                .encrypted_media_epoch_secret("aa", 0x8008, 7)
-                .unwrap(),
-            Some(vec![1, 2, 3])
-        );
-        let durable_rows: i64 = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM encrypted_media_epoch_secrets",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            durable_rows, 1,
-            "pre-cached secrets remain for delayed messages"
-        );
-    }
-
-    #[test]
     fn duplicate_attachments_create_one_epoch_secret_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
@@ -853,95 +823,102 @@ mod tests {
             .app_storage()
             .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
             .unwrap();
-        let watermark: (i64, i64) = store
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*), max(retired_through_epoch)
-                 FROM encrypted_media_epoch_secret_retirement_watermarks",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let watermark = |store: &SqliteAccountStorage| -> (i64, i64) {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*), max(retired_through_epoch)
+                     FROM encrypted_media_epoch_secret_retirement_watermarks",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(watermark(&store), (1, 8));
+
+        // Retiring a lower epoch afterwards never lowers it: epoch 8 is not
+        // cached again.
+        let app = store.app_storage();
+        let retire = |id: &str, at: u64, epoch: u64| {
+            app.record_app_event(&media_event(id, at, epoch)).unwrap();
+            let pruned = app
+                .secure_prune_app_events_before("aa", at + 1, "local", &no_mentions)
+                .unwrap();
+            assert_eq!(pruned.pruned_messages, 1, "{id}");
+        };
+        retire("five", 30, 5);
+        assert_eq!(watermark(&store), (1, 8));
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 8, &[8])
             .unwrap();
-        assert_eq!(watermark, (1, 8));
+        assert_eq!(
+            app.encrypted_media_epoch_secret("aa", 0x8008, 8).unwrap(),
+            None
+        );
+
+        // Nor after a wipe of the group's data, whose barrier covers every
+        // epoch.
+        app.record_app_event(&media_event("wiped", 40, 3)).unwrap();
+        store.delete_local_group_data("aa").unwrap();
+        assert_eq!(watermark(&store), (1, i64::MAX));
+        retire("three", 50, 3);
+        assert_eq!(watermark(&store), (1, i64::MAX));
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 5, &[5])
+            .unwrap();
+        assert_eq!(
+            app.encrypted_media_epoch_secret("aa", 0x8008, 5).unwrap(),
+            None
+        );
     }
 
+    /// A retired epoch stays unavailable in session and after a reopen
+    /// (mdk#1056), whether its secret was cached before the prune or the
+    /// message's reference was all there was. Each row reopens a plain
+    /// SQLite file.
     #[test]
     fn retired_secret_stays_unavailable_after_restart() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("media-retirement.sqlite");
-        let store = SqliteAccountStorage::from_connection_with_options(
-            rusqlite::Connection::open(&path).unwrap(),
-            crate::SqliteStorageOptions::default(),
-        )
-        .unwrap();
-        let app = store.app_storage();
-        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
-            .unwrap();
-        app.record_app_event(&media_event("old", 10, 7)).unwrap();
-        app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
-            .unwrap();
-        drop(app);
-        drop(store);
+        for cached_before_prune in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("media-retirement.sqlite");
+            let open = || {
+                SqliteAccountStorage::from_connection_with_options(
+                    rusqlite::Connection::open(&path).unwrap(),
+                    crate::SqliteStorageOptions::default(),
+                )
+                .unwrap()
+            };
+            let store = open();
+            let app = store.app_storage();
+            if cached_before_prune {
+                app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+                    .unwrap();
+            }
+            app.record_app_event(&media_event("old", 10, 7)).unwrap();
+            app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+                .unwrap();
+            app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
+                .unwrap();
+            assert_eq!(
+                app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+                None,
+                "cached before the prune: {cached_before_prune}; retirement must not \
+                 depend on a key row existing at prune time"
+            );
+            drop(app);
+            drop(store);
 
-        let reopened = SqliteAccountStorage::from_connection_with_options(
-            rusqlite::Connection::open(&path).unwrap(),
-            crate::SqliteStorageOptions::default(),
-        )
-        .unwrap()
-        .app_storage();
-        reopened
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
-            .unwrap();
-        assert_eq!(
+            let reopened = open().app_storage();
             reopened
-                .encrypted_media_epoch_secret("aa", 0x8008, 7)
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn reference_without_cached_secret_still_retires_across_restart() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory
-            .path()
-            .join("media-reference-only-retirement.sqlite");
-        let store = SqliteAccountStorage::from_connection_with_options(
-            rusqlite::Connection::open(&path).unwrap(),
-            crate::SqliteStorageOptions::default(),
-        )
-        .unwrap();
-        let app = store.app_storage();
-        app.record_app_event(&media_event("reference-only", 10, 7))
-            .unwrap();
-        app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
-            .unwrap();
-        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
-            .unwrap();
-        assert_eq!(
-            app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
-            None,
-            "retirement must not depend on a key row existing at prune time"
-        );
-        drop(app);
-        drop(store);
-
-        let reopened = SqliteAccountStorage::from_connection_with_options(
-            rusqlite::Connection::open(&path).unwrap(),
-            crate::SqliteStorageOptions::default(),
-        )
-        .unwrap()
-        .app_storage();
-        reopened
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[4, 5, 6])
-            .unwrap();
-        assert_eq!(
-            reopened
-                .encrypted_media_epoch_secret("aa", 0x8008, 7)
-                .unwrap(),
-            None
-        );
+                .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[4, 5, 6])
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .encrypted_media_epoch_secret("aa", 0x8008, 7)
+                    .unwrap(),
+                None,
+                "cached before the prune: {cached_before_prune}"
+            );
+        }
     }
 
     #[test]

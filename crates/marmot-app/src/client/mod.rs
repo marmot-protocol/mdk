@@ -86,6 +86,7 @@ mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
 mod history_delivery;
+pub(crate) mod history_imports;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -884,6 +885,15 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    /// The client just opened, so the device-group seams announce
+    /// `ChatHistoryImportsChanged` once whatever the answer (mdk#2628 4.2d).
+    pub(crate) chat_history_imports_changed: bool,
+    /// Storage's count of changes chat history imports read, and a hash of
+    /// the held chats, when the answer was last read; none before the first
+    /// read on this client.
+    pub(crate) history_imports_inputs: Option<(u64, u64)>,
+    /// The chat history imports last announced.
+    pub(crate) listed_history_imports: Vec<history_imports::ChatHistoryImport>,
     /// The device group removed this device after its link was made, and the
     /// account is marked unlinked (mdk#2628 D67). The account worker stops at
     /// its next turn and asks the runtime to deactivate the account.
@@ -1053,6 +1063,10 @@ pub struct AppClient {
     /// Welcomes already announced as pending by this process, so a Welcome
     /// that keeps failing on each maintenance pass is announced once.
     pub(crate) announced_welcome_failures: HashSet<MessageId>,
+    /// The 461s this process sent to carry sibling Welcomes, until each
+    /// settles. A carrier the engine holds that is not here was in flight
+    /// when the app last stopped, so its Welcome is owed again.
+    pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1343,7 +1357,7 @@ pub(crate) fn group_is_quarantined(runtime: &AppRuntime, group_id: &GroupId) -> 
 /// into the media-boundary error the caller expects. Only media sends pin an
 /// epoch, so the engine variants never reach a host for any other intent.
 fn pinned_media_send_error(
-    expected_epoch: Option<cgka_traits::types::EpochId>,
+    expected_epoch: Option<cgka_traits::EpochPin>,
     error: AppError,
 ) -> AppError {
     use cgka_traits::error::EngineError;
@@ -1577,6 +1591,7 @@ impl AppClient {
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
+        self.send_owed_sibling_welcomes(&held).await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
@@ -4813,11 +4828,25 @@ impl AppClient {
             // retain the message while the group's epoch is unsettled and refuses
             // to encrypt it if convergence moves the epoch during the send, instead
             // of publishing an attachment nobody can decrypt. Callers have already
-            // checked that every attachment shares one epoch.
+            // checked that every attachment shares one epoch and that it is the
+            // epoch whose media secret this device holds now.
+            //
+            // The reference names only the number, and the sync below or the
+            // engine's own preflight can select a rival branch at that number.
+            // So the pin also carries the identity of the branch this device
+            // holds now, read before either can run. It is read the way the
+            // media secret is, a pending commit's epoch included, and a
+            // reference to any other epoch never matches it. A branch change
+            // before this point, such as during a caller's earlier sync, is
+            // not caught: the reference carries no identity from its upload.
             let expected_epoch = match &intent {
-                AppMessageIntent::Media { attachments, .. } => attachments
-                    .first()
-                    .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
+                AppMessageIntent::Media { attachments, .. } => match attachments.first() {
+                    Some(attachment) => Some(cgka_traits::EpochPin {
+                        epoch: cgka_traits::types::EpochId(attachment.source_epoch),
+                        ..self.runtime.epoch_pin(group_id)?
+                    }),
+                    None => None,
+                },
                 _ => None,
             };
             let (event, payload) = if let Some((event, payload)) = prepared {

@@ -9,7 +9,7 @@ use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
-use cgka_traits::engine::{SendIntent, SendResult};
+use cgka_traits::engine::{EpochPin, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
@@ -123,11 +123,8 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
-            SendIntent::AddOwnAccountDevices {
-                group_id,
-                key_packages,
-            } => {
-                self.do_send_add_own_account_devices(group_id, key_packages)
+            SendIntent::AddOwnAccountDevices { group_id, siblings } => {
+                self.do_send_add_own_account_devices(group_id, siblings)
                     .await
             }
             SendIntent::RemoveOwnAccountDevices {
@@ -1031,7 +1028,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         payload: Vec<u8>,
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     ) -> Result<SendResult, EngineError> {
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
@@ -1053,16 +1050,18 @@ impl<S: StorageProvider> Engine<S> {
 
         // The authoritative epoch is the loaded MLS state, read at the last
         // moment before encryption. `do_send` may have folded retained peer
-        // commits into this send on the way here, so a payload pinned to the
-        // epoch the caller saw can legitimately no longer be encrypted under
-        // it. Nothing has been written yet; hand the untouched group back.
+        // commits into this send on the way here, or selected a rival branch
+        // at the same epoch number, so a payload pinned to the epoch the
+        // caller saw can legitimately no longer be encrypted under it. The
+        // pin's identity tells the branches apart where the numbers agree.
+        // Nothing has been written yet; hand the untouched group back.
         let source_epoch = EpochId(mls_group.epoch().as_u64());
         if let Some(expected) = expected_epoch
-            && expected != source_epoch
+            && expected != crate::app_payload::epoch_pin(&mls_group)
         {
             self.return_unmodified_mls_group(&group_id, mls_group);
             return Err(EngineError::AppMessageEpochMismatch {
-                expected,
+                expected: expected.epoch,
                 current: source_epoch,
             });
         }

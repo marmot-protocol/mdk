@@ -894,7 +894,7 @@ impl<S: StorageProvider> Engine<S> {
             } = &intent
             {
                 return Err(EngineError::AppMessageEpochUnsettled {
-                    expected: *expected,
+                    expected: expected.epoch,
                 });
             }
             // A link never waits in the queue (device-group.md, "Linking a
@@ -925,6 +925,8 @@ impl<S: StorageProvider> Engine<S> {
             }
             // So is a KeyPackage it carries; see `check_queued_key_packages`.
             self.check_queued_key_packages(&intent)?;
+            // And a same-account Add's siblings; see `check_queued_sibling_add`.
+            self.check_queued_sibling_add(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
@@ -1075,8 +1077,8 @@ impl<S: StorageProvider> Engine<S> {
         // adds a leaf there; this answers an Invite or a same-account Add
         // before anything is queued, with a reason that names it.
         let adds_devices = match intent {
-            SendIntent::Invite { key_packages, .. }
-            | SendIntent::AddOwnAccountDevices { key_packages, .. } => !key_packages.is_empty(),
+            SendIntent::Invite { key_packages, .. } => !key_packages.is_empty(),
+            SendIntent::AddOwnAccountDevices { siblings, .. } => !siblings.is_empty(),
             _ => false,
         };
         if adds_devices

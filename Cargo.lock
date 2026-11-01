@@ -3764,6 +3764,7 @@ name = "marmot-session"
 version = "0.15.0-dev"
 dependencies = [
  "async-trait",
+ "base64",
  "cgka-engine",
  "cgka-traits",
  "futures",

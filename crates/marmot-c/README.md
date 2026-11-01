@@ -453,6 +453,11 @@ it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` block
 device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
 [shared contract](../marmot-uniffi/README.md#linked-devices).
 
+`marmot_chat_history_imports` blocks on the account worker and writes an owned `MarmotChatHistoryImportList`; free it
+with `marmot_chat_history_import_list_free`. Each entry's tagged `state` is `Receiving` or `Imported`. Imported
+`MarmotTimelineMessageRecord`s name their source in the nullable `imported_from`. Re-read on
+`MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED`.
+
 When another of the account's devices removes this one, `MARMOT_EVENT_DEVICE_UNLINKED` fires once and the account
 stops on this device: `MarmotAccountSummary.unlinked` and `signed_out` stay set, and `marmot_sign_in_account` returns
 `MARMOT_STATUS_ACCOUNT_UNLINKED`. `marmot_sign_out_and_wipe` skips leaving its chats and deleting its slot. See the

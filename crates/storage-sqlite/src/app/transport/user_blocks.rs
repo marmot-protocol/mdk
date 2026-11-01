@@ -266,9 +266,8 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn user_blocks_versions_isolation_and_public_precedence() {
+    fn user_blocks_versions_and_public_precedence() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let other = SqliteAccountStorage::in_memory().unwrap();
         assert!(adopt(
             &store,
             "bb",
@@ -285,14 +284,6 @@ mod tests {
             ["alice", "bob"]
         );
         assert!(!first.users[0].is_private);
-        assert!(
-            other
-                .app_storage()
-                .block_list_snapshot()
-                .unwrap()
-                .users
-                .is_empty()
-        );
         assert!(!adopt(&store, "cc", 10, &[]));
         assert!(!adopt(&store, "aa", 9, &[]));
         assert_eq!(store.app_storage().block_list_snapshot().unwrap(), first);
@@ -315,22 +306,25 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         adopt(&store, "a", 1, &[("alice", true)]);
         let before = store.app_storage().block_list_snapshot().unwrap();
-        store.lock().unwrap().execute_batch("CREATE TRIGGER fail_block_version BEFORE UPDATE ON user_block_list BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+        store.lock().unwrap().execute_batch("CREATE TRIGGER fail_block_version BEFORE UPDATE ON user_block_list BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let refused = store.app_storage().adopt_block_list(
+            &StoredBlockList {
+                event_id: "b".into(),
+                event_created_at: 2,
+                ..Default::default()
+            },
+            &[],
+            200,
+            "local",
+            &|_, _| false,
+        );
         assert!(
-            store
-                .app_storage()
-                .adopt_block_list(
-                    &StoredBlockList {
-                        event_id: "b".into(),
-                        event_created_at: 2,
-                        ..Default::default()
-                    },
-                    &[],
-                    200,
-                    "local",
-                    &|_, _| false
-                )
-                .is_err()
+            matches!(
+                &refused,
+                Err(cgka_traits::storage::StorageError::Backend(message))
+                    if message.contains("injected")
+            ),
+            "{refused:?}"
         );
         assert_eq!(store.app_storage().block_list_snapshot().unwrap(), before);
     }
@@ -338,7 +332,7 @@ mod tests {
     fn user_blocks_pending_and_dismissal_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.sqlite");
-        let key = crate::SqlCipherKey::new("test block key").unwrap();
+        let key = crate::SqlCipherKey::raw([7; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         adopt(&store, "a", 1, &[("alice", true)]);
         store
@@ -356,14 +350,18 @@ mod tests {
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert!(reopened.app_storage().is_user_blocked("alice").unwrap());
+        let pending = reopened
+            .app_storage()
+            .pending_block_publication()
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            reopened
-                .app_storage()
-                .pending_block_publication()
-                .unwrap()
-                .unwrap()
-                .event_json,
-            "signed bytes"
+            (
+                pending.target.as_str(),
+                pending.blocked,
+                pending.event_json.as_str()
+            ),
+            ("bob", true, "signed bytes")
         );
         assert!(
             reopened

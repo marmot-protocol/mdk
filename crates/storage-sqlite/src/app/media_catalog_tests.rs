@@ -20,7 +20,8 @@ const NOW: u64 = 1_000;
 
 struct SqliteHarness {
     dir: tempfile::TempDir,
-    key: SqlCipherKey,
+    /// The file-backed database's key; `None` for an in-memory one.
+    key: Option<SqlCipherKey>,
     storage: SqliteAccountStorage,
     slots: RefCell<HashMap<u32, (Vec<u8>, AttachmentAssetRef)>>,
     /// Each slot's claimed download attempt, for its checkpoint target.
@@ -30,11 +31,30 @@ struct SqliteHarness {
 }
 
 impl SqliteHarness {
-    fn new() -> Self {
+    /// An encrypted account database file, for the cases that restart.
+    fn file() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x6b; 32])).unwrap();
+        let key = SqlCipherKey::raw([0x6b; 32]);
         let storage =
             SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        Self::with_storage(dir, Some(key), storage)
+    }
+
+    /// An in-memory account database beside a media root on disk, for the
+    /// cases that never restart.
+    fn memory() -> Self {
+        Self::with_storage(
+            tempfile::tempdir().unwrap(),
+            None,
+            SqliteAccountStorage::in_memory().unwrap(),
+        )
+    }
+
+    fn with_storage(
+        dir: tempfile::TempDir,
+        key: Option<SqlCipherKey>,
+        storage: SqliteAccountStorage,
+    ) -> Self {
         storage
             .lock()
             .unwrap()
@@ -237,9 +257,13 @@ impl Harness for SqliteHarness {
     }
 
     fn restart(&mut self) {
+        let key = self
+            .key
+            .as_ref()
+            .expect("an in-memory harness cannot restart: list the case under `FILE_CASES`");
         self.storage.close().unwrap();
         self.storage =
-            SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), &self.key)
+            SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), key)
                 .unwrap();
     }
 
@@ -303,21 +327,93 @@ impl Harness for SqliteHarness {
     }
 }
 
-#[test]
-fn the_sqlcipher_catalog_passes_the_conformance_suite() {
-    conformance::run_all(&SqliteHarness::new);
-}
+/// One test per case of media-store's catalog conformance suite, so the
+/// cases run in parallel: the cases that restart on an encrypted file, the
+/// rest on an in-memory database. An in-memory harness panics on `restart`.
+mod catalog_conformance {
+    use super::*;
 
-#[test]
-fn deleting_a_key_relies_on_secure_delete() {
-    let harness = SqliteHarness::new();
-    let secure_delete: i64 = harness
-        .storage
-        .lock()
-        .unwrap()
-        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(secure_delete, 1);
+    macro_rules! cases {
+        ($list:ident, $harness:ident: $($case:ident,)+) => {
+            const $list: &[&str] = &[$(stringify!($case)),+];
+            $(
+                #[test]
+                fn $case() {
+                    conformance::$case(SqliteHarness::$harness());
+                }
+            )+
+        };
+    }
+
+    cases!(FILE_CASES, file:
+        crash_before_the_file_drops_the_pending_row,
+        crash_mid_write_drops_the_row_and_the_partial_file,
+        crash_before_the_ready_commit_drops_the_complete_file,
+        crash_after_the_ready_commit_keeps_the_file,
+        crash_between_key_deletion_and_unlink_unlinks_the_orphan,
+        staged_files_survive_restarts_until_promoted,
+        a_crash_before_the_staged_commit_leaves_nothing,
+    );
+
+    cases!(MEMORY_CASES, memory:
+        publish_reads_back_and_reuses_identical_content,
+        missing_ready_files_become_lost,
+        reuse_skips_a_twin_whose_file_is_gone,
+        ready_commit_keeps_its_file_when_the_twin_is_gone,
+        a_failed_presence_check_leaves_the_twin_untouched,
+        a_torn_twin_is_lost_and_the_new_body_kept,
+        the_last_reference_releases_the_file,
+        supersession_during_the_write_keeps_nothing,
+        reset_during_the_write_keeps_nothing,
+        the_sweep_leaves_live_publishes_alone,
+        checkpoints_append_restore_and_clear,
+        a_new_checkpoint_replaces_the_old_file,
+        a_fenced_attempt_cannot_change_the_checkpoint,
+        a_crash_between_append_and_record_is_cut_off,
+        a_missing_or_short_wire_file_discards_the_checkpoint,
+        wire_checkpoints_live_exactly_as_long_as_their_rows,
+        a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row,
+        a_refused_staged_commit_leaves_nothing,
+        an_ended_owner_releases_its_staged_file,
+        releasing_a_staged_file_deletes_its_key_then_the_file,
+        promotion_attaches_a_present_twin_instead,
+        promotion_skips_a_twin_whose_file_is_gone,
+        a_missing_staged_file_is_lost_and_never_promoted,
+    );
+
+    /// The split runs exactly the cases `run_all` runs, read from its source,
+    /// so a case added to the suite cannot go unrun here. Every statement of
+    /// `run_all` must read as a case call, however it is wrapped, or the
+    /// guard fails rather than skip it.
+    #[test]
+    fn the_split_runs_every_case_of_the_suite() {
+        let source = include_str!("../../../media-store/src/conformance.rs");
+        let body = source
+            .split_once("pub fn run_all")
+            .and_then(|(_, rest)| rest.split_once('{'))
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("media-store's `conformance::run_all`")
+            .0;
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut suite: Vec<&str> = compact
+            .split(';')
+            .filter(|statement| !statement.is_empty())
+            .map(|statement| {
+                statement
+                    .strip_suffix("(make())")
+                    .or_else(|| statement.strip_suffix("(make(),)"))
+                    .unwrap_or_else(|| panic!("`run_all` runs `{statement}`, not a case call"))
+            })
+            .collect();
+        suite.sort_unstable();
+        let mut split: Vec<&str> = FILE_CASES.iter().chain(MEMORY_CASES).copied().collect();
+        split.sort_unstable();
+        assert!(!suite.is_empty(), "no cases found in `run_all`");
+        assert_eq!(
+            split, suite,
+            "list each case of `run_all` under `FILE_CASES` (it restarts) or `MEMORY_CASES`"
+        );
+    }
 }
 
 fn publish(
@@ -345,7 +441,7 @@ fn publish(
 
 #[test]
 fn references_require_ready_files_and_repointing_releases_the_old_file() {
-    let harness = SqliteHarness::new();
+    let harness = SqliteHarness::memory();
     let store = MediaStore::new(harness.root(), harness.catalog());
     let token = harness.token(9);
     let pending = FileId([3; 16]);
@@ -360,15 +456,14 @@ fn references_require_ready_files_and_repointing_releases_the_old_file() {
             created_at: NOW,
         })
         .unwrap();
+    let refused = harness.storage.connection.with_transaction(|| {
+        let conn = harness.storage.lock()?;
+        attach_slot(&conn, &token, pending)
+    });
     assert!(
-        harness
-            .storage
-            .connection
-            .with_transaction(|| {
-                let conn = harness.storage.lock()?;
-                attach_slot(&conn, &token, pending)
-            })
-            .is_err()
+        matches!(&refused, Err(StorageError::Backend(m))
+            if m.contains("media file reference requires a ready file")),
+        "{refused:?}"
     );
 
     let old = publish(&harness, &store, 9, b"old");
@@ -376,4 +471,121 @@ fn references_require_ready_files_and_repointing_releases_the_old_file() {
     // The second publish re-pointed slot 9, releasing the old file's key.
     assert_eq!(store.file_state(&old).unwrap(), None);
     assert_eq!(store.file_state(&new).unwrap(), Some(FileState::Ready));
+}
+
+fn count(harness: &SqliteHarness, sql: &str, params: impl rusqlite::Params) -> i64 {
+    harness
+        .storage
+        .lock()
+        .unwrap()
+        .query_row(sql, params, |r| r.get(0))
+        .unwrap()
+}
+
+fn read(store: &MediaStore<SqliteMediaCatalog>, id: &FileId, len: usize) -> Vec<u8> {
+    let mut out = vec![0; len];
+    assert_eq!(store.read_at(id, 0, &mut out).unwrap(), Some(len));
+    out
+}
+
+/// Reads `content`, running `during` once before the first byte.
+struct During<'a> {
+    during: Option<Box<dyn FnOnce() + 'a>>,
+    content: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for During<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(during) = self.during.take() {
+            during();
+        }
+        self.content.read(out)
+    }
+}
+
+/// Another publication of the same content became ready while this one
+/// wrote its file. The ready commit drops its own row and attaches that
+/// twin, whose key the other slot still needs, rather than marking it lost.
+#[test]
+fn a_twin_ready_before_the_commit_is_attached_not_lost() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let body = b"the same picture, sent twice".to_vec();
+    let twin = std::cell::Cell::new(None);
+    let mut reader = During {
+        during: Some(Box::new(|| {
+            twin.set(Some(publish(&harness, &store, 1, &body)));
+        })),
+        content: Cursor::new(body.clone()),
+    };
+    let outcome = store
+        .publish(
+            harness.target(0).as_ref(),
+            Category::Retained,
+            &mut reader,
+            body.len() as u64,
+            Sha256::digest(&body).into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    let twin = twin.get().expect("the twin was published during the write");
+    assert_eq!(outcome, PublishOutcome::Existing(twin));
+    assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Ready));
+    assert_eq!(count(&harness, "SELECT count(*) FROM media_files", []), 1);
+    assert_eq!(
+        count(
+            &harness,
+            "SELECT count(*) FROM media_file_refs WHERE file_id=?1",
+            [twin.as_bytes().as_slice()]
+        ),
+        2,
+        "both slots reference the twin"
+    );
+    assert_eq!(read(&store, &twin, body.len()), body);
+}
+
+/// A ready file found missing is marked lost, and its key is wiped with it.
+#[test]
+fn a_lost_file_keeps_no_key() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let id = publish(&harness, &store, 9, b"gone");
+    std::fs::remove_file(store.path(&id)).unwrap();
+    assert_eq!(store.read_at(&id, 0, &mut [0; 4]).unwrap(), None);
+    let (state, key): (i64, Vec<u8>) = harness
+        .storage
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state,file_key FROM media_files WHERE id=?1",
+            [id.as_bytes().as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state, key), (STATE_LOST, vec![0; 32]));
+}
+
+/// Publishing a slot's current content again reuses the file and leaves the
+/// slot's reference in place: dropping and re-adding it would release the
+/// file before the new reference could point at it.
+#[test]
+fn republishing_a_slots_content_keeps_its_reference() {
+    let harness = SqliteHarness::memory();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let id = publish(&harness, &store, 9, b"same");
+    let again = store
+        .publish(
+            harness.target(9).as_ref(),
+            Category::Retained,
+            &mut Cursor::new(b"same"),
+            4,
+            Sha256::digest(b"same").into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(again, PublishOutcome::Existing(id));
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Ready));
+    assert_eq!(read(&store, &id, 4), b"same");
 }

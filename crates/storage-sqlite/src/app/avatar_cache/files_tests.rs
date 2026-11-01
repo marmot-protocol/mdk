@@ -7,10 +7,12 @@ use super::*;
 use crate::app::avatar_cache::{
     AvatarAvailability, AvatarCacheUsage, AvatarImage, AvatarPublishResult,
 };
-use crate::{DatabaseAvatarBody, SqlCipherKey, SqliteAccountStorage, SqliteMediaCatalog};
+use crate::{DatabaseAvatarBody, SqliteAccountStorage, SqliteMediaCatalog};
 
 const NOW: u64 = 1_000;
 
+/// An in-memory account database beside a media root on disk: no test here
+/// reopens the database.
 struct Fixture {
     _dir: tempfile::TempDir,
     store: SqliteAccountStorage,
@@ -26,9 +28,7 @@ fn body(seed: u8, len: usize) -> Vec<u8> {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x5a; 32])).unwrap();
-        let store =
-            SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let media = MediaStore::new(
             dir.path().join(MEDIA_DIRECTORY),
             SqliteMediaCatalog::new(store.app_storage()),
@@ -436,8 +436,7 @@ fn a_store_reset_drops_cache_files() {
     assert_eq!(f.files_on_disk(), 0);
 }
 
-/// Clearing the cache or deleting the owning chat's rows releases the files
-/// to the sweep.
+/// Clearing the cache releases its files to the sweep.
 #[test]
 fn clearing_the_cache_releases_its_files() {
     let f = Fixture::new();
@@ -565,4 +564,23 @@ fn a_migration_loses_to_a_newer_image() {
         2
     );
     assert_eq!(f.read_file(&owner), Some(vec![4; 1_200]));
+}
+
+/// A refresh that fetched the same bytes commits through the owner's own
+/// file: the reference stays, the revision moves on and the file still reads.
+#[test]
+fn an_unchanged_refresh_keeps_its_file_and_moves_the_revision_on() {
+    let f = Fixture::new();
+    let owner = f.bind("chat:aa");
+    let bytes = body(19, 2_000);
+    let id = file_of(f.publish(&owner, 0, &bytes));
+    assert_eq!(f.publish(&owner, 1, &bytes), PublishOutcome::Existing(id));
+    let status = f.app().avatar_status(&owner, NOW).unwrap();
+    assert_eq!(
+        (status.availability, status.content_revision),
+        (AvatarAvailability::Ready, 2)
+    );
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 1);
+    assert_eq!(f.files_on_disk(), 1);
+    assert_eq!(f.read_file(&owner), Some(bytes));
 }

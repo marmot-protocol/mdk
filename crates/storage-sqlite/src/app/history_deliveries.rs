@@ -40,6 +40,15 @@ pub struct ParkedHistoryDelivery {
     pub received_at: u64,
 }
 
+/// A chat that parked deliveries name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedHistoryChat {
+    pub group_id_hex: String,
+    /// An attempt to fetch one of its Blossom deliveries failed or was put
+    /// off, and it waits to be tried again.
+    pub retrying: bool,
+}
+
 /// What a parked delivery carries of its bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParkedBundle {
@@ -420,6 +429,27 @@ impl SqliteAppStorage {
             .storage()
     }
 
+    /// Each chat parked deliveries name, and whether a fetch for one of them
+    /// failed.
+    pub fn parked_history_chats(&self) -> StorageResult<Vec<ParkedHistoryChat>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT group_id_hex, MAX(fetch_attempts > 0) FROM history_deliveries_parked
+                 GROUP BY group_id_hex ORDER BY group_id_hex",
+            )
+            .storage()?;
+        stmt.query_map([], |row| {
+            Ok(ParkedHistoryChat {
+                group_id_hex: row.get(0)?,
+                retrying: row.get(1)?,
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+    }
+
     /// The deliveries parked for the chat `group_id_hex`, oldest first.
     pub fn parked_history_deliveries(
         &self,
@@ -687,10 +717,19 @@ mod tests {
         );
         assert_eq!(store.due_parked_history_fetches(12, 1).unwrap().len(), 1);
         assert!(store.due_parked_history_fetches(10, 8).unwrap().is_empty());
+        let chats = |retrying: [bool; 2]| {
+            [("aa", retrying[0]), ("bb", retrying[1])].map(|(chat, retrying)| ParkedHistoryChat {
+                group_id_hex: chat.into(),
+                retrying,
+            })
+        };
+        assert_eq!(store.parked_history_chats().unwrap(), chats([false; 2]));
 
         store.defer_parked_history_fetch("e2", 70).unwrap();
         // An inline delivery has no fetch to defer.
         store.defer_parked_history_fetch("e1", 70).unwrap();
+        // One deferred fetch marks its chat as retrying.
+        assert_eq!(store.parked_history_chats().unwrap(), chats([true, false]));
         assert_eq!(
             store.due_parked_history_fetches(69, 8).unwrap(),
             [located("e3", "bb", 11)]

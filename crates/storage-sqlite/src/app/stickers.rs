@@ -1151,11 +1151,13 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let current = pack(&"cc".repeat(32), 10, &"11".repeat(32));
         assert!(store.replace_sticker_pack_if_newer(&current).unwrap());
+        let refused = |result: StorageResult<bool>| {
+            matches!(result, Err(StorageError::Backend(message))
+                if message == "sticker event id must be 64 lowercase hex characters")
+        };
         for bad in ["", "CC", &"CC".repeat(32), &"zz".repeat(32)] {
             assert!(
-                store
-                    .replace_sticker_pack_if_newer(&pack(bad, 10, &"22".repeat(32)))
-                    .is_err(),
+                refused(store.replace_sticker_pack_if_newer(&pack(bad, 10, &"22".repeat(32)))),
                 "pack event id {bad:?} must be rejected"
             );
         }
@@ -1180,16 +1182,12 @@ mod tests {
             event_id_hex: String::new(),
             created_at: 10,
         };
-        assert!(
-            store
-                .replace_installed_sticker_packs_if_newer(&empty, &[])
-                .is_err()
-        );
-        assert!(
-            store
-                .commit_installed_sticker_publication(&empty, &[])
-                .is_err()
-        );
+        assert!(refused(
+            store.replace_installed_sticker_packs_if_newer(&empty, &[])
+        ));
+        assert!(refused(
+            store.commit_installed_sticker_publication(&empty, &[])
+        ));
         let state = store.installed_sticker_state().unwrap();
         assert_eq!(state.version, Some(list));
         assert_eq!(state.packs, vec!["pack-a".to_owned()]);
@@ -1238,6 +1236,35 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+
+        // A winner that fails while rewriting the pack's items leaves the
+        // stored pack and its assets exactly as they were.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_sticker_items BEFORE INSERT ON app_stickers
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let hash_c = "33".repeat(32);
+        assert!(matches!(
+            store.replace_sticker_pack_if_newer(&pack(&"cc".repeat(32), 11, &hash_c)),
+            Err(StorageError::Backend(message)) if message == "injected"
+        ));
+        assert_eq!(
+            store.sticker_pack(&first.coordinate).unwrap().unwrap(),
+            tie_winner
+        );
+        for shortcode in ["wave", "cover"] {
+            assert!(
+                store
+                    .sticker_for_ref(&first.coordinate, shortcode, &hash_c)
+                    .unwrap()
+                    .is_none(),
+                "the failed winner's {shortcode} asset must roll back"
+            );
+        }
     }
 
     #[test]
@@ -1338,66 +1365,6 @@ mod tests {
     }
 
     #[test]
-    fn losing_pack_versions_cannot_grow_asset_history_without_a_bound() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        let current = pack(&"ff".repeat(32), 1_000, &"aa".repeat(32));
-        assert!(store.replace_sticker_pack_if_newer(&current).unwrap());
-        for index in 0..MAX_STICKER_ASSET_HISTORY_ROWS + 5 {
-            let older = pack(&format!("{index:064x}"), 10, &format!("{:064x}", index + 1));
-            assert!(!store.replace_sticker_pack_if_newer(&older).unwrap());
-        }
-        let mut retained = 0;
-        for index in 0..MAX_STICKER_ASSET_HISTORY_ROWS + 5 {
-            if store
-                .sticker_for_ref(&current.coordinate, "wave", &format!("{:064x}", index + 1))
-                .unwrap()
-                .is_some()
-            {
-                retained += 1;
-            }
-        }
-        assert!(
-            retained <= MAX_STICKER_ASSET_HISTORY_ROWS,
-            "losing versions retained {retained} historical assets"
-        );
-        assert!(
-            store
-                .sticker_for_ref(&current.coordinate, "wave", &"aa".repeat(32))
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn winning_replacements_trim_asset_history_to_the_cap() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        let coordinate = pack(&"aa".repeat(32), 1, &"11".repeat(32)).coordinate;
-        for index in 0..=MAX_STICKER_ASSET_HISTORY_ROWS {
-            let mut winner = pack(
-                &format!("{index:064x}"),
-                u64::try_from(index).unwrap() + 1,
-                &format!("{:064x}", index + 1),
-            );
-            winner.coordinate = coordinate.clone();
-            assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
-        }
-        let mut retained = 0;
-        for index in 0..=MAX_STICKER_ASSET_HISTORY_ROWS {
-            if store
-                .sticker_for_ref(&coordinate, "wave", &format!("{:064x}", index + 1))
-                .unwrap()
-                .is_some()
-            {
-                retained += 1;
-            }
-        }
-        assert!(
-            retained <= MAX_STICKER_ASSET_HISTORY_ROWS,
-            "winning versions retained {retained} historical assets"
-        );
-    }
-
-    #[test]
     fn history_trim_preserves_every_asset_of_a_large_winning_pack() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let coordinate = pack(&"11".repeat(32), 1, &"01".repeat(32)).coordinate;
@@ -1434,47 +1401,6 @@ mod tests {
                 asset.shortcode
             );
         }
-    }
-
-    #[test]
-    fn installed_operations_rebase_without_losing_concurrent_intent() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        let base = StoredStickerPackVersion {
-            event_id_hex: "cc".repeat(32),
-            created_at: 5,
-        };
-        store
-            .replace_installed_sticker_packs_if_newer(&base, &["pack-a".to_owned()])
-            .unwrap();
-        store
-            .enqueue_sticker_install_operation("pack-b", true, 6)
-            .unwrap();
-
-        let remote = StoredStickerPackVersion {
-            event_id_hex: "dd".repeat(32),
-            created_at: 7,
-        };
-        store
-            .replace_installed_sticker_packs_if_newer(&remote, &["pack-c".to_owned()])
-            .unwrap();
-        assert_eq!(
-            store.desired_installed_sticker_packs().unwrap(),
-            vec!["pack-c".to_owned(), "pack-b".to_owned()]
-        );
-
-        let published = StoredStickerPackVersion {
-            event_id_hex: "ee".repeat(32),
-            created_at: 8,
-        };
-        assert!(
-            store
-                .commit_installed_sticker_publication(
-                    &published,
-                    &["pack-c".to_owned(), "pack-b".to_owned()],
-                )
-                .unwrap()
-        );
-        assert!(store.sticker_install_operations().unwrap().is_empty());
     }
 
     #[test]
@@ -1702,6 +1628,19 @@ mod tests {
             winner.coordinate = coordinate.clone();
             assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
         }
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
+                    rusqlite::params![coordinate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            MAX_STICKER_ASSET_HISTORY_ROWS,
+            "winning replacements trim history to exactly the cap"
+        );
         assert!(
             store
                 .sticker_for_ref(&coordinate, "wave", &referenced_hash)
@@ -1801,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_roundtrips_without_secret_side_channel() {
+    fn outbox_lists_oldest_first_replaces_by_event_id_and_clears() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let event = StoredStickerOutboxEvent {
             event_id_hex: "aa".repeat(32),
@@ -1809,11 +1748,30 @@ mod tests {
             event_json: "{\"kind\":30031}".to_owned(),
             created_at: 12,
         };
+        let earlier = StoredStickerOutboxEvent {
+            event_id_hex: "bb".repeat(32),
+            kind: 10_031,
+            event_json: "{\"kind\":10031}".to_owned(),
+            created_at: 5,
+        };
         store.put_sticker_outbox_event(&event).unwrap();
-        assert_eq!(store.sticker_outbox_events().unwrap(), vec![event.clone()]);
+        store.put_sticker_outbox_event(&earlier).unwrap();
+        assert_eq!(
+            store.sticker_outbox_events().unwrap(),
+            vec![earlier.clone(), event.clone()]
+        );
+        let replaced = StoredStickerOutboxEvent {
+            event_json: "{\"kind\":30031,\"content\":\"retry\"}".to_owned(),
+            ..event.clone()
+        };
+        store.put_sticker_outbox_event(&replaced).unwrap();
+        assert_eq!(
+            store.sticker_outbox_events().unwrap(),
+            vec![earlier.clone(), replaced]
+        );
         store
             .clear_sticker_outbox_event(&event.event_id_hex)
             .unwrap();
-        assert!(store.sticker_outbox_events().unwrap().is_empty());
+        assert_eq!(store.sticker_outbox_events().unwrap(), vec![earlier]);
     }
 }

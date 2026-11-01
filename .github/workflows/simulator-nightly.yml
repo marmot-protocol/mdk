@@ -60,11 +60,6 @@ jobs:
         with:
           tool: just
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-
       - name: Prepare private evidence roots
         run: |
           install -d -m 700 \
@@ -263,7 +258,7 @@ jobs:
   public-app-catchup:
     name: Public app 1024-message recovery
     runs-on: ubuntu-latest
-    # Step budgets (30 + 20 + 20 + 50) plus setup, evidence upload and cache save.
+    # Step budgets (30 + 20 + 20 + 50) plus setup and evidence upload.
     timeout-minutes: 125
     env:
       CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
@@ -285,15 +280,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache production-policy Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: public-app-catchup-release
-          # Save compiled dependencies even when a later step fails or times
-          # out; otherwise one cold timeout leaves every later run cold.
-          cache-on-failure: true
-
       - name: Record source provenance
         run: |
           umask 077
@@ -303,9 +289,9 @@ jobs:
 
       - name: Build public recovery tests with production policy
         id: build_catchup
-        # Budget a cold build: the repository cache sits at its 10 GB cap, so
-        # this once-daily entry is usually evicted before the next run. Cold
-        # builds exceeded the former 15-minute cap from 2026-09-22 onward.
+        # Budget a cold build: this job has no cache (see the budget in
+        # ci.yml). Cold builds exceeded the former 15-minute cap from
+        # 2026-09-22 onward.
         # --timings keeps a per-crate build profile for resizing this budget.
         timeout-minutes: 30
         # Keep this separate from workspace test-policy feature unification.

@@ -73,6 +73,14 @@ pub struct KeyPackage {
     pub protocol_profile: ProtocolProfile,
 }
 
+/// A private KeyPackage a sibling device handed over, with the roster slot of
+/// that sibling ([`SendIntent::AddOwnAccountDevices`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiblingKeyPackage {
+    pub slot: DeviceSlotId,
+    pub key_package: KeyPackage,
+}
+
 impl KeyPackage {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
@@ -118,6 +126,19 @@ impl Hash for KeyPackage {
     }
 }
 
+/// One epoch of a group as this device holds it: its number, and a digest of
+/// its MLS epoch authenticator. Two branches of a fork can reach the same
+/// number; their authenticators differ, so a pin read on one branch never
+/// matches the other. Read it with [`CgkaEngine::epoch_pin`]; pin an
+/// application message to it with
+/// [`SendIntent::AppMessage::expected_epoch`](SendIntent::AppMessage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochPin {
+    pub epoch: EpochId,
+    /// SHA-256 of the epoch's MLS epoch authenticator.
+    pub identity: [u8; 32],
+}
+
 /// Application's intent when calling [`CgkaEngine::send`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
@@ -130,7 +151,7 @@ pub enum SendIntent {
         /// An encrypted-media `imeta` reference is the case today: recipients
         /// derive the media key from the epoch of the message that delivers
         /// the tag, so ciphertext produced at epoch N is unreadable when the
-        /// tag ships at N+1.
+        /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
         /// retain the intent while the group's epoch is unsettled and encrypt
@@ -138,10 +159,11 @@ pub enum SendIntent {
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
-        /// time if convergence moved the epoch during the send. Nothing is
-        /// persisted or published in either case.
+        /// time if the send's own convergence moved the group off the pinned
+        /// [`EpochPin`]: to another epoch, or to another branch at the same
+        /// number. Nothing is persisted or published in either case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     },
     /// Invite new members via their KeyPackages.
     ///
@@ -163,19 +185,23 @@ pub enum SendIntent {
         group_id: GroupId,
         members: Vec<MemberId>,
     },
-    /// Add devices of this device's own account, without admin authority, in
-    /// a group that requires `marmot.group.account-devices.v1`
+    /// Add sibling devices of this device's own account, without admin
+    /// authority, in a group that requires `marmot.group.account-devices.v1`
     /// (account-devices-v1.md, "Same-account operations").
     ///
-    /// The caller supplies every KeyPackage: each must belong to this
-    /// device's account, advertise everything the group requires, and keep
-    /// the account within the leaf limit. The caller must have authenticated
-    /// each one as a device its user approved; the engine never selects an
+    /// The caller supplies every KeyPackage, each a private one a sibling
+    /// handed over, named with that sibling's roster slot (device-group.md,
+    /// "Sibling Welcomes"). Each must belong to this device's account, carry a
+    /// device tag that reads as that slot in the trusted device group's
+    /// roster, name no publication, advertise everything the group requires,
+    /// and keep the account within the leaf limit. The caller must have taken
+    /// each from the KeyPackages handed to it; the engine never selects an
     /// own-account KeyPackage itself ("Sender rules"). Each added device gets
-    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    /// a sibling Welcome, owed once the Commit confirms and sent in the device
+    /// group, never through the transport binding.
     AddOwnAccountDevices {
         group_id: GroupId,
-        key_packages: Vec<KeyPackage>,
+        siblings: Vec<SiblingKeyPackage>,
     },
     /// Remove other devices of this device's own account, without admin
     /// authority, in a group that requires
@@ -1279,6 +1305,12 @@ pub trait CgkaEngine: Send + Sync {
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
+
+    /// The group's [`EpochPin`]: its epoch and the branch it reached that
+    /// epoch on. While a commit of this device awaits its publication, that
+    /// is the commit's epoch, whose secrets [`Self::group_context`] exports;
+    /// the pin matches the group once the commit merges.
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError>;
 
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;

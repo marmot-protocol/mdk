@@ -1082,6 +1082,19 @@ impl AccountManager {
         local_account_worker_response(response).await
     }
 
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ChatHistoryImports { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();

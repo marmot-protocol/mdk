@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_upload_survives_reopen_state_transitions_and_consumption() {
+    fn staged_upload_moves_through_failure_upload_and_consumption_and_drops_its_secrets() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .app_storage()
@@ -409,6 +409,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed.state, PreparedGroupImageUploadState::Failed);
         assert_eq!(failed.attempt_count, 1);
+        assert_eq!(failed.last_error_kind.as_deref(), Some("blob_store"));
 
         store
             .app_storage()
@@ -477,7 +478,7 @@ mod tests {
     fn staged_upload_survives_database_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.sqlite3");
-        let key = crate::SqlCipherKey::new("prepared-image-restart-key").unwrap();
+        let key = crate::SqlCipherKey::raw([7; 32]);
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store
@@ -567,5 +568,95 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS);
         assert!(rows.iter().all(|row| row.upload_id != "upload-0000"));
+    }
+
+    /// Only an uploaded record is consumed, and only once, by one group: a
+    /// group must never name an image that was never uploaded.
+    #[test]
+    fn only_an_uploaded_record_is_consumed_and_unknown_uploads_are_not_found() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        let record = || {
+            app.prepared_group_image_upload("upload-1")
+                .unwrap()
+                .unwrap()
+        };
+        let not_ready = |result: StorageResult<()>| match result {
+            Err(StorageError::Backend(message)) => {
+                assert_eq!(
+                    message,
+                    "prepared group image upload is not ready for consumption"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        app.stage_prepared_group_image_upload(&staged_record())
+            .unwrap();
+        not_ready(app.consume_prepared_group_image_upload("upload-1", "abcd", 11));
+        assert_eq!(record(), staged_record());
+        app.mark_prepared_group_image_upload_failed("upload-1", "blob_store", 12)
+            .unwrap();
+        let failed = record();
+        not_ready(app.consume_prepared_group_image_upload("upload-1", "abcd", 13));
+        assert_eq!(record(), failed);
+
+        app.mark_prepared_group_image_upload_uploaded("upload-1", 14)
+            .unwrap();
+        app.consume_prepared_group_image_upload("upload-1", "abcd", 15)
+            .unwrap();
+        let consumed = record();
+        not_ready(app.consume_prepared_group_image_upload("upload-1", "other", 16));
+        // Marks on a consumed record are no-ops.
+        app.mark_prepared_group_image_upload_uploaded("upload-1", 17)
+            .unwrap();
+        app.mark_prepared_group_image_upload_failed("upload-1", "late", 18)
+            .unwrap();
+        assert_eq!(record(), consumed);
+
+        assert!(matches!(
+            app.consume_prepared_group_image_upload("missing", "abcd", 19),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            app.mark_prepared_group_image_upload_uploaded("missing", 19),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            app.mark_prepared_group_image_upload_failed("missing", "blob_store", 19),
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    /// Staging accepts only a fresh, unbound record; each row breaks one rule.
+    #[test]
+    fn staging_refuses_anything_but_an_unbound_fresh_record() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        type BreakRule = fn(&mut PreparedGroupImageUploadRecord);
+        let rows: [(&str, BreakRule); 9] = [
+            ("uploaded", |r| {
+                r.state = PreparedGroupImageUploadState::Uploaded
+            }),
+            ("empty id", |r| r.upload_id.clear()),
+            ("empty component", |r| r.component_data.clear()),
+            ("bound", |r| r.group_id_hex = Some("abcd".into())),
+            ("no blob", |r| r.encrypted_blob = None),
+            ("empty blob", |r| r.encrypted_blob = Some(Vec::new())),
+            ("short secret", |r| r.upload_secret = Some(vec![7; 31])),
+            ("attempted", |r| r.attempt_count = 1),
+            ("errored", |r| r.last_error_kind = Some("blob_store".into())),
+        ];
+        for (name, break_rule) in rows {
+            let mut record = staged_record();
+            break_rule(&mut record);
+            match app.stage_prepared_group_image_upload(&record) {
+                Err(StorageError::Serialization(message)) => assert_eq!(
+                    message, "new prepared group image upload must be an unbound staged record",
+                    "{name}"
+                ),
+                other => panic!("{name}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(app.list_prepared_group_image_uploads().unwrap().is_empty());
     }
 }

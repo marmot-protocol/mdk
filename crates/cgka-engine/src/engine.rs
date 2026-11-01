@@ -12,6 +12,7 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
+pub use crate::own_account_devices::OwedSiblingWelcome;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -19,8 +20,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
-    GroupStateChange, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, EpochPin, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -3377,7 +3378,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::StagedInviteWelcome { .. }
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         }
         .ok_or_else(|| {
             EngineError::Backend(
@@ -3636,7 +3639,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::RawTransport(_)
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         };
         if !message
             .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
@@ -3731,9 +3736,13 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::RawTransport(message) => {
                 matches!(message.envelope, TransportEnvelope::Welcome { .. })
             }
+            // A sibling Welcome is never a transport message, so no
+            // transport publish names its id.
             StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => false,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
         })
     }
 
@@ -4283,6 +4292,24 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.epoch_manager
             .epoch(group_id)
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+    }
+
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let group = self
+            .take_mls_group(group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        // Project a pending commit as `group_context` does, so the pin names
+        // the epoch whose secrets that view exports. It matches the group
+        // once the commit merges, and never if the commit is rolled back.
+        let pin = match group.pending_commit() {
+            Some(staged) => crate::app_payload::staged_epoch_pin(staged).ok_or_else(|| {
+                EngineError::Backend("staged commit carries no epoch authenticator".into())
+            }),
+            None => Ok(crate::app_payload::epoch_pin(&group)),
+        };
+        self.return_unmodified_mls_group(group_id, group);
+        pin
     }
 
     fn self_id(&self) -> MemberId {

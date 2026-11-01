@@ -416,6 +416,14 @@ impl SqliteAppStorage {
 mod tests {
     use super::*;
 
+    /// The operation failed on the trigger the test injected, not elsewhere.
+    fn assert_injected<T: std::fmt::Debug>(result: StorageResult<T>, context: &str) {
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message.contains("injected")),
+            "{context}: {result:?}"
+        );
+    }
+
     #[test]
     fn replay_cursor_retries_observed_writer_contention() {
         use std::cell::Cell;
@@ -427,7 +435,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay-contention.db");
-        let key = crate::SqlCipherKey::new("synthetic replay contention").unwrap();
+        let key = crate::SqlCipherKey::raw([7; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
             .app_storage()
@@ -517,7 +525,7 @@ mod tests {
     fn replay_progress_survives_more_than_256_owned_routes_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("progress.db");
-        let key = crate::SqlCipherKey::new("synthetic replay progress").unwrap();
+        let key = crate::SqlCipherKey::raw([7; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let now = unix_now_secs().unwrap();
         let routes = (0_u64..257)
@@ -553,18 +561,6 @@ mod tests {
                 "selecting a replay batch must never manufacture durable admission"
             );
         }
-        let other_account = SqliteAccountStorage::in_memory().unwrap();
-        other_account
-            .app_storage()
-            .transport_reconciliation_inventory(&routes[0], now)
-            .unwrap();
-        assert_eq!(
-            other_account
-                .app_storage()
-                .transport_reconciliation_replay_cursor(&routes[0])
-                .unwrap(),
-            None
-        );
         app.advance_transport_reconciliation_replay_cursor(&routes[0], None)
             .unwrap();
         assert_eq!(
@@ -578,7 +574,6 @@ mod tests {
             Some([7; 32])
         );
         store.close().unwrap();
-        other_account.close().unwrap();
     }
 
     #[test]
@@ -620,9 +615,9 @@ mod tests {
                 _ => store.delete_transport_group_routes_for_group(&group.id),
             };
             store.lock().unwrap().execute_batch("CREATE TRIGGER reject_recovery_fence BEFORE UPDATE ON account_recovery_state BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-            assert!(
-                retire().is_err(),
-                "path {path} must include the invalidation write"
+            assert_injected(
+                retire(),
+                &format!("path {path} must include the invalidation write"),
             );
             assert_eq!(app.recovery_revision_fence().unwrap(), before);
             assert!(
@@ -855,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_route_cursor_is_durable_and_route_scoped() {
+    fn route_cursor_starts_empty_and_holds_the_last_advanced_route() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         assert_eq!(store.transport_reconciliation_route_cursor().unwrap(), None);
 
@@ -910,9 +905,9 @@ mod tests {
             )
             .unwrap();
         let expired_at = now + TRANSPORT_RECONCILIATION_RETENTION_SECS + 1;
-        assert!(
-            app.transport_reconciliation_inventory(&route, expired_at)
-                .is_err()
+        assert_injected(
+            app.transport_reconciliation_inventory(&route, expired_at),
+            "expiration must include the fence write",
         );
         store
             .lock()

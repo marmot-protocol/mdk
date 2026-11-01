@@ -16,6 +16,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `groups_left_to_siblings` and `siblings_not_reached`. The struct layout
   changed: use matching regenerated headers and libraries.
 
+- `MarmotTimelineMessageRecord` adds a nullable `imported_from`
+  (`MarmotHistoryImportSource`), and `MarmotEvent` adds
+  `MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED`, last, so earlier tags keep
+  their values (mdk#2628 item 4.2d). New
+  `marmot_chat_history_imports` writes a `MarmotChatHistoryImportList` (free
+  with `marmot_chat_history_import_list_free`) whose tagged
+  `MarmotChatHistoryImportState` is `Receiving` or `Imported`. Use matching
+  regenerated headers and libraries.
+
 - `MARMOT_COMPROMISE_WARNING_REASON_REJECTED_KEY_PACKAGE` is now
   `MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, with the
   same value (mdk#2628 D74, 3.7b): a KeyPackage this device found in its own

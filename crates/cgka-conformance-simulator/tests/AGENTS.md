@@ -167,6 +167,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 - **File:** `tracing_audit.rs`
   - **Owns:** Repo-wide production tracing privacy audit.
+  - **Keep it std-only.** The pull-request pre-check builds this one file with rustc alone
+    (`scripts/check_tracing_audit.sh`, `just tracing-audit`), so it cannot use this crate or any dependency.
 
 - **File:** `vector_artifacts.rs`
   - **Owns:** Vector manifest and byte-fixture well-formedness checks, and the Welcome wire fixture's unwrap through

@@ -115,6 +115,14 @@ fn busy_backoff(attempt: u32) -> Duration {
 /// Message carried by every [`StorageError::Closed`] this module raises.
 const CLOSED_DETAIL: &str = "sqlite account storage is closed";
 
+/// What the rest of a transaction gets once SQLite rolled it back by itself.
+fn rolled_back_by_sqlite() -> StorageError {
+    StorageError::Backend(
+        "sqlite rolled the transaction back after an earlier failure; the rest of it cannot run"
+            .to_string(),
+    )
+}
+
 /// Coarse, privacy-safe label for a `rusqlite::Error`, for `tracing` fields.
 /// The full error text can carry SQL, so only the classification is logged.
 fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
@@ -462,6 +470,10 @@ impl SharedConnection {
                     return Err(err);
                 }
                 if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                    // This thread's transaction, unless SQLite rolled it back.
+                    if owner.is_some() && connection.is_autocommit() {
+                        return Err(rolled_back_by_sqlite());
+                    }
                     drop(owner);
                     return Ok(connection);
                 }
@@ -681,6 +693,9 @@ impl SharedConnection {
             // already active and owns rollback/commit.
             if owner.as_ref().is_some_and(|owner| owner == &current) {
                 drop(owner);
+                if self.inner.connection.lock()?.is_autocommit() {
+                    return Err(E::from(rolled_back_by_sqlite()));
+                }
                 return f();
             }
 
@@ -766,7 +781,10 @@ impl SharedConnection {
     /// their errors roll back only at the outermost boundary; this rolls `f`
     /// back on its own. On `Err` or panic, `ROLLBACK TO` undoes every write
     /// `f` made, drops the wakeups it registered and invalidates cached
-    /// OpenMLS objects, and the caller's transaction stays open and usable.
+    /// OpenMLS objects, and the caller's transaction stays open and usable,
+    /// unless SQLite rolled the whole transaction back by itself (see
+    /// [`Self::rollback_boundary_with_retry`]): then `f`'s error comes back
+    /// and the rest of the caller's transaction fails.
     pub(crate) fn with_savepoint<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,
@@ -806,7 +824,8 @@ impl SharedConnection {
     /// unit's writes open in a transaction a caller catching the error could
     /// otherwise commit, so it marks the connection unusable, as a failed
     /// `ROLLBACK` does, and the outermost transaction then rolls back instead
-    /// of committing. A closed connection already rolled everything back.
+    /// of committing. A closed connection already rolled everything back, and
+    /// so did SQLite when no transaction is open: the savepoint went with it.
     fn rollback_to_savepoint(&self, wakeups: usize) -> StorageResult<()> {
         // `ROLLBACK TO` discards OpenMLS writes, like `ROLLBACK`.
         self.note_openmls_write();
@@ -821,6 +840,7 @@ impl SharedConnection {
         {
             Ok(()) => Ok(()),
             Err(err @ StorageError::Closed(_)) => Err(err),
+            Err(_) if !self.transaction_is_open() => Ok(()),
             Err(err) => Err(self.mark_transaction_unusable(format!(
                 "sqlite ROLLBACK TO SAVEPOINT failed ({err}); connection marked unusable",
             ))),
@@ -866,9 +886,36 @@ impl SharedConnection {
     /// turn an orderly host suspension into a corruption-shaped error.
     /// `ROLLBACK` discards OpenMLS writes the transaction made, so it counts
     /// as a write for cache-validation purposes.
+    ///
+    /// SQLite also rolls a transaction back by itself: after `SQLITE_FULL`,
+    /// an I/O error or out of memory in a statement with no statement journal,
+    /// a trigger's `RAISE(ROLLBACK)`, and a `COMMIT` that fails for any reason
+    /// but busy. The `ROLLBACK` here then fails with "no transaction is
+    /// active". With no transaction open nothing is left to undo, so that also
+    /// reports success, and the caller returns the failure's own error, a full
+    /// disk as [`StorageError::Capacity`]. Only a `ROLLBACK` that fails with
+    /// the transaction still open is an error. Until this boundary releases
+    /// the transaction, [`Self::lock`] and nested transactions refuse the
+    /// rest of it, whose writes would otherwise commit one by one.
     fn rollback_boundary_with_retry(&self) -> StorageResult<()> {
         self.note_openmls_write();
         self.execute_transaction_boundary_with_retry("ROLLBACK")
+            .or_else(|error| {
+                if self.transaction_is_open() {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            })
+    }
+
+    /// Whether SQLite still has a transaction open on the connection. A
+    /// closed connection has none: closing rolled it back.
+    fn transaction_is_open(&self) -> bool {
+        self.inner
+            .connection
+            .lock()
+            .is_ok_and(|conn| !conn.is_autocommit())
     }
 
     fn execute_transaction_boundary_with_retry(&self, sql: &str) -> StorageResult<()> {
@@ -938,7 +985,11 @@ impl SharedConnection {
             previous
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read));
+        // Not `lock`: it refuses a transaction SQLite rolled back during the
+        // read, and the mode must be restored all the same.
         let restored = self
+            .inner
+            .connection
             .lock()
             .and_then(|conn| conn.pragma_update(None, "query_only", previous).storage());
         // A mode-restore failure must never leave a surviving connection with
@@ -1278,11 +1329,27 @@ pub(crate) fn finish_account_open(
     let migration_started = std::time::Instant::now();
     let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
     let migration_duration = migration_started.elapsed();
+    create_connection_tables(&connection)?;
     Ok(OpenedAccount {
         connection: SharedConnection::new(connection),
         migrations_applied,
         migration_duration,
     })
+}
+
+/// Tables that live only as long as the connection: TEMP, so nothing is
+/// stored and, with `temp_store = MEMORY`, nothing reaches a file.
+/// `device_labels` holds the device names imported chat history resolves its
+/// source against, by roster slot (mdk#2628 4.2d).
+fn create_connection_tables(connection: &rusqlite::Connection) -> StorageResult<()> {
+    connection
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS device_labels (
+                 slot BLOB PRIMARY KEY NOT NULL,
+                 label TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .storage()
 }
 
 impl SharedConnection {
@@ -2777,6 +2844,152 @@ mod tests {
             "the callback's own error must survive the closed rollback",
         );
         assert!(store.connection.transaction_unusable_error().is_none());
+    }
+
+    /// SQLite rolls a transaction back by itself after some failures: a
+    /// trigger's `RAISE(ROLLBACK)`, `SQLITE_FULL` (or an I/O error) in a
+    /// statement with no statement journal, and a COMMIT that fails for any
+    /// reason but busy, a full disk among them. The boundary's own `ROLLBACK`
+    /// (or a savepoint's `ROLLBACK TO`) then finds no transaction. The work is
+    /// already undone, so that is no fault: the caller gets the failure's own
+    /// error and class, and the connection stays usable instead of latching
+    /// until the account reopens. Until the outermost boundary, the rest of
+    /// the transaction is refused: its writes would commit one by one.
+    #[test]
+    fn a_transaction_sqlite_rolled_back_itself_keeps_its_error_and_the_connection() {
+        fn write(storage: &SqliteAccountStorage, sql: &str) -> StorageResult<()> {
+            storage.lock()?.execute_batch(sql).storage()
+        }
+        fn veto(storage: &SqliteAccountStorage) {
+            let vetoed = write(storage, "INSERT INTO auto_rollback_veto VALUES(1)");
+            assert!(
+                matches!(&vetoed, Err(StorageError::Backend(detail)) if detail.contains("vetoed")),
+                "{vetoed:?}"
+            );
+        }
+        fn fill_disk(storage: &SqliteAccountStorage) -> StorageResult<()> {
+            write(storage, "PRAGMA max_page_count = 1")?;
+            write(
+                storage,
+                "INSERT INTO auto_rollback VALUES(zeroblob(1048576))",
+            )
+        }
+        type Outcome = std::thread::Result<StorageResult<()>>;
+        fn commit_failed(outcome: &Outcome) -> bool {
+            matches!(outcome, Ok(Err(StorageError::Backend(detail))) if detail.starts_with("sqlite transaction COMMIT:"))
+        }
+        // (case, a callback that runs after a write that must not persist,
+        // the outcome expected)
+        type Case = (
+            &'static str,
+            fn(&SqliteAccountStorage) -> StorageResult<()>,
+            fn(&Outcome) -> bool,
+        );
+        let cases: [Case; 7] = [
+            (
+                "a trigger's RAISE(ROLLBACK), then the callback's own error",
+                |s| {
+                    veto(s);
+                    Err(StorageError::Serialization("callback failed".into()))
+                },
+                |outcome| matches!(outcome, Ok(Err(StorageError::Serialization(detail))) if detail == "callback failed"),
+            ),
+            (
+                "a trigger's RAISE(ROLLBACK), then a panic",
+                |s| {
+                    veto(s);
+                    panic!("callback panicked")
+                },
+                |outcome| matches!(outcome, Err(payload) if payload.downcast_ref::<&str>() == Some(&"callback panicked")),
+            ),
+            (
+                "SQLITE_FULL in a statement, propagated",
+                fill_disk,
+                |outcome| matches!(outcome, Ok(Err(StorageError::Capacity(_)))),
+            ),
+            (
+                "SQLITE_FULL in a savepoint, propagated",
+                |s| s.connection.with_savepoint(|| fill_disk(s)),
+                |outcome| matches!(outcome, Ok(Err(StorageError::Capacity(_)))),
+            ),
+            (
+                "SQLITE_FULL in a savepoint the caller gets past",
+                |s| {
+                    let unit = s.connection.with_savepoint(|| fill_disk(s));
+                    assert!(matches!(unit, Err(StorageError::Capacity(_))), "{unit:?}");
+                    // Outside a transaction a write commits at once, and a
+                    // savepoint begins a transaction of its own.
+                    for refused in [
+                        write(s, "INSERT INTO auto_rollback VALUES('torn')"),
+                        s.connection.with_savepoint(|| {
+                            write(s, "INSERT INTO auto_rollback VALUES('torn')")
+                        }),
+                    ] {
+                        assert!(
+                            matches!(&refused, Err(StorageError::Backend(detail)) if detail.starts_with("sqlite rolled the transaction back")),
+                            "{refused:?}"
+                        );
+                    }
+                    Ok(())
+                },
+                commit_failed,
+            ),
+            (
+                // SQLite rolls a read back after an I/O error or out of memory.
+                "a read snapshot SQLite rolls back mid-read",
+                |s| s.with_read_snapshot(|read| read.lock()?.execute_batch("ROLLBACK").storage()),
+                commit_failed,
+            ),
+            (
+                "a COMMIT SQLite rolls back, as it does a disk-full one",
+                |s| s.lock()?.commit_hook(Some(|| true)).storage(),
+                commit_failed,
+            ),
+        ];
+        for (case, callback, expected) in cases {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            write(
+                &store,
+                "CREATE TABLE auto_rollback(value BLOB);
+                 CREATE TABLE auto_rollback_veto(value INTEGER);
+                 CREATE TEMP TRIGGER auto_rollback_veto BEFORE INSERT ON auto_rollback_veto
+                 BEGIN SELECT RAISE(ROLLBACK, 'vetoed'); END;",
+            )
+            .unwrap();
+            let outcome: Outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.with_transaction(|s| {
+                    write(s, "INSERT INTO auto_rollback VALUES('lost')")?;
+                    callback(s)
+                })
+            }));
+            assert!(expected(&outcome), "{case}: {outcome:?}");
+            let latched = store.connection.transaction_unusable_error();
+            assert!(
+                latched.is_none(),
+                "{case}: a rollback SQLite already made must not latch the connection: {latched:?}"
+            );
+            let conn = store.lock().unwrap();
+            conn.commit_hook(None::<fn() -> bool>).unwrap();
+            conn.execute_batch("PRAGMA max_page_count = 1073741824")
+                .unwrap();
+            assert!(conn.is_autocommit(), "{case}");
+            drop(conn);
+            store
+                .with_transaction(|s| write(s, "INSERT INTO auto_rollback VALUES('next')"))
+                .unwrap_or_else(|error| {
+                    panic!("{case}: the next transaction must commit: {error}")
+                });
+            let rows: Vec<String> = store
+                .lock()
+                .unwrap()
+                .prepare("SELECT CAST(value AS TEXT) FROM auto_rollback")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(rows, ["next"], "{case}");
+        }
     }
 
     /// Closing while another thread is parked waiting for the transaction slot

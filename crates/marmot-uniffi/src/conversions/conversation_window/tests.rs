@@ -159,6 +159,18 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
             wire(presented_timeline(&rows[0], false))
         );
         assert_eq!(cache.parses, size + 1);
+        // An imported row's source device, renamed, is a visible change.
+        for label in ["Phone", "Old phone"] {
+            rows[0].imported_from = Some(app::HistoryImportSource {
+                device_slot_id_hex: "77".repeat(32),
+                device_label: label.into(),
+            });
+            assert_eq!(
+                wire(cache.row(&rows[0], false)),
+                wire(presented_timeline(&rows[0], false))
+            );
+        }
+        assert_eq!(cache.conversions, size + 5);
         cache.close();
         assert!(cache.rows.is_empty());
     }

@@ -15,43 +15,117 @@
 //! published, whoever commits it. An admin gets the same answer, and so does
 //! every committer in a group that does not require the component.
 //!
-//! Each added device gets its Welcome the way an Invite's devices do: one
-//! delivery per KeyPackage, naming it ([`Engine::wrap_staged_welcomes`]).
+//! A same-account Add adds siblings, each with a private KeyPackage it handed
+//! this device (device-group.md, "Sibling Welcomes"). Each added sibling gets
+//! a sibling Welcome, staged with the Commit as an Invite's Welcome is and
+//! owed once it confirms, but never a transport message: the host sends it as
+//! a kind-461 message in the device group. A published KeyPackage of this
+//! account never adds a sibling (mdk#2628 D14).
 //! Like a self-update, neither intent keeps an `OwnCommitIntent`: when branch
 //! selection supersedes one, nothing re-issues it (mdk#1734).
 
 use crate::commit_class::CommitClass;
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
+use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::engine::{KeyPackage, SendResult};
+use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
+use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::EngineError;
-use cgka_traits::storage::StorageProvider;
-use cgka_traits::transport::EncryptedPayload;
-use cgka_traits::types::{EpochId, GroupId};
+use cgka_traits::message::{MessageState, StoredMessagePayload};
+use cgka_traits::storage::{StorageError, StorageProvider};
+use cgka_traits::transport::{EncryptedPayload, Timestamp};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::prelude::LeafNodeIndex;
 use openmls_traits::OpenMlsProvider as _;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
 
 const ADD: &str = "AddOwnAccountDevices";
 const REMOVE: &str = "RemoveOwnAccountDevices";
 
+/// What every sibling Welcome of one Add carries besides its own fields,
+/// settled before anything is staged.
+struct SiblingWelcomePlan {
+    from: DeviceSlotId,
+    relays: Vec<String>,
+}
+
+/// A sibling Welcome built for one added KeyPackage, not yet recorded.
+pub(crate) struct BuiltSiblingWelcome {
+    pub(crate) id: MessageId,
+    pub(crate) content: Vec<u8>,
+    pub(crate) key_package_ref: Vec<u8>,
+    pub(crate) deliver_until: Timestamp,
+}
+
+/// A sibling Welcome this device owes: its Commit confirmed, no kind-461
+/// message carrying it was published yet, and its KeyPackage's lifetime has
+/// not ended ([`Engine::owed_sibling_welcomes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwedSiblingWelcome {
+    /// The Welcome's row id, which each transition names.
+    pub id: MessageId,
+    /// The chat the Welcome joins.
+    pub group_id: GroupId,
+    /// The encoded sibling Welcome: a 461's content once base64-encoded.
+    pub content: Vec<u8>,
+    /// The app event id of the 461 sent to carry it, while that send is not
+    /// resolved.
+    pub carrier: Option<Vec<u8>>,
+}
+
+/// The row id of the sibling Welcome for the KeyPackage `key_package_ref`
+/// that the Commit `commit_id` adds. A KeyPackage added again after its
+/// Commit rolled back gets a row per attempt.
+fn sibling_welcome_row_id(commit_id: &MessageId, key_package_ref: &[u8]) -> MessageId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot sibling welcome row v1");
+    hasher.update((commit_id.as_slice().len() as u64).to_be_bytes());
+    hasher.update(commit_id.as_slice());
+    hasher.update(key_package_ref);
+    MessageId::new(hasher.finalize().to_vec())
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_add_own_account_devices(
         &mut self,
         group_id: GroupId,
-        key_packages: Vec<KeyPackage>,
+        siblings: Vec<SiblingKeyPackage>,
     ) -> Result<SendResult, EngineError> {
-        if key_packages.is_empty() {
+        if siblings.is_empty() {
             return Err(EngineError::Other(
                 "adding own account devices requires at least one KeyPackage".into(),
             ));
         }
-        self.do_send_own_account_devices(group_id, key_packages, Vec::new(), ADD)
+        self.do_send_own_account_devices(group_id, siblings, Vec::new(), ADD)
             .await
+    }
+
+    /// Refuse now a same-account Add whose siblings a direct send would
+    /// refuse now. Run before it is queued, so the sender is answered at
+    /// once with nothing written; the drain checks a queued one again when
+    /// it prepares it, and refuses it there as `QueuedIntentRefused`.
+    pub(crate) fn check_queued_sibling_add(&self, intent: &SendIntent) -> Result<(), EngineError> {
+        let SendIntent::AddOwnAccountDevices { group_id, siblings } = intent else {
+            return Ok(());
+        };
+        if siblings.is_empty() {
+            return Err(EngineError::Other(
+                "adding own account devices requires at least one KeyPackage".into(),
+            ));
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_group = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        self.sibling_welcome_plan(&mls_group, siblings).map(|_| ())
     }
 
     pub(crate) async fn do_send_remove_own_account_devices(
@@ -76,7 +150,7 @@ impl<S: StorageProvider> Engine<S> {
     async fn do_send_own_account_devices(
         &mut self,
         group_id: GroupId,
-        key_packages: Vec<KeyPackage>,
+        siblings: Vec<SiblingKeyPackage>,
         leaf_signature_keys: Vec<Vec<u8>>,
         intent: &'static str,
     ) -> Result<SendResult, EngineError> {
@@ -108,6 +182,10 @@ impl<S: StorageProvider> Engine<S> {
         }
         let account = crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let existing = self.storage.get_group(&group_id)?;
+        let key_packages: Vec<KeyPackage> = siblings
+            .iter()
+            .map(|sibling| sibling.key_package.clone())
+            .collect();
         let parsed_kps =
             self.own_account_key_packages(&mls_group, &existing, &key_packages, &account)?;
         let removed_leaves = own_account_leaves(&mls_group, &leaf_signature_keys, &account)?;
@@ -178,17 +256,23 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             &parsed_kps,
         )?;
+        let sibling_plan = if siblings.is_empty() {
+            None
+        } else {
+            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
+        };
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        let welcome_bytes = match welcome_out {
-            Some(welcome) if !parsed_kps.is_empty() => Some(
+        let welcome_bytes = match (welcome_out, &sibling_plan) {
+            (Some(welcome), Some(plan)) => Some((
                 welcome
                     .tls_serialize_detached()
                     .map_err(|e| EngineError::Serialize(format!("{e:?}")))?,
-            ),
-            None if parsed_kps.is_empty() => None,
+                plan,
+            )),
+            (None, None) => None,
             _ => {
                 return Err(EngineError::Backend(
                     "own account devices Welcome does not match its Adds".into(),
@@ -208,10 +292,9 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let commit_msg =
             crate::message_processor::route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        let welcomes = match welcome_bytes {
-            Some(welcome_bytes) => {
-                self.wrap_staged_welcomes(&mls_group, &welcome_bytes, &key_packages, &parsed_kps)
-                    .await?
+        let sibling_welcomes = match welcome_bytes {
+            Some((welcome, plan)) => {
+                build_sibling_welcomes(plan, &siblings, &parsed_kps, &welcome, &commit_msg.id)?
             }
             None => Vec::new(),
         };
@@ -237,13 +320,14 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             pre_commit_epoch,
         )?;
-        let welcomes = self.record_staged_welcomes(
-            welcomes,
-            &group_id,
-            &commit_msg.id,
-            pre_commit_epoch,
-            None,
-        )?;
+        for sibling_welcome in sibling_welcomes {
+            self.record_staged_sibling_welcome(
+                sibling_welcome,
+                &commit_msg.id,
+                &group_id,
+                pre_commit_epoch,
+            )?;
+        }
         self.storage.put_group(&group_record)?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
@@ -276,9 +360,200 @@ impl<S: StorageProvider> Engine<S> {
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
-            welcomes,
+            welcomes: Vec::new(),
             pending: pending_ref,
         })
+    }
+
+    /// Check the siblings a same-account Add names, as device-group.md
+    /// ("Sibling Welcomes") needs them, and settle what their sibling
+    /// Welcomes carry. This device must be tagged in the device group it
+    /// trusts. Each KeyPackage names no publication (D14) and passes the check
+    /// a hand-off from its named slot passes: this account's, single-use,
+    /// unexpired, its device tag reading as that slot in that roster, another
+    /// roster device, one KeyPackage each. The chat names one to 16 relays for
+    /// the new member to fetch from.
+    fn sibling_welcome_plan(
+        &self,
+        mls_group: &MlsGroup,
+        siblings: &[SiblingKeyPackage],
+    ) -> Result<SiblingWelcomePlan, EngineError> {
+        let refused = |reason: &str| EngineError::Other(format!("adding a sibling: {reason}"));
+        let own = self
+            .own_device_tag(&self.storage)?
+            .ok_or_else(|| refused("this device is not tagged in a trusted device group"))?;
+        let mut slots = HashSet::new();
+        for sibling in siblings {
+            if sibling.key_package.source.is_some() {
+                return Err(refused("a published KeyPackage never adds a sibling"));
+            }
+            if sibling.slot == own.slot() {
+                return Err(refused("the named slot is this device's"));
+            }
+            if !slots.insert(sibling.slot) {
+                return Err(refused("two KeyPackages name the same sibling"));
+            }
+            crate::private_key_packages::validate_received_private_key_package(
+                &sibling.key_package,
+                self.identity.self_id(),
+                own.roster(),
+                &sibling.slot,
+                self.wall_clock.now().0,
+            )
+            .map_err(|error| refused(&error.to_string()))?;
+        }
+        let relays: Vec<String> = crate::group_lifecycle::welcome_relays_for_group(mls_group)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|relay| relay.0)
+            .collect();
+        if !valid_sibling_welcome_relays(&relays) {
+            return Err(refused(
+                "the chat must name one to 16 relays, none repeated once parsed",
+            ));
+        }
+        Ok(SiblingWelcomePlan {
+            from: own.slot(),
+            relays,
+        })
+    }
+
+    /// Every sibling Welcome this device owes at `now`, in its live groups
+    /// (device-group.md, "Sending a sibling Welcome"). The host sends each as
+    /// a kind-461 message in the device group. One with a `carrier` already
+    /// has a 461 on its way, and gets another only once that one failed. A
+    /// disbanded chat owes none: its sibling would join a group every other
+    /// member has left.
+    pub fn owed_sibling_welcomes(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<OwedSiblingWelcome>, EngineError> {
+        let mut owed = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err()
+                || self
+                    .stored_group_record(&group_id)?
+                    .is_none_or(|group| group.disbanded.is_some())
+            {
+                continue;
+            }
+            for record in self.storage.list_messages_in_states(
+                &group_id,
+                &[MessageState::Sent],
+                EpochId(0),
+            )? {
+                let Ok(StoredMessagePayload::OutboundSiblingWelcome {
+                    welcome,
+                    deliver_until,
+                    carrier,
+                    ..
+                }) = StoredMessagePayload::decode(&record.payload)
+                else {
+                    continue;
+                };
+                if now < deliver_until {
+                    owed.push(OwedSiblingWelcome {
+                        id: record.id,
+                        group_id: group_id.clone(),
+                        content: welcome,
+                        carrier,
+                    });
+                }
+            }
+        }
+        Ok(owed)
+    }
+
+    /// Record `carrier`, the app event id of the 461 about to carry the owed
+    /// sibling Welcome `id`, before that 461 is sent. `false`, recording
+    /// nothing, when the Welcome is not owed or already has a carrier.
+    pub fn carry_sibling_welcome(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> Result<bool, EngineError> {
+        self.update_owed_sibling_welcome(id, |current, _| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(carrier.to_vec());
+            true
+        })
+    }
+
+    /// Mark the sibling Welcome `id` delivered once the 461 `carrier` was
+    /// published, so no 461 carries it again: when to resend one is not
+    /// specified yet. `false` when `carrier` does not carry it, or it is no
+    /// longer owed.
+    pub fn sibling_welcome_delivered(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> Result<bool, EngineError> {
+        self.update_owed_sibling_welcome(id, |current, state| {
+            let carried = current.as_deref() == Some(carrier);
+            if carried {
+                *state = MessageState::Processed;
+            }
+            carried
+        })
+    }
+
+    /// Clear `carrier` from the sibling Welcome `id` once that 461 failed and
+    /// reached no one, so the Welcome is owed again. `false` when `carrier`
+    /// does not carry it, or it is no longer owed.
+    pub fn sibling_welcome_send_failed(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> Result<bool, EngineError> {
+        self.update_owed_sibling_welcome(id, |current, _| {
+            let carried = current.as_deref() == Some(carrier);
+            if carried {
+                *current = None;
+            }
+            carried
+        })
+    }
+
+    /// Apply `update` to the carrier and state of the owed sibling Welcome
+    /// `id`, writing them back when it returns `true`. Like withdrawal, it
+    /// reads only the Welcome's own row.
+    fn update_owed_sibling_welcome(
+        &self,
+        id: &MessageId,
+        update: impl FnOnce(&mut Option<Vec<u8>>, &mut MessageState) -> bool,
+    ) -> Result<bool, EngineError> {
+        let mut record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(EngineError::Storage(error)),
+        };
+        if record.state != MessageState::Sent {
+            return Ok(false);
+        }
+        let Ok(StoredMessagePayload::OutboundSiblingWelcome {
+            welcome,
+            key_package_ref,
+            deliver_until,
+            mut carrier,
+        }) = StoredMessagePayload::decode(&record.payload)
+        else {
+            return Ok(false);
+        };
+        if !update(&mut carrier, &mut record.state) {
+            return Ok(false);
+        }
+        record.payload = StoredMessagePayload::outbound_sibling_welcome(
+            welcome,
+            key_package_ref,
+            deliver_until,
+            carrier,
+        )
+        .encode()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        self.storage.put_message(&record)?;
+        Ok(true)
     }
 
     /// Parse `key_packages` for a same-account Add: each belongs to
@@ -326,6 +601,42 @@ impl<S: StorageProvider> Engine<S> {
         }
         Ok(parsed_kps)
     }
+}
+
+/// One sibling Welcome per added KeyPackage, each naming its own KeyPackage
+/// and carrying the staged Commit's Welcome (device-group.md, "Sending a
+/// sibling Welcome"). It is deliverable until the KeyPackage's lifetime ends,
+/// after which the sibling no longer holds its key.
+fn build_sibling_welcomes(
+    plan: &SiblingWelcomePlan,
+    siblings: &[SiblingKeyPackage],
+    parsed_kps: &[openmls::prelude::KeyPackage],
+    welcome: &[u8],
+    commit_id: &MessageId,
+) -> Result<Vec<BuiltSiblingWelcome>, EngineError> {
+    siblings
+        .iter()
+        .zip(parsed_kps)
+        .map(|(sibling, parsed)| {
+            let key_package_ref = crate::key_package::key_package_ref(parsed)?
+                .as_slice()
+                .to_vec();
+            let content = SiblingWelcome {
+                from: plan.from,
+                to: sibling.slot,
+                key_package_ref: key_package_ref.clone(),
+                welcome: welcome.to_vec(),
+                relays: plan.relays.clone(),
+            }
+            .encode()?;
+            Ok(BuiltSiblingWelcome {
+                id: sibling_welcome_row_id(commit_id, &key_package_ref),
+                content,
+                key_package_ref,
+                deliver_until: Timestamp(parsed.life_time().not_after()),
+            })
+        })
+        .collect()
 }
 
 /// The leaves a same-account Remove targets: each signature key names a

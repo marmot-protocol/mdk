@@ -366,52 +366,6 @@ async fn an_invite_whose_welcome_cannot_be_wrapped_writes_nothing() {
     .await;
 }
 
-/// A same-account Add refuses an unwrappable Welcome before anything is
-/// written, as an invite does. Bob adds his laptop with a private KeyPackage,
-/// which names no publication, so his peeler cannot wrap its Welcome. His
-/// chat keeps every row and its record, no commit is left pending, and his
-/// next send goes through.
-#[tokio::test]
-async fn a_same_account_add_whose_welcome_cannot_be_wrapped_writes_nothing() {
-    let mut alice = device(b"alice", true);
-    let mut bob = device_with_peeler(b"bob", true, Box::<PublishedWelcomesOnly>::default());
-    let mut laptop = device(b"bob", true);
-    laptop
-        .engine
-        .issue_private_key_packages(&SLOT, 1, None, NOW)
-        .unwrap();
-    let private = private_key_packages(&laptop).remove(0);
-    let bob_kp = bob.engine.fresh_key_package().await.unwrap();
-    let gid = found_group(&mut alice, vec![bob_kp], true, &mut [&mut bob]).await;
-    let rows = bob
-        .storage
-        .list_messages(&gid, cgka_traits::types::EpochId(0))
-        .unwrap();
-    let record = bob.engine.group_record(&gid).unwrap();
-
-    let refused = bob.engine.send(add_own_devices(&gid, vec![private])).await;
-    assert!(
-        matches!(refused, Err(EngineError::Peeler(_))),
-        "{refused:?}"
-    );
-    assert_eq!(
-        bob.storage
-            .list_messages(&gid, cgka_traits::types::EpochId(0))
-            .unwrap(),
-        rows
-    );
-    assert_eq!(bob.engine.group_record(&gid).unwrap(), record);
-    assert!(load_group(&bob, &gid).pending_commit().is_none());
-    send_commit(
-        &mut bob,
-        SendIntent::SelfUpdate {
-            group_id: gid.clone(),
-        },
-        &gid,
-    )
-    .await;
-}
-
 fn sibling_welcome(
     welcome: &TransportMessage,
     from: [u8; 32],
@@ -555,7 +509,7 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
     assert!(laptop.engine.epoch(&other).is_ok());
 }
 
-/// The phone removes the laptop from `gid` and adds it back with
+/// The phone removes the laptop from `gid` and invites it back with
 /// `key_package`: the removal commit and the laptop's new Welcome.
 async fn remove_and_add_back(
     phone: &mut Device,
@@ -576,9 +530,10 @@ async fn remove_and_add_back(
         welcomes, pending, ..
     } = phone
         .engine
-        .send(SendIntent::AddOwnAccountDevices {
+        .send(SendIntent::Invite {
             group_id: gid.clone(),
             key_packages: vec![key_package],
+            initial_admins: vec![],
         })
         .await
         .unwrap()

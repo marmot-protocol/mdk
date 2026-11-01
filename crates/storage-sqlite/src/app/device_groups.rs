@@ -395,26 +395,45 @@ mod tests {
         assert_eq!(store.device_groups().unwrap(), vec![held]);
     }
 
+    fn refusal<T: std::fmt::Debug>(result: StorageResult<T>) -> String {
+        match result {
+            Err(StorageError::Backend(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     /// Only `trust_device_group` makes a row trusted, so the compromise
     /// warning's first roster is always written with it; it moves into
     /// nothing else.
     #[test]
     fn a_group_becomes_trusted_only_through_the_trust_write() {
+        const ONLY_THE_TRUST_WRITE: &str =
+            "a device group becomes trusted only through trust_device_group";
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        assert!(store.insert_device_group(&record("aa", Created)).is_err());
-        assert!(store.insert_device_group(&record("aa", Linked)).is_err());
-        assert!(store.insert_device_group(&record("aa", Creating)).unwrap());
-        assert!(
-            store
-                .set_device_group_trust("aa", Creating, Created, None, 2)
-                .is_err()
+        assert_eq!(
+            refusal(store.insert_device_group(&record("aa", Created))),
+            ONLY_THE_TRUST_WRITE
         );
-        assert!(
-            store
-                .trust_device_group("aa", Creating, Untrusted, None, 2, &NO_ROSTER)
-                .is_err()
+        assert_eq!(
+            refusal(store.insert_device_group(&record("aa", Linked))),
+            ONLY_THE_TRUST_WRITE
+        );
+        assert!(store.insert_device_group(&record("aa", Creating)).unwrap());
+        assert_eq!(
+            refusal(store.set_device_group_trust("aa", Creating, Created, None, 2)),
+            ONLY_THE_TRUST_WRITE
         );
         assert_eq!(store.device_group("aa").unwrap().unwrap().trust, Creating);
+        // An untrusted row with no KeyPackageRef, so only this guard refuses.
+        assert!(store.insert_device_group(&record("bb", Untrusted)).unwrap());
+        assert_eq!(
+            refusal(store.trust_device_group("bb", Untrusted, Untrusted, None, 2, &NO_ROSTER)),
+            "trust_device_group moves only into a trusted state"
+        );
+        assert_eq!(
+            store.device_group("bb").unwrap().unwrap(),
+            record("bb", Untrusted)
+        );
         // The way back is a plain move.
         assert_eq!(
             store
@@ -457,10 +476,14 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let mut missing = record("aa", Creating);
         missing.key_package_ref_hex = None;
-        assert!(store.insert_device_group(&missing).is_err());
         let mut named = record("aa", Untrusted);
         named.key_package_ref_hex = Some("ab".into());
-        assert!(store.insert_device_group(&named).is_err());
+        for refused in [missing, named] {
+            assert_eq!(
+                refusal(store.insert_device_group(&refused)),
+                "only an untrusted device group has no confirmed KeyPackageRef"
+            );
+        }
         assert!(store.device_groups().unwrap().is_empty());
     }
 }

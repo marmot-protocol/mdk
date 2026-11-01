@@ -110,7 +110,8 @@ pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
 pub use app::device_removals::DeviceRemovalRecord;
 pub use app::history_deliveries::{
-    HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryDelivery,
+    HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryChat,
+    ParkedHistoryDelivery,
 };
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
@@ -145,12 +146,12 @@ pub use app::timeline::{
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
     ConversationWindowQuery, DeletionSource, HistoryExportEvent, HistoryExportRow,
-    ImportedAppEvent, ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
-    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    HistoryImportSource, ImportedAppEvent, ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON,
+    LatestHistoryImport, MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent,
+    TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion, TimelineMessageChange,
+    TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget, TimelinePage,
+    TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
+    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,

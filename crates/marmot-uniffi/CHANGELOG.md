@@ -15,6 +15,16 @@
   sign-out that has asked its siblings always finishes. Regenerate bindings
   with the matching native library.
 
+- `TimelineMessageRecordFfi` adds `imported_from: Option<HistoryImportSourceFfi>`,
+  the device an imported row came from, and `MarmotEventFfi` adds
+  `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628
+  item 4.2d). New `chat_history_imports(account_ref)` lists each held chat's
+  history from another device as `ChatHistoryImportFfi`: `Receiving`, with
+  `retrying` once an attempt to get its bundle failed, or `Imported` with
+  its source and time. An
+  empty `device_label` means "another device". Only behind
+  `dev_device_groups`. Exhaustive matches add the new arm.
+
 - `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
   `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
   found in its own slot that it did not make, which only this device warns

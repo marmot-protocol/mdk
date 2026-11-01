@@ -466,6 +466,7 @@ fn presented_timeline_with_tokens(
         deletion_source: row.deletion_source.into(),
         deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
         invalidation_status: row.invalidation_status.clone(),
+        imported_from: row.imported_from.clone().map(Into::into),
     }
 }
 impl From<app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
@@ -615,6 +616,7 @@ impl ConversationConversionCache {
             deletion_source: row.deletion_source,
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
+            imported_from: row.imported_from.clone(),
         };
         let tokens = match cached.filter(|cached| {
             cached.source.kind == row.kind && cached.source.plaintext == row.plaintext
@@ -678,6 +680,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         deleted_by_message_id_hex,
         deletion_source,
         invalidation_status,
+        imported_from,
     } = row;
     (
         (
@@ -711,6 +714,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             presented_custom_tags(row),
             if trusted { group_system.as_ref() } else { None },
             poll,
+            imported_from,
         ),
     )
 }
@@ -859,6 +863,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            imported_from: None,
         };
 
         record

@@ -4,6 +4,20 @@
 
 ### Breaking changes
 
+- Imported timeline rows name their source device (mdk#2628 item 4.2d).
+  `TimelineMessageRecord` adds `imported_from: Option<HistoryImportSource>`,
+  read from `app_event_imports`, with the device's name from
+  `set_device_labels`, which marmot-app gives from the roster. The names live
+  in a TEMP table each account connection creates at open, so nothing is
+  stored and every open starts with none; no migration. `latest_history_imports`
+  reads each chat's latest import (of two sources importing in the same
+  second, the greater slot) and `parked_history_chats` each chat parked
+  deliveries name, with whether a fetch failed. `watch_history_imports` starts
+  a per-connection TEMP count of every change those reads see, imports,
+  cascade deletes, parked deliveries and device names alike, and
+  `history_imports_generation` reads it; `set_device_labels` writes only when
+  the names differ.
+
 - Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
   It adds `backup_recovery_key`, at most one row: the public half of the
   recovery key that words confirmed while this device trusts no device group
@@ -429,6 +443,12 @@
 - A queued proposal or proposal-queue ref list that fails to decode in the
   MessagePack value encoding clears the group's proposal queue, as a
   corrupt JSON row already did, instead of failing group load.
+- A transaction SQLite rolled back by itself (a full disk, an I/O error or
+  out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`, a failed
+  `COMMIT`) no longer marks the account's connection unusable until the
+  account reopens. The caller gets the failure's own error, so a full disk
+  reaches it as `StorageError::Capacity`, and the rest of that transaction,
+  inside or after a savepoint, fails instead of committing write by write.
 
 ## 0.14.0 - 2026-10-23
 

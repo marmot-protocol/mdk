@@ -20,6 +20,7 @@ use super::device_roster::{
     entry, found_device_group, phone_and_laptop, roster, roster_device, roster_device_on,
     roster_of, roster_update, slot,
 };
+use super::tagged_siblings::{found_routed_group, handed};
 use super::*;
 use cgka_engine::device_tag::{DeviceTagClaim, device_tag_claim, seal_device_tag};
 use cgka_traits::app_components::{
@@ -640,9 +641,15 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
     let (mut phone, mut laptop, device_gid) = phone_and_laptop().await;
     let mut bob = roster_device(b"bob");
     let mut groups = Vec::new();
-    for _ in 0..6 {
-        let bob_kp = bob.engine.fresh_key_package().await.unwrap();
-        groups.push(found_group(&mut laptop, vec![bob_kp], true, &mut [&mut bob]).await);
+    for index in 0..6 {
+        // The same-account Add's chat names a relay for its sibling Welcome.
+        let gid = if index == 3 {
+            found_routed_group(&mut laptop, &mut [&mut bob]).await
+        } else {
+            let bob_kp = bob.engine.fresh_key_package().await.unwrap();
+            found_group(&mut laptop, vec![bob_kp], true, &mut [&mut bob]).await
+        };
+        groups.push(gid);
     }
     hold_slot(&laptop, slot(2));
     laptop
@@ -650,10 +657,17 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
         .set_device_tag_group(Some(device_gid.clone()))
         .unwrap();
     set_own_key(&mut laptop, slot(2), &device_gid, &mut [&mut phone]).await;
+    // The phone, tagged too, hands the laptop the KeyPackage it adds.
+    hold_slot(&phone, slot(1));
+    phone
+        .engine
+        .set_device_tag_group(Some(device_gid.clone()))
+        .unwrap();
+    set_own_key(&mut phone, slot(1), &device_gid, &mut [&mut laptop]).await;
     let tagged = roster_of(&laptop, &device_gid);
     let mut carol = roster_device(b"carol");
     let carol_kp = carol.engine.fresh_key_package().await.unwrap();
-    let phone_kp = phone.engine.fresh_key_package().await.unwrap();
+    let phone_kp = handed(&mut phone, slot(1), slot(2));
 
     let intents = [
         SendIntent::SelfUpdate {

@@ -253,16 +253,31 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
     Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
     held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
-    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite or a
-    same-account Add with a private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite with a
+    private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
     `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its
     proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
-    and sibling accepts, an added device joins through its Welcome and a removed one sees its removal; restart treats
-    them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets, never a
-    self-update or a Leave, and only while the group requires 0x800d.
+    and sibling accepts, an added sibling joins through its sibling Welcome and a removed one sees its removal; restart
+    treats them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets,
+    never a self-update or a Leave, and only while the group requires 0x800d. A successful Add needs the device roster,
+    so those tests run in test-policy builds only.
+
+- **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
+  - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
+    failed by a rollback or a restart before it; one carrier at a time, and only that carrier delivers or fails it; owed
+    no more once its KeyPackage expires or its chat is disbanded; every refusal (a published KeyPackage, this device's
+    own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged adder, a chat
+    that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
+    refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
+    by then.
+
+- **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
+  - **Owns:** No tests. Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how
+    the gated same-account tests in `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a
+    sibling: tagged devices, a chat that names relays, and a join through the sibling Welcome the Add owes.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
