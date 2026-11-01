@@ -9,6 +9,10 @@
 //! app event's `created_at`, the moment it was sent) took the drained sends
 //! first, and its ratchet for carol then ran more than 100 generations past
 //! the earliest sends that went ahead, which it could no longer decrypt.
+//!
+//! The same order holds for every other intent kind that queues behind a
+//! waiting row: a leave, an invite and a removal go out after a queued
+//! message, and a message after a queued group change.
 
 use super::*;
 
@@ -330,4 +334,292 @@ async fn a_queued_change_already_made_holds_no_later_send() {
         matches!(later, SendResult::ApplicationMessage { .. }),
         "{later:?}"
     );
+}
+
+/// What the host publishes for a group, in the order it publishes it.
+#[derive(Default)]
+struct Published {
+    messages: Vec<TransportMessage>,
+    kinds: Vec<&'static str>,
+    welcomes: Vec<TransportMessage>,
+}
+
+impl Published {
+    /// Publish one send result as the host does: a group change is
+    /// confirmed, and a drained message's queued intent with it.
+    async fn take(
+        &mut self,
+        engine: &mut Engine<SqliteAccountStorage>,
+        group_id: &GroupId,
+        result: SendResult,
+    ) {
+        let (msg, kind) = match result {
+            SendResult::ApplicationMessage { msg, .. } => (msg, "message"),
+            SendResult::Proposal { msg } => (msg, "proposal"),
+            SendResult::GroupEvolution {
+                msg,
+                welcomes,
+                pending,
+            } => {
+                engine.confirm_published(pending).await.unwrap();
+                self.welcomes.extend(welcomes);
+                (msg, "commit")
+            }
+            SendResult::Queued { .. } => return,
+            other => panic!("unexpected send result: {other:?}"),
+        };
+        if let Some((_, intent_id)) = engine.regenerated_queued_intent_for_message(&msg.id) {
+            engine.confirm_queued_outbound_intent(&intent_id).unwrap();
+        }
+        self.messages.push(route(msg, group_id));
+        self.kinds.push(kind);
+    }
+
+    /// The scheduled drain, run until the group's queue is empty.
+    async fn drain(&mut self, engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
+        for _ in 0..8 {
+            if !engine.has_queued_outbound_intents(group_id).unwrap() {
+                return;
+            }
+            for result in engine.advance_convergence(group_id).await.unwrap() {
+                self.take(engine, group_id, result).await;
+            }
+        }
+        panic!("the drain never emptied the queue");
+    }
+}
+
+/// What `receiver` makes of `messages`, read in order: each message it
+/// decrypts as `content@epoch`, each epoch it moves to as `-> epoch`. A
+/// Commit it buffers is settled at once. A message it cannot read adds
+/// nothing, so an outcome is not asserted.
+async fn read(
+    receiver: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+) -> Vec<String> {
+    receiver.drain_events();
+    let mut seen = Vec::new();
+    for msg in messages {
+        let epoch = receiver.epoch(group_id).ok();
+        if let Ok(IngestOutcome::Buffered { .. }) = receiver.ingest(msg.clone()).await {
+            let _ = receiver.converge_stored_openmls_messages_at(group_id, 1_000_000);
+        }
+        for event in receiver.drain_events() {
+            if let GroupEvent::MessageReceived { payload, epoch, .. } = event {
+                seen.push(format!(
+                    "{}@{}",
+                    String::from_utf8(app_content(&payload)).unwrap(),
+                    epoch.0
+                ));
+            }
+        }
+        let now = receiver.epoch(group_id).ok();
+        if let Some(to) = now.filter(|_| now != epoch) {
+            seen.push(format!("-> {}", to.0));
+        }
+    }
+    seen
+}
+
+/// Alice, carol (an admin) and bob, at the group's first epoch.
+async fn three_member_group(
+    alice: &mut Engine<SqliteAccountStorage>,
+    carol: &mut Engine<SqliteAccountStorage>,
+    bob: &mut Engine<SqliteAccountStorage>,
+) -> GroupId {
+    let members = vec![
+        carol.fresh_key_package().await.unwrap(),
+        bob.fresh_key_package().await.unwrap(),
+    ];
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "three".into(),
+            description: "".into(),
+            members,
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = create else {
+        panic!("expected GroupCreated, got {create:?}");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    group_id
+}
+
+async fn queue_message(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    content: &str,
+) {
+    let queued = engine
+        .queue_app_message(group_id.clone(), app_payload_for(engine, content))
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
+}
+
+/// A leave made while a message waits in the queue goes out after it: the
+/// message the member sent before leaving still reaches the group.
+#[tokio::test]
+async fn a_leave_behind_a_queued_message_goes_out_after_it() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let group_id = three_member_group(&mut alice, &mut carol, &mut bob).await;
+    let epoch = bob.epoch(&group_id).unwrap().0;
+    queue_message(&mut bob, &group_id, "sent before leaving").await;
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let leave_queued = matches!(leave, SendResult::Queued { .. });
+    let mut published = Published::default();
+    published.take(&mut bob, &group_id, leave).await;
+    published.drain(&mut bob, &group_id).await;
+
+    assert_eq!(
+        read(&mut alice, &group_id, &published.messages).await,
+        vec![format!("sent before leaving@{epoch}")],
+        "alice reads the message bob sent before leaving"
+    );
+    assert_eq!(published.kinds, vec!["message", "proposal"]);
+    assert!(leave_queued, "the leave waits behind the queued message");
+}
+
+/// An invite made while a message waits in the queue is committed after it,
+/// so the invitee never reads a message sent before it was invited.
+#[tokio::test]
+async fn an_invite_behind_a_queued_message_never_shows_it_to_the_invitee() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let (mut dave, _dave_storage) = build_client(b"dave");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "invite").await;
+    let epoch = alice.epoch(&group_id).unwrap().0;
+    queue_message(&mut alice, &group_id, "sent before the invite").await;
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![dave.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let invite_queued = matches!(invite, SendResult::Queued { .. });
+    let mut published = Published::default();
+    published.take(&mut alice, &group_id, invite).await;
+    published.drain(&mut alice, &group_id).await;
+
+    dave.join_welcome(welcome_for(&published.welcomes, b"dave"))
+        .await
+        .unwrap();
+    assert!(
+        read(&mut dave, &group_id, &published.messages)
+            .await
+            .iter()
+            .all(|seen| !seen.starts_with("sent before the invite")),
+        "dave never reads a message sent before his invite"
+    );
+    assert_eq!(
+        read(&mut carol, &group_id, &published.messages).await,
+        vec![
+            format!("sent before the invite@{epoch}"),
+            format!("-> {}", epoch + 1)
+        ]
+    );
+    assert_eq!(published.kinds, vec!["message", "commit"]);
+    assert!(invite_queued, "the invite waits behind the queued message");
+}
+
+/// A removal made while a message waits in the queue is committed after it,
+/// so the removed member still reads the message sent while it was a member.
+#[tokio::test]
+async fn a_removal_behind_a_queued_message_lets_the_removed_member_read_it() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let group_id = three_member_group(&mut alice, &mut carol, &mut bob).await;
+    let epoch = alice.epoch(&group_id).unwrap().0;
+    queue_message(&mut alice, &group_id, "sent before the removal").await;
+
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let remove_queued = matches!(remove, SendResult::Queued { .. });
+    let mut published = Published::default();
+    published.take(&mut alice, &group_id, remove).await;
+    published.drain(&mut alice, &group_id).await;
+
+    let bob_seen = read(&mut bob, &group_id, &published.messages).await;
+    assert_eq!(
+        bob_seen.first(),
+        Some(&format!("sent before the removal@{epoch}")),
+        "bob reads the message sent while he was a member: {bob_seen:?}"
+    );
+    assert_eq!(published.kinds, vec!["message", "commit"]);
+    assert!(remove_queued, "the removal waits behind the queued message");
+}
+
+/// A message made while a group change waits in the queue is encrypted after
+/// the change, so every member applies the change first.
+#[tokio::test]
+async fn a_message_behind_a_queued_group_change_applies_after_it() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "change").await;
+    let epoch = alice.epoch(&group_id).unwrap().0;
+    // Queued as a send made while the group settled would be.
+    queue_intent(
+        &alice_storage,
+        &group_id,
+        b"queued-rename",
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        },
+        0,
+    );
+
+    let message = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "sent after the rename"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let message_queued = matches!(message, SendResult::Queued { .. });
+    let mut published = Published::default();
+    published.take(&mut alice, &group_id, message).await;
+    published.drain(&mut alice, &group_id).await;
+
+    assert_eq!(
+        read(&mut carol, &group_id, &published.messages).await,
+        vec![
+            format!("-> {}", epoch + 1),
+            format!("sent after the rename@{}", epoch + 1)
+        ],
+        "carol applies the rename before the message sent after it"
+    );
+    assert_eq!(published.kinds, vec!["commit", "message"]);
+    assert!(message_queued, "the message waits behind the queued change");
 }
