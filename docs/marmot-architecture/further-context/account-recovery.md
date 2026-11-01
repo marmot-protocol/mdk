@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-30
+updated: 2026-11-01
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -1051,10 +1051,13 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   survive notification-worker cancellation; owner cancellation retains credit through IO
   cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
   gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
-  discards what its source held without new loss, including copies the live REQ delivered
-  before the capture: the source stays unadmitted, the pending obligation still owes that
-  window, and a new loss would wipe that obligation's scope certificates so it could never
-  finish. That loss is deferred on the source, not dropped: a finished capture clears it,
+  discards what its source held in each MLS-group unit it left unfinished without new loss,
+  including copies the live REQ delivered before the capture: the source stays unadmitted,
+  the pending obligation still owes that window, and a new loss would wipe that
+  obligation's scope certificates so it could never finish. A unit whose every route the
+  source finished is proven, so it keeps its bodies, through a later terminal refusal too,
+  and releases them in order once its peers stop holding the group, ahead of later live
+  input (#2835). That loss is deferred on the source, not dropped: a finished capture clears it,
   and a reconnect, refusal, removal or execution failure records it, since the source can
   then be admitted or retired without the capture. A parked obligation, or one whose notice
   the user dismissed, schedules no capture, so the debt stays deferred until one of those
