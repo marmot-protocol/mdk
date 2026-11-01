@@ -138,6 +138,63 @@ struct MarmotRelayPlaneInner {
     account_publish_clients: std::sync::Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>,
 }
 
+/// The router and notification forwarders own clones of `transport` and each waits on a channel only `transport`
+/// can close, so they would keep the transport, its SDK clients and their preallocated caches alive for the life
+/// of the process after the last plane handle is gone. A plane dropped without [`MarmotRelayPlane::shutdown`]
+/// (every short-lived `MarmotApp`, such as one per `wnd` Execute request) leaked several MB that way.
+impl Drop for MarmotRelayPlaneInner {
+    fn drop(&mut self) {
+        let transport = &self.transport;
+        transport.shutting_down.store(true, Ordering::SeqCst);
+        fn abort(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
+            match slot.try_lock() {
+                Ok(mut slot) => {
+                    if let Some(handle) = slot.take() {
+                        handle.abort();
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        let released = abort(&transport.router)
+            & abort(&transport.notification_forwarder)
+            & abort(&transport.directory_notification_forwarder)
+            & match transport.account_notification_forwarders.try_lock() {
+                Ok(mut forwarders) => {
+                    for (_, handle) in forwarders.drain() {
+                        handle.abort();
+                    }
+                    true
+                }
+                Err(_) => false,
+            };
+        if !released && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // A slot is briefly held (a respawn in flight). Finish the release once it is free.
+            let transport = transport.clone();
+            runtime.spawn(async move {
+                for slot in [
+                    &transport.router,
+                    &transport.notification_forwarder,
+                    &transport.directory_notification_forwarder,
+                ] {
+                    if let Some(handle) = slot.lock().await.take() {
+                        handle.abort();
+                    }
+                }
+                for (_, handle) in transport
+                    .account_notification_forwarders
+                    .lock()
+                    .await
+                    .drain()
+                {
+                    handle.abort();
+                }
+            });
+        }
+    }
+}
+
 struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
