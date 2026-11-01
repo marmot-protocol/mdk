@@ -143,7 +143,7 @@ fn presented_chat_preview_retention_comes_from_selected_message() {
 fn selected_value_reopens_without_mutation_and_keeps_activity() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("presentation.db");
-    let key = SqlCipherKey::new("presentation fixture key").unwrap();
+    let key = SqlCipherKey::raw([0x21; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "11");
     let input = store
@@ -255,7 +255,7 @@ fn source_generation_and_store_epoch_reject_stale_preparation() {
 fn backfill_is_bounded_and_resumes_from_persisted_pending_rows() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("backfill.db");
-    let key = SqlCipherKey::new("backfill fixture key").unwrap();
+    let key = SqlCipherKey::raw([0x22; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     for i in 0..57 {
         seed(&store, &format!("{i:04x}"));
@@ -293,9 +293,9 @@ fn failed_dependency_write_rolls_back_value_and_revision() {
     let before = app.chat_presentation_version().unwrap();
     store.lock().unwrap().execute_batch("CREATE TRIGGER fail_dependency BEFORE INSERT ON chat_presentation_dependencies BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     let input = app.chat_presentation_input("11").unwrap().unwrap();
-    assert!(
-        app.store_chat_presentation(&input, &value("bb", "Peer", 1))
-            .is_err()
+    assert_fails_with(
+        app.store_chat_presentation(&input, &value("bb", "Peer", 1)),
+        "injected",
     );
     assert_eq!(
         app.chat_presentation("11").unwrap(),
@@ -333,7 +333,10 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
             [serde_json::to_vec(&json).unwrap()],
         )
         .unwrap();
-    assert!(app.chat_presentation("11").is_err());
+    assert_fails_with(
+        app.chat_presentation("11"),
+        "unsupported chat presentation format",
+    );
     assert_eq!(
         app.store_chat_presentation(&input, &value("bb", "Peer", 10))
             .unwrap(),
@@ -458,7 +461,7 @@ fn unchanged_source_observations_keep_a_ready_selection_and_generation() {
 fn same_subject_source_changes_reopen_as_last_known_and_identical_repair_does_not_notify() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("last-known.db");
-    let key = SqlCipherKey::new("last known fixture key").unwrap();
+    let key = SqlCipherKey::raw([0x23; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "11");
     let input = store
@@ -523,6 +526,18 @@ fn malformed_member_identity_clears_peer_evidence() {
             .unwrap()
             .members
             .is_empty()
+    );
+}
+
+#[track_caller]
+fn assert_fails_with<T: std::fmt::Debug, E: std::fmt::Display>(
+    result: Result<T, E>,
+    expected: &str,
+) {
+    let error = result.expect_err("the operation must fail");
+    assert!(
+        error.to_string().contains(expected),
+        "expected an error containing {expected:?}, got: {error}"
     );
 }
 
@@ -669,16 +684,16 @@ fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
     next.shared_epoch = vec![3; 16];
     let first = app.chat_presentation_input("11").unwrap().unwrap();
     let second = app.chat_presentation_input("22").unwrap().unwrap();
-    assert!(
+    assert_fails_with(
         app.commit_chat_presentation_batch(
             &initial,
             &next,
             &[
                 (first.clone(), value("bb", "First", 1)),
-                (second, value("cc", "Invalid peer", 1))
-            ]
-        )
-        .is_err()
+                (second, value("cc", "Invalid peer", 1)),
+            ],
+        ),
+        "presentation peer is not in captured roster",
     );
     assert!(matches!(
         app.chat_presentation("11").unwrap(),
@@ -752,10 +767,16 @@ fn initialization_completes_an_upsert_over_an_existing_chat_row() {
 
 #[test]
 fn initialization_completion_failure_rolls_back_refresh_and_retries_after_reopen() {
-    for fail_with in ["ABORT, 'injected completion failure'", "IGNORE"] {
+    for (fail_with, expected) in [
+        (
+            "ABORT, 'injected completion failure'",
+            "injected completion failure",
+        ),
+        ("IGNORE", "presentation initialization did not complete"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("initialization.db");
-        let key = SqlCipherKey::new("initialization fixture").unwrap();
+        let key = SqlCipherKey::raw([0x24; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         seed(&store, "11");
         store
@@ -769,11 +790,13 @@ fn initialization_completion_failure_rolls_back_refresh_and_retries_after_reopen
             ))
             .unwrap();
         let before = store.app_storage().chat_list_row("11").unwrap();
-        assert!(
-            store
-                .app_storage()
-                .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
-                .is_err()
+        assert_fails_with(
+            store.app_storage().initialize_chat_presentation_row(
+                &"aa".repeat(32),
+                "11",
+                &|_, _| false,
+            ),
+            expected,
         );
         assert_eq!(
             store.app_storage().chat_list_row("11").unwrap(),
@@ -949,7 +972,7 @@ fn selected_avatar_and_demand_commit_atomically_even_for_pending_invitations() {
         url: "https://example.com/b.png".into(),
         cache_key: "b".into(),
     };
-    assert!(app.store_chat_presentation(&input, &changed).is_err());
+    assert_fails_with(app.store_chat_presentation(&input, &changed), "injected");
     assert_eq!(
         app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(Box::new(selected))
@@ -993,7 +1016,7 @@ fn avatar_ownership_does_not_limit_opaque_group_id_length() {
 fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("draft-preview.db");
-    let key = SqlCipherKey::new("draft preview fixture key").unwrap();
+    let key = SqlCipherKey::raw([0x25; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let app = store.app_storage();
     seed(&store, "11");

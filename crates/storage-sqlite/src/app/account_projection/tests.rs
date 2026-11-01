@@ -20,6 +20,20 @@ fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
 }
 
+/// Asserts that `result` failed with an error whose text contains `expected`,
+/// so a rollback or guard test cannot pass on an unrelated failure.
+#[track_caller]
+fn assert_fails_with<T: std::fmt::Debug, E: std::fmt::Display>(
+    result: Result<T, E>,
+    expected: &str,
+) {
+    let error = result.expect_err("the operation must fail");
+    assert!(
+        error.to_string().contains(expected),
+        "expected an error containing {expected:?}, got: {error}"
+    );
+}
+
 #[test]
 fn keyed_group_read_is_bounded() {
     use crate::base::query_work_test_support::measure;
@@ -137,7 +151,7 @@ fn secure_delete_restore_failure_preserves_committed_outcome() {
 fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("delivery-recovery.sqlite");
-    let key = SqlCipherKey::new("delivery recovery marker test key").unwrap();
+    let key = SqlCipherKey::raw([0x11; 32]);
 
     {
         let store = SqliteAccountStorage::open_encrypted(&path, &key)
@@ -314,7 +328,7 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
 fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retention.sqlite");
-    let key = SqlCipherKey::new("source epoch retention test key").unwrap();
+    let key = SqlCipherKey::raw([0x12; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
 
     let mut due = app_event("due", "aa", 10);
@@ -666,19 +680,39 @@ fn delete_event(
 #[test]
 fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let mut stored_group = group("aa", "alpha");
-    stored_group.nostr_routing_last_epoch = 8;
-    stored_group.prior_nostr_routes = vec![StoredNostrRoute {
+    // Every persisted field holds a value other than its default and whole
+    // groups are compared, so a column dropped from the save or the load fails.
+    let mut named = group("aa", "alpha");
+    named.profile_description = "a description".to_owned();
+    named.image_hash_hex = "01".repeat(32);
+    named.image_key_hex = "02".repeat(32);
+    named.image_nonce_hex = "03".repeat(12);
+    named.image_upload_key_hex = "04".repeat(32);
+    named.image_media_type = Some("image/png".to_owned());
+    named.admin_keys_hex = "05".repeat(32);
+    named.archived = true;
+    named.pending_confirmation = true;
+    named.member_count = Some(2);
+    named.presentation_member_ids_hex = Some(vec!["11".repeat(32), "22".repeat(32)]);
+    named.welcomer_account_id_hex = Some("33".repeat(32));
+    named.via_welcome_message_id_hex = Some("44".repeat(32));
+    named.nostr_routing_last_epoch = 8;
+    named.prior_nostr_routes = vec![StoredNostrRoute {
         nostr_group_id_hex: "11".repeat(32),
         relays: vec!["wss://prior.example".to_owned()],
         last_epoch: 7,
-        replaced_at: None,
+        replaced_at: Some(1_700_000_000),
     }];
+    // The peer index is kept only for a Direct conversation: no name and
+    // exactly two member accounts.
+    let mut direct = group("bb", "");
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec!["11".repeat(32), "66".repeat(32)]);
     let state = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: vec!["old".to_owned(), "kept".to_owned()],
         last_transport_timestamp: Some(1_700_000_001),
-        groups: vec![stored_group],
+        groups: vec![named, direct],
     };
 
     store
@@ -688,19 +722,9 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     let restored = store.load_account_projection_state("alice", 16).unwrap();
     assert_eq!(restored.seen_events, vec!["kept"]);
     assert_eq!(restored.last_transport_timestamp, Some(1_700_000_001));
-    assert_eq!(restored.groups[0].profile_name, "alpha");
-    assert_eq!(restored.groups[0].components.len(), 2);
-    assert_eq!(restored.groups[0].components[1].component_id, 0x8004);
-    assert_eq!(restored.groups[0].nostr_routing_last_epoch, 8);
-    assert_eq!(
-        restored.groups[0].prior_nostr_routes,
-        vec![StoredNostrRoute {
-            nostr_group_id_hex: "11".repeat(32),
-            relays: vec!["wss://prior.example".to_owned()],
-            last_epoch: 7,
-            replaced_at: None,
-        }]
-    );
+    // The save never writes `self_membership` (`set_group_self_membership`
+    // owns it), so both groups keep the `Member` they were given.
+    assert_eq!(restored.groups, state.groups);
 }
 
 #[test]
@@ -931,17 +955,36 @@ fn pending_confirmation_group_invites_uses_the_partial_covering_index() {
     // mdk#1380 review: the invite-policy predicate must not scan retained
     // group state. The partial covering index keeps examined rows at
     // O(pending invites); pin the query plan so a regression that drops the
-    // index (or rewrites the query out of it) fails deterministically.
+    // index (or rewrites the query out of it) fails deterministically. The plan
+    // is of the statement the read runs, captured from SQLite's trace.
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+    thread_local! {
+        static STATEMENTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
     let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(|event| {
+            if let TraceEvent::Stmt(statement, _) = event {
+                STATEMENTS
+                    .with_borrow_mut(|statements| statements.push(statement.sql().into_owned()));
+            }
+        }),
+    );
+    store
+        .app_storage()
+        .pending_confirmation_group_invites()
+        .unwrap();
     let conn = store.lock().unwrap();
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    let statements = STATEMENTS.with_borrow_mut(std::mem::take);
+    let [production_sql] = statements.as_slice() else {
+        panic!("the invite read runs one statement, got {statements:?}");
+    };
     let mut statement = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN
-             SELECT group_id_hex, welcomer_account_id_hex
-             FROM account_groups
-             WHERE pending_confirmation = 1 AND archived = 0
-             ORDER BY group_id_hex",
-        )
+        .prepare(&format!("EXPLAIN QUERY PLAN {production_sql}"))
         .unwrap();
     let plan = statement
         .query_map([], |row| row.get::<_, String>(3))
@@ -1023,8 +1066,19 @@ fn account_projection_state_keeps_max_cursor_across_racing_saves() {
         last_transport_timestamp: Some(1_700_000_100),
         ..ahead.clone()
     };
+    // A runtime that never learned a cursor (fresh process, no deliveries yet)
+    // still saves other state; that save must never wipe the stored cursor.
+    let never_learned = StoredAccountState {
+        last_transport_timestamp: None,
+        ..ahead.clone()
+    };
 
-    for saves in [[&ahead, &behind], [&behind, &ahead]] {
+    for saves in [
+        [&ahead, &behind],
+        [&behind, &ahead],
+        [&ahead, &never_learned],
+        [&never_learned, &ahead],
+    ] {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         for state in saves {
             store
@@ -1034,34 +1088,6 @@ fn account_projection_state_keeps_max_cursor_across_racing_saves() {
         let restored = store.load_account_projection_state("alice", 16).unwrap();
         assert_eq!(restored.last_transport_timestamp, Some(1_700_000_200));
     }
-}
-
-#[test]
-fn account_projection_state_save_without_cursor_preserves_stored_cursor() {
-    // A runtime that never learned a cursor (fresh process, no deliveries yet)
-    // still saves other state; that save must never wipe an advanced stored
-    // cursor back to NULL.
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    let advanced = StoredAccountState {
-        label: "alice".to_owned(),
-        seen_events: Vec::new(),
-        last_transport_timestamp: Some(1_700_000_200),
-        groups: Vec::new(),
-    };
-    store
-        .save_account_projection_state(&advanced, 16, MAX_FUTURE_SKEW_SECS)
-        .unwrap();
-
-    let never_learned = StoredAccountState {
-        last_transport_timestamp: None,
-        ..advanced
-    };
-    store
-        .save_account_projection_state(&never_learned, 16, MAX_FUTURE_SKEW_SECS)
-        .unwrap();
-
-    let restored = store.load_account_projection_state("alice", 16).unwrap();
-    assert_eq!(restored.last_transport_timestamp, Some(1_700_000_200));
 }
 
 #[test]
@@ -1151,20 +1177,25 @@ const MERGE_NOW: u64 = 1_800_000_000;
 
 #[test]
 fn merged_transport_timestamp_is_explicit_over_missing_sides() {
-    assert_eq!(
-        merged_transport_timestamp(None, None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
-        None
-    );
-    // A fresh store adopts whatever the runtime learned.
-    assert_eq!(
-        merged_transport_timestamp(None, Some(MERGE_NOW), MERGE_NOW, MAX_FUTURE_SKEW_SECS),
-        Some(MERGE_NOW)
-    );
-    // A runtime that never learned a cursor must never wipe the stored one.
-    assert_eq!(
-        merged_transport_timestamp(Some(MERGE_NOW), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
-        Some(MERGE_NOW)
-    );
+    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    for (stored, snapshot, expected) in [
+        (None, None, None),
+        // A fresh store adopts whatever the runtime learned.
+        (None, Some(MERGE_NOW), Some(MERGE_NOW)),
+        // A runtime that never learned a cursor must never wipe the stored one.
+        (Some(MERGE_NOW), None, Some(MERGE_NOW)),
+        // Without a snapshot cursor there is nothing to merge against: the
+        // stored value passes through unchanged, even when poisoned. Healing
+        // waits for the next save that learned a cursor, so a cursor-less save
+        // never moves the durable value in either direction.
+        (Some(poisoned), None, Some(poisoned)),
+    ] {
+        assert_eq!(
+            merged_transport_timestamp(stored, snapshot, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+            expected,
+            "stored {stored:?}, snapshot {snapshot:?}"
+        );
+    }
 }
 
 #[test]
@@ -1191,19 +1222,6 @@ fn merged_transport_timestamp_clamps_both_sides_before_max() {
             MAX_FUTURE_SKEW_SECS
         ),
         Some(MERGE_NOW + MAX_FUTURE_SKEW_SECS)
-    );
-}
-
-#[test]
-fn merged_transport_timestamp_is_cursor_neutral_without_snapshot() {
-    // Without a snapshot cursor there is nothing to merge against: the stored
-    // value passes through byte-identical, even when poisoned. Healing waits
-    // for the next save that learned a cursor, so a cursor-less save never
-    // moves the durable value in either direction.
-    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60;
-    assert_eq!(
-        merged_transport_timestamp(Some(poisoned), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
-        Some(poisoned)
     );
 }
 
@@ -1719,15 +1737,11 @@ fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
 fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("account.sqlite");
-    let options = crate::SqliteStorageOptions {
+    let options = SqliteStorageOptions {
         secure_delete: false,
-        ..crate::SqliteStorageOptions::default()
+        ..SqliteStorageOptions::default()
     };
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        options,
-    )
-    .unwrap();
+    let store = open_plaintext_file(&db_path, options.clone());
     let app = store.app_storage();
     let secret = "secure-prune-disk-secret-586-plaintext";
     let secret_filename = "secure-prune-disk-secret-586.png";
@@ -1756,19 +1770,25 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
     app.record_app_event(&old).unwrap();
     app.refresh_chat_list_row("alice-account", "aa", &no_mentions)
         .unwrap();
-    {
-        let conn = store.lock().unwrap();
-        let (busy, _, _): (i64, i64, i64) = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert_eq!(busy, 0);
-    }
+    assert_eq!(
+        app.chat_list_row("aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        secret,
+        "fixture should project the message into the chat-list preview"
+    );
+    checkpoint_and_truncate_wal(&store);
+    drop(app);
+    drop(store);
     assert!(
         file_contains(&db_path, secret.as_bytes()),
         "fixture should place plaintext in the database file before secure prune"
     );
+    let store = open_plaintext_file(&db_path, options);
+    let app = store.app_storage();
 
     let outcome = app
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
@@ -1810,14 +1830,11 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
 fn secure_prune_removes_pruned_plaintext_from_search_index() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("account.sqlite");
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        crate::SqliteStorageOptions {
-            secure_delete: false,
-            ..crate::SqliteStorageOptions::default()
-        },
-    )
-    .unwrap();
+    let options = SqliteStorageOptions {
+        secure_delete: false,
+        ..SqliteStorageOptions::default()
+    };
+    let store = open_plaintext_file(&db_path, options.clone());
     let app = store.app_storage();
     let old_secret = "secure-prune-index-secret-586-old";
     let survivor_secret = "secure-prune-index-secret-586-survivor";
@@ -1835,19 +1852,15 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         })
         .unwrap();
     assert_eq!(indexed.messages.len(), 2);
-    {
-        let conn = store.lock().unwrap();
-        let (busy, _, _): (i64, i64, i64) = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert_eq!(busy, 0);
-    }
+    checkpoint_and_truncate_wal(&store);
+    drop(app);
+    drop(store);
     assert!(
         file_contains(&db_path, old_secret.as_bytes()),
         "fixture should place indexed plaintext in the database file before secure prune"
     );
+    let store = open_plaintext_file(&db_path, options);
+    let app = store.app_storage();
 
     let outcome = app
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
@@ -1866,6 +1879,9 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
     );
 }
 
+/// Reads a database file through `std::fs`. Call it only once every connection
+/// to the file is closed: closing the descriptor `std::fs` opens drops this
+/// process's POSIX locks on a live SQLite file (`crates/storage-sqlite/AGENTS.md`).
 fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
     let haystack = std::fs::read(path).unwrap();
     haystack
@@ -1873,60 +1889,39 @@ fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-#[test]
-fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
-    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: vec![group("aa", "alpha")],
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    let mut old = app_event("old-aa", "aa", 10);
-    old.plaintext = "chat list should not retain this".to_owned();
-    store.record_app_event(&old).unwrap();
-    store
-        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
-        .unwrap();
-    assert_eq!(
-        store
-            .chat_list_row("aa")
-            .unwrap()
-            .unwrap()
-            .last_message
-            .unwrap()
-            .plaintext,
-        "chat list should not retain this"
-    );
+/// Opens an unencrypted file-backed store, so a test can look for plaintext in
+/// its files after closing it.
+fn open_plaintext_file(
+    path: &std::path::Path,
+    options: SqliteStorageOptions,
+) -> SqliteAccountStorage {
+    SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(path).unwrap(),
+        options,
+    )
+    .unwrap()
+}
 
-    let outcome = store
-        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+/// Checkpoints every WAL frame into the database file and truncates the WAL.
+fn checkpoint_and_truncate_wal(store: &SqliteAccountStorage) {
+    let (busy, _, _): (i64, i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .unwrap();
-
-    assert_eq!(outcome.pruned_messages, 1);
-    assert!(
-        store
-            .chat_list_row("aa")
-            .unwrap()
-            .unwrap()
-            .last_message
-            .is_none()
-    );
+    assert_eq!(busy, 0);
 }
 
 #[test]
 fn secure_prune_restores_caller_secure_delete_setting() {
-    let store = SqliteAccountStorage::in_memory_with_options(crate::SqliteStorageOptions {
-        secure_delete: false,
-        ..crate::SqliteStorageOptions::default()
-    })
-    .unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA secure_delete = OFF")
+        .unwrap();
     assert_eq!(secure_delete_pragma(&store), 0);
     store
         .app_storage()
@@ -2016,16 +2011,9 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
 fn competing_storage_handles_consume_one_checkpoint_intent_once() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("competing-checkpoint.sqlite");
-    let store_a = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        SqliteStorageOptions::default(),
-    )
-    .unwrap();
-    let store_b = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        SqliteStorageOptions::default(),
-    )
-    .unwrap();
+    let store_a = open_plaintext_file(&db_path, SqliteStorageOptions::default());
+    let store_b = open_plaintext_file(&db_path, SqliteStorageOptions::default());
+    let store_c = open_plaintext_file(&db_path, SqliteStorageOptions::default());
     let expected = crate::SecurePruneAppEventsResult {
         pruned_messages: 1,
         pruned_media_epoch_secrets: 0,
@@ -2059,78 +2047,107 @@ fn competing_storage_handles_consume_one_checkpoint_intent_once() {
         )
         .unwrap()
     });
-    let outcomes = [a.join().unwrap().result, b.join().unwrap().result];
+    let outcomes = [a.join().unwrap(), b.join().unwrap()];
+    // A finisher whose checkpoint stays busy past its retries reports the
+    // stored result with `erasure_pending` and leaves the intent in place, by
+    // design; only a finisher that checkpointed and deleted the intent consumed it.
     assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_some() && !outcome.erasure_pending)
+            .count(),
         1,
         "exactly one competing finisher should consume the durable result"
     );
+    for outcome in outcomes {
+        match outcome.result {
+            Some(result) => assert_eq!(result, expected),
+            None => assert!(!outcome.erasure_pending),
+        }
+    }
+    let conn = store_c.lock().unwrap();
     assert!(
-        outcomes
-            .into_iter()
-            .flatten()
-            .all(|outcome| outcome == expected)
+        secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+            .unwrap()
+            .is_none(),
+        "the consumer deletes the intent"
     );
 }
 
+/// A finisher reads an intent, then checkpoints. Another writer that recreates
+/// the intent meanwhile gives it a new nonce, and the finisher's delete, keyed
+/// by the nonce it read, must leave the new intent for its own pass.
 #[test]
 fn recreated_checkpoint_intent_cannot_be_deleted_by_a_stale_nonce() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
+
     let first_result = crate::SecurePruneAppEventsResult {
         pruned_messages: 1,
         ..crate::SecurePruneAppEventsResult::default()
     };
     let second_result = crate::SecurePruneAppEventsResult {
         pruned_messages: 2,
+        media_ciphertext_sha256: vec!["cd".repeat(32)],
         ..crate::SecurePruneAppEventsResult::default()
     };
-    let conn = store.lock().unwrap();
-    upsert_secure_delete_intent_tx(
-        &conn,
-        SECURE_DELETE_RETENTION_OPERATION,
-        "aa",
-        &serde_json::to_string(&first_result).unwrap(),
-    )
-    .unwrap();
-    let first = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
-        .unwrap()
-        .unwrap();
-    conn.execute(
-        "DELETE FROM secure_delete_checkpoint_intents
-         WHERE operation_kind = ?1 AND scope = ?2",
-        params![SECURE_DELETE_RETENTION_OPERATION, "aa"],
-    )
-    .unwrap();
-    upsert_secure_delete_intent_tx(
-        &conn,
-        SECURE_DELETE_RETENTION_OPERATION,
-        "aa",
-        &serde_json::to_string(&second_result).unwrap(),
-    )
-    .unwrap();
-    let second = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(first.nonce.len(), 16);
-    assert_eq!(second.nonce.len(), 16);
-    assert_ne!(first.nonce, second.nonce);
-    assert_eq!(
-        conn.execute(
-            "DELETE FROM secure_delete_checkpoint_intents
-             WHERE operation_kind = ?1 AND scope = ?2 AND intent_nonce = ?3",
-            params![SECURE_DELETE_RETENTION_OPERATION, "aa", &first.nonce],
+    let db = SharedDatabase::new();
+    let store = db.open();
+    let first_nonce = {
+        let conn = store.lock().unwrap();
+        upsert_secure_delete_intent_tx(
+            &conn,
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa",
+            &serde_json::to_string(&first_result).unwrap(),
         )
-        .unwrap(),
-        0,
-        "a stale finisher must not consume a recreated intent"
-    );
-    let remaining = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
-        .unwrap()
         .unwrap();
+        secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+            .unwrap()
+            .unwrap()
+            .nonce
+    };
+
+    // The finisher reads the first intent, and its TRUNCATE checkpoint waits
+    // for the write lock that the other connection holds while it recreates
+    // the intent.
+    let (second_nonce_tx, second_nonce_rx) = std::sync::mpsc::channel();
+    let recreated = serde_json::to_string(&second_result).unwrap();
+    let blocker = db.hold_write_lock(Release::WhenTheStoreWaits, move |other| {
+        let conn = other.lock().unwrap();
+        upsert_secure_delete_intent_tx(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa", &recreated)
+            .unwrap();
+        let nonce = secure_delete_intent(&conn, SECURE_DELETE_RETENTION_OPERATION, "aa")
+            .unwrap()
+            .unwrap()
+            .nonce;
+        second_nonce_tx.send(nonce).unwrap();
+    });
+    let finish = finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
+        &store.app_storage(),
+        SECURE_DELETE_RETENTION_OPERATION,
+        "aa",
+    )
+    .unwrap();
+    blocker.join();
+
+    let second_nonce = second_nonce_rx.recv().unwrap();
+    assert_eq!(first_nonce.len(), 16);
+    assert_eq!(second_nonce.len(), 16);
+    assert_ne!(first_nonce, second_nonce);
     assert_eq!(
-        serde_json::from_str::<crate::SecurePruneAppEventsResult>(&remaining.result_json).unwrap(),
-        second_result
+        finish.result,
+        Some(second_result),
+        "a stale finisher must not consume a recreated intent; it reports the new one"
+    );
+    assert!(!finish.erasure_pending);
+    assert!(
+        secure_delete_intent(
+            &store.lock().unwrap(),
+            SECURE_DELETE_RETENTION_OPERATION,
+            "aa"
+        )
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -3043,7 +3060,7 @@ fn push_registration_removal_outbox_preserves_same_server_revisions() {
 fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("local-delete-routes.sqlite");
-    let key = SqlCipherKey::new("local delete route preservation key").unwrap();
+    let key = SqlCipherKey::raw([0x13; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let mut deleted_group = group("aa", "alpha");
     deleted_group.prior_nostr_routes = vec![StoredNostrRoute {
@@ -3134,7 +3151,7 @@ fn retaining_a_local_delete_route_keeps_its_earliest_known_switch() {
 fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy-retained-routes.sqlite");
-    let key = SqlCipherKey::new("legacy retained route stamp key").unwrap();
+    let key = SqlCipherKey::raw([0x14; 32]);
     let route = |id: &str, replaced_at| StoredNostrRoute {
         nostr_group_id_hex: id.repeat(32),
         relays: vec![format!("wss://retained-{id}.example")],
@@ -3351,7 +3368,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         std::slice::from_ref(&fresh_message_id),
     );
 
-    assert!(result.is_err());
+    assert_fails_with(result, "injected projection failure");
     assert_eq!(
         app.local_group_deletion_frontier("aa").unwrap(),
         Some(frontier),
@@ -3403,16 +3420,6 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
     let repeated_frontier = app.local_group_deletion_frontier("aa").unwrap().unwrap();
 
     assert!(repeated_frontier > first_frontier);
-    assert!(
-        !app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
-            .unwrap(),
-        "a message buffered before the repeated delete must remain behind its frontier"
-    );
-    assert_eq!(
-        app.local_group_deletion_frontier("aa").unwrap(),
-        Some(repeated_frontier)
-    );
-
     let fresh_message_id = MessageId::new(vec![3]);
     store
         .lock()
@@ -3423,10 +3430,46 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
             rusqlite::params![fresh_message_id.as_slice(), &[0xaa_u8], &[0_u8]],
         )
         .unwrap();
+    // The crossing check the app's sync path runs: only a message of this
+    // group stored after the frontier crosses it. The buffered message is the
+    // repeated delete's frontier itself, so it does not.
+    let newer = |group_id_hex: &str, message_id: &MessageId, frontier: u64| {
+        app.local_group_deletion_message_is_newer_than(group_id_hex, message_id, frontier)
+            .unwrap()
+    };
+    assert!(newer("aa", &buffered_message_id, first_frontier));
+    assert!(
+        !newer("aa", &buffered_message_id, repeated_frontier),
+        "a message buffered before the repeated delete must remain behind its frontier"
+    );
+    assert!(!newer("aa", &first_message_id, repeated_frontier));
+    assert!(
+        newer("aa", &fresh_message_id, repeated_frontier),
+        "a message inserted after the repeated delete must cross the advanced frontier"
+    );
+    assert!(
+        !newer("bb", &fresh_message_id, repeated_frontier),
+        "another group's message never crosses this group's frontier"
+    );
+    assert_eq!(
+        app.local_group_deletion_frontier("aa").unwrap(),
+        Some(repeated_frontier),
+        "the check leaves the frontier for the caller's save to clear"
+    );
+
+    // `clear_local_group_deletion_frontier_if_message_is_newer` has no
+    // production caller; these probes go with it.
+    assert!(
+        !app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
+            .unwrap()
+    );
+    assert_eq!(
+        app.local_group_deletion_frontier("aa").unwrap(),
+        Some(repeated_frontier)
+    );
     assert!(
         app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &fresh_message_id)
-            .unwrap(),
-        "a message inserted after the repeated delete must cross the advanced frontier"
+            .unwrap()
     );
 }
 
@@ -3540,19 +3583,15 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .local_group_deletion_frontier("aa")
         .unwrap()
         .unwrap();
-    assert!(
-        !store
-            .app_storage()
-            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &historical_message_id,)
-            .unwrap(),
-        "historical replay already inside the deletion frontier must stay suppressed"
-    );
-    assert_eq!(
+    let crosses_frontier = |message_id: &MessageId| {
         store
             .app_storage()
-            .local_group_deletion_frontier("aa")
-            .unwrap(),
-        Some(deletion_frontier)
+            .local_group_deletion_message_is_newer_than("aa", message_id, deletion_frontier)
+            .unwrap()
+    };
+    assert!(
+        !crosses_frontier(&historical_message_id),
+        "historical replay already inside the deletion frontier must stay suppressed"
     );
     store
         .app_storage()
@@ -3594,18 +3633,8 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         )
         .unwrap();
     assert!(
-        store
-            .app_storage()
-            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &newer_message_id,)
-            .unwrap(),
-        "causally newer group activity must clear the deletion frontier"
-    );
-    assert_eq!(
-        store
-            .app_storage()
-            .local_group_deletion_frontier("aa")
-            .unwrap(),
-        None
+        crosses_frontier(&newer_message_id),
+        "causally newer group activity crosses the deletion frontier"
     );
     store
         .app_storage()
@@ -3668,21 +3697,57 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     assert_eq!(all_row_count(&store, "seen_events"), 1);
     assert_eq!(all_row_count(&store, "cgka_groups"), 1);
     assert!(!store.delete_local_group_data("aa").unwrap().did_delete());
+
+    // The repeated delete advanced the frontier past the newer message. A save
+    // that crosses with the frontier it observed before then is stale and
+    // clears nothing; one that observed the current frontier clears it in the
+    // same transaction that restores the chat.
+    let repeated_frontier = store
+        .app_storage()
+        .local_group_deletion_frontier("aa")
+        .unwrap()
+        .unwrap();
+    assert!(repeated_frontier > deletion_frontier);
+    let has_aa = || {
+        store
+            .app_storage()
+            .account_groups(Some("aa"))
+            .unwrap()
+            .len()
+            == 1
+    };
+    for (observed, cleared) in [(deletion_frontier, false), (repeated_frontier, true)] {
+        store
+            .app_storage()
+            .save_account_projection_state_clearing_local_group_deletion_frontiers(
+                &state,
+                16,
+                MAX_FUTURE_SKEW_SECS,
+                &[("aa".to_owned(), observed)],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .app_storage()
+                .local_group_deletion_frontier("aa")
+                .unwrap(),
+            (!cleared).then_some(repeated_frontier),
+            "observed frontier {observed}"
+        );
+        assert_eq!(has_aa(), cleared, "observed frontier {observed}");
+    }
 }
 
 #[test]
 fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("local-wipe.sqlite");
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        crate::SqliteStorageOptions {
-            busy_timeout_ms: 1,
-            secure_delete: false,
-            ..crate::SqliteStorageOptions::default()
-        },
-    )
-    .unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 1,
+        secure_delete: false,
+        ..SqliteStorageOptions::default()
+    };
+    let store = open_plaintext_file(&db_path, options.clone());
     let group_id_hex = "aa";
     store
         .app_storage()
@@ -3701,16 +3766,10 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     let mut message = app_event("wipe-me", group_id_hex, 10);
     message.plaintext = secret.to_owned();
     store.app_storage().record_app_event(&message).unwrap();
-    {
-        let conn = store.lock().unwrap();
-        let (busy, _, _): (i64, i64, i64) = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert_eq!(busy, 0);
-    }
+    checkpoint_and_truncate_wal(&store);
+    drop(store);
     assert!(file_contains(&db_path, secret.as_bytes()));
+    let store = open_plaintext_file(&db_path, options.clone());
 
     let reader = rusqlite::Connection::open(&db_path).unwrap();
     reader.execute_batch("BEGIN").unwrap();
@@ -3734,15 +3793,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     reader.execute_batch("COMMIT").unwrap();
     drop(reader);
     drop(store);
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        crate::SqliteStorageOptions {
-            busy_timeout_ms: 1,
-            secure_delete: false,
-            ..crate::SqliteStorageOptions::default()
-        },
-    )
-    .unwrap();
+    let store = open_plaintext_file(&db_path, options);
     let completed = store
         .delete_local_group_data(group_id_hex)
         .expect("retry after reopen should finish the prior checkpoint");
@@ -3821,48 +3872,18 @@ fn delete_local_group_data_rolls_back_all_tables_on_failure() {
 #[test]
 fn record_app_event_retries_concurrent_writer_contention() {
     // Representative projection-writer regression: the other projection writers use the
-    // same with_transaction retry path.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("projection-contention.sqlite");
-    let key = SqlCipherKey::new("projection contention key").unwrap();
-    let options = SqliteStorageOptions {
-        busy_timeout_ms: 50,
-        ..SqliteStorageOptions::default()
-    };
+    // same with_transaction retry path. The other connection holds the write lock
+    // until the writer's first attempt has failed busy, so only a retry succeeds.
+    use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-        .expect("writer storage opens");
-
-    let blocker_path = path.clone();
-    let blocker_options = options.clone();
-    let blocker_key = SqlCipherKey::new("projection contention key").unwrap();
-    let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        let blocker = SqliteAccountStorage::open_encrypted_with_options(
-            &blocker_path,
-            &blocker_key,
-            blocker_options,
-        )
-        .expect("blocker storage opens");
-        let conn = blocker.lock().unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        lock_acquired_tx
-            .send(())
-            .expect("signal BEGIN IMMEDIATE acquired");
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        conn.execute_batch("COMMIT").unwrap();
-    });
-
-    lock_acquired_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("blocker should hold BEGIN IMMEDIATE before writer starts");
-
+    let db = SharedDatabase::new();
+    let writer = db.open();
+    let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
     writer
         .app_storage()
         .record_app_event(&app_event("contended", "aa", 10))
         .expect("projection writer should wait out transient sqlite write-lock contention");
-
-    blocker.join().unwrap();
+    blocker.join();
     assert_eq!(writer.app_storage().app_message_count().unwrap(), 1);
 }
 
@@ -3908,60 +3929,74 @@ fn push_token(
     }
 }
 
+/// Runs `op` while a second connection holds the write lock, and releases the
+/// lock only when the store begins a second transaction: the first attempt
+/// must fail busy, and only its retry can succeed.
+///
+/// The push-token applies read inside a deferred transaction before they write.
+/// SQLite returns `SQLITE_BUSY` to that upgrade without calling the busy
+/// handler, so `write_contention`, which releases from the busy handler, cannot
+/// drive them.
+fn retried_past_a_held_write_lock<T>(
+    store: &SqliteAccountStorage,
+    path: &std::path::Path,
+    op: impl FnOnce() -> T,
+) -> T {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+    thread_local! {
+        static HOLDER: std::cell::RefCell<Option<rusqlite::Connection>> =
+            const { std::cell::RefCell::new(None) };
+        static BEGINS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    let holder = rusqlite::Connection::open(path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    HOLDER.set(Some(holder));
+    BEGINS.set(0);
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(|event| {
+            if let TraceEvent::Stmt(statement, _) = event
+                && statement.sql().starts_with("BEGIN")
+            {
+                BEGINS.set(BEGINS.get() + 1);
+                if BEGINS.get() == 2 {
+                    let holder = HOLDER.take().expect("the lock is still held");
+                    holder.execute_batch("COMMIT").unwrap();
+                }
+            }
+        }),
+    );
+    let value = op();
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(TraceEventCodes::empty(), None);
+    assert_eq!(BEGINS.get(), 2, "one failed attempt, then one retry");
+    assert!(HOLDER.take().is_none());
+    value
+}
+
 #[test]
 fn push_token_apply_retries_concurrent_writer_contention() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("push-token-contention.sqlite");
-    let key = SqlCipherKey::new("push token contention key").unwrap();
-    let options = SqliteStorageOptions {
-        busy_timeout_ms: 50,
-        ..SqliteStorageOptions::default()
-    };
-    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-        .expect("writer storage opens")
-        .app_storage();
+    let store = open_plaintext_file(&path, SqliteStorageOptions::default());
+    let writer = store.app_storage();
     let group_id = "aa".repeat(32);
     let member_id = "bb".repeat(32);
 
-    let spawn_blocker = || {
-        let blocker_path = path.clone();
-        let blocker_options = options.clone();
-        let blocker_key = SqlCipherKey::new("push token contention key").unwrap();
-        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                &blocker_path,
-                &blocker_key,
-                blocker_options,
-            )
-            .expect("blocker storage opens");
-            let conn = blocker.lock().unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            lock_acquired_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            conn.execute_batch("COMMIT").unwrap();
-        });
-        lock_acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("blocker acquires write lock");
-        handle
-    };
+    let applied = retried_past_a_held_write_lock(&store, &path, || {
+        writer.apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
+    });
+    assert!(applied.expect("token apply retries after transient contention"));
 
-    let blocker = spawn_blocker();
-    assert!(
-        writer
-            .apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
-            .expect("token apply retries after transient contention")
-    );
-    blocker.join().unwrap();
-
-    let blocker = spawn_blocker();
-    assert!(
+    let applied = retried_past_a_held_write_lock(&store, &path, || {
         writer
             .apply_group_push_token_tombstone(&push_tombstone(&group_id, &member_id, 0, 200, "r1"))
-            .expect("tombstone apply retries after transient contention")
-    );
-    blocker.join().unwrap();
+    });
+    assert!(applied.expect("tombstone apply retries after transient contention"));
     assert!(writer.group_push_tokens(&group_id).unwrap().is_empty());
 }
 
@@ -4502,7 +4537,10 @@ fn push_snapshot_owed_keeps_the_latest_add_for_the_current_membership() {
             ("bb".to_owned(), Some(u64::MAX >> 1))
         ]
     );
-    assert!(app.record_group_push_snapshot_owed("bb", u64::MAX).is_err());
+    assert_fails_with(
+        app.record_group_push_snapshot_owed("bb", u64::MAX),
+        "value does not fit in sqlite INTEGER",
+    );
 
     // A stale expectation changes nothing; a current one restores or settles.
     assert!(!app.replace_group_push_snapshot_owed("aa", 4, None).unwrap());
@@ -4899,10 +4937,9 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         )
         .unwrap();
     let id = cgka_traits::GroupId::new(vec![0xaa]);
-    assert!(
-        store
-            .forget_group_local(&id, cgka_traits::Timestamp(100))
-            .is_err()
+    assert_fails_with(
+        store.forget_group_local(&id, cgka_traits::Timestamp(100)),
+        "injected failure",
     );
     assert!(!store.is_group_forgotten(&id).unwrap());
     assert!(store.list_groups().unwrap().contains(&id));
@@ -4971,15 +5008,12 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         0,
         "a stale app snapshot cannot restore the chat"
     );
-    assert!(
-        store
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
-                []
-            )
-            .is_err()
+    assert_fails_with(
+        store.lock().unwrap().execute(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 0, x'00')",
+            [],
+        ),
+        "group awaiting fresh welcome",
     );
     assert_eq!(
         store
@@ -5034,7 +5068,7 @@ fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
         insert_protocol_group_marker(storage, id.as_slice());
         Err(StorageError::Backend("injected join failure".into()))
     });
-    assert!(failed.is_err());
+    assert_fails_with(failed, "injected join failure");
     assert!(
         !app.encrypted_media_epoch_secret_may_be_served("aa", 1)
             .unwrap()
@@ -5075,14 +5109,11 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
     for expiry in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edits.sqlite");
-        let store = SqliteAccountStorage::from_connection_with_options(
-            rusqlite::Connection::open(&path).unwrap(),
-            crate::SqliteStorageOptions {
-                secure_delete: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let options = crate::SqliteStorageOptions {
+            secure_delete: false,
+            ..Default::default()
+        };
+        let store = open_plaintext_file(&path, options.clone());
         let app = store.app_storage();
         app.save_account_projection_state(
             &StoredAccountState {
@@ -5114,7 +5145,14 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
                 .plaintext,
             secret
         );
+        checkpoint_and_truncate_wal(&store);
+        drop(app);
+        drop(store);
+        assert!(file_contains(&path, secret.as_bytes()));
+        let store = open_plaintext_file(&path, options);
+        let app = store.app_storage();
         {
+            // TEMP objects belong to one connection, so they are created after the reopen.
             let conn = store.lock().unwrap();
             conn.execute_batch("CREATE TEMP TABLE scrub_audit (surface TEXT, prior BLOB);
                 CREATE TEMP TRIGGER audit_target_restore BEFORE UPDATE ON message_timeline
@@ -5124,10 +5162,8 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
                 CREATE TEMP TRIGGER audit_preview_restore BEFORE UPDATE ON chat_list_rows
                 WHEN OLD.group_id_hex='aa' AND NEW.last_message_preview='retained original'
                   AND OLD.last_message_preview IS NOT NEW.last_message_preview
-                BEGIN INSERT INTO scrub_audit VALUES ('preview',CAST(OLD.last_message_preview AS BLOB)); END;
-                PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                BEGIN INSERT INTO scrub_audit VALUES ('preview',CAST(OLD.last_message_preview AS BLOB)); END;").unwrap();
         }
-        assert!(file_contains(&path, secret.as_bytes()));
         let result = if expiry {
             app.secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
         } else {
@@ -5270,7 +5306,10 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
         )
         .unwrap();
     let roster = [(m.clone(), 1)];
-    assert!(app.reconcile_group_push_token_leaves(&g, &roster).is_err());
+    assert_fails_with(
+        app.reconcile_group_push_token_leaves(&g, &roster),
+        "injected tombstone cleanup failure",
+    );
     assert_eq!(
         app.group_push_tokens(&g).unwrap().len(),
         3,
