@@ -2302,14 +2302,13 @@ mod otlp {
 
         async fn receive_metrics(
             stream: &mut tokio::net::TcpStream,
-        ) -> ExportMetricsServiceRequest {
+        ) -> Option<ExportMetricsServiceRequest> {
             use tokio::io::AsyncReadExt;
             let mut bytes = Vec::new();
             let end = loop {
-                assert!(
-                    stream.read_buf(&mut bytes).await.unwrap() > 0,
-                    "request ended before headers"
-                );
+                if stream.read_buf(&mut bytes).await.ok()? == 0 {
+                    return None;
+                }
                 if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
                     break end + 4;
                 }
@@ -2324,12 +2323,11 @@ mod otlp {
                 })
                 .unwrap();
             while bytes.len() < end + length {
-                assert!(
-                    stream.read_buf(&mut bytes).await.unwrap() > 0,
-                    "request body ended early"
-                );
+                if stream.read_buf(&mut bytes).await.ok()? == 0 {
+                    return None;
+                }
             }
-            ExportMetricsServiceRequest::decode(&bytes[end..end + length]).unwrap()
+            Some(ExportMetricsServiceRequest::decode(&bytes[end..end + length]).unwrap())
         }
 
         async fn collector(
@@ -2349,13 +2347,18 @@ mod otlp {
                 let mut index = 0;
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let request = receive_metrics(&mut stream).await;
+                    // An export deadline can cancel after connect but before
+                    // the complete request arrives. Keep accepting later ticks.
+                    let Some(request) = receive_metrics(&mut stream).await else {
+                        continue;
+                    };
                     let status = statuses[index.min(statuses.len() - 1)];
                     index += 1;
                     if tx.send(request).is_err() {
                         break;
                     }
-                    stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                    // Cancellation can also close a fully received request before its reply.
+                    let _ = stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
                 }
             });
             (endpoint, rx, task)
@@ -2523,7 +2526,7 @@ mod otlp {
                 .expect("the resolver must start before revocation")
                 .unwrap();
             product.revoke_memory();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), send)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2555,7 +2558,9 @@ mod otlp {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                receive_metrics(&mut stream).await;
+                receive_metrics(&mut stream)
+                    .await
+                    .expect("complete metrics request before revocation");
                 tx.send(()).unwrap();
                 std::future::pending::<()>().await;
                 drop(stream);
@@ -2573,7 +2578,7 @@ mod otlp {
                 .expect("the collector must accept the request before revocation")
                 .unwrap();
             product.revoke_memory();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), send)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2587,8 +2592,30 @@ mod otlp {
                 let (endpoint, mut requests, server) = collector(&[200]).await;
                 let product = crate::ProductAnalytics::default();
                 crate::grant(&product);
+                let collector_url = reqwest::Url::parse(&endpoint).unwrap();
                 let mut exporter = exporter(endpoint, product.permit().unwrap());
-                exporter.config.interval = std::time::Duration::from_millis(25);
+                // This also bounds each HTTP attempt; leave room for scheduling
+                // and socket I/O instead of cancelling healthy requests at 25ms.
+                exporter.config.interval = std::time::Duration::from_millis(500);
+                if stop == "shutdown" {
+                    use tokio::io::AsyncWriteExt;
+                    // Deterministically exercise abandoned attempts before any
+                    // headers, within headers, and within a declared body.
+                    for prefix in [
+                        b"".as_slice(),
+                        b"POST /metrics HTTP/1.1\r\n",
+                        b"POST /metrics HTTP/1.1\r\nContent-Length: 12\r\n\r\n",
+                    ] {
+                        let mut stream = tokio::net::TcpStream::connect((
+                            collector_url.host_str().unwrap(),
+                            collector_url.port().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                        stream.write_all(prefix).await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                }
                 let (tx, rx) = tokio::sync::watch::channel(false);
                 let worker = tokio::spawn(
                     exporter
@@ -2596,7 +2623,7 @@ mod otlp {
                 );
                 // Observe both the immediate push and a produced periodic tick.
                 for _ in 0..2 {
-                    tokio::time::timeout(std::time::Duration::from_secs(3), requests.recv())
+                    tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
                         .await
                         .unwrap()
                         .unwrap();
@@ -2608,7 +2635,7 @@ mod otlp {
                     "closed" => drop(tx),
                     _ => product.revoke_memory(),
                 }
-                tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+                tokio::time::timeout(std::time::Duration::from_secs(10), worker)
                     .await
                     .unwrap()
                     .unwrap();

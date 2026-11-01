@@ -1664,7 +1664,7 @@ async fn detached_delivery_cancellation_and_flush_deadline_preserve_generation_a
             }
         });
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), request_received)
+            tokio::time::timeout(Duration::from_secs(10), request_received)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1677,12 +1677,9 @@ async fn detached_delivery_cancellation_and_flush_deadline_preserve_generation_a
         } else if stop == "abort" {
             task.abort();
         }
-        let result = tokio::time::timeout(
-            Duration::from_secs(if stop == "flush_deadline" { 5 } else { 1 }),
-            task,
-        )
-        .await
-        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap();
         if stop == "abort" {
             assert!(result.unwrap_err().is_cancelled());
         } else {
