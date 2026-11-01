@@ -40,12 +40,19 @@ fn targeting(id: &str, kind: u64, target: &str, at: u64, plaintext: &str) -> Sto
 }
 
 fn damage_tags(app: &SqliteAppStorage, id: &str) {
+    damage_tags_to(app, id, "'not-json'");
+}
+
+/// Overwrite one row's tags with the SQL expression `value`.
+fn damage_tags_to(app: &SqliteAppStorage, id: &str, value: &str) {
     let damaged = app
         .lock()
         .unwrap()
         .execute(
-            "UPDATE app_events SET tags_json = 'not-json'
-             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            &format!(
+                "UPDATE app_events SET tags_json = {value}
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2"
+            ),
             params![group(), id],
         )
         .unwrap();
@@ -416,6 +423,67 @@ fn app_message_reads_return_a_row_whose_tags_no_longer_decode() {
             .map(|message| message.message_id_hex.as_str());
         assert_eq!(ids.collect::<Vec<_>>(), ["damaged", "healthy"]);
     }
+}
+
+// A damaged dismissal names no report, so it is left out of the report's
+// dismissals, and the report list still reads. Damage that is not even text
+// must not fail the read either.
+#[test]
+fn report_reads_skip_a_dismissal_whose_tags_no_longer_decode() {
+    use cgka_traits::app_event::AppMessageAuthority;
+    use cgka_traits::reporting::REPORT_REVIEW_NAMESPACE;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let (author, target, report) = ("ab".repeat(32), "66".repeat(32), "33".repeat(32));
+    let mut message = chat(&target, 10, "reported");
+    message.sender = author.clone();
+    app.record_app_event(&message).unwrap();
+    let report_tags = vec![
+        vec![EVENT_REF_TAG.to_owned(), target.clone(), "spam".to_owned()],
+        vec!["p".to_owned(), author],
+    ];
+    let reported = event(&report, MARMOT_APP_EVENT_KIND_REPORT, report_tags, 11, "");
+    app.record_app_event(&reported).unwrap();
+    let (healthy, damaged) = ("44".repeat(32), "55".repeat(32));
+    for (id, at) in [(&healthy, 12), (&damaged, 13)] {
+        let tags = vec![
+            vec!["L".to_owned(), REPORT_REVIEW_NAMESPACE.to_owned()],
+            vec![
+                "l".to_owned(),
+                "dismissed".to_owned(),
+                REPORT_REVIEW_NAMESPACE.to_owned(),
+            ],
+            vec![EVENT_REF_TAG.to_owned(), report.clone()],
+        ];
+        let mut dismissal = event(id, MARMOT_APP_EVENT_KIND_REVIEW, tags, at, "");
+        dismissal.moderation_grant = true;
+        app.record_app_event(&dismissal).unwrap();
+        let authority = AppMessageAuthority {
+            source_context: [7; 32],
+            moderation_grant: true,
+        };
+        app.finalize_app_event_authority(&group(), id, Some(authority))
+            .unwrap();
+    }
+    damage_tags_to(&app, &damaged, "zeroblob(10)");
+
+    let dismissals = app
+        .report_dismissals(&group(), &report, None, 10)
+        .expect("a damaged dismissal must not block the report's dismissals");
+    let ids = dismissals
+        .labels
+        .iter()
+        .map(|label| label.event_id_hex.as_str());
+    assert_eq!(ids.collect::<Vec<_>>(), [healthy.as_str()]);
+    let reports = app
+        .content_reports(&group(), None, None, 10)
+        .expect("a damaged dismissal must not block the report list");
+    let listed = reports
+        .reports
+        .iter()
+        .map(|report| (report.report_id_hex.as_str(), report.dismissed));
+    assert_eq!(listed.collect::<Vec<_>>(), [(report.as_str(), true)]);
 }
 
 // A held send that publishes takes its retention deadline here; failing it

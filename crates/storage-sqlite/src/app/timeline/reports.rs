@@ -146,7 +146,7 @@ fn dismissal_page(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    app_event_tags(r, 4)?,
                 ))
             })
             .storage()?
@@ -157,9 +157,8 @@ fn dismissal_page(
         }
         for (id, admin, explanation, created_at, tags) in rows {
             cursor = Some(id.clone());
-            if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(&tags)
-                && parse_dismissal(&tags, &explanation)
-                    .is_some_and(|ids| ids.iter().any(|id| id == report))
+            if parse_dismissal(&tags, &explanation)
+                .is_some_and(|ids| ids.iter().any(|id| id == report))
             {
                 labels.push(ReportDismissal {
                     event_id_hex: id,
