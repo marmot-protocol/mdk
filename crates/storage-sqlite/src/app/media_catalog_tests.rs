@@ -382,18 +382,28 @@ mod catalog_conformance {
     );
 
     /// The split runs exactly the cases `run_all` runs, read from its source,
-    /// so a case added to the suite cannot go unrun here.
+    /// so a case added to the suite cannot go unrun here. Every statement of
+    /// `run_all` must read as a case call, however it is wrapped, or the
+    /// guard fails rather than skip it.
     #[test]
     fn the_split_runs_every_case_of_the_suite() {
         let source = include_str!("../../../media-store/src/conformance.rs");
         let body = source
             .split_once("pub fn run_all")
+            .and_then(|(_, rest)| rest.split_once('{'))
             .and_then(|(_, rest)| rest.split_once("\n}\n"))
             .expect("media-store's `conformance::run_all`")
             .0;
-        let mut suite: Vec<&str> = body
-            .lines()
-            .filter_map(|line| line.trim().strip_suffix("(make());"))
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut suite: Vec<&str> = compact
+            .split(';')
+            .filter(|statement| !statement.is_empty())
+            .map(|statement| {
+                statement
+                    .strip_suffix("(make())")
+                    .or_else(|| statement.strip_suffix("(make(),)"))
+                    .unwrap_or_else(|| panic!("`run_all` runs `{statement}`, not a case call"))
+            })
             .collect();
         suite.sort_unstable();
         let mut split: Vec<&str> = FILE_CASES.iter().chain(MEMORY_CASES).copied().collect();

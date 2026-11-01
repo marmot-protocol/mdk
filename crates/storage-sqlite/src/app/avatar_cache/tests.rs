@@ -1484,6 +1484,10 @@ fn avatar_debug_output_hides_identifiers_sources_and_bytes() {
     })
     .collect();
     assert!(leaks.is_empty(), "{leaks:#?}");
+    // Their ids' own Debug output is already opaque, so the byte checks
+    // above cannot see them added: the field names can.
+    assert!(!format!("{file:?}").contains("id:"), "{file:?}");
+    assert!(!format!("{held:?}").contains("reference:"), "{held:?}");
 }
 
 /// A queued job whose descriptor no longer decodes is blocked, so the jobs
