@@ -75,7 +75,7 @@ pub const NSEC_SYNTHETIC_REJECTION: &str = "nsec1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg
 pub const EVENT_ID_32_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 /// Valid nevent for the synthetic EventId authored by ACCOUNT_ID with one relay hint.
 pub const NEVENT_RELAY_HINT_EVENT_HRP: &str = "nevent1qqszyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygszyz4yljrxtatfdceakls62uhrkr6m84s4sdas7d3devwgq69snrrmgqgmwaehxw309aex2mrp0yhx27rpd4cxcefwd9h8vctvd9jqmvq0h9";
-/// Valid 1023-byte nevent: type-0 synthetic EventId plus unknown 0xff extension padding (3 TLV entries).
+/// Valid 1023-byte nevent: type-0 synthetic EventId plus unknown 0xff extension padding (4 TLV entries).
 pub const NEVENT_SIZE_1023: &str = concat!(
     "nevent1qqszyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyghllamhwamhwamhwamh",
     "wamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwam",
@@ -91,7 +91,7 @@ pub const NEVENT_SIZE_1023: &str = concat!(
     "mhwamhwamhwamh0l63wamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhw",
     "amhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwum5c6wg"
 );
-/// Valid 1025-byte nevent: type-0 synthetic EventId plus unknown 0xff extension padding (3 TLV entries).
+/// Valid 1025-byte nevent: type-0 synthetic EventId plus unknown 0xff extension padding (4 TLV entries).
 pub const NEVENT_SIZE_1025: &str = concat!(
     "nevent1qqszyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyghllamhwamhwamhwamh",
     "wamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwam",
@@ -397,11 +397,16 @@ pub fn cases() -> Vec<IdentityReferenceCase> {
         .with_md_hrp("nprofile"),
         // Preview-parser rejection paths and divergences from markdown.
         // Size boundary: a nostr-wrapped nevent just under (1023 chars) and
-        // just over (1025 chars) the shared 1,024-char bech32 shape cap.
-        // Markdown is shape-only, so it accepts the short one and rejects
-        // the long one; the preview parser's 5,000-byte pre-check passes
-        // both, but its bech32 decoder enforces the same 1,024-char cap, so
-        // both rows pin that shared boundary rather than a divergence.
+        // just over (1025 chars) the bech32 shape cap. The caps differ by
+        // one character: markdown is shape-only and caps the whole bech32
+        // string at 1,024, while the preview parser's bech32 decoder
+        // rejects strings over 1,023 (bech32 0.11.1 CODE_LENGTH). A valid
+        // nevent literal can never be exactly 1,024 chars — whole-byte TLV
+        // streams encode to 13 + ceil(8n/5) chars (631 bytes -> 1023, 632
+        // bytes -> 1025), so these two rows cover every reachable boundary:
+        // 1023 is accepted by both paths, 1025 is rejected by both. The
+        // crafted-string divergence at exactly 1,024 is pinned for the
+        // nprofile path by oversized_1024_nostr above.
         rejected("nevent_size_1023_nostr", format!("nostr:{NEVENT_SIZE_1023}"))
             .with_md_hrp("nevent")
             .with_previews_target(PREVIEW_EVENT_2222),
