@@ -53,7 +53,7 @@ use crate::backup_archive::{
     ListedBackup, MAX_BACKUP_HEAD_BYTES, PointerEntry, backup_address, new_backup_id, retain,
     seal_backup_bundle, seal_backup_small_state,
 };
-use crate::history_bundle::{ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT};
+use crate::history_bundle::{ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, is_chat_hex};
 use crate::history_delivery::{MAX_BLOSSOM_BUNDLES, blossom_server_for_endpoint};
 use crate::media::{
     BlossomHttpTransport, delete_blossom_blob, fetch_history_blob, upload_blossom_blob,
@@ -539,10 +539,14 @@ impl AppClient {
         }))
     }
 
-    /// The chats this device holds, never a device group.
+    /// The chats this device holds, never a device group, nor a chat whose
+    /// MLS group id no bundle can name.
     fn backup_chats(&self) -> Result<Vec<GroupId>, AppError> {
         let mut chats = Vec::new();
         for group in &self.state.groups {
+            if !is_chat_hex(&group.group_id_hex) {
+                continue;
+            }
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {
                 continue;
             };
