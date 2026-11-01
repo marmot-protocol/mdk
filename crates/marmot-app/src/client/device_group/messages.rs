@@ -36,7 +36,7 @@ use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceTagClaim};
 use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::engine::{GroupEvent, SendIntent};
 use cgka_traits::storage::MaintenanceStorage as _;
-use cgka_traits::{EpochId, GroupId, MessageId};
+use cgka_traits::{EpochId, EpochPin, GroupId, MessageId};
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
 };
@@ -73,13 +73,15 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
 
 /// The trusted device group this device talks to its siblings in, its
 /// roster, this device's slot there, and whether this device's own leaf
-/// carries a device tag that reads as that slot. Siblings read nothing this
-/// device sends until it does.
+/// carries a device tag that reads as that slot at `pin`, the group's epoch
+/// and branch when it was read. Siblings read nothing this device sends
+/// until it does.
 pub(crate) struct Exchange {
     pub(crate) group_id: GroupId,
     pub(crate) roster: DeviceRosterV1,
     pub(crate) own_slot: DeviceSlotId,
     pub(crate) tagged: bool,
+    pub(crate) pin: EpochPin,
 }
 
 impl Exchange {
@@ -117,6 +119,14 @@ impl AppClient {
             return Ok(None);
         }
         let epoch = self.runtime.group_record(&group_id)?.epoch;
+        // The branch the tag is read on. While a commit of this device is
+        // pending, the identity is that commit's: either the tag reads as
+        // untagged at this number or the engine refuses a pinned send, until
+        // the commit settles.
+        let pin = EpochPin {
+            epoch,
+            ..self.runtime.epoch_pin(&group_id)?
+        };
         let own_leaf = self.runtime.own_leaf_index(&group_id)?;
         let tagged = self
             .runtime
@@ -127,6 +137,7 @@ impl AppClient {
             roster,
             own_slot,
             tagged,
+            pin,
         }))
     }
 
@@ -291,6 +302,20 @@ impl AppClient {
         group_id: &GroupId,
         event: MarmotAppEvent,
     ) -> Result<bool, AppError> {
+        self.send_device_group_event_at(group_id, event, None).await
+    }
+
+    /// [`Self::send_device_group_event`], pinned to `expected_epoch` when
+    /// one is given: the engine encrypts `event` under that epoch, on that
+    /// branch, or refuses it (`AppMessageEpochUnsettled`,
+    /// `AppMessageEpochMismatch`) before writing anything, and never queues
+    /// it.
+    pub(crate) async fn send_device_group_event_at(
+        &mut self,
+        group_id: &GroupId,
+        event: MarmotAppEvent,
+        expected_epoch: Option<EpochPin>,
+    ) -> Result<bool, AppError> {
         let kind = event.kind;
         let payload = event
             .encode()
@@ -305,7 +330,7 @@ impl AppClient {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
-                expected_epoch: None,
+                expected_epoch,
             })
             .await?;
         let reached = !effects

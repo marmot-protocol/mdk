@@ -29,6 +29,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# A sibling Welcome's 461 carries it as standard base64.
+base64.workspace = true
 # This crate's own integration tests reach the session accessors.
 marmot-session = { workspace = true, features = ["test-support"] }
 nostr.workspace = true

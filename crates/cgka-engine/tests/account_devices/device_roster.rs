@@ -19,14 +19,15 @@ use super::*;
 use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
     AccountEntryV1, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, NOSTR_ROUTING_COMPONENT_ID,
+    RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
+    encode_device_roster_v1,
 };
 use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport};
 use cgka_traits::storage::{DeviceGroupWelcomeExpectation, GroupStorage as _};
 
 /// A device of `account` that advertises the device roster beside
-/// account-devices.
+/// account-devices, and Nostr routing, so its chats can name relays.
 pub(super) fn roster_device(account: &[u8]) -> Device {
     roster_device_on(SqliteAccountStorage::in_memory_for_test().unwrap(), account)
 }
@@ -67,7 +68,11 @@ fn build_roster_device(
     peeler: Box<dyn TransportPeeler>,
 ) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
-    supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        NOSTR_ROUTING_COMPONENT_ID,
+    ]);
     let mut builder = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))

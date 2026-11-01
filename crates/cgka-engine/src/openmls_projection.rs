@@ -669,7 +669,9 @@ pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
         // state update preserves their shape.
         other @ (StoredMessagePayload::RawTransport(_)
         | StoredMessagePayload::OutboundWelcome { .. }
-        | StoredMessagePayload::StagedInviteWelcome { .. }) => other,
+        | StoredMessagePayload::StagedInviteWelcome { .. }
+        | StoredMessagePayload::StagedSiblingWelcome { .. }
+        | StoredMessagePayload::OutboundSiblingWelcome { .. }) => other,
     };
     record.state = MessageState::Processed;
     record.payload = payload

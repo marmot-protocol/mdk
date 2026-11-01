@@ -126,6 +126,16 @@ impl OwnDeviceTag {
         (entry_key == Some(own_signature_key)).then_some(Self { roster, slot })
     }
 
+    /// The device group's current roster this entry was read from.
+    pub(crate) fn roster(&self) -> &DeviceRosterV1 {
+        &self.roster
+    }
+
+    /// This device's roster slot.
+    pub(crate) fn slot(&self) -> DeviceSlotId {
+        self.slot
+    }
+
     /// Whether `leaf`, one of this device's, carries a tag that reads as this
     /// device's. A leaf that does not needs a tagged replacement.
     pub(crate) fn reads_as_own(&self, leaf: &LeafNode) -> bool {

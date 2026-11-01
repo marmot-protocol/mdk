@@ -207,7 +207,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   second one). Never publish one, and never fall back to a public KeyPackage when none is held. A KeyPackage this
   device has used is never kept again if a sibling hands it over again (mdk#2628 D42).
   Stash a sibling Welcome (461, mdk#2628 3.5b) only after a hand-off's checks, a relay list of one to 16 relay URLs
-  distinct once parsed, and a KeyPackage this device issued to its sender; join from the stash (migration 0160) in
+  distinct once parsed (`valid_sibling_welcome_relays`, which the sender's Add checks too), and a KeyPackage this
+  device issued to its sender; join from the stash (migration 0160) in
   the maintenance pass, never in the synchronous dispatch, only while its carrier is still `Processed`, and drain the
   joins' events as a confirmed rejoin does. A refused or withdrawn 461 is dropped; one whose checks could not be read,
   or admitted but not stashed, fails the event's projection, which is retried. One into a chat still held active is
@@ -220,6 +221,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Upkeep runs in the maintenance pass and serves siblings before asking for this device's own. Issue, hand over and
   ask for nothing until this device's own leaf reads as its slot: siblings would refuse it, and what it issued would
   be untagged.
+- Send a sibling Welcome (mdk#2628 3.5b-2, `src/client/private_key_packages.rs`) only once the engine owes it, after its
+  Add's Commit confirmed, as a 461 in the trusted device group while this device's leaf there is tagged: right after the
+  Add and in each maintenance pass. Pin each 461 to the device group's epoch and branch (`EpochPin`) whose tag was read
+  (`send_device_group_event_at`), so the engine sends it there or refuses it (`AppMessageEpochUnsettled`,
+  `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
+  and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
+  reports that 461 published marks it delivered (`settle_sibling_welcome_carriers`, from `retain_effect_projection`);
+  one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
+  before the engine settles it, and a carrier not in that set was sent before this run or never settled, so its Welcome
+  is sent again; a second 461 joins nothing twice. Never send a delivered one again: resending is 3.5e. The Add spends
+  its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
+  it back.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history

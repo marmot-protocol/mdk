@@ -2225,6 +2225,7 @@ impl MarmotApp {
             test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             announced_welcome_failures: HashSet::new(),
+            sibling_welcome_carriers: HashSet::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,

@@ -71,7 +71,7 @@ pub(crate) fn fail_deferred_peel_rows_in_terminal_group<S: StorageProvider>(
 }
 
 /// Promote or retire the non-deliverable Welcome artifacts produced beside one
-/// staged invite commit.
+/// staged invite commit, sibling Welcomes among them.
 ///
 /// Normal publish resolution supplies the exact origin commit id, so another
 /// staged or stale Welcome at the same group epoch cannot be promoted with the
@@ -97,6 +97,30 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
             && matches!(message.envelope, TransportEnvelope::Welcome { .. })
         {
             record.state = MessageState::Failed;
+            storage.put_message(&record)?;
+            continue;
+        }
+        if let StoredMessagePayload::StagedSiblingWelcome {
+            welcome,
+            origin_commit_id: staged_origin_commit_id,
+            key_package_ref,
+            deliver_until,
+        } = &payload
+        {
+            record.state =
+                if origin_commit_id.is_some_and(|expected| expected != staged_origin_commit_id) {
+                    MessageState::Failed
+                } else {
+                    record.payload = StoredMessagePayload::outbound_sibling_welcome(
+                        welcome.clone(),
+                        key_package_ref.clone(),
+                        *deliver_until,
+                        None,
+                    )
+                    .encode()
+                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+                    state
+                };
             storage.put_message(&record)?;
             continue;
         }
@@ -327,6 +351,30 @@ impl<S: StorageProvider> Engine<S> {
                 origin_commit_id.clone(),
                 Some(key_package_ref),
                 deliver_until,
+            ),
+            None,
+        )
+    }
+
+    /// Record a sibling Welcome as staged delivery work of `origin_commit_id`
+    /// (device-group.md, "Sending a sibling Welcome").
+    pub(crate) fn record_staged_sibling_welcome(
+        &self,
+        welcome: crate::own_account_devices::BuiltSiblingWelcome,
+        origin_commit_id: &MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.persist_stored_message_payload(
+            welcome.id,
+            group_id,
+            RowEpochs::at(epoch),
+            MessageState::Sent,
+            StoredMessagePayload::staged_sibling_welcome(
+                welcome.content,
+                origin_commit_id.clone(),
+                welcome.key_package_ref,
+                welcome.deliver_until,
             ),
             None,
         )

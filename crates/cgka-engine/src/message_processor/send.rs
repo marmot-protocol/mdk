@@ -123,11 +123,8 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
             }
-            SendIntent::AddOwnAccountDevices {
-                group_id,
-                key_packages,
-            } => {
-                self.do_send_add_own_account_devices(group_id, key_packages)
+            SendIntent::AddOwnAccountDevices { group_id, siblings } => {
+                self.do_send_add_own_account_devices(group_id, siblings)
                     .await
             }
             SendIntent::RemoveOwnAccountDevices {

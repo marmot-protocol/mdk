@@ -1144,7 +1144,8 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     let mut historical = storage.get_message(&welcome_id).unwrap();
     let message = StoredMessagePayload::decode(&historical.payload)
         .unwrap()
-        .into_message();
+        .into_message()
+        .unwrap();
     historical.payload = StoredMessagePayload::raw_transport(message)
         .encode()
         .unwrap();

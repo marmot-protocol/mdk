@@ -16,7 +16,7 @@ pub use cgka_engine::account_identity_proof::{
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
-pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
+pub use cgka_engine::engine::{OwedSiblingWelcome, WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
@@ -1389,6 +1389,30 @@ impl AccountDeviceSession {
             "sibling Welcome ingested"
         );
         Ok(outcome)
+    }
+
+    /// See [`cgka_engine::Engine::owed_sibling_welcomes`].
+    pub fn owed_sibling_welcomes(&self, now: Timestamp) -> SessionResult<Vec<OwedSiblingWelcome>> {
+        Ok(self.engine.owed_sibling_welcomes(now)?)
+    }
+
+    /// See [`cgka_engine::Engine::carry_sibling_welcome`].
+    pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.carry_sibling_welcome(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_delivered`].
+    pub fn sibling_welcome_delivered(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_delivered(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_send_failed`].
+    pub fn sibling_welcome_send_failed(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_send_failed(id, carrier)?)
     }
 
     pub async fn advance_convergence(

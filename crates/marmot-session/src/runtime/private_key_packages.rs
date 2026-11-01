@@ -2,7 +2,8 @@
 //! device issues to one sibling and hands over inside the device group. The
 //! engine keeps each one's record with its private key; the host decides when
 //! to issue, sends the hand-offs and reports them queued. A sibling Welcome
-//! (3.5) joins a chat with one; the host admits it first.
+//! (3.5) joins a chat with one; the host admits it first. Adding a sibling to
+//! a chat leaves one owed, which the host sends in the device group.
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportAdapter;
@@ -15,7 +16,7 @@ use super::AccountDeviceRuntime;
 use crate::error::AccountResult;
 use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
-use crate::session::SiblingWelcome;
+use crate::session::{OwedSiblingWelcome, SiblingWelcome};
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
 where
@@ -53,6 +54,35 @@ where
             .session
             .join_sibling_welcome(message_id, welcome, created_at)
             .await?)
+    }
+
+    /// Every sibling Welcome this device owes at `now`, for the host to send
+    /// in the device group. See [`cgka_engine::Engine::owed_sibling_welcomes`].
+    pub fn owed_sibling_welcomes(&self, now: Timestamp) -> AccountResult<Vec<OwedSiblingWelcome>> {
+        Ok(self.session.owed_sibling_welcomes(now)?)
+    }
+
+    /// Record `carrier`, the app event id of the device-group message about
+    /// to carry the owed sibling Welcome `id`. See
+    /// [`cgka_engine::Engine::carry_sibling_welcome`].
+    pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> AccountResult<bool> {
+        Ok(self.session.carry_sibling_welcome(id, carrier)?)
+    }
+
+    /// Mark the sibling Welcome `id` delivered by its published `carrier`.
+    /// See [`cgka_engine::Engine::sibling_welcome_delivered`].
+    pub fn sibling_welcome_delivered(&self, id: &MessageId, carrier: &[u8]) -> AccountResult<bool> {
+        Ok(self.session.sibling_welcome_delivered(id, carrier)?)
+    }
+
+    /// Clear the failed `carrier` from the sibling Welcome `id`, so it is
+    /// owed again. See [`cgka_engine::Engine::sibling_welcome_send_failed`].
+    pub fn sibling_welcome_send_failed(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> AccountResult<bool> {
+        Ok(self.session.sibling_welcome_send_failed(id, carrier)?)
     }
 
     /// Every private KeyPackage this device issued, oldest first.

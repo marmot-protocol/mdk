@@ -401,7 +401,10 @@ async fn a_device_joins_the_device_group_only_through_a_link() {
         },
         SendIntent::AddOwnAccountDevices {
             group_id: gid.clone(),
-            key_packages: vec![tablet.engine.fresh_key_package().await.unwrap()],
+            siblings: vec![SiblingKeyPackage {
+                slot: slot(3),
+                key_package: tablet.engine.fresh_key_package().await.unwrap(),
+            }],
         },
     ] {
         let refused = phone.engine.send(intent).await;
