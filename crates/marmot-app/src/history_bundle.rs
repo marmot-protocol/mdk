@@ -47,7 +47,7 @@ pub(crate) const HISTORY_BUNDLE_MAX_PLAINTEXT: usize = 8 * 1024 * 1024;
 pub(crate) const HISTORY_BUNDLE_AAD: &[u8] = b"marmot history bundle v1";
 const HISTORY_BUNDLE_VERSION: u64 = 1;
 /// The largest integer a bundle carries, as in spec A's messages.
-const MAX_INTEGER: u64 = 9_007_199_254_740_991;
+pub(crate) const MAX_INTEGER: u64 = 9_007_199_254_740_991;
 /// The longest MLS group id a bundle names, as for small state.
 const MAX_CHAT_ID_BYTES: usize = 256;
 const TAG_LEN: usize = 16;
@@ -109,7 +109,7 @@ pub(crate) struct FileKey {
 }
 
 /// An optional member is absent or holds a value, never `null`.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -156,11 +156,7 @@ impl HistoryBundle {
         if bundle.v != HISTORY_BUNDLE_VERSION {
             return Err(bundle_error("history_bundle_version"));
         }
-        let chat_ok = bundle.chat.len() <= 2 * MAX_CHAT_ID_BYTES
-            && !bundle.chat.is_empty()
-            && bundle.chat.len().is_multiple_of(2)
-            && is_lower_hex(&bundle.chat);
-        if !chat_ok
+        if !is_chat_hex(&bundle.chat)
             || !bundle.from.is_well_formed()
             || !bundle.to.is_well_formed()
             || !bundle.events.iter().all(BundledEvent::is_well_formed)
@@ -196,7 +192,7 @@ impl ChatPosition {
         }
     }
 
-    fn is_well_formed(&self) -> bool {
+    pub(crate) fn is_well_formed(&self) -> bool {
         self.epoch <= MAX_INTEGER && self.at <= MAX_INTEGER && is_hash_hex(&self.id)
     }
 }
@@ -365,12 +361,22 @@ pub(crate) struct SealedHistoryBundle {
 }
 
 pub(crate) fn seal_history_bundle(bundle: &HistoryBundle) -> Result<SealedHistoryBundle, AppError> {
+    let mut key = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(key.as_mut());
+    seal_history_bundle_with_key(bundle, key)
+}
+
+/// A bundle encrypted under `key`, which the caller uses for this bundle
+/// only, so the all-zero nonce never repeats under it: a backup derives one
+/// per blob (`backup_archive.rs`).
+pub(crate) fn seal_history_bundle_with_key(
+    bundle: &HistoryBundle,
+    key: Zeroizing<[u8; 32]>,
+) -> Result<SealedHistoryBundle, AppError> {
     let plaintext = Zeroizing::new(bundle.encode()?);
     if plaintext.len() > HISTORY_BUNDLE_MAX_PLAINTEXT {
         return Err(bundle_error("history_bundle_too_large"));
     }
-    let mut key = Zeroizing::new([0_u8; 32]);
-    OsRng.fill_bytes(key.as_mut());
     let ciphertext = cipher(&key)?
         .encrypt(
             &Nonce::default(),
@@ -423,11 +429,20 @@ fn encoded_len<T: Serialize>(value: &T) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-fn is_hash_hex(value: &str) -> bool {
+/// Whether `chat` names an MLS group id as a bundle does: one to
+/// [`MAX_CHAT_ID_BYTES`] bytes in lowercase hexadecimal.
+pub(crate) fn is_chat_hex(chat: &str) -> bool {
+    chat.len() <= 2 * MAX_CHAT_ID_BYTES
+        && !chat.is_empty()
+        && chat.len().is_multiple_of(2)
+        && is_lower_hex(chat)
+}
+
+pub(crate) fn is_hash_hex(value: &str) -> bool {
     value.len() == 64 && is_lower_hex(value)
 }
 
-fn is_lower_hex(value: &str) -> bool {
+pub(crate) fn is_lower_hex(value: &str) -> bool {
     value
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

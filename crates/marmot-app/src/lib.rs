@@ -102,6 +102,10 @@ mod error;
 pub mod error_kind_table;
 mod external_signer;
 mod groups;
+// The backup run (mdk#2628 4.4b) is not wired yet; only the codec's tests
+// reach it until then.
+#[allow(dead_code)]
+mod backup_archive;
 mod history_bundle;
 mod history_delivery;
 mod history_notices;
