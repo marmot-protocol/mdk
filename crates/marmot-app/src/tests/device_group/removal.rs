@@ -1861,6 +1861,7 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
         let (
             Devices {
                 _dirs,
+                relay,
                 phone_app,
                 mut phone,
                 laptop,
@@ -1925,12 +1926,17 @@ async fn a_removal_a_failed_link_undid_is_recorded_alone() {
             vec![DeviceRosterOperationV1::RemoveRejectedSlot(laptop_slot)],
         )
         .await;
+        // A roster state the phone applied held the record, so it is not
+        // made again, not even after a restart.
+        drop((phone, phone_app));
+        let phone_app = device_group_app_at(&_dirs[0], relay.clone());
+        let mut phone = phone_app.client("alice").await.unwrap();
         phone.run_due_maintenance().await.unwrap();
         assert!(
             !roster(&phone, &group)
                 .rejected_slots
                 .contains_key(&laptop_slot),
-            "the record is made once a run"
+            "the record is made once"
         );
     }
 }

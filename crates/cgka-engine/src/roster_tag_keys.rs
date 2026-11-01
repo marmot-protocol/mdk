@@ -38,17 +38,18 @@ pub(crate) fn roster_tag_keys(group: &MlsGroup) -> BTreeSet<RosterTagKey> {
     let devices = roster
         .devices
         .into_iter()
-        .filter_map(|(slot, device)| Some((slot, device.tag_signature_key?)));
+        .filter_map(|(slot, device)| Some((slot, device.tag_signature_key?, false)));
     let removed = roster
         .rejected_slots
         .into_iter()
         .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::Removed)
-        .filter_map(|(slot, rejected)| Some((slot, rejected.tag_signature_key?)));
+        .filter_map(|(slot, rejected)| Some((slot, rejected.tag_signature_key?, true)));
     devices
         .chain(removed)
-        .map(|(slot, tag_signature_key)| RosterTagKey {
+        .map(|(slot, tag_signature_key, held_as_removed)| RosterTagKey {
             slot,
             tag_signature_key,
+            held_as_removed,
         })
         .collect()
 }

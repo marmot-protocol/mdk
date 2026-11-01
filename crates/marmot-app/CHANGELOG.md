@@ -604,6 +604,8 @@
   Untagged leaves stay. When a failed link's undo takes the entry of a
   device the user decided to remove, the deciding device commits its
   `removed` record alone, so siblings that never saw its key clean up too.
+  It makes that record once: not again after a roster state it applied held
+  it, even across a restart.
   Release builds hold no device group.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is

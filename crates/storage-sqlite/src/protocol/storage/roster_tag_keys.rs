@@ -20,17 +20,19 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         for key in keys {
             conn.execute_cached(
                 "INSERT INTO cgka_roster_tag_keys
-                     (group_id, slot, tag_signature_key, last_seen_at, seen_seq)
+                     (group_id, slot, tag_signature_key, last_seen_at, seen_seq, held_as_removed)
                  VALUES (?1, ?2, ?3, ?4,
-                         (SELECT coalesce(max(seen_seq), 0) + 1 FROM cgka_roster_tag_keys))
+                         (SELECT coalesce(max(seen_seq), 0) + 1 FROM cgka_roster_tag_keys), ?5)
                  ON CONFLICT (group_id, slot, tag_signature_key) DO UPDATE
                      SET last_seen_at = max(last_seen_at, excluded.last_seen_at),
-                         seen_seq = excluded.seen_seq",
+                         seen_seq = excluded.seen_seq,
+                         held_as_removed = max(held_as_removed, excluded.held_as_removed)",
                 params![
                     group_id.as_slice(),
                     key.slot.as_slice(),
                     key.tag_signature_key,
-                    seen_at
+                    seen_at,
+                    key.held_as_removed
                 ],
             )
             .storage()?;
@@ -65,24 +67,29 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT slot, tag_signature_key FROM cgka_roster_tag_keys
+                "SELECT slot, tag_signature_key, held_as_removed FROM cgka_roster_tag_keys
                  WHERE group_id = ?1 AND last_seen_at >= ?2
                  ORDER BY slot, seen_seq DESC",
             )
             .storage()?;
         let rows = stmt
             .query_map(params![group_id.as_slice(), u64_to_i64(since)?], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         Ok(rows
             .into_iter()
-            .filter_map(|(slot, tag_signature_key)| {
+            .filter_map(|(slot, tag_signature_key, held_as_removed)| {
                 Some(RosterTagKey {
                     slot: slot.try_into().ok()?,
                     tag_signature_key,
+                    held_as_removed,
                 })
             })
             .collect())
@@ -100,6 +107,7 @@ mod tests {
         RosterTagKey {
             slot: [slot; 32],
             tag_signature_key: vec![key; 32],
+            held_as_removed: false,
         }
     }
 
@@ -143,6 +151,19 @@ mod tests {
             vec![key(1, 1), key(1, 2), key(1, 3)]
         );
         assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 3)]);
+        // A key once listed in a `removed` record stays held as removed when
+        // a later state lists it in a device entry.
+        let held = RosterTagKey {
+            held_as_removed: true,
+            ..key(2, 1)
+        };
+        store
+            .record_roster_tag_keys(&gid(1), &[held.clone()], 300)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(2, 1)], 300)
+            .unwrap();
+        assert_eq!(store.roster_tag_keys(&gid(1), 250).unwrap(), vec![held]);
     }
 
     #[test]

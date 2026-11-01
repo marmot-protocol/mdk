@@ -1065,6 +1065,11 @@ pub struct RosterTagKey {
     /// by.
     pub slot: [u8; 32],
     pub tag_signature_key: Vec<u8>,
+    /// Whether a roster state listed it in the slot's `removed` record. A
+    /// recorded key keeps this once any state this device applied did, so
+    /// the app knows a `removed` record for the slot was held even after it
+    /// went (mdk#2761, "The removal Commit").
+    pub held_as_removed: bool,
 }
 
 /// How long a tag signature key is kept after the last roster state this
@@ -1086,7 +1091,7 @@ pub trait RosterTagKeyStorage {
     /// order this device applied the roster states that listed them: a key
     /// later in `keys`, or in a later call, is more recently seen, whatever
     /// the clock says. A pair already recorded keeps the later of the two
-    /// times.
+    /// times, and is held as removed once either sighting was.
     fn record_roster_tag_keys(
         &self,
         group_id: &GroupId,

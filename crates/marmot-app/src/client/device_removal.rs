@@ -226,12 +226,9 @@ impl AppClient {
                     None,
                 )?;
             }
-            self.commit_device_removal(group_id, roster, &slot, removal.requested_at)
-                .await?;
-            // A sibling's expiry pass can drop the record before the next
-            // pass reads it; seen now, it is not made again alone.
-            self.note_removed_record_seen(group_id, &slot, removal)?;
-            return Ok(());
+            return self
+                .commit_device_removal(group_id, roster, &slot, removal.requested_at)
+                .await;
         }
         // Not listed: removed, its `removed` record has expired since, or a
         // failed link's undo took the entry. The slot is deleted until a
@@ -239,10 +236,6 @@ impl AppClient {
         // account's device, so it is left alone.
         let record = roster.rejected_slots.get(&slot);
         let not_me = record.is_some_and(|record| record.reason == RejectedSlotReasonV1::NotMe);
-        if record.is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed) {
-            self.removed_records_seen
-                .insert((removal.group_id_hex.clone(), removal.slot_hex.clone()));
-        }
         let withdrawn = async {
             if !not_me
                 && removal.slot_withdrawn_at.is_none()
@@ -278,12 +271,14 @@ impl AppClient {
     ///
     /// Only while the decision is under 30 days old, so a record the expiry
     /// pass drops is not made again; the undo comes about an hour after the
-    /// link, which comes before the decision. Only until this device has
-    /// seen the record in its trusted roster this run, so a sibling whose
-    /// clock drops the record early does not trade commits with this device,
-    /// while a send that went nowhere, or whose Commit failed or was rolled
-    /// back, is made again. Sent only while the device group is settled and
-    /// can take a commit from this device; otherwise a later pass retries.
+    /// link, which comes before the decision. Only until a roster state this
+    /// device applied has held a `removed` record for the slot, as its
+    /// remembered keys say (`held_as_removed`): a record a sibling's expiry
+    /// pass or branch selection dropped is not made again, even when one pass
+    /// applied it and its drop, or after a restart, while a send that went
+    /// nowhere, or whose Commit failed or was rolled back, is made again.
+    /// Sent only while the device group is settled and can take a commit from
+    /// this device; otherwise a later pass retries.
     async fn record_removal_alone(
         &mut self,
         group_id: &GroupId,
@@ -291,19 +286,23 @@ impl AppClient {
         removal: &DeviceRemovalRecord,
     ) -> Result<(), AppError> {
         let now = unix_now_seconds();
-        let seen = (removal.group_id_hex.clone(), removal.slot_hex.clone());
         if removal
             .requested_at
             .saturating_add(REMOVED_RECORD_LIFETIME_SECS)
             <= now
-            || self.removed_records_seen.contains(&seen)
             || !self.device_group_settled(group_id)
             || !self.group_quiet(group_id)?
         {
             return Ok(());
         }
-        let Some(tag_signature_key) = self
-            .remembered_tag_keys(group_id)?
+        let remembered = self.remembered_tag_keys(group_id)?;
+        if remembered
+            .iter()
+            .any(|key| key.slot == *slot && key.held_as_removed)
+        {
+            return Ok(());
+        }
+        let Some(tag_signature_key) = remembered
             .into_iter()
             .find(|key| key.slot == *slot)
             .map(|key| key.tag_signature_key)
@@ -327,31 +326,15 @@ impl AppClient {
             .reject_device_slots(group_id, &held, vec![(*slot, record)], context)
             .await?;
         self.observe_drained_session_events(&effects).await?;
-        if self.note_removed_record_seen(group_id, slot, removal)? {
-            self.linked_devices_changed = true;
-        }
-        Ok(())
-    }
-
-    /// Whether the trusted roster records `slot` of `group_id` as `removed`.
-    /// If it does, `removal`'s record counts as seen this run, so it is not
-    /// made again alone ([`Self::record_removal_alone`]).
-    fn note_removed_record_seen(
-        &mut self,
-        group_id: &GroupId,
-        slot: &DeviceSlotId,
-        removal: &DeviceRemovalRecord,
-    ) -> Result<bool, AppError> {
-        let recorded = self
+        if self
             .trusted_device_roster()?
             .filter(|(trusted, _)| trusted == group_id)
             .and_then(|(_, roster)| roster.rejected_slots.get(slot).cloned())
-            .is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed);
-        if recorded {
-            self.removed_records_seen
-                .insert((removal.group_id_hex.clone(), removal.slot_hex.clone()));
+            .is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed)
+        {
+            self.linked_devices_changed = true;
         }
-        Ok(recorded)
+        Ok(())
     }
 
     /// One commit in the device group that removes the device in `slot`:
@@ -501,6 +484,7 @@ impl AppClient {
                 gone.keys.insert(RosterTagKey {
                     slot: *slot,
                     tag_signature_key: tag_signature_key.clone(),
+                    held_as_removed: true,
                 });
             }
         }

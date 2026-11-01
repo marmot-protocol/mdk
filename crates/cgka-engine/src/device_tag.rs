@@ -598,6 +598,7 @@ mod tests {
         let remembered = |slot, tag_signature_key| RosterTagKey {
             slot,
             tag_signature_key,
+            held_as_removed: false,
         };
         let reads = |leaf_tag_key: &[u8; 32], keys: &[RosterTagKey]| {
             entry_reads_as_one_of(&spec_tag(), &LEAF_SIGNATURE_KEY, leaf_tag_key, keys)

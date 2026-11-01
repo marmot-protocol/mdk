@@ -21,6 +21,15 @@ fn tag_key(n: u8, key: u8) -> RosterTagKey {
     RosterTagKey {
         slot: slot(n),
         tag_signature_key: vec![key; 32],
+        held_as_removed: false,
+    }
+}
+
+/// A key a roster state listed in slot `n`'s `removed` record.
+fn removed_key(n: u8, key: u8) -> RosterTagKey {
+    RosterTagKey {
+        held_as_removed: true,
+        ..tag_key(n, key)
     }
 }
 
@@ -87,7 +96,7 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
         let commit = send_commit(&mut phone, intent, &gid).await;
         assert_accepted(&mut laptop, &commit, &gid).await;
     }
-    let expected = BTreeSet::from([tag_key(1, 0xa1), tag_key(2, 0xb2), tag_key(3, 0xb3)]);
+    let expected = BTreeSet::from([tag_key(1, 0xa1), tag_key(2, 0xb2), removed_key(3, 0xb3)]);
     for device in [&phone, &laptop] {
         assert_eq!(recorded(device, &gid), expected);
     }
@@ -95,8 +104,9 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
 
 /// One pass applies two commits: the first records slot 3 as `removed`, the
 /// second drops that record, as an expiry pass does. The roster at the end
-/// of the pass never held the record, yet its key is recorded. Slot 4's key
-/// changes in each, and the one the later commit listed reads as its newest.
+/// of the pass never held the record, yet its key is recorded, held as
+/// removed. Slot 4's key changes in each, and the one the later commit
+/// listed reads as its newest.
 #[tokio::test]
 async fn a_removed_record_dropped_within_one_pass_is_recorded() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
@@ -138,7 +148,7 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
             .contains_key(&slot(3))
     );
     let mut expected = before_pass;
-    expected.extend([tag_key(3, 0xc3), tag_key(4, 0xd2)]);
+    expected.extend([removed_key(3, 0xc3), tag_key(4, 0xd2)]);
     assert_eq!(recorded(&laptop, &gid), expected);
     let slot_4_newest_first = laptop
         .storage
