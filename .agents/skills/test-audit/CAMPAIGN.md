@@ -15,9 +15,10 @@ Pin an `origin/master` SHA and record for the scope:
   (`tests/`);
 - the number of tests and of test binaries
   (`cargo nextest list -p <crate> --message-format json`);
-- each test's result and wall time from one run with the features CI uses
-  for the crate (the crate `AGENTS.md` names them; many need
-  `test-policy-overrides`);
+- each test's result and wall time from one run with the exact features of
+  the crate's CI job (the crate `AGENTS.md` names them). Where a feature
+  changes harness defaults, as `test-policy-overrides` does in the simulator,
+  apply it only to the tests CI selects with it;
 - what the shared setup costs: time one store open, fixture or process start
   alone, and count how many each test pays for. nextest runs every test in
   its own process, so anything a test binary builds once per process is built
@@ -25,8 +26,9 @@ Pin an `origin/master` SHA and record for the scope:
 - line coverage of the production owner, saved for later diffs.
 
 ```sh
+SCRATCH=<your scratch directory>
 cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features> \
-  2>&1 | tee "$SCRATCH/<crate>-baseline.log"          # PASS [ 1.234s] lines carry wall time
+  > "$SCRATCH/<crate>-baseline.log" 2>&1; echo "exit=$?"   # PASS [ 1.234s] lines carry wall time
 ```
 
 For coverage, build instrumented into a target directory of its own and run
@@ -37,9 +39,11 @@ package in this repository.
 export CARGO_TARGET_DIR="$PWD/target/coverage"
 export RUSTFLAGS='-C instrument-coverage --cfg=coverage --cfg=trybuild_no_target'
 export LLVM_PROFILE_FILE="$SCRATCH/profraw/%p-%14m.profraw"
+mkdir -p "$SCRATCH/profraw"     # the profile runtime does not create it
 cargo nextest run -p <crate> --locked --no-fail-fast --features <ci-features>
 TOOLS="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
 find "$SCRATCH/profraw" -name '*.profraw' > "$SCRATCH/profraw.list"
+test -s "$SCRATCH/profraw.list" || echo "no profiles written"
 "$TOOLS/llvm-profdata" merge -sparse -f "$SCRATCH/profraw.list" -o "$SCRATCH/<crate>.profdata"
 set -- $(cargo nextest list -p <crate> --locked --features <ci-features> --message-format json |
   jq -r '.["rust-suites"][]["binary-path"]')
@@ -80,7 +84,10 @@ so on; for the engine, the subsystems in `crates/cgka-engine/AGENTS.md`. A
 test file joins the lane of the owner most of its tests exercise, and unit
 and integration tests of one owner share a lane. Size a lane so its PR is a
 diff a reviewer reads whole; in `storage-sqlite` that was 70 to 220 tests.
-Lanes share no files, so their ledgers and PRs can run in parallel.
+Lanes share no test or production files, so their ledgers and PRs can run in
+parallel. The routing files several lanes update (nextest config, workflows,
+`AGENTS.md` file maps) are the only overlap: rebase a lane when another lane
+that touched the same routing merges first.
 
 Read the owner's tests in other crates (simulator scenarios, app journeys,
 CLI end-to-end) with the lane so layer replays are visible. They stay out of
@@ -183,10 +190,11 @@ has a caught mutation.
 
 ## 6. Cutover
 
-Edit one lane at a time. Change shared harnesses and support modules first,
-on their own, so lanes do not collide. With each lane, add its step 5 tests,
-delete the seams it unlocks, update the routing listed in SKILL.md's
-validation section, and update the crate's `tests/AGENTS.md` file map. Put
+Change shared harnesses and support modules first, on their own, so lanes do
+not collide. Then edit each lane on its own branch and worktree. With each
+lane, add its step 5 tests, delete the seams it unlocks, update the routing
+listed in SKILL.md's validation section, and update the test file maps in the
+crate's `AGENTS.md` files. Put
 durable test-ownership rules that came from real mistakes in this campaign
 into the nearest `AGENTS.md`.
 

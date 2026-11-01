@@ -114,9 +114,11 @@ delete it.
   bindings see.
 - **Convergence, delivery and branch selection:** simulator vectors, scenario
   families, fixed-seed properties, observable ordering.
-- **Root `AGENTS.md` invariants:** privacy-safe tracing, dial safety, the
-  retired-relay denylist, restrictive file modes, torn-write-free multi-step
-  state changes, MLS group ids kept apart from Nostr route ids.
+- **`AGENTS.md` invariants, root and nested:** privacy-safe tracing, dial
+  safety, the retired-relay denylist, restrictive file modes, torn-write-free
+  multi-step state changes, MLS group ids kept apart from Nostr route ids,
+  and every guard a nested `AGENTS.md` names (for example the engine's ban on
+  calling OpenMLS `leave_group`).
 - **Named regressions:** a test tied to an issue or incident stays until a
   keeper provably catches the same failure.
 - **Cross-referenced names:** tests named by Tamarin models, vectors,
@@ -125,7 +127,8 @@ delete it.
   the reference in the same change.
 
 A test that reads source is valid only when it is the cheapest guard of an
-invariant above and survives renaming identifiers. A failing test may be
+invariant above, such as a ban on a call. Keep it failing closed: when the
+marker or file it reads moves, it should fail, not pass vacuously. A failing test may be
 reporting a product bug: reproduce it and fix the owner. Never delete a test
 because it fails.
 
@@ -138,13 +141,20 @@ the tests do.
 
 - **Acceptable:** a seam that only changes a value the same production path
   reads (a settlement window, retry budget or clock), or that skips cost
-  without changing behavior, like `in_memory_for_test()` copying a template
-  that the same fresh open migrated, while `cgka-engine/tests/sqlite_storage.rs`
-  keeps the encrypted rail.
-- **Not acceptable:** a seam that skips a production step, injects state the
-  owner should produce, or exposes internals so a test can assert on them.
-  Move the proof to the public boundary and delete the seam together with the
-  tests that needed it.
+  without changing what the test asserts. `in_memory_for_test()` copies a
+  template that the same fresh open migrated and turns off SQLCipher memory
+  security, so tests that assert production settings
+  (`crates/storage-sqlite/tests/test_support_defaults.rs`) and the encrypted
+  rail (`crates/cgka-engine/tests/sqlite_storage.rs`) keep their own stores.
+- **Documented fault and observation seams:** a feature a nested `AGENTS.md`
+  names for a contract no public boundary can reach, such as
+  `test-crash-hooks` (a crash between two writes) or
+  `test-conformance-snapshot` (a parked convergence pass's backoff). Keep it
+  and its tests.
+- **Not acceptable:** any other seam that skips a production step, injects
+  state the owner should produce, or exposes internals so a test can assert
+  on them. Move the proof to the public boundary first, then delete the seam
+  together with the tests that needed it.
 - A seam whose last test caller you delete is dead: remove it in the same
   change. The compiler does not warn about unused `pub` items or
   feature-gated code, so grep for callers.
@@ -187,11 +197,14 @@ repository.
 - Run the owner's tests and its siblings, then the root `AGENTS.md`
   Verification steps for each crate you touched. Clippy with `--all-targets
   --all-features` catches imports and private helpers a deletion orphans.
-- Update everything that names tests or binaries: `.config/nextest.toml`
-  overrides, `.github/workflows/ci.yml` filters, `Justfile` filters (run
-  `just simulator-filter-contract` for simulator changes), the land-change
-  smoke, and the file maps in `tests/AGENTS.md`. Grep all of them for every
-  old test and binary name: a stale exact-name filter does not always fail.
+- Update everything that names tests or binaries. Grep the whole repository
+  for every old test and binary name; the usual places are
+  `.config/nextest.toml` overrides, every workflow in `.github/workflows/`
+  (the nightly jobs pin exact names too), `Justfile` filters (run
+  `just simulator-filter-contract` for simulator changes), `scripts/`,
+  registries such as the simulator's `PROPERTY_TESTS.md` and `SCENARIOS.md`,
+  the land-change smoke, and the test file maps in the crate's `AGENTS.md`
+  files. A stale exact-name filter does not always fail.
   An exclusion (`not test(=...)`) silently stops excluding, and the
   partitioned workspace CI job runs with `--no-tests=pass`.
 - For each contract you consolidated, break the production owner once by
