@@ -1296,6 +1296,21 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         .unwrap();
     let historical_attempts = peeler.attempts_for(&commit3.id);
 
+    // The existing row is historical-only under an unchanged fingerprint, so
+    // it neither blocks a direct send nor repeats ahead of queued work.
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "direct send"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap(),
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
+
     assert!(matches!(
         carol
             .queue_app_message(
@@ -1314,23 +1329,9 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         1
     );
 
-    // The existing row is historical-only under an unchanged fingerprint, so
-    // it neither blocks a newer direct send nor repeats ahead of queued work.
-    assert!(matches!(
-        carol
-            .send(SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload: app_payload_for(&carol, "later direct send"),
-                expected_epoch: None,
-            })
-            .await
-            .unwrap(),
-        SendResult::ApplicationMessage { .. }
-    ));
-    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
-
     // A newly retained row is current-generation work, even with a queue. It
-    // receives a definitive foreground attempt before any wire is prepared.
+    // receives a definitive foreground attempt before the send is accepted;
+    // the send then queues behind the earlier one (mdk#2842).
     let fresh = TransportMessage {
         id: MessageId::new(b"fresh-row-ahead-of-queue".to_vec()),
         ..commit3
@@ -1349,7 +1350,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             })
             .await
             .unwrap(),
-        SendResult::ApplicationMessage { .. }
+        SendResult::Queued { .. }
     ));
     assert_eq!(peeler.attempts_for(&fresh.id), fresh_attempts + 1);
 
@@ -1360,7 +1361,10 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         .unwrap();
     assert!(matches!(
         drained.as_slice(),
-        [SendResult::ApplicationMessage { .. }]
+        [
+            SendResult::ApplicationMessage { .. },
+            SendResult::ApplicationMessage { .. }
+        ]
     ));
     assert_eq!(
         peeler.attempts_for(&fresh.id),

@@ -59,7 +59,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
 | `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; a send queued behind convergence is checked before it is queued, and a drain-time refusal is retired like any other (`queued_intent_refusal.rs`); no `OwnCommitIntent` re-issue |
-| `link_device.rs` | `SendIntent::LinkDevice`: one admin Commit in a device group that adds the KeyPackage a link confirmed and sets its roster entry, through the shared Adds-plus-AppDataUpdates staging, taking nothing from the proposal store; refused unless the group requires 0x800e, the KeyPackage is this account's and supports the group, and the update sets exactly one device entry; never queued (`LinkDeviceUnsettled` while the group settles or an own Commit is in flight); no `OwnCommitIntent` re-issue. Also `SendIntent::UnlinkDevice`, its undo for a link whose new device never committed (D40): one admin Commit removing exactly one listed roster entry and, if the tree still has it, one other leaf of the account, under the same rules |
+| `link_device.rs` | `SendIntent::LinkDevice`: one admin Commit in a device group that adds the KeyPackage a link confirmed and sets its roster entry, through the shared Adds-plus-AppDataUpdates staging, taking nothing from the proposal store; refused unless the group requires 0x800e, the KeyPackage is this account's and supports the group, and the update sets exactly one device entry; never queued (`LinkDeviceUnsettled` while the group settles, an own Commit is in flight or an earlier send is queued); no `OwnCommitIntent` re-issue. Also `SendIntent::UnlinkDevice`, its undo for a link whose new device never committed (D40): one admin Commit removing exactly one listed roster entry and, if the tree still has it, one other leaf of the account, under the same rules |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
 | `queued_intent_refusal.rs` | What the outbound drain does with a queued intent whose preparation fails on the settled state (mdk#2694): retire and announce (`GroupEvent::QueuedIntentRefused`) a refusal, keep a failure the device or a closed group-wide gate caused; check an intent's KeyPackages before it is queued (a same-account Add's sibling checks: `check_queued_sibling_add` in `own_account_devices.rs`) |
 | `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue. An Add names each sibling by its roster slot (`SiblingKeyPackage`) and stages that sibling's Welcome for the device group, never the transport (mdk#2628 3.5b-2); `owed_sibling_welcomes`, `carry_sibling_welcome`, `sibling_welcome_delivered` and `sibling_welcome_send_failed` hand it to the app's 461 sender |
@@ -441,6 +441,20 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   answered at once. Pinned by
   `tests/distributed_convergence/refused_queued_intents.rs` and
   `tests/record_write_atomicity.rs::a_queued_intent_held_by_a_storage_failure_stays_queued`.
+- **A send never goes ahead of an intent queued earlier for its group (mdk#2842).** While any queued intent of the
+  group still waits for the drain (`has_queued_intent_awaiting_preparation`: one the drain prepared and the host has
+  not resolved is in flight, not waiting), `outbound_queue_reason` queues a send it would otherwise prepare at once, so
+  the intents that never queue are refused as they are while the group settles, and the drain prepares the queue in
+  order; only the fairness slot, a requested disband and the engine's maintenance commits (replay rotation, SelfRemove
+  auto-commit), none of which an application message takes, let a group change go first. A retried in-flight intent
+  waits again and takes a later generation, which is why the session runtime resolves each drained intent within the
+  advance that prepared it. Each encryption takes the sender's next generation, and a member reading history in `created_at` order, which
+  is send order, loses any send more than `DEFAULT_OUT_OF_ORDER_TOLERANCE` generations behind one it already read; a
+  send ahead of the queue also lets a membership change overtake a message sent before it. A drained message keeps its
+  `created_at`: it is the inner event's, part of its id, and the Nostr binding stamps the outer event with it. A
+  queued intent that drains to `NoChange` is retired at once, since no confirmation will; a failed delete leaves it
+  for the next drain and keeps what the pass prepared. Pinned by `tests/distributed_convergence/queued_send_order.rs`
+  and `tests/record_write_atomicity.rs::a_queued_no_change_whose_retirement_fails_keeps_the_pass`.
 - **A held publication and an unresolved convergence input are mutually exclusive**, which is why
   `converge_stored_openmls_messages*` needs no held-publication gate. Outbound: `should_queue_outbound_intent` settles
   convergence before staging, so an unresolved input diverts the intent to the retention queue and `begin_pending` is

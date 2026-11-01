@@ -267,11 +267,33 @@ convergence, so the engine MUST NOT report those intents as still pending. The a
 that outcome per message rather than infer it from a message that never arrives; how it is surfaced is an application
 concern, not a protocol one.
 
-Releasing a retained intent is not ordered against a new send: a send accepted once the group is `Stable` publishes
-immediately if its convergence inputs have settled, while a retained intent waits for the next convergence drain, so a
-message accepted later MAY reach the transport first — by up to the settlement quiescence delay. Display order is
-unaffected, because the application timeline stamps a message when it is accepted rather than when it publishes;
-per-sender FIFO publication is not a protocol promise.
+A new send MUST NOT be prepared ahead of an intent retained earlier for the same group. While any retained intent
+still waits for the drain to prepare it, a send the engine would otherwise prepare at once is retained behind it, or
+refused like any intent that never queues (an epoch-pinned message, a device link, an account entry replacement), and
+the drain prepares them in the order they were accepted. An intent the drain already prepared, and whose publication
+the host has not yet resolved, no longer waits: its generation is taken. That holds until the host retries it
+instead: the next drain prepares a retried intent again, at a later generation, after any send made since. The session
+runtime resolves every intent a drain prepared within the advance that prepared it, so none of its sends falls in
+between. The cost is latency: a send accepted while earlier ones wait publishes with them, at the next drain.
+
+Group changes can still go ahead of retained application messages in three ways the queue already allowed. After a
+convergence pass the drain gives its first attempt to one queued admin or same-account change. A requested disband is
+prepared before the queue, and its terminal Commit discards the queue. The engine's own maintenance commits (a replay
+rotation, a due SelfRemove auto-commit) are not sends, and go first. None of them reorders application messages among
+themselves, which is what the ratchet needs. A queued change the settled state already holds (enabling disbanding that
+is already on) is retired when the drain reaches it, with nothing to publish and no event; the drain returns
+`NoChange`.
+
+Display order does not need this, because the application timeline stamps a message when it is accepted. The ratchet
+does (mdk#2842). Each encryption takes the sender's next generation in the epoch, and a receiver keeps only 100 earlier
+generations of a sender (`DEFAULT_OUT_OF_ORDER_TOLERANCE`). A member that reads the group's history in `created_at`
+order, which is acceptance order because the Nostr binding stamps the outer event with the inner app event's
+`created_at`, steps each sender's ratchet in that order. Had later sends gone ahead of retained ones, it would reach
+the retained ones first, at higher generations, and lose every earlier-generation send more than 100 behind. Outside
+those exceptions, ordering by acceptance also keeps a membership change from taking effect before a message
+accepted ahead of it. A drained
+message keeps its original `created_at`: it is part of the inner event's id, and with sends prepared in acceptance
+order it already sorts by generation.
 
 When the group becomes stable, the application calls:
 

@@ -11,7 +11,7 @@ use super::device_roster::{
     key_package_ref, phone_and_laptop, roster, roster_device, roster_device_with_peeler, roster_of,
     roster_update, slot,
 };
-use super::send_intents::{pending_proposals, store_pending_add};
+use super::send_intents::{pending_proposals, queue, store_pending_add};
 use super::*;
 use cgka_engine::engine::OutboundWelcomeStatus;
 use cgka_traits::app_components::{
@@ -462,6 +462,51 @@ async fn a_link_is_refused_not_queued_while_convergence_is_unsettled() {
         .unwrap();
     send_commit(&mut phone, intent, &gid).await;
     assert!(roster_of(&phone, &gid).devices.contains_key(&slot(3)));
+}
+
+/// A link or an unlink made while an intent waits in the group's queue is
+/// refused the same way, and the waiting intent is kept: neither goes ahead
+/// of an intent queued before it (mdk#2842).
+#[tokio::test]
+async fn a_link_or_unlink_behind_a_queued_intent_is_refused() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let tablet = link_tablet(&mut phone, &mut laptop, &gid).await;
+    let key_package = roster_device(b"alice")
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    queue(
+        &phone,
+        &gid,
+        b"waiting",
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+    );
+
+    for intent in [
+        link(
+            &gid,
+            &key_package,
+            vec![DeviceRosterOperationV1::SetDevice(
+                slot(4),
+                linked_entry("Watch", &key_package),
+            )],
+        ),
+        unlink(
+            &gid,
+            signature_key(&tablet, &gid),
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+        ),
+    ] {
+        let refused = phone.engine.send(intent).await;
+        assert!(
+            matches!(&refused, Err(EngineError::LinkDeviceUnsettled { group_id }) if *group_id == gid),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(queued_intents(&phone, &gid).len(), 1);
 }
 
 /// A link while this device's own Commit awaits its publish is refused the
