@@ -4438,6 +4438,127 @@ async fn media_send_epoch_pin_body() {
 }
 
 #[test]
+#[cfg(feature = "test-policy-overrides")]
+fn media_send_pins_the_engine_to_the_reference_branch() {
+    run_composed_app_runtime_test("media-send-branch-pin", media_send_branch_pin_body);
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn media_send_branch_pin_body() {
+    // A reference names only its epoch number. A rival commit from the same
+    // source epoch can win branch selection inside the send itself and leave
+    // the group at that number on another branch, whose media secret the
+    // recipients would derive instead. The pin carries the branch, so the
+    // engine refuses the send and nothing is published.
+    use canonical_membership::{app_at, deliver_new};
+    use cgka_traits::engine::SendIntent;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("branch pin", &[&bob_account.account_id_hex])
+        .await
+        .unwrap();
+    let mut bob_cursor = 0;
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    bob.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    let source_epoch = bob.runtime.epoch_pin(&group).unwrap().epoch;
+    assert_eq!(alice.runtime.epoch_pin(&group).unwrap().epoch, source_epoch);
+
+    // Two self-updates from one epoch order by committer: the smaller account
+    // id wins, so the other account is the sender and loses.
+    let (mut winner, mut sender) = if alice_account.account_id_hex < bob_account.account_id_hex {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
+    let settling = |ms| marmot_session::CanonicalizationPolicy {
+        settlement_quiescence_ms: ms,
+        ..marmot_session::CanonicalizationPolicy::default()
+    };
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(3_600_000))
+        .unwrap();
+    let self_update = || SendIntent::SelfUpdate {
+        group_id: group.clone(),
+    };
+    sender.runtime.send(self_update()).await.unwrap();
+    let mut sender_cursor = relay.published_events.lock().unwrap().len();
+    winner.runtime.send(self_update()).await.unwrap();
+
+    // The sender pins the epoch its own commit reached, then holds the rival
+    // as retained convergence input.
+    let pin = sender.runtime.epoch_pin(&group).unwrap();
+    assert_eq!(pin.epoch.0, source_epoch.0 + 1);
+    assert_ne!(pin, winner.runtime.epoch_pin(&group).unwrap());
+    deliver_new(&mut sender, &relay, &mut sender_cursor).await;
+    assert_eq!(sender.runtime.epoch_pin(&group).unwrap(), pin);
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(0))
+        .unwrap();
+
+    let published_before = relay.published_event_ids().len();
+    let reference = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x66_u8; 32]),
+        plaintext_sha256: hex::encode([0x14_u8; 32]),
+        nonce_hex: hex::encode([0x25_u8; 12]),
+        file_name: "d.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: pin.epoch.0,
+        dim: None,
+        thumbhash: None,
+    };
+    let error = sender
+        .send_app_event(
+            &group,
+            AppMessageIntent::Media {
+                message_tags: Vec::new(),
+                attachments: vec![reference],
+                caption: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sender.runtime.epoch_pin(&group).unwrap(),
+        winner.runtime.epoch_pin(&group).unwrap(),
+        "the send must have selected the rival branch before encrypting"
+    );
+    assert!(
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } if source_epoch == pin.epoch.0 && current_epoch == pin.epoch.0
+        ),
+        "a same-number branch change must refuse the media send, got {error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused pinned send must reach the relay with nothing"
+    );
+}
+
+#[test]
 fn edits_require_an_available_own_chat_target() {
     run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
 }

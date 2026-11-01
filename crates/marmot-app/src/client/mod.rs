@@ -1339,7 +1339,7 @@ pub(crate) fn group_is_quarantined(runtime: &AppRuntime, group_id: &GroupId) -> 
 /// into the media-boundary error the caller expects. Only media sends pin an
 /// epoch, so the engine variants never reach a host for any other intent.
 fn pinned_media_send_error(
-    expected_epoch: Option<cgka_traits::types::EpochId>,
+    expected_epoch: Option<cgka_traits::EpochPin>,
     error: AppError,
 ) -> AppError {
     use cgka_traits::error::EngineError;
@@ -4789,11 +4789,25 @@ impl AppClient {
             // retain the message while the group's epoch is unsettled and refuses
             // to encrypt it if convergence moves the epoch during the send, instead
             // of publishing an attachment nobody can decrypt. Callers have already
-            // checked that every attachment shares one epoch.
+            // checked that every attachment shares one epoch and that it is the
+            // epoch whose media secret this device holds now.
+            //
+            // The reference names only the number, and the sync below or the
+            // engine's own preflight can select a rival branch at that number.
+            // So the pin also carries the identity of the branch this device
+            // holds now, read before either can run. It is read the way the
+            // media secret is, a pending commit's epoch included, and a
+            // reference to any other epoch never matches it. A branch change
+            // before this point, such as during a caller's earlier sync, is
+            // not caught: the reference carries no identity from its upload.
             let expected_epoch = match &intent {
-                AppMessageIntent::Media { attachments, .. } => attachments
-                    .first()
-                    .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
+                AppMessageIntent::Media { attachments, .. } => match attachments.first() {
+                    Some(attachment) => Some(cgka_traits::EpochPin {
+                        epoch: cgka_traits::types::EpochId(attachment.source_epoch),
+                        ..self.runtime.epoch_pin(group_id)?
+                    }),
+                    None => None,
+                },
                 _ => None,
             };
             let (event, payload) = if let Some((event, payload)) = prepared {

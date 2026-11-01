@@ -307,11 +307,12 @@ pub enum AppError {
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
     /// A media reference was encrypted under `source_epoch`, but the message
-    /// that would carry it is sent at `current_epoch`. The `imeta` tag has no
+    /// that would carry it is sent at `current_epoch`, or at the same number
+    /// on another branch of the group's history. The `imeta` tag has no
     /// epoch field, so recipients would derive the wrong media secret; the
     /// attachment has to be uploaded again.
     #[error(
-        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+        "media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again"
     )]
     MediaReferenceStaleEpoch {
         source_epoch: u64,

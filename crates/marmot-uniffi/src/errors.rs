@@ -108,11 +108,12 @@ pub enum MarmotKitError {
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
     /// An attachment was encrypted at `source_epoch`, but the group moved to
-    /// `current_epoch` before it could be sent (mdk#2158). Its media key is bound
-    /// to the epoch it was encrypted under, so it cannot be sent; upload the
-    /// file again. Nothing was published.
+    /// `current_epoch`, or to another branch at the same epoch, before it could
+    /// be sent (mdk#2158). Its media key is bound to the epoch it was encrypted
+    /// under, so it cannot be sent; upload the file again. Nothing was
+    /// published.
     #[error(
-        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+        "media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again"
     )]
     MediaReferenceStaleEpoch {
         source_epoch: u64,

@@ -144,12 +144,16 @@ pub enum EngineError {
 
     /// An application message pinned to `expected` (see
     /// [`SendIntent::AppMessage::expected_epoch`](crate::engine::SendIntent))
-    /// reached encryption after the group had already advanced to `current`:
-    /// the send folded retained peer commits first. Nothing was prepared or
-    /// published. Routine input for epoch-bound payloads such as
+    /// reached encryption after the group had moved off that pin, to
+    /// `current`: the send folded retained peer commits first. When the two
+    /// numbers are equal, branch selection moved the group to another branch
+    /// at the same epoch, which the pin's identity tells apart. Nothing was
+    /// prepared or published. Routine input for epoch-bound payloads such as
     /// encrypted-media references, not an engine bug: the caller re-derives
     /// the payload for the current epoch (re-uploads the media).
-    #[error("application message pinned to epoch {expected} but the group is at epoch {current}")]
+    #[error(
+        "application message pinned to epoch {expected} but the group has moved off it (now at epoch {current})"
+    )]
     AppMessageEpochMismatch { expected: EpochId, current: EpochId },
 
     /// An application message pinned to `expected` arrived while the group's

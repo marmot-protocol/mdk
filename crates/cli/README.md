@@ -501,8 +501,8 @@ the wire `imeta` tag carries no epoch, and recipients derive the media key from 
 - A stale reference is refused before publication with `media_reference_stale_epoch` (`source_epoch`,
   `current_epoch`). Upload the file again after the commit and send the new reference. A plaintext hash resolves to the
   newest projected reference carrying it, so after a re-upload the hash form sends the current-epoch copy.
-- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send gives the same
-  error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
+- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send, including a move
+  to another branch at the same epoch number, gives the same error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
   refused with `media_reference_epoch_unsettled` rather than queued. Sync and retry, or upload again if the epoch
   advanced.
 
