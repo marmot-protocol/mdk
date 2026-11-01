@@ -1106,12 +1106,32 @@ mod tests {
         store
     }
 
+    /// Panics unless `result` failed with a backend error containing `text`,
+    /// such as an injected trigger's message.
+    #[track_caller]
+    pub(super) fn assert_backend<T>(result: StorageResult<T>, text: &str) {
+        match result.map(|_| ()) {
+            Err(StorageError::Backend(message)) if message.contains(text) => {}
+            other => panic!("expected a backend error containing {text:?}, got {other:?}"),
+        }
+    }
+
+    /// Panics unless `result` failed with exactly the serialization error
+    /// `text` a guard raises.
+    #[track_caller]
+    pub(super) fn assert_serialization<T>(result: StorageResult<T>, text: &str) {
+        match result.map(|_| ()) {
+            Err(StorageError::Serialization(message)) if message == text => {}
+            other => panic!("expected the serialization error {text:?}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn review_legacy_clear_preserves_each_generation_across_reopen() {
         for (old, newer) in [(10, 90), (90, 10)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("loss.sqlite");
-            let key = SqlCipherKey::new("generation retirement test").unwrap();
+            let key = SqlCipherKey::raw([0x31; 32]);
             {
                 let store = SqliteAccountStorage::open_encrypted(&path, &key)
                     .unwrap()
@@ -1148,11 +1168,15 @@ mod tests {
             );
             assert!(store.clear_account_delivery_recovery("alice", old).unwrap());
             assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            // The cleared generations keep their evidence watermarks: a late
+            // duplicate write neither rearms nor bumps the loss revision.
+            let before = store.recovery_revision_fence().unwrap();
             store
                 .record_account_delivery_loss("alice", newer, 15, 11)
                 .unwrap();
             store.synchronize_account_delivery_loss("alice").unwrap();
             assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            assert_eq!(store.recovery_revision_fence().unwrap(), before);
             store
                 .record_account_delivery_loss("alice", newer, 16, 12)
                 .unwrap();
@@ -1178,7 +1202,7 @@ mod tests {
         app.synchronize_account_delivery_loss("alice").unwrap();
         let before = app.recovery_revision_fence().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert!(app.clear_account_delivery_recovery("alice", 90).is_err());
+        assert_backend(app.clear_account_delivery_recovery("alice", 90), "injected");
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(
             app.account_delivery_recovery("alice")
@@ -1424,30 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retirement_keeps_evidence_watermark_for_a_late_writer() {
-        let store = fixture().app_storage();
-        store
-            .record_account_delivery_loss("alice", 3, 9, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.clear_account_delivery_recovery("alice", 3).unwrap());
-        let before = store.recovery_revision_fence().unwrap();
-        store
-            .record_account_delivery_loss("alice", 3, 9, 11)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
-        store
-            .record_account_delivery_loss("alice", 3, 10, 12)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations.len(),
-            1
-        );
-    }
-
-    #[test]
     fn reservation_fences_selected_demand_without_blocking_on_unrelated_joins() {
         let store = fixture();
         let app = store.app_storage();
@@ -1476,12 +1476,16 @@ mod tests {
                 .is_none(),
             "unselected eligible demand cannot authorize the selected quiescent scope"
         );
+        // Only the explicit override reserves it, and reserving fences
+        // nothing.
+        let joined = app.recovery_revision_fence().unwrap();
         assert!(
             app.reserve_recovery_attempt(&selected, 1000, 15000, true)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(app.recovery_revision_fence().unwrap().obligations.len(), 2);
+        assert_eq!(app.recovery_revision_fence().unwrap(), joined);
+        assert_eq!(joined.obligations.len(), 2);
     }
 
     #[test]
@@ -1508,7 +1512,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(store.consume_released_transport_receipts().is_err());
+        assert_backend(store.consume_released_transport_receipts(), "injected");
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         store
             .lock()
@@ -1537,24 +1541,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_does_not_take_mutation_ownership_from_the_worker() {
-        let store = fixture().app_storage();
-        store
-            .record_account_delivery_loss("alice", 9, 1, 10)
-            .unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(
-            store
-                .recovery_revision_fence()
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
-    }
-
-    #[test]
     fn zero_count_loss_is_still_imported_as_pending_evidence() {
         let store = fixture().app_storage();
         store
@@ -1579,9 +1565,9 @@ mod tests {
             .execute_batch("UPDATE account_recovery_scopes SET scope_format = 2")
             .unwrap();
         let fence = app.recovery_revision_fence().unwrap();
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, true)
-                .is_err()
+        assert_serialization(
+            app.reserve_recovery_attempt(&fence, 1000, 15000, true),
+            "unsupported recovery scope format",
         );
         assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
     }
@@ -1593,6 +1579,9 @@ mod tests {
         app.record_account_delivery_loss("alice", 1, 4, 10).unwrap();
         app.record_account_delivery_loss("alice", 2, 7, 11).unwrap();
         app.record_account_delivery_loss("alice", 1, 2, 12).unwrap();
+        // The legacy read is not an import: it reports nothing and creates
+        // no demand before the worker imports.
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         let before = app.recovery_revision_fence().unwrap();
         assert!(before.obligations.is_empty());
         assert!(
@@ -1601,6 +1590,7 @@ mod tests {
                 .is_none()
         );
         app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
         let joined = app.recovery_revision_fence().unwrap();
         assert_eq!(joined.obligations.len(), 1);
         assert_eq!(joined.loss_revision, 2);
@@ -1646,7 +1636,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(app.synchronize_account_delivery_loss("alice").is_err());
+        assert_backend(app.synchronize_account_delivery_loss("alice"), "injected");
         assert!(
             app.recovery_revision_fence()
                 .unwrap()
@@ -1678,7 +1668,7 @@ mod tests {
     fn reservation_survives_reopen_and_clock_changes_without_free_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner.sqlite");
-        let key = SqlCipherKey::new("owner retry test").unwrap();
+        let key = SqlCipherKey::raw([0x32; 32]);
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key)
                 .unwrap()
@@ -1767,31 +1757,5 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn incapable_pending_scope_does_not_wake_on_retry_deadline() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 1, 4).unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3;")
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        for now in [0, 300000, 600000, 1000000] {
-            assert!(
-                app.reserve_recovery_attempt(&fence, now, 300000, false)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000000, 300000, true)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
     }
 }
