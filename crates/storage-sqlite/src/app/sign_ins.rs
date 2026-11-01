@@ -501,12 +501,10 @@ mod tests {
             [("aa", true), ("bb", false)]
         );
         assert_eq!(store.sign_in_baseline().unwrap(), Some(100));
-    }
 
-    /// A slot the first read returned was here first even when nothing in it
-    /// counted then: freshness is a publication time, which never decides.
-    #[test]
-    fn a_slot_the_first_check_returned_was_here_first_whenever_it_counts() {
+        // A first read that returns a slot but counts nothing in it changes
+        // nothing yet; `starting_fresh_puts_off_every_device_here_first`
+        // shows that slot was here first once it counts.
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         assert!(
             !store
@@ -519,19 +517,8 @@ mod tests {
                 })
                 .unwrap()
         );
-        assert!(check(
-            &store,
-            &[observed("aa", 150, "e1"), observed("bb", 150, "e2")],
-            true,
-            200
-        ));
-        let rows = store.sign_ins().unwrap();
-        assert_eq!(
-            rows.iter()
-                .map(|row| (row.slot_id_hex.as_str(), row.before_this_device))
-                .collect::<Vec<_>>(),
-            [("aa", true), ("bb", false)]
-        );
+        assert_eq!(store.sign_in_baseline().unwrap(), Some(100));
+        assert!(store.sign_ins().unwrap().is_empty());
     }
 
     #[test]

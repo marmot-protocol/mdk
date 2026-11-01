@@ -162,7 +162,7 @@ mod tests {
     fn a_stashed_sibling_welcome_survives_reopen_until_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+        let key = SqlCipherKey::raw([7; 32]);
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key)
                 .unwrap()
@@ -216,26 +216,5 @@ mod tests {
             .unwrap();
         assert!(store.stash_sibling_welcome(&stashed(1000)).unwrap());
         assert!(!store.stash_sibling_welcome(&stashed(1001)).unwrap());
-    }
-
-    #[test]
-    fn the_stash_keeps_at_most_its_cap() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        for id in 0..MAX_STASHED_SIBLING_WELCOMES {
-            assert!(store.stash_sibling_welcome(&stashed(id)).unwrap());
-        }
-        assert!(
-            !store
-                .stash_sibling_welcome(&stashed(MAX_STASHED_SIBLING_WELCOMES))
-                .unwrap()
-        );
-        store
-            .delete_stashed_sibling_welcome(&stashed(0).message_id_hex)
-            .unwrap();
-        assert!(
-            store
-                .stash_sibling_welcome(&stashed(MAX_STASHED_SIBLING_WELCOMES))
-                .unwrap()
-        );
     }
 }

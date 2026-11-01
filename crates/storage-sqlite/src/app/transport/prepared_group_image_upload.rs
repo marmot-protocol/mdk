@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_upload_survives_reopen_state_transitions_and_consumption() {
+    fn staged_upload_moves_through_failure_upload_and_consumption_and_drops_its_secrets() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .app_storage()
@@ -409,6 +409,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed.state, PreparedGroupImageUploadState::Failed);
         assert_eq!(failed.attempt_count, 1);
+        assert_eq!(failed.last_error_kind.as_deref(), Some("blob_store"));
 
         store
             .app_storage()
@@ -477,7 +478,7 @@ mod tests {
     fn staged_upload_survives_database_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account.sqlite3");
-        let key = crate::SqlCipherKey::new("prepared-image-restart-key").unwrap();
+        let key = crate::SqlCipherKey::raw([7; 32]);
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store
