@@ -140,6 +140,7 @@ pub(crate) fn encode_small_state_items(items: &[SmallStateItem]) -> String {
 
 /// The items [`encode_small_state_items`] wrote, read as an update's are,
 /// from content of at most `limit` bytes. Unlike an update, it may hold none.
+#[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
 pub(crate) fn decode_small_state_items(
     content: &str,
     limit: usize,

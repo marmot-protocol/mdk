@@ -142,6 +142,7 @@ impl ArchiveKey {
 
     /// The archive key a head's sealed key opened to, or none unless it is
     /// exactly 32 bytes.
+    #[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
     pub(crate) fn from_opened(opened: &[u8]) -> Option<Self> {
         let mut key = Zeroizing::new([0_u8; 32]);
         (opened.len() == 32).then(|| {
@@ -208,11 +209,13 @@ impl BlobLocator {
     }
 
     /// Whether `ciphertext` is the blob this names, by size and hash.
+    #[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
     fn names(&self, ciphertext: &[u8]) -> bool {
         ciphertext.len() as u64 == self.size
             && hex::encode(Sha256::digest(ciphertext)) == self.sha256
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
     fn sha256_bytes(&self) -> Result<[u8; 32], AppError> {
         let mut hash = [0_u8; 32];
         hex::decode_to_slice(&self.sha256, &mut hash).map_err(|_| backup_error("backup_format"))?;
@@ -416,6 +419,7 @@ pub(crate) fn seal_backup_bundle(
 /// Open bundle blob `number`, which the index lists as `blob` of `chat`.
 /// Refused unless it is the blob the index names, it decrypts under that
 /// number's key, and its bundle names that chat and that stretch.
+#[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
 pub(crate) fn open_backup_bundle(
     archive_key: &ArchiveKey,
     number: u32,
@@ -464,6 +468,7 @@ pub(crate) fn seal_backup_small_state(
 /// Open the small-state blob `locator` names. Refused unless it is that
 /// blob, it decrypts, and it is an items object; an item that breaks the
 /// item rules is skipped, as in an update.
+#[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
 pub(crate) fn open_backup_small_state(
     archive_key: &ArchiveKey,
     locator: &BlobLocator,
@@ -602,6 +607,7 @@ impl BackupHead {
 
     /// The context and the sealed value the archive key opens from, with
     /// the private half the recovery words derive.
+    #[cfg_attr(not(test), allow(dead_code))] // Restoring backups (mdk#2628 4.4c) opens them.
     pub(crate) fn sealed_archive_key(&self) -> (Vec<u8>, &[u8]) {
         (seal_context(&self.id, &self.index), &self.sealed_key)
     }

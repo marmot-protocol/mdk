@@ -76,6 +76,7 @@ mod chat_history;
 pub use chat_history::DevSealedHistoryBundle;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use chat_history::newest_bundles_start;
+pub(crate) mod backup_writer;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;
 pub(crate) mod delivery_spill;
@@ -87,6 +88,7 @@ mod device_renames;
 pub(crate) mod epoch_stall;
 mod history_delivery;
 pub(crate) mod history_imports;
+pub(crate) use backup_writer::BackupPassOutcome;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -1585,6 +1587,7 @@ impl AppClient {
         self.drive_sign_ins().await;
         self.drive_small_state().await;
         self.drive_history_deliveries().await;
+        self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
         let held = self.epoch_gap_held_groups()?;

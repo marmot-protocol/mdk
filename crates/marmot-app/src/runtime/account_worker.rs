@@ -4441,12 +4441,14 @@ struct MediaHttpContext {
 struct HistoryBlobFlights {
     upload: std::sync::atomic::AtomicBool,
     fetch: std::sync::atomic::AtomicBool,
+    backup: std::sync::atomic::AtomicBool,
 }
 
-/// Starts the next due history upload and history fetch on the media
-/// executor, unless one of that kind is running, keeping a slot free for
-/// commands as avatar acquisition does. Each runs off the worker; its
-/// completion sends or imports here, then starts the next.
+/// Starts the next due history upload, history fetch and backup pass on the
+/// media executor, unless one of that kind is running, keeping a slot free
+/// for commands as avatar acquisition does. Each runs off the worker; its
+/// completion sends, imports or publishes here, and a history's then starts
+/// the next.
 fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext) {
     use std::sync::atomic::Ordering;
     let permit = || {
@@ -4497,6 +4499,29 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
                 "history fetch deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.backup.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_backup_pass() {
+            Ok(Some(pass)) => {
+                media_http
+                    .history_blobs
+                    .backup
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    pass.run(),
+                    MediaHttpCompletion::BackupPass,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "backup pass deferred")
             }
         }
     }
@@ -4602,6 +4627,7 @@ enum MediaHttpCompletion {
     },
     HistoryUpload(crate::client::HistoryUploadOutcome),
     HistoryFetch(crate::client::HistoryFetchOutcome),
+    BackupPass(crate::client::BackupPassOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4811,6 +4837,15 @@ async fn complete_media_http(
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
+            return;
+        }
+        MediaHttpCompletion::BackupPass(outcome) => {
+            client.finish_backup_pass(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .backup
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         MediaHttpCompletion::Attachment {
