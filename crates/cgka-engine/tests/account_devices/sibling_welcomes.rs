@@ -146,9 +146,13 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
     };
 }
 
+/// A forensic state row: the message id, the state it left, the state it
+/// entered and its epoch.
+type StateRow = (String, Option<String>, String, Option<u64>);
+
 /// The forensic rows naming one message's state changes.
 #[derive(Clone, Default)]
-struct StateRows(Arc<Mutex<Vec<(String, Option<String>, String, Option<u64>)>>>);
+struct StateRows(Arc<Mutex<Vec<StateRow>>>);
 
 impl StateRows {
     fn of(&self, id: &MessageId) -> Vec<(Option<String>, String, Option<u64>)> {
