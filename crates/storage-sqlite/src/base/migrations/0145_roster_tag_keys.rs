@@ -2,7 +2,10 @@
 //!
 //! `cgka_roster_tag_keys` holds one row per `(group, slot, tag signature
 //! key)` a roster this device held listed, in a device entry or a `removed`
-//! record, with when this device last applied a roster state that listed it.
+//! record, with when this device last applied a roster state that listed it
+//! and `seen_seq`, which every sighting raises past every other row's, so
+//! that a slot's keys read in the order this device applied the states that
+//! listed them, even when a clock second or one pass covers several.
 //! The engine writes them in the transaction that applies each roster state,
 //! and never reads them: no snapshot or replay fingerprint covers them, so a
 //! branch-selection rewind keeps them. A row is dropped 30 days after it was
@@ -21,6 +24,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             slot BLOB NOT NULL CHECK(length(slot) = 32),
             tag_signature_key BLOB NOT NULL,
             last_seen_at INTEGER NOT NULL CHECK(last_seen_at >= 0),
+            seen_seq INTEGER NOT NULL CHECK(seen_seq > 0),
             PRIMARY KEY (group_id, slot, tag_signature_key)
         );
         CREATE INDEX cgka_roster_tag_keys_by_age

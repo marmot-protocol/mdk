@@ -1082,8 +1082,11 @@ pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
 /// applies; nothing in the engine reads them back. The app reads them to
 /// clean up after a device whose key the roster no longer lists.
 pub trait RosterTagKeyStorage {
-    /// Record `keys` as seen in `group_id`'s roster at `seen_at`. A pair
-    /// already recorded keeps the later of the two times.
+    /// Record `keys` as seen in `group_id`'s roster at `seen_at`, in the
+    /// order this device applied the roster states that listed them: a key
+    /// later in `keys`, or in a later call, is more recently seen, whatever
+    /// the clock says. A pair already recorded keeps the later of the two
+    /// times.
     fn record_roster_tag_keys(
         &self,
         group_id: &GroupId,

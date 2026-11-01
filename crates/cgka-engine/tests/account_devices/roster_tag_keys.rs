@@ -26,32 +26,34 @@ fn tag_key(n: u8, key: u8) -> RosterTagKey {
 
 /// Set the entry of slot `n`, labelled `label`, to carry tag signature key
 /// `key`.
-fn set_key(gid: &GroupId, n: u8, label: &str, key: u8) -> SendIntent {
-    roster_update(
-        gid,
-        vec![DeviceRosterOperationV1::SetDevice(
-            slot(n),
-            DeviceEntryV1 {
-                tag_signature_key: Some(vec![key; 32]),
-                ..entry(label)
-            },
-        )],
+fn set_key_op(n: u8, label: &str, key: u8) -> DeviceRosterOperationV1 {
+    DeviceRosterOperationV1::SetDevice(
+        slot(n),
+        DeviceEntryV1 {
+            tag_signature_key: Some(vec![key; 32]),
+            ..entry(label)
+        },
     )
 }
 
+fn set_key(gid: &GroupId, n: u8, label: &str, key: u8) -> SendIntent {
+    roster_update(gid, vec![set_key_op(n, label, key)])
+}
+
 /// Record slot `n`, which holds no device, as `removed` with key `key`.
-fn record_removed(gid: &GroupId, n: u8, key: u8) -> SendIntent {
-    roster_update(
-        gid,
-        vec![DeviceRosterOperationV1::SetRejectedSlot(
-            slot(n),
-            RejectedSlotV1 {
-                reason: RejectedSlotReasonV1::Removed,
-                rejected_at: 1,
-                tag_signature_key: Some(vec![key; 32]),
-            },
-        )],
+fn record_removed_op(n: u8, key: u8) -> DeviceRosterOperationV1 {
+    DeviceRosterOperationV1::SetRejectedSlot(
+        slot(n),
+        RejectedSlotV1 {
+            reason: RejectedSlotReasonV1::Removed,
+            rejected_at: 1,
+            tag_signature_key: Some(vec![key; 32]),
+        },
     )
+}
+
+fn record_removed(gid: &GroupId, n: u8, key: u8) -> SendIntent {
+    roster_update(gid, vec![record_removed_op(n, key)])
 }
 
 fn recorded(device: &Device, gid: &GroupId) -> BTreeSet<RosterTagKey> {
@@ -93,21 +95,27 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
 
 /// One pass applies two commits: the first records slot 3 as `removed`, the
 /// second drops that record, as an expiry pass does. The roster at the end
-/// of the pass never held the record, yet its key is recorded.
+/// of the pass never held the record, yet its key is recorded. Slot 4's key
+/// changes in each, and the one the later commit listed reads as its newest.
 #[tokio::test]
 async fn a_removed_record_dropped_within_one_pass_is_recorded() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
     let before_pass = recorded(&laptop, &gid);
-    let first = send_commit(&mut phone, record_removed(&gid, 3, 0xc3), &gid).await;
-    let second = send_commit(
-        &mut phone,
-        roster_update(
-            &gid,
-            vec![DeviceRosterOperationV1::RemoveRejectedSlot(slot(3))],
-        ),
+    // Slot 4's later key sorts first, so only the order the commits were
+    // applied in makes it the newest.
+    let first = roster_update(
         &gid,
-    )
-    .await;
+        vec![record_removed_op(3, 0xc3), set_key_op(4, "Tablet", 0xd2)],
+    );
+    let second = roster_update(
+        &gid,
+        vec![
+            DeviceRosterOperationV1::RemoveRejectedSlot(slot(3)),
+            set_key_op(4, "Tablet", 0xd1),
+        ],
+    );
+    let first = send_commit(&mut phone, first, &gid).await;
+    let second = send_commit(&mut phone, second, &gid).await;
     let before = laptop.engine.epoch(&gid).unwrap().0;
     for commit in [&first, &second] {
         laptop
@@ -127,8 +135,16 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
             .contains_key(&slot(3))
     );
     let mut expected = before_pass;
-    expected.insert(tag_key(3, 0xc3));
+    expected.extend([tag_key(3, 0xc3), tag_key(4, 0xd2), tag_key(4, 0xd1)]);
     assert_eq!(recorded(&laptop, &gid), expected);
+    let slot_4_newest_first = laptop
+        .storage
+        .roster_tag_keys(&gid, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|key| key.slot == slot(4))
+        .collect::<Vec<_>>();
+    assert_eq!(slot_4_newest_first, [tag_key(4, 0xd1), tag_key(4, 0xd2)]);
 }
 
 /// The phone and the laptop each set a key from the same epoch, then

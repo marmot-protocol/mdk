@@ -351,9 +351,9 @@ struct OpenMlsReplayOutput {
     /// Empty for a candidate probe.
     announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
     /// The tag signature keys each roster state a canonical apply reached
-    /// listed, for the caller to record in the apply's transaction
-    /// (mdk#2761). Empty for a candidate probe.
-    roster_tag_keys: BTreeSet<RosterTagKey>,
+    /// listed, in the order it reached them, for the caller to record in the
+    /// apply's transaction (mdk#2761). Empty for a candidate probe.
+    roster_tag_keys: Vec<RosterTagKey>,
 }
 
 /// Presentation output stays private; public replay observations retain their API.
@@ -368,7 +368,7 @@ pub(crate) struct OpenMlsApplyOutput {
     pub(crate) observations: Vec<OpenMlsReplayObservation>,
     pub(crate) group_changes: Vec<AppliedGroupChanges>,
     pub(crate) announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
-    pub(crate) roster_tag_keys: BTreeSet<RosterTagKey>,
+    pub(crate) roster_tag_keys: Vec<RosterTagKey>,
 }
 
 #[derive(Debug)]
@@ -3731,7 +3731,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     let mut observations = Vec::new();
     let mut group_changes = Vec::new();
     let mut announced_key_packages = BTreeSet::new();
-    let mut roster_tag_keys = BTreeSet::new();
+    let mut roster_tag_keys = Vec::new();
     let mut epoch_authenticators = BTreeMap::from([(
         mls_group.epoch().as_u64(),
         own_commit_post_merge_epoch_authenticator(&mls_group),
@@ -3859,7 +3859,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     final_members: marmot_members(&mls_group),
                     epoch_authenticators: BTreeMap::new(),
                     announced_key_packages: BTreeSet::new(),
-                    roster_tag_keys: BTreeSet::new(),
+                    roster_tag_keys: Vec::new(),
                 };
                 update_group_record_from_replay(storage, group_id, &intermediate)?;
                 retain_current_group_epoch_snapshot(storage, group_id, max_rewind)?;
@@ -4192,7 +4192,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         final_members: marmot_members(&mls_group),
                         epoch_authenticators: BTreeMap::new(),
                         announced_key_packages: BTreeSet::new(),
-                        roster_tag_keys: BTreeSet::new(),
+                        roster_tag_keys: Vec::new(),
                     };
                     update_group_record_from_replay(storage, group_id, &intermediate)?;
                     retain_current_group_epoch_snapshot(

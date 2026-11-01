@@ -53,12 +53,15 @@ pub(crate) fn roster_tag_keys(group: &MlsGroup) -> BTreeSet<RosterTagKey> {
         .collect()
 }
 
-/// Record `keys` as seen in `group_id` at `now`, then drop what is past its
-/// bounds. A backend without the store records none.
+/// Record `keys`, in the order the roster states that listed them were
+/// applied, as seen in `group_id` at `now`, then drop what is past its
+/// bounds. A key listed again later counts from its last listing, so a
+/// slot's newest key is the one a roster state listed last, even within one
+/// pass. A backend without the store records none.
 pub(crate) fn record_tag_keys<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
-    keys: &BTreeSet<RosterTagKey>,
+    keys: &[RosterTagKey],
     now: Timestamp,
 ) -> Result<(), StorageError> {
     let Some(store) = storage.roster_tag_key_storage() else {
@@ -67,7 +70,14 @@ pub(crate) fn record_tag_keys<S: StorageProvider>(
     if keys.is_empty() {
         return Ok(());
     }
-    let keys = keys.iter().cloned().collect::<Vec<_>>();
+    let mut listed = BTreeSet::new();
+    let mut keys = keys
+        .iter()
+        .rev()
+        .filter(|key| listed.insert(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.reverse();
     store.record_roster_tag_keys(group_id, &keys, now.0)?;
     store.prune_roster_tag_keys(
         now.0.saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS),
@@ -82,5 +92,6 @@ pub(crate) fn record_roster_tag_keys<S: StorageProvider>(
     group: &MlsGroup,
     now: Timestamp,
 ) -> Result<(), StorageError> {
-    record_tag_keys(storage, group_id, &roster_tag_keys(group), now)
+    let keys = roster_tag_keys(group).into_iter().collect::<Vec<_>>();
+    record_tag_keys(storage, group_id, &keys, now)
 }

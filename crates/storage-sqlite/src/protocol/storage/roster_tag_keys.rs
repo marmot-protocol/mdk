@@ -20,10 +20,12 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
         for key in keys {
             conn.execute_cached(
                 "INSERT INTO cgka_roster_tag_keys
-                     (group_id, slot, tag_signature_key, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                     (group_id, slot, tag_signature_key, last_seen_at, seen_seq)
+                 VALUES (?1, ?2, ?3, ?4,
+                         (SELECT coalesce(max(seen_seq), 0) + 1 FROM cgka_roster_tag_keys))
                  ON CONFLICT (group_id, slot, tag_signature_key) DO UPDATE
-                     SET last_seen_at = max(last_seen_at, excluded.last_seen_at)",
+                     SET last_seen_at = max(last_seen_at, excluded.last_seen_at),
+                         seen_seq = excluded.seen_seq",
                 params![
                     group_id.as_slice(),
                     key.slot.as_slice(),
@@ -48,7 +50,7 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
                  SELECT rowid FROM (
                      SELECT rowid, ROW_NUMBER() OVER (
                          PARTITION BY group_id, slot
-                         ORDER BY last_seen_at DESC, rowid DESC
+                         ORDER BY seen_seq DESC
                      ) AS newest
                      FROM cgka_roster_tag_keys
                  ) WHERE newest > ?1
@@ -65,7 +67,7 @@ impl RosterTagKeyStorage for SqliteAccountStorage {
             .prepare_cached(
                 "SELECT slot, tag_signature_key FROM cgka_roster_tag_keys
                  WHERE group_id = ?1 AND last_seen_at >= ?2
-                 ORDER BY slot, last_seen_at DESC, rowid DESC",
+                 ORDER BY slot, seen_seq DESC",
             )
             .storage()?;
         let rows = stmt
@@ -101,8 +103,9 @@ mod tests {
         }
     }
 
-    /// A key keeps its latest sighting, and a slot's keys read newest first,
-    /// whatever order they were recorded in.
+    /// A key keeps its latest sighting time, and a slot's keys read in the
+    /// order they were last seen: the order of the keys in a call and of the
+    /// calls, not the clock, which can give one second to several.
     #[test]
     fn keys_keep_their_latest_sighting_and_read_newest_first() {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -121,16 +124,23 @@ mod tests {
             store.roster_tag_keys(&gid(1), 0).unwrap(),
             vec![key(1, 1), key(1, 2), key(2, 1)]
         );
-        // An earlier sighting never takes a later one back.
+        // One pass lists slot 1's key 3 and then its key 2 again, in the
+        // second key 1 was last seen in.
         store
-            .record_roster_tag_keys(&gid(1), &[key(1, 2)], 300)
+            .record_roster_tag_keys(&gid(1), &[key(1, 3), key(1, 2)], 200)
             .unwrap();
+        assert_eq!(
+            store.roster_tag_keys(&gid(1), 0).unwrap(),
+            vec![key(1, 2), key(1, 3), key(1, 1), key(2, 1)]
+        );
+        // A sighting at an earlier time is the latest seen, but never takes
+        // the later time back.
         store
-            .record_roster_tag_keys(&gid(1), &[key(1, 2)], 50)
+            .record_roster_tag_keys(&gid(1), &[key(1, 1)], 50)
             .unwrap();
         assert_eq!(
             store.roster_tag_keys(&gid(1), 150).unwrap(),
-            vec![key(1, 2), key(1, 1)]
+            vec![key(1, 1), key(1, 2), key(1, 3)]
         );
         assert_eq!(store.roster_tag_keys(&gid(2), 0).unwrap(), vec![key(1, 3)]);
     }
@@ -153,6 +163,19 @@ mod tests {
         assert_eq!(
             store.roster_tag_keys(&gid(1), 0).unwrap(),
             vec![key(1, 4), key(2, 14)]
+        );
+        // Within one second, the key seen again outranks the ones recorded
+        // after it first.
+        store
+            .record_roster_tag_keys(&gid(1), &[key(3, 1), key(3, 2), key(3, 3)], 500)
+            .unwrap();
+        store
+            .record_roster_tag_keys(&gid(1), &[key(3, 1)], 500)
+            .unwrap();
+        store.prune_roster_tag_keys(400, 2).unwrap();
+        assert_eq!(
+            store.roster_tag_keys(&gid(1), 0).unwrap(),
+            vec![key(1, 4), key(2, 14), key(3, 1), key(3, 3)]
         );
     }
 

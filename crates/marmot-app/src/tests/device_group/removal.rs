@@ -265,8 +265,21 @@ async fn removing_a_device_takes_it_out_of_the_device_group_and_its_chats() {
     assert_eq!(slot_deletions(&relay, &account_id_hex, &laptop_slot), 0);
     assert_eq!(slots_withdrawn(&phone_app), [false]);
 
+    // A sibling whose clock runs ahead drops the record before the phone's
+    // next pass. The phone saw it when it committed the removal, so it does
+    // not commit it again on its own (mdk#2761).
+    commit_roster(
+        &mut phone,
+        &group,
+        vec![DeviceRosterOperationV1::RemoveRejectedSlot(
+            laptop_slot_bytes,
+        )],
+    )
+    .await;
+    let epoch = phone.runtime.group_record(&group).unwrap().epoch;
     let before_deletion = crate::unix_now_seconds();
     phone.run_due_maintenance().await.unwrap();
+    assert_eq!(phone.runtime.group_record(&group).unwrap().epoch, epoch);
     assert!(slot_deletions(&relay, &account_id_hex, &laptop_slot) > 0);
     assert!(
         relay
@@ -286,20 +299,6 @@ async fn removing_a_device_takes_it_out_of_the_device_group_and_its_chats() {
         deletions,
         "a finished removal sends nothing more"
     );
-
-    // A sibling whose clock runs ahead drops the record early. The phone has
-    // seen it, so it does not commit it again on its own (mdk#2761).
-    commit_roster(
-        &mut phone,
-        &group,
-        vec![DeviceRosterOperationV1::RemoveRejectedSlot(
-            laptop_slot_bytes,
-        )],
-    )
-    .await;
-    let epoch = phone.runtime.group_record(&group).unwrap().epoch;
-    phone.run_due_maintenance().await.unwrap();
-    assert_eq!(phone.runtime.group_record(&group).unwrap().epoch, epoch);
 }
 
 /// A device that did not decide a removal cleans up after it all the same.

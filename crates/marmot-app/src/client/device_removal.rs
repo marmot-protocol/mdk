@@ -226,9 +226,12 @@ impl AppClient {
                     None,
                 )?;
             }
-            return self
-                .commit_device_removal(group_id, roster, &slot, removal.requested_at)
-                .await;
+            self.commit_device_removal(group_id, roster, &slot, removal.requested_at)
+                .await?;
+            // A sibling's expiry pass can drop the record before the next
+            // pass reads it; seen now, it is not made again alone.
+            self.note_removed_record_seen(group_id, &slot, removal)?;
+            return Ok(());
         }
         // Not listed: removed, its `removed` record has expired since, or a
         // failed link's undo took the entry. The slot is deleted until a
@@ -324,16 +327,31 @@ impl AppClient {
             .reject_device_slots(group_id, &held, vec![(*slot, record)], context)
             .await?;
         self.observe_drained_session_events(&effects).await?;
+        if self.note_removed_record_seen(group_id, slot, removal)? {
+            self.linked_devices_changed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether the trusted roster records `slot` of `group_id` as `removed`.
+    /// If it does, `removal`'s record counts as seen this run, so it is not
+    /// made again alone ([`Self::record_removal_alone`]).
+    fn note_removed_record_seen(
+        &mut self,
+        group_id: &GroupId,
+        slot: &DeviceSlotId,
+        removal: &DeviceRemovalRecord,
+    ) -> Result<bool, AppError> {
         let recorded = self
             .trusted_device_roster()?
             .filter(|(trusted, _)| trusted == group_id)
             .and_then(|(_, roster)| roster.rejected_slots.get(slot).cloned())
             .is_some_and(|record| record.reason == RejectedSlotReasonV1::Removed);
         if recorded {
-            self.removed_records_seen.insert(seen);
-            self.linked_devices_changed = true;
+            self.removed_records_seen
+                .insert((removal.group_id_hex.clone(), removal.slot_hex.clone()));
         }
-        Ok(())
+        Ok(recorded)
     }
 
     /// One commit in the device group that removes the device in `slot`:
