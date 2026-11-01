@@ -366,7 +366,17 @@ mod tests {
     #[test]
     fn concurrent_publishes_stage_to_their_own_files() {
         let template = Path::new("binary.migrated-template-1-1.sqlite");
-        assert_ne!(staging_path(template), staging_path(template));
+        let first = staging_path(template);
+        assert_ne!(
+            first,
+            staging_path(template),
+            "another publish in this process"
+        );
+        let name = first.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.contains(&format!(".{}-", std::process::id())),
+            "another process's publish: nextest runs each test in its own: {name}"
+        );
     }
 
     #[test]

@@ -404,62 +404,67 @@ mod tests {
     }
 
     fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(primary),
-            Some("database is locked".to_string()),
-        )
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(primary), None)
     }
 
+    /// Error classes reach the bindings: `Busy` is retried, `Capacity` shows
+    /// as storage full, and `Corruption` drives recovery. Extended result
+    /// codes collapse to their primary code, and an unrecognized or
+    /// encrypted file (NOTADB) is not proof of corruption.
     #[test]
-    fn busy_and_locked_are_classified_transient() {
-        assert!(is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_BUSY)));
-        assert!(is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_LOCKED)));
-        // Extended result codes collapse to the primary code via
-        // `sqlite_error_code`, so they classify as transient too.
-        assert!(is_busy_error(&sqlite_failure(
-            rusqlite::ffi::SQLITE_BUSY_RECOVERY
-        )));
-        assert!(is_busy_error(&sqlite_failure(
-            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE
-        )));
-    }
-
-    #[test]
-    fn other_sqlite_errors_are_not_transient() {
-        assert!(!is_busy_error(&sqlite_failure(
-            rusqlite::ffi::SQLITE_CORRUPT
-        )));
-        assert!(!is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_FULL)));
-        assert!(!is_busy_error(&rusqlite::Error::QueryReturnedNoRows));
-    }
-
-    #[test]
-    fn map_sqlite_error_routes_busy_to_busy_variant() {
-        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_BUSY));
-        assert!(
-            matches!(mapped, StorageError::Busy(_)),
-            "SQLITE_BUSY must map to StorageError::Busy, got {mapped:?}"
-        );
-        assert!(mapped.is_transient());
-    }
-
-    #[test]
-    fn sqlite_corruption_and_capacity_keep_typed_failure_classes() {
-        let corruption = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT));
-        assert!(matches!(corruption, StorageError::Corruption(_)));
-        assert!(!corruption.is_transient());
-        let capacity = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_FULL));
-        assert!(matches!(capacity, StorageError::Capacity(_)));
-        assert!(!capacity.is_transient());
-    }
-
-    #[test]
-    fn map_sqlite_error_routes_other_errors_to_backend() {
-        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_NOTADB));
-        assert!(
-            matches!(mapped, StorageError::Backend(_)),
-            "an unrecognized/encrypted database is not proof of corruption: {mapped:?}"
-        );
-        assert!(!mapped.is_transient());
+    fn sqlite_errors_keep_their_failure_class() {
+        use rusqlite::ffi;
+        type Variant = fn(String) -> StorageError;
+        let rows: [(&str, rusqlite::Error, Variant); 8] = [
+            ("BUSY", sqlite_failure(ffi::SQLITE_BUSY), StorageError::Busy),
+            (
+                "LOCKED",
+                sqlite_failure(ffi::SQLITE_LOCKED),
+                StorageError::Busy,
+            ),
+            (
+                "BUSY_RECOVERY",
+                sqlite_failure(ffi::SQLITE_BUSY_RECOVERY),
+                StorageError::Busy,
+            ),
+            (
+                "LOCKED_SHAREDCACHE",
+                sqlite_failure(ffi::SQLITE_LOCKED_SHAREDCACHE),
+                StorageError::Busy,
+            ),
+            (
+                "CORRUPT",
+                sqlite_failure(ffi::SQLITE_CORRUPT),
+                StorageError::Corruption,
+            ),
+            (
+                "FULL",
+                sqlite_failure(ffi::SQLITE_FULL),
+                StorageError::Capacity,
+            ),
+            (
+                "NOTADB",
+                sqlite_failure(ffi::SQLITE_NOTADB),
+                StorageError::Backend,
+            ),
+            (
+                "no rows",
+                rusqlite::Error::QueryReturnedNoRows,
+                StorageError::Backend,
+            ),
+        ];
+        for (name, error, variant) in rows {
+            let expected = variant(error.to_string());
+            let busy = matches!(expected, StorageError::Busy(_));
+            assert_eq!(is_busy_error(&error), busy, "{name}");
+            let mapped = map_sqlite_error(error);
+            assert_eq!(
+                std::mem::discriminant(&mapped),
+                std::mem::discriminant(&expected),
+                "{name}: {mapped:?}"
+            );
+            assert_eq!(mapped.to_string(), expected.to_string(), "{name}");
+            assert_eq!(mapped.is_transient(), busy, "{name}");
+        }
     }
 }

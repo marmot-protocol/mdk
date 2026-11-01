@@ -87,5 +87,7 @@ fn cached_statement_measurement_counts_executions_once() {
         })
         .1
     };
-    assert_eq!(run(10), run(1) * 10);
+    let once = run(1);
+    assert!(once > 0, "measure counted no VM steps");
+    assert_eq!(run(10), once * 10);
 }

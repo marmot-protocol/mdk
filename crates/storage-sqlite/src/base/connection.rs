@@ -1623,8 +1623,22 @@ mod tests {
         for enabled in [false, true, false, true] {
             store.set_timing_observer(enabled.then(|| observer.clone()));
             if !enabled {
-                let _guard = store.connection.inner.timing.lock().unwrap();
-                assert!(store.connection.start_timing().is_none());
+                // On another thread, so a check that takes the held lock
+                // blocks there instead of relocking it on this one.
+                let guard = store.connection.inner.timing.lock().unwrap();
+                let connection = store.connection.clone();
+                let (skipped_tx, skipped_rx) = mpsc::channel();
+                let probe = std::thread::spawn(move || {
+                    let _ = skipped_tx.send(connection.start_timing().is_none());
+                });
+                let skipped = skipped_rx.recv_timeout(Duration::from_secs(5));
+                drop(guard);
+                probe.join().unwrap();
+                assert_eq!(
+                    skipped,
+                    Ok(true),
+                    "a disabled observer must not take the timing lock"
+                );
             }
             drop(store.lock().unwrap());
         }
@@ -1648,9 +1662,12 @@ mod tests {
             s.lock()?
                 .execute("INSERT INTO timing_test VALUES(1)", [])
                 .storage()?;
-            Err(StorageError::Closed("deliberate rollback".into()))
+            Err(StorageError::Backend("deliberate rollback".into()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(detail)) if detail == "deliberate rollback"),
+            "{result:?}"
+        );
         let count: i64 = store
             .lock()
             .unwrap()
@@ -1669,7 +1686,7 @@ mod tests {
     fn read_snapshot_pins_foreign_writes_and_mls_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("read-snapshot.db");
-        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let key = SqlCipherKey::raw([0x42; 32]);
         let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         reader
@@ -1733,7 +1750,14 @@ mod tests {
                 Ok(())
             })
         };
+        let query_only = |s: &SqliteAccountStorage| -> bool {
+            s.lock()
+                .unwrap()
+                .pragma_query_value(None, "query_only", |r| r.get(0))
+                .unwrap()
+        };
         store.with_read_snapshot(assert_readonly).unwrap();
+        assert!(!query_only(&store), "the snapshot must restore writes");
         let result: StorageResult<()> = store.with_transaction(|outer| {
             outer
                 .lock()?
@@ -1744,39 +1768,61 @@ mod tests {
                 assert_readonly(s)?;
                 Err(StorageError::Backend("fixture error".into()))
             });
-            assert!(failed.is_err());
+            assert!(
+                matches!(&failed, Err(StorageError::Backend(detail)) if detail == "fixture error"),
+                "{failed:?}"
+            );
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _: StorageResult<()> = outer.with_read_snapshot(|s| {
                     assert_readonly(s)?;
                     panic!("fixture panic")
                 });
             }));
-            assert!(panicked.is_err());
+            assert_eq!(
+                panicked.unwrap_err().downcast_ref::<&str>(),
+                Some(&"fixture panic")
+            );
             outer
                 .lock()?
                 .execute("INSERT INTO capture_test VALUES(2)", [])
                 .storage()?;
             Err(StorageError::Backend("rollback outer".into()))
         });
-        assert!(result.is_err());
-        let count: i64 = store
+        assert!(
+            matches!(&result, Err(StorageError::Backend(detail)) if detail == "rollback outer"),
+            "every snapshot exit must leave the outer transaction writable: {result:?}"
+        );
+        store
+            .with_transaction(|s| {
+                s.lock()?
+                    .execute("INSERT INTO capture_test VALUES(3)", [])
+                    .storage()
+            })
+            .unwrap();
+        let values: Vec<i64> = store
             .lock()
             .unwrap()
-            .query_row("SELECT count(*) FROM capture_test", [], |r| r.get(0))
+            .prepare("SELECT value FROM capture_test")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(count, 0, "read capture must not commit the caller's writes");
+        assert_eq!(
+            values,
+            [3],
+            "read capture must not commit the caller's writes"
+        );
         store
             .lock()
             .unwrap()
             .execute_batch("PRAGMA query_only=ON")
             .unwrap();
         store.with_read_snapshot(assert_readonly).unwrap();
-        let query_only: bool = store
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "query_only", |r| r.get(0))
-            .unwrap();
-        assert!(query_only, "preserve the caller's already-read-only mode");
+        assert!(
+            query_only(&store),
+            "preserve the caller's already-read-only mode"
+        );
         store.close().unwrap();
         assert!(matches!(
             store.with_read_snapshot(|_| Ok::<_, StorageError>(())),
@@ -1829,17 +1875,45 @@ mod tests {
     fn open_delete_journal_store(path: &Path) -> SqliteAccountStorage {
         SqliteAccountStorage::open_encrypted_with_options(
             path,
-            &SqlCipherKey::new("delete journal transaction boundary key").unwrap(),
+            &SqlCipherKey::raw([0xde; 32]),
             delete_journal_options(),
         )
         .unwrap()
     }
 
+    /// A writer, and a second connection to the same rollback-journal file
+    /// that holds a read transaction open, so the writer's `COMMIT` is busy
+    /// until `reader` commits.
+    fn writer_with_a_reading_connection(
+        dir: &tempfile::TempDir,
+    ) -> (SqliteAccountStorage, SqliteAccountStorage) {
+        let path = dir.path().join("contended-commit.sqlite");
+        let writer = open_delete_journal_store(&path);
+        writer
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        let reader = open_delete_journal_store(&path);
+        let conn = reader.lock().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        (writer, reader)
+    }
+
+    fn insert_boundary_probe(storage: &SqliteAccountStorage, value: i64) -> StorageResult<()> {
+        storage
+            .lock()?
+            .execute("INSERT INTO boundary_probe (value) VALUES (?1)", [value])
+            .storage()
+            .map(drop)
+    }
+
     fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(primary),
-            Some("database is locked".to_string()),
-        )
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(primary), None)
     }
 
     fn trace_sqlcipher_setup(sql: &str) {
@@ -1966,28 +2040,6 @@ mod tests {
     }
 
     #[test]
-    fn transaction_rolls_back_openmls_writes_on_error() {
-        use crate::base::test_support::TestGroupState;
-        use cgka_traits::storage::StorageError;
-        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
-
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let group_id = openmls::group::GroupId::from_slice(b"transaction-rollback");
-
-        let result: Result<(), StorageError> = store.with_transaction(|storage| {
-            storage
-                .mls_storage()
-                .write_group_state(&group_id, &TestGroupState(b"partial".to_vec()))
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-            Err(StorageError::Backend("force rollback".to_string()))
-        });
-
-        assert!(result.is_err());
-        let persisted: Option<TestGroupState> = store.mls_storage().group_state(&group_id).unwrap();
-        assert_eq!(persisted, None);
-    }
-
-    #[test]
     fn failed_group_savepoint_undoes_only_its_own_work_inside_a_committing_transaction() {
         use crate::base::test_support::{TestGroupState, gid, mid, sample_group, sample_message};
         use cgka_traits::storage::{GroupStorage, MessageStorage};
@@ -2018,7 +2070,10 @@ mod tests {
                         generation_inside = inner.mls_write_generation();
                         Err(StorageError::Backend("abandon the unit".into()))
                     });
-                assert!(failed.is_err());
+                assert!(
+                    matches!(&failed, Err(StorageError::Backend(detail)) if detail == "abandon the unit"),
+                    "{failed:?}"
+                );
                 assert_ne!(
                     outer.mls_write_generation(),
                     generation_inside,
@@ -2111,7 +2166,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("savepoint-rollback-failure.db");
-        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let key = SqlCipherKey::raw([0x42; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
 
         let committed = store.with_transaction(|outer| -> StorageResult<()> {
@@ -2189,25 +2244,44 @@ mod tests {
     {
     }
 
+    /// OpenMLS writes join the caller's transaction instead of opening their
+    /// own (#421): they commit with it, and roll back with it.
     #[test]
-    fn transaction_allows_openmls_list_mutations_inside_outer_transaction() {
-        use cgka_traits::storage::StorageError;
+    fn openmls_writes_commit_and_roll_back_with_the_callers_transaction() {
+        use crate::base::test_support::TestGroupState;
         use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
 
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let group_id = openmls::group::GroupId::from_slice(b"transaction-list-mutation");
-
+        let committed = openmls::group::GroupId::from_slice(b"transaction-list-mutation");
         store
             .with_transaction(|storage| {
                 storage
                     .mls_storage()
-                    .append_own_leaf_node(&group_id, &TestLeafNode(b"leaf".to_vec()))
+                    .append_own_leaf_node(&committed, &TestLeafNode(b"leaf".to_vec()))
                     .map_err(|e| StorageError::Backend(e.to_string()))
             })
             .unwrap();
-
-        let leaves: Vec<TestLeafNode> = store.mls_storage().own_leaf_nodes(&group_id).unwrap();
+        let leaves: Vec<TestLeafNode> = store.mls_storage().own_leaf_nodes(&committed).unwrap();
         assert_eq!(leaves, vec![TestLeafNode(b"leaf".to_vec())]);
+
+        let rolled_back = openmls::group::GroupId::from_slice(b"transaction-rollback");
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            let mls = storage.mls_storage();
+            mls.write_group_state(&rolled_back, &TestGroupState(b"partial".to_vec()))
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            mls.append_own_leaf_node(&rolled_back, &TestLeafNode(b"leaf".to_vec()))
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(detail)) if detail == "force rollback"),
+            "{result:?}"
+        );
+        let persisted: Option<TestGroupState> =
+            store.mls_storage().group_state(&rolled_back).unwrap();
+        assert_eq!(persisted, None);
+        let leaves: Vec<TestLeafNode> = store.mls_storage().own_leaf_nodes(&rolled_back).unwrap();
+        assert!(leaves.is_empty(), "{leaves:?}");
     }
 
     #[test]
@@ -2250,19 +2324,7 @@ mod tests {
     #[test]
     fn delete_journal_transient_commit_contention_retries_boundary_not_closure() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transient-commit.sqlite");
-        let writer = open_delete_journal_store(&path);
-        {
-            let conn = writer.lock().unwrap();
-            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
-                .unwrap();
-        }
-        let reader = open_delete_journal_store(&path);
-        let reader_conn = reader.lock().unwrap();
-        reader_conn.execute_batch("BEGIN").unwrap();
-        let _: i64 = reader_conn
-            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
-            .unwrap();
+        let (writer, reader) = writer_with_a_reading_connection(&dir);
 
         let closure_calls = Arc::new(AtomicU32::new(0));
         let worker_calls = closure_calls.clone();
@@ -2271,10 +2333,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             worker_store.with_transaction(|storage| {
                 worker_calls.fetch_add(1, Ordering::SeqCst);
-                storage
-                    .lock()?
-                    .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
-                    .storage()?;
+                insert_boundary_probe(storage, 1)?;
                 closure_done_tx.send(()).unwrap();
                 Ok::<_, StorageError>(())
             })
@@ -2297,8 +2356,7 @@ mod tests {
             "transaction ownership must remain held while COMMIT is retrying",
         );
 
-        reader_conn.execute_batch("COMMIT").unwrap();
-        drop(reader_conn);
+        reader.lock().unwrap().execute_batch("COMMIT").unwrap();
         worker
             .join()
             .unwrap()
@@ -2324,28 +2382,12 @@ mod tests {
     #[test]
     fn delete_journal_persistent_commit_contention_returns_busy_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("persistent-commit.sqlite");
-        let writer = open_delete_journal_store(&path);
-        {
-            let conn = writer.lock().unwrap();
-            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
-                .unwrap();
-        }
-        let reader = open_delete_journal_store(&path);
-        let reader_conn = reader.lock().unwrap();
-        reader_conn.execute_batch("BEGIN").unwrap();
-        let _: i64 = reader_conn
-            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
-            .unwrap();
+        let (writer, reader) = writer_with_a_reading_connection(&dir);
 
         let mut closure_calls = 0;
         let result: StorageResult<()> = writer.with_transaction(|storage| {
             closure_calls += 1;
-            storage
-                .lock()?
-                .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
-                .storage()?;
-            Ok(())
+            insert_boundary_probe(storage, 1)
         });
 
         assert!(
@@ -2369,16 +2411,9 @@ mod tests {
             "failed COMMIT must be rolled back before ownership is released",
         );
 
-        reader_conn.execute_batch("COMMIT").unwrap();
-        drop(reader_conn);
+        reader.lock().unwrap().execute_batch("COMMIT").unwrap();
         writer
-            .with_transaction(|storage| {
-                storage
-                    .lock()?
-                    .execute("INSERT INTO boundary_probe (value) VALUES (2)", [])
-                    .storage()?;
-                Ok::<_, StorageError>(())
-            })
+            .with_transaction(|storage| insert_boundary_probe(storage, 2))
             .expect("connection must remain usable after contended COMMIT rollback");
         let values: i64 = writer
             .lock()
@@ -2391,10 +2426,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_journal_fatal_commit_failure_rolls_back_and_cleans_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fatal-commit.sqlite");
-        let store = open_delete_journal_store(&path);
+    fn fatal_commit_failure_rolls_back_and_cleans_up() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         {
             let conn = store.lock().unwrap();
             conn.execute_batch(
@@ -2417,7 +2450,8 @@ mod tests {
         });
 
         assert!(
-            matches!(result, Err(StorageError::Backend(_))),
+            matches!(&result, Err(StorageError::Backend(detail))
+                if detail.contains("sqlite transaction COMMIT") && detail.contains("FOREIGN KEY")),
             "deferred constraint failure must remain fatal Backend, got {result:?}",
         );
         assert_eq!(closure_calls, 1, "fatal COMMIT must not rerun the closure");
@@ -2443,104 +2477,79 @@ mod tests {
             .expect("connection must remain usable after fatal COMMIT rollback");
     }
 
+    /// `retry_transaction_boundary` (and the `retry_on_busy` loop under it)
+    /// retries BUSY and LOCKED in place, gives up after `BUSY_MAX_ATTEMPTS`
+    /// with the last `Busy`, returns any other failure at once, and keeps
+    /// the boundary in the error.
     #[test]
-    fn delete_journal_rollback_boundary_retries_busy_and_locked_in_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollback-classification.sqlite");
-        let store = open_delete_journal_store(&path);
-        assert_eq!(
-            pragma_string(&store.lock().unwrap(), "journal_mode"),
-            "delete"
-        );
-
-        let mut calls = 0;
-        retry_transaction_boundary("ROLLBACK", || {
-            calls += 1;
-            match calls {
-                1 => Err(BoundaryOutcome::Sqlite(sqlite_failure(
-                    rusqlite::ffi::SQLITE_BUSY,
-                ))),
-                2 => Err(BoundaryOutcome::Sqlite(sqlite_failure(
-                    rusqlite::ffi::SQLITE_LOCKED,
-                ))),
-                _ => Ok(()),
+    fn transaction_boundaries_retry_busy_in_place_and_keep_failure_classes() {
+        use rusqlite::ffi::{SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_LOCKED};
+        // `None` is the class of a boundary that succeeded.
+        type Class = Option<fn(String) -> StorageError>;
+        let ok: Class = None;
+        let busy: Class = Some(StorageError::Busy);
+        let backend: Class = Some(StorageError::Backend);
+        // (boundary, codes it fails with in turn, then succeeds or repeats
+        // the last code forever, expected class, expected attempts)
+        let rows: [(&str, &[std::os::raw::c_int], bool, Class, u32); 3] = [
+            ("ROLLBACK", &[SQLITE_BUSY, SQLITE_LOCKED], true, ok, 3),
+            ("ROLLBACK", &[SQLITE_LOCKED], false, busy, BUSY_MAX_ATTEMPTS),
+            ("ROLLBACK", &[SQLITE_CONSTRAINT], false, backend, 1),
+        ];
+        for (sql, codes, then_succeeds, class, attempts) in rows {
+            let mut calls = 0;
+            let result = retry_transaction_boundary(sql, || {
+                calls += 1;
+                match codes.get(calls - 1) {
+                    None if then_succeeds => Ok(()),
+                    code => Err(BoundaryOutcome::Sqlite(sqlite_failure(
+                        *code.unwrap_or(codes.last().unwrap()),
+                    ))),
+                }
+            });
+            let case = format!("{sql} failing with {codes:?}: {result:?}");
+            match (class, &result) {
+                (None, Ok(())) => {}
+                (Some(variant), Err(error)) => {
+                    assert_eq!(
+                        std::mem::discriminant(error),
+                        std::mem::discriminant(&variant(String::new())),
+                        "{case}"
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("sqlite transaction {sql}")),
+                        "the error keeps the boundary: {case}"
+                    );
+                }
+                _ => panic!("{case}"),
             }
-        })
-        .expect("transient rollback boundary failures should be retried");
-        assert_eq!(calls, 3);
-
-        let mut persistent_calls = 0;
-        let result = retry_transaction_boundary("ROLLBACK", || {
-            persistent_calls += 1;
-            Err(BoundaryOutcome::Sqlite(sqlite_failure(
-                rusqlite::ffi::SQLITE_LOCKED,
-            )))
-        });
-        assert!(
-            matches!(result, Err(StorageError::Busy(_))),
-            "exhausted ROLLBACK lock contention must remain Busy, got {result:?}",
-        );
-        assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("sqlite transaction ROLLBACK"),
-            "busy classification should retain transaction-boundary context",
-        );
-        assert_eq!(persistent_calls, BUSY_MAX_ATTEMPTS);
+            assert_eq!(calls, attempts as usize, "{case}");
+        }
     }
 
+    /// One key kind: both reach the same `apply_sqlcipher_key` path, and the
+    /// raw key is the one the app uses.
     #[test]
     fn encrypted_connection_applies_operational_defaults() {
         use_production_storage_for_test_process();
-        for key in [
-            SqlCipherKey::new("operational defaults key").unwrap(),
-            SqlCipherKey::raw([0x42; 32]),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("marmot.sqlite");
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            let conn = store.lock().unwrap();
-
-            assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
-            assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
-            assert_eq!(pragma_i64(&conn, "secure_delete"), 1);
-            assert_eq!(pragma_i64(&conn, "temp_store"), 2);
-            assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
-            assert_eq!(pragma_i64(&conn, "synchronous"), 2);
-            assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
-            assert_eq!(pragma_string(&conn, "cipher_use_hmac"), "1");
-            assert_eq!(pragma_string(&conn, "kdf_iter"), "256000");
-            assert_eq!(pragma_string(&conn, "cipher_page_size"), "4096");
-        }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn account_db_and_sidecars_are_owner_only_on_disk() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("on-disk mode key").unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        // Force a WAL write so the -wal/-shm sidecars exist.
-        store
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE mode_probe (id INTEGER); INSERT INTO mode_probe VALUES (1);",
-            )
-            .unwrap();
+        let store =
+            SqliteAccountStorage::open_encrypted(&path, &SqlCipherKey::raw([0x42; 32])).unwrap();
+        let conn = store.lock().unwrap();
 
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
-            assert!(sidecar.exists(), "expected {suffix} sidecar to exist");
-            assert_eq!(mode(&sidecar), 0o600, "sidecar {suffix} should be 0600");
-        }
+        assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
+        assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
+        assert_eq!(pragma_i64(&conn, "secure_delete"), 1);
+        assert_eq!(pragma_i64(&conn, "temp_store"), 2);
+        assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
+        assert_eq!(pragma_i64(&conn, "synchronous"), 2);
+        assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
+        assert_eq!(pragma_string(&conn, "cipher_use_hmac"), "1");
+        assert_eq!(pragma_string(&conn, "kdf_iter"), "256000");
+        assert_eq!(pragma_string(&conn, "cipher_page_size"), "4096");
     }
 
     /// The load-bearing assertion for the iOS `0xdead10cc` fix: after `close`,
@@ -2553,7 +2562,7 @@ mod tests {
     fn close_releases_wal_locks_and_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("close releases locks key").unwrap();
+        let key = SqlCipherKey::raw([0x43; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
             .lock()
@@ -2614,7 +2623,7 @@ mod tests {
     fn closer_closes_every_live_handle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("closer closes live handles key").unwrap();
+        let key = SqlCipherKey::raw([0x44; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
             .lock()
@@ -2644,7 +2653,7 @@ mod tests {
     fn closer_does_not_keep_dropped_handles_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("closer weak reference key").unwrap();
+        let key = SqlCipherKey::raw([0x45; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
             .lock()
@@ -2799,17 +2808,25 @@ mod tests {
         entered_rx.recv().unwrap();
 
         let waiter_connection = shared.clone();
-        let waiter = std::thread::spawn(move || waiter_connection.lock().map(|_| ()));
+        let (woken_tx, woken_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = woken_tx.send(waiter_connection.lock().map(|_| ()));
+        });
 
         // Give the waiter time to park on the condvar, then close under it.
+        // Losing that race only lets the waiter see the close without
+        // parking; it cannot make the test fail.
         std::thread::sleep(Duration::from_millis(100));
         shared.close().unwrap();
-        release_tx.send(()).unwrap();
 
+        // The holder still holds the slot: only the close can wake the waiter.
+        let woken = woken_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
         assert!(
-            matches!(waiter.join().unwrap(), Err(StorageError::Closed(_))),
-            "a parked waiter must be woken with Closed",
+            matches!(woken, Ok(Err(StorageError::Closed(_)))),
+            "a parked waiter must be woken with Closed before the holder finishes: {woken:?}",
         );
+        waiter.join().unwrap();
         let _ = holder.join().unwrap();
     }
 
@@ -2822,7 +2839,7 @@ mod tests {
     fn close_under_a_live_writer_is_prompt_and_leaves_no_torn_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("torn write probe key").unwrap();
+        let key = SqlCipherKey::raw([0x46; 32]);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
             .lock()
@@ -2833,8 +2850,15 @@ mod tests {
             .unwrap();
 
         let writer_store = store.clone();
+        let (committed_tx, committed_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
-            for id in 0..10_000i64 {
+            // Writes until the close stops it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            for id in 0i64.. {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the close never stopped the writer"
+                );
                 // Both inserts land, or neither does. Nothing else is allowed.
                 let result: Result<(), StorageError> =
                     writer_store.connection.with_transaction(|| {
@@ -2853,11 +2877,14 @@ mod tests {
                     );
                     return;
                 }
+                let _ = committed_tx.send(());
             }
         });
 
-        // Let the writer get going, then close out from under it.
-        std::thread::sleep(Duration::from_millis(50));
+        // Close out from under the writer once it has committed.
+        committed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer commits before the close");
         let started_at = std::time::Instant::now();
         store.close().unwrap();
         let close_elapsed = started_at.elapsed();
@@ -2880,7 +2907,7 @@ mod tests {
             left, right,
             "a transaction interrupted by close must be rolled back whole",
         );
-        assert!(left > 0, "the writer should have committed something first");
+        assert!(left > 0, "the writer committed before the close");
     }
 
     #[test]
@@ -2890,8 +2917,24 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("tighten mode key").unwrap();
-        drop(SqliteAccountStorage::open_encrypted(&path, &key).unwrap());
+        let key = SqlCipherKey::raw([0x47; 32]);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        // A WAL write, so SQLite creates the -wal/-shm sidecars itself.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE mode_probe (id INTEGER); INSERT INTO mode_probe VALUES (1);",
+            )
+            .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(sidecar.exists(), "expected {suffix} sidecar to exist");
+            assert_eq!(mode(&sidecar), 0o600, "sidecar {suffix} should be 0600");
+        }
+        drop(store);
         let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
         // Simulate files left behind by builds that created them at the umask.
         for p in [&path, &wal] {
@@ -2904,7 +2947,6 @@ mod tests {
         // Assert while the store is open: the -wal sidecar is checkpointed
         // away on clean close.
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&wal), 0o600);
         drop(store);
@@ -2913,7 +2955,7 @@ mod tests {
     #[cfg(unix)]
     const TAKEOVER_PROBE_PATH: &str = "MDK_STORAGE_TEST_TAKEOVER_PROBE_PATH";
     #[cfg(unix)]
-    const TAKEOVER_PROBE_KEY: &str = "posix lock retention key";
+    const TAKEOVER_PROBE_KEY: [u8; 32] = [0x5a; 32];
 
     /// Child half of [`reopening_a_live_database_keeps_its_posix_locks`]: try
     /// to take the database exclusively and write. Passes only when SQLite
@@ -2924,7 +2966,7 @@ mod tests {
         let Some(path) = std::env::var_os(TAKEOVER_PROBE_PATH) else {
             return;
         };
-        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let key = SqlCipherKey::raw(TAKEOVER_PROBE_KEY);
         let connection = rusqlite::Connection::open(path).unwrap();
         apply_cipher_pragmas(&connection, &SqliteStorageOptions::default()).unwrap();
         apply_sqlcipher_key(&connection, &key).unwrap();
@@ -2975,7 +3017,7 @@ mod tests {
     fn reopening_a_live_database_keeps_its_posix_locks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let key = SqlCipherKey::raw(TAKEOVER_PROBE_KEY);
         let live = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         // A WAL write so the -wal/-shm sidecars exist and the next open's file
         // preparation reaches them too.
@@ -3007,160 +3049,99 @@ mod tests {
         }
     }
 
+    /// Asserts the traced setup pinned `cipher_compatibility`, then enabled
+    /// `cipher_memory_security`, both before `PRAGMA key` and its probe.
+    fn assert_cipher_pragmas_precede_keying() {
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        let position = |step: &str| {
+            statements
+                .iter()
+                .position(|statement| *statement == step)
+                .unwrap_or_else(|| panic!("{step} was not traced: {statements:?}"))
+        };
+        let order = [
+            "cipher_compatibility",
+            "cipher_memory_security",
+            "key",
+            "key_probe",
+        ]
+        .map(position);
+        assert!(
+            order.is_sorted(),
+            "cipher pragmas must precede SQLCipher keying and its probe: {statements:?}"
+        );
+    }
+
+    /// One key kind for this and the next test: both reach the same
+    /// `apply_sqlcipher_key` path, and the raw key is the one the app uses.
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
         use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
-        for key in [
-            SqlCipherKey::new("trace setup key").unwrap(),
-            SqlCipherKey::raw([0x42; 32]),
-        ] {
-            TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("marmot.sqlite")).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
 
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("marmot.sqlite");
-            let connection = rusqlite::Connection::open(path).unwrap();
-            connection.trace_v2(
-                TraceEventCodes::SQLITE_TRACE_STMT,
-                Some(trace_sqlcipher_setup_event),
-            );
+        let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
+            connection,
+            &SqlCipherKey::raw([0x42; 32]),
+            SqliteStorageOptions::default(),
+        )
+        .unwrap();
 
-            let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
-                connection,
-                &key,
-                SqliteStorageOptions::default(),
-            )
-            .unwrap();
-
-            let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
-            let cipher_compatibility = statements
-                .iter()
-                .position(|statement| *statement == "cipher_compatibility")
-                .expect("cipher_compatibility pragma was traced");
-            let cipher_memory_security = statements
-                .iter()
-                .position(|statement| *statement == "cipher_memory_security")
-                .expect("cipher_memory_security pragma was traced");
-            let key = statements
-                .iter()
-                .position(|statement| *statement == "key")
-                .expect("key pragma was traced");
-            let key_probe = statements
-                .iter()
-                .position(|statement| *statement == "key_probe")
-                .expect("keying probe was traced");
-
-            assert!(
-                cipher_compatibility < key,
-                "cipher_compatibility must be pinned before SQLCipher keying",
-            );
-            assert!(
-                cipher_compatibility < key_probe,
-                "cipher_compatibility must be pinned before the keying probe",
-            );
-            assert!(
-                cipher_memory_security < key,
-                "cipher_memory_security must be enabled before SQLCipher keying",
-            );
-            assert!(
-                cipher_memory_security < key_probe,
-                "cipher_memory_security must be enabled before the keying probe",
-            );
-            assert!(cipher_compatibility < cipher_memory_security);
-            assert!(key < key_probe);
-        }
+        assert_cipher_pragmas_precede_keying();
     }
 
     #[test]
     fn public_hardened_open_pins_cipher_pragmas_before_keying() {
         use_production_storage_for_test_process();
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
-        for key in [
-            SqlCipherKey::new("public hardened key").unwrap(),
-            SqlCipherKey::raw([0x42; 32]),
-        ] {
-            TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("hardened.sqlite")).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
 
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("hardened.sqlite");
-            let connection = rusqlite::Connection::open(path).unwrap();
-            connection.trace_v2(
-                TraceEventCodes::SQLITE_TRACE_STMT,
-                Some(trace_sqlcipher_setup_event),
-            );
+        open_hardened_sqlcipher(
+            &connection,
+            &SqlCipherKey::raw([0x42; 32]),
+            SqlCipherHardening::live_cache(),
+        )
+        .unwrap();
 
-            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
-
-            let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
-            let cipher_compatibility = statements
-                .iter()
-                .position(|statement| *statement == "cipher_compatibility")
-                .expect("cipher_compatibility pragma was traced");
-            let cipher_memory_security = statements
-                .iter()
-                .position(|statement| *statement == "cipher_memory_security")
-                .expect("cipher_memory_security pragma was traced");
-            let key = statements
-                .iter()
-                .position(|statement| *statement == "key")
-                .expect("key pragma was traced");
-            let key_probe = statements
-                .iter()
-                .position(|statement| *statement == "key_probe")
-                .expect("keying probe was traced");
-
-            assert!(
-                cipher_compatibility < key,
-                "cipher_compatibility must be pinned before SQLCipher keying",
-            );
-            assert!(
-                cipher_compatibility < key_probe,
-                "cipher_compatibility must be pinned before the keying probe",
-            );
-            assert!(
-                cipher_memory_security < key,
-                "cipher_memory_security must be enabled before SQLCipher keying",
-            );
-            assert!(
-                cipher_memory_security < key_probe,
-                "cipher_memory_security must be enabled before the keying probe",
-            );
-            assert!(cipher_compatibility < cipher_memory_security);
-            assert!(key < key_probe);
-        }
+        assert_cipher_pragmas_precede_keying();
     }
 
     #[test]
     fn public_hardened_open_applies_requested_privacy_pragmas() {
-        for key in [
-            SqlCipherKey::new("hardened privacy key").unwrap(),
-            SqlCipherKey::raw([0x42; 32]),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("hardened.sqlite");
+        let key = SqlCipherKey::raw([0x42; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("hardened.sqlite")).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
+        assert_eq!(pragma_i64(&connection, "temp_store"), 2);
+        drop(connection);
 
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
-            assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
-            assert_eq!(pragma_i64(&connection, "temp_store"), 2);
-            drop(connection);
-
-            // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
-            // left at the SQLCipher compile-time default, which is ON, so it is not
-            // asserted here — only the live-cache path opts into it explicitly.)
-            let path = dir.path().join("cipher-only.sqlite");
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
-            assert_ne!(pragma_i64(&connection, "temp_store"), 2);
-        }
+        // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
+        // left at the SQLCipher compile-time default, which is ON, so it is not
+        // asserted here — only the live-cache path opts into it explicitly.)
+        let connection = rusqlite::Connection::open(dir.path().join("cipher-only.sqlite")).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
+        assert_ne!(pragma_i64(&connection, "temp_store"), 2);
     }
 
     #[test]
     fn hardened_file_roundtrip_requires_the_correct_sqlcipher_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hardened-roundtrip.sqlite");
-        let key = SqlCipherKey::new("hardened correct key").unwrap();
-        let wrong_key = SqlCipherKey::new("hardened wrong key").unwrap();
+        let key = SqlCipherKey::raw([0x48; 32]);
+        let wrong_key = SqlCipherKey::raw([0x49; 32]);
 
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
@@ -3303,7 +3284,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_options_can_relax_operational_defaults_for_tests() {
+    fn custom_options_override_the_operational_defaults() {
         // From the defaults, so `synchronous` comes from the options.
         use_production_storage_for_test_process();
         let store = SqliteAccountStorage::in_memory_with_options(SqliteStorageOptions {
@@ -3321,6 +3302,7 @@ mod tests {
 
         assert_eq!(pragma_i64(&conn, "busy_timeout"), 250);
         assert_eq!(pragma_i64(&conn, "secure_delete"), 0);
+        assert_eq!(pragma_i64(&conn, "temp_store"), 0);
         assert_eq!(pragma_i64(&conn, "trusted_schema"), 1);
         assert_eq!(pragma_i64(&conn, "synchronous"), 1);
     }
@@ -3393,18 +3375,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_summary_does_not_count_existing_ledger_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("migration-summary.sqlite");
-        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
-        let first = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert!(first.migration_summary().0 > 0);
-        first.close().unwrap();
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(reopened.migration_summary().0, 0);
-    }
-
-    #[test]
     fn encrypted_file_roundtrip_requires_the_correct_sqlcipher_key() {
         use crate::base::test_support::{gid, sample_group};
         use cgka_traits::storage::GroupStorage;
@@ -3412,8 +3382,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("correct horse battery staple").unwrap();
-        let wrong_key = SqlCipherKey::new("wrong key").unwrap();
+        let key = SqlCipherKey::raw([0x4a; 32]);
+        let wrong_key = SqlCipherKey::raw([0x4b; 32]);
 
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -3423,7 +3393,11 @@ mod tests {
         let file_bytes = std::fs::read(&path).unwrap();
         assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
 
-        assert!(SqliteAccountStorage::open_encrypted(&path, &wrong_key).is_err());
+        let wrong = SqliteAccountStorage::open_encrypted(&path, &wrong_key).err();
+        assert!(
+            matches!(&wrong, Some(StorageError::Backend(detail)) if detail.contains("file is not a database")),
+            "{wrong:?}"
+        );
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(reopened.get_group(&gid(1)).unwrap().epoch, EpochId(3));
@@ -3439,109 +3413,33 @@ mod tests {
         assert!(busy_backoff(3) <= BUSY_BACKOFF_CAP);
     }
 
-    #[test]
-    fn retry_on_busy_retries_transient_then_succeeds() {
-        let mut calls = 0u32;
-        let result: Result<u32, StorageError> = retry_on_busy(|| {
-            calls += 1;
-            if calls < 3 {
-                Err(StorageError::Busy("locked".into()))
-            } else {
-                Ok(calls)
-            }
-        });
-        assert_eq!(result.unwrap(), 3, "should succeed once the busy clears");
-    }
-
-    #[test]
-    fn retry_on_busy_does_not_retry_fatal_errors() {
-        let mut calls = 0u32;
-        let result: Result<(), StorageError> = retry_on_busy(|| {
-            calls += 1;
-            Err(StorageError::Backend("fatal".into()))
-        });
-        assert!(matches!(result, Err(StorageError::Backend(_))));
-        assert_eq!(calls, 1, "fatal errors must not be retried");
-    }
-
-    #[test]
-    fn retry_on_busy_surfaces_busy_after_exhausting_attempts() {
-        let mut calls = 0u32;
-        let result: Result<(), StorageError> = retry_on_busy(|| {
-            calls += 1;
-            Err(StorageError::Busy("still locked".into()))
-        });
-        assert!(
-            matches!(result, Err(StorageError::Busy(_))),
-            "persistent busy must surface as a transient Busy error, not Backend"
-        );
-        assert_eq!(calls, BUSY_MAX_ATTEMPTS, "must use the full attempt budget");
-    }
-
-    // Regression for issue #484: a concurrent writer on a SECOND connection to
-    // the same database file briefly holds the SQLite write lock. With a busy
-    // timeout shorter than the hold, the first attempt sees SQLITE_BUSY; the
-    // storage layer's retry-with-backoff must wait it out so the send-path
-    // write succeeds instead of bubbling "database is locked" to the user.
+    /// Regression for issue #484: while another connection to the same file
+    /// holds the write lock, a transaction's `BEGIN IMMEDIATE` fails with
+    /// `SQLITE_BUSY`. The storage layer must retry it, so the send-path write
+    /// succeeds instead of surfacing "database is locked" to the user. The
+    /// holder commits only after the first attempt has failed.
     #[test]
     fn concurrent_writer_contention_is_retried_not_surfaced() {
         use crate::base::test_support::{gid, mid, sample_group, sample_message};
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
         use cgka_traits::storage::{GroupStorage, MessageStorage};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("contention.sqlite");
-        let key = SqlCipherKey::new("contention test key").unwrap();
-        // Short busy timeout so the *first* attempt fails fast and the win comes
-        // from the retry loop, not from SQLite's own busy_timeout wait.
-        let options = SqliteStorageOptions {
-            busy_timeout_ms: 50,
-            ..SqliteStorageOptions::default()
-        };
+        let db = SharedDatabase::new();
+        let store = db.open();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
 
-        let writer =
-            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-                .unwrap();
-        writer.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-
-        // A separate connection/handle to the same file holds an exclusive write
-        // transaction for longer than one busy-timeout window, then releases.
-        let hold = std::time::Duration::from_millis(200);
-        let blocker_options = options.clone();
-        let blocker_key = SqlCipherKey::new("contention test key").unwrap();
-        let blocker_path = path.clone();
-        let blocker = std::thread::spawn(move || {
-            let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                &blocker_path,
-                &blocker_key,
-                blocker_options,
-            )
-            .unwrap();
-            let conn = blocker.lock().unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            conn.execute(
-                "INSERT INTO cgka_groups (id, record) VALUES (?1, ?2)",
-                rusqlite::params![gid(2).as_slice(), b"blocker".as_slice()],
-            )
-            .ok();
-            std::thread::sleep(hold);
-            conn.execute_batch("COMMIT").unwrap();
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |other| {
+            other.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         });
+        let result: StorageResult<()> =
+            store.with_transaction(|s| s.put_message(&sample_message(mid(1), gid(1), 0)));
+        blocker.join();
 
-        // Give the blocker time to take the write lock before we try to write.
-        std::thread::sleep(std::time::Duration::from_millis(40));
-
-        // This write contends with the blocker. Without retry it would return
-        // a "database is locked" error after the 50ms busy timeout; with retry
-        // it waits out the 200ms hold and succeeds.
-        writer
-            .put_message(&sample_message(mid(1), gid(1), 0))
-            .expect("contended write must succeed via busy retry, not surface as failure");
-
-        blocker.join().unwrap();
-        assert_eq!(
-            writer.get_message(&mid(1)).unwrap().id,
-            mid(1),
-            "the message persisted after contention cleared"
+        result.expect("contended write must succeed via busy retry, not surface as failure");
+        assert_eq!(store.get_message(&mid(1)).unwrap().id, mid(1));
+        assert!(
+            store.get_group(&gid(2)).is_ok(),
+            "the holder's write committed first"
         );
     }
 
