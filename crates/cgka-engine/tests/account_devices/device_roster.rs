@@ -15,6 +15,7 @@
 //! account-devices tests.
 
 use super::activation::{buffer_unsettled, queued_intents};
+use super::send_intents::queue;
 use super::*;
 use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
@@ -1406,6 +1407,35 @@ async fn an_account_entry_replacement_is_refused_rather_than_queued() {
     };
     phone.engine.confirm_published(pending).await.unwrap();
     assert_eq!(roster_of(&phone, &gid).account, account(1, 8));
+}
+
+/// An account entry replacement made while an intent waits in the group's
+/// queue is refused the same way, and the waiting intent is kept (mdk#2842).
+#[tokio::test]
+async fn an_account_entry_replacement_behind_a_queued_intent_is_refused() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
+    queue(
+        &phone,
+        &gid,
+        b"waiting",
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+    );
+
+    let refused = phone.engine.send(set_account(&phone, &gid, 1, 8)).await;
+    assert!(
+        matches!(&refused, Err(EngineError::AccountEntryUnsettled { group_id }) if *group_id == gid),
+        "{refused:?}"
+    );
+    assert_eq!(queued_intents(&phone, &gid).len(), 1);
 }
 
 /// The convergence input a send settles first can change the account entry

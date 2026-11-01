@@ -1422,7 +1422,8 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         let sentinel = staging.join("sentinel");
         std::fs::write(&sentinel, b"keep").unwrap();
-        assert!(bind_unix_listener_private(&too_long, 0o600).is_err());
+        let error = bind_unix_listener_private(&too_long, 0o600).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
 
         // Same character count, larger encoded byte length.
@@ -1437,18 +1438,27 @@ mod tests {
         }
         assert_eq!(parse_octal_mode("0700"), Ok(0o700));
         assert_eq!(parse_octal_mode("7777"), Ok(0o7777));
-    }
-
-    #[test]
-    fn parse_octal_mode_parses_bare_zero_to_mode_zero() {
+        // Stripping leading zeros must not leave a bare zero empty.
         assert_eq!(parse_octal_mode("0"), Ok(0));
         assert_eq!(parse_octal_mode("00"), Ok(0));
     }
 
     #[test]
     fn parse_octal_mode_rejects_empty_non_octal_and_overlong() {
-        for input in ["", "8", "abc", "077777", "0o", "6 00", "-600", "0x600"] {
-            assert!(parse_octal_mode(input).is_err(), "input {input:?}");
+        for input in ["", "8", "abc", "0o", "6 00", "-600", "0x600"] {
+            let error = parse_octal_mode(input).unwrap_err();
+            assert!(
+                error.starts_with("expected octal digits"),
+                "input {input:?}: {error}"
+            );
+        }
+        // Above 0o7777, and past `u32` before the range check runs.
+        for input in ["077777", "0o777777777777"] {
+            let error = parse_octal_mode(input).unwrap_err();
+            assert!(
+                error.starts_with("octal mode out of range"),
+                "input {input:?}: {error}"
+            );
         }
     }
 
@@ -1477,35 +1487,82 @@ mod unix_tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
+    /// Whether `error`, raw or wrapped with its operation, is a no-follow open
+    /// refusing a symlink: ELOOP on Linux, Apple platforms and OpenBSD, EMLINK
+    /// on FreeBSD, and ENOTDIR from Linux's `O_DIRECTORY | O_NOFOLLOW`.
+    fn refused_symlink(error: &io::Error) -> bool {
+        [libc::ELOOP, libc::EMLINK, libc::ENOTDIR]
+            .iter()
+            .any(|code| {
+                error.raw_os_error() == Some(*code)
+                    || error.to_string().ends_with(&format!("(os error {code})"))
+            })
+    }
+
     #[test]
-    fn write_private_creates_file_owner_only() {
+    fn write_private_creates_or_replaces_the_file_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret.txt");
         write_private(&path, b"secret").unwrap();
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+
+        // An existing permissive file is tightened and truncated.
+        std::fs::write(&path, b"a longer, older secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"new").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]
-    fn open_private_append_creates_owner_only() {
+    fn open_private_append_creates_or_tightens_and_appends() {
+        use std::io::Write;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
         drop(open_private_append(&path).unwrap());
         assert_eq!(mode_of(&path), 0o600);
+
+        std::fs::write(&path, b"first\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_private_append(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");
     }
 
     #[test]
-    fn private_exclusive_file_lease_is_nonblocking_and_drop_releases_it() {
+    fn private_exclusive_file_lease_creates_or_tightens_the_lock_file_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime.lock");
-        let first = try_acquire_private_exclusive_file_lease(&path).unwrap();
+        drop(try_acquire_private_exclusive_file_lease(&path).unwrap());
         assert_eq!(mode_of(&path), 0o600);
 
-        let blocked = try_acquire_private_exclusive_file_lease(&path).unwrap_err();
-        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
-
-        drop(first);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(try_acquire_private_exclusive_file_lease(&path).unwrap());
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn private_exclusive_file_lease_refuses_a_non_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.lock");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = try_acquire_private_exclusive_file_lease(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("must be a regular file"),
+            "{error}"
+        );
+        assert_eq!(mode_of(&path), 0o644, "the FIFO's mode is untouched");
     }
 
     #[test]
@@ -1536,33 +1593,32 @@ mod unix_tests {
         let path = dir.path().join("runtime.lock");
         let first = try_acquire_private_exclusive_file_lease(&path).unwrap();
         let current_exe = std::env::current_exe().unwrap();
-        let run_child = |expect_blocked: bool| {
+        let run_child = |mode: Option<&str>| {
             let mut command = Command::new(&current_exe);
             command
                 .arg("--exact")
                 .arg("unix_tests::private_exclusive_file_lease_child_process")
                 .arg("--nocapture")
                 .env("FS_PRIVATE_LEASE_CHILD_PATH", &path);
-            if expect_blocked {
-                command.env("FS_PRIVATE_LEASE_EXPECT_BLOCKED", "1");
+            if let Some(mode) = mode {
+                command.env(mode, "1");
             }
-            let status = command.status().expect("run lease child test process");
-            assert!(status.success(), "lease child process failed");
+            let output = command.output().expect("run lease child test process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "lease child process failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // A child filter that matches nothing exits 0 having checked
+            // nothing. The abrupt-exit child never prints its result line.
+            assert!(stdout.contains("running 1 test"), "the child must run");
         };
 
-        run_child(true);
+        run_child(Some("FS_PRIVATE_LEASE_EXPECT_BLOCKED"));
         drop(first);
-        run_child(false);
-
-        let status = Command::new(&current_exe)
-            .arg("--exact")
-            .arg("unix_tests::private_exclusive_file_lease_child_process")
-            .arg("--nocapture")
-            .env("FS_PRIVATE_LEASE_CHILD_PATH", &path)
-            .env("FS_PRIVATE_LEASE_EXIT_WITHOUT_DROP", "1")
-            .status()
-            .expect("run abrupt-exit lease child test process");
-        assert!(status.success(), "abrupt-exit lease child process failed");
+        run_child(None);
+        run_child(Some("FS_PRIVATE_LEASE_EXIT_WITHOUT_DROP"));
         drop(try_acquire_private_exclusive_file_lease(&path).unwrap());
     }
 
@@ -1595,6 +1651,7 @@ mod unix_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite-wal");
         tighten_existing_private_file(&path).unwrap();
+        assert!(!path.exists(), "a missing file stays missing");
         std::fs::write(&path, b"wal").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         tighten_existing_private_file(&path).unwrap();
@@ -1612,10 +1669,14 @@ mod unix_tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(write_private(&link, b"replacement").is_err());
-        assert!(open_private_append(&link).is_err());
-        assert!(ensure_private_file(&link).is_err());
-        assert!(tighten_existing_private_file(&link).is_err());
+        for error in [
+            write_private(&link, b"replacement").unwrap_err(),
+            open_private_append(&link).unwrap_err(),
+            ensure_private_file(&link).unwrap_err(),
+            tighten_existing_private_file(&link).unwrap_err(),
+        ] {
+            assert!(refused_symlink(&error), "{error}");
+        }
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         assert_eq!(mode_of(&target), 0o644);
     }
@@ -1656,7 +1717,16 @@ mod unix_tests {
             let mut link = db.as_os_str().to_owned();
             link.push(suffix);
             symlink(&target, &link).unwrap();
-            assert!(ensure_private_db_files(&db).is_err(), "suffix {suffix:?}");
+            let error = ensure_private_db_files(&db).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "suffix {suffix:?}"
+            );
+            assert!(
+                error.to_string().contains("must be regular files"),
+                "suffix {suffix:?}: {error}"
+            );
         }
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         assert_eq!(mode_of(&target), 0o644);
@@ -1686,20 +1756,6 @@ mod unix_tests {
             assert_eq!(mode_of(&target), 0o644);
         }
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn o_path_chmod_tightens_a_regular_file() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite");
-        std::fs::write(&path, b"x").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        chmod_private_through_o_path(&c_path).unwrap();
-        assert_eq!(mode_of(&path), 0o600);
     }
 
     const DB_LOCK_PROBE_PATH: &str = "FS_PRIVATE_DB_LOCK_PROBE_PATH";
@@ -1805,12 +1861,22 @@ mod unix_tests {
     }
 
     #[test]
-    fn create_dir_all_private_sets_0700() {
+    fn create_dir_all_private_creates_0700_and_tightens_only_an_existing_leaf() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a").join("b");
         create_dir_all_private(&path).unwrap();
         assert_eq!(mode_of(&path), 0o700);
         assert_eq!(mode_of(&dir.path().join("a")), 0o700);
+
+        let ancestor = dir.path().join("shared");
+        let leaf = ancestor.join("private");
+        std::fs::create_dir_all(&leaf).unwrap();
+        for existing in [&ancestor, &leaf] {
+            std::fs::set_permissions(existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        create_dir_all_private(&leaf).unwrap();
+        assert_eq!(mode_of(&leaf), 0o700);
+        assert_eq!(mode_of(&ancestor), 0o755);
     }
 
     #[test]
@@ -1824,7 +1890,8 @@ mod unix_tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(create_dir_all_private(&link).is_err());
+        let error = create_dir_all_private(&link).unwrap_err();
+        assert!(refused_symlink(&error), "{error}");
         assert_eq!(mode_of(&target), 0o755);
     }
 
@@ -1856,8 +1923,53 @@ mod unix_tests {
             .expect("create descriptor-relative directory path");
         assert!(prepared.was_created());
         assert_eq!(prepared.mode() & 0o777, 0o770);
+        assert_eq!(prepared.uid(), unsafe { libc::geteuid() });
         assert_eq!(mode_of(&parent), 0o770);
         assert_eq!(mode_of(&leaf), 0o770);
+    }
+
+    #[test]
+    fn prepare_directory_path_rejects_parent_traversal_and_out_of_range_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+
+        // The descriptor walk would climb out through `..`, and Apple's
+        // full-path anchor open would resolve it.
+        let error = prepare_directory_path(
+            &base.join("..").join("escaped"),
+            0o700,
+            ExistingDirectoryMode::Enforce,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("parent traversal"), "{error}");
+        assert!(!dir.path().join("escaped").exists());
+
+        let error =
+            prepare_directory_path(&base.join("child"), 0o10000, ExistingDirectoryMode::Enforce)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("out of range"), "{error}");
+        assert!(!base.join("child").exists());
+    }
+
+    #[test]
+    fn prepare_directory_path_refuses_to_enforce_a_mode_on_root_or_cwd() {
+        for path in [Path::new("/"), Path::new(".")] {
+            // The directory's own mode, so a broken guard changes nothing.
+            let mode = mode_of(path);
+            let error =
+                prepare_directory_path(path, mode, ExistingDirectoryMode::Enforce).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+            assert!(
+                error.to_string().contains("refusing to change"),
+                "{path:?}: {error}"
+            );
+            let preserved = prepare_directory_path(path, mode, ExistingDirectoryMode::Preserve)
+                .expect("preserving opens it");
+            assert!(!preserved.was_created());
+        }
     }
 
     #[test]
@@ -1871,14 +1983,37 @@ mod unix_tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(
+        // Alias verification refuses a symlinked prefix the user owns before
+        // the walk runs; the walk's no-follow open refuses a symlinked leaf.
+        let error =
             prepare_directory_path(&link.join("child"), 0o700, ExistingDirectoryMode::Enforce)
-                .is_err()
-        );
+                .unwrap_err();
+        assert_untrusted_alias_refusal(&error);
         assert!(!target.join("child").exists());
         assert_eq!(mode_of(&target), 0o755);
-        assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
+        let error =
+            prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).unwrap_err();
+        assert!(refused_symlink(&error), "{error}");
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    /// Alias verification refuses the test's `link` symlink for its owner.
+    /// Run as root the link is trusted-owned and only its parent chain can
+    /// refuse it.
+    fn assert_untrusted_alias_refusal(error: &io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let message = error.to_string();
+        if effectively_root() {
+            assert!(
+                message.starts_with("refusing untrusted directory alias at "),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.ends_with("/link: symlink is not trusted-owned"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -1902,8 +2037,9 @@ mod unix_tests {
 
         let link = dir.path().join("link");
         symlink(&existing, &link).unwrap();
-        assert!(inspect_directory_path(&link.join("child")).is_err());
-        assert!(inspect_directory_path(&link).is_err());
+        assert_untrusted_alias_refusal(&inspect_directory_path(&link.join("child")).unwrap_err());
+        let error = inspect_directory_path(&link).unwrap_err();
+        assert!(refused_symlink(&error), "{error}");
         assert!(!existing.join("child").exists());
     }
 
@@ -2006,6 +2142,11 @@ mod unix_tests {
                 .status()
                 .unwrap();
             assert!(status.success(), "unveiled directory creation failed");
+            // A child filter that matches nothing exits 0 having checked nothing.
+            assert!(
+                root.join("new/leaf").is_dir(),
+                "the unveiled child must run"
+            );
             assert!(!outside.join("leaf").exists());
             assert!(!root.join("aliased").exists());
             return;
@@ -2050,9 +2191,14 @@ mod unix_tests {
     #[test]
     fn open_walk_anchor_stops_at_the_first_missing_component() {
         let dir = tempfile::tempdir().unwrap();
+        let (anchor, probed) = walk_anchor_probing(dir.path(), &["missing", "deeper"]);
         assert_eq!(
-            walk_anchor(dir.path(), &["missing", "deeper"]).expect("anchor at the root"),
+            anchor.expect("anchor at the root"),
             (0, dir.path().to_owned())
+        );
+        assert_eq!(
+            probed,
+            vec![dir.path().to_owned(), dir.path().join("missing")]
         );
     }
 
@@ -2202,6 +2348,16 @@ mod unix_tests {
         resolve_platform_directory_aliases(Path::new(path), PLATFORM_TRUSTED_IDS, inspector(tree))
     }
 
+    /// Several checks refuse an alias with PermissionDenied; match the one
+    /// that should have.
+    fn assert_alias_refused(error: &io::Error, path: &str, reason: &str) {
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("refusing untrusted directory alias at {path}: {reason}")
+        );
+    }
+
     #[test]
     fn trusted_path_ids_admit_the_platform_uid_only_where_it_is_one() {
         // Uid 1000 owns `/data` on Android but is an ordinary human user on a
@@ -2229,7 +2385,7 @@ mod unix_tests {
             symlink_facts("/data/data", 10491),
         );
         let error = resolve_aliases(ALIASED_PATH, tree).expect_err("app-owned alias");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_alias_refused(&error, "/data/user/0", "symlink is not trusted-owned");
     }
 
     #[test]
@@ -2240,14 +2396,14 @@ mod unix_tests {
             directory_facts(0, 2000, 0o775),
         );
         let error = resolve_aliases(ALIASED_PATH, tree).expect_err("group-writable ancestor");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_alias_refused(&error, "/data", "component is not trusted-owned");
     }
 
     #[test]
     fn resolve_platform_directory_aliases_rejects_a_world_writable_ancestor() {
         let tree = replacing(android_namespace(), "/data", directory_facts(0, 0, 0o777));
         let error = resolve_aliases(ALIASED_PATH, tree).expect_err("world-writable ancestor");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_alias_refused(&error, "/data", "component is not trusted-owned");
     }
 
     #[test]
@@ -2258,7 +2414,7 @@ mod unix_tests {
             directory_facts(10491, 10491, 0o700),
         );
         let error = resolve_aliases(ALIASED_PATH, tree).expect_err("app-owned alias target");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_alias_refused(&error, "/data/data", "component is not trusted-owned");
     }
 
     #[test]
@@ -2271,7 +2427,31 @@ mod unix_tests {
             inspector(android_namespace()),
         )
         .expect_err("platform-owned ancestor outside the trusted ids");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_alias_refused(&error, "/data", "component is not trusted-owned");
+    }
+
+    #[test]
+    fn resolve_platform_directory_aliases_rejects_a_target_that_is_not_a_plain_directory_path() {
+        // A symlink in the target chain: verifying its own facts would vouch
+        // for nothing it points to. Its mode passes the ownership checks, so
+        // only the directory check can refuse it.
+        let symlinked_target = PathFacts {
+            kind: PathKind::Symlink(PathBuf::from("/elsewhere")),
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+        };
+        let tree = replacing(android_namespace(), "/data/data", symlinked_target);
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("symlinked alias target");
+        assert_alias_refused(&error, "/data/data", "component is not a directory");
+
+        let tree = replacing(
+            android_namespace(),
+            "/data/user/0",
+            symlink_facts("../data", 0),
+        );
+        let error = resolve_aliases(ALIASED_PATH, tree).expect_err("`..` in the alias target");
+        assert_alias_refused(&error, "/data/user/0", "target is not a plain path");
     }
 
     #[test]
@@ -2383,7 +2563,15 @@ mod unix_tests {
         )
         .expect("prepare root");
 
-        for name in ["", ".", "..", "child/lock", "/etc/passwd", "../escape"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "child/lock",
+            "/etc/passwd",
+            "../escape",
+            "lock\0name",
+        ] {
             let error = prepared
                 .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new(name))
                 .expect_err("invalid lease name must be rejected");
@@ -2400,21 +2588,21 @@ mod unix_tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(
-            prepared
-                .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new("lease-link"))
-                .is_err()
-        );
+        let error = prepared
+            .try_acquire_private_exclusive_file_lease(std::ffi::OsStr::new("lease-link"))
+            .unwrap_err();
+        assert!(refused_symlink(&error), "{error}");
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         assert_eq!(mode_of(&target), 0o644);
     }
 
     #[test]
-    fn verify_unix_socket_inode_fails_when_final_path_unlinked() {
+    fn verify_unix_socket_inode_accepts_the_bound_link_until_it_is_unlinked() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("test.sock");
         let bound = bind_unix_listener_private_tracked(&socket, 0o600).unwrap();
         let identity = bound.link_identity();
+        verify_unix_socket_inode(&socket, identity).expect("the bound link is intact");
         std::fs::remove_file(&socket).unwrap();
         let err = verify_unix_socket_inode(&socket, identity).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -2435,11 +2623,12 @@ mod unix_tests {
     }
 
     #[test]
-    fn bind_unix_listener_private_yields_0600_socket_and_no_staging_leftover() {
+    fn bind_unix_listener_private_applies_the_mode_and_leaves_no_staging() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("test.sock");
-        let listener = bind_unix_listener_private(&socket, 0o600).unwrap();
-        assert_eq!(mode_of(&socket), 0o600);
+        // Not 0600: the connector binds at a configured mode.
+        let listener = bind_unix_listener_private(&socket, 0o660).unwrap();
+        assert_eq!(mode_of(&socket), 0o660);
         assert!(
             !socket_staging_dir(&socket).exists(),
             "staging dir should be cleaned up"
@@ -2454,9 +2643,11 @@ mod unix_tests {
     fn bind_unix_listener_private_errors_addr_in_use_when_target_exists() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("test.sock");
-        std::fs::write(&socket, b"").unwrap();
+        std::fs::write(&socket, b"existing").unwrap();
         let err = bind_unix_listener_private(&socket, 0o600).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(std::fs::read(&socket).unwrap(), b"existing");
+        assert!(!socket_staging_dir(&socket).exists());
     }
 
     #[test]

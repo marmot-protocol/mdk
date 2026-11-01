@@ -429,6 +429,15 @@ onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing i
 as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
 which the other devices did; signing in again is then a new link.
 
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too. It records in the device group that it is leaving, which can take about 30 seconds to settle, then
+leaves only the chats no other device can take it out of, deletes its slot and wipes; the other devices then remove it
+from the device group and from the rest. `WipeOutcome::groups_left_to_siblings` counts the chats it left to them. When
+it can't ask them in time, it tries to leave every chat itself, reporting any it can't in `group_leave_failures`, and
+sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
+the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it.
+A device removed while it signs out finishes signing out and is not unlinked.
+
 ### Chat history from another device
 
 A device linked with "Bring chat history" receives each chat's history from the device that added it (mdk#2628 4.2).

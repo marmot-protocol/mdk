@@ -93,6 +93,17 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
     wall time to the first delivered message over a widened group.
 
+- **File:** `distributed_convergence/queued_send_order.rs`
+  - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
+    is queued behind them, so the sender's generations follow its send order and a member reading the history in
+    `created_at` order decrypts every message (mdk#2842). Each other intent kind keeps that order behind a queued
+    row: a member's leave goes out after its queued message, an invite or a removal is committed after the
+    committer's queued message (the invitee never reads it, the removed member does), and a message made behind a
+    queued group change is encrypted after it. Also an epoch-pinned send behind a queued one is refused, not queued;
+    a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
+    retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
+    `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+
 - **File:** `distributed_convergence/refused_queued_intents.rs`
   - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
     announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,
@@ -127,7 +138,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
-    write fails part way through the generic one (mdk#2330). `record_write_atomicity/convergence_pass_retry.rs`: a
+    write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
+    (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
+    prepared (mdk#2842). `record_write_atomicity/convergence_pass_retry.rs`: a
     frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
     current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
     application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit
@@ -205,7 +218,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
     entry is untouched (`DeviceEntryChanged`). An account entry replacement (`ReplaceAccountEntry`, 4.4a) holds to
     the same rules for the account entry (`AccountEntryChanged`), and a send of one is refused rather than queued
-    while the group settles (`AccountEntryUnsettled`). The
+    while the group settles or behind a queued intent (`AccountEntryUnsettled`). The
     `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
@@ -213,13 +226,14 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     device and sets its roster entry, accepted by every member, with the device joining through its Welcome. Each
     refusal leaves the group as it was: not a device group, another account's KeyPackage, a device already in the
     group, a KeyPackage without the group's required components, an update that doesn't set exactly one device entry,
-    an entry not for a new slot or not announcing the KeyPackage, a roster the link would leave invalid. Also the sender
-    rule refusing any own device-group Commit that takes an Add from the proposal store, and `LinkDeviceUnsettled`
-    instead of a queued link while convergence is unsettled or an own Commit is in flight. Its undo, `UnlinkDevice`
-    (D40): one privileged Commit removing the linked leaf and its entry, which the removed device sees as its removal;
-    refused for another leaf than one other leaf of the account, an update that doesn't remove exactly one listed
-    entry, or while an own Commit is in flight. A device it removed that forgot its copy joins again through the next
-    link's Welcome, which no forget cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
+    an entry not for a new slot or not announcing the KeyPackage, a roster the link would leave invalid. Also the
+    sender rule refusing any own device-group Commit that takes an Add from the proposal store, and
+    `LinkDeviceUnsettled` instead of a queued link while convergence is unsettled, an own Commit is in flight, or an
+    intent waits in the queue. Its undo, `UnlinkDevice` (D40): one privileged Commit removing the linked leaf and its
+    entry, which the removed device sees as its removal; refused for another leaf than one other leaf of the account,
+    an update that doesn't remove exactly one listed entry, or while an own Commit is in flight or an intent waits in
+    the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
+    cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
 
 - **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
   - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored

@@ -315,7 +315,9 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
 /// partial-failure sheet.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct WipeOutcomeFfi {
-    /// Active MLS groups this account successfully left.
+    /// Active MLS groups this account successfully left. A chat this device
+    /// is no longer in, its copy removed or disbanded, is neither left nor
+    /// reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailureFfi>,
@@ -326,6 +328,16 @@ pub struct WipeOutcomeFfi {
     pub key_package_failures: Vec<RelayFailureFfi>,
     /// Local cleanup (MLS DB, media cache, SQL row, secret-store nsec) result.
     pub local_cleanup: LocalCleanupReportFfi,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings.
+    pub groups_left_to_siblings: u32,
+    /// This device could not ask its siblings to take it out within about 30
+    /// seconds, so it tried to leave every chat itself; one it could not
+    /// leave is in `group_leave_failures`. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
+    pub siblings_not_reached: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -378,6 +390,8 @@ impl From<WipeOutcome> for WipeOutcomeFfi {
                 .map(Into::into)
                 .collect(),
             local_cleanup: value.local_cleanup.into(),
+            groups_left_to_siblings: value.groups_left_to_siblings,
+            siblings_not_reached: value.siblings_not_reached,
         }
     }
 }

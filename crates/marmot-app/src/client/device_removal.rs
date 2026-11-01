@@ -124,6 +124,14 @@ impl AppClient {
         if !self.app.device_groups_enabled() {
             return;
         }
+        if let Err(error) = self.decide_leaving_siblings() {
+            tracing::warn!(
+                target: TARGET,
+                method = "decide_leaving_siblings",
+                error_kind = error.privacy_safe_kind(),
+                "could not decide a leaving device's removal; retrying"
+            );
+        }
         if let Err(error) = self.drive_recorded_removals().await {
             tracing::warn!(
                 target: TARGET,
@@ -469,7 +477,10 @@ impl AppClient {
             .any(|fanout| matches!(fanout.mls_state(), FanoutMlsState::Pending(_))))
     }
 
-    fn group_requires_account_devices(&self, group_id: &GroupId) -> Result<bool, AppError> {
+    pub(crate) fn group_requires_account_devices(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
         Ok(self.stored_group(group_id)?.is_some_and(|group| {
             group
                 .required_capabilities

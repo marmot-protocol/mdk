@@ -2183,7 +2183,9 @@ typedef struct MarmotLocalCleanupReport {
  */
 typedef struct MarmotWipeOutcome {
   /**
-   * Active MLS groups this account successfully left.
+   * Active MLS groups this account successfully left. A chat this
+   * device is no longer in, its copy removed or disbanded, is neither
+   * left nor reported as a failure.
    */
   uint32_t groups_left;
   struct MarmotGroupLeaveFailure *group_leave_failures;
@@ -2196,6 +2198,17 @@ typedef struct MarmotWipeOutcome {
   struct MarmotRelayFailure *key_package_failures;
   uintptr_t key_package_failures_len;
   struct MarmotLocalCleanupReport local_cleanup;
+  /**
+   * Chats this device did not leave itself because another of the
+   * account's devices takes it out of them.
+   */
+  uint32_t groups_left_to_siblings;
+  /**
+   * This device could not ask its siblings within about 30 seconds,
+   * so it tried to leave every chat itself; one it could not leave is
+   * in `group_leave_failures`. Tell the user.
+   */
+  bool siblings_not_reached;
 } MarmotWipeOutcome;
 
 /**

@@ -346,8 +346,8 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point; `shutdownAndClose()` keeps
-  running regardless. Generated Swift waits for the call to finish even when its `Task` is
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
+  `signOutAndWipe()` keep running regardless. Generated Swift waits for the call to finish even when its `Task` is
   cancelled.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
@@ -1036,6 +1036,21 @@ once it reads the removal, and nothing more is sent from it (mdk#2628):
 - Signing in to it, logging in to it or importing its key fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
   account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
   sign-in that links this device anew.
+
+### Signing out with linked devices
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too (mdk#2628):
+
+- It first records in the device group that it is leaving and waits for that to settle, which can take about 30
+  seconds; show progress. It then leaves only the chats no other device can take it out of, deletes its KeyPackage
+  slot and wipes. The other devices remove it from the device group and from the rest.
+- `WipeOutcomeFfi.groups_left_to_siblings` counts the chats it left to the other devices; `groups_left` counts those it
+  left itself.
+- When it can't ask them in time, it tries to leave every chat itself, reporting any it can't in
+  `group_leave_failures`, and sets `siblings_not_reached`. Tell the user their other devices couldn't be asked, and
+  that those devices may still list this one until the user removes it from one of them.
+- The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
 ### Overdue KeyPackage refresh
 

@@ -27,6 +27,7 @@ mod history;
 mod history_delivery;
 mod private_key_packages;
 mod removal;
+mod sign_out;
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(

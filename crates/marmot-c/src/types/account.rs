@@ -221,7 +221,9 @@ c_mirror! {
     /// Structured result of the destructive sign-out-and-wipe.
     MarmotWipeOutcome from WipeOutcomeFfi,
     free marmot_wipe_outcome_free {
-        /// Active MLS groups this account successfully left.
+        /// Active MLS groups this account successfully left. A chat this
+        /// device is no longer in, its copy removed or disbanded, is neither
+        /// left nor reported as a failure.
         copy groups_left: u32,
         vec group_leave_failures/group_leave_failures_len: MarmotGroupLeaveFailure,
         /// `1` when a relay accepted the deletion of this device's
@@ -229,6 +231,13 @@ c_mirror! {
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
         rec local_cleanup: MarmotLocalCleanupReport,
+        /// Chats this device did not leave itself because another of the
+        /// account's devices takes it out of them.
+        copy groups_left_to_siblings: u32,
+        /// This device could not ask its siblings within about 30 seconds,
+        /// so it tried to leave every chat itself; one it could not leave is
+        /// in `group_leave_failures`. Tell the user.
+        copy siblings_not_reached: bool,
     }
 }
 
@@ -273,9 +282,13 @@ mod tests {
                 completed: false,
                 reason: Some("media cache busy".into()),
             },
+            groups_left_to_siblings: 4,
+            siblings_not_reached: true,
         }
         .into();
         assert_eq!(mirror.groups_left, 2);
+        assert_eq!(mirror.groups_left_to_siblings, 4);
+        assert!(mirror.siblings_not_reached);
         assert_eq!(mirror.group_leave_failures_len, 1);
         assert_eq!(mirror.key_package_failures_len, 1);
         assert!(!mirror.local_cleanup.completed);
