@@ -962,14 +962,16 @@ impl AppClient {
             return Ok(());
         };
         let writer = entry.backup_writer;
-        if writer == Some(self.own_slot()?) {
-            return Ok(());
-        }
+        // Noted even when this device writes, so a writer named again
+        // after it gets a fresh week.
         if let Some(writer) = writer {
             self.app
                 .account_storage(&self.state.label)?
                 .app_storage()
                 .note_backup_writer(key, &writer, unix_now_seconds())?;
+        }
+        if writer == Some(self.own_slot()?) {
+            return Ok(());
         }
         let gone = writer.is_none_or(|writer| {
             roster

@@ -690,6 +690,61 @@ async fn a_sibling_takes_over_a_quiet_or_leaving_writer() {
     assert_eq!(writer(&devices.phone), Some(phone_slot));
 }
 
+/// A writer named again after this device wrote gets a fresh week: the
+/// time this device first saw it named starts again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_named_again_gets_a_fresh_week() {
+    let blossom = local_blossom();
+    let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
+    let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
+    let writer = |device: &AppClient| roster(device, &group).account.backup_writer;
+    let start = devices.relay.published_events.lock().unwrap().len();
+    let mut cursors = (start, start);
+
+    let ledger = storage(&devices.laptop_app);
+    ledger
+        .note_backup_writer(&words.public, &laptop_slot, 0)
+        .unwrap();
+    ledger
+        .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
+        .unwrap();
+    due_now(&devices.laptop);
+    devices.laptop.drive_backup_pass().await;
+    assert_eq!(writer(&devices.laptop), Some(laptop_slot));
+    devices.laptop.drive_backup_takeover().await;
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        &group,
+        &mut cursors,
+    )
+    .await;
+
+    let edit = devices
+        .phone
+        .runtime
+        .edit_roster_account_entry(&group, &[], |entry| {
+            entry.backup_writer = Some(phone_slot);
+        })
+        .await
+        .unwrap();
+    assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        &group,
+        &mut cursors,
+    )
+    .await;
+    assert_eq!(writer(&devices.laptop), Some(phone_slot));
+    devices.laptop.drive_backup_takeover().await;
+    due_now(&devices.laptop);
+    devices.laptop.drive_backup_pass().await;
+    assert_eq!(writer(&devices.laptop), Some(phone_slot));
+}
+
 /// A device that stops writing abandons the run whose pointer no relay
 /// accepted, so a later pass deletes its blobs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
