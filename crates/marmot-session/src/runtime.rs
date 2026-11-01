@@ -752,6 +752,26 @@ where
         Ok(self.session.account_devices_activation_refusal(group_id)?)
     }
 
+    /// Why a same-account Add of `sibling` to `group_id` would be refused
+    /// now, or `None`, without spending its KeyPackage. The send repeats the
+    /// checks. See [`cgka_engine::engine::Engine::sibling_add_refusal`].
+    pub fn sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+        sibling: &cgka_traits::engine::SiblingKeyPackage,
+    ) -> AccountResult<Option<cgka_traits::error::SiblingAddRefusal>> {
+        Ok(self.session.sibling_add_refusal(group_id, sibling)?)
+    }
+
+    /// Why `group_id` takes no same-account Add of any sibling now, or
+    /// `None`. See [`cgka_engine::engine::Engine::chat_sibling_add_refusal`].
+    pub fn chat_sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::error::SiblingAddRefusal>> {
+        Ok(self.session.chat_sibling_add_refusal(group_id)?)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.acknowledge_disband_failure(group_id)?)
     }

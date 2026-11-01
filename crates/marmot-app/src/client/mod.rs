@@ -90,6 +90,7 @@ pub(crate) mod history_imports;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
+pub(crate) mod linked_device_chats;
 mod private_key_packages;
 mod projection;
 mod push;
@@ -1580,6 +1581,7 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
+        self.add_linked_devices_to_chats(&held).await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;

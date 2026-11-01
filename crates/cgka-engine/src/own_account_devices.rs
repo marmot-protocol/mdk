@@ -29,14 +29,16 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
+use cgka_traits::app_components::{
+    DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
+};
 use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{EngineError, SiblingAddRefusal};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, Timestamp};
-use cgka_traits::types::{EpochId, GroupId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::prelude::LeafNodeIndex;
 use openmls_traits::OpenMlsProvider as _;
@@ -53,6 +55,9 @@ struct SiblingWelcomePlan {
     from: DeviceSlotId,
     relays: Vec<String>,
 }
+
+/// A sibling Welcome plan, or why the Add is refused and the reason it gives.
+type CheckedPlan = Result<SiblingWelcomePlan, (SiblingAddRefusal, String)>;
 
 /// A sibling Welcome built for one added KeyPackage, not yet recorded.
 pub(crate) struct BuiltSiblingWelcome {
@@ -126,6 +131,66 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         self.sibling_welcome_plan(&mls_group, siblings).map(|_| ())
+    }
+
+    /// Why a same-account Add of `sibling` to `group_id` would be refused
+    /// now, or `None` when it would go through (mdk#2628 3.5c). An advisory
+    /// read that writes nothing and spends no KeyPackage, so a host can pass
+    /// over a chat that would refuse before it takes a KeyPackage for it. It
+    /// runs the Add's checks short of staging its Commit, and the account's
+    /// leaf limit, which the Commit's own validation would apply; the send
+    /// runs them again under the engine lock.
+    pub fn sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+        sibling: &SiblingKeyPackage,
+    ) -> Result<Option<SiblingAddRefusal>, EngineError> {
+        self.ensure_group_live(group_id)?;
+        self.with_mls_group(group_id, |mls_group| {
+            if let Some(refusal) = chat_sibling_add_refusal(mls_group, self.identity.self_id())? {
+                return Ok(Some(refusal));
+            }
+            if let Err((refusal, _)) =
+                self.checked_sibling_welcome_plan(mls_group, std::slice::from_ref(sibling))?
+            {
+                return Ok(Some(refusal));
+            }
+            let account =
+                crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
+            let existing = self.storage.get_group(group_id)?;
+            let checked = self
+                .own_account_key_packages(
+                    mls_group,
+                    &existing,
+                    std::slice::from_ref(&sibling.key_package),
+                    &account,
+                )
+                .and_then(|parsed| {
+                    crate::capability_manager::check_key_package_profiles(
+                        &self.storage,
+                        group_id,
+                        &parsed,
+                    )
+                });
+            match checked {
+                Ok(()) => Ok(None),
+                Err(EngineError::Storage(error)) => Err(EngineError::Storage(error)),
+                Err(_) => Ok(Some(SiblingAddRefusal::KeyPackage)),
+            }
+        })
+    }
+
+    /// Why `group_id` takes no same-account Add of any sibling now, or
+    /// `None`: the refusals of [`Self::sibling_add_refusal`] that are facts
+    /// about the chat. An advisory read.
+    pub fn chat_sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<SiblingAddRefusal>, EngineError> {
+        self.ensure_group_live(group_id)?;
+        self.with_mls_group(group_id, |mls_group| {
+            chat_sibling_add_refusal(mls_group, self.identity.self_id())
+        })
     }
 
     pub(crate) async fn do_send_remove_own_account_devices(
@@ -378,44 +443,64 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &MlsGroup,
         siblings: &[SiblingKeyPackage],
     ) -> Result<SiblingWelcomePlan, EngineError> {
-        let refused = |reason: &str| EngineError::Other(format!("adding a sibling: {reason}"));
-        let own = self
-            .own_device_tag(&self.storage)?
-            .ok_or_else(|| refused("this device is not tagged in a trusted device group"))?;
+        self.checked_sibling_welcome_plan(mls_group, siblings)?
+            .map_err(|(_, reason)| EngineError::Other(format!("adding a sibling: {reason}")))
+    }
+
+    /// [`Self::sibling_welcome_plan`], with a refusal as its kind and reason
+    /// rather than an error; the error is a failed read.
+    fn checked_sibling_welcome_plan(
+        &self,
+        mls_group: &MlsGroup,
+        siblings: &[SiblingKeyPackage],
+    ) -> Result<CheckedPlan, EngineError> {
+        let refused = |refusal, reason: &str| Ok(Err((refusal, reason.to_owned())));
+        let Some(own) = self.own_device_tag(&self.storage)? else {
+            return refused(
+                SiblingAddRefusal::NotTagged,
+                "this device is not tagged in a trusted device group",
+            );
+        };
         let mut slots = HashSet::new();
         for sibling in siblings {
             if sibling.key_package.source.is_some() {
-                return Err(refused("a published KeyPackage never adds a sibling"));
+                return refused(
+                    SiblingAddRefusal::KeyPackage,
+                    "a published KeyPackage never adds a sibling",
+                );
             }
             if sibling.slot == own.slot() {
-                return Err(refused("the named slot is this device's"));
+                return refused(
+                    SiblingAddRefusal::KeyPackage,
+                    "the named slot is this device's",
+                );
             }
             if !slots.insert(sibling.slot) {
-                return Err(refused("two KeyPackages name the same sibling"));
+                return refused(
+                    SiblingAddRefusal::KeyPackage,
+                    "two KeyPackages name the same sibling",
+                );
             }
-            crate::private_key_packages::validate_received_private_key_package(
+            if let Err(error) = crate::private_key_packages::validate_received_private_key_package(
                 &sibling.key_package,
                 self.identity.self_id(),
                 own.roster(),
                 &sibling.slot,
                 self.wall_clock.now().0,
-            )
-            .map_err(|error| refused(&error.to_string()))?;
+            ) {
+                return refused(SiblingAddRefusal::KeyPackage, &error.to_string());
+            }
         }
-        let relays: Vec<String> = crate::group_lifecycle::welcome_relays_for_group(mls_group)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|relay| relay.0)
-            .collect();
-        if !valid_sibling_welcome_relays(&relays) {
-            return Err(refused(
+        let Some(relays) = sibling_welcome_relays(mls_group)? else {
+            return refused(
+                SiblingAddRefusal::ChatRelays,
                 "the chat must name one to 16 relays, none repeated once parsed",
-            ));
-        }
-        Ok(SiblingWelcomePlan {
+            );
+        };
+        Ok(Ok(SiblingWelcomePlan {
             from: own.slot(),
             relays,
-        })
+        }))
     }
 
     /// Every sibling Welcome this device owes at `now`, in its live groups
@@ -615,6 +700,43 @@ impl<S: StorageProvider> Engine<S> {
         }
         Ok(parsed_kps)
     }
+}
+
+/// The refusals of a same-account Add that are facts about the chat
+/// `mls_group`, the same for every sibling: what it requires, the relays it
+/// names, and how many leaves `account` holds in it.
+fn chat_sibling_add_refusal(
+    mls_group: &MlsGroup,
+    account: &MemberId,
+) -> Result<Option<SiblingAddRefusal>, EngineError> {
+    if !crate::app_components::group_requires_account_devices(mls_group)? {
+        return Ok(Some(SiblingAddRefusal::AccountDevicesNotRequired));
+    }
+    if sibling_welcome_relays(mls_group)?.is_none() {
+        return Ok(Some(SiblingAddRefusal::ChatRelays));
+    }
+    let account_leaves = mls_group
+        .members()
+        .filter(|member| {
+            openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                .is_ok_and(|credential| credential.identity() == account.as_slice())
+        })
+        .count();
+    if account_leaves >= MAX_LEAVES_PER_ACCOUNT {
+        return Ok(Some(SiblingAddRefusal::AccountLeaves));
+    }
+    Ok(None)
+}
+
+/// The relays a sibling Welcome into `mls_group` carries: the chat's own,
+/// when it names one to 16, none repeated once parsed.
+fn sibling_welcome_relays(mls_group: &MlsGroup) -> Result<Option<Vec<String>>, EngineError> {
+    let relays: Vec<String> = crate::group_lifecycle::welcome_relays_for_group(mls_group)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|relay| relay.0)
+        .collect();
+    Ok(valid_sibling_welcome_relays(&relays).then_some(relays))
 }
 
 /// One sibling Welcome per added KeyPackage, each naming its own KeyPackage

@@ -99,4 +99,24 @@ impl Marmot {
             .removed_device_leftover_chats(&account_ref)
             .await?)
     }
+
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves (mdk#2628
+    /// item 3.5c). A newly linked device is added to this device's other
+    /// chats. A chat admin can turn the component on; removing a device frees
+    /// its leaves.
+    /// Zero until this device trusts a device group, and always zero in
+    /// release builds until the device group's spec lands. Read it when
+    /// showing the device list; it is not evented.
+    pub async fn chats_closed_to_linked_devices(
+        &self,
+        account_ref: String,
+    ) -> Result<u32, MarmotKitError> {
+        Ok(self
+            .runtime
+            .chats_closed_to_linked_devices(&account_ref)
+            .await?)
+    }
 }
