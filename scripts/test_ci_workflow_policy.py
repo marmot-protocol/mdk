@@ -298,6 +298,13 @@ class CacheBudgetPolicyTests(unittest.TestCase):
                         self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
         self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
 
+    def test_published_bindings_build_from_a_clean_target_directory(self):
+        for workflow in ("bindings.yaml", "c-bindings.yml"):
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertNotIn("Swatinem/rust-cache", text)
+                self.assertNotIn("actions/cache", text)
+
 
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""

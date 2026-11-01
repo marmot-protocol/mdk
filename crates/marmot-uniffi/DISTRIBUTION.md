@@ -258,7 +258,7 @@ Set the dispatch input `build_only=true` to build and validate workflow artifact
 without publishing. This also permits testing the workflow on a development
 branch. Publishing retains the `master` workflow/source-ancestry restrictions.
 See [parallel builds and rehearsals](../../release.md#parallel-builds-and-build-only-rehearsals)
-for phase boundaries, concurrency limits, cache warming and evidence scope.
+for phase boundaries, concurrency limits and evidence scope.
 
 Publishing first uploads and verifies every asset on a draft, then publishes it under repository-enforced immutable
 releases. A retry discards only an incomplete draft. Publishing fails if a public release already exists, and snapshot
