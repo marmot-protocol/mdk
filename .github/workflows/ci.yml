@@ -86,7 +86,8 @@ jobs:
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
-      # precheck: pull requests without `ci:full` run only the fast gates.
+      # precheck: pull requests without `ci:full` run the fast gates and the
+      # quick workspace tests.
       # full: merge groups, manual runs and `ci:full` run every job.
       # warm: master pushes run only the jobs that save a Rust cache.
       - name: Select CI mode
