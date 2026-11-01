@@ -133,8 +133,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   finished on the worker, run off it on the media lane. A backup counts only once a relay accepts a pointer listing it;
   never treat an upload or a sent pointer as done. Record each blob in the ledger (`backup_run_blobs`) before its
   upload, and condemn a dropped backup's blobs before the pointer that drops it goes out. Delete a condemned blob only
-  while the pointer fetched in that same pass, from a relay that answered in full, lists no backup it belongs to;
-  never delete under any key but the roster's current one. Re-check the writer and key on the worker before signing
+  while the pointer fetched in that same pass, from a relay that answered in full, lists no backup it belongs to,
+  and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
   the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the

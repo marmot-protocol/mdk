@@ -765,7 +765,8 @@ impl ListedBackup {
 /// ones it drops, at `now`. Kept are the newest two; any older one whose
 /// head was not read; and any older one that holds, for some chat, an
 /// unexpired stretch starting before every newer kept backup's earliest
-/// for that chat, or a chat none of them holds. At most
+/// unexpired one for that chat, if they hold any. A newer backup whose
+/// head was not read counts as holding none. At most
 /// [`MAX_POINTER_BACKUPS`] are kept, the newest.
 pub(crate) fn retain(
     mut listed: Vec<ListedBackup>,

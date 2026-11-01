@@ -27,8 +27,11 @@
 //! A condemned blob is deleted only while the pointer fetched in that pass
 //! lists no backup it belongs to, and no sooner than an hour after it was
 //! condemned; deletes are tried for a week. A run abandoned or cut short
-//! has its blobs condemned the same way. Backups under other words, or
-//! turned off, are never deleted.
+//! has its blobs condemned the same way. A pass deletes only blobs
+//! condemned under its own key, so nothing a pointer under other words
+//! lists is deleted, and a due pass forgets the ledger under any other key.
+//! A pass that began before the words changed may still delete blobs its
+//! key's pointer no longer lists.
 //!
 //! A device that does not write takes over at once when the writer has left
 //! the roster or is leaving, and once the writer has listed nothing for a
@@ -53,8 +56,8 @@ use super::AppClient;
 use super::chat_history::{ExportedBundle, export_history, newest_bundles_start};
 use crate::backup_archive::{
     ArchiveKey, BACKUP_ID_LEN, BackupHead, BackupIndex, BackupPointer, BlobLocator, IndexBlob,
-    ListedBackup, MAX_BACKUP_HEAD_BYTES, PointerEntry, SealedBlob, backup_address, new_backup_id,
-    retain, seal_backup_bundle, seal_backup_small_state,
+    ListedBackup, PointerEntry, SealedBlob, backup_address, new_backup_id, retain,
+    seal_backup_bundle, seal_backup_small_state,
 };
 use crate::history_bundle::{
     ChatPosition, HISTORY_BUNDLE_MAX_PLAINTEXT, HistoryBundle, is_chat_hex,
@@ -592,14 +595,10 @@ impl BackupPass {
     async fn read_index(&self, entry: &PointerEntry) -> Option<BackupIndex> {
         let mut hash = [0_u8; 32];
         hex::decode_to_slice(&entry.head.sha256, &mut hash).ok()?;
-        let bytes = fetch_history_blob(
-            &entry.head.server,
-            &hash,
-            MAX_BACKUP_HEAD_BYTES as u64,
-            &self.transport,
-        )
-        .await
-        .ok()?;
+        // The pointer's own check bounds `size` by MAX_BACKUP_HEAD_BYTES.
+        let bytes = fetch_history_blob(&entry.head.server, &hash, entry.head.size, &self.transport)
+            .await
+            .ok()?;
         if bytes.len() as u64 != entry.head.size {
             return None;
         }

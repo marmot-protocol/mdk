@@ -535,8 +535,8 @@ async fn a_dropped_backup_is_deleted_later_unless_the_pointer_lists_it_again() {
     assert_eq!(deleters, vec![account; dropped.len()]);
 }
 
-/// A listed backup whose head does not match its locator has no index to
-/// read, so retention keeps it.
+/// A listed backup whose head is longer or shorter than its locator says
+/// has no index to read, so retention keeps it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_head_that_does_not_match_its_locator_keeps_its_backup() {
     let blossom = local_blossom();
@@ -551,6 +551,7 @@ async fn a_head_that_does_not_match_its_locator_keeps_its_backup() {
     for entry in &mut listed {
         entry.written_at -= 2 * DAY;
     }
+    listed[0].head.size -= 1;
     listed[1].head.size += 1;
     publish_pointer(&phone, &relay, &key, listed.clone()).await;
     due_now(&phone);
@@ -581,7 +582,7 @@ async fn a_new_pointer_postdates_the_one_it_replaces() {
 }
 
 /// Under a key nothing can be sealed to, the writer uploads nothing and
-/// lists nothing.
+/// lists nothing, and tries again a day later, not at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_that_seals_nothing_gets_no_backup() {
     let blossom = local_blossom();
@@ -591,9 +592,14 @@ async fn a_key_that_seals_nothing_gets_no_backup() {
         .keep_recovery_key(&[0x04; 33])
         .unwrap();
     due_now(&phone);
+    let before = unix_now_seconds();
     phone.drive_backup_pass().await;
+    let after = unix_now_seconds();
     assert!(held(&blossom).is_empty());
     assert_eq!(pointers_published(&devices.relay), 0);
+    let schedule = storage(&phone.app).backup_schedule().unwrap();
+    assert!((before + DAY..=after + DAY).contains(&schedule.next_pass_at));
+    assert_eq!(schedule.failed_passes, 0);
 }
 
 /// A device with no device group writes under the key it keeps. New words
