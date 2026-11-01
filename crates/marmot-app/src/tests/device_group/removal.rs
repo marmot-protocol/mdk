@@ -7,10 +7,12 @@
 //! device group, so a busy device group only delays it, and a removal that
 //! branch selection drops is committed again. A device refills its emptied
 //! slot (3.4) only while its roster lists it, so a removed one never does.
+//! A device the roster stops listing with no `removed` record is cleaned up
+//! after by the tag signature key this device remembers for it (mdk#2761).
 
 use super::*;
 use crate::tests::sign_ins::{
-    publish_two_days_ago, published_at, relay_empties_slot, relay_serves_slot,
+    commit_roster, publish_two_days_ago, published_at, relay_empties_slot, relay_serves_slot,
 };
 
 pub(super) fn published_count(relay: &ScriptedPushRelayClient) -> usize {
@@ -105,17 +107,10 @@ pub(super) async fn chat_with_both(devices: &mut Devices) -> GroupId {
 /// recorded here and no clean-up run.
 async fn commit_removal_decided_elsewhere(phone: &mut AppClient, group: &GroupId, slot: [u8; 32]) {
     let before = roster(phone, group);
-    let leaf = phone
-        .runtime
-        .own_account_leaf_claims(group, &before)
-        .unwrap()
-        .into_iter()
-        .find_map(|(key, claim)| (claim == DeviceTagClaim::Device(slot)).then_some(key))
-        .expect("the device's leaf");
     phone
         .unlink_device_from_group(
             group,
-            leaf,
+            device_group_leaf(phone, group, slot),
             vec![
                 DeviceRosterOperationV1::RemoveDevice(slot),
                 DeviceRosterOperationV1::SetRejectedSlot(
@@ -127,6 +122,45 @@ async fn commit_removal_decided_elsewhere(phone: &mut AppClient, group: &GroupId
                     },
                 ),
             ],
+        )
+        .await
+        .unwrap();
+}
+
+/// The device-group leaf whose tag reads as the device in `slot`.
+fn device_group_leaf(phone: &AppClient, group: &GroupId, slot: [u8; 32]) -> Vec<u8> {
+    phone
+        .runtime
+        .own_account_leaf_claims(group, &roster(phone, group))
+        .unwrap()
+        .into_iter()
+        .find_map(|(key, claim)| (claim == DeviceTagClaim::Device(slot)).then_some(key))
+        .expect("the device's leaf")
+}
+
+/// What `phone`'s trusted roster reads each other leaf of its account in
+/// `chat` as.
+fn chat_claims(phone: &AppClient, chat: &GroupId, group: &GroupId) -> Vec<DeviceTagClaim> {
+    phone
+        .runtime
+        .own_account_leaf_claims(chat, &roster(phone, group))
+        .unwrap()
+        .into_iter()
+        .map(|(_, claim)| claim)
+        .collect()
+}
+
+/// Commit, on `phone`, the removal of the device in `slot`'s entry and leaf
+/// with no `removed` record, as a failed link's undo does. A `removed` record
+/// dropped before this device cleans up, or a later branch that drops a made
+/// link, leaves the same roster. Nothing is recorded or cleaned up here.
+async fn unlist_without_record(phone: &mut AppClient, group: &GroupId, slot: [u8; 32]) {
+    let leaf = device_group_leaf(phone, group, slot);
+    phone
+        .unlink_device_from_group(
+            group,
+            leaf,
+            vec![DeviceRosterOperationV1::RemoveDevice(slot)],
         )
         .await
         .unwrap();
@@ -1717,4 +1751,152 @@ async fn a_device_its_roster_records_as_removed_never_refills_its_slot() {
     laptop.run_due_maintenance().await.unwrap();
     assert_eq!(published_at(&laptop), published);
     assert!(!relay_serves_slot(&relay, &laptop_slot));
+}
+
+/// A device the roster stops listing with no `removed` record is cleaned up
+/// after all the same, by the tag signature key this device remembers a
+/// roster listing for it (mdk#2761). While the laptop is listed, a
+/// maintenance pass leaves its leaf and private KeyPackages alone. Once the
+/// roster neither lists nor records it, its chat leaf reads as unclaimed,
+/// and while the device group is unsettled, which could still list the
+/// laptop again, nothing is cleaned up. Once it settles, the phone discards
+/// the private KeyPackages it issued the laptop and removes the laptop's
+/// leaf from the chat. Only a deciding device deletes the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered_key() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        laptop,
+        ..
+    } = devices;
+    let laptop_slot = slot_of(&laptop);
+    let account_id_hex = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(issued_to(&phone, &laptop_slot) > 0);
+    assert_eq!(
+        chat_claims(&phone, &chat, &group),
+        [DeviceTagClaim::Device(laptop_slot)]
+    );
+
+    unlist_without_record(&mut phone, &group, laptop_slot).await;
+    assert_eq!(
+        chat_claims(&phone, &chat, &group),
+        [DeviceTagClaim::Unclaimed]
+    );
+    let marmot_session::PreparedSessionSend::Commit(staged) = phone
+        .runtime
+        .confirm_commit_without_publish_with_audit_context(
+            SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            },
+            marmot_forensics::AuditEventContext::default(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a stable device group stages the commit");
+    };
+    assert!(!matches!(
+        phone.runtime.epoch_state(&group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    phone.drive_device_removals().await;
+    assert!(issued_to(&phone, &laptop_slot) > 0, "unsettled");
+    assert_eq!(chat_claims(&phone, &chat, &group).len(), 1, "unsettled");
+    let effects = phone
+        .runtime
+        .rollback_prepared_session_commit(staged)
+        .await
+        .unwrap();
+    phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(issued_to(&phone, &laptop_slot), 0);
+    assert!(
+        chat_claims(&phone, &chat, &group).is_empty(),
+        "the laptop's chat leaf is gone"
+    );
+    assert_eq!(
+        slot_deletions(&relay, &account_id_hex, &own_slot(&laptop)),
+        0
+    );
+}
+
+/// A failed link's undo can take the entry of a device the user decided to
+/// remove, and it writes no `removed` record. The deciding device commits
+/// that record alone, with the tag signature key it remembers for the slot
+/// and the decision's time, so devices that never applied a roster listing
+/// the key learn it (mdk#2761). It does so once a run: a sibling whose clock
+/// drops the record early gets no second one. A decision 30 days old makes
+/// no record, since the next expiry pass would drop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_a_failed_link_undid_is_recorded_alone() {
+    for (days_ago, recorded) in [(0, true), (31, false)] {
+        let (
+            Devices {
+                _dirs,
+                phone_app,
+                mut phone,
+                laptop,
+                ..
+            },
+            group,
+        ) = tagging_devices().await;
+        let laptop_slot = slot_of(&laptop);
+        let tag_signature_key = roster(&phone, &group).devices[&laptop_slot]
+            .tag_signature_key
+            .clone();
+        let decided_at = crate::unix_now_seconds() - days_ago * 24 * 60 * 60 - 60;
+        phone_app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .record_device_removal(
+                &hex::encode(group.as_slice()),
+                &own_slot(&laptop),
+                decided_at,
+            )
+            .unwrap();
+        unlist_without_record(&mut phone, &group, laptop_slot).await;
+
+        phone.run_due_maintenance().await.unwrap();
+        let record = roster(&phone, &group).rejected_slots.remove(&laptop_slot);
+        if !recorded {
+            assert_eq!(record, None, "{days_ago} days");
+            continue;
+        }
+        assert_eq!(
+            record,
+            Some(RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::Removed,
+                rejected_at: decided_at,
+                tag_signature_key,
+            })
+        );
+        commit_roster(
+            &mut phone,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(laptop_slot)],
+        )
+        .await;
+        phone.run_due_maintenance().await.unwrap();
+        assert!(
+            !roster(&phone, &group)
+                .rejected_slots
+                .contains_key(&laptop_slot),
+            "the record is made once a run"
+        );
+    }
 }
