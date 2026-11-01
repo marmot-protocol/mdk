@@ -1071,7 +1071,9 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Number of active MLS groups this account successfully left.
+    /// Number of active MLS groups this account successfully left. A chat
+    /// this device is no longer in, its copy removed or disbanded, is
+    /// neither left nor reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
@@ -4724,6 +4726,7 @@ impl MarmotAppRuntime {
                     Vec::new()
                 }
             };
+            let storage = self.accounts.app.account_storage(&account.label).ok();
             for group in groups {
                 let group_id_hex = group.group_id_hex.clone();
                 if left_to_siblings.contains(&group_id_hex) {
@@ -4740,6 +4743,15 @@ impl MarmotAppRuntime {
                         continue;
                     }
                 };
+                // A chat whose copy here is removed or disbanded holds no
+                // leaf of this device to leave: a sibling or an admin
+                // already took it out, maybe while this sign-out waited.
+                if storage.as_ref().is_some_and(|storage| {
+                    cgka_traits::storage::GroupStorage::get_group(storage, &group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                }) {
+                    continue;
+                }
                 match self.leave_group(account_ref, &group_id).await {
                     Ok(_) => outcome.groups_left += 1,
                     Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
@@ -4788,12 +4800,23 @@ impl MarmotAppRuntime {
     /// leave. Empty when it signs out on its own, and when the commit was not
     /// confirmed in time, which `siblings_not_reached` reports. A step that
     /// fails is taken again until then, so a passing error does not cost the
-    /// sibling path, and one that persists ends as not reached.
+    /// sibling path, and one that persists ends as not reached. An account
+    /// whose worker cannot take commands at all, signed out without a wipe
+    /// or with no external signer registered, signs out on its own at once.
     async fn sign_out_through_siblings(
         &self,
         account_ref: &str,
         outcome: &mut WipeOutcome,
     ) -> HashSet<String> {
+        if let Err(err) = self.accounts.worker_commands(account_ref).await {
+            tracing::info!(
+                target: "marmot_app::runtime",
+                method = "sign_out_through_siblings",
+                error_kind = err.privacy_safe_kind(),
+                "no worker to take sign-out steps; signing out on its own"
+            );
+            return HashSet::new();
+        }
         let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
         let mut logged = false;
         loop {

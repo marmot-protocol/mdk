@@ -2039,8 +2039,10 @@ impl AppClient {
         self.refresh_routing()?;
         // The slot's deletion is a step of a sign-out, which may go out
         // after a removal held the rest back (mdk#2628 D67).
-        let _sign_out_step = self.sign_out_step_permit()?;
-        Ok(self.runtime.withdraw_key_package_slot().await?)
+        let sign_out_step = self.sign_out_step_permit()?;
+        Ok(sign_out_step
+            .run(self.runtime.withdraw_key_package_slot())
+            .await?)
     }
 
     /// Fetch current relay KeyPackages for the composition roster without
@@ -3809,14 +3811,13 @@ impl AppClient {
         };
         let effects = match async {
             self.sync_runtime_groups_for_send("leave_group").await?;
-            let effects = self
-                .runtime
-                .send_with_audit_context(
+            let effects = sign_out_step
+                .run(self.runtime.send_with_audit_context(
                     SendIntent::Leave {
                         group_id: group_id.clone(),
                     },
                     audit_context.clone(),
-                )
+                ))
                 .await?;
             self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
                 .await?;

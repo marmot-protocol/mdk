@@ -221,7 +221,9 @@ c_mirror! {
     /// Structured result of the destructive sign-out-and-wipe.
     MarmotWipeOutcome from WipeOutcomeFfi,
     free marmot_wipe_outcome_free {
-        /// Active MLS groups this account successfully left.
+        /// Active MLS groups this account successfully left. A chat this
+        /// device is no longer in, its copy removed or disbanded, is neither
+        /// left nor reported as a failure.
         copy groups_left: u32,
         vec group_leave_failures/group_leave_failures_len: MarmotGroupLeaveFailure,
         /// `1` when a relay accepted the deletion of this device's

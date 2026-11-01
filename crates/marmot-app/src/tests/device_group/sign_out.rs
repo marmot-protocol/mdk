@@ -10,6 +10,7 @@ use super::*;
 use crate::client::sign_out::SiblingSignOut;
 use crate::messages::AppMessageIntent;
 use crate::notifications::PushPlatform;
+use crate::tests::canonical_membership::deliver_events;
 use marmot_session::DeviceRosterEdit;
 
 fn account_id_hex(app: &MarmotApp) -> String {
@@ -213,11 +214,13 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 /// removal reaches the laptop, which is not unlinked and is told nothing.
 /// Every publish of its account is held back but its sign-out's own steps:
 /// it can still delete its own slot, and sends nothing else. A chat message
-/// does not go out, no maintenance pass or push token retry runs, and
-/// leaving a chat its account administers takes an admin-policy update it
-/// may no longer commit, so the leave fails without the push token removal
-/// a leave sends first. When its sign-out ends without a wipe, the next
-/// pairing drive finds the stored removal and unlinks it.
+/// does not go out, no maintenance pass or push token retry runs, and the
+/// engine refuses to let an admin's device leave the chat its account
+/// administers, a refusal that comes without the push token removal a leave
+/// sends first. While the slot's deletion waits on its relay, a
+/// profile published beside it, in the same task or a spawned one, is still
+/// refused. When its sign-out ends without a wipe, the next pairing drive
+/// finds the stored removal and unlinks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_removed_while_signing_out_is_not_unlinked() {
     let (devices, group) = tagging_devices().await;
@@ -287,11 +290,47 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     ));
     assert_eq!(published_count(&relay), published, "nothing goes out");
 
+    let publish_profile = |app: MarmotApp| async move {
+        app.publish_user_profile(
+            "alice",
+            nostr_directory::UserProfileMetadata::default(),
+            AccountRelayListBootstrap::new(
+                vec![TransportEndpoint("wss://relay.example".to_owned())],
+                Vec::new(),
+            ),
+        )
+        .await
+    };
     let published = published_count(&relay);
-    assert_eq!(laptop.withdraw_key_package_slot().await.unwrap(), 1);
-    assert!(
-        published_count(&relay) > published,
-        "its slot's deletion goes out"
+    relay.block_next_publish();
+    let (withdrawn, beside) = tokio::join!(laptop.withdraw_key_package_slot(), async {
+        tokio::time::timeout(Duration::from_secs(10), relay.wait_for_blocked_publish())
+            .await
+            .expect("the slot's deletion reaches its relay");
+        let beside = (
+            publish_profile(laptop_app.clone()).await,
+            tokio::spawn(publish_profile(laptop_app.clone()))
+                .await
+                .unwrap(),
+        );
+        relay.release_publish();
+        beside
+    });
+    assert_eq!(withdrawn.unwrap(), 1);
+    for refused in [beside.0, beside.1] {
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::Transport(cgka_traits::TransportAdapterError::Publish(ref reason)))
+                    if reason == "this device is unlinked"
+            ),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(
+        published_count(&relay),
+        published + 1,
+        "its slot's deletion goes out, and nothing beside it"
     );
     assert!(laptop_app.account_publishing_stopped(&account_id_hex));
 
@@ -430,6 +469,106 @@ async fn sign_out_and_wipe_leaves_every_chat_when_siblings_are_not_reached() {
     };
     assert_eq!(failure.group_id_hex, hex::encode(chat.as_slice()));
     assert!(outcome.local_cleanup.completed);
+    runtime.shutdown().await;
+}
+
+/// The laptop's `sign_out_and_wipe` sends its `leaving` commit, and the
+/// phone sees it and removes the laptop before the laptop learns that the
+/// commit went out, and out of the chat both are in. The removal reaches
+/// the laptop mid-wait: it is not unlinked but signs out on its own, does
+/// not try to leave the chat it is no longer in, and from then on sends
+/// nothing but its slot's deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        mut phone,
+        laptop_app,
+        laptop,
+        ..
+    } = devices;
+    let laptop_slot = slot_of(&laptop);
+    drop(laptop);
+    let mut phone_cursor = published_count(&relay);
+    let _eose = scripted_eose_pump(
+        laptop_app.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    // The worker's first maintenance pass sends before the wipe starts.
+    runtime.run_due_maintenance("alice").await.unwrap();
+    let account_id_hex = account_id_hex(&laptop_app);
+
+    relay.block_next_publish();
+    let mut wipe = Box::pin(runtime.sign_out_and_wipe("alice"));
+    tokio::select! {
+        _ = &mut wipe => panic!("the wipe waits on its siblings"),
+        () = relay.wait_for_blocked_publish() => {}
+    }
+    let leaving = relay.attempted_events().pop().unwrap();
+    assert_eq!(leaving.kind, 445, "the laptop's `leaving` commit");
+    deliver_new(&mut phone, &relay, &mut phone_cursor).await;
+    deliver_events(&mut phone, &[leaving]).await;
+    phone.sync().await.unwrap();
+    decide_after_delay(&mut phone, &phone_app, laptop_slot).await;
+    assert!(
+        phone
+            .runtime
+            .own_account_leaf_claims(&chat, &roster(&phone, &group))
+            .unwrap()
+            .is_empty(),
+        "the phone takes the laptop out of the chat too"
+    );
+    // Separate apps share no live relay: route the removal in.
+    let removal = relay.published_events.lock().unwrap()[phone_cursor..].to_vec();
+    for event in removal {
+        laptop_app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("removal-mid-wait".to_owned()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+    relay.release_publish();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !laptop_app.account_publishing_stopped(&account_id_hex) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the removal reaches the laptop");
+    let attempted = relay.attempted_events().len();
+
+    let outcome = wipe.await.unwrap();
+    assert!(!outcome.siblings_not_reached);
+    assert_eq!(outcome.groups_left_to_siblings, 0);
+    // It is no longer in the chat: nothing to leave, nothing to report.
+    assert_eq!(outcome.groups_left, 0);
+    assert!(
+        outcome.group_leave_failures.is_empty(),
+        "{:?}",
+        outcome.group_leave_failures
+    );
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.local_cleanup.completed);
+    assert_eq!(
+        relay.attempted_events()[attempted..]
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![5],
+        "only its slot's deletion goes out"
+    );
     runtime.shutdown().await;
 }
 

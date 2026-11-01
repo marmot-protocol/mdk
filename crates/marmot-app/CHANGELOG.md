@@ -15,7 +15,11 @@
   every chat itself. A device
   that finds a sibling `leaving` removes it after a random delay of up to 30
   seconds, as if its user had. A device removed while it signs out is not
-  unlinked. Struct literals add the new fields.
+  unlinked. A chat this device is no longer in, its copy removed or
+  disbanded, is neither left nor reported in `group_leave_failures`. A wipe
+  of an account whose worker cannot run, signed out or with no external
+  signer registered, does not wait on its siblings. Struct literals add the
+  new fields.
 
 - The device roster no longer holds rejected KeyPackages, and kind 462 is no
   longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding

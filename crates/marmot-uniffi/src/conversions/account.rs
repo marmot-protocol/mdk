@@ -315,7 +315,9 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
 /// partial-failure sheet.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct WipeOutcomeFfi {
-    /// Active MLS groups this account successfully left.
+    /// Active MLS groups this account successfully left. A chat this device
+    /// is no longer in, its copy removed or disbanded, is neither left nor
+    /// reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailureFfi>,

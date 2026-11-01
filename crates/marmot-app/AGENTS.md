@@ -311,10 +311,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   any step until the wipe returns or is dropped. While it is set the removal note does nothing (a device removed while
   signing out is not unlinked and is told nothing), the pairing drive does not run and push token gossip stops. Once
   the removal is stored (`removed_while_signing_out`), `hold_removed_sign_out_publishing` sets the account's publish
-  stop, so every publish path is refused at one point; only a leave and the slot's deletion lift it, each for its own
-  duration under a `SignOutStepPermit`. No maintenance pass runs then, and leaves drain no push token removal. Keep the
-  removed device-group copy until the wipe: a sign-out that is cancelled or fails then leaves the removal, still held
-  back, for the next pairing drive to note as an unlink. Each
+  stop, so every publish path is refused at one point. The stop stays set: a leave's send and the slot's deletion pass
+  it only inside `SignOutStepPermit::run`, a task-local scoped to that step's own future, so a spawned task or a future
+  polled beside it is still refused. Never lift the stop for a step. No maintenance pass runs then, and leaves drain no
+  push token removal. Keep the removed device-group copy until the wipe: a sign-out that is cancelled or fails then
+  leaves the removal, still held back, for the next pairing drive to note as an unlink. Each
   step runs as a worker command so deliveries settle between steps: commit the own entry as `leaving` through
   `edit_device_roster_entry`, then, once it reads `leaving` on a stable device group with no convergence input left,
   name the chats a sibling takes this device out of (they require 0x800d, the own leaf's tag reads as its slot and
