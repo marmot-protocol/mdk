@@ -384,6 +384,54 @@ fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     assert_eq!(ready(&app, &reference).image, Some(bytes));
 }
 
+/// Two racing publishes with one expected revision: one wins. The race also
+/// fails if a second thread's transaction does not wait for the first's
+/// (`with_transaction_mode` in `base/connection.rs`).
+#[test]
+fn concurrent_publications_have_one_winner() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let reference = bind(&store.app_storage(), "owner");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let threads: Vec<_> = (1..=2)
+        .map(|value| {
+            let store = store.clone();
+            let reference = reference.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .app_storage()
+                    .publish_avatar(&reference, 0, &image(value, 8), None)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, AvatarPublishResult::Published { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| **r == AvatarPublishResult::Superseded)
+            .count(),
+        1
+    );
+    assert_eq!(
+        ready(&store.app_storage(), &reference)
+            .status
+            .content_revision,
+        1
+    );
+}
+
 #[test]
 fn clear_cache_invalidates_all_generations_but_shared_views_share_one_owner() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
