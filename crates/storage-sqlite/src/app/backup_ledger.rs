@@ -30,11 +30,14 @@ pub struct BackupRunHead {
     pub publish_until: u64,
 }
 
-/// A blob to delete from its Blossom server once no listed backup holds it.
+/// A blob to delete from its Blossom server while no pointer lists its
+/// backup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CondemnedBackupBlob {
     pub sha256: String,
     pub server: String,
+    /// The backup it belongs to.
+    pub backup_id: [u8; 16],
     pub condemned_at: u64,
     /// How many deletes of it failed.
     pub attempts: u64,
@@ -230,9 +233,7 @@ impl SqliteAppStorage {
                         _ => None,
                     };
                     Ok(BackupRun {
-                        backup_id: id.try_into().map_err(|_| {
-                            cgka_traits::storage::StorageError::Backend("backup id length".into())
-                        })?,
+                        backup_id: backup_id_of(id)?,
                         recovery_key: key,
                         written_at: i64_to_u64(written_at)?,
                         head,
@@ -273,8 +274,8 @@ impl SqliteAppStorage {
             let conn = self.lock()?;
             conn.execute_cached(
                 "INSERT OR IGNORE INTO backup_condemned_blobs
-                     (sha256, server, recovery_key, condemned_at, next_try_at)
-                 SELECT blobs.sha256, blobs.server, runs.recovery_key, ?2, ?3
+                     (sha256, server, recovery_key, backup_id, condemned_at, next_try_at)
+                 SELECT blobs.sha256, blobs.server, runs.recovery_key, runs.backup_id, ?2, ?3
                  FROM backup_run_blobs AS blobs
                  JOIN backup_runs AS runs ON runs.backup_id = blobs.backup_id
                  WHERE blobs.backup_id = ?1",
@@ -290,12 +291,13 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Condemn `blobs`, each a SHA-256 and the server that holds it, under
-    /// `key` at `now`, first tried at `first_try_at`. A blob condemned
-    /// already keeps its row.
+    /// Condemn `blobs` of backup `backup_id`, each a SHA-256 and the server
+    /// that holds it, under `key` at `now`, first tried at `first_try_at`. A
+    /// blob condemned already keeps its row.
     pub fn condemn_backup_blobs(
         &self,
         key: &[u8],
+        backup_id: &[u8; 16],
         blobs: &[(String, String)],
         now: u64,
         first_try_at: u64,
@@ -305,12 +307,13 @@ impl SqliteAppStorage {
             for (sha256, server) in blobs {
                 conn.execute_cached(
                     "INSERT OR IGNORE INTO backup_condemned_blobs
-                         (sha256, server, recovery_key, condemned_at, next_try_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                         (sha256, server, recovery_key, backup_id, condemned_at, next_try_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         sha256,
                         server,
                         key,
+                        backup_id.as_slice(),
                         u64_to_i64(now)?,
                         u64_to_i64(first_try_at)?
                     ],
@@ -331,23 +334,31 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT sha256, server, condemned_at, attempts FROM backup_condemned_blobs
+                "SELECT sha256, server, backup_id, condemned_at, attempts
+                 FROM backup_condemned_blobs
                  WHERE recovery_key = ?1 AND next_try_at <= ?2
                  ORDER BY condemned_at, sha256, server",
             )
             .storage()?;
         let rows = stmt
             .query_map(params![key, u64_to_i64(now)?], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .storage()?
-            .collect::<Result<Vec<(String, String, i64, i64)>, _>>()
+            .collect::<Result<Vec<(String, String, Vec<u8>, i64, i64)>, _>>()
             .storage()?;
         rows.into_iter()
-            .map(|(sha256, server, condemned_at, attempts)| {
+            .map(|(sha256, server, backup_id, condemned_at, attempts)| {
                 Ok(CondemnedBackupBlob {
                     sha256,
                     server,
+                    backup_id: backup_id_of(backup_id)?,
                     condemned_at: i64_to_u64(condemned_at)?,
                     attempts: i64_to_u64(attempts)?,
                 })
@@ -422,6 +433,12 @@ impl SqliteAppStorage {
             Ok(())
         })
     }
+}
+
+fn backup_id_of(bytes: Vec<u8>) -> StorageResult<[u8; 16]> {
+    bytes
+        .try_into()
+        .map_err(|_| cgka_traits::storage::StorageError::Backend("backup id length".into()))
 }
 
 #[cfg(test)]
@@ -517,10 +534,10 @@ mod tests {
         let account = SqliteAccountStorage::in_memory().unwrap();
         let store = account.app_storage();
         store
-            .condemn_backup_blobs(KEY, &[blob(1, "https://a/")], 10, 10)
+            .condemn_backup_blobs(KEY, &RUN, &[blob(1, "https://a/")], 10, 10)
             .unwrap();
         store
-            .condemn_backup_blobs(KEY, &[blob(1, "https://a/")], 50, 50)
+            .condemn_backup_blobs(KEY, &RUN, &[blob(1, "https://a/")], 50, 50)
             .unwrap();
         store
             .defer_condemned_backup_blob(&hash(1), "https://a/", 100)
@@ -536,6 +553,7 @@ mod tests {
             vec![CondemnedBackupBlob {
                 sha256: hash(1),
                 server: "https://a/".into(),
+                backup_id: RUN,
                 condemned_at: 10,
                 attempts: 1,
             }]
@@ -558,7 +576,7 @@ mod tests {
                 .record_backup_run_blob(&run, &hash(byte), "https://a/")
                 .unwrap();
             store
-                .condemn_backup_blobs(key, &[blob(byte + 10, "https://a/")], 10, 10)
+                .condemn_backup_blobs(key, &run, &[blob(byte + 10, "https://a/")], 10, 10)
                 .unwrap();
         }
         store.forget_backups_except(Some(KEY)).unwrap();

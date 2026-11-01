@@ -7,9 +7,10 @@
 //!   pointer is published again (`publish_until`), all four set together.
 //! - `backup_run_blobs`: each blob of a run, recorded before it is uploaded,
 //!   so a run that is abandoned or cut short has its blobs condemned.
-//! - `backup_condemned_blobs`: blobs to delete from their Blossom server once
-//!   no backup the pointer under `recovery_key` lists holds them, with when
-//!   they were condemned, how many deletes failed and when the next is due.
+//! - `backup_condemned_blobs`: blobs to delete from their Blossom server
+//!   while the pointer under `recovery_key` lists no backup `backup_id`, the
+//!   backup each belongs to, with when they were condemned, how many deletes
+//!   failed and when the next is due.
 //! - `backup_schedule`, at most one row: when the next backup pass is due
 //!   and how many in a row failed; and the backup writer this device last
 //!   saw the roster name for a key, with when it first saw that pair.
@@ -43,6 +44,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
             server TEXT NOT NULL,
             recovery_key BLOB NOT NULL CHECK (length(recovery_key) BETWEEN 1 AND 255),
+            backup_id BLOB NOT NULL CHECK (length(backup_id) = 16),
             condemned_at INTEGER NOT NULL CHECK (condemned_at >= 0),
             attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
             next_try_at INTEGER NOT NULL CHECK (next_try_at >= 0),
