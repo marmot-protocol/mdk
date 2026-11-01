@@ -141,12 +141,7 @@ jobs:
           rustc --version
           cargo --version
           xcodebuild -version
-      - name: Restore trusted Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
-          shared-key: marmotkit-profile-${{ matrix.part }}
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh') }}
+      # No Cargo cache: the repository cache budget belongs to ci.yml (see its header).
       - name: Verify native archive reconstruction and linking
         if: matrix.part == 'swift'
         run: |
@@ -262,12 +257,7 @@ jobs:
           set -o pipefail
           "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
           echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-      - name: Restore trusted Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
-          shared-key: marmotkit-profile-${{ matrix.part }}
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/kotlin-bindings.sh') }}
+      # No Cargo cache, as in apple-build.
       - name: Build one Android candidate input
         env:
           PART: ${{ matrix.part }}

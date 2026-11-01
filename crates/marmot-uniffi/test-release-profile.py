@@ -847,15 +847,6 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn("target/release-profile-measure/logs", text)
         self.assertNotIn("Swatinem/rust-cache", text)
 
-    def test_profile_cache_writes_are_trusted_only(self):
-        automatic = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        measurement = (ROOT / ".github/workflows/bindings-profile-measurement.yml").read_text()
-        trusted = "save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}"
-        self.assertGreaterEqual(automatic.count(trusted), 2)
-        self.assertNotIn("save-if: true", automatic)
-        self.assertNotIn("save-if: true", measurement)
-        self.assertNotIn("save-if:", measurement)
-
     def test_measurement_policy_requires_explicit_evidence_for_policy_changes(self):
         guidance = (HERE / "AGENTS.md").read_text()
         self.assertIn(

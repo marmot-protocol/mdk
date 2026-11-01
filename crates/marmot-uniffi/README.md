@@ -1324,7 +1324,7 @@ builder, toolchain, profile and features. CI transfers inputs only within the sa
 workflow run. Apple assembly checks required files before replacing an existing
 bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
 See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
-for the build-only benchmark workflow and cache-warming procedure.
+for the build-only benchmark workflow.
 
 ## Kotlin / Android
 
@@ -1423,15 +1423,15 @@ Android target compilation, NDK checks and native linking are deferred unless
 explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
-Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it.
+Candidate builds use no Cargo cache, so
+every run compiles from a clean target directory.
 The workflow has no schedule of its own. The
 [nightly release](../../release.md#nightly-builds) builds and validates the
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It does not run `test-native-archive.py` or refresh this
-workflow's cache seeds; matching `master` pushes do both.
+for three hours. It does not run `test-native-archive.py`; matching `master`
+pushes do.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full
