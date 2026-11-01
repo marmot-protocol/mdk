@@ -1996,12 +1996,20 @@ mod tests {
                 outcomes.sort_unstable();
                 assert_eq!(outcomes, ["failure", "success"]);
                 let snapshot = telemetry.snapshot();
-                let total = snapshot.media_upload.attempts
-                    + snapshot.media_download.attempts
-                    + snapshot.group_create_image_upload.attempts;
+                let expected = match operation {
+                    Op::MediaUpload => [2, 0, 0],
+                    Op::MediaDownload => [0, 2, 0],
+                    Op::GroupCreateImageUpload => [0, 0, 2],
+                    _ => unreachable!(),
+                };
                 assert_eq!(
-                    total, 2,
-                    "product reporting must preserve performance counters"
+                    [
+                        snapshot.media_upload.attempts,
+                        snapshot.media_download.attempts,
+                        snapshot.group_create_image_upload.attempts,
+                    ],
+                    expected,
+                    "product reporting must preserve each operation's counters"
                 );
             }
         }

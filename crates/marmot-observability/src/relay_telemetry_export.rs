@@ -2443,6 +2443,21 @@ mod otlp {
             }
         }
 
+        fn app_start_attempts(request: &ExportMetricsServiceRequest) -> i64 {
+            let point = request.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .find(|metric| metric.name == metric_names::APP_START_ATTEMPTS)
+                .unwrap();
+            let Some(metric::Data::Sum(sum)) = &point.data else {
+                panic!("expected cumulative counter");
+            };
+            let Some(number_data_point::Value::AsInt(attempts)) = sum.data_points[0].value else {
+                panic!("expected integer counter");
+            };
+            attempts
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn wire_collection_omits_history_and_uses_the_permit_identity() {
             let (endpoint, mut requests, server) = collector(&[200]).await;
@@ -2481,23 +2496,12 @@ mod otlp {
                         .unwrap(),
                     &string_key_value("service.instance.id", &diagnostic_id)
                 );
-                let metric = request.resource_metrics[0].scope_metrics[0]
-                    .metrics
-                    .iter()
-                    .find(|metric| metric.name == metric_names::APP_START_ATTEMPTS)
-                    .unwrap();
-                let Some(metric::Data::Sum(sum)) = &metric.data else {
-                    panic!("expected cumulative counter");
-                };
-                assert_eq!(
-                    sum.data_points[0].value,
-                    Some(number_data_point::Value::AsInt(expected))
-                );
+                assert_eq!(app_start_attempts(&request), expected);
             }
             server.abort();
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[tokio::test(start_paused = true)]
         async fn revocation_cancels_a_resolution_that_has_started() {
             let product = crate::ProductAnalytics::default();
             crate::grant(&product);
@@ -2526,7 +2530,7 @@ mod otlp {
                 .expect("the resolver must start before revocation")
                 .unwrap();
             product.revoke_memory();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), send)
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), send)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2617,17 +2621,34 @@ mod otlp {
                     }
                 }
                 let (tx, rx) = tokio::sync::watch::channel(false);
-                let worker = tokio::spawn(
-                    exporter
-                        .run_with_app_performance(rx, crate::AppPerformanceTelemetry::default()),
-                );
-                // Observe both the immediate push and a produced periodic tick.
-                for _ in 0..2 {
+                let performance = crate::AppPerformanceTelemetry::default();
+                let worker =
+                    tokio::spawn(exporter.run_with_app_performance(rx, performance.clone()));
+                let first =
                     tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
                         .await
                         .unwrap()
                         .unwrap();
-                }
+                assert_eq!(app_start_attempts(&first), 0);
+                performance.record(
+                    crate::AppPerformanceOperation::AppStart,
+                    std::time::Duration::from_millis(1),
+                    true,
+                );
+                // Initial-window retries reuse its original performance snapshot.
+                // Only a new periodic collection can include the added sample.
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let request = requests.recv().await.expect("collector stopped");
+                        match app_start_attempts(&request) {
+                            0 => continue,
+                            1 => break,
+                            other => panic!("unexpected attempts: {other}"),
+                        }
+                    }
+                })
+                .await
+                .expect("a periodic collection must sample updated performance");
                 match stop {
                     "shutdown" => {
                         tx.send(true).unwrap();

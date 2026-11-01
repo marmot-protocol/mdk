@@ -415,7 +415,13 @@ async fn timeout_after_acceptance_is_unknown() {
         .unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
-    assert_eq!(send.await.unwrap(), AuditOtlpSendResult::Unknown);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(1), send)
+            .await
+            .expect("the 30-second request timeout must have fired")
+            .unwrap(),
+        AuditOtlpSendResult::Unknown
+    );
     release.send(()).unwrap();
     task.await.unwrap();
     let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
