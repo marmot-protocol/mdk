@@ -11,7 +11,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - `MarmotTimelineMessageRecord` adds a nullable `imported_from`
   (`MarmotHistoryImportSource`), and `MarmotEvent` adds
-  `MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED` (mdk#2628 item 4.2d). New
+  `MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED`, last, so earlier tags keep
+  their values (mdk#2628 item 4.2d). New
   `marmot_chat_history_imports` writes a `MarmotChatHistoryImportList` (free
   with `marmot_chat_history_import_list_free`) whose tagged
   `MarmotChatHistoryImportState` is `Receiving` or `Imported`. Use matching

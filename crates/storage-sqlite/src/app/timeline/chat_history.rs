@@ -37,6 +37,33 @@ impl HistoryImportSource {
 /// live or a source no name was given for. Reads `timeline`.
 pub(crate) const TIMELINE_IMPORT_LABEL_SQL: &str = "(SELECT label.label FROM app_event_imports imported JOIN temp.device_labels label ON label.slot = imported.source_slot WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
 
+/// The per-connection counter [`SqliteAppStorage::watch_history_imports`]
+/// keeps: every row added to or removed from `app_event_imports` (a cascade
+/// from `app_events` included), every change to a parked history delivery
+/// and every change to `temp.device_labels` bumps it, inside the writing
+/// transaction. TEMP, so nothing is stored.
+const WATCH_HISTORY_IMPORTS_SQL: &str = "
+CREATE TEMP TABLE IF NOT EXISTS history_import_changes (n INTEGER NOT NULL);
+INSERT INTO temp.history_import_changes (n)
+    SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM temp.history_import_changes);
+CREATE TEMP TRIGGER IF NOT EXISTS history_import_added AFTER INSERT ON main.app_event_imports
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_import_removed AFTER DELETE ON main.app_event_imports
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_parked AFTER INSERT ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_deferred AFTER UPDATE ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS history_delivery_dropped AFTER DELETE ON main.history_deliveries_parked
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_added AFTER INSERT ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_changed AFTER UPDATE ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+CREATE TEMP TRIGGER IF NOT EXISTS device_label_removed AFTER DELETE ON device_labels
+    BEGIN UPDATE history_import_changes SET n = n + 1; END;
+";
+
 /// The latest history import into one chat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LatestHistoryImport {
@@ -356,12 +383,51 @@ impl SqliteAppStorage {
             .collect()
     }
 
+    /// Count, on this connection, every change chat history imports read:
+    /// imported rows, parked deliveries and device names (see
+    /// [`Self::history_imports_generation`]). Idempotent; the count starts at
+    /// zero and is not stored.
+    pub fn watch_history_imports(&self) -> StorageResult<()> {
+        self.lock()?
+            .execute_batch(WATCH_HISTORY_IMPORTS_SQL)
+            .storage()
+    }
+
+    /// How many changes chat history imports read since
+    /// [`Self::watch_history_imports`]; equal counts mean nothing they read
+    /// changed. Fails before the first watch.
+    pub fn history_imports_generation(&self) -> StorageResult<u64> {
+        let generation = self
+            .lock()?
+            .query_row_cached("SELECT n FROM temp.history_import_changes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .storage()?;
+        i64_to_u64(generation)
+    }
+
     /// Replace the device names imported rows resolve their source against
-    /// with `labels`, by roster slot. Kept in memory for this connection
-    /// only, so every open starts with none.
+    /// with `labels`, by roster slot; the last name given for a slot wins.
+    /// Kept in memory for this connection only, so every open starts with
+    /// none. The same names again write nothing, so they change no
+    /// [`Self::history_imports_generation`].
     pub fn set_device_labels(&self, labels: &[(DeviceSlotId, String)]) -> StorageResult<()> {
+        let wanted: BTreeMap<Vec<u8>, String> = labels
+            .iter()
+            .map(|(slot, label)| (slot.as_slice().to_vec(), label.clone()))
+            .collect();
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let held = conn
+                .prepare_cached("SELECT slot, label FROM temp.device_labels")
+                .storage()?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .storage()?
+                .collect::<Result<BTreeMap<Vec<u8>, String>, _>>()
+                .storage()?;
+            if held == wanted {
+                return Ok(());
+            }
             conn.execute_cached("DELETE FROM temp.device_labels", [])
                 .storage()?;
             for (slot, label) in labels {
@@ -376,17 +442,21 @@ impl SqliteAppStorage {
     }
 
     /// Each chat's latest history import: when it landed and the device it
-    /// came from.
+    /// came from. Of two sources importing in the same second, which nothing
+    /// orders, the greater slot is named.
     pub fn latest_history_imports(&self) -> StorageResult<Vec<LatestHistoryImport>> {
         let conn = self.lock()?;
-        // SQLite takes the bare columns from the row holding the maximum.
         let mut stmt = conn
             .prepare_cached(
-                "SELECT imported.group_id_hex, imported.source_slot, label.label,
-                        MAX(imported.imported_at)
-                 FROM app_event_imports imported
-                 LEFT JOIN temp.device_labels label ON label.slot = imported.source_slot
-                 GROUP BY imported.group_id_hex ORDER BY imported.group_id_hex",
+                "SELECT latest.group_id_hex, latest.source_slot, label.label, latest.imported_at
+                 FROM (SELECT group_id_hex, source_slot, imported_at,
+                              ROW_NUMBER() OVER (PARTITION BY group_id_hex
+                                                 ORDER BY imported_at DESC, source_slot DESC)
+                                  AS rank
+                       FROM app_event_imports) latest
+                 LEFT JOIN temp.device_labels label ON label.slot = latest.source_slot
+                 WHERE latest.rank = 1
+                 ORDER BY latest.group_id_hex",
             )
             .storage()?;
         let rows = stmt
@@ -1113,5 +1183,51 @@ mod tests {
             .unwrap();
         assert_eq!(source(&first.message_id_hex), Some(named(phone, "")));
         assert_eq!(latest()[0].source, named(laptop, "Laptop"));
+    }
+
+    // mdk#2628 4.2d: the watch counts every change chat history imports read,
+    // a cascade from `app_events` included. Two sources importing in the same
+    // second name the greater slot.
+    #[test]
+    fn the_history_import_watch_counts_every_change_it_reads() {
+        let account = SqliteAccountStorage::in_memory().unwrap();
+        let s = account.app_storage();
+        assert!(s.history_imports_generation().is_err(), "nothing watched");
+        s.watch_history_imports().unwrap();
+        s.watch_history_imports().unwrap();
+        let generation = || s.history_imports_generation().unwrap();
+        assert_eq!(generation(), 0);
+        let (phone, laptop) = (DeviceSlotId::from([7; 32]), DeviceSlotId::from([8; 32]));
+        let first = chat(2, 1, 10, "first");
+        let second = chat(2, 2, 20, "second");
+
+        s.import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        let imported_once = generation();
+        assert!(imported_once > 0);
+        s.import_app_events(GROUP, &phone, &[imported(&first, Vec::new())], NOW)
+            .unwrap();
+        assert_eq!(generation(), imported_once, "a held row adds nothing");
+        s.import_app_events(GROUP, &laptop, &[imported(&second, Vec::new())], NOW)
+            .unwrap();
+        assert!(generation() > imported_once);
+        assert_eq!(
+            s.latest_history_imports().unwrap()[0]
+                .source
+                .device_slot_id_hex,
+            hex::encode(laptop)
+        );
+
+        let unnamed = generation();
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        let named = generation();
+        assert!(named > unnamed);
+        s.set_device_labels(&[(phone, "Phone".to_owned())]).unwrap();
+        assert_eq!(generation(), named, "the same names write nothing");
+
+        let held = generation();
+        account.delete_local_group_data(GROUP).unwrap();
+        assert!(generation() > held, "the wipe's cascade counts");
+        assert!(s.latest_history_imports().unwrap().is_empty());
     }
 }

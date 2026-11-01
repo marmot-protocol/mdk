@@ -10,9 +10,13 @@
   `set_device_labels`, which marmot-app gives from the roster. The names live
   in a TEMP table each account connection creates at open, so nothing is
   stored and every open starts with none; no migration. `latest_history_imports`
-  reads each chat's latest import and `parked_history_chats` each chat parked
-  deliveries name, with whether a fetch failed. `expire_history_deliveries` now
-  returns how many parked deliveries went, not every row.
+  reads each chat's latest import (of two sources importing in the same
+  second, the greater slot) and `parked_history_chats` each chat parked
+  deliveries name, with whether a fetch failed. `watch_history_imports` starts
+  a per-connection TEMP count of every change those reads see, imports,
+  cascade deletes, parked deliveries and device names alike, and
+  `history_imports_generation` reads it; `set_device_labels` writes only when
+  the names differ.
 
 - Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
   It adds `backup_recovery_key`, at most one row: the public half of the

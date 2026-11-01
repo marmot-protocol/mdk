@@ -1598,13 +1598,13 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
-    /// Chat history from another of this account's devices may have changed
-    /// as hosts read it: re-read `chat_history_imports`. Fires when a
-    /// delivery arrives to wait for its chat or bundle, when one is imported
-    /// or dropped, and when fetching one first fails, and once each time the
-    /// account's worker opens or reconnects. Carries no chat or device
-    /// identities, and may fire with no visible change. A device's new name
-    /// comes with `LinkedDevicesChanged` instead.
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
     ChatHistoryImportsChanged {
         account_id_hex: String,
         account_label: String,

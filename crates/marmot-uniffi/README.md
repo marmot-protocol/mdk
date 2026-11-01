@@ -1010,8 +1010,9 @@ the device group this device trusts, for a Devices screen:
 Chat history from another device (behind `dev_device_groups`): each imported `TimelineMessageRecordFfi` names its
 source in `imported_from`, and `chat_history_imports(account_ref)` lists each held chat's history as `Receiving`
 (`retrying` once an attempt to get its bundle failed) or `Imported`. Draw "Imported from <device>" where rows change from imported to live,
-and say "another device" for an empty `device_label`. Re-read on `MarmotEventFfi::ChatHistoryImportsChanged`; names
-follow `LinkedDevicesChanged`.
+and say "another device" for an empty `device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`,
+which fires whenever its answer changes, a source device's rename or removal included; re-read rows on
+`LinkedDevicesChanged` for their new names.
 
 `rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one included, with
 one roster commit in the device group:

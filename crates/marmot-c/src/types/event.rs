@@ -383,15 +383,6 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
-    /// Chat history from another of this account's devices may have changed
-    /// as `marmot_chat_history_imports` reads it: a delivery arrived, was
-    /// imported or dropped, or fetching one first failed. Also fires once
-    /// each time the account's worker opens or reconnects. Carries no chat or
-    /// device identities, and may fire with no visible change.
-    ChatHistoryImportsChanged {
-        account_id_hex: *mut c_char,
-        account_label: *mut c_char,
-    },
     /// The account's recovery status may have changed; re-read
     /// `marmot_account_recovery_status`. Carries no group identities. Not
     /// raised until the recovery runner owns history (mdk#2660).
@@ -404,6 +395,18 @@ pub enum MarmotEvent {
     /// the accounts and show the device-level notice. Fires once; afterwards
     /// `MarmotAccountSummary.unlinked` says so.
     DeviceUnlinked {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// `marmot_chat_history_imports` answers differently; re-read it. Fires
+    /// when a held chat's delivery from another of this account's devices
+    /// arrives, is imported, first fails to fetch, or goes; when imported
+    /// rows go, as retention prunes them or the chat is deleted; when a
+    /// source device is renamed or removed; and when a chat whose delivery
+    /// arrived first is joined. Also fires once each time the account's
+    /// worker opens or reconnects, whatever the answer. Carries no chat or
+    /// device identities.
+    ChatHistoryImportsChanged {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },

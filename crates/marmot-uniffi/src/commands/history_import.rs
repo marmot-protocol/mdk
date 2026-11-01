@@ -13,8 +13,8 @@ impl Marmot {
     /// then `Imported` with the device it came from and when. Facts only: an
     /// empty history sends nothing, and an expired delivery leaves nothing.
     /// Empty while device groups are off. Refresh on
-    /// `ChatHistoryImportsChanged`; a device's name follows
-    /// `LinkedDevicesChanged`.
+    /// `ChatHistoryImportsChanged`, which also fires when a source device is
+    /// renamed or removed.
     pub async fn chat_history_imports(
         &self,
         account_ref: String,

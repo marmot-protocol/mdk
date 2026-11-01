@@ -2170,7 +2170,8 @@ impl MarmotApp {
             compromise_warning_gather_due: true,
             device_link_changed: true,
             chat_history_imports_changed: true,
-            listed_receiving_chats: Vec::new(),
+            history_imports_inputs: None,
+            listed_history_imports: Vec::new(),
             device_unlinked: false,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
@@ -7196,16 +7197,15 @@ impl MarmotApp {
     }
 
     /// Import a sibling's history for one chat (mdk#2628 4.2a), with the
-    /// chat-list refresh in the same transaction. Returns how many events
-    /// became new rows, and the projection change: `None` when no timeline
-    /// row changed, as when every event was already held or skipped.
+    /// chat-list refresh in the same transaction. `None` when every event was
+    /// already held or skipped.
     pub(crate) fn import_account_app_events(
         &self,
         label: &str,
         group_id_hex: &str,
         source_slot: &cgka_traits::app_components::DeviceSlotId,
         events: &[storage_sqlite::ImportedAppEvent],
-    ) -> Result<(usize, Option<AppProjectionUpdate>), AppError> {
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let import = storage.app_storage().import_app_events(
@@ -7215,10 +7215,9 @@ impl MarmotApp {
                 unix_now_seconds(),
             )?;
             if import.update.changes.is_empty() {
-                return Ok((import.imported, None));
+                return Ok(None);
             }
-            let update = self.app_projection_update(label, import.update)?;
-            Ok((import.imported, Some(update)))
+            self.app_projection_update(label, import.update).map(Some)
         })
     }
 

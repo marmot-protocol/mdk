@@ -796,8 +796,8 @@ c_cmd! {
     /// waits to be imported, with `retrying` once an attempt to get its
     /// bundle failed, then `Imported` with the device it came from and when. Empty
     /// while device groups are off. Re-read on the
-    /// `ChatHistoryImportsChanged` event; a device's name follows
-    /// `LinkedDevicesChanged`. Free with
+    /// `ChatHistoryImportsChanged` event, which also fires when a source
+    /// device is renamed or removed. Free with
     /// `marmot_chat_history_import_list_free`.
     async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
 

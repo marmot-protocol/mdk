@@ -5960,14 +5960,6 @@ typedef enum MarmotEvent_Tag {
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
   /**
-   * Chat history from another of this account's devices may have changed
-   * as `marmot_chat_history_imports` reads it: a delivery arrived, was
-   * imported or dropped, or fetching one first failed. Also fires once
-   * each time the account's worker opens or reconnects. Carries no chat or
-   * device identities, and may fire with no visible change.
-   */
-  MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED,
-  /**
    * The account's recovery status may have changed; re-read
    * `marmot_account_recovery_status`. Carries no group identities. Not
    * raised until the recovery runner owns history (mdk#2660).
@@ -5980,6 +5972,17 @@ typedef enum MarmotEvent_Tag {
    * `MarmotAccountSummary.unlinked` says so.
    */
   MARMOT_EVENT_DEVICE_UNLINKED,
+  /**
+   * `marmot_chat_history_imports` answers differently; re-read it. Fires
+   * when a held chat's delivery from another of this account's devices
+   * arrives, is imported, first fails to fetch, or goes; when imported
+   * rows go, as retention prunes them or the chat is deleted; when a
+   * source device is renamed or removed; and when a chat whose delivery
+   * arrived first is joined. Also fires once each time the account's
+   * worker opens or reconnects, whatever the answer. Carries no chat or
+   * device identities.
+   */
+  MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -6076,11 +6079,6 @@ typedef struct MarmotEvent_DeviceLinkChanged_Body {
   char *account_label;
 } MarmotEvent_DeviceLinkChanged_Body;
 
-typedef struct MarmotEvent_ChatHistoryImportsChanged_Body {
-  char *account_id_hex;
-  char *account_label;
-} MarmotEvent_ChatHistoryImportsChanged_Body;
-
 typedef struct MarmotEvent_RecoveryStatusChanged_Body {
   char *account_id_hex;
   char *account_label;
@@ -6090,6 +6088,11 @@ typedef struct MarmotEvent_DeviceUnlinked_Body {
   char *account_id_hex;
   char *account_label;
 } MarmotEvent_DeviceUnlinked_Body;
+
+typedef struct MarmotEvent_ChatHistoryImportsChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_ChatHistoryImportsChanged_Body;
 
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
@@ -6110,9 +6113,9 @@ typedef struct MarmotEvent {
     MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED;
     MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED;
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
-    MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED;
     MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED;
     MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED;
+    MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED;
   };
 } MarmotEvent;
 
@@ -8145,8 +8148,8 @@ MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
  * waits to be imported, with `retrying` once an attempt to get its
  * bundle failed, then `Imported` with the device it came from and when. Empty
  * while device groups are off. Re-read on the
- * `ChatHistoryImportsChanged` event; a device's name follows
- * `LinkedDevicesChanged`. Free with
+ * `ChatHistoryImportsChanged` event, which also fires when a source
+ * device is renamed or removed. Free with
  * `marmot_chat_history_import_list_free`.
  *
  * # Safety

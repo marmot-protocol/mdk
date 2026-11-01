@@ -1342,10 +1342,18 @@ async fn an_imported_row_names_the_device_it_came_from() {
     );
 
     name_phone(&mut devices, &group, "Old phone").await;
-    device_group_seam(&mut devices.laptop);
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the rename is announced"
+    );
     assert_eq!(
         sources(&devices),
         [Some(phone_named(&devices, "Old phone")), None]
+    );
+    devices.laptop.refresh_device_labels();
+    assert!(
+        !devices.laptop.take_chat_history_imports_changed(),
+        "the same names again change nothing"
     );
     assert!(matches!(
         &history_state(&devices.laptop, &chat)[..],
@@ -1362,8 +1370,69 @@ async fn an_imported_row_names_the_device_it_came_from() {
             .devices
             .contains_key(&slot_of(&devices.phone))
     );
-    device_group_seam(&mut devices.laptop);
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the removal is announced"
+    );
     assert_eq!(sources(&devices), [Some(phone_named(&devices, "")), None]);
+}
+
+/// The phone sends the laptop the chat's history and the laptop lists it as
+/// imported, with every announcement so far drained.
+async fn imported_history() -> (Devices, GroupId) {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    add_laptop(&mut devices, &chat).await;
+    device_group_seam(&mut devices.laptop);
+    devices.phone.drive_history_deliveries().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(matches!(
+        history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { .. }]
+    ));
+    (devices, chat)
+}
+
+/// Retention pruning the imported rows takes the chat off the list, and
+/// hosts are told: nothing but storage's change count sees the cascade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_imported_history_is_announced() {
+    let (mut devices, chat) = imported_history().await;
+    let account_id_hex = devices
+        .laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let pruned = storage(&devices.laptop_app)
+        .prune_app_events_before(
+            &hex::encode(chat.as_slice()),
+            crate::unix_now_seconds() + 24 * 60 * 60,
+            &account_id_hex,
+            &|_, _| false,
+        )
+        .unwrap();
+    assert!(pruned > 0);
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+    assert!(!device_group_seam(&mut devices.laptop), "nothing new");
+}
+
+/// Deleting the chat's data locally removes its imported rows through the
+/// cascade from its app events; hosts are told, though the laptop still
+/// holds the chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_an_imported_chat_is_announced() {
+    let (mut devices, chat) = imported_history().await;
+    devices
+        .laptop_app
+        .account_storage("alice")
+        .unwrap()
+        .delete_local_group_data(&hex::encode(chat.as_slice()))
+        .unwrap();
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+    assert!(!device_group_seam(&mut devices.laptop), "nothing new");
 }
 
 /// A Blossom delivery read before the laptop holds its chat is neither

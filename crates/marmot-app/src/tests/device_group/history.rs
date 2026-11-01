@@ -171,10 +171,11 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
             .is_none()
     );
 
-    // A reaction to a message Bob lacks changes no timeline row, yet is a new
-    // imported row that moves the chat's latest import, so hosts are told
+    // A reaction to a message Bob lacks, from another device, changes no
+    // timeline row, yet names a new latest import, so hosts are told
     // (mdk#2628 4.2d).
     bob.take_chat_history_imports_changed();
+    const TABLET_SLOT: [u8; 32] = [0x22; 32];
     let orphan = MarmotAppEvent::new(
         bob_account.account_id_hex.clone(),
         3,
@@ -195,7 +196,7 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
         keys: None,
     }];
     assert!(
-        bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&reaction_only))
+        bob.dev_import_history_bundle(&chat, &TABLET_SLOT, &sealed(&reaction_only))
             .unwrap()
             .is_none(),
         "no timeline row changed"
@@ -204,10 +205,17 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
         storage
             .app_event_import_source(&chat_hex, &orphan.id)
             .unwrap(),
-        Some(PHONE_SLOT)
+        Some(TABLET_SLOT)
     );
     assert!(bob.take_chat_history_imports_changed());
-    bob.dev_import_history_bundle(&chat, &PHONE_SLOT, &sealed(&reaction_only))
+    assert!(matches!(
+        &bob.chat_history_imports().unwrap()[..],
+        [crate::ChatHistoryImport {
+            state: crate::ChatHistoryImportState::Imported { from, .. },
+            ..
+        }] if from.device_slot_id_hex == hex::encode(TABLET_SLOT)
+    ));
+    bob.dev_import_history_bundle(&chat, &TABLET_SLOT, &sealed(&reaction_only))
         .unwrap();
     assert!(!bob.take_chat_history_imports_changed(), "nothing new");
 

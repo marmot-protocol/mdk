@@ -441,8 +441,9 @@ first read the roster. Names are resolved when rows are read, so a rename shows 
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
 It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
 after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
-`MarmotAppEvent::ChatHistoryImportsChanged` says to re-read, and also fires once each time the account's worker opens or
-reconnects. Everything here is empty and silent unless `dev_device_groups` is on.
+`MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
+is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
+`dev_device_groups` is on.
 
 ### Recovery words
 

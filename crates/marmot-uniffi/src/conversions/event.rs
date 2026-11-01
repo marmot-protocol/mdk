@@ -162,11 +162,13 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
-    /// Chat history from another of this account's devices may have changed
-    /// as `chat_history_imports` reads it: a delivery arrived, was imported
-    /// or dropped, or fetching one first failed. Also fires once each time
-    /// the account's worker opens or reconnects. Carries no chat or device
-    /// identities, and may fire with no visible change.
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
     ChatHistoryImportsChanged {
         account_id_hex: String,
         account_label: String,
