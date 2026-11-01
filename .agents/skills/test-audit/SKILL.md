@@ -97,7 +97,7 @@ check the [retention bar](#retention-bar) first.
   promises the order.
 - **Misleading names.** The name promises behavior the inputs or assertions
   never exercise. Judge a test by its assertions, not its name.
-- **Dead tests.** `#[ignore]` with no recipe, CI lane or documented manual
+- **Dead tests.** `#[ignore]` with no recipe, CI job or documented manual
   command that runs it.
 
 ## Retention bar
@@ -161,7 +161,7 @@ the tests do.
   app-runtime journeys) rather than booting a new stack per test.
 - **Budget.** Report the wall time of each new or changed test from nextest's
   output. A test over 5 seconds must prove a contract no cheaper layer can.
-  Over 30 seconds, it belongs in a dedicated lane or test group, with the
+  Over 30 seconds, it belongs in a dedicated CI job or nextest test group, with the
   reason in the PR.
 - **Storage.** Use in-memory storage unless the contract is about the file,
   encryption or locking.
@@ -193,7 +193,7 @@ repository.
   smoke, and the file maps in `tests/AGENTS.md`. Grep all of them for every
   old test and binary name: a stale exact-name filter does not always fail.
   An exclusion (`not test(=...)`) silently stops excluding, and the
-  partitioned workspace lane runs with `--no-tests=pass`.
+  partitioned workspace CI job runs with `--no-tests=pass`.
 - For each contract you consolidated, break the production owner once by
   hand, confirm the keeper fails, then restore the source exactly.
 - Report what you removed and why (by junk pattern), the contracts kept and

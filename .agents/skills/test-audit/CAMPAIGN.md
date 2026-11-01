@@ -69,13 +69,22 @@ is saved.
 
 ## 2. Lanes
 
-Split the scope into lanes along production owners, not file names: for
-`storage-sqlite`, the base layer, migrations, OpenMLS storage, protocol
-storage and snapshots; for the engine, the subsystems in
-`crates/cgka-engine/AGENTS.md`. Unit and integration tests of one owner share
-a lane. Include the owner's tests that live elsewhere (simulator scenarios,
-app journeys, CLI end-to-end) so layer replays are visible, even if those
-tests are not edited in this campaign.
+A lane is the unit of work in a campaign: one production owner (a module or
+subsystem of the crate) together with the test files that prove its
+contracts. One subagent writes its ledger and one PR changes it. A CI lane, a
+job in the CI matrix, is unrelated.
+
+Draw lanes along production owners, not file names: for `storage-sqlite`,
+the base layer, migrations, protocol storage, the chat list, the timeline and
+so on; for the engine, the subsystems in `crates/cgka-engine/AGENTS.md`. A
+test file joins the lane of the owner most of its tests exercise, and unit
+and integration tests of one owner share a lane. Size a lane so its PR is a
+diff a reviewer reads whole; in `storage-sqlite` that was 70 to 220 tests.
+Lanes share no files, so their ledgers and PRs can run in parallel.
+
+Read the owner's tests in other crates (simulator scenarios, app journeys,
+CLI end-to-end) with the lane so layer replays are visible. They stay out of
+its file list and its PR.
 
 Done when every test file in scope belongs to exactly one lane.
 
