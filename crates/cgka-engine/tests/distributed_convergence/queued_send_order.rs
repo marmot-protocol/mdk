@@ -232,6 +232,48 @@ async fn a_pinned_send_behind_a_queued_one_is_refused() {
     );
 }
 
+/// A queued intent the drain prepared and the host has not yet confirmed or
+/// retried holds no later send: its generation is already taken, so a send
+/// made then is prepared at once, at the next one.
+#[tokio::test]
+async fn a_drained_intent_awaiting_its_outcome_holds_no_later_send() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "in-flight").await;
+    let outbox = alice
+        .queue_app_message(group_id.clone(), app_payload_for(&alice, "from the outbox"))
+        .await
+        .unwrap();
+    assert!(matches!(outbox, SendResult::Queued { .. }), "{outbox:?}");
+    let drained = alice.advance_convergence(&group_id).await.unwrap();
+    let [SendResult::ApplicationMessage { msg, .. }] = drained.as_slice() else {
+        panic!("the drain prepares the outbox message: {drained:?}");
+    };
+
+    let later = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "sent while the outbox message publishes"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(later, SendResult::ApplicationMessage { .. }),
+        "{later:?}"
+    );
+    let (_, intent_id) = alice
+        .regenerated_queued_intent_for_message(&msg.id)
+        .unwrap();
+    alice.confirm_queued_outbound_intent(&intent_id).unwrap();
+    assert!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// A queued change the settled state already holds is done at drain: nothing
 /// to publish confirms it, so the drain retires it rather than leave it
 /// waiting forever with every later send queued behind it.
