@@ -164,15 +164,36 @@ fn legacy_promotion_skips_file_backed_uploads() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
     let media = media(&dir, &store.app_storage());
-    let (_, id) = staged_send(&store, &media, "legacy");
+    let app = store.app_storage();
+    let (token, id) = staged_send(&store, &media, "legacy");
     assert_eq!(
-        store
-            .app_storage()
-            .promote_attachment_uploads(GROUP, "legacy", 12, u64::MAX)
+        app.promote_attachment_uploads(GROUP, "legacy", 12, u64::MAX)
             .unwrap(),
         0
     );
     assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Staged));
+    // No acquisition was recorded and the upload was not quarantined, so the
+    // media store still promotes it.
+    let untouched: (i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM attachment_acquisition),
+                (SELECT count(*) FROM outgoing_attachment_uploads WHERE quarantined=1)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(untouched, (0, 0));
+    assert_eq!(
+        media
+            .promote(
+                &app.attachment_upload_promotion(GROUP, "legacy", &token, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
 }
 
 /// A store reset deletes every media row, staged ones included, without a
@@ -393,6 +414,7 @@ fn owned_file_backed_uploads_are_paged_for_promotion() {
     sorted.sort();
     assert_eq!(all.iter().map(key).collect::<Vec<_>>(), sorted);
     assert_eq!(all.len(), 4);
+    assert_eq!(format!("{:?}", all[0]), "AttachmentUploadOwner { .. }");
     assert!(all.iter().any(|owner| owner.token == second));
     assert!(
         all.iter()
@@ -566,4 +588,131 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
         std::io::Read::read_to_end(&mut reader, &mut body).unwrap();
         assert_eq!(body, BODY, "{id}");
     }
+}
+
+/// Promotion never attaches a file that is not there. A ready twin whose
+/// file is gone is marked lost and the upload's own file is attached
+/// instead; an upload whose own file the catalog already lost attaches
+/// nothing.
+#[test]
+fn promotion_attaches_only_files_that_are_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let media = media(&dir, &app);
+    let (first, twin) = staged_send(&store, &media, "first");
+    assert_eq!(
+        media
+            .promote(
+                &app.attachment_upload_promotion(GROUP, "first", &first, || 12),
+                twin
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    std::fs::remove_file(media.path(&twin)).unwrap();
+    let (second, own) = staged_send(&store, &media, "second");
+    assert_eq!(
+        media
+            .promote(
+                &app.attachment_upload_promotion(GROUP, "second", &second, || 12),
+                own
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    assert_eq!(media.file_state(&twin).unwrap(), Some(FileState::Lost));
+    assert_eq!(media.file_state(&own).unwrap(), Some(FileState::Ready));
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM media_file_refs WHERE file_id=?1",
+            &own
+        ),
+        1
+    );
+
+    let (lost, id) = staged_send(&store, &media, "lost");
+    std::fs::remove_file(media.path(&id)).unwrap();
+    assert!(media.open_staged_reader(&id).unwrap().is_none());
+    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        media
+            .promote(
+                &app.attachment_upload_promotion(GROUP, "lost", &lost, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM media_file_refs WHERE file_id=?1",
+            &id
+        ),
+        0
+    );
+}
+
+/// An upload abandoned while its body is still being read is not staged:
+/// the store keeps neither a row nor a file.
+#[test]
+fn an_upload_abandoned_during_staging_keeps_nothing() {
+    struct Abandoning<'a> {
+        storage: SqliteAppStorage,
+        token: Vec<u8>,
+        body: std::io::Cursor<&'a [u8]>,
+        abandoned: bool,
+    }
+    impl std::io::Read for Abandoning<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if !self.abandoned {
+                self.abandoned = true;
+                self.storage
+                    .abandon_attachment_uploads(std::slice::from_ref(&self.token))
+                    .unwrap();
+            }
+            self.body.read(out)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let media = media(&dir, &app);
+    seed(&store, "abandoned");
+    let token = app
+        .reserve_attachment_upload(GROUP, 3, 11)
+        .unwrap()
+        .unwrap();
+    let outcome = media
+        .stage(
+            &app.attachment_upload_stage(&token),
+            Category::Retained,
+            &mut Abandoning {
+                storage: app.clone(),
+                token: token.clone(),
+                body: std::io::Cursor::new(BODY),
+                abandoned: false,
+            },
+            BODY.len() as u64,
+            11,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(outcome, StageOutcome::Superseded);
+    let rows: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM media_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+    let files = std::fs::read_dir(dir.path().join(media_store::MEDIA_DIRECTORY))
+        .map(|shards| {
+            shards
+                .map(|shard| std::fs::read_dir(shard.unwrap().path()).unwrap().count())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    assert_eq!(files, 0);
 }

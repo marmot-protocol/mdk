@@ -2,7 +2,7 @@
 use crate::SqliteAccountStorage;
 use std::io::{Cursor, Read};
 
-use media_store::{MEDIA_DIRECTORY, MediaError, MediaStore, PublishOutcome};
+use media_store::{FileState, MEDIA_DIRECTORY, MediaError, MediaStore, PublishOutcome};
 
 use super::*;
 use crate::{AttachmentHistoryEntry, SqliteMediaCatalog, StoredAppEvent};
@@ -1097,14 +1097,27 @@ fn keep_media_defaults_to_forever_and_round_trips() {
         app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
         AttachmentRemoval::default()
     );
-    for keep in [
-        AttachmentKeepMedia::OneYear,
-        AttachmentKeepMedia::SixMonths,
-        AttachmentKeepMedia::ThirtyDays,
-        AttachmentKeepMedia::Forever,
+    // The stored day counts are the schema's, so an upgraded account's
+    // setting decodes to the same window.
+    for (keep, days) in [
+        (AttachmentKeepMedia::OneYear, Some(365)),
+        (AttachmentKeepMedia::SixMonths, Some(183)),
+        (AttachmentKeepMedia::ThirtyDays, Some(30)),
+        (AttachmentKeepMedia::Forever, None),
     ] {
         app.set_attachment_keep_media(keep).unwrap();
         assert_eq!(app.attachment_keep_media().unwrap(), keep);
+        let stored: Option<i64> = fixture
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT keep_days FROM attachment_keep_media WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, days, "{keep:?}");
     }
     assert_eq!(
         app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
@@ -1425,4 +1438,100 @@ fn the_sweep_cleans_queued_automatic_downloads_but_not_explicit_ones() {
             .is_some(),
         "the explicit request still downloads"
     );
+}
+
+/// A ready download whose media file is lost shows as previously acquired
+/// and unavailable: automatic demand does not queue it again, and an
+/// explicit retry downloads it again.
+#[test]
+fn a_lost_media_file_is_unavailable_until_an_explicit_retry() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = body();
+    let message = "d".repeat(64);
+    let job = fixture.claimed(&message, &content);
+    let PublishOutcome::Published(id) = fixture.publish(&job, &content) else {
+        panic!("published");
+    };
+    std::fs::remove_file(fixture.media.path(&id)).unwrap();
+    assert!(fixture.media.open_reader(&id).unwrap().is_none());
+    assert_eq!(
+        fixture.media.file_state(&id).unwrap(),
+        Some(FileState::Lost)
+    );
+
+    let (_, entry) = Fixture::entry(&message, &content);
+    let policy = AttachmentDownloadPolicy {
+        automatic: true,
+        retained_bytes: 1 << 30,
+        disk_reserve: 0,
+        transfer_limit: 1 << 20,
+    };
+    for _ in 0..3 {
+        let (status, queued) = app
+            .request_automatic_attachment(GROUP, &entry, digest(&content), NOW, (&policy, true))
+            .unwrap();
+        assert!(!queued);
+        assert_eq!(
+            status.unwrap().state,
+            AttachmentTransferState::PreviouslyAcquiredUnavailable
+        );
+    }
+    assert!(
+        app.attachment_transfer_candidates(NOW, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        app.explicitly_retry_attachment(&job.reference, NOW)
+            .unwrap()
+    );
+    let retry = app
+        .claim_attachment_acquisition(&job.reference, NOW, LEASE)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        fixture.publish(&retry, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        fixture.status(GROUP, &message),
+        AttachmentTransferState::Ready
+    );
+    assert_eq!(fixture.read(&retry).unwrap(), content);
+}
+
+/// The attachment types a host may log print lengths and offsets only: no
+/// token, attempt, group, message, file or slot.
+#[test]
+fn attachment_debug_output_names_no_identifier() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = b"abc";
+    let job = fixture.claimed(&"f".repeat(64), content);
+    fixture.legacy(&job, content);
+    let body = fixture.legacy_bodies().remove(0);
+    let entry = app
+        .largest_retained_attachments(NOW, None, None, 1)
+        .unwrap()
+        .remove(0);
+    for (debug, expected) in [
+        (
+            format!("{body:?}"),
+            "LegacyAttachmentBody { byte_len: 3, .. }",
+        ),
+        (
+            format!("{:?}", app.legacy_attachment_reader(&body)),
+            "LegacyBodyReader { byte_len: 3, offset: 0, .. }",
+        ),
+        (
+            format!("{entry:?}"),
+            "RetainedAttachmentEntry { byte_count: 3, .. }",
+        ),
+        (format!("{:?}", job.reference), "AttachmentAssetRef { .. }"),
+        (format!("{job:?}"), "AttachmentAcquisition { .. }"),
+    ] {
+        assert_eq!(debug, expected);
+    }
 }

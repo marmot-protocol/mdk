@@ -1300,6 +1300,23 @@ fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
             .is_some()
     );
     assert_eq!(partial_usage(&store), 0);
+    // Whole-job cleanup clears whatever checkpoint the job holds and hands
+    // back its wire file once, for the store to unlink.
+    assert!(checkpoint(&app, &current, &identity, 0, b"abc", 13).unwrap());
+    let wire = app
+        .load_attachment_partial(&current, 13, u64::MAX, None)
+        .unwrap()
+        .unwrap()
+        .wire_file;
+    assert_eq!(
+        app.clear_attachment_partial(&current, 13, None).unwrap(),
+        Some(wire)
+    );
+    assert_eq!(partial_usage(&store), 0);
+    assert_eq!(
+        app.clear_attachment_partial(&current, 13, None).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -3789,6 +3806,83 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
         )
         .unwrap();
     assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+}
+
+/// A body receipt from a superseded attempt never marks the job's body
+/// completed; the live attempt still can.
+#[test]
+fn a_stale_attempt_cannot_mark_the_body_completed() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "one");
+    let asset = request(&app, "one");
+    let old = app
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    app.resume_attachment_acquisitions(13, 64).unwrap();
+    let current = app
+        .claim_attachment_acquisition(&asset, 13, 100)
+        .unwrap()
+        .unwrap();
+    let body_completed = || -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT body_completed FROM attachment_acquisition WHERE token=?1",
+                [&asset.token],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(!app.mark_attachment_body_completed(&old, 13).unwrap());
+    assert_eq!(body_completed(), 0);
+    assert!(app.mark_attachment_body_completed(&current, 13).unwrap());
+    assert_eq!(body_completed(), 1);
+}
+
+/// A due job whose source became hidden or unaccepted is parked when the
+/// worker prepares it, so it cannot hold the head of the due page.
+#[test]
+fn preparation_parks_due_jobs_whose_source_became_ineligible() {
+    for mutation in [
+        "UPDATE attachment_history SET visible=0",
+        "UPDATE account_groups SET pending_confirmation=1",
+    ] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
+        seed(&store, "one");
+        let asset = request(&app, "one");
+        assert!(
+            app.prepare_attachment_acquisition(&asset, 12)
+                .unwrap()
+                .is_some()
+        );
+        sql(&store, mutation);
+        assert!(
+            app.prepare_attachment_acquisition(&asset, 12)
+                .unwrap()
+                .is_none(),
+            "{mutation}"
+        );
+        let parked: (i64, Option<i64>) = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state,due FROM attachment_acquisition WHERE token=?1",
+                [&asset.token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(parked, (5, None), "{mutation}");
+        assert!(
+            app.attachment_transfer_candidates(12, 64, true)
+                .unwrap()
+                .is_empty(),
+            "{mutation}"
+        );
+    }
 }
 
 mod outgoing;
