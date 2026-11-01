@@ -280,7 +280,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     Ok(())
 }
 
-fn encrypted_media_secret_reference_epochs_for_message_tx(
+pub(crate) fn encrypted_media_secret_reference_epochs_for_message_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,

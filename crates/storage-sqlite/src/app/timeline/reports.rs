@@ -146,7 +146,7 @@ fn dismissal_page(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    app_event_tags(r, 4)?,
                 ))
             })
             .storage()?
@@ -157,9 +157,8 @@ fn dismissal_page(
         }
         for (id, admin, explanation, created_at, tags) in rows {
             cursor = Some(id.clone());
-            if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(&tags)
-                && parse_dismissal(&tags, &explanation)
-                    .is_some_and(|ids| ids.iter().any(|id| id == report))
+            if parse_dismissal(&tags, &explanation)
+                .is_some_and(|ids| ids.iter().any(|id| id == report))
             {
                 labels.push(ReportDismissal {
                     event_id_hex: id,
@@ -393,8 +392,7 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
         return Ok(());
     }
     if let Some(event) = raw(conn, group, id)? {
-        let tags = event
-            .tags
+        let tags = control_tags(conn, &event)?
             .into_iter()
             .filter_map(|mut tag| {
                 let limit = match (event.kind, tag.first().map(String::as_str)) {
@@ -437,6 +435,15 @@ pub(super) fn rescrub_control(conn: &Connection, group: &str, id: &str) -> Stora
     .storage()?;
     Ok(())
 }
+/// A control's tags. Once they no longer decode, what survives of them is the
+/// `e` tags its edges recorded: all a retained control keeps, and all a
+/// removal needs to keep hiding its target.
+fn control_tags(conn: &Connection, event: &RawAppEvent) -> StorageResult<Vec<Vec<String>>> {
+    if !app_event_tags_damaged_tx(conn, &event.group_id_hex, &event.message_id_hex)? {
+        return Ok(event.tags.clone());
+    }
+    recovered_app_event_tags_tx(conn, &event.group_id_hex, &event.message_id_hex)
+}
 pub(super) fn retain_pruned_controls(
     conn: &Connection,
     group: &str,
@@ -448,7 +455,8 @@ pub(super) fn retain_pruned_controls(
             continue;
         };
         if event.kind == 5
-            || (event.kind == 4891 && parse_removal(&event.tags, &event.plaintext).is_some())
+            || (event.kind == 4891
+                && parse_removal(&control_tags(conn, &event)?, &event.plaintext).is_some())
         {
             conn.execute_cached(
                 "INSERT OR IGNORE INTO content_pruned_controls VALUES(?1,?2)",

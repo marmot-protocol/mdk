@@ -277,8 +277,9 @@ impl SqliteAppStorage {
     /// A row stays out when branch selection withdrew it, its retention
     /// expired by `now`, it is local to this device (group-system rows, and
     /// this device's sends no relay accepted), its content no longer matches
-    /// its id (a scrubbed control), or it is a deleted or removed message or
-    /// targets one. A deletion or removal itself goes in.
+    /// its id (a scrubbed control, or stored tags that no longer decode), or it
+    /// is a deleted or removed message or targets one. A deletion or removal
+    /// itself goes in.
     pub fn history_export_page(
         &self,
         group_id_hex: &str,
@@ -343,7 +344,7 @@ impl SqliteAppStorage {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        app_event_tags(row, 6)?,
                         row.get::<_, Option<i64>>(7)?,
                         row.get::<_, Option<bool>>(8)?,
                         row.get::<_, bool>(9)?,
@@ -357,14 +358,8 @@ impl SqliteAppStorage {
             .map(
                 |(id, epoch, at, sender, plaintext, kind, tags, retention, grant, left_out)| {
                     let created_at = i64_to_u64(at)?;
-                    let event = MarmotAppEvent::new(
-                        sender,
-                        created_at,
-                        i64_to_u64(kind)?,
-                        tags_from_json(tags)
-                            .map_err(|err| StorageError::Backend(err.to_string()))?,
-                        plaintext,
-                    );
+                    let event =
+                        MarmotAppEvent::new(sender, created_at, i64_to_u64(kind)?, tags, plaintext);
                     let event = (!left_out && event.id == id).then(|| -> StorageResult<_> {
                         Ok(HistoryExportEvent {
                             event,
