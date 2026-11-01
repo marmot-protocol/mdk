@@ -2321,6 +2321,67 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A transaction another thread asks for while this one owns the slot
+    /// waits for it to finish, then runs in a transaction of its own: two
+    /// threads never share one, and neither fails.
+    #[test]
+    fn a_second_threads_transaction_waits_for_the_first_to_finish() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.with_transaction(|storage| {
+                insert_boundary_probe(storage, 1)?;
+                inside_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, StorageError>(())
+            })
+        });
+        inside_rx.recv().unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let second_store = store.clone();
+        let second = std::thread::spawn(move || {
+            second_store.with_transaction(|storage| {
+                entered_tx.send(()).unwrap();
+                insert_boundary_probe(storage, 2)
+            })
+        });
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the second transaction entered while the first was open"
+        );
+
+        release_tx.send(()).unwrap();
+        first
+            .join()
+            .unwrap()
+            .expect("the first transaction commits");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second transaction runs once the first has committed");
+        second
+            .join()
+            .unwrap()
+            .expect("the second transaction commits");
+        let values: Vec<i64> = store
+            .lock()
+            .unwrap()
+            .prepare("SELECT value FROM boundary_probe ORDER BY value")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, [1, 2]);
+    }
+
     #[test]
     fn delete_journal_transient_commit_contention_retries_boundary_not_closure() {
         let dir = tempfile::tempdir().unwrap();
@@ -2483,18 +2544,26 @@ mod tests {
     /// the boundary in the error.
     #[test]
     fn transaction_boundaries_retry_busy_in_place_and_keep_failure_classes() {
-        use rusqlite::ffi::{SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_LOCKED};
+        use rusqlite::ffi::{
+            SQLITE_BUSY, SQLITE_CONSTRAINT, SQLITE_CORRUPT, SQLITE_FULL, SQLITE_LOCKED,
+        };
         // `None` is the class of a boundary that succeeded.
         type Class = Option<fn(String) -> StorageError>;
         let ok: Class = None;
         let busy: Class = Some(StorageError::Busy);
         let backend: Class = Some(StorageError::Backend);
+        // A disk-full or corrupt COMMIT reaches the app as such: bindings
+        // show storage full, and recovery tells corruption apart.
+        let capacity: Class = Some(StorageError::Capacity);
+        let corruption: Class = Some(StorageError::Corruption);
         // (boundary, codes it fails with in turn, then succeeds or repeats
         // the last code forever, expected class, expected attempts)
-        let rows: [(&str, &[std::os::raw::c_int], bool, Class, u32); 3] = [
+        let rows: [(&str, &[std::os::raw::c_int], bool, Class, u32); 5] = [
             ("ROLLBACK", &[SQLITE_BUSY, SQLITE_LOCKED], true, ok, 3),
             ("ROLLBACK", &[SQLITE_LOCKED], false, busy, BUSY_MAX_ATTEMPTS),
             ("ROLLBACK", &[SQLITE_CONSTRAINT], false, backend, 1),
+            ("COMMIT", &[SQLITE_FULL], false, capacity, 1),
+            ("COMMIT", &[SQLITE_CORRUPT], false, corruption, 1),
         ];
         for (sql, codes, then_succeeds, class, attempts) in rows {
             let mut calls = 0;
@@ -2786,6 +2855,30 @@ mod tests {
             "the callback's own error must survive the closed rollback",
         );
         assert!(store.connection.transaction_unusable_error().is_none());
+
+        // A savepoint open at the close reports the close too, whether its
+        // body failed or succeeded, and latches nothing: its `ROLLBACK TO`
+        // (and, on success, its `RELEASE`) found the connection closed.
+        for body_fails in [true, false] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let closed_during_unit = store.connection.clone();
+            let result: StorageResult<()> = store.connection.with_savepoint(|| {
+                closed_during_unit.close().unwrap();
+                if body_fails {
+                    Err(StorageError::Backend("unit failed".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(result, Err(StorageError::Closed(_))),
+                "body fails: {body_fails}: {result:?}"
+            );
+            assert!(
+                store.connection.transaction_unusable_error().is_none(),
+                "body fails: {body_fails}"
+            );
+        }
     }
 
     /// Closing while another thread is parked waiting for the transaction slot
@@ -2812,21 +2905,34 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let _ = woken_tx.send(waiter_connection.lock().map(|_| ()));
         });
+        let transaction_connection = shared.clone();
+        let (transaction_woken_tx, transaction_woken_rx) = mpsc::channel();
+        let transaction_waiter = std::thread::spawn(move || {
+            let _ = transaction_woken_tx
+                .send(transaction_connection.with_transaction(|| Ok::<_, StorageError>(())));
+        });
 
-        // Give the waiter time to park on the condvar, then close under it.
-        // Losing that race only lets the waiter see the close without
+        // Give the waiters time to park on the condvar, then close under
+        // them. Losing that race only lets a waiter see the close without
         // parking; it cannot make the test fail.
         std::thread::sleep(Duration::from_millis(100));
         shared.close().unwrap();
 
-        // The holder still holds the slot: only the close can wake the waiter.
+        // The holder still holds the slot: only the close can wake a waiter.
         let woken = woken_rx.recv_timeout(Duration::from_secs(5));
+        let transaction_woken = transaction_woken_rx.recv_timeout(Duration::from_secs(5));
         release_tx.send(()).unwrap();
         assert!(
             matches!(woken, Ok(Err(StorageError::Closed(_)))),
             "a parked waiter must be woken with Closed before the holder finishes: {woken:?}",
         );
+        assert!(
+            matches!(transaction_woken, Ok(Err(StorageError::Closed(_)))),
+            "a parked transaction must be woken with Closed before the holder finishes: \
+             {transaction_woken:?}",
+        );
         waiter.join().unwrap();
+        transaction_waiter.join().unwrap();
         let _ = holder.join().unwrap();
     }
 

@@ -403,6 +403,38 @@ mod tests {
         assert_eq!(decoded.as_slice(), value);
     }
 
+    /// The snapshot encoder sizes its buffer of secret bytes up front. A
+    /// write past that size must fail rather than reallocate and leave an
+    /// unzeroized copy behind.
+    #[test]
+    fn sensitive_bytes_refuse_to_grow_past_their_exact_allocation() {
+        let mut bytes = SensitiveBytes::with_capacity(4);
+        bytes.extend_exact(&[1, 2]).unwrap();
+        let overflow = bytes.extend_exact(&[3, 4, 5]);
+        assert!(
+            matches!(&overflow, Err(StorageError::Serialization(detail))
+                if detail == "sensitive binary encoding exceeded its exact allocation"),
+            "{overflow:?}"
+        );
+        bytes.extend_exact(&[3, 4]).unwrap();
+        assert_eq!(bytes.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(bytes.capacity(), 4);
+    }
+
+    /// A stored state this build does not know fails to decode rather than
+    /// reading as some state; snapshot blobs carry it as a byte.
+    #[test]
+    fn unknown_stored_message_states_fail_to_decode() {
+        for state in [8, -1] {
+            let decoded = message_state_from_i64(state);
+            assert!(
+                matches!(&decoded, Err(StorageError::Serialization(detail))
+                    if *detail == format!("unknown stored message state {state}")),
+                "{state}: {decoded:?}"
+            );
+        }
+    }
+
     fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
         rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(primary), None)
     }
