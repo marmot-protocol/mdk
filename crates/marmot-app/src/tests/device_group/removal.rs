@@ -407,6 +407,65 @@ async fn a_device_that_did_not_decide_cleans_up_after_a_removal() {
     assert_eq!(slot_deletions(&relay, &account_id_hex, &laptop_slot), 0);
 }
 
+/// A slot both gone rules cover is read by every key either names
+/// (mdk#2761). The laptop's entry moves to a newer key before the removal,
+/// so the `removed` record carries only that key, while the laptop's chat
+/// leaf is still tagged under the older one and reads as unclaimed. The
+/// phone kept both keys, so its maintenance pass removes the leaf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_slot_is_read_by_every_key_the_device_keeps() {
+    let (mut devices, group) = tagging_devices().await;
+    let chat = chat_with_both(&mut devices).await;
+    let Devices {
+        _dirs,
+        mut phone,
+        laptop,
+        ..
+    } = devices;
+    let laptop_slot = slot_of(&laptop);
+    let leaf = device_group_leaf(&phone, &group, laptop_slot);
+    let newer_key = vec![0x77; 32];
+    let entry = DeviceEntryV1 {
+        tag_signature_key: Some(newer_key.clone()),
+        ..roster(&phone, &group).devices[&laptop_slot].clone()
+    };
+    commit_roster(
+        &mut phone,
+        &group,
+        vec![DeviceRosterOperationV1::SetDevice(laptop_slot, entry)],
+    )
+    .await;
+    phone
+        .unlink_device_from_group(
+            &group,
+            leaf,
+            vec![
+                DeviceRosterOperationV1::RemoveDevice(laptop_slot),
+                DeviceRosterOperationV1::SetRejectedSlot(
+                    laptop_slot,
+                    RejectedSlotV1 {
+                        reason: RejectedSlotReasonV1::Removed,
+                        rejected_at: crate::unix_now_seconds() - 60,
+                        tag_signature_key: Some(newer_key),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        chat_claims(&phone, &chat, &group),
+        [DeviceTagClaim::Unclaimed],
+        "the record's key reads no leaf"
+    );
+
+    phone.run_due_maintenance().await.unwrap();
+    assert!(
+        chat_claims(&phone, &chat, &group).is_empty(),
+        "the leaf under the older key is gone"
+    );
+}
+
 /// The phone removes only the laptop's leaf from a chat both are in. The
 /// account stays in the chat through the phone, so the laptop records the
 /// chat as `DeviceRemoved`, not as a removal of the account from it (D62):

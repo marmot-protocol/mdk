@@ -354,6 +354,8 @@ async fn a_link_whose_welcome_cannot_be_wrapped_writes_nothing() {
     assert!(load_group(&phone, &gid).pending_commit().is_none());
 }
 
+/// A link, and a removed slot's lone record (mdk#2761), each need a group
+/// that requires the roster.
 #[tokio::test]
 async fn a_link_needs_a_device_group() {
     let mut alice = roster_device(b"alice");
@@ -378,14 +380,23 @@ async fn a_link_needs_a_device_group() {
             )],
         ))
         .await;
-    assert!(
-        matches!(
-            &refused,
-            Err(EngineError::InvalidTransition(transition))
-                if transition.from == "DeviceRosterNotRequired"
-        ),
-        "{refused:?}"
-    );
+    let refused_record = alice
+        .engine
+        .send(record_removed_slot(
+            &gid,
+            vec![removed_slot(3, Some(vec![0x44; 32]))],
+        ))
+        .await;
+    for refused in [refused, refused_record] {
+        assert!(
+            matches!(
+                &refused,
+                Err(EngineError::InvalidTransition(transition))
+                    if transition.from == "DeviceRosterNotRequired"
+            ),
+            "{refused:?}"
+        );
+    }
 }
 
 /// A device joins the device group only through a link, never by an Invite

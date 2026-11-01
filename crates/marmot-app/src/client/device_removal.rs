@@ -329,9 +329,14 @@ impl AppClient {
             .await
         {
             Ok(effects) => effects,
-            Err(marmot_session::AccountError::Engine(EngineError::LinkDeviceUnsettled {
-                ..
-            })) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::LinkDeviceUnsettled { .. })
+                ) =>
+            {
+                return Ok(());
+            }
             Err(error) => return Err(error.into()),
         };
         self.observe_drained_session_events(&effects).await?;

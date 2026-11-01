@@ -76,8 +76,8 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Stage a [`cgka_traits::engine::SendIntent::RecordRemovedSlot`]: one
     /// roster `SetRejectedSlot` with reason `removed` and a tag signature
-    /// key, for a slot the roster lists neither as a device nor as a
-    /// rejected slot (mdk#2761). It goes out as a component update; its
+    /// key, in a group that requires the roster, for a slot the roster lists
+    /// neither as a device nor as a rejected slot (mdk#2761). It goes out as a component update; its
     /// intent kind is what keeps it out of the queue and out of re-issue.
     /// Like an unlink, it is refused with
     /// [`EngineError::LinkDeviceUnsettled`] while a Commit is in flight.
@@ -108,6 +108,15 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
         let held = self.with_mls_group(&group_id, |mls_group| {
+            if !crate::app_components::group_requires_device_roster(mls_group)? {
+                return Err(EngineError::InvalidTransition(
+                    cgka_traits::engine_state::InvalidTransition {
+                        from: "DeviceRosterNotRequired",
+                        to: "record_removed_slot",
+                        reason: "the group does not require marmot.account.device-roster.v1",
+                    },
+                ));
+            }
             Ok(
                 crate::app_components::device_roster_of_group(mls_group).is_some_and(|roster| {
                     roster.devices.contains_key(slot) || roster.rejected_slots.contains_key(slot)
