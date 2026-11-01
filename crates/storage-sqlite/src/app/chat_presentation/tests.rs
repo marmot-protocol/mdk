@@ -54,6 +54,70 @@ fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
         format!("{:?}", deleted.draft_version.as_ref().unwrap()),
         "ChatListDraftVersion { .. }"
     );
+    // Debug output carries no names, ids, text or per-database store epoch.
+    let secret_presentation = ConversationPresentation {
+        title: PresentationText::Literal("secret-title".into()),
+        avatar: SelectedAvatar::RemoteImage {
+            url: "https://example.com/secret.png".into(),
+            cache_key: "secret-cache-key".into(),
+        },
+        peer_id: Some("f1".repeat(32)),
+        ..value("bb", "Peer", 1).presentation
+    };
+    let secret_version = ChatPresentationVersion {
+        store_epoch: vec![0xEE; 16],
+        revision: 7,
+    };
+    let secret_preview = SelectedChatPreview::Draft(ChatListDraftPreview {
+        text: "secret-draft".into(),
+        text_truncated: false,
+        attachment_count: 0,
+        attachment_kind: None,
+    });
+    let mut secret_row = deleted.clone();
+    secret_row.presentation = secret_presentation.clone();
+    secret_row.preview = secret_preview.clone();
+    secret_row.row.last_message = Some(crate::ChatListMessagePreview {
+        message_id_hex: "message".into(),
+        sender: "sender".into(),
+        sender_display_name: None,
+        plaintext: "secret-plaintext".into(),
+        media_json: None,
+        kind: 9,
+        tags: Vec::new(),
+        timeline_at: 7,
+        retention_seconds: None,
+        retention_expires_at: None,
+        deleted: false,
+        deletion_source: crate::DeletionSource::Unknown,
+        group_system: None,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: crate::ChatListMessageDeliveryState::NotApplicable,
+    });
+    let stored = StoredChatPresentation {
+        presentation: secret_presentation,
+        profile_version: Some(secret_version.clone()),
+    };
+    let snapshot = PresentedChatListSnapshot {
+        rows: vec![secret_row.clone()],
+        presentation_version: secret_version.clone(),
+    };
+    for (kind, debug) in [
+        ("StoredChatPresentation", format!("{stored:?}")),
+        ("ChatPresentationVersion", format!("{secret_version:?}")),
+        ("PresentedChatRow", format!("{secret_row:?}")),
+        ("PresentedChatListSnapshot", format!("{snapshot:?}")),
+        ("SelectedChatPreview", format!("{secret_preview:?}")),
+    ] {
+        // 238 is how Debug prints the store epoch's 0xEE bytes.
+        for secret in ["secret", "f1f1", "238"] {
+            assert!(
+                !debug.contains(secret),
+                "{kind} Debug shows {secret:?}: {debug}"
+            );
+        }
+    }
     assert_ne!(
         first, edited,
         "identical text still changes the full snapshot row"
@@ -304,6 +368,23 @@ fn failed_dependency_write_rolls_back_value_and_revision() {
     assert_eq!(app.chat_presentation_version().unwrap(), before);
 }
 #[test]
+fn oversized_presentation_is_refused_before_it_is_stored() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    seed(&store, "11");
+    let before = app.chat_presentation_version().unwrap();
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    assert_fails_with(
+        app.store_chat_presentation(&input, &value("bb", &"x".repeat(70_000), 1)),
+        "oversized chat presentation",
+    );
+    assert_eq!(
+        app.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Pending
+    );
+    assert_eq!(app.chat_presentation_version().unwrap(), before);
+}
+#[test]
 fn profile_order_and_missing_unknown_format_are_explicit() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
@@ -394,6 +475,14 @@ fn deleted_and_recreated_row_rejects_old_prepared_value() {
         .unwrap()
         .execute("DELETE FROM account_groups WHERE group_id_hex = '11'", [])
         .unwrap();
+    assert!(
+        store
+            .app_storage()
+            .chat_presentation_input("11")
+            .unwrap()
+            .is_none(),
+        "a chat deleted after listing is skipped, not an error"
+    );
     seed(&store, "11");
     assert_eq!(
         store
@@ -703,6 +792,24 @@ fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
         app.chat_presentation_checkpoint().unwrap().generation,
         initial.generation
     );
+    // A value prepared under another directory incarnation never commits.
+    let mut other_directory = value("bb", "Other directory", 1);
+    other_directory
+        .profile_version
+        .as_mut()
+        .unwrap()
+        .store_epoch = vec![4; 16];
+    assert_fails_with(
+        app.commit_chat_presentation_batch(&initial, &next, &[(first.clone(), other_directory)]),
+        "presentation batch directory epoch mismatch",
+    );
+    assert!(matches!(
+        app.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Pending
+    ));
+    let unchanged = app.chat_presentation_checkpoint().unwrap();
+    assert_eq!(unchanged.generation, initial.generation);
+    assert!(unchanged.state == initial.state);
     assert!(
         app.commit_chat_presentation_batch(
             &initial,

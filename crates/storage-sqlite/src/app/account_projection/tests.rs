@@ -1941,22 +1941,26 @@ fn secure_prune_restores_caller_secure_delete_setting() {
 fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("account.sqlite");
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        crate::SqliteStorageOptions {
-            busy_timeout_ms: 1,
-            ..crate::SqliteStorageOptions::default()
-        },
-    )
-    .unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 1,
+        ..SqliteStorageOptions::default()
+    };
+    let store = open_plaintext_file(&db_path, options.clone());
+    let with_media = |id: &str, at: u64, hash: &str| {
+        let mut event = app_event(id, "aa", at);
+        event.tags = vec![vec![
+            "imeta".to_owned(),
+            "v encrypted-media-v1".to_owned(),
+            format!("ciphertext_sha256 {hash}"),
+        ]];
+        event
+    };
     let media_hash = "db".repeat(32);
-    let mut old = app_event("old-aa", "aa", 10);
-    old.tags = vec![vec![
-        "imeta".to_owned(),
-        "v encrypted-media-v1".to_owned(),
-        format!("ciphertext_sha256 {media_hash}"),
-    ]];
-    store.app_storage().record_app_event(&old).unwrap();
+    let later_hash = "dc".repeat(32);
+    store
+        .app_storage()
+        .record_app_event(&with_media("old-aa", 10, &media_hash))
+        .unwrap();
 
     let reader = rusqlite::Connection::open(&db_path).unwrap();
     reader.execute_batch("BEGIN").unwrap();
@@ -1977,28 +1981,44 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
         0,
         "logical deletion commits before the checkpoint failure is surfaced"
     );
+
+    // A second prune while erasure is still pending reports both prunes: the
+    // caller deletes encrypted media by these hashes.
+    store
+        .app_storage()
+        .record_app_event(&with_media("later-aa", 20, &later_hash))
+        .unwrap();
+    let both = crate::SecurePruneAppEventsResult {
+        pruned_messages: 2,
+        pruned_media_epoch_secrets: 0,
+        media_ciphertext_sha256: vec![media_hash.clone(), later_hash.clone()],
+        erasure_pending: true,
+    };
+    assert_eq!(
+        store
+            .app_storage()
+            .secure_prune_app_events_before("aa", 25, "local", &no_mentions)
+            .unwrap(),
+        both
+    );
     reader.execute_batch("COMMIT").unwrap();
     drop(reader);
     drop(store);
 
-    let store = SqliteAccountStorage::from_connection_with_options(
-        rusqlite::Connection::open(&db_path).unwrap(),
-        crate::SqliteStorageOptions {
-            busy_timeout_ms: 1,
-            ..crate::SqliteStorageOptions::default()
-        },
-    )
-    .unwrap()
-    .app_storage();
+    let store = open_plaintext_file(&db_path, options).app_storage();
     let outcome = store
-        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .secure_prune_app_events_before("aa", 25, "local", &no_mentions)
         .expect("retry after reopen must re-drive the durable pending checkpoint");
-    assert_eq!(outcome.pruned_messages, 1);
-    assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
-    assert!(!outcome.erasure_pending);
+    assert_eq!(
+        outcome,
+        crate::SecurePruneAppEventsResult {
+            erasure_pending: false,
+            ..both
+        }
+    );
 
     let empty = store
-        .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+        .secure_prune_app_events_before("aa", 25, "local", &no_mentions)
         .unwrap();
     assert_eq!(
         empty,
@@ -2618,6 +2638,94 @@ fn push_registration_preserves_created_at_when_token_rotates() {
     assert_eq!(stored.registration.created_at_ms, 10);
     assert_eq!(stored.registration.last_shared_at_ms, None);
     assert_eq!(stored.token_bytes, vec![4, 5, 6]);
+}
+
+/// Disabling native push, clearing the registration and moving it to another
+/// push server each queue the old registration's server removal in the same
+/// transaction. If the removal cannot be queued, nothing changes: deleting the
+/// local registration without it would leave the token on the push server.
+#[test]
+fn push_registration_changes_queue_their_server_removal_or_change_nothing() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let account_id = "11".repeat(32);
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![group("aa", "alpha")],
+            ..Default::default()
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.set_native_push_enabled("alice", &account_id, true)
+        .unwrap();
+    let registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: account_id.clone(),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "bb".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    app.upsert_push_registration(registration.clone(), vec![1, 2, 3])
+        .unwrap();
+    let state = || {
+        let shares = store
+            .lock()
+            .unwrap()
+            .prepare("SELECT group_id_hex, token_fingerprint FROM pending_push_registration_shares")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        (
+            app.push_registration("alice").unwrap(),
+            app.notification_settings("alice", &account_id).unwrap(),
+            shares,
+        )
+    };
+    let before = state();
+    assert!(before.0.is_some());
+    assert!(before.1.native_push_enabled);
+    assert_eq!(before.2.len(), 1);
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_push_removal BEFORE INSERT ON pending_push_registration_removals
+             BEGIN SELECT RAISE(ABORT, 'injected removal failure'); END;",
+        )
+        .unwrap();
+    let moved = AccountPushRegistration {
+        server_pubkey_hex: "dd".repeat(32),
+        updated_at_ms: 20,
+        ..registration
+    };
+    let changes: [(&str, &dyn Fn() -> StorageResult<()>); 3] = [
+        ("disabling native push", &|| {
+            app.set_native_push_enabled("alice", &account_id, false)
+                .map(drop)
+        }),
+        ("clearing the registration", &|| {
+            app.clear_push_registration("alice").map(drop)
+        }),
+        ("moving to another push server", &|| {
+            app.upsert_push_registration(moved.clone(), vec![4, 5, 6])
+                .map(drop)
+        }),
+    ];
+    for (change, apply) in changes {
+        assert_fails_with(apply(), "injected removal failure");
+        assert_eq!(state(), before, "{change} must change nothing");
+    }
 }
 
 #[test]
@@ -3790,6 +3898,32 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
         "the caller's secure_delete setting must be restored after the committed wipe"
     );
 
+    // A second wipe while erasure is still pending adds its rows to the
+    // pending result instead of replacing it. Its row is a push-token
+    // tombstone: a new message could reuse the page space the wiped plaintext
+    // held and hide plaintext the wipe left behind from the on-disk check below.
+    assert!(
+        store
+            .app_storage()
+            .apply_group_push_token_tombstone(&push_tombstone(
+                group_id_hex,
+                &"bb".repeat(32),
+                0,
+                100,
+                "removed-after-wipe",
+            ))
+            .unwrap()
+    );
+    let both = store.delete_local_group_data(group_id_hex).unwrap();
+    assert!(both.erasure_pending);
+    assert!(!both.completed_pending_checkpoint);
+    assert!(
+        both.deleted_rows > pending.deleted_rows,
+        "{} rows reported after a first wipe of {}",
+        both.deleted_rows,
+        pending.deleted_rows
+    );
+
     reader.execute_batch("COMMIT").unwrap();
     drop(reader);
     drop(store);
@@ -3800,7 +3934,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     assert!(completed.did_delete());
     assert!(completed.completed_pending_checkpoint);
     assert!(!completed.erasure_pending);
-    assert!(completed.deleted_rows > 0);
+    assert_eq!(completed.deleted_rows, both.deleted_rows);
     drop(store);
     for path in [
         db_path.clone(),
