@@ -2174,7 +2174,7 @@ mod otlp {
             authorization_bearer_token,
             started_at,
             host_safety::system_resolve,
-            Some(permit),
+            permit,
         )
         .await
     }
@@ -2186,7 +2186,7 @@ mod otlp {
         authorization_bearer_token: &str,
         started_at: SystemTime,
         resolver: F,
-        permit: Option<&crate::DiagnosticsPermit>,
+        permit: &crate::DiagnosticsPermit,
     ) -> Result<(), RelayExportError>
     where
         F: FnOnce(String, u16) -> Fut,
@@ -2194,23 +2194,17 @@ mod otlp {
     {
         // Include our explicit DNS lookup in the overall attempt deadline.
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            if permit.is_some_and(|p| !p.valid()) {
+            if !permit.valid() {
                 return Err(RelayExportError::Request);
             }
-            let pin = if let Some(permit) = permit {
-                tokio::select! {
-                    biased;
-                    _ = permit.cancelled() => return Err(RelayExportError::Request),
-                    result = host_safety::resolve_with(metrics_url, resolver) => {
-                        result.map_err(|_| RelayExportError::Request)?
-                    }
+            let pin = tokio::select! {
+                biased;
+                _ = permit.cancelled() => return Err(RelayExportError::Request),
+                result = host_safety::resolve_with(metrics_url, resolver) => {
+                    result.map_err(|_| RelayExportError::Request)?
                 }
-            } else {
-                host_safety::resolve_with(metrics_url, resolver)
-                    .await
-                    .map_err(|_| RelayExportError::Request)?
             };
-            if permit.is_some_and(|p| !p.valid()) {
+            if !permit.valid() {
                 return Err(RelayExportError::Request);
             }
             let client = pin.build_client().map_err(|_| RelayExportError::Request)?;
@@ -2226,17 +2220,13 @@ mod otlp {
                 .header("content-type", "application/x-protobuf")
                 .bearer_auth(authorization_bearer_token)
                 .body(body);
-            if permit.is_some_and(|p| !p.valid()) {
+            if !permit.valid() {
                 return Err(RelayExportError::Request);
             }
-            let response = if let Some(permit) = permit {
-                tokio::select! {
-                    biased;
-                    _ = permit.cancelled() => return Err(RelayExportError::Request),
-                    result = request.send() => result,
-                }
-            } else {
-                request.send().await
+            let response = tokio::select! {
+                biased;
+                _ = permit.cancelled() => return Err(RelayExportError::Request),
+                result = request.send() => result,
             }
             .map_err(|_| RelayExportError::Request)?;
             if !response.status().is_success() {
@@ -2272,6 +2262,8 @@ mod otlp {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn relay_telemetry_host_safety_rejects_before_any_connection() {
+            host_safety::hand_in_direct_http_builder();
+            let permit = crate::product_analytics::test_permit();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             for endpoint in [
@@ -2290,7 +2282,7 @@ mod otlp {
                     "bearer-secret",
                     SystemTime::now(),
                     |_, _| async { Ok(vec![addr.ip()]) },
-                    None,
+                    &permit,
                 )
                 .await;
                 let error = result.unwrap_err();
@@ -2308,56 +2300,320 @@ mod otlp {
             );
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
-            use crate::export_config::RelayTelemetryExportConfig;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let complete = RelayTelemetryExportConfig {
-                enabled: true,
-                endpoint: Some(format!(
-                    "http://localhost:{}/metrics",
-                    listener.local_addr().unwrap().port()
-                )),
-                authorization_bearer_token: Some("bearer-secret".into()),
-                resource: Some(test_resource()),
-                ..Default::default()
-            };
-            let plane = transport_nostr::MarmotRelayPlane::full_history();
-            assert!(
-                crate::RelayTelemetryExporter::new(
-                    &plane,
-                    complete.clone(),
-                    crate::product_analytics::test_permit()
-                )
-                .is_some()
-            );
-            for case in 0..7 {
-                let mut config = complete.clone();
-                match case {
-                    0 => config.enabled = false,
-                    1 => config.endpoint = None,
-                    2 => config.authorization_bearer_token = None,
-                    3 => config.authorization_bearer_token = Some(" ".into()),
-                    4 => config.resource = None,
-                    5 => config.resource.as_mut().unwrap().tenant.clear(),
-                    _ => config.endpoint = Some("https://user:password@localhost/".into()),
-                }
-                // Construction is the only entrance to export; no exporter
-                // exists on these paths to invoke a DNS resolver or HTTP push.
+        async fn receive_metrics(
+            stream: &mut tokio::net::TcpStream,
+        ) -> ExportMetricsServiceRequest {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            let end = loop {
                 assert!(
-                    crate::RelayTelemetryExporter::new(
-                        &plane,
-                        config,
-                        crate::product_analytics::test_permit()
-                    )
-                    .is_none()
+                    stream.read_buf(&mut bytes).await.unwrap() > 0,
+                    "request ended before headers"
+                );
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length: usize = std::str::from_utf8(&bytes[..end])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|length| length.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < end + length {
+                assert!(
+                    stream.read_buf(&mut bytes).await.unwrap() > 0,
+                    "request body ended early"
                 );
             }
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            ExportMetricsServiceRequest::decode(&bytes[end..end + length]).unwrap()
+        }
+
+        async fn collector(
+            statuses: &[u16],
+        ) -> (
+            String,
+            tokio::sync::mpsc::UnboundedReceiver<ExportMetricsServiceRequest>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            use tokio::io::AsyncWriteExt;
+            host_safety::hand_in_direct_http_builder();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/metrics", listener.local_addr().unwrap());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let statuses = statuses.to_vec();
+            let task = tokio::spawn(async move {
+                let mut index = 0;
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = receive_metrics(&mut stream).await;
+                    let status = statuses[index.min(statuses.len() - 1)];
+                    index += 1;
+                    if tx.send(request).is_err() {
+                        break;
+                    }
+                    stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                }
+            });
+            (endpoint, rx, task)
+        }
+
+        fn exporter(
+            endpoint: String,
+            permit: crate::DiagnosticsPermit,
+        ) -> crate::RelayTelemetryExporter {
+            crate::RelayTelemetryExporter::new(
+                &transport_nostr::MarmotRelayPlane::full_history(),
+                crate::RelayTelemetryExportConfig::enabled(endpoint).with_runtime_config(
+                    crate::RelayTelemetryRuntimeConfig {
+                        authorization_bearer_token: Some("collector-token".into()),
+                        resource: Some(test_resource()),
+                        ..Default::default()
+                    },
+                ),
+                permit,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn collector_statuses_bound_retries_and_suspend_only_rejected_telemetry() {
+            use std::sync::atomic::Ordering;
+            use tokio::sync::mpsc::error::TryRecvError;
+            for (statuses, expected_attempts, rejected) in [
+                (vec![400], 1, true),
+                (vec![401], 1, true),
+                (vec![403], 1, true),
+                (vec![404], 1, true),
+                (vec![422], 1, true),
+                (vec![500, 500, 200], 3, false),
+                (vec![500], 4, false),
+            ] {
+                let (endpoint, mut requests, server) = collector(&statuses).await;
+                let product = crate::ProductAnalytics::default();
+                crate::grant(&product);
+                let permit = product.permit().unwrap();
+                let mut exporter = exporter(endpoint, permit.clone());
+                // This proves the attempt budget independently of the collection
+                // deadline (covered by the app's stalled-window test). Backoff
+                // caps at one second: the two transient rows take about 3s+7s.
+                exporter.config.interval = std::time::Duration::from_secs(3600);
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    exporter.export_once_with_retries(None),
+                )
+                .await
+                .unwrap();
+                if statuses.last() == Some(&200) {
+                    assert!(result.unwrap() > 0);
+                } else {
+                    assert!(
+                        matches!(result, Err(RelayExportError::Status(status)) if status == statuses[0])
+                    );
+                }
+                for _ in 0..expected_attempts {
+                    requests
+                        .try_recv()
+                        .expect("collector completed every attempt before exporter returned");
+                }
+                assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+                assert_eq!(permit.telemetry_rejected.load(Ordering::Acquire), rejected);
+                assert!(
+                    permit.valid(),
+                    "OTLP rejection must preserve the product grant"
+                );
+                assert!(product.permit().is_some());
+                if rejected {
+                    assert!(matches!(
+                        exporter.export_once(None).await,
+                        Err(RelayExportError::Request)
+                    ));
+                    assert!(
+                        matches!(requests.try_recv(), Err(TryRecvError::Empty)),
+                        "rejected credentials were sent again"
+                    );
+                }
+                server.abort();
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn wire_collection_omits_history_and_uses_the_permit_identity() {
+            let (endpoint, mut requests, server) = collector(&[200]).await;
+            let product = crate::ProductAnalytics::default();
+            crate::grant(&product);
+            let permit = product.permit().unwrap();
+            let diagnostic_id = permit.diagnostic_id.clone();
+            let exporter = exporter(endpoint, permit);
+            let performance = crate::AppPerformanceTelemetry::default();
+            for _ in 0..3 {
+                performance.record(
+                    crate::AppPerformanceOperation::AppStart,
+                    std::time::Duration::from_millis(40),
+                    true,
+                );
+            }
+            for expected in [0, 1] {
+                if expected != 0 {
+                    performance.record(
+                        crate::AppPerformanceOperation::AppStart,
+                        std::time::Duration::from_millis(40),
+                        true,
+                    );
+                }
+                exporter
+                    .export_once_with_app_performance(None, Some(performance.snapshot()))
                     .await
-                    .is_err()
-            );
+                    .unwrap();
+                let request = requests.try_recv().unwrap();
+                let resource = request.resource_metrics[0].resource.as_ref().unwrap();
+                assert_eq!(
+                    resource
+                        .attributes
+                        .iter()
+                        .find(|attr| attr.key == "service.instance.id")
+                        .unwrap(),
+                    &string_key_value("service.instance.id", &diagnostic_id)
+                );
+                let metric = request.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .find(|metric| metric.name == metric_names::APP_START_ATTEMPTS)
+                    .unwrap();
+                let Some(metric::Data::Sum(sum)) = &metric.data else {
+                    panic!("expected cumulative counter");
+                };
+                assert_eq!(
+                    sum.data_points[0].value,
+                    Some(number_data_point::Value::AsInt(expected))
+                );
+            }
+            server.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revocation_cancels_a_resolution_that_has_started() {
+            let product = crate::ProductAnalytics::default();
+            crate::grant(&product);
+            let permit = product.permit().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send = tokio::spawn(async move {
+                push_with_resolver(
+                    &RelayTelemetryExportBatch::default(),
+                    "https://collector.example/metrics",
+                    &test_resource(),
+                    "token",
+                    SystemTime::now(),
+                    |_, _| async move {
+                        tx.send(()).unwrap();
+                        std::future::pending::<std::io::Result<Vec<std::net::IpAddr>>>().await
+                    },
+                    &permit,
+                )
+                .await
+            });
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+            if !matches!(ready, Ok(Ok(()))) {
+                send.abort();
+            }
+            ready
+                .expect("the resolver must start before revocation")
+                .unwrap();
+            product.revoke_memory();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(RelayExportError::Request)));
+
+            crate::grant(&product);
+            let stale = product.permit().unwrap();
+            product.revoke_memory();
+            let result = push_with_resolver(
+                &RelayTelemetryExportBatch::default(),
+                "https://collector.example/metrics",
+                &test_resource(),
+                "token",
+                SystemTime::now(),
+                |_, _| -> std::future::Ready<std::io::Result<Vec<std::net::IpAddr>>> {
+                    panic!("a stale grant reached DNS")
+                },
+                &stale,
+            )
+            .await;
+            assert!(matches!(result, Err(RelayExportError::Request)));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revocation_cancels_a_request_after_the_collector_accepts_it() {
+            host_safety::hand_in_direct_http_builder();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/metrics", listener.local_addr().unwrap());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                receive_metrics(&mut stream).await;
+                tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+            let product = crate::ProductAnalytics::default();
+            crate::grant(&product);
+            let exporter = exporter(endpoint, product.permit().unwrap());
+            let send = tokio::spawn(async move { exporter.export_once(None).await });
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+            if !matches!(ready, Ok(Ok(()))) {
+                send.abort();
+                server.abort();
+            }
+            ready
+                .expect("the collector must accept the request before revocation")
+                .unwrap();
+            product.revoke_memory();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(RelayExportError::Request)));
+            server.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn periodic_export_stops_after_shutdown_channel_close_or_consent_revocation() {
+            for stop in ["shutdown", "closed", "revoked"] {
+                let (endpoint, mut requests, server) = collector(&[200]).await;
+                let product = crate::ProductAnalytics::default();
+                crate::grant(&product);
+                let mut exporter = exporter(endpoint, product.permit().unwrap());
+                exporter.config.interval = std::time::Duration::from_millis(25);
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let worker = tokio::spawn(
+                    exporter
+                        .run_with_app_performance(rx, crate::AppPerformanceTelemetry::default()),
+                );
+                // Observe both the immediate push and a produced periodic tick.
+                for _ in 0..2 {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), requests.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                match stop {
+                    "shutdown" => {
+                        tx.send(true).unwrap();
+                    }
+                    "closed" => drop(tx),
+                    _ => product.revoke_memory(),
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                server.abort();
+            }
         }
 
         #[test]
@@ -2486,12 +2742,39 @@ mod otlp {
             assert_eq!(point.time_unix_nano, 200);
             assert_eq!(point.attributes[0].key, "relay");
 
+            // Gauges preserve their live value instead of becoming cumulative sums.
+            let gauge = match &scope_metrics.metrics[1].data {
+                Some(metric::Data::Gauge(gauge)) => gauge,
+                other => panic!("expected gauge, got {other:?}"),
+            };
+            assert_eq!(gauge.data_points.len(), 1);
+            let point = &gauge.data_points[0];
+            assert_eq!(point.value, Some(number_data_point::Value::AsDouble(0.5)));
+            assert_eq!(
+                (point.start_time_unix_nano, point.time_unix_nano),
+                (100, 200)
+            );
+            assert_eq!(point.attributes.len(), 1);
+            assert_eq!(
+                point.attributes[0],
+                string_key_value("relay", "wss://a.example")
+            );
+
             // Histogram -> bucket_counts = per-bucket + overflow, same bounds and sum, no label.
             let histogram = match &scope_metrics.metrics[2].data {
                 Some(metric::Data::Histogram(histogram)) => histogram,
                 other => panic!("expected histogram, got {other:?}"),
             };
+            assert_eq!(
+                histogram.aggregation_temporality,
+                AggregationTemporality::Cumulative as i32
+            );
+            assert_eq!(histogram.data_points.len(), 1);
             let point = &histogram.data_points[0];
+            assert_eq!(
+                (point.start_time_unix_nano, point.time_unix_nano),
+                (100, 200)
+            );
             assert!(
                 point.attributes.is_empty(),
                 "population metric carries no label"

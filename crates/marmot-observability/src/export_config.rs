@@ -293,6 +293,95 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_debug_redacts_the_bearer_token() {
+        let mut config = runtime_config();
+        config.authorization_bearer_token = Some("private-bearer-sentinel".into());
+        for debug in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!debug.contains("private-bearer-sentinel"));
+            assert!(debug.contains("<redacted>"));
+        }
+        config.authorization_bearer_token = None;
+        assert!(format!("{config:?}").contains("authorization_bearer_token: None"));
+    }
+
+    #[test]
+    fn runtime_normalization_trims_inputs_and_names_invalid_required_fields() {
+        let mut config = runtime_config();
+        config.otlp_endpoint = Some(" https://collector.example/metrics ".into());
+        config.authorization_bearer_token = Some(" secret ".into());
+        let resource = config.resource.as_mut().unwrap();
+        resource.service_version = " 1.4.2 ".into();
+        resource.service_instance_id = " host-identity ".into();
+        resource.deployment_environment = " staging ".into();
+        resource.tenant = " mdk-ios ".into();
+        resource.os_type = " ios ".into();
+        resource.os_version = " 17.5 ".into();
+        resource.device_model_identifier = Some(" model-id ".into());
+        let normalized = crate::wiring::normalize_runtime_config(config).unwrap();
+        assert_eq!(
+            normalized.otlp_endpoint.as_deref(),
+            Some("https://collector.example/metrics")
+        );
+        assert_eq!(
+            normalized.authorization_bearer_token.as_deref(),
+            Some("secret")
+        );
+        let resource = normalized.resource.as_ref().unwrap();
+        assert_eq!(resource.service_version, "1.4.2");
+        assert_eq!(resource.service_instance_id, "host-identity");
+        assert_eq!(resource.deployment_environment, "staging");
+        assert_eq!(resource.tenant, "mdk-ios");
+        assert_eq!(resource.os_type, "ios");
+        assert_eq!(resource.os_version, "17.5");
+        assert_eq!(
+            resource.device_model_identifier.as_deref(),
+            Some("model-id")
+        );
+        let mut blank_optional = normalized;
+        blank_optional.otlp_endpoint = Some(" ".into());
+        blank_optional.authorization_bearer_token = Some(" ".into());
+        blank_optional
+            .resource
+            .as_mut()
+            .unwrap()
+            .device_model_identifier = Some(" ".into());
+        let normalized = crate::wiring::normalize_runtime_config(blank_optional).unwrap();
+        assert_eq!(normalized.otlp_endpoint, None);
+        assert_eq!(normalized.authorization_bearer_token, None);
+        assert_eq!(normalized.resource.unwrap().device_model_identifier, None);
+
+        for (case, field) in [
+            "service.version",
+            "deployment.environment.name",
+            "tenant",
+            "os.type",
+            "os.version",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut config = runtime_config();
+            let resource = config.resource.as_mut().unwrap();
+            match case {
+                0 => resource.service_version = " ".into(),
+                1 => resource.deployment_environment = " ".into(),
+                2 => resource.tenant = " ".into(),
+                3 => resource.os_type = " ".into(),
+                _ => resource.os_version = " ".into(),
+            }
+            assert_eq!(
+                crate::wiring::normalize_runtime_config(config.clone()).unwrap_err(),
+                format!("{field} must not be empty")
+            );
+            // The non-fallible export builder also fails closed for an invalid resource.
+            let export = RelayTelemetryExportConfig::enabled("https://collector.example/metrics")
+                .with_runtime_config(config);
+            assert_eq!(export.resource, None);
+            assert!(!export.export_allowed());
+        }
+    }
+
+    #[test]
     fn relay_export_gate_is_the_export_allowed_check() {
         use transport_nostr::RelayExportGate;
         let configs = [

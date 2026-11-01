@@ -57,14 +57,133 @@ fn generation_never_revives() {
 
 #[test]
 fn keys_are_redacted_and_reserved_properties_rejected() {
-    let (c, _) = configured();
-    let mut config = c.lock().config.clone();
-    assert!(!format!("{config:?}").contains("A-SH-123456"));
-    config.registry[0].properties.push(ProductPropertySchema {
-        name: "environment".into(),
-        rule: ProductPropertyRule::Boolean,
-    });
-    assert!(config.validate().is_err());
+    let (collector, _) = configured();
+    let config = collector.lock().config.clone();
+    grant(&collector);
+    let permit = collector.permit().unwrap();
+    for debug in [format!("{config:?}"), format!("{collector:?}")] {
+        assert!(!debug.contains("A-SH-123456"));
+        assert!(!debug.contains("127.0.0.1:9876"));
+    }
+    for name in ["account_id", "text", "environment"] {
+        let mut invalid = config.clone();
+        invalid.registry[0].properties.push(ProductPropertySchema {
+            name: name.into(),
+            rule: ProductPropertyRule::Boolean,
+        });
+        assert!(
+            matches!(
+                collector.configure(invalid, String::new()),
+                Err(ProductAnalyticsError::InvalidConfiguration)
+            ),
+            "reserved property {name}"
+        );
+        assert_eq!(collector.lock().config, config);
+        assert!(
+            permit.valid(),
+            "an invalid optional configuration must preserve consent"
+        );
+    }
+}
+
+#[test]
+fn configuration_admission_is_closed_and_failed_changes_preserve_the_grant() {
+    let (collector, _) = configured();
+    let config = collector.lock().config.clone();
+    grant(&collector);
+    let permit = collector.permit().unwrap();
+    for case in [
+        "built_in_override",
+        "unprefixed_event",
+        "invalid_event_label",
+        "duplicate_event",
+        "duplicate_property",
+        "invalid_property_label",
+        "empty_choices",
+        "duplicate_choices",
+        "invalid_choice_label",
+        "endpoint_query",
+        "loopback_without_opt_in",
+        "bad_endpoint",
+        "empty_key",
+        "long_key",
+        "invalid_key",
+        "operator",
+        "app_version",
+        "long_app_version",
+        "os_family",
+        "os_major_version",
+        "device_class",
+        "host_surface",
+        "environment",
+    ] {
+        let mut invalid = config.clone();
+        match case {
+            "built_in_override" => invalid.registry[0] = approved_host_product_schemas()[0].clone(),
+            "unprefixed_event" => invalid.registry[0].name = "event".into(),
+            "invalid_event_label" => invalid.registry[0].name = "app_Personal".into(),
+            "duplicate_event" => invalid.registry.push(invalid.registry[0].clone()),
+            "duplicate_property" => {
+                let property = ProductPropertySchema {
+                    name: "visible".into(),
+                    rule: ProductPropertyRule::Boolean,
+                };
+                invalid.registry[0].properties = vec![property.clone(), property];
+            }
+            "invalid_property_label" => {
+                invalid.registry[0].properties.push(ProductPropertySchema {
+                    name: "raw value".into(),
+                    rule: ProductPropertyRule::Boolean,
+                })
+            }
+            "empty_choices" | "duplicate_choices" | "invalid_choice_label" => {
+                let choices = match case {
+                    "empty_choices" => vec![],
+                    "duplicate_choices" => vec!["visible".into(), "visible".into()],
+                    _ => vec!["raw value".into()],
+                };
+                invalid.registry[0].properties.push(ProductPropertySchema {
+                    name: "choice".into(),
+                    rule: ProductPropertyRule::Enum(choices),
+                });
+            }
+            "endpoint_query" => {
+                invalid.events_endpoint =
+                    Some("https://analytics.example/events?token=private".into())
+            }
+            "loopback_without_opt_in" => invalid.allow_loopback = false,
+            "bad_endpoint" => invalid.events_endpoint = Some("file:///tmp/private".into()),
+            "empty_key" => invalid.app_key = Some(String::new()),
+            "long_key" => invalid.app_key = Some("a".repeat(129)),
+            "invalid_key" => invalid.app_key = Some("private\nheader".into()),
+            "operator" => invalid.operator = String::new(),
+            "app_version" => invalid.metadata.app_version = "private-version".into(),
+            "long_app_version" => invalid.metadata.app_version = "1".repeat(51),
+            "os_family" => invalid.metadata.os_family = "private-os".into(),
+            "os_major_version" => invalid.metadata.os_major_version = "12345".into(),
+            "device_class" => invalid.metadata.device_class = "private-device".into(),
+            "host_surface" => invalid.metadata.host_surface = "private-host".into(),
+            "environment" => invalid.metadata.environment = "private-deployment".into(),
+            _ => unreachable!(),
+        }
+        let error = collector.configure(invalid, String::new()).unwrap_err();
+        assert!(
+            matches!(error, ProductAnalyticsError::InvalidConfiguration),
+            "{case}"
+        );
+        assert!(!error.to_string().contains("private"), "{case}");
+        assert_eq!(collector.lock().config, config, "{case}");
+        assert!(permit.valid(), "{case}");
+    }
+    let mut valid = config;
+    valid.events_endpoint = Some("https://analytics.example/prefix/events".into());
+    valid.app_key = Some("a".repeat(128));
+    collector.configure(valid.clone(), String::new()).unwrap();
+    assert_eq!(collector.lock().config, valid);
+    assert!(
+        !permit.valid(),
+        "an accepted configuration replaces its old grant generation"
+    );
 }
 #[cfg(feature = "product-analytics-export")]
 #[test]
@@ -89,6 +208,10 @@ fn no_preconsent_backlog_and_idempotent_background() {
     );
     c.activity(ProductAnalyticsActivity::Background);
     let count = c.lock().queue.len();
+    assert!(c.lock().queue.iter().any(|row| {
+        row.payload["eventName"] == "mdk_maintenance_summary"
+            && row.payload["props"]["count_bucket"] == "1"
+    }));
     c.activity(ProductAnalyticsActivity::Background);
     assert_eq!(count, c.lock().queue.len());
     c.revoke_memory();
@@ -98,39 +221,146 @@ fn no_preconsent_backlog_and_idempotent_background() {
 #[cfg(feature = "product-analytics-export")]
 #[test]
 fn session_expiry_queue_bounds_and_clock_jump() {
-    let (c, clock) = configured();
-    grant(&c);
-    c.activity(ProductAnalyticsActivity::Foreground);
-    let id = c.lock().session.clone().unwrap().0;
-    clock.mono.store(1_800_000, Ordering::Relaxed);
-    clock.wall.store(3600, Ordering::Relaxed);
-    c.activity(ProductAnalyticsActivity::Foreground);
-    assert_ne!(c.lock().session.clone().unwrap().0, id);
-    {
-        let mut s = c.lock();
-        for _ in 0..700 {
-            c.enqueue(
-                &mut s,
-                "mdk_session_started",
-                BTreeMap::from([("launch_reason".into(), "ordinary".into())]),
-                "00000000-0000-4000-8000-000000000000",
-                3600,
+    for large in [false, true] {
+        let (collector, clock) = configured();
+        let mut config = collector.lock().config.clone();
+        config.registry[0].properties = (0..if large { 8 } else { 1 })
+            .map(|index| ProductPropertySchema {
+                name: format!("value_{index}"),
+                rule: ProductPropertyRule::Enum(
+                    (0..16)
+                        .map(|value| {
+                            format!("v_{value:02}_{}", "x".repeat(if large { 175 } else { 0 }))
+                        })
+                        .collect(),
+                ),
+            })
+            .collect();
+        collector.configure(config, String::new()).unwrap();
+        grant(&collector);
+        collector.activity(ProductAnalyticsActivity::Foreground);
+        for index in 0..700 {
+            let value = format!(
+                "v_{:02}_{}",
+                index % 16,
+                "x".repeat(if large { 175 } else { 0 })
             );
+            assert_eq!(
+                collector
+                    .record(ProductEvent {
+                        name: "app_test_view".into(),
+                        properties: (0..if large { 8 } else { 1 })
+                            .map(|property| (format!("value_{property}"), value.clone()))
+                            .collect(),
+                    })
+                    .unwrap(),
+                ProductRecordResult::Recorded
+            );
+            if index == 0 {
+                assert_eq!(
+                    collector.status().queued_events,
+                    2,
+                    "positive control: session plus first event"
+                );
+            }
         }
-        assert!(s.queue.len() <= MAX_EVENTS);
-        assert!(s.queue_bytes <= MAX_QUEUE_BYTES);
-    }
-    clock.mono.store(5_400_000, Ordering::Relaxed);
-    clock.wall.store(100, Ordering::Relaxed);
-    {
-        let mut s = c.lock();
-        c.advance(&mut s);
-        assert!(
-            s.queue
-                .iter()
-                .all(|e| clock.monotonic().saturating_sub(e.created) < EVENT_TTL)
+        let state = collector.lock();
+        let retained = state.queue.len();
+        let bytes: usize = state.queue.iter().map(|event| event.bytes).sum();
+        assert_eq!(state.queue_bytes, bytes);
+        assert_eq!(state.status.dropped_events, 701 - retained as u64);
+        if large {
+            assert!(
+                retained > 0 && retained < MAX_EVENTS,
+                "the byte limit must act before the event limit"
+            );
+            assert!(bytes <= MAX_QUEUE_BYTES);
+            assert!(bytes + state.queue.front().unwrap().bytes > MAX_QUEUE_BYTES);
+        } else {
+            assert_eq!(retained, MAX_EVENTS);
+            assert!(bytes < MAX_QUEUE_BYTES);
+        }
+        assert_eq!(
+            state.queue.front().unwrap().payload["props"]["value_0"],
+            format!(
+                "v_{:02}_{}",
+                (700 - retained) % 16,
+                "x".repeat(if large { 175 } else { 0 })
+            )
         );
+        assert_eq!(
+            state.queue.back().unwrap().payload["props"]["value_0"],
+            format!(
+                "v_{:02}_{}",
+                699 % 16,
+                "x".repeat(if large { 175 } else { 0 })
+            )
+        );
+        drop(state);
+        clock
+            .mono
+            .store(EVENT_TTL.as_millis() as u64 - 1, Ordering::Relaxed);
+        clock.wall.store(5399, Ordering::Relaxed);
+        let remaining = {
+            let mut state = collector.lock();
+            collector.advance(&mut state);
+            let remaining = state
+                .queue
+                .iter()
+                .filter(|event| event.payload["eventName"] == "app_test_view")
+                .count();
+            // Sealing the elapsed window may evict one oldest row, but none is expired yet.
+            assert!(remaining >= retained - 1);
+            remaining
+        };
+        let before = collector.status().dropped_events;
+        clock
+            .mono
+            .store(EVENT_TTL.as_millis() as u64, Ordering::Relaxed);
+        clock.wall.store(5400, Ordering::Relaxed);
+        let mut state = collector.lock();
+        collector.advance(&mut state);
+        assert!(
+            state
+                .queue
+                .iter()
+                .all(|event| event.payload["eventName"] != "app_test_view")
+        );
+        assert_eq!(state.status.dropped_events - before, remaining as u64);
     }
+    let (collector, clock) = configured();
+    grant(&collector);
+    collector.observe(
+        ProductFamily::Maintenance,
+        "retention",
+        "success",
+        ProductUnit::Attempt,
+        None,
+    );
+    clock.mono.store(1000, Ordering::Relaxed);
+    clock.wall.store(1900, Ordering::Relaxed); // Same 15-minute window, but a wall-clock jump.
+    collector.observe(
+        ProductFamily::Maintenance,
+        "retention",
+        "success",
+        ProductUnit::Attempt,
+        None,
+    );
+    let state = collector.lock();
+    let rows: Vec<_> = state
+        .queue
+        .iter()
+        .filter(|event| event.payload["eventName"] == "mdk_maintenance_summary")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].payload["props"]["partial"], "true");
+    assert_eq!(rows[0].payload["props"]["count_bucket"], "1");
+    assert_eq!(rows[0].payload["timestamp"], "1970-01-01T00:30:00Z");
+    assert_eq!(
+        state.cells.values().sum::<u64>(),
+        1,
+        "the new observation belongs to the new window"
+    );
 }
 
 #[cfg(feature = "product-analytics-export")]
@@ -261,6 +491,49 @@ fn backlog_aggregates_sources_without_counting_scheduler_ticks() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].payload["props"]["count_bucket"], "3_5");
     assert_eq!(rows[0].payload["props"]["unit"], "backlog");
+    drop(s);
+    drop(b);
+    a.sample(
+        &c.permit().unwrap(),
+        ProductFamily::Maintenance,
+        "pending",
+        2,
+    );
+    c.seal_partial();
+    let buckets: Vec<_> = c
+        .lock()
+        .queue
+        .iter()
+        .filter(|row| row.payload["eventName"] == "mdk_maintenance_summary")
+        .map(|row| {
+            row.payload["props"]["count_bucket"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        buckets,
+        ["3_5", "2"],
+        "a departed worker must stop contributing backlog"
+    );
+    drop(a);
+    c.observe(
+        ProductFamily::Runtime,
+        "startup",
+        "success",
+        ProductUnit::Attempt,
+        None,
+    );
+    c.seal_partial();
+    assert_eq!(
+        c.lock()
+            .queue
+            .iter()
+            .filter(|row| row.payload["eventName"] == "mdk_maintenance_summary")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -351,6 +624,25 @@ fn launch_reason_account_boundary_and_idle_rotation_are_finite() {
     clock.wall.store(3600, Ordering::Relaxed);
     c.activity(ProductAnalyticsActivity::Foreground);
     assert_ne!(c.lock().session.as_ref().unwrap().0, second);
+    let hourly = c.lock().session.as_ref().unwrap().0.clone();
+    for seconds in [2700, 3600, 4500] {
+        clock.mono.store(seconds * 1000, Ordering::Relaxed);
+        clock.wall.store(seconds + 1800, Ordering::Relaxed);
+        c.activity(ProductAnalyticsActivity::Foreground);
+        assert_eq!(
+            c.lock().session.as_ref().unwrap().0,
+            hourly,
+            "activity prevents idle expiry"
+        );
+    }
+    clock.mono.store(5_400_000, Ordering::Relaxed);
+    clock.wall.store(7200, Ordering::Relaxed);
+    c.activity(ProductAnalyticsActivity::Foreground);
+    assert_ne!(
+        c.lock().session.as_ref().unwrap().0,
+        hourly,
+        "a session expires after an hour even while active"
+    );
 }
 
 #[test]
@@ -380,9 +672,53 @@ fn serialization_rechecks_closed_schema_and_uuid() {
     let mut invalid = payload.clone();
     invalid["sessionId"] = serde_json::json!("zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz");
     assert!(!collector.valid_payload(&state.config, &invalid));
-    invalid = payload;
+    invalid = payload.clone();
     invalid["eventName"] = serde_json::json!("mdk_unreviewed_event");
     assert!(!collector.valid_payload(&state.config, &invalid));
+    for case in [
+        "not_object",
+        "missing_envelope",
+        "missing_launch_reason",
+        "missing_common",
+        "non_string_property",
+        "invalid_stamp",
+        "negative_stamp",
+        "future_stamp",
+        "not_uuid_v4",
+        "not_uuid_variant",
+    ] {
+        let mut invalid = payload.clone();
+        match case {
+            "not_object" => invalid = serde_json::json!([]),
+            "missing_envelope" => {
+                invalid.as_object_mut().unwrap().remove("timestamp");
+            }
+            "missing_launch_reason" => {
+                invalid["props"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("launch_reason");
+            }
+            "missing_common" => {
+                invalid["props"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("schema_version");
+            }
+            "non_string_property" => invalid["props"]["launch_reason"] = serde_json::json!(true),
+            "invalid_stamp" => invalid["timestamp"] = serde_json::json!("not-a-date"),
+            "negative_stamp" => invalid["timestamp"] = serde_json::json!("1969-12-31T23:59:59Z"),
+            "future_stamp" => invalid["timestamp"] = serde_json::json!("1970-01-01T00:40:01Z"),
+            "not_uuid_v4" => {
+                invalid["sessionId"] = serde_json::json!("00000000-0000-1000-8000-000000000000")
+            }
+            "not_uuid_variant" => {
+                invalid["sessionId"] = serde_json::json!("00000000-0000-4000-c000-000000000000")
+            }
+            _ => unreachable!(),
+        }
+        assert!(!collector.valid_payload(&state.config, &invalid), "{case}");
+    }
 }
 
 #[cfg(feature = "product-analytics-export")]
@@ -404,9 +740,17 @@ async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     crate::collector_host_safety::hand_in_direct_http_builder();
     for (status, expire_during_retry) in [
-        (401u16, false),
+        (400u16, false),
+        (401, false),
+        (403, false),
+        (404, false),
+        (422, false),
         (500, false),
         (503, false),
+        (408, false),
+        (302, false),
+        (202, false),
+        (204, false),
         (429, false),
         (429, true),
     ] {
@@ -482,7 +826,7 @@ async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() 
         assert!(permit.valid()); // A product rejection never revokes the OTLP grant.
         assert!(!c.telemetry_rejected.load(Ordering::Acquire));
         let report = c.status();
-        if status == 401 {
+        if matches!(status, 400 | 401 | 403 | 404 | 422) {
             assert_eq!(
                 report.product_analytics,
                 DiagnosticsExporterStatus::ConfigurationRejected
@@ -493,7 +837,7 @@ async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() 
             );
             c.send_pending().await;
             assert_eq!(requests.load(Ordering::Relaxed), 1);
-        } else if matches!(status, 500 | 503) || expire_during_retry {
+        } else if matches!(status, 500 | 503 | 408 | 302) || expire_during_retry {
             assert_eq!(report.failed_batches, 1);
             assert_eq!(report.accepted_batches, 0);
             assert!(report.dropped_events > 0);
@@ -653,6 +997,26 @@ fn directory_sources_are_closed_and_stale_resolution_results_are_discarded() {
         .filter(|r| r["eventName"] == "mdk_directory_summary")
         .collect();
     assert_eq!(rows.len(), 2);
+    let mut observations: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let props = &row["props"];
+            (
+                props["source"].as_str().unwrap(),
+                props["outcome"].as_str().unwrap(),
+                props["unit"].as_str().unwrap(),
+                props["count_bucket"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    observations.sort_unstable();
+    assert_eq!(
+        observations,
+        [
+            ("cache", "success", "attempt", "2"),
+            ("network", "empty", "attempt", "1")
+        ]
+    );
     assert!(
         rows.iter()
             .all(|row| collector.valid_payload(&collector.lock().config, row))
@@ -715,6 +1079,7 @@ fn registry_limits_accept_boundaries_and_reject_one_past_without_echoing_values(
             _ => unreachable!(),
         }
         let error = invalid.validate().unwrap_err();
+        assert!(matches!(error, ProductAnalyticsError::InvalidConfiguration));
         assert!(!error.to_string().contains(&"v".repeat(30)));
     }
     config.registry[0].properties[0].rule = ProductPropertyRule::Boolean;
@@ -773,7 +1138,12 @@ fn non_media_measurements_do_not_depend_on_optional_product_analytics() {
             "other",
         );
     }
-    assert_eq!(plain.snapshot(), attached.snapshot());
+    for telemetry in [&plain, &attached] {
+        let start = telemetry.snapshot().app_start;
+        assert_eq!((start.attempts, start.successes, start.failures), (1, 1, 0));
+        assert_eq!(start.duration_ms.sample_count(), 1);
+        assert_eq!(start.duration_ms.sum_ms, 42);
+    }
 }
 
 #[cfg(not(feature = "product-analytics-export"))]
@@ -875,4 +1245,468 @@ fn local_ready_handoff_does_not_duplicate_the_complete_phase_observation() {
         .map(|(_, count)| *count)
         .sum();
     assert_eq!(attempts, 1);
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn host_event_admission_checks_each_rule_before_queueing() {
+    let (collector, _) = configured();
+    let mut config = collector.lock().config.clone();
+    config.registry[0].properties = vec![
+        ProductPropertySchema {
+            name: "choice".into(),
+            rule: ProductPropertyRule::Enum(vec!["visible".into()]),
+        },
+        ProductPropertySchema {
+            name: "visible".into(),
+            rule: ProductPropertyRule::Boolean,
+        },
+        ProductPropertySchema {
+            name: "amount".into(),
+            rule: ProductPropertyRule::CountBucket,
+        },
+        ProductPropertySchema {
+            name: "elapsed".into(),
+            rule: ProductPropertyRule::DurationBucket,
+        },
+    ];
+    let event = ProductEvent {
+        name: "app_test_view".into(),
+        properties: BTreeMap::from([
+            ("choice".into(), "visible".into()),
+            ("visible".into(), "true".into()),
+            ("amount".into(), "1".into()),
+            ("elapsed".into(), "le_10ms".into()),
+        ]),
+    };
+    let mut incomplete = config.clone();
+    incomplete.events_endpoint = None;
+    collector.configure(incomplete, String::new()).unwrap();
+    grant(&collector);
+    assert_eq!(
+        collector.record(event.clone()).unwrap(),
+        ProductRecordResult::IgnoredUnconfigured
+    );
+    assert_eq!(
+        collector.status().product_analytics,
+        DiagnosticsExporterStatus::Unconfigured
+    );
+    assert_eq!(collector.status().queued_events, 0);
+    collector.configure(config, String::new()).unwrap();
+    grant(&collector);
+    collector.activity(ProductAnalyticsActivity::Foreground);
+    assert_eq!(
+        collector.record(event.clone()).unwrap(),
+        ProductRecordResult::Recorded
+    );
+    let queued = collector.status().queued_events;
+    for case in [
+        "unknown_event",
+        "missing_property",
+        "extra_property",
+        "wrong_property",
+        "choice",
+        "visible",
+        "amount",
+        "elapsed",
+    ] {
+        let mut invalid = event.clone();
+        match case {
+            "unknown_event" => invalid.name = "app_unregistered".into(),
+            "missing_property" => {
+                invalid.properties.remove("choice");
+            }
+            "extra_property" => {
+                invalid.properties.insert("extra".into(), "private".into());
+            }
+            "wrong_property" => {
+                invalid.properties.remove("choice");
+                invalid.properties.insert("other".into(), "private".into());
+            }
+            key => {
+                invalid.properties.insert(key.into(), "private".into());
+            }
+        }
+        assert!(
+            matches!(
+                collector.record(invalid),
+                Err(ProductAnalyticsError::InvalidEvent)
+            ),
+            "{case}"
+        );
+        assert_eq!(collector.status().queued_events, queued, "{case}");
+    }
+    let state = collector.lock();
+    let payload = &state.queue.back().unwrap().payload;
+    assert_eq!(payload["props"]["choice"], "visible");
+    assert_eq!(payload["props"]["visible"], "true");
+    assert_eq!(payload["props"]["amount"], "1");
+    assert_eq!(payload["props"]["elapsed"], "le_10ms");
+    let mut config = state.config.clone();
+    drop(state);
+    config.registry[0].properties = (0..8)
+        .map(|index| ProductPropertySchema {
+            name: format!("field_{index}{}", "p".repeat(33)),
+            rule: ProductPropertyRule::Enum(vec!["v".repeat(180)]),
+        })
+        .collect();
+    let oversized = ProductEvent {
+        name: "app_test_view".into(),
+        properties: config.registry[0]
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), "v".repeat(180)))
+            .collect(),
+    };
+    collector.configure(config, String::new()).unwrap();
+    grant(&collector);
+    collector.activity(ProductAnalyticsActivity::Foreground);
+    let before = collector.status();
+    collector.record(oversized).unwrap();
+    let after = collector.status();
+    assert_eq!(after.queued_events, before.queued_events);
+    assert_eq!(after.dropped_events, before.dropped_events + 1);
+    assert!(
+        collector
+            .lock()
+            .queue
+            .iter()
+            .all(|row| row.payload["eventName"] != "app_test_view")
+    );
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn journey_duplicates_are_suppressed_until_the_session_changes() {
+    let (collector, _) = configured();
+    grant(&collector);
+    collector.activity(ProductAnalyticsActivity::Foreground);
+    let events = [
+        ProductEvent {
+            name: "app_screen_viewed".into(),
+            properties: BTreeMap::from([("screen".into(), "inbox".into())]),
+        },
+        ProductEvent {
+            name: "mdk_onboarding_step".into(),
+            properties: BTreeMap::from([
+                ("step".into(), "start".into()),
+                ("path".into(), "create".into()),
+                ("outcome".into(), "success".into()),
+            ]),
+        },
+        ProductEvent {
+            name: "mdk_runtime_ready".into(),
+            properties: BTreeMap::from([
+                ("outcome".into(), "success".into()),
+                ("duration_bucket".into(), "le_10ms".into()),
+            ]),
+        },
+    ];
+    let mut sessions = BTreeSet::new();
+    for round in 0..2 {
+        for event in &events {
+            assert_eq!(
+                collector.record(event.clone()).unwrap(),
+                ProductRecordResult::Recorded
+            );
+            assert_eq!(
+                collector.record(event.clone()).unwrap(),
+                ProductRecordResult::IgnoredDuplicate
+            );
+            let state = collector.lock();
+            let rows: Vec<_> = state
+                .queue
+                .iter()
+                .filter(|row| row.payload["eventName"] == event.name)
+                .collect();
+            assert_eq!(rows.len(), round + 1);
+            sessions.insert(
+                rows.last().unwrap().payload["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        for mut duplicate in [events[1].clone(), events[2].clone()] {
+            duplicate
+                .properties
+                .insert("outcome".into(), "failure".into());
+            assert_eq!(
+                collector.record(duplicate).unwrap(),
+                ProductRecordResult::IgnoredDuplicate
+            );
+        }
+        collector.activity(ProductAnalyticsActivity::AccountChanged);
+        collector.activity(ProductAnalyticsActivity::ForegroundDeepLink);
+    }
+    assert_eq!(sessions.len(), 2);
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn aggregate_capacity_reserves_coverage_and_counts_overflow_without_losing_existing_cells() {
+    for with_backlog in [false, true] {
+        let (collector, _) = configured();
+        let mut config = collector.lock().config.clone();
+        config.registry = vec![ProductEventSchema {
+            name: "app_capacity".into(),
+            mode: ProductEventMode::Aggregate,
+            properties: ["first", "second"]
+                .into_iter()
+                .map(|name| ProductPropertySchema {
+                    name: name.into(),
+                    rule: ProductPropertyRule::Enum(
+                        (0..16).map(|index| format!("v_{index}")).collect(),
+                    ),
+                })
+                .collect(),
+        }];
+        collector.configure(config, String::new()).unwrap();
+        grant(&collector);
+        let source = collector.backlog_source();
+        if with_backlog {
+            source.sample(
+                &collector.permit().unwrap(),
+                ProductFamily::Maintenance,
+                "pending",
+                2,
+            );
+        }
+        let event = |index: usize| ProductEvent {
+            name: "app_capacity".into(),
+            properties: BTreeMap::from([
+                ("first".into(), format!("v_{}", index / 16)),
+                ("second".into(), format!("v_{}", index % 16)),
+            ]),
+        };
+        for index in 0..256 {
+            assert_eq!(
+                collector.record(event(index)).unwrap(),
+                ProductRecordResult::Recorded
+            );
+        }
+        assert_eq!(
+            collector.record(event(0)).unwrap(),
+            ProductRecordResult::Recorded
+        );
+        let rows = collector.test_payloads();
+        let aggregates: Vec<_> = rows
+            .iter()
+            .filter(|row| row["eventName"] == "app_capacity")
+            .collect();
+        assert_eq!(aggregates.len(), MAX_CELLS - 3 - usize::from(with_backlog));
+        let first = aggregates
+            .iter()
+            .find(|row| row["props"]["first"] == "v_0" && row["props"]["second"] == "v_0")
+            .unwrap();
+        assert_eq!(
+            first["props"]["count_bucket"], "2",
+            "capacity must not block an existing cell"
+        );
+        let overflow = rows
+            .iter()
+            .find(|row| row["props"]["operation"] == "overflow")
+            .unwrap();
+        assert_eq!(overflow["props"]["count_bucket"], "3_5");
+        assert_eq!(overflow["props"]["outcome"], "capacity");
+        assert!(rows.iter().any(|row| row["props"]["unit"] == "coverage"));
+        if with_backlog {
+            assert!(rows.iter().any(
+                |row| row["props"]["unit"] == "backlog" && row["props"]["count_bucket"] == "2"
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn backlog_sources_are_bounded_and_existing_sources_can_update_at_capacity() {
+    let (collector, _) = configured();
+    grant(&collector);
+    let permit = collector.permit().unwrap();
+    let sources: Vec<_> = (0..=MAX_CELLS)
+        .map(|_| collector.backlog_source())
+        .collect();
+    for source in &sources[..MAX_CELLS] {
+        source.sample(&permit, ProductFamily::Maintenance, "pending", 0);
+    }
+    sources[MAX_CELLS].sample(&permit, ProductFamily::Maintenance, "pending", 1001);
+    sources[0].sample(&permit, ProductFamily::Maintenance, "pending", 2);
+    let rows = collector.test_payloads();
+    let backlog: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "mdk_maintenance_summary")
+        .collect();
+    assert_eq!(backlog.len(), 1);
+    assert_eq!(backlog[0]["props"]["unit"], "backlog");
+    assert_eq!(backlog[0]["props"]["count_bucket"], "2");
+}
+
+#[cfg(feature = "product-analytics-export")]
+async fn read_product_batch(stream: &mut tokio::net::TcpStream) -> Vec<serde_json::Value> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    loop {
+        let mut buffer = [0; 4096];
+        let length = stream.read(&mut buffer).await.unwrap();
+        assert!(length > 0, "request ended before its body");
+        bytes.extend_from_slice(&buffer[..length]);
+        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(|value| value.parse().unwrap())
+                })
+                .unwrap();
+            if bytes.len() >= end + 4 + content_length {
+                return serde_json::from_slice(&bytes[end + 4..end + 4 + content_length]).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_retry_budget_and_long_cooldowns_drop_an_unaccepted_batch_once() {
+    use tokio::io::AsyncWriteExt;
+    crate::collector_host_safety::hand_in_direct_http_builder();
+    for (retry_after, expected_attempts) in [("0", 4), ("301", 1)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (collector, clock) = configured();
+        clock.wall.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        let mut config = collector.lock().config.clone();
+        config.events_endpoint = Some(format!(
+            "http://{}/api/v0/events",
+            listener.local_addr().unwrap()
+        ));
+        collector.configure(config, String::new()).unwrap();
+        grant(&collector);
+        collector.activity(ProductAnalyticsActivity::Foreground);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(read_product_batch(&mut stream).await.len(), 1);
+                observed.lock().unwrap().push(Instant::now());
+                stream.write_all(format!("HTTP/1.1 429 Limited\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), collector.send_pending())
+            .await
+            .unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), expected_attempts);
+        for pair in attempts.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= Duration::from_secs(1),
+                "zero Retry-After still has a one-second minimum"
+            );
+        }
+        let status = collector.status();
+        assert_eq!(status.queued_events, 0);
+        assert_eq!(status.failed_batches, 1);
+        assert_eq!(status.dropped_events, 1);
+        assert_eq!(status.accepted_batches, 0);
+        assert_eq!(status.product_analytics, DiagnosticsExporterStatus::Ready);
+    }
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_delivery_cancellation_and_flush_deadline_preserve_generation_accounting() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
+    for stop in ["revoke", "abort", "flush_deadline"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (collector, clock) = configured();
+        clock.wall.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        let mut config = collector.lock().config.clone();
+        config.events_endpoint = Some(format!(
+            "http://{}/api/v0/events",
+            listener.local_addr().unwrap()
+        ));
+        collector.configure(config, String::new()).unwrap();
+        grant(&collector);
+        let old = collector.permit().unwrap();
+        collector.activity(ProductAnalyticsActivity::Foreground);
+        let (received, request_received) = tokio::sync::oneshot::channel();
+        let (release, hold_response) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let batch = read_product_batch(&mut stream).await;
+            received.send(batch.len()).unwrap();
+            hold_response.await.unwrap();
+            drop(stream);
+        });
+        let sending = collector.clone();
+        let task = tokio::spawn(async move {
+            if stop == "flush_deadline" {
+                sending.flush().await;
+            } else {
+                sending.send_pending().await;
+            }
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), request_received)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        if stop == "revoke" {
+            collector.revoke_memory();
+            grant(&collector);
+            collector.activity(ProductAnalyticsActivity::Foreground);
+        } else if stop == "abort" {
+            task.abort();
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(if stop == "flush_deadline" { 5 } else { 1 }),
+            task,
+        )
+        .await
+        .unwrap();
+        if stop == "abort" {
+            assert!(result.unwrap_err().is_cancelled());
+        } else {
+            result.unwrap();
+        }
+        release.send(()).unwrap();
+        server.await.unwrap();
+        let status = collector.status();
+        assert_eq!(status.accepted_batches, 0);
+        assert_eq!(status.product_analytics, DiagnosticsExporterStatus::Ready);
+        if stop == "revoke" {
+            assert!(!old.valid());
+            assert!(collector.permit().unwrap().valid());
+            assert_eq!(
+                status.queued_events, 1,
+                "the new generation keeps its own session event"
+            );
+            assert_eq!(status.failed_batches, 0);
+            assert_eq!(status.dropped_events, 0);
+        } else {
+            assert!(old.valid());
+            assert_eq!(status.queued_events, 0);
+            assert_eq!(status.failed_batches, 1);
+            assert_eq!(status.dropped_events, 1);
+        }
+    }
 }

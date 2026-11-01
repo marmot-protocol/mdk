@@ -348,9 +348,9 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             duration_ms: hist(3),
         },
         account_sync: AppPerformanceOperationSnapshot {
-            attempts: 1,
+            attempts: 3,
             successes: 0,
-            failures: 1,
+            failures: 3,
             failure_classifications: vec![SyncFailureCount {
                 classification: SyncFailureClassification::new(
                     SyncFailureStage::CgkaIngest,
@@ -384,6 +384,15 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
         ))
     );
     assert_eq!(sync_failure.value, ExportMetricValue::Counter(1));
+    let sync_failures: Vec<_> = batch
+        .points
+        .iter()
+        .filter(|point| point.name == metric_names::APP_ACCOUNT_SYNC_FAILURES)
+        .collect();
+    assert_eq!(sync_failures.len(), 2);
+    assert!(sync_failures.iter().any(|point| point.failure
+        == Some(SyncFailureClassification::UNKNOWN)
+        && point.value == ExportMetricValue::Counter(2)));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_START_ATTEMPTS
             && point.value == ExportMetricValue::Counter(3)
@@ -586,27 +595,39 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
 async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
     let relay_plane = MarmotRelayPlane::full_history();
 
-    // Off by default, and enabled-without-endpoint is still inert.
-    assert!(
-        RelayTelemetryExporter::new(
-            &relay_plane,
-            RelayTelemetryExportConfig::disabled(),
-            crate::product_analytics::test_permit()
-        )
-        .is_none()
-    );
-    assert!(
-        RelayTelemetryExporter::new(
-            &relay_plane,
-            RelayTelemetryExportConfig {
-                enabled: true,
-                endpoint: None,
-                ..Default::default()
-            },
-            crate::product_analytics::test_permit()
-        )
-        .is_none()
-    );
+    let complete = RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+        .with_runtime_config(runtime_config());
+    for case in 0..12 {
+        let mut config = complete.clone();
+        match case {
+            0 => config.enabled = false,
+            1 => config.endpoint = None,
+            2 => config.authorization_bearer_token = None,
+            3 => config.authorization_bearer_token = Some(" ".into()),
+            4 => config.resource = None,
+            5 => config.resource.as_mut().unwrap().tenant.clear(),
+            6 => config.endpoint = Some("https://user:password@localhost/".into()),
+            7 => config.resource.as_mut().unwrap().service_version.clear(),
+            8 => config
+                .resource
+                .as_mut()
+                .unwrap()
+                .deployment_environment
+                .clear(),
+            9 => config.resource.as_mut().unwrap().os_type.clear(),
+            10 => config.resource.as_mut().unwrap().os_version.clear(),
+            _ => config.endpoint = Some("http://collector.example/metrics".into()),
+        }
+        assert!(
+            RelayTelemetryExporter::new(
+                &relay_plane,
+                config,
+                crate::product_analytics::test_permit()
+            )
+            .is_none(),
+            "incomplete case {case}"
+        );
+    }
 
     let exporter = RelayTelemetryExporter::new(
         &relay_plane,
@@ -626,6 +647,17 @@ async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
             .any(|point| point.name == metric_names::CROSS_RELAY_SPREAD)
     );
     assert!(batch.points.iter().all(|point| point.relay.is_none()));
+
+    let collector = crate::ProductAnalytics::default();
+    crate::grant(&collector);
+    let permit = collector.permit().unwrap();
+    let exporter =
+        RelayTelemetryExporter::new(&relay_plane, complete.clone(), permit.clone()).unwrap();
+    collector.revoke_memory();
+    // A later grant cannot revive either an old exporter or an old construction permit.
+    crate::grant(&collector);
+    assert!(RelayTelemetryExporter::new(&relay_plane, complete, permit).is_none());
+    assert!(exporter.build_batch(None).await.points.is_empty());
 }
 
 #[test]
@@ -639,6 +671,24 @@ fn collection_period_subtracts_history_and_detects_resets_against_previous_sampl
     .unwrap();
     let batch = |total, redundant, buckets: Vec<u64>, sum| RelayTelemetryExportBatch {
         points: vec![
+            ExportMetricPoint {
+                name: metric_names::SETTLES,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(total),
+            },
+            ExportMetricPoint {
+                name: metric_names::POST_SETTLE_REORGS,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(redundant),
+            },
+            ExportMetricPoint {
+                name: metric_names::OBSERVED_REORG_RATE,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(0.99),
+            },
             ExportMetricPoint {
                 name: metric_names::DELIVERY_COUNT,
                 relay: None,
@@ -671,13 +721,15 @@ fn collection_period_subtracts_history_and_detects_resets_against_previous_sampl
         ],
     };
     let (initial, start) = exporter.since_baseline(batch(10, 5, vec![2, 3], 80));
-    assert_eq!(initial.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(initial.points[3].value, ExportMetricValue::Counter(0));
     let (later, later_start) = exporter.since_baseline(batch(20, 7, vec![4, 4], 110));
     assert_eq!(start, later_start);
-    assert_eq!(later.points[0].value, ExportMetricValue::Counter(10));
-    assert_eq!(later.points[2].value, ExportMetricValue::Gauge(0.8));
+    assert_eq!(initial.points[2].value, ExportMetricValue::Gauge(0.0));
+    assert_eq!(later.points[2].value, ExportMetricValue::Gauge(0.2));
+    assert_eq!(later.points[3].value, ExportMetricValue::Counter(10));
+    assert_eq!(later.points[5].value, ExportMetricValue::Gauge(0.8));
     assert_eq!(
-        later.points[3].value,
+        later.points[6].value,
         ExportMetricValue::Histogram(ExportHistogram {
             bounds_ms: vec![10, 20],
             bucket_counts: vec![2, 1],
@@ -688,7 +740,8 @@ fn collection_period_subtracts_history_and_detects_resets_against_previous_sampl
     // Still above the original baseline, but below the previous sample: a source reset.
     let (reset, reset_start) = exporter.since_baseline(batch(15, 6, vec![3, 4], 100));
     assert!(reset_start >= later_start);
-    assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(reset.points[2].value, ExportMetricValue::Gauge(0.0));
+    assert_eq!(reset.points[3].value, ExportMetricValue::Counter(0));
     let mut next = batch(16, 6, vec![3, 5], 120);
     next.points.push(ExportMetricPoint {
         name: "new_series",
@@ -701,7 +754,8 @@ fn collection_period_subtracts_history_and_detects_resets_against_previous_sampl
         next.points.last().unwrap().value,
         ExportMetricValue::Counter(0)
     );
-    assert_eq!(next.points[2].value, ExportMetricValue::Gauge(1.0));
+    assert_eq!(next.points[5].value, ExportMetricValue::Gauge(1.0));
+    assert_eq!(next.points[2].value, ExportMetricValue::Gauge(0.0));
 }
 
 #[test]
@@ -843,7 +897,22 @@ fn message_journey_metric_export() {
                 .filter(|point| point.name == name)
                 .collect::<Vec<_>>();
             assert_eq!(points.len(), 1, "{name} must be exported exactly once");
-            assert!(points[0].relay.is_none());
+            assert!(points[0].relay.is_none() && points[0].failure.is_none());
+            match (suffix, &points[0].value) {
+                ("duration_ms", ExportMetricValue::Histogram(histogram)) => {
+                    assert_eq!(histogram.sum_ms, 180, "{name}");
+                    assert_eq!(
+                        histogram.bucket_counts.iter().sum::<u64>() + histogram.overflow_count,
+                        2,
+                        "{name}"
+                    );
+                }
+                ("attempts", value) => assert_eq!(*value, ExportMetricValue::Counter(2), "{name}"),
+                ("successes" | "failures", value) => {
+                    assert_eq!(*value, ExportMetricValue::Counter(1), "{name}")
+                }
+                _ => panic!("unexpected metric value for {name}"),
+            }
         }
         legacy.as_object_mut().unwrap().remove(name);
     }
@@ -1019,6 +1088,14 @@ fn host_stages_use_registry() {
     };
     let telemetry = AppPerformanceTelemetry::default();
     let stages = [
+        (
+            Host::ConversationLocalVisible,
+            Op::HostConversationLocalVisible,
+        ),
+        (
+            Host::ConversationComposerReady,
+            Op::HostConversationComposerReady,
+        ),
         (
             Host::LinuxStartupBeforeVault,
             Op::HostLinuxStartupBeforeVault,

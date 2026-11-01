@@ -595,9 +595,13 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
+      - name: Install uv for sender and receiver compatibility
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
       - name: Test consent and both diagnostic exporters
         run: |
-          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib product_analytics:: --locked
+          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib --locked
+          cargo test -p marmot-observability --locked --lib audit_otlp_sender::tests::reference_receiver_accepts_exact_sender_wire -- --exact --ignored
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib usage_diagnostics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
