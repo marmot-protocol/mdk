@@ -77,3 +77,20 @@ slow-timeout = { period = "60s" }
 filter = 'package(wn-cli) & binary(cli)'
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# Pull-request pre-check profile (`ci.yml`, job `rust-test-build`). Each test
+# runs for at most half a second; one still running then is stopped and counted
+# as passed (TIMEOUT-PASS), so the pre-check fails only on a test that fails
+# inside that window. The merge queue runs every test to the end with the `ci`
+# profile. `on-timeout` needs nextest 0.9.115 or later; older versions warn
+# that the key is unknown and would fail the stopped tests instead.
+#
+# Most of these tests wait rather than compute, so eight threads on the
+# four-CPU runner halve the run: about 4 minutes, with about two thirds of the
+# tests finishing (November 2026). Sixteen threads finished fewer tests inside
+# the window, and a one-second window took about 2.5 minutes longer.
+[profile.precheck]
+retries = 1
+fail-fast = false
+test-threads = 8
+slow-timeout = { period = "500ms", terminate-after = 1, grace-period = "0s", on-timeout = "pass" }
