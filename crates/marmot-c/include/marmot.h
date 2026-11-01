@@ -2196,6 +2196,16 @@ typedef struct MarmotWipeOutcome {
   struct MarmotRelayFailure *key_package_failures;
   uintptr_t key_package_failures_len;
   struct MarmotLocalCleanupReport local_cleanup;
+  /**
+   * Chats this device did not leave itself because another of the
+   * account's devices takes it out of them.
+   */
+  uint32_t groups_left_to_siblings;
+  /**
+   * The siblings could not be asked within about 30 seconds, so this
+   * device left every chat itself. Tell the user.
+   */
+  bool siblings_not_reached;
 } MarmotWipeOutcome;
 
 /**

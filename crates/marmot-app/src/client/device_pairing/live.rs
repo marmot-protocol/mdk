@@ -1746,6 +1746,12 @@ impl AppClient {
     pub(super) fn note_device_group_removal_live(
         &mut self,
     ) -> Result<Option<DeviceGroupRemoval>, AppError> {
+        // A device that started signing out before its removal reached it
+        // is not unlinked, whatever the removal was, and is told nothing:
+        // its sign-out finishes what it has left, then wipes (D67).
+        if self.signing_out() {
+            return Ok(None);
+        }
         let Some(group_id) = self.app.removed_device_group(&self.state.label)? else {
             return Ok(None);
         };

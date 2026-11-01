@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first records in the device group that it is leaving, which can take about
+  30 seconds, and leaves those devices the chats they can take it out of.
+  `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
+  which says the request did not settle in time and the device left every
+  chat itself; tell the user. Regenerate bindings with the matching native
+  library.
+
 - `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
   `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
   found in its own slot that it did not make, which only this device warns

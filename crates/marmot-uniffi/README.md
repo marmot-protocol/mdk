@@ -1030,6 +1030,20 @@ once it reads the removal, and nothing more is sent from it (mdk#2628):
   account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
   sign-in that links this device anew.
 
+### Signing out with linked devices
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too (mdk#2628):
+
+- It first records in the device group that it is leaving and waits for that to settle, which can take about 30
+  seconds; show progress. It then leaves only the chats no other device can take it out of, deletes its KeyPackage
+  slot and wipes. The other devices remove it from the device group and from the rest.
+- `WipeOutcomeFfi.groups_left_to_siblings` counts the chats it left to the other devices; `groups_left` counts those it
+  left itself.
+- When the request doesn't settle in time, it leaves every chat itself and sets `siblings_not_reached`. Tell the user
+  their other devices couldn't be asked, and that those devices still list this one until they remove it.
+- The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, it announces each KeyPackage in its own roster entry before publishing it, so

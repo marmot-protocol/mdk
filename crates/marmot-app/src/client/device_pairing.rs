@@ -225,8 +225,12 @@ impl AppClient {
     /// commit in a device group it joined. The worker calls it after each delivery and
     /// on its maintenance tick.
     pub(crate) async fn drive_device_pairing(&mut self) {
+        // A device signing out sends only what its sign-out has left
+        // (mdk#2628 D67).
         #[cfg(feature = "unreleased-device-pairing")]
-        self.drive_device_pairing_live().await;
+        if !self.signing_out() {
+            self.drive_device_pairing_live().await;
+        }
     }
 
     /// Note at once that a batch the engine applied removed this device

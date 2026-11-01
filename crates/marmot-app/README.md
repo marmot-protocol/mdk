@@ -429,6 +429,15 @@ onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing i
 as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
 which the other devices did; signing in again is then a new link.
 
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too. It records in the device group that it is leaving, which can take about 30 seconds to settle, then
+leaves only the chats no other device can take it out of, deletes its slot and wipes; the other devices then remove it
+from the device group and from the rest. `WipeOutcome::groups_left_to_siblings` counts the chats it left to them. When
+its request doesn't settle in time, it leaves every chat itself and sets `siblings_not_reached`: tell the user its
+other devices couldn't be asked, and that they still list it until one of them removes it. The other devices show it
+as `LinkedDeviceStatus::Leaving` until they remove it. A device removed while it signs out finishes signing out and is
+not unlinked.
+
 ### Recovery words
 
 An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).

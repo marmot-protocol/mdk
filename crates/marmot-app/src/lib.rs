@@ -617,6 +617,10 @@ pub struct MarmotApp {
     /// would. The runtime's own mark as it deactivates still lands.
     #[cfg(test)]
     test_fail_unlink_mark: Arc<AtomicBool>,
+    /// How long `sign_out_and_wipe` waits for its `leaving` commit, in
+    /// place of about 30 seconds.
+    #[cfg(test)]
+    test_sign_out_leaving_wait: Arc<Mutex<Option<Duration>>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     /// Live KeyPackages of this app's accounts that their clients have not
@@ -626,6 +630,10 @@ pub struct MarmotApp {
     /// unlinked this device, and shared by every publisher
     /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
     unlinked_publish_stops: Arc<Mutex<HashMap<String, unlinked_publish_gate::AccountPublishStop>>>,
+    /// The accounts signing out through `sign_out_and_wipe` on this device,
+    /// by account id: their device group's removal of this device does not
+    /// unlink it (mdk#2628 D67).
+    signing_out_accounts: Arc<Mutex<HashSet<String>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1733,10 +1741,13 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             #[cfg(test)]
             test_fail_unlink_mark: Arc::default(),
+            #[cfg(test)]
+            test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
             unlinked_publish_stops: Arc::default(),
+            signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1843,10 +1854,13 @@ impl MarmotApp {
             audit_v5_peel_slot: None,
             #[cfg(test)]
             test_fail_unlink_mark: Arc::default(),
+            #[cfg(test)]
+            test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
             sign_in_nudges: Arc::new(Default::default()),
             unlinked_publish_stops: Arc::default(),
+            signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -2160,6 +2174,7 @@ impl MarmotApp {
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
             inactive_siblings: None,
+            leaving_siblings: HashMap::new(),
             pending_recovery_words: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,

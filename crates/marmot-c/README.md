@@ -458,6 +458,12 @@ stops on this device: `MarmotAccountSummary.unlinked` and `signed_out` stay set,
 `MARMOT_STATUS_ACCOUNT_UNLINKED`. `marmot_sign_out_and_wipe` skips leaving its chats and deleting its slot. See the
 [shared contract](../marmot-uniffi/README.md#this-device-unlinked).
 
+With a linked device that is not signing out too, `marmot_sign_out_and_wipe` first asks the account's other devices
+to take this one out, which can block for about 30 seconds, and leaves them the chats they can.
+`MarmotWipeOutcome.groups_left_to_siblings` counts those chats, and `siblings_not_reached` says the request did not
+settle in time, so it left every chat itself; tell the user. See the
+[shared contract](../marmot-uniffi/README.md#signing-out-with-linked-devices).
+
 `marmot_key_package_refresh_overdue` blocks on the account worker, reads local state only, and writes whether this
 device's device group has held its KeyPackage refresh back for a week. Re-read it on
 `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`. See the

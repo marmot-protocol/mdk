@@ -98,6 +98,7 @@ mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
 pub(crate) mod sign_ins;
+pub(crate) mod sign_out;
 mod small_state;
 mod sync;
 #[cfg(test)]
@@ -851,6 +852,9 @@ pub struct AppClient {
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.
     pub(crate) inactive_siblings: Option<std::collections::BTreeSet<String>>,
+    /// The siblings this client found `leaving`, by slot, and when it
+    /// decides to remove each: after its own random delay (mdk#2628 D67).
+    pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
@@ -1513,6 +1517,14 @@ impl AppClient {
             return Err(AppError::AccountHome(
                 marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
             ));
+        }
+        // A device signing out sends only what its sign-out has left
+        // (mdk#2628 D67).
+        if self.signing_out() {
+            let summary = self
+                .runtime
+                .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
+            return Ok(maintenance_run_summary_from_account(summary));
         }
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;

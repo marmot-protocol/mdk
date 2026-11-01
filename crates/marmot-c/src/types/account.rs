@@ -229,6 +229,12 @@ c_mirror! {
         copy key_packages_deleted: u32,
         vec key_package_failures/key_package_failures_len: MarmotRelayFailure,
         rec local_cleanup: MarmotLocalCleanupReport,
+        /// Chats this device did not leave itself because another of the
+        /// account's devices takes it out of them.
+        copy groups_left_to_siblings: u32,
+        /// The siblings could not be asked within about 30 seconds, so this
+        /// device left every chat itself. Tell the user.
+        copy siblings_not_reached: bool,
     }
 }
 
@@ -273,9 +279,13 @@ mod tests {
                 completed: false,
                 reason: Some("media cache busy".into()),
             },
+            groups_left_to_siblings: 4,
+            siblings_not_reached: true,
         }
         .into();
         assert_eq!(mirror.groups_left, 2);
+        assert_eq!(mirror.groups_left_to_siblings, 4);
+        assert!(mirror.siblings_not_reached);
         assert_eq!(mirror.group_leave_failures_len, 1);
         assert_eq!(mirror.key_package_failures_len, 1);
         assert!(!mirror.local_cleanup.completed);

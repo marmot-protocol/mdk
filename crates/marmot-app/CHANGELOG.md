@@ -4,6 +4,18 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
+  link is made and the roster lists another device that is not leaving. It
+  commits its own roster entry as `leaving` and waits about 30 seconds for
+  that commit to be confirmed, then leaves only the chats no sibling takes
+  it out of, deletes its slot and wipes. `WipeOutcome` adds
+  `groups_left_to_siblings` and `siblings_not_reached`, set when the commit
+  was not confirmed in time and the device left every chat itself. A device
+  that finds a sibling `leaving` removes it after a random delay of up to 30
+  seconds, as if its user had. A device removed while it signs out is not
+  unlinked. Struct literals add the new fields.
+
 - The device roster no longer holds rejected KeyPackages, and kind 462 is no
   longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
   changed under the same component id, so existing development device groups

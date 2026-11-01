@@ -1216,6 +1216,21 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// One step of signing out through siblings (mdk#2628 D67), run in the
+    /// account's worker so deliveries keep settling between steps.
+    pub(crate) async fn sign_out_through_siblings_step(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::client::sign_out::SiblingSignOut, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SignOutThroughSiblingsStep { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();

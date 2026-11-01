@@ -326,6 +326,15 @@ pub struct WipeOutcomeFfi {
     pub key_package_failures: Vec<RelayFailureFfi>,
     /// Local cleanup (MLS DB, media cache, SQL row, secret-store nsec) result.
     pub local_cleanup: LocalCleanupReportFfi,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings.
+    pub groups_left_to_siblings: u32,
+    /// This device asked its siblings to take it out, but the request was not
+    /// confirmed within about 30 seconds, so it left every chat itself. Tell
+    /// the user its other devices could not be asked; they still list it
+    /// until one of them removes it.
+    pub siblings_not_reached: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -378,6 +387,8 @@ impl From<WipeOutcome> for WipeOutcomeFfi {
                 .map(Into::into)
                 .collect(),
             local_cleanup: value.local_cleanup.into(),
+            groups_left_to_siblings: value.groups_left_to_siblings,
+            siblings_not_reached: value.siblings_not_reached,
         }
     }
 }
