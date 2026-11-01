@@ -171,6 +171,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   signature key is not this device's (`ForeignOwnSlotKeyPackage`, 3.7b): this device made a KeyPackage exactly when it
   carries its signature key, which never rotates, so a backup restore, a pre-group KeyPackage or a republished copy
   never warns. Only the device that found it warns.
+- Cleanup after removed devices (`src/client/device_removal.rs`, mdk#2628 3.6b, mdk#2761) runs for every gone slot:
+  one the trusted roster records as `removed`, read by its record's key, and, only while the device group is settled
+  (stable, no convergence input left), one the roster lists no device in that has a tag signature key the engine
+  remembers (`roster_tag_keys`), read by every such key. Never this device's own slot, and never discard private
+  KeyPackages for a slot the roster lists. Leaves are found with `own_account_leaves_tagged_by`, never by an absent
+  claim: an untagged leaf stays (D55). The deciding device commits a lone `removed` record after a failed link's undo
+  only while the decision is under 30 days old, the group is settled and quiet, and at most once a run
+  (`removed_records_made_alone`), so it never trades commits with a sibling's expiry pass.
 - The compromise warning (`src/client/compromise_warning.rs`, mdk#2628 3.7a and 3.7b, D53) is storage's
   (`account_compromise_warning_items`): every `not_me` slot in the trusted roster, plus this device's own rejected
   sign-ins, gathered with insert-or-ignore so a seen mark survives branch selection dropping and restoring an item,
