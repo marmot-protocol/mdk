@@ -165,6 +165,9 @@ for reconnect/backoff and relay status mechanics.
   the window, and a loss would restart that obligation. Only a finished capture clears the debt; a reconnect,
   refusal, removal or execution failure can admit or retire the source without the capture, so it records the
   debt. Native clamp paging is not an owner capture: its cut keeps its loss, as does every other discard.
+  A cut discards only the MLS-group units its source left unfinished. A unit whose every route the source finished
+  is proven: it keeps its bodies, REQ copies included, and releases them in order once its cut peers stop holding
+  the group, so later live input never reaches ingest ahead of them (mdk#2835). The source still stays unadmitted.
   Same-epoch capture takeover preserves held bodies. Interrupted
   multi-tag history discards the affected source's whole MLS-group unit, never releases its newer suffix.
 - Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous

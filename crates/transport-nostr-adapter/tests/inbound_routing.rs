@@ -7305,6 +7305,90 @@ async fn cut_capture_defers_req_page_loss() {
     );
 }
 
+/// mdk#2835: a reconnecting healthy relay's live REQ returns a full stored
+/// page, and the owner's capture completes that relay's range while a stalled
+/// peer withholds its own. The comparison deadline then cuts the capture. The
+/// completed range is proven, so it reaches ingest ahead of the next live
+/// frame instead of being discarded behind it, where a sender's later
+/// messages would move its ratchet past the held ones.
+#[tokio::test(start_paused = true)]
+async fn cut_capture_keeps_complete_source() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC7; 32]);
+    let healthy = TransportEndpoint("wss://healthy.example".into());
+    let stalled = TransportEndpoint("wss://stalled.example".into());
+    let mut group = sync_fixture_group(0xC8);
+    group.endpoints = vec![healthy.clone(), stalled.clone()];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    for endpoint in [&healthy, &stalled] {
+        assert!(
+            adapter
+                .observe_replay_epoch(
+                    Some(&account),
+                    endpoint,
+                    [1, 1],
+                    transport_nostr_adapter::ReplayRestart::Connection
+                )
+                .await
+        );
+    }
+    let id = group_subscription_id(&adapter, &account, &group).await;
+    let page = (1..=RELAY_REPLAY_PAGE_LIMIT as u64)
+        .map(|offset| group_event_at(&format!("stored body {offset}"), &group, floor + offset))
+        .collect::<Vec<_>>();
+    *relay.retained.lock().unwrap() = Some(
+        page.iter()
+            .map(|event| (account.clone(), healthy.clone(), event.clone()))
+            .collect(),
+    );
+    for event in &page {
+        route_group_copy(&adapter, &group, &id, event).await;
+    }
+    adapter.handle_relay_eose(healthy.clone(), id.clone()).await;
+    let stalled_hold = Arc::new(AcquisitionHold::default());
+    relay
+        .acquisition_holds
+        .lock()
+        .unwrap()
+        .push_back((stalled.clone(), stalled_hold.clone()));
+    let plan = capture_plan(&adapter, &account, 1).await;
+    assert_eq!(plan.sources.len(), 2, "both relays still owe the range");
+    let cut = NostrAcquisitionCancellation::new();
+    let capture = tokio::spawn({
+        let (adapter, account, cut) = (adapter.clone(), account.clone(), cut.clone());
+        async move { adapter.capture_replay(&account, plan, cut).await.unwrap() }
+    });
+    wait_snapshot(&stalled_hold).await;
+    // The healthy relay's completed range waits on its stalled peer.
+    assert_no_delivery(&adapter).await;
+    cut.cancel();
+    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Cancelled);
+
+    let live = group_event_at(
+        "live frame after the stored page",
+        &group,
+        floor + RELAY_REPLAY_PAGE_LIMIT as u64 + 1,
+    );
+    route_group_copy(&adapter, &group, &id, &live).await;
+    for event in page.iter().chain([&live]) {
+        assert_group_delivery(&adapter, &account, event).await;
+    }
+    assert!(
+        adapter.take_replay_status(&account).await.loss.is_none(),
+        "the stalled peer's cut discarded nothing"
+    );
+}
+
 async fn capture_plan(
     adapter: &NostrTransportAdapter,
     account: &MemberId,

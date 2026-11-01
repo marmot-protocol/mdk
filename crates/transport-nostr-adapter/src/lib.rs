@@ -5837,6 +5837,16 @@ impl AccountReplayCoverage {
         let owners = self
             .groups
             .iter()
+            // A group unit this source finished is proven: it releases once
+            // its cut peers stop holding the group, ahead of later live input
+            // (mdk#2835). Only unfinished units discard their bodies.
+            .filter(|(_, group)| {
+                !group
+                    .streams
+                    .iter()
+                    .filter(|(owner, _)| owner.request.as_ref() == id && owner.relay == relay)
+                    .all(|(_, stream)| stream.phase == ReplayAdmission::Complete)
+            })
             .flat_map(|(group_id, group)| {
                 group
                     .streams
