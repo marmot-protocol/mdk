@@ -1327,7 +1327,10 @@ pub trait StorageProvider:
     /// commit its other work. On success `f`'s writes join the enclosing
     /// transaction, or commit as one unit when there is none. A backend may
     /// undo more on failure, up to every write `f` made, so callers must not
-    /// depend on any write of a failed `f` surviving.
+    /// depend on any write of a failed `f` surviving. A backend whose database
+    /// aborts the whole transaction by itself (SQLite does after a full disk,
+    /// an I/O error or out of memory mid-statement) returns `f`'s error, and
+    /// the rest of the enclosing transaction then fails rather than commits.
     ///
     /// The default is [`with_group_snapshot_rollback`]: a full group snapshot
     /// named `fallback_snapshot`, which costs time and space in proportion to
