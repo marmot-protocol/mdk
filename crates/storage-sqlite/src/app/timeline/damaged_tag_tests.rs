@@ -120,9 +120,10 @@ fn secure_prunes_erase_a_row_whose_tags_no_longer_decode() {
     }
 }
 
-// A damaged chat's tags cannot say whether it carried encrypted media, so the
-// prune asks the references they wrote while they still decoded: the media
-// chat's epoch secret retires, and the plain chat's epoch stays open.
+// A damaged chat's media survives in its timeline row, so the prune still
+// hands the host its ciphertext hash to purge. Whether its epoch secret
+// retires comes from the references its tags wrote while they decoded: the
+// media chat's epoch retires, and the plain chat's epoch stays open.
 #[test]
 fn secure_prune_retires_only_the_media_epochs_a_damaged_chat_referenced() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -153,6 +154,7 @@ fn secure_prune_retires_only_the_media_epochs_a_damaged_chat_referenced() {
         .unwrap();
 
     assert_eq!(outcome.pruned_messages, 2);
+    assert_eq!(outcome.media_ciphertext_sha256, ["ab".repeat(32)]);
     assert_eq!(outcome.pruned_media_epoch_secrets, 1);
     assert_eq!(
         app.encrypted_media_epoch_secret(&group(), media, 7)
@@ -539,8 +541,9 @@ fn report_reads_skip_a_dismissal_whose_tags_no_longer_decode() {
     assert_eq!(listed.collect::<Vec<_>>(), [(report.as_str(), true)]);
 }
 
-// A held send that publishes takes its retention deadline here; failing it
-// would leave the row with no deadline, so it would never expire.
+// A held send that publishes takes its retention deadline and its epoch's
+// media-secret references here. Failing it would leave the row with no
+// deadline, so it would never expire; its media survives in its timeline row.
 #[test]
 fn source_retention_finalizes_a_row_whose_tags_no_longer_decode() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -548,6 +551,11 @@ fn source_retention_finalizes_a_row_whose_tags_no_longer_decode() {
     let mut sent = chat("damaged", 10, "held send");
     sent.direction = "sent".to_owned();
     sent.source_message_id_hex = None;
+    sent.tags = vec![vec![
+        "imeta".to_owned(),
+        format!("v {ENCRYPTED_MEDIA_FORMAT_V1}"),
+        format!("ciphertext_sha256 {}", "ab".repeat(32)),
+    ]];
     app.record_app_event(&sent).unwrap();
     damage_tags(&app, "damaged");
 
@@ -564,6 +572,44 @@ fn source_retention_finalizes_a_row_whose_tags_no_longer_decode() {
     assert!(update.is_some());
     let message = app.timeline_message(&group(), "damaged").unwrap().unwrap();
     assert_eq!(message.retention_expires_at, Some(20));
+    let epochs = encrypted_media_secret_reference_epochs_for_message_tx(
+        &app.lock().unwrap(),
+        &group(),
+        "damaged",
+    )
+    .unwrap();
+    assert_eq!(epochs, BTreeSet::from([1]));
+}
+
+// Reviving a send whose publish failed names the rows it affects. A damaged
+// reaction's tags no longer name its target, but its edge does.
+#[test]
+fn publish_failure_revival_names_the_target_of_a_damaged_modifier() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    app.record_app_event(&chat("target", 10, "original"))
+        .unwrap();
+    let mut reaction = targeting(
+        "reaction",
+        MARMOT_APP_EVENT_KIND_REACTION,
+        "target",
+        11,
+        "+",
+    );
+    reaction.direction = "sent".to_owned();
+    reaction.source_message_id_hex = None;
+    app.record_app_event(&reaction).unwrap();
+    app.invalidate_pending_sent_app_events_for_group(&group(), LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    damage_tags(&app, "reaction");
+
+    let update = app
+        .clear_local_publish_failure(&group(), "reaction")
+        .unwrap()
+        .expect("the failed send revives");
+
+    let target = app.timeline_message(&group(), "target").unwrap().unwrap();
+    assert_eq!(update.messages, [target]);
 }
 
 // Deleting a reaction or an edit looks up the modifier's own target. A damaged

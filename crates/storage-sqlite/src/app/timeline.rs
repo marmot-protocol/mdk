@@ -475,8 +475,8 @@ struct PrunedAppEvent {
     kind: u64,
     source_epoch: Option<u64>,
     tags: Vec<Vec<String>>,
-    /// The stored tags no longer decode, so `tags` is empty and cannot name
-    /// the row's targets or media.
+    /// The stored tags no longer decode, so `tags` holds only what
+    /// [`recovered_app_event_tags_tx`] found of them.
     tags_damaged: bool,
 }
 
@@ -1773,12 +1773,16 @@ pub(crate) fn secure_prune_expired_app_events_tx(
 fn secure_prune_selected_app_events_tx(
     tx: &Connection,
     group_id_hex: &str,
-    pruned_events: Vec<PrunedAppEvent>,
+    mut pruned_events: Vec<PrunedAppEvent>,
     local_account_id_hex: &str,
     mention_classifier: &crate::app::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     if pruned_events.is_empty() {
         return Ok(SecurePruneAppEventsResult::default());
+    }
+    // Before anything below deletes the edges and timeline rows they come from.
+    for event in pruned_events.iter_mut().filter(|event| event.tags_damaged) {
+        event.tags = recovered_app_event_tags_tx(tx, group_id_hex, &event.message_id_hex)?;
     }
 
     let mut pruned_message_ids = BTreeSet::new();
@@ -1793,8 +1797,8 @@ fn secure_prune_selected_app_events_tx(
                 .extend(tag_values(&event.tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
-        // A damaged row's tags cannot say whether it carried encrypted media;
-        // the references they wrote while they still decoded can.
+        // A damaged row's timeline row may have lost its media (reprojected
+        // since); the references its tags wrote while they decoded have not.
         let carries_encrypted_media = if event.tags_damaged {
             !encrypted_media_secret_reference_epochs_for_message_tx(
                 tx,
@@ -1818,17 +1822,6 @@ fn secure_prune_selected_app_events_tx(
             event.kind,
             &event.tags,
         )?);
-        if event.tags_damaged {
-            // A damaged row's tags no longer name its targets, but the edges
-            // recorded while they still decoded do, and the per-row projection
-            // reads those: scrub and reproject them as a healthy row's would be,
-            // so an expired edit's text cannot survive on its target.
-            let targets = modifier_edge_targets_tx(tx, group_id_hex, &event.message_id_hex)?;
-            if event.kind == MARMOT_APP_EVENT_KIND_EDIT {
-                retained_edit_targets.extend(targets.iter().cloned());
-            }
-            affected_message_ids.extend(targets);
-        }
     }
 
     let roots = pruned_message_ids.clone();
@@ -2093,23 +2086,35 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     Ok(())
 }
 
+/// One row's kind and tags. A row whose tags no longer decode gets what
+/// [`recovered_app_event_tags_tx`] finds of them, so its targets and media
+/// still drive what depends on them.
 fn app_event_projection_parts_tx(
     tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<(u64, Vec<Vec<String>>)>> {
-    tx.query_row_cached(
-        "SELECT kind, tags_json
-         FROM app_events
-         WHERE group_id_hex = ?1 AND message_id_hex = ?2",
-        params![group_id_hex, message_id_hex],
-        |row| {
-            let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
-            Ok((kind, app_event_tags(row, 1)?))
-        },
-    )
-    .optional()
-    .storage()
+    let row: Option<(u64, Option<Vec<Vec<String>>>)> = tx
+        .query_row_cached(
+            "SELECT kind, tags_json
+             FROM app_events
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |row| {
+                let kind = row.get::<_, i64>(0)?.try_into().unwrap_or_default();
+                Ok((kind, decode_app_event_tags(row, 1)?))
+            },
+        )
+        .optional()
+        .storage()?;
+    let Some((kind, tags)) = row else {
+        return Ok(None);
+    };
+    let tags = match tags {
+        Some(tags) => tags,
+        None => recovered_app_event_tags_tx(tx, group_id_hex, message_id_hex)?,
+    };
+    Ok(Some((kind, tags)))
 }
 
 pub(crate) fn upsert_message_timeline_projection_for_message_tx(
@@ -2721,6 +2726,45 @@ fn modifier_edge_targets_tx(
     .storage()?
     .collect::<Result<_, _>>()
     .storage()
+}
+
+/// What survives elsewhere of a row's tags once they no longer decode: the `e`
+/// tags its modifier edges recorded and the `imeta` tags its timeline row
+/// materialized, both written while the tags still decoded. Either may be
+/// missing (a row that is not a modifier has no edges; a deleted or reprojected
+/// one has no media left), so this names at most what the tags named.
+fn recovered_app_event_tags_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<Vec<Vec<String>>> {
+    #[derive(Deserialize)]
+    struct MaterializedMedia {
+        imeta: Vec<Vec<String>>,
+    }
+    let mut tags = modifier_edge_targets_tx(tx, group_id_hex, message_id_hex)?
+        .into_iter()
+        .map(|target| vec![EVENT_REF_TAG.to_owned(), target])
+        .collect::<Vec<_>>();
+    let media = tx
+        .query_row_cached(
+            "SELECT media_json FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+            |row| {
+                Ok(match row.get_ref(0)? {
+                    ValueRef::Text(json) | ValueRef::Blob(json) => {
+                        serde_json::from_slice::<MaterializedMedia>(json).ok()
+                    }
+                    ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+                })
+            },
+        )
+        .optional()
+        .storage()?
+        .flatten();
+    tags.extend(media.map(|media| media.imeta).unwrap_or_default());
+    Ok(tags)
 }
 
 /// Whether a stored `app_events.tags_json` no longer decodes.
