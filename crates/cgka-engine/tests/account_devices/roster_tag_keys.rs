@@ -100,9 +100,12 @@ async fn every_roster_state_a_device_applies_records_its_tag_keys() {
 #[tokio::test]
 async fn a_removed_record_dropped_within_one_pass_is_recorded() {
     let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    // Slot 4 lists key 0xd1 before the pass, then 0xd2 and 0xd1 again within
+    // it. 0xd1 is the newest, though its row is the older one, the pass
+    // gives both keys one time, and it sorts first.
+    let commit = send_commit(&mut phone, set_key(&gid, 4, "Tablet", 0xd1), &gid).await;
+    assert_accepted(&mut laptop, &commit, &gid).await;
     let before_pass = recorded(&laptop, &gid);
-    // Slot 4's later key sorts first, so only the order the commits were
-    // applied in makes it the newest.
     let first = roster_update(
         &gid,
         vec![record_removed_op(3, 0xc3), set_key_op(4, "Tablet", 0xd2)],
@@ -135,7 +138,7 @@ async fn a_removed_record_dropped_within_one_pass_is_recorded() {
             .contains_key(&slot(3))
     );
     let mut expected = before_pass;
-    expected.extend([tag_key(3, 0xc3), tag_key(4, 0xd2), tag_key(4, 0xd1)]);
+    expected.extend([tag_key(3, 0xc3), tag_key(4, 0xd2)]);
     assert_eq!(recorded(&laptop, &gid), expected);
     let slot_4_newest_first = laptop
         .storage
