@@ -2879,6 +2879,70 @@ typedef struct MarmotLinkedDeviceList {
 } MarmotLinkedDeviceList;
 
 /**
+ * The device a row or a chat's history was imported from.
+ * `device_slot_id_hex` is its roster slot, as `marmot_linked_devices`
+ * names it. `device_label` is its name now: empty when it has none, is
+ * no longer linked, or this device has not read the roster since it
+ * started; show "another device" then. It follows
+ * `LinkedDevicesChanged`.
+ */
+typedef struct MarmotHistoryImportSource {
+  char *device_slot_id_hex;
+  char *device_label;
+} MarmotHistoryImportSource;
+
+/**
+ * Where a chat's history from another device stands.
+ */
+typedef enum MarmotChatHistoryImportState_Tag {
+  /**
+   * A delivery arrived and waits to be imported, as while its bundle is
+   * fetched. `retrying` once an attempt to get one of its bundles failed;
+   * it is tried again later.
+   */
+  MARMOT_CHAT_HISTORY_IMPORT_STATE_RECEIVING,
+  /**
+   * Its latest import: the device it came from, and when, in Unix
+   * seconds.
+   */
+  MARMOT_CHAT_HISTORY_IMPORT_STATE_IMPORTED,
+} MarmotChatHistoryImportState_Tag;
+
+typedef struct MarmotChatHistoryImportState_Receiving_Body {
+  bool retrying;
+} MarmotChatHistoryImportState_Receiving_Body;
+
+typedef struct MarmotChatHistoryImportState_Imported_Body {
+  struct MarmotHistoryImportSource from;
+  uint64_t at;
+} MarmotChatHistoryImportState_Imported_Body;
+
+typedef struct MarmotChatHistoryImportState {
+  MarmotChatHistoryImportState_Tag tag;
+  union {
+    MarmotChatHistoryImportState_Receiving_Body RECEIVING;
+    MarmotChatHistoryImportState_Imported_Body IMPORTED;
+  };
+} MarmotChatHistoryImportState;
+
+/**
+ * A held chat whose history from another device is arriving or has
+ * arrived.
+ */
+typedef struct MarmotChatHistoryImport {
+  char *group_id_hex;
+  struct MarmotChatHistoryImportState state;
+} MarmotChatHistoryImport;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotChatHistoryImportList {
+  struct MarmotChatHistoryImport *items;
+  uintptr_t len;
+} MarmotChatHistoryImportList;
+
+/**
  * A sign-in of this account that this device does not recognize.
  * `slot_id_hex` is the handle answers take. `client` is empty when the
  * sign-in reports none. `appeared_at` and `last_seen_at` are in Unix
@@ -4929,6 +4993,12 @@ typedef struct MarmotTimelineMessageRecord {
    */
   char *invalidation_status;
   char *client_token;
+  /**
+   * The device this row came from in a chat history it sent; NULL
+   * for a row that arrived live. Draw "Imported from <device>"
+   * where rows change from imported to live.
+   */
+  struct MarmotHistoryImportSource *imported_from;
 } MarmotTimelineMessageRecord;
 
 /**
@@ -5902,6 +5972,17 @@ typedef enum MarmotEvent_Tag {
    * `MarmotAccountSummary.unlinked` says so.
    */
   MARMOT_EVENT_DEVICE_UNLINKED,
+  /**
+   * `marmot_chat_history_imports` answers differently; re-read it. Fires
+   * when a held chat's delivery from another of this account's devices
+   * arrives, is imported, first fails to fetch, or goes; when imported
+   * rows go, as retention prunes them or the chat is deleted; when a
+   * source device is renamed or removed; and when a chat whose delivery
+   * arrived first is joined. Also fires once each time the account's
+   * worker opens or reconnects, whatever the answer. Carries no chat or
+   * device identities.
+   */
+  MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -6008,6 +6089,11 @@ typedef struct MarmotEvent_DeviceUnlinked_Body {
   char *account_label;
 } MarmotEvent_DeviceUnlinked_Body;
 
+typedef struct MarmotEvent_ChatHistoryImportsChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_ChatHistoryImportsChanged_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -6029,6 +6115,7 @@ typedef struct MarmotEvent {
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
     MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED;
     MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED;
+    MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED;
   };
 } MarmotEvent;
 
@@ -8054,6 +8141,26 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotLinkedDeviceList **out);
+
+/**
+ * List the held chats whose history from another of this account's
+ * devices is arriving or has arrived: `Receiving` while a delivery
+ * waits to be imported, with `retrying` once an attempt to get its
+ * bundle failed, then `Imported` with the device it came from and when. Empty
+ * while device groups are off. Re-read on the
+ * `ChatHistoryImportsChanged` event, which also fires when a source
+ * device is renamed or removed. Free with
+ * `marmot_chat_history_import_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chat_history_imports(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotChatHistoryImportList **out);
 
 /**
  * Whether this device's KeyPackage refresh is overdue because its device
@@ -13521,6 +13628,15 @@ void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImag
  * this library.
  */
 void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_chat_history_import_list_free(struct MarmotChatHistoryImportList *list);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

@@ -4,6 +4,19 @@
 
 ### Breaking changes
 
+- Hosts can show chat history from another of the account's devices
+  (mdk#2628 item 4.2d, D78). `TimelineMessageRecord` adds `imported_from`,
+  the device an imported row came from (`HistoryImportSource`: its slot and
+  its roster name now, empty for an unnamed or removed device), so a host
+  draws "Imported from <device>" where rows change from imported to live.
+  `MarmotAppRuntime::chat_history_imports` lists each held chat whose history
+  is `Receiving` (with `retrying` once an attempt to get its bundle failed)
+  or `Imported`, and `MarmotAppEvent` adds `ChatHistoryImportsChanged {
+  account_id_hex, account_label }`, which fires whenever that list's answer
+  changes. Row names are resolved when rows are read and follow
+  `LinkedDevicesChanged`. Only behind `dev_device_groups`. Exhaustive
+  matches and struct literals add the new arm and field.
+
 - The device roster no longer holds rejected KeyPackages, and kind 462 is no
   longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
   changed under the same component id, so existing development device groups

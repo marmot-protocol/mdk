@@ -429,6 +429,22 @@ onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing i
 as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
 which the other devices did; signing in again is then a new link.
 
+### Chat history from another device
+
+A device linked with "Bring chat history" receives each chat's history from the device that added it (mdk#2628 4.2).
+Each imported `TimelineMessageRecord` names its source in `imported_from` (`HistoryImportSource`: the device's slot and
+its roster name now); a row that arrived live has none. Draw "Imported from <device>" where rows change from imported
+to live, and say "another device" for an empty name: a device with no name, one no longer linked, or before this device
+first read the roster. Names are resolved when rows are read, so a rename shows after `LinkedDevicesChanged`.
+
+`MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
+waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
+It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
+after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
+`MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
+is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
+`dev_device_groups` is on.
+
 ### Recovery words
 
 An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).

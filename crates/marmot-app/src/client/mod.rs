@@ -86,6 +86,7 @@ mod device_removal;
 mod device_renames;
 pub(crate) mod epoch_stall;
 mod history_delivery;
+pub(crate) mod history_imports;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -880,6 +881,15 @@ pub struct AppClient {
     /// client just opened, ending any link in progress. The same seams drain
     /// it into one `DeviceLinkChanged`.
     pub(crate) device_link_changed: bool,
+    /// The client just opened, so the device-group seams announce
+    /// `ChatHistoryImportsChanged` once whatever the answer (mdk#2628 4.2d).
+    pub(crate) chat_history_imports_changed: bool,
+    /// Storage's count of changes chat history imports read, and a hash of
+    /// the held chats, when the answer was last read; none before the first
+    /// read on this client.
+    pub(crate) history_imports_inputs: Option<(u64, u64)>,
+    /// The chat history imports last announced.
+    pub(crate) listed_history_imports: Vec<history_imports::ChatHistoryImport>,
     /// The device group removed this device after its link was made, and the
     /// account is marked unlinked (mdk#2628 D67). The account worker stops at
     /// its next turn and asks the runtime to deactivate the account.

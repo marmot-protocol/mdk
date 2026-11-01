@@ -1329,11 +1329,27 @@ pub(crate) fn finish_account_open(
     let migration_started = std::time::Instant::now();
     let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
     let migration_duration = migration_started.elapsed();
+    create_connection_tables(&connection)?;
     Ok(OpenedAccount {
         connection: SharedConnection::new(connection),
         migrations_applied,
         migration_duration,
     })
+}
+
+/// Tables that live only as long as the connection: TEMP, so nothing is
+/// stored and, with `temp_store = MEMORY`, nothing reaches a file.
+/// `device_labels` holds the device names imported chat history resolves its
+/// source against, by roster slot (mdk#2628 4.2d).
+fn create_connection_tables(connection: &rusqlite::Connection) -> StorageResult<()> {
+    connection
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS device_labels (
+                 slot BLOB PRIMARY KEY NOT NULL,
+                 label TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .storage()
 }
 
 impl SharedConnection {

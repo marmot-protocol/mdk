@@ -975,6 +975,8 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(Vec::new());
         };
+        // Imported rows name their source from the roster just read.
+        self.give_device_labels(Some(&roster));
         let storage = self.app.account_storage(&self.state.label)?;
         // A slot that is not 32 bytes names no roster entry.
         let own_slot = storage

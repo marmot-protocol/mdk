@@ -1146,6 +1146,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        imported_from: None,
         reply_to_message_id_hex: None,
         reply_preview: None,
         media: None,
