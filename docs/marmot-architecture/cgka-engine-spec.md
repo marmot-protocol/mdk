@@ -159,8 +159,9 @@ would encrypt it under the drain-time epoch, and the payload binds key material 
 encrypted-media `imeta` reference, whose media key recipients derive from the delivering message's epoch). The
 engine MUST refuse such a message with `AppMessageEpochUnsettled` instead of retaining it, and MUST compare the loaded
 MLS epoch against the pin immediately before encryption, refusing with `AppMessageEpochMismatch` when convergence
-folded into the send moved the epoch. The pin names the epoch's number and a digest of its epoch authenticator, so a
-rival branch selected at the same number is refused too; neither refusal persists or publishes anything. A device link (`LinkDevice`)
+folded into the send moved the epoch. The pin, read with `CgkaEngine::epoch_pin`, names the epoch's number and a
+digest of its epoch authenticator, so a rival branch selected at the same number is refused too; neither refusal
+persists or publishes anything. A device link (`LinkDevice`)
 is the other exception: the engine MUST refuse it with `LinkDeviceUnsettled` whenever it would retain it, and while
 an own Commit is in flight, because the new device stops waiting for its Welcome and a link drained after that would
 add a device that never joins. The caller retries while the new device still waits. Current-fingerprint deferred
@@ -564,9 +565,10 @@ A conforming engine MUST pass scenario tests for:
 - outbound app and commit intents queued while syncing,
 - app message retained across a pending publish and regenerated under the epoch the publish established,
 - epoch-pinned app message refused rather than retained while a publish is pending, and refused at encryption when
-  the send folds a retained commit
+  the send folds a retained commit or selects a rival branch at the same epoch number
   (`epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publish_is_pending`,
-  `epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit`),
+  `epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit`,
+  `epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_the_same_epoch`),
 - queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.

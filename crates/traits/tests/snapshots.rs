@@ -13,7 +13,7 @@ use cgka_traits::capabilities::{
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, EpochPin, GroupEvent,
     GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason, KeyPackage,
     SendIntent, SendResult,
 };
@@ -548,6 +548,17 @@ fn snapshot_send_intents() {
             group_id: gid(),
             payload: b"hello".to_vec(),
             expected_epoch: None,
+        }
+    );
+    insta::assert_json_snapshot!(
+        "intent_app_message_pinned",
+        SendIntent::AppMessage {
+            group_id: gid(),
+            payload: b"hello".to_vec(),
+            expected_epoch: Some(EpochPin {
+                epoch: EpochId(7),
+                identity: [0xAB; 32],
+            }),
         }
     );
     insta::assert_json_snapshot!(

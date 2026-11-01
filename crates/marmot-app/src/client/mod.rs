@@ -4792,12 +4792,14 @@ impl AppClient {
             // checked that every attachment shares one epoch and that it is the
             // epoch whose media secret this device holds now.
             //
-            // The reference names only the number, and this send's sync or the
+            // The reference names only the number, and the sync below or the
             // engine's own preflight can select a rival branch at that number.
             // So the pin also carries the identity of the branch this device
             // holds now, read before either can run. It is read the way the
             // media secret is, a pending commit's epoch included, and a
-            // reference to any other epoch never matches it.
+            // reference to any other epoch never matches it. A branch change
+            // before this point, such as during a caller's earlier sync, is
+            // not caught: the reference carries no identity from its upload.
             let expected_epoch = match &intent {
                 AppMessageIntent::Media { attachments, .. } => match attachments.first() {
                     Some(attachment) => Some(cgka_traits::EpochPin {
