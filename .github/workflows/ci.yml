@@ -150,7 +150,9 @@ jobs:
         run: ./scripts/check_legacy_naming.sh
 
       - name: Tracing and direct-output source audit
-        run: ./scripts/check_tracing_audit.sh
+        run: |
+          ./scripts/check_tracing_audit.sh
+          python3 scripts/test_check_tracing_audit.py
 
       - name: C binding command-surface parity gate
         run: python3 scripts/check_c_binding_parity.py

@@ -492,6 +492,7 @@ convergence-release-hardening-lane manifest:
 # so it skips the simulator crate's build.
 tracing-audit:
     ./scripts/check_tracing_audit.sh
+    python3 scripts/test_check_tracing_audit.py
 
 tamarin:
     @command -v tamarin-prover >/dev/null || { echo "error: tamarin-prover not found on PATH"; exit 127; }

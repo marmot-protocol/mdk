@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-10-31
+updated: 2026-11-01
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -809,7 +809,7 @@ Focused checks for this surface:
 cargo test -p transport-nostr-adapter
 cargo test -p marmot-app
 cargo test -p marmot-app --features otlp-export
-cargo nextest run -p cgka-conformance-simulator --test tracing_audit
+just tracing-audit    # the tracing audit, built without the simulator crate
 ```
 
 The repo-level `just check` and `just test` recipes include the `otlp-export` feature set through the shared

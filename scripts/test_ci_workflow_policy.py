@@ -134,8 +134,8 @@ class MergeGatePolicyTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, expected)
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
-        # The merge queue is the only gate that runs tests, so a profile filter
-        # would silently drop coverage from master.
+        # The merge queue is the only gate that runs every test to the end, so a
+        # profile filter would silently drop coverage from master.
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         used = set(re.findall(r"--profile (\S+)", workflow)) - {"minimal"}
@@ -162,6 +162,11 @@ class MergeGatePolicyTests(unittest.TestCase):
         steps = [step for step in workflow.split("\n      - name: ")[1:] if "--profile precheck" in step]
         self.assertEqual(len(steps), 1)
         self.assertIn("\n        if: needs.changes.outputs.ci_mode == 'precheck'\n", steps[0])
+        # The job holding that step must still start for a pre-check, or the
+        # pre-check silently loses its tests: it accepts skipped jobs.
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
+        self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
 
     def test_required_ci_aggregates_every_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

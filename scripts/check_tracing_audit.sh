@@ -12,6 +12,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 crate=crates/cgka-conformance-simulator
 edition="$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)"
+if [[ ! "$edition" =~ ^[0-9]{4}$ ]]; then
+    echo "error: expected one edition = \"<year>\" line in Cargo.toml, found: ${edition:-none}" >&2
+    exit 1
+fi
 out=target/tracing-audit
 mkdir -p "$out"
 # The audit finds the workspace root from env!("CARGO_MANIFEST_DIR"), which
