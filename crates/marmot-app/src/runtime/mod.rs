@@ -2735,9 +2735,10 @@ impl MarmotAppRuntime {
     /// account, linked or not: they don't require
     /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
     /// can carry, or already hold this account's limit of 20 leaves (mdk#2628
-    /// item 3.5c). A newly linked device is added to this device's other
-    /// chats. A chat admin can turn the component on; removing a device frees
-    /// its leaves.
+    /// item 3.5c). Once a link this device approved is made, the new device
+    /// is added to this device's other chats when its "add to all my chats"
+    /// setting is on. A chat admin can turn the component on; removing a
+    /// device frees its leaves.
     /// Zero until this device trusts a device group, and always zero in
     /// release builds until the device group's spec lands. Read it when
     /// showing the device list; it is not evented.

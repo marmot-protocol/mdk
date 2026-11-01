@@ -82,8 +82,8 @@ impl AppClient {
         }
     }
 
-    /// Each chat is handled on its own: one that fails never holds the
-    /// others back, and the first failure is returned at the end.
+    /// Each device and each chat is handled on its own: one that fails never
+    /// holds the others back, and the first failure is returned at the end.
     async fn try_add_linked_devices_to_chats(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
@@ -112,10 +112,12 @@ impl AppClient {
             if owed.is_empty() {
                 continue;
             }
-            self.want_private_key_packages(
+            if let Err(error) = self.want_private_key_packages(
                 &device.slot,
                 u32::try_from(owed.len()).unwrap_or(u32::MAX),
-            )?;
+            ) {
+                first_error.get_or_insert(error);
+            }
             for chat in owed {
                 if budget == 0 {
                     break 'devices;
@@ -128,8 +130,13 @@ impl AppClient {
                         continue;
                     }
                 }
-                let Some(key_package) = self.next_private_key_package(&device.slot)? else {
-                    break;
+                let key_package = match self.next_private_key_package(&device.slot) {
+                    Ok(Some(key_package)) => key_package,
+                    Ok(None) => break,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        break;
+                    }
                 };
                 let sibling = SiblingKeyPackage {
                     slot: device.slot,
