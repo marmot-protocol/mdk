@@ -429,6 +429,12 @@
 - A queued proposal or proposal-queue ref list that fails to decode in the
   MessagePack value encoding clears the group's proposal queue, as a
   corrupt JSON row already did, instead of failing group load.
+- A transaction SQLite rolled back by itself (a full disk, an I/O error or
+  out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`, a failed
+  `COMMIT`) no longer marks the account's connection unusable until the
+  account reopens. The caller gets the failure's own error, so a full disk
+  reaches it as `StorageError::Capacity`, and the rest of that transaction,
+  inside or after a savepoint, fails instead of committing write by write.
 
 ## 0.14.0 - 2026-10-23
 
