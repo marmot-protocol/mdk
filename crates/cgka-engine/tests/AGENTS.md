@@ -43,7 +43,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
-  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
+  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip, exact buffered-malformed retirement, and
+    encrypted own-echo persistence. The pure canonical-disposition/public-outcome mapper is pinned in
+    `../src/message_processor/ingest.rs::tests`
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
@@ -66,7 +68,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
-    `peel_deferred -> peel_deferred` audit row.
+    `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return
+    deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
+    continuation, restore live state between slices and eventually deliver the real rival application exactly once.
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical

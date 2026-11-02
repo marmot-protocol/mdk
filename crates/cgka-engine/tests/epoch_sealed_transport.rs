@@ -714,7 +714,7 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
 
     let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
     bob.join_welcome(welcome).await.unwrap();
-    bob.drain_events();
+    let mut events = bob.drain_events();
 
     // Alice advances the group and speaks from the new epoch. Bob is served
     // the message first; its commit is still in flight.
@@ -729,6 +729,7 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
         &group_id,
         WELCOME_CREATED_AT + 60,
     );
+    let expected_payload = chat_payload(&alice, "from the epoch ahead");
     let ahead = route_at(
         chat(&mut alice, &group_id, "from the epoch ahead").await,
         &group_id,
@@ -745,15 +746,30 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
     bob.ingest(commit).await.unwrap();
     bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
         .unwrap();
-    bob.drain_events();
+    events.extend(bob.drain_events());
 
     bob.retry_deferred_peels(&group_id).await.unwrap();
-    assert!(
-        bob.drain_events().iter().any(|event| matches!(
-            event,
-            cgka_traits::engine::GroupEvent::MessageReceived { group_id: id, .. } if *id == group_id
-        )),
-        "once the commit lands, the deferred message opens"
+    events.extend(bob.drain_events());
+    let mut delivered = 0;
+    for event in events {
+        if let cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: id,
+            sender,
+            epoch,
+            payload,
+            ..
+        } = event
+        {
+            assert_eq!(id, group_id);
+            assert_eq!(sender, alice.self_id());
+            assert_eq!(epoch, alice.epoch(&group_id).unwrap());
+            assert_eq!(payload, expected_payload);
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 1,
+        "the deferred application must deliver exactly once"
     );
     assert_eq!(
         deferred_rows(&bob_storage, &group_id),
