@@ -30,11 +30,11 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 | --- | --- |
 | `src/lib.rs` | The public surface: production re-exports, the crate-internal shorthands the moved code uses, and the `test-support`-gated re-exports. |
 | `src/test_support.rs` | `_for_test` wrappers over crate-private methods that `marmot-app`'s directory tests call; built only with `test-support`. |
-| `src/service.rs` | `Directory<R>`, the service, and `DirectoryState`, what it keeps between calls (preview cooldowns, the member prewarm cache, the sync worker's handle slot). The host builds a fresh `Directory` per call and shares one state. |
+| `src/service.rs` | `Directory<R>`, the service, and `DirectoryState`, what it keeps between calls (the record-update lane, preview cooldowns, the member prewarm cache, the sync worker's handle slot). The host builds a fresh `Directory` per call and shares one state. |
 | `src/resources.rs`, `src/observer.rs` | The three traits the host implements, and the `DirectoryAccount` view. |
 | `src/config.rs` | `DirectoryConfig` (relays, future-skew limit, Open Ranking provider, fallback seeds, proxy-aware HTTP builder, test clock) and the deployment's `OpenRankingProvider`. |
 | `src/error.rs` | `DirectoryError`, its `privacy_safe_kind`, and `ResourceError`, which carries a host failure through unchanged. |
-| `src/store.rs` | The directory store: entry reads, the `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the freshness bound and record hydration. |
+| `src/store.rs` | The directory store: entry reads, the `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the freshness bound and record hydration; concurrency and callback regressions in `src/store/tests.rs`. |
 | `src/methods.rs` | Relay-list, profile, KeyPackage and follow-list fetches, refreshes, the cached identity page, synchronous user-directory search and the sync plan. |
 | `src/records.rs` | The public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs and stateless record helpers: cached <-> shared conversion, recency selection, profile and follow-list parsing, search-match ranking, `profile_content_json`. |
 | `src/published_records.rs`, `src/ids.rs` | Stateless relay-list and KeyPackage handling for other accounts (status, tag validation, fresh-vs-cached reconciliation, per-account ranking and selection of up to 20 KeyPackages, deletion and revocation evidence), the same per-slot validation over a local account's own slots for its new-sign-in check (`AccountKeyPackageSlots`: every valid fresh slot, with no cap and no signature-key collapse, the id of every slot the read returned, and the device's own slot as relays serve it (`OwnSlotRead`), each publication with its valid current-profile KeyPackage's ref and leaf signature key, if it holds one), the record-selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`), and the Nostr account-id helpers. |
@@ -52,6 +52,10 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   `marmot-app`'s `error::directory_error_tests`.
 - Anything kept between calls belongs in `DirectoryState`. The sync worker's handle has one owner, the state's slot:
   `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
+- Keep record read/merge/write in the shared `DirectoryState` update lane. Acquire host-owned handles before
+  entering, preserve component recency and equality rules, and notify the host only after leaving. A later
+  account-cache error still reports a committed shared-row change; the lane does not make separate databases
+  one atomic transaction.
 - Reach relays only through `transport-nostr`, and build every HTTP client by passing a fresh reqwest builder straight
   into `DirectoryConfig::http_builder`, the host's proxy-aware builder; `clippy.toml` rejects direct `nostr_sdk` and
   `reqwest` client constructors. Allow that lint only at that hand-off (today, Open Ranking's client). Clippy cannot
