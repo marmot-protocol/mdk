@@ -1421,15 +1421,16 @@ async fn stale_commit_without_own_commit_is_classified_as_already_at_epoch_not_f
 }
 
 #[tokio::test]
-async fn failed_invite_staging_does_not_poison_fork_detection() {
+async fn rejected_duplicate_invite_does_not_poison_fork_detection() {
     // Regression (historical shape): `do_send_invite` used to record
     // fork-detection bookkeeping BEFORE staging the commit; when staging
     // failed, the leftover phantom entry mis-routed a legitimate same-epoch
     // sibling commit into fail-closed fork recovery, sticking the group in
     // Recovering. Routing no longer consults committer-side bookkeeping at
     // all — the sibling is admitted into convergence by the retained
-    // source-epoch anchor — and this test keeps pinning that a failed staging
-    // attempt leaves later sibling classification untouched.
+    // source-epoch anchor. Duplicate-device invites are now refused before
+    // staging; this test pins that the refusal leaves later sibling
+    // classification untouched.
     let (mut alice, _alice_storage) = build_client_with_storage(b"phantom-alice");
     let mut bob = build_client(b"phantom-bob");
     let mut carol = build_client(b"phantom-carol");
@@ -1470,10 +1471,9 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
     // later.
     let dave_sibling_commit = raw_self_update_commit(&dave_storage, &dave_id, &group_id);
 
-    // Alice's invite fails DURING staging: the duplicate-Bob KeyPackage is
-    // signed with Bob's existing leaf signature key, which OpenMLS rejects
-    // inside `add_members` — after capability validation, before
-    // `begin_pending`.
+    // Alice's duplicate-Bob KeyPackage repeats a signature key already on
+    // the roster. The send path skips that device and refuses the now-empty
+    // invite before staging any commit.
     let duplicate_bob_kp = bob.fresh_key_package().await.unwrap();
     let failed = alice
         .send(SendIntent::Invite {
@@ -1483,8 +1483,9 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
         })
         .await;
     assert!(
-        failed.is_err(),
-        "duplicate-member invite must fail during staging"
+        matches!(&failed, Err(cgka_traits::error::EngineError::Other(reason))
+            if reason == "the invite adds no device: each one is already in the group"),
+        "duplicate-device invite must be refused before staging: {failed:?}"
     );
 
     // Bob commits from the same epoch (invites Carol). Alice advances by
@@ -1527,7 +1528,7 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
     alice
         .ingest(dave_sibling_commit)
         .await
-        .expect("sibling commit after failed staging must not fail closed");
+        .expect("sibling commit after refused invite must not fail closed");
 
     // The group is still operational: a fresh (valid) invite from Alice is
     // accepted — staged immediately or queued behind unresolved convergence
@@ -1542,7 +1543,7 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
             initial_admins: vec![],
         })
         .await
-        .expect("group must remain usable after failed staging + sibling commit");
+        .expect("group must remain usable after refused invite + sibling commit");
     assert!(matches!(
         recovery_probe,
         SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
@@ -1551,8 +1552,8 @@ async fn failed_invite_staging_does_not_poison_fork_detection() {
 
 #[tokio::test]
 async fn publish_failed_rollback_does_not_poison_fork_detection() {
-    // Companion regression to `failed_invite_staging_does_not_poison_fork_
-    // detection`, for the POST-staging failure: staging succeeds and then
+    // Companion to `rejected_duplicate_invite_does_not_poison_fork_detection`,
+    // for the POST-staging failure: staging succeeds and then
     // the publish fails. Historically the rollback left phantom
     // fork-detection bookkeeping behind that mis-routed a legitimate late
     // same-epoch sibling into fail-closed fork recovery. Routing no longer
@@ -2740,24 +2741,21 @@ fn settled_branch(engine: &Engine<SqliteAccountStorage>, f: &RouterFlipFixture) 
     }
 }
 
-/// Drive convergence like a runtime scheduler until the competing commit leaves
-/// `Created`, letting the real P4 quiescence window elapse.
-async fn drive_convergence(
+/// Settle the retained fork after the production quiescence window. These
+/// routing/event tests do not depend on how much wall time the scheduler takes.
+fn drive_convergence(
     engine: &mut Engine<SqliteAccountStorage>,
     f: &RouterFlipFixture,
     competing_id: &MessageId,
 ) {
-    for _ in 0..40 {
-        engine
-            .converge_stored_openmls_messages(&f.group_id)
-            .expect("convergence pass runs");
-        let state = f.local_storage.get_message(competing_id).unwrap().state;
-        if state != MessageState::Created {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("competing commit never left MessageState::Created");
+    engine
+        .converge_stored_openmls_messages_at(&f.group_id, u64::MAX)
+        .expect("convergence pass runs");
+    assert_ne!(
+        f.local_storage.get_message(competing_id).unwrap().state,
+        MessageState::Created,
+        "competing commit must receive a settled disposition"
+    );
 }
 
 #[tokio::test]
@@ -2796,7 +2794,7 @@ async fn restarted_committer_routes_same_epoch_sibling_into_convergence() {
         "a restarted committer must not classify the sibling stale, got {outcome:?}"
     );
 
-    drive_convergence(&mut local, &f, &competing_id).await;
+    drive_convergence(&mut local, &f, &competing_id);
     assert_eq!(
         settled_branch(&local, &f),
         Branch::Sibling,
@@ -3011,7 +3009,7 @@ async fn canonicalization_transition_reports_the_device_tip_not_the_rival_source
     );
 
     local.ingest(f.competing.clone()).await.unwrap();
-    drive_convergence(&mut local, &f, &competing_id).await;
+    drive_convergence(&mut local, &f, &competing_id);
     assert_eq!(
         f.local_storage.get_message(&competing_id).unwrap().state,
         MessageState::Processed,
@@ -3310,15 +3308,15 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
     local.drain_events();
 
     // A halted group refuses new work — the wedge is real before the repair.
-    assert!(
+    assert!(matches!(
         local
             .send(SendIntent::SelfUpdate {
                 group_id: f.group_id.clone(),
             })
-            .await
-            .is_err(),
-        "an unrecoverable group must refuse sends"
-    );
+            .await,
+        Err(cgka_traits::error::EngineError::GroupUnrecoverableRepairRequired { group_id })
+            if group_id == f.group_id
+    ));
 
     // (2) The verified repair: the sibling author removes the wedged device
     // from the fleet's branch and re-invites it with a fresh key package.
@@ -3980,7 +3978,7 @@ async fn convergence_pass_that_keeps_the_own_commit_emits_no_own_withdrawal() {
         "the rival must reach the settling pass never having been applied"
     );
 
-    drive_convergence(&mut local, &f, &competing_id).await;
+    drive_convergence(&mut local, &f, &competing_id);
     assert_eq!(settled_branch(&local, &f), Branch::Own);
     assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
 
@@ -4075,7 +4073,7 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         "buffering the rival must not be application-visible"
     );
 
-    drive_convergence(&mut local, &f, &competing_id).await;
+    drive_convergence(&mut local, &f, &competing_id);
     assert_eq!(settled_branch(&local, &f), Branch::Sibling);
     assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
 

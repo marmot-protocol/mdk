@@ -3472,6 +3472,25 @@ where
             .await?)
     }
 
+    /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
+    pub async fn prepare_create_group_with_siblings_and_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        context: AuditEventContext,
+    ) -> AccountResult<CreateGroupEffects> {
+        Ok(self
+            .session
+            .prepare_create_group_with_siblings_and_audit_context(
+                request,
+                optional_app_components,
+                siblings,
+                context,
+            )
+            .await?)
+    }
+
     /// Prepare creation of a group under a group id chosen before it exists,
     /// as a device link needs; a device group's founding Add sets the linked
     /// device's entry by `roster_update`. Publish the effects as for

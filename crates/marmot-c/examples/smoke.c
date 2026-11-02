@@ -45,8 +45,8 @@ _Static_assert(MARMOT_SIGN_IN_RESPONSE_DISMISS == 2, "sign-in response ABI value
 _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN == 0, "compromise warning reason ABI value");
 _Static_assert(MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE == 1, "compromise warning reason ABI value");
 
-_Static_assert(MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN == 108, "selection uncertainty ABI value");
-_Static_assert(MARMOT_STATUS_CHAT_SELECTION_QUERY == 124, "selection query ABI value");
+_Static_assert(MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN == 117, "selection uncertainty ABI value");
+_Static_assert(MARMOT_STATUS_CHAT_SELECTION_QUERY == 133, "selection query ABI value");
 _Static_assert(MARMOT_CHAT_SELECTION_FIELD_UNREAD == 0, "selection field ABI value");
 _Static_assert(MARMOT_CHAT_SELECTION_FIELD_PARTICIPANTS == 10, "selection participant field ABI value");
 _Static_assert(MARMOT_CHAT_SELECTION_MODE_CONTAINS == 7, "selection mode ABI value");

@@ -133,7 +133,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     seam that projects the record. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
-    stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
+    stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
+    receive-state/output rollback and retry after a direct application's pending-output write fails (mdk#2872), including
+    encrypted close/reopen and the following sender generation. Also owns the snapshot-guard durability pair: a guard whose
     rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
@@ -290,6 +292,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
     included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
+
+  The sibling-Welcome owner also covers 3.5f: a real losing Add holds its Welcome across reopen instead of becoming
+  sendable or terminal from a lost event, missing origin evidence and a settling chat hold delivery, terminal origin
+  invalidation stays retired after reopen, and legacy development rows with no provable origin are not handed off
+  after reopen. Exact delivered carrier outcomes settle even while held. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
+  compatibility live in `cgka-traits` `message::stored_payload_codec_tests`.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
   - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
