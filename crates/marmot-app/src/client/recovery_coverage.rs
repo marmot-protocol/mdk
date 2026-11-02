@@ -12,6 +12,7 @@
 //! follows goes on. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
     RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
@@ -599,7 +600,8 @@ impl AppClient {
     }
 
     /// Settle what routing replacements changed since the recovery runner's
-    /// last debt turn (mdk#2660 section 3). A (route, relay) a replacement
+    /// last debt turn (mdk#2660 section 3), giving every current route its
+    /// standing goal before the turn reads debt. A (route, relay) a replacement
     /// dropped is retired as gone once this turn confirms it: the routes still
     /// do not carry it, and its group is terminal or still has a route
     /// installed (the inbox: still has a relay). A group left with none may
@@ -607,13 +609,18 @@ impl AppClient {
     /// routes carry again owes its whole goal. It runs at the start of a debt
     /// turn, between the owner's commands, so a command that drops a route and
     /// restores it settles nothing. A failed write keeps the changes for the
-    /// next turn.
-    pub(crate) fn settle_recovery_route_changes(&self, app: &SqliteAppStorage, now: u64) {
+    /// next turn and returns the error to the runner's local-failure backoff;
+    /// no debt read may treat failed preparation as nothing owed.
+    pub(crate) fn settle_recovery_route_changes(
+        &self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
         let Some(changes) = self.routing.take_route_changes() else {
-            return;
+            return Ok(());
         };
         if changes.dropped.is_empty() && !changes.changed {
-            return;
+            return Ok(());
         }
         let routing = self.routing.snapshot();
         let carried =
@@ -639,6 +646,12 @@ impl AppClient {
             }
         }
         let settled = (|| {
+            let current = self.current_coverage_routes();
+            // This turn reads the new debt immediately. Do not wake its own
+            // runner, especially if a later write keeps the changes pending.
+            for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now)? {
+                app.widen_recovery_coverage_goals(&routes, floor)?;
+            }
             for (route, relays) in &gone {
                 let ended = !carried.iter().any(|(carried, _)| carried == *route);
                 app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
@@ -648,10 +661,10 @@ impl AppClient {
             })?;
             Ok::<_, cgka_traits::storage::StorageError>(())
         })();
-        if let Err(error) = settled {
-            log_failure("settle_recovery_route_changes", &AppError::from(error));
+        if settled.is_err() {
             self.routing.restore_route_changes(changes);
         }
+        settled
     }
 
     /// Whether the group's local copy is Unrecoverable, which suspends its
@@ -697,9 +710,9 @@ impl AppClient {
         }
     }
 
-    /// Widen `routes`' goals to `floor`. Every goal the client widens goes
-    /// through here: it may owe new debt, so the recovery runner, if one
-    /// runs, reads its ledger again.
+    /// Widen `routes`' goals to `floor` and wake the recovery runner to read
+    /// its ledger again. Only the runner's own routing-change settlement
+    /// widens directly without a wake: that turn immediately reads the debt.
     fn widen_coverage_goals(
         &self,
         app: &SqliteAppStorage,
@@ -720,37 +733,72 @@ impl AppClient {
     /// A Welcome time after `now` (the joining clock ran fast) is ignored, even
     /// one inside the allowance, or the goal would start minutes ago and never
     /// owe the window.
-    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> u64 {
-        let welcome = current.group_id.as_ref().and_then(|group| {
-            self.runtime
-                .group_record(&cgka_traits::GroupId::new(group.clone()))
-                .ok()?
-                .local_copy_welcome_created_at
-        });
-        welcome
+    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> StorageResult<u64> {
+        let welcome = match &current.group_id {
+            Some(group) => match self
+                .engine_storage
+                .get_group(&cgka_traits::GroupId::new(group.clone()))
+            {
+                Ok(group) => group.local_copy_welcome_created_at,
+                Err(StorageError::NotFound) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        Ok(welcome
             .filter(|welcome| welcome.0 <= now)
             .map_or(0, |welcome| crate::history_floor(welcome.0).0)
-            .max(retention_floor(now))
+            .max(retention_floor(now)))
     }
 
-    /// Widen each current route's goal to its standing floor.
+    /// Group standing goals by floor so one write can widen each set.
+    fn standing_goals(
+        &self,
+        routes: &[&CurrentRoute],
+        now: u64,
+    ) -> StorageResult<BTreeMap<u64, Vec<TransportReconciliationRoute>>> {
+        let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for current in routes {
+            by_floor
+                .entry(self.standing_floor(current, now)?)
+                .or_default()
+                .push(current.route.clone());
+        }
+        Ok(by_floor)
+    }
+
+    /// Widen each current route's goal to its standing floor and wake the
+    /// runner. Its own routing-change turn uses the same grouping without a
+    /// wake: that turn already reads what it widened.
     fn widen_standing_goals(
         &self,
         app: &SqliteAppStorage,
         routes: &[&CurrentRoute],
         now: u64,
     ) -> Result<(), AppError> {
-        let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
-        for current in routes {
-            by_floor
-                .entry(self.standing_floor(current, now))
-                .or_default()
-                .push(current.route.clone());
-        }
-        for (floor, routes) in by_floor {
+        for (floor, routes) in self.standing_goals(routes, now)? {
             self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
+    }
+
+    /// Every open owes each current route's retained window, even with a
+    /// transport cursor. Durable coverage leaves only its unproven restart
+    /// gap as debt. Widen the ledger directly: an IncrementalHistory request
+    /// would also give the old comparison owner work in the hybrid. The
+    /// runner's first routing-change turn retries a failed best-effort write.
+    pub(crate) fn record_open_coverage_goals(&self) {
+        let current = self.current_coverage_routes();
+        let result = self.coverage_storage().and_then(|storage| {
+            self.widen_standing_goals(
+                &storage.app_storage(),
+                &current.iter().collect::<Vec<_>>(),
+                unix_now_seconds(),
+            )
+        });
+        if let Err(error) = result {
+            log_failure("record_open_coverage_goals", &error);
+        }
     }
 
     /// Startup incremental history wants every current route from its

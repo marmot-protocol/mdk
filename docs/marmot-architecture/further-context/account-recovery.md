@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-30
+updated: 2026-11-02
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -521,6 +521,8 @@ in `marmot-app` fills it from facts the owner already has:
 
 | Fact | Ledger effect |
 | --- | --- |
+| Every account open, with or without a transport cursor | Every current route's goal widens to its standing floor, directly in the ledger. No extra incremental-history obligation is created for the old owner when a cursor exists |
+| A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
 | A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
@@ -537,6 +539,20 @@ Welcome and sent after it is openable here yet older than the Welcome. The stand
 therefore only starts the goals that want history in general. It never retires, un-covers or
 drops debt: loss and released receipts keep their own floors, explicit repair wants the whole
 window, and goals only widen, so a later Welcome raises nothing.
+The hint is read from durable group metadata even on a deferred runtime open, before MLS
+hydration: an unavailable live accessor must not substitute the retention floor and
+permanently widen a recently joined copy's goal.
+An error reading that metadata is a preparation failure, not an absent hint. All standing
+floors are validated before any goals widen, so a later successful retry can use the actual
+Welcome floor instead of preserving an accidentally broader goal.
+
+**Coverage versus goals.** No debt means no unproven history against the goals the ledger
+holds; it says nothing about a route with no goal. Every current route therefore needs a
+standing goal, including one added after the account's first cold start. Account open seeds
+these even when the transport cursor skips the old owner's incremental-history request.
+Routing replacements wake the runner, whose next routing-change turn seeds newly current
+routes before selecting debt. With the runner gate off these ledger writes do not change
+the old owner's obligations or host-visible recovery status.
 
 **Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
@@ -621,7 +637,8 @@ A restart or relay rebuild drops every tail, and its new REQs start at the trans
 less the rebuild lookback, which a healthy generation keeps raising past its request. The new
 generation proves only from its `since` or past the oldest event it counted, whichever is
 later, so the seconds from a route's last durable proof to that start stay owed, inside the
-retained window startup history already owes, until the runner's sweep proves them. A busy
+retained window the route's standing goal owes, until the runner's sweep proves them. This
+restart-gap debt is background sweep work and never fences live input. A busy
 route's count reaches back near its `since`, so it owes little more than the time between its
 last request and that `since`; a quiet route's count holds nothing, so it owes everything from
 its last proof through the new request. The REQs do not reach back to the last proof instead:
@@ -853,6 +870,12 @@ drain the group; a stalled group is not swept, and the runner idles until the ho
 ends. A stalled group's fence stays where it is meanwhile, since the capture debt that would
 drop it is not swept. What a route the runner no longer lists staged is given back, its seconds owed again on
 that route, so it never holds the account's bound.
+
+Before a debt turn reads anything, the host settles pending route changes and their goals.
+A failed preparation write keeps those changes and returns a storage error instead of
+running the read or publishing a successful no-debt survey. The same local-failure backoff
+as admission and survey errors schedules another attempt, without an immediate self-wake
+or a separate retry timer. Existing capture fences stay in force while preparation waits.
 
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
 that its relay's non-empty count left unproven. An empty count's range is cold-start debt,

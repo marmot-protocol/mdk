@@ -71,7 +71,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportDelivery;
-use cgka_traits::storage::StorageError;
+use cgka_traits::storage::{StorageError, StorageResult};
 use marmot_forensics::{AuditEventKind, RecoveryRunnerCap};
 use nostr::prelude::Event;
 use storage_sqlite::{
@@ -220,9 +220,11 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
 
     /// Run `turn` on the worker with the live tails and live counts read at
     /// its start ([`AppClient::recovery_runner_live_tails`](crate::client::AppClient)).
-    async fn debt_turn<T, F>(&self, turn: F) -> Option<T>
+    /// Preparation errors are returned without calling `turn`, through the
+    /// same local-failure handling as its storage reads. `None` means stopped.
+    async fn debt_turn<T, F>(&self, turn: F) -> Option<StorageResult<T>>
     where
-        F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
+        F: FnOnce(&DebtTurn<'_>) -> StorageResult<T> + Send + 'static,
         T: Send + 'static;
 
     /// The relay's NIP-11 caps (`MarmotApp::relay_caps`); `None` when unknown.
