@@ -254,6 +254,14 @@ impl<S: StorageProvider> Engine<S> {
         let parsed_kps =
             self.own_account_key_packages(&mls_group, &existing, &key_packages, &account)?;
         let removed_leaves = own_account_leaves(&mls_group, &leaf_signature_keys, &account)?;
+        // The selected tree may have gained this sibling after the caller's
+        // presence read or while this intent waited in the queue. Check the
+        // device slot before staging, even when its MLS signer changed.
+        let sibling_plan = if siblings.is_empty() {
+            None
+        } else {
+            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
+        };
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let pending_commit_guard =
@@ -321,12 +329,6 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             &parsed_kps,
         )?;
-        let sibling_plan = if siblings.is_empty() {
-            None
-        } else {
-            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
-        };
-
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -489,6 +491,34 @@ impl<S: StorageProvider> Engine<S> {
                 self.wall_clock.now().0,
             ) {
                 return refused(SiblingAddRefusal::KeyPackage, &error.to_string());
+            }
+            let tag_key = own
+                .roster()
+                .devices
+                .get(&sibling.slot)
+                .and_then(|entry| entry.tag_signature_key.as_deref());
+            let present = mls_group.members().any(|member| {
+                if !openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                    .is_ok_and(|credential| {
+                        credential.identity() == self.identity.self_id().as_slice()
+                    })
+                {
+                    return false;
+                }
+                tag_key == Some(member.signature_key.as_slice())
+                    || mls_group
+                        .public_group()
+                        .leaf(member.index)
+                        .is_some_and(|leaf| {
+                            crate::device_tag::device_tag_claim(leaf, own.roster())
+                                == cgka_traits::app_components::DeviceTagClaim::Device(sibling.slot)
+                        })
+            });
+            if present {
+                return refused(
+                    SiblingAddRefusal::KeyPackage,
+                    "the chat already holds the sibling",
+                );
             }
         }
         let Some(relays) = sibling_welcome_relays(mls_group)? else {

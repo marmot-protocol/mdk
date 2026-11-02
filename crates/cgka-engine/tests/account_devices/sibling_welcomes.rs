@@ -26,6 +26,149 @@ use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
 use std::sync::{Arc, Mutex};
 
+/// A valid private KeyPackage whose MLS key differs from the device's tag
+/// key. Another implementation may rotate its MLS signer independently;
+/// device-group.md binds private hand-offs by tag, not by one shared signer.
+fn with_another_mls_key(
+    sibling: &Device,
+    template: &SiblingKeyPackage,
+    roster: &cgka_traits::app_components::DeviceRosterV1,
+) -> SiblingKeyPackage {
+    let parsed = parse_key_package(&template.key_package);
+    let leaf = parsed.leaf_node();
+    let signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).unwrap();
+    let mut dictionary = leaf
+        .extensions()
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    let proof = dictionary
+        .get(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+        .unwrap();
+    let created_at = u64::from_be_bytes(proof[32..40].try_into().unwrap());
+    dictionary.insert(
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        account_identity_proof_component(
+            &pad32(b"bob"),
+            signer.public(),
+            DEFAULT_CIPHERSUITE,
+            DEFAULT_CIPHERSUITE.signature_algorithm(),
+            created_at,
+            proof_signer(b"bob").as_ref(),
+        )
+        .unwrap(),
+    );
+    dictionary.insert(
+        cgka_traits::app_components::DEVICE_TAG_COMPONENT_ID,
+        cgka_engine::device_tag::seal_device_tag(
+            &RustCrypto::default(),
+            &roster.leaf_tag_key,
+            &template.slot,
+            &device_signer(sibling),
+            signer.public(),
+        )
+        .unwrap(),
+    );
+    let mut extensions = leaf.extensions().clone();
+    extensions
+        .add_or_replace(Extension::AppDataDictionary(
+            AppDataDictionaryExtension::new(dictionary),
+        ))
+        .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .key_package_lifetime(*parsed.life_time())
+        .leaf_node_capabilities(leaf.capabilities().clone())
+        .leaf_node_extensions(extensions)
+        .build(
+            DEFAULT_CIPHERSUITE,
+            &OpenMlsRustCrypto::default(),
+            &signer,
+            CredentialWithKey {
+                credential: leaf.credential().clone(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    SiblingKeyPackage {
+        slot: template.slot,
+        key_package: KeyPackage::new(
+            MlsMessageOut::from(bundle.key_package().clone())
+                .tls_serialize_detached()
+                .unwrap(),
+        )
+        .with_protocol_profile(ProtocolProfile::Current),
+    }
+}
+
+/// A selected Add by another sibling defeats an earlier presence read,
+/// including when a device uses different MLS signers for its allocations.
+/// Re-check the slot before a direct send and at a queued Add's actual drain.
+#[tokio::test]
+async fn a_sibling_added_while_its_add_waits_is_not_added_again_at_drain() {
+    let (mut phone, mut devices, device_group) = tagged_devices(b"bob", 2).await;
+    let mut laptop = devices.remove(0);
+    let mut tablet = devices.remove(0);
+    let mut alice = chat_device(b"alice");
+    let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut tablet]).await;
+    let template = handed(&mut laptop, slot(2), slot(1));
+    let roster = super::device_roster::roster_of(&phone, &device_group);
+    let candidate = with_another_mls_key(&laptop, &template, &roster);
+    assert_eq!(
+        phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+        None
+    );
+    let first = handed(&mut laptop, slot(2), slot(3));
+    let add = send_commit(&mut tablet, add_own_devices(&gid, vec![first]), &gid).await;
+    phone
+        .engine
+        .buffer_openmls_convergence_message_at(&gid, add, 1_000)
+        .unwrap();
+    let SendResult::Queued { intent_id, .. } = phone
+        .engine
+        .send(add_own_devices(&gid, vec![candidate.clone()]))
+        .await
+        .unwrap()
+    else {
+        panic!("expected the Add to queue while the competing Add settles")
+    };
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    phone.engine.drain_events();
+    let prepared = phone
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 1_000_100)
+        .await
+        .unwrap();
+    assert_eq!(prepared.len(), 0, "a stale queued Add must stage no Commit");
+    assert!(
+        phone
+            .storage
+            .list_queued_outbound_intents(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(phone.engine.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::QueuedIntentRefused { intent_id: refused, .. } if *refused == intent_id
+    )));
+    assert!(sibling_rows(&phone, &gid).is_empty());
+    assert_eq!(
+        phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+        Some(SiblingAddRefusal::KeyPackage),
+        "the selected tree already holds this sibling under another MLS key"
+    );
+    assert_refused(
+        phone
+            .engine
+            .send(add_own_devices(&gid, vec![candidate]))
+            .await,
+        "the chat already holds the sibling",
+    );
+}
+
 /// `device`'s sibling Welcome rows in `gid`.
 fn sibling_rows(device: &Device, gid: &GroupId) -> Vec<(MessageState, StoredMessagePayload)> {
     device
