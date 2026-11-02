@@ -827,6 +827,30 @@ where
     /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
     /// its own retained anchor. `None` when `epoch` is neither current nor
     /// retained, or no leaf sat at that index. See
+    /// Recover immutable accepted source proof without changing its first observation.
+    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> AccountResult<()> {
+        Ok(self
+            .session
+            .recover_pending_device_group_sources(group_id)?)
+    }
+
+    /// Attribute accepted native DG sources under the current trusted roster.
+    pub fn pending_device_group_activity(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<
+        Vec<(
+            cgka_traits::MessageId,
+            EpochId,
+            Option<cgka_traits::app_components::DeviceSlotId>,
+        )>,
+    > {
+        Ok(self
+            .session
+            .pending_device_group_activity(group_id, roster)?)
+    }
+
     /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,

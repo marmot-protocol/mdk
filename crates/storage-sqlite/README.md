@@ -385,10 +385,27 @@ private KeyPackage reference, expiry and originating Add remain engine-owned. Th
 new activity after its own publication boundary. A prepared-carrier timestamp high-water prevents reuse of any earlier
 carrier identity after a wall-clock rollback; failed or unexposed exact retries keep their reservation.
 
-Publication acceptance and current-roster-qualified device-group activity share a durable scalar local observation
-order, so same-millisecond observations and backward clocks do not invent ordering. Qualification is immutable content
-metadata on the existing processed transport-id ledger, outside protocol snapshots and without changing wrapper-id
-deduplication. Rewrapping, snapshot replay and delayed app projection cannot make old qualified content new. Existing
-experimental local groups freeze their current epoch at migration 0169; only later-source-epoch activity qualifies,
-after an ordinary committed update. Newly installed local groups qualify immediately. This is best-effort activity
-evidence: queued traffic is not proof of live post-publication activity or Welcome receipt.
+Publication acceptance and native accepted device-group source observations share a durable scalar local observation
+order, so same-millisecond observations and backward clocks do not invent ordering. Direct acceptance and selected
+convergence/application replay capture the authenticated source epoch, member and leaf proof in their native transaction;
+branch probes never observe. The optional versioned proof and immutable first time/order live on the existing lifetime
+processed-wrapper/content ledger outside snapshots. Missing source-leaf proof stays pending; exact ciphertext
+reauthentication may fill it without retiming. App attribution under the current trusted roster reuses that native stamp
+for application, accepted member Commit and Proposal traffic, including empty app-effect batches. Valid application
+aliases retain the inner event id and exact authenticated source binding; malformed application identities include the
+source epoch/member/index and plaintext digest, and accepted Proposals reuse their authenticated ProposalRef. Two device
+leaves sharing an account and the same application id remain independent. An earlier unavailable source holds only
+ambiguous aliases of that event until exact proof resolves; proof never comes from a later occupant of an index.
+Attribution records the current roster tag key actually verified with the slot. That signature attests the source leaf
+key, so aliases from different MLS leaf keys coalesce to the earliest native observation only under the same verified
+(DG, tag key, slot) principal. A changed roster tag key is a different incarnation. Earlier delayed proof can tighten a
+deadline, never postpone it. Separate indexed32-row scans for proof-present and unavailable work, with source-roster
+slot hints excluding current-key-unready work before the result limit, keep pending sources from starving healthy
+traffic. Hints never grant attribution. Rewrapping,
+message upserts, format promotion, snapshot replay and delayed projection cannot make any old observed content new.
+Existing experimental local groups freeze their selected current epoch at migration 0169; only later-source-epoch
+activity qualifies, after an ordinary committed update. Newly installed local groups qualify immediately. This is
+best-effort activity evidence: queued traffic is not proof of live post-publication activity or Welcome receipt.
+
+Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
+arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.

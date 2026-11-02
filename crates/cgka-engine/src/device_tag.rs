@@ -354,6 +354,232 @@ pub(crate) fn own_device_slot(
         .and_then(|bytes| DeviceSlotId::try_from(bytes).ok()))
 }
 
+/// Capture only native authenticated member sources in protocol-marked DGs.
+/// An older message may authenticate from past secrets without its source tree;
+/// retain that partial fact rather than guessing the current occupant's leaf.
+pub(crate) fn authenticated_source(
+    group: &MlsGroup,
+    processed: &openmls::prelude::ProcessedMessage,
+    content_id: &cgka_traits::MessageId,
+) -> Result<Option<cgka_traits::storage::AuthenticatedDeviceGroupSource>, EngineError> {
+    use cgka_traits::storage::{AuthenticatedDeviceGroupLeaf, AuthenticatedDeviceGroupSource};
+    if !crate::app_components::group_requires_device_roster(group)? {
+        return Ok(None);
+    }
+    let openmls::prelude::Sender::Member(index) = processed.sender() else {
+        return Ok(None);
+    };
+    let Some(sender) = crate::identity::member_id_of_processed_message(processed, group) else {
+        return Ok(None);
+    };
+    let leaf = if processed.epoch() == group.epoch() {
+        let source_roster =
+            crate::app_components::app_component_data_of_group(group, DEVICE_ROSTER_COMPONENT_ID)
+                .and_then(|bytes| decode_device_roster_v1(&bytes).ok());
+        group.public_group().leaf(*index).map(|leaf| {
+            let device_tag = leaf
+                .extensions()
+                .app_data_dictionary()
+                .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_TAG_COMPONENT_ID))
+                .map(|bytes| bytes.to_vec());
+            let slot_hint = device_tag
+                .as_deref()
+                .and_then(|tag| {
+                    source_roster.as_ref().and_then(|roster| {
+                        open_entry(tag, leaf.signature_key().as_slice(), &roster.leaf_tag_key)
+                    })
+                })
+                .map(|content| content.slot);
+            AuthenticatedDeviceGroupLeaf {
+                signature_key: leaf.signature_key().as_slice().to_vec(),
+                device_tag,
+                slot_hint,
+            }
+        })
+    } else {
+        None
+    };
+    Ok(Some(AuthenticatedDeviceGroupSource {
+        identity: content_id.clone(),
+        application_id: None,
+        epoch: cgka_traits::EpochId(processed.epoch().as_u64()),
+        sender,
+        leaf_index: index.u32(),
+        leaf,
+    }))
+}
+
+pub(crate) fn bind_proposal_source_identity(
+    source: &mut cgka_traits::storage::AuthenticatedDeviceGroupSource,
+    reference: &[u8],
+) {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"marmot native DG authenticated proposal v1");
+    hash.update(source.epoch.0.to_be_bytes());
+    hash.update((source.sender.as_slice().len() as u64).to_be_bytes());
+    hash.update(source.sender.as_slice());
+    hash.update(reference);
+    source.identity = cgka_traits::MessageId::new(hash.finalize().to_vec());
+}
+
+/// Valid Marmot events deduplicate by authenticated inner event id across new
+/// MLS encryptions/epochs. Malformed payloads have no event id: use a domain-
+/// separated digest of their authenticated sender, source epoch and plaintext.
+/// Transport wrapper identities never supply either key.
+pub(crate) fn bind_application_source_identity(
+    source: &mut cgka_traits::storage::AuthenticatedDeviceGroupSource,
+    payload: &[u8],
+) {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    if let Ok(event) = crate::app_payload::validate_app_payload_for_sender(payload, &source.sender)
+    {
+        source.application_id = Some(cgka_traits::MessageId::new(event.id.as_bytes().to_vec()));
+        hash.update(b"marmot native DG application event v1");
+        if let Some(leaf) = source.leaf.as_ref() {
+            hash.update((leaf.signature_key.len() as u64).to_be_bytes());
+            hash.update(&leaf.signature_key);
+            let tag = leaf.device_tag.as_deref().unwrap_or_default();
+            hash.update((tag.len() as u64).to_be_bytes());
+            hash.update(tag);
+        } else {
+            hash.update(b"unavailable source leaf");
+            hash.update(source.epoch.0.to_be_bytes());
+            hash.update(source.leaf_index.to_be_bytes());
+        }
+        hash.update(event.id.as_bytes());
+    } else {
+        hash.update(b"marmot native DG malformed application v1");
+        hash.update(source.epoch.0.to_be_bytes());
+        hash.update(source.leaf_index.to_be_bytes());
+        hash.update((source.sender.as_slice().len() as u64).to_be_bytes());
+        hash.update(source.sender.as_slice());
+        hash.update(payload);
+    }
+    source.identity = cgka_traits::MessageId::new(hash.finalize().to_vec());
+}
+
+impl<S: StorageProvider> Engine<S> {
+    /// Retry a bounded set of partial accepted facts against their exact
+    /// ciphertext and retained source epoch. The rewind is always restored;
+    /// attaching proof never resets the native first observation.
+    pub fn recover_pending_device_group_sources(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        use cgka_traits::message::StoredMessagePayload;
+        use openmls_traits::OpenMlsProvider as _;
+        self.ensure_group_live(group_id)?;
+        for (id, partial) in self
+            .storage
+            .pending_authenticated_device_group_sources(group_id, false, None, 32)?
+        {
+            let record = match self.storage.get_message(&id) {
+                Ok(record) => record,
+                Err(cgka_traits::storage::StorageError::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let stored = StoredMessagePayload::decode(&record.payload)
+                .map_err(|_| EngineError::Backend("decode device-group source record".into()))?;
+            let Some(wire) = stored.as_openmls_wire() else {
+                continue;
+            };
+            let recovered = crate::openmls_projection::with_retained_anchor_group(
+                &self.storage,
+                &self.crypto,
+                group_id,
+                partial.epoch,
+                crate::snapshot_guard::RewindSite::ModerationSource,
+                &format!("{:032x}", rand::random::<u128>()),
+                |_, provider| {
+                    let Some(mut group) = MlsGroup::load(
+                        provider.storage(),
+                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    )
+                    .map_err(|_| EngineError::Backend("load device-group source state".into()))?
+                    else {
+                        return Ok(None);
+                    };
+                    let (_, protocol) =
+                        crate::openmls_projection::project_protocol_message(&wire.payload)
+                            .map_err(|_| {
+                                EngineError::Backend("decode device-group source message".into())
+                            })?;
+                    let Some(processed) = protocol
+                        .and_then(|protocol| group.process_message(provider, protocol).ok())
+                    else {
+                        return Ok(None);
+                    };
+                    let mut source = authenticated_source(&group, &processed, &id)?;
+                    if let openmls::prelude::ProcessedMessageContent::ApplicationMessage(bytes) =
+                        processed.into_content()
+                        && let Some(source) = source.as_mut()
+                    {
+                        bind_application_source_identity(source, &bytes.into_bytes());
+                    }
+                    Ok(source.filter(|source| {
+                        source.epoch == partial.epoch
+                            && source.sender == partial.sender
+                            && source.leaf_index == partial.leaf_index
+                    }))
+                },
+            )?;
+            if let Some(source) = recovered {
+                self.storage.observe_authenticated_device_group_source(
+                    group_id,
+                    &id,
+                    &source,
+                    self.wall_clock.now_ms(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Current-roster attribution of immutable accepted source facts. Missing
+    /// source proof is excluded from this bounded scan and remains retryable.
+    pub fn pending_device_group_activity(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> Result<
+        Vec<(
+            cgka_traits::MessageId,
+            cgka_traits::EpochId,
+            Option<DeviceSlotId>,
+        )>,
+        EngineError,
+    > {
+        self.ensure_group_live(group_id)?;
+        let key_unready: Vec<_> = roster
+            .devices
+            .iter()
+            .filter_map(|(slot, entry)| entry.tag_signature_key.is_none().then_some(*slot))
+            .collect();
+        self.storage
+            .pending_authenticated_device_group_sources(group_id, true, Some(&key_unready), 32)?
+            .into_iter()
+            .map(|(id, source)| {
+                let claim = if source.sender == *self.identity.self_id() {
+                    source.leaf.as_ref().and_then(|leaf| {
+                        leaf.device_tag
+                            .as_deref()
+                            .map(|tag| read_entry(tag, &leaf.signature_key, roster))
+                    })
+                } else {
+                    None
+                };
+                let slot = match claim {
+                    Some(DeviceTagClaim::Device(slot)) => Some(slot),
+                    _ => None,
+                };
+                Ok((id, source.epoch, slot))
+            })
+            .collect()
+    }
+}
+
 /// Which roster slot `leaf` belongs to, as its device tag says
 /// (device-tag-v1.md, "Reading tags"), read against `roster`, the device
 /// group's current roster.
@@ -558,6 +784,25 @@ mod tests {
         assert_eq!(
             read_entry(&spec_tag(), &LEAF_SIGNATURE_KEY, &roster),
             DeviceTagClaim::Device(SLOT)
+        );
+        let other_leaf_key = [0x67; 32];
+        let rekeyed = seal_device_tag(
+            &RustCrypto::default(),
+            &LEAF_TAG_KEY,
+            &SLOT,
+            &tag_signer(),
+            &other_leaf_key,
+        )
+        .unwrap();
+        assert_eq!(
+            read_entry(&rekeyed, &other_leaf_key, &roster),
+            DeviceTagClaim::Device(SLOT),
+            "one verified device tag principal authenticates both source leaf keys"
+        );
+        assert_eq!(
+            read_entry(&rekeyed, &LEAF_SIGNATURE_KEY, &roster),
+            DeviceTagClaim::Unclaimed,
+            "the tag proof cannot be detached from the leaf key it attests"
         );
     }
 

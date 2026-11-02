@@ -1671,7 +1671,7 @@ mod tests {
             .unwrap();
         assert_eq!(floors, vec![7, -1]);
         let legacy: (Option<Vec<u8>>, Option<i64>) = conn.query_row(
-            "SELECT content_id, qualified_order FROM cgka_processed_transport_ids WHERE id = x'bb'", [],
+            "SELECT content_id, source_observed_order FROM cgka_processed_transport_ids WHERE id = x'bb'", [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
         assert_eq!(legacy, (None, None));

@@ -854,3 +854,383 @@ async fn only_a_live_device_group_tags() {
             .is_err()
     );
 }
+
+/// Native DG acceptance owns source facts for application, Commit and standalone
+/// Proposal traffic. Probes/buffering never observe; selected replay does, and
+/// the captured source survives a changed live tree and rewrapped duplicates.
+#[tokio::test]
+async fn accepted_device_group_application_commit_and_proposal_retain_their_exact_source() {
+    use super::tagged_siblings::tagged_devices;
+    for through_convergence in [false, true] {
+        let (mut phone, mut siblings, gid) = tagged_devices(b"source-observation", 2).await;
+        let mut laptop = siblings.remove(0);
+        let mut tablet = siblings.remove(0);
+        let roster = roster_of(&phone, &gid);
+        for (id, _) in phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .unwrap()
+        {
+            phone
+                .storage
+                .app_storage()
+                .ignore_sibling_welcome_activity(&gid, &id)
+                .unwrap();
+        }
+        let event = cgka_traits::MarmotAppEvent::new(
+            hex::encode(laptop.engine.self_id().as_slice()),
+            1,
+            49_999,
+            vec![],
+            "activity",
+        );
+        let SendResult::ApplicationMessage { msg, .. } = laptop
+            .engine
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("application");
+        };
+        let application = route_to_group(&msg, &gid);
+        let source_epoch = phone.engine.epoch(&gid).unwrap();
+        if through_convergence {
+            phone
+                .engine
+                .buffer_openmls_convergence_message_at(&gid, application.clone(), 1)
+                .unwrap();
+            phone
+                .engine
+                .advance_convergence_inputs_until_settled(&gid, 1_000_000)
+                .await
+                .unwrap();
+        } else {
+            phone.engine.ingest(application.clone()).await.unwrap();
+        }
+        let app_id = hash_id(&application.payload);
+        let facts = phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .unwrap();
+        let (_, source) = facts.iter().find(|(id, _)| *id == app_id).unwrap_or_else(|| panic!("accepted application fact missing: convergence={through_convergence}, facts={facts:?}, state={:?}", phone.storage.get_message(&app_id).unwrap().state));
+        assert_eq!(source.epoch, source_epoch);
+        assert_eq!(source.sender, laptop.engine.self_id());
+        assert_eq!(source.leaf_index, leaf_index(&laptop, &gid));
+        assert_eq!(
+            source.leaf.as_ref().unwrap().signature_key,
+            device_signer(&laptop).to_public_vec()
+        );
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &roster)
+                .unwrap()
+                .contains(&(app_id.clone(), source_epoch, Some(slot(2))))
+        );
+        let mut key_unready = roster.clone();
+        key_unready
+            .devices
+            .get_mut(&slot(2))
+            .unwrap()
+            .tag_signature_key = None;
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &key_unready)
+                .unwrap()
+                .is_empty(),
+            "missing current tag key is pending, not a definitive rejection"
+        );
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &roster)
+                .unwrap()
+                .contains(&(app_id.clone(), source_epoch, Some(slot(2)))),
+            "restored current key reuses immutable accepted source"
+        );
+        let mut wrong_roster = roster.clone();
+        wrong_roster
+            .devices
+            .get_mut(&slot(2))
+            .unwrap()
+            .tag_signature_key = Some(device_signer(&phone).to_public_vec());
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &wrong_roster)
+                .unwrap()
+                .contains(&(app_id.clone(), source_epoch, None))
+        );
+        phone
+            .storage
+            .app_storage()
+            .ignore_sibling_welcome_activity(&gid, &app_id)
+            .unwrap();
+        let commit = send_commit(
+            &mut laptop,
+            SendIntent::SelfUpdate {
+                group_id: gid.clone(),
+            },
+            &gid,
+        )
+        .await;
+        let commit_id = hash_id(&commit.payload);
+        phone
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, commit.clone(), 1)
+            .unwrap();
+        assert!(
+            phone
+                .storage
+                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .unwrap()
+                .is_empty(),
+            "unauthenticated buffering/probes cannot observe source activity"
+        );
+        phone
+            .engine
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        let facts = phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .unwrap();
+        let (_, source) = facts.iter().find(|(id, _)| *id == commit_id).unwrap();
+        assert_eq!(
+            source.epoch, source_epoch,
+            "Commit source is its parent epoch, not merged result"
+        );
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &roster)
+                .unwrap()
+                .contains(&(commit_id.clone(), source_epoch, Some(slot(2))))
+        );
+        assert_accepted(&mut tablet, &commit, &gid).await;
+        let mut rewrapped = commit;
+        rewrapped.id = MessageId::new(vec![0x55; 32]);
+        phone.engine.ingest(rewrapped).await.unwrap();
+        assert_eq!(
+            phone
+                .storage
+                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .unwrap(),
+            facts
+        );
+        phone
+            .storage
+            .app_storage()
+            .ignore_sibling_welcome_activity(&gid, &commit_id)
+            .unwrap();
+        // A new MLS encryption of the exact valid event remains the original
+        // accepted inner content even after the source epoch advanced.
+        let SendResult::ApplicationMessage { msg: alias, .. } = laptop
+            .engine
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("alias application");
+        };
+        phone
+            .engine
+            .ingest(route_to_group(&alias, &gid))
+            .await
+            .unwrap();
+        assert!(
+            phone
+                .storage
+                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .unwrap()
+                .is_empty(),
+            "a valid application alias cannot become fresh after attribution/epoch change"
+        );
+        // MLS-authenticated malformed application content still has an immutable
+        // inner identity, even though no MessageReceived app output can be emitted.
+        let shared = cgka_traits::MarmotAppEvent::new(
+            hex::encode(laptop.engine.self_id().as_slice()),
+            2,
+            457,
+            vec![],
+            "",
+        );
+        for sender in [&mut laptop, &mut tablet] {
+            let SendResult::ApplicationMessage { msg, .. } = sender
+                .engine
+                .send(SendIntent::AppMessage {
+                    group_id: gid.clone(),
+                    payload: shared.encode().unwrap(),
+                    expected_epoch: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("shared account heartbeat");
+            };
+            phone
+                .engine
+                .ingest(route_to_group(&msg, &gid))
+                .await
+                .unwrap();
+        }
+        let shared_facts = phone
+            .engine
+            .pending_device_group_activity(&gid, &roster)
+            .unwrap();
+        assert_eq!(
+            shared_facts.len(),
+            2,
+            "same account/kind/content/second app id belongs to two authenticated source devices"
+        );
+        assert!(
+            shared_facts
+                .iter()
+                .any(|(_, _, source)| *source == Some(slot(2)))
+        );
+        assert!(
+            shared_facts
+                .iter()
+                .any(|(_, _, source)| *source == Some(slot(3)))
+        );
+        for (id, _, _) in shared_facts {
+            phone
+                .storage
+                .app_storage()
+                .ignore_sibling_welcome_activity(&gid, &id)
+                .unwrap();
+        }
+        let crypto = RustCrypto::default();
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            laptop.storage.mls_storage(),
+        );
+        phone.engine.drain_events();
+        for _ in 0..2 {
+            let raw = load_group(&laptop, &gid)
+                .create_message(
+                    &provider,
+                    &device_signer(&laptop),
+                    b"malformed Marmot application",
+                )
+                .unwrap();
+            let malformed = group_transport(raw, &gid, "malformed-source");
+            if through_convergence {
+                phone
+                    .engine
+                    .buffer_openmls_convergence_message_at(&gid, malformed, 2_000_000)
+                    .unwrap();
+                phone
+                    .engine
+                    .advance_convergence_inputs_until_settled(&gid, 3_000_000)
+                    .await
+                    .unwrap();
+            } else {
+                phone.engine.ingest(malformed).await.unwrap();
+            }
+        }
+        let malformed = phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .unwrap();
+        assert_eq!(
+            malformed.len(),
+            1,
+            "reencryption of the same malformed inner content cannot create fresh activity"
+        );
+        assert!(
+            !phone
+                .engine
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
+            "malformed traffic produces no application effect"
+        );
+        phone
+            .storage
+            .app_storage()
+            .ignore_sibling_welcome_activity(&gid, &malformed[0].0)
+            .unwrap();
+        let crypto = RustCrypto::default();
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            laptop.storage.mls_storage(),
+        );
+        let (proposal, _) = load_group(&laptop, &gid)
+            .propose_self_update(
+                &provider,
+                &device_signer(&laptop),
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        let proposal = group_transport(proposal, &gid, "standalone-source");
+        phone.engine.drain_events();
+        let next_epoch = phone.engine.epoch(&gid).unwrap();
+        if through_convergence {
+            phone
+                .engine
+                .buffer_openmls_convergence_message_at(&gid, proposal.clone(), 4_000_000)
+                .unwrap();
+            let (_, committing) = craft(
+                &tablet,
+                &gid,
+                Parts {
+                    by_reference: vec![proposal.clone()],
+                    ..Parts::default()
+                },
+            );
+            phone
+                .engine
+                .buffer_openmls_convergence_message_at(&gid, committing, 4_000_000)
+                .unwrap();
+            phone
+                .engine
+                .converge_stored_openmls_messages_at(&gid, 5_000_000)
+                .map(|result| {
+                    assert!(
+                        result
+                            .accepted_proposals
+                            .contains(&hex::encode(hash_id(&proposal.payload).as_slice())),
+                        "proposal result: {result:?}"
+                    );
+                    result
+                })
+                .unwrap();
+        } else {
+            assert_eq!(
+                phone.engine.ingest(proposal.clone()).await.unwrap(),
+                IngestOutcome::Processed
+            );
+        }
+        assert!(
+            !phone
+                .engine
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
+            "standalone control has no application output"
+        );
+        let proposal_id = hash_id(&proposal.payload);
+        assert!(
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &roster)
+                .unwrap()
+                .contains(&(proposal_id, next_epoch, Some(slot(2)))),
+            "proposal activity missing convergence={through_convergence}, facts={:?}",
+            phone
+                .engine
+                .pending_device_group_activity(&gid, &roster)
+                .unwrap()
+        );
+    }
+}

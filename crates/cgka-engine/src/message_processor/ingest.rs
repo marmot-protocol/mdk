@@ -1705,6 +1705,8 @@ impl<S: StorageProvider> Engine<S> {
         processed: ProcessedMessage,
         context: DirectApplicationContext<'_>,
     ) -> Result<DirectMessageContent, EngineError> {
+        let mut source =
+            crate::device_tag::authenticated_source(mls_group, &processed, &context.msg.id)?;
         let sender_id = member_id_of_processed_message(&processed, mls_group);
         let sender_leaf_index = match processed.sender() {
             Sender::Member(leaf) => Some(leaf.u32()),
@@ -1713,6 +1715,27 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => bytes,
             ProcessedMessageContent::ProposalMessage(queued) => {
+                if self
+                    .strict_cutover_rejects_legacy_group_addition(
+                        context.group_id,
+                        matches!(queued.proposal(), Proposal::Add(_)),
+                    )
+                    .is_ok()
+                    && crate::app_components::authorize_standalone_proposal(mls_group, &queued)
+                        .is_ok()
+                    && let Some(source) = source.as_mut()
+                {
+                    crate::device_tag::bind_proposal_source_identity(
+                        source,
+                        queued.proposal_reference_ref().as_slice(),
+                    );
+                    self.storage.observe_authenticated_device_group_source(
+                        context.group_id,
+                        &context.msg.id,
+                        source,
+                        self.wall_clock.now_ms(),
+                    )?;
+                }
                 return Ok(DirectMessageContent::Proposal(queued));
             }
             ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
@@ -1731,6 +1754,15 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(DirectMessageContent::UnattributableApplication);
         };
         let payload = bytes.into_bytes();
+        if let Some(source) = source.as_mut() {
+            crate::device_tag::bind_application_source_identity(source, &payload);
+            self.storage.observe_authenticated_device_group_source(
+                context.group_id,
+                &context.msg.id,
+                source,
+                self.wall_clock.now_ms(),
+            )?;
+        }
         let app_event = match crate::app_payload::validate_app_payload_for_sender(&payload, &sender)
         {
             Ok(event) => event,

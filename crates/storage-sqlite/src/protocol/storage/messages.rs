@@ -863,6 +863,76 @@ impl MessageStorage for SqliteAccountStorage {
         })
     }
 
+    fn observe_authenticated_device_group_source(
+        &self,
+        group_id: &GroupId,
+        content_id: &MessageId,
+        source: &cgka_traits::storage::AuthenticatedDeviceGroupSource,
+        now_ms: u64,
+    ) -> StorageResult<()> {
+        crate::cross::sibling_welcome_resends::observe_native_source(
+            self, group_id, content_id, source, now_ms,
+        )
+    }
+
+    fn pending_authenticated_device_group_sources(
+        &self,
+        group_id: &GroupId,
+        with_leaf: bool,
+        key_unready_slots: Option<&[cgka_traits::app_components::DeviceSlotId]>,
+        limit: usize,
+    ) -> StorageResult<
+        Vec<(
+            MessageId,
+            cgka_traits::storage::AuthenticatedDeviceGroupSource,
+        )>,
+    > {
+        let conn = self.lock()?;
+        let blocked = key_unready_slots.unwrap_or_default();
+        let mut sql = "SELECT content_id, source_proof FROM cgka_processed_transport_ids AS p WHERE group_id = ?1 AND source_has_leaf = ?2".to_owned();
+        if with_leaf {
+            sql.push_str(" AND source_resolved = 0 AND (source_application_id IS NULL OR NOT EXISTS (SELECT 1 FROM cgka_processed_transport_ids AS old WHERE old.group_id = p.group_id AND old.source_application_id = p.source_application_id AND old.source_has_leaf = 0 AND old.source_observed_order < p.source_observed_order))");
+        }
+        if with_leaf && !blocked.is_empty() {
+            sql.push_str(" AND (source_slot_hint IS NULL OR source_slot_hint NOT IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", blocked.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+        }
+        sql.push_str(" ORDER BY source_observed_order LIMIT ?");
+        let mut args = vec![
+            rusqlite::types::Value::Blob(group_id.as_slice().to_vec()),
+            rusqlite::types::Value::Integer(i64::from(with_leaf)),
+        ];
+        if with_leaf {
+            args.extend(
+                blocked
+                    .iter()
+                    .map(|slot| rusqlite::types::Value::Blob(slot.to_vec())),
+            );
+        }
+        args.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit)
+                .map_err(|_| StorageError::Backend("source batch limit overflow".into()))?,
+        ));
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
+        stmt.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .storage()?
+        .map(|row| {
+            let (id, bytes) = row.storage()?;
+            Ok((
+                MessageId::new(id),
+                crate::cross::sibling_welcome_resends::decode_source_proof(&bytes)?,
+            ))
+        })
+        .collect()
+    }
+
     fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(

@@ -4,7 +4,7 @@
 use crate::base::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{OutboundFanoutStorage, StorageError, StorageProvider, StorageResult};
-use cgka_traits::{EpochId, GroupId, MessageId, PublicationObservation};
+use cgka_traits::{GroupId, MessageId, PublicationObservation};
 use rusqlite::{OptionalExtension, params};
 
 pub(crate) fn next_order(conn: &rusqlite::Connection) -> StorageResult<u64> {
@@ -104,95 +104,174 @@ impl SqliteAccountStorage {
     }
 }
 
+pub(crate) fn decode_source_proof(
+    bytes: &[u8],
+) -> StorageResult<cgka_traits::storage::AuthenticatedDeviceGroupSource> {
+    let (version, source): (u8, cgka_traits::storage::AuthenticatedDeviceGroupSource) =
+        crate::deserialize(bytes)?;
+    if version != 1 {
+        return Err(StorageError::Serialization(
+            "unsupported native source proof version".into(),
+        ));
+    }
+    Ok(source)
+}
+
+/// Native acceptance and first local source observation are one transaction.
+/// Only an existing admitted wrapper/content association can own this fact.
+/// The lifetime ledger survives snapshots; later exact-source proof fills an
+/// unavailable leaf without changing its first order/time.
+pub(crate) fn observe_native_source(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    content_id: &MessageId,
+    source: &cgka_traits::storage::AuthenticatedDeviceGroupSource,
+    now_ms: u64,
+) -> StorageResult<()> {
+    // Every retained observation must support its fixed deadline without
+    // SQLite integer promotion or a wrapped timestamp.
+    u64_to_i64(
+        now_ms
+            .checked_add(SIBLING_WELCOME_RESEND_WAIT_MS)
+            .ok_or_else(|| StorageError::Backend("sibling Welcome deadline overflow".into()))?,
+    )?;
+    store.with_transaction(|store| {
+        let conn = store.lock()?;
+        let current: Option<(Vec<u8>, Option<Vec<u8>>)> = conn.query_row_cached(
+            "SELECT id, source_proof FROM cgka_processed_transport_ids WHERE group_id = ?1 AND content_id = ?2
+             ORDER BY source_observed_order IS NULL, source_observed_order, id LIMIT 1",
+            params![group_id.as_slice(), content_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().storage()?;
+        let Some((wrapper, prior)) = current else { return Ok(()); };
+        if let Some(prior) = prior {
+            let old = decode_source_proof(&prior)?;
+            if old.leaf.is_none() && source.leaf.is_some() && old.epoch == source.epoch && old.sender == source.sender
+                && old.leaf_index == source.leaf_index && old.application_id == source.application_id {
+                // Exact ciphertext was reauthenticated under its actual source
+                // epoch. Upgrade its provisional identity, never its stamp.
+                conn.execute_cached(
+                    "UPDATE cgka_processed_transport_ids SET source_identity = ?3 WHERE group_id = ?1 AND source_identity = ?2",
+                    params![group_id.as_slice(), old.identity.as_slice(), source.identity.as_slice()],
+                ).storage()?;
+                conn.execute_cached(
+                    "UPDATE cgka_processed_transport_ids SET source_proof = ?2, source_has_leaf = 1, source_slot_hint = ?3 WHERE id = ?1",
+                    params![wrapper, crate::serialize(&(1u8, source))?, source.leaf.as_ref().and_then(|leaf| leaf.slot_hint.as_ref().map(|slot| slot.as_slice()))],
+                ).storage()?;
+                // A later known-key alias was held while this source was
+                // unavailable. Only matching authenticated identity coalesces.
+                conn.execute_cached(
+                    "UPDATE cgka_processed_transport_ids SET source_resolved = 1
+                     WHERE group_id = ?1 AND source_identity = ?2 AND source_proof IS NOT NULL
+                       AND id != (SELECT id FROM cgka_processed_transport_ids WHERE group_id = ?1 AND source_identity = ?2 AND source_observed_order IS NOT NULL ORDER BY source_observed_order LIMIT 1)",
+                    params![group_id.as_slice(), source.identity.as_slice()],
+                ).storage()?;
+            }
+        }
+        conn.execute_cached("UPDATE cgka_processed_transport_ids SET source_identity = ?2, source_application_id = ?3 WHERE id = ?1 AND source_identity IS NULL",
+            params![wrapper, source.identity.as_slice(), source.application_id.as_ref().map(|id| id.as_slice())]).storage()?;
+        let (owner, bytes): (Vec<u8>, Option<Vec<u8>>) = conn.query_row_cached(
+            "SELECT id, source_proof FROM cgka_processed_transport_ids
+             WHERE group_id = ?1 AND source_identity = ?2
+             ORDER BY source_observed_order IS NULL, source_observed_order, id LIMIT 1",
+            params![group_id.as_slice(), source.identity.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).storage()?;
+        let wrapper = owner;
+        if let Some(bytes) = bytes {
+            let old = decode_source_proof(&bytes)?;
+            if old.epoch != source.epoch || old.sender != source.sender || old.leaf_index != source.leaf_index
+                || (old.leaf.is_some() && source.leaf.is_some() && old.leaf != source.leaf) {
+                // Another accepted encryption of the same application event
+                // cannot replace the earliest source or make it fresh. Its
+                // different source cannot fill an older partial proof either.
+                return Ok(());
+            }
+            if old.leaf.is_none() && source.leaf.is_some() {
+                conn.execute_cached(
+                    "UPDATE cgka_processed_transport_ids SET source_proof = ?2, source_has_leaf = 1, source_slot_hint = ?3 WHERE id = ?1",
+                    params![wrapper, crate::serialize(&(1u8, source))?, source.leaf.as_ref().and_then(|leaf| leaf.slot_hint.as_ref().map(|slot| slot.as_slice()))],
+                ).storage()?;
+            }
+            return Ok(());
+        }
+        conn.execute_cached(
+            "UPDATE cgka_processed_transport_ids SET source_proof = ?2, source_has_leaf = ?3,
+                 source_observed_order = ?4, source_observed_at_ms = ?5, source_resolved = 0, source_epoch = ?6, source_slot_hint = ?7 WHERE id = ?1",
+            params![wrapper, crate::serialize(&(1u8, source))?, source.leaf.is_some(),
+                u64_to_i64(next_order(&conn)?)?, u64_to_i64(now_ms)?, u64_to_i64(source.epoch.0)?, source.leaf.as_ref().and_then(|leaf| leaf.slot_hint.as_ref().map(|slot| slot.as_slice()))],
+        ).storage()?;
+        Ok(())
+    })
+}
+
 const SIBLING_WELCOME_RESEND_WAIT_MS: u64 = 600_000;
 
 impl SqliteAppStorage {
-    /// Linearization point for the first durable qualified observation of this
-    /// authenticated message. The caller has attributed its sending leaf to a
-    /// current trusted-roster device. Replayed content and rewrapped duplicates
-    /// reuse the earliest existing qualification outside all MLS snapshots.
-    pub fn observe_sibling_welcome_activity(
+    /// Attribute a native accepted observation to a current trusted-roster
+    /// device. This transaction never allocates a timestamp or order: delayed
+    /// proof/projection cannot turn pre-publication content into fresh activity.
+    pub fn qualify_sibling_welcome_activity(
         &self,
         group_id: &GroupId,
         content_id: &MessageId,
-        source_epoch: EpochId,
         slot: &[u8; 32],
-        now_ms: u64,
+        verified_tag_key: &[u8],
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let floor = conn
-                .query_row_cached(
-                    "SELECT sibling_resend_after_epoch FROM cgka_groups WHERE id = ?1",
-                    params![group_id.as_slice()],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()
-                .storage()?
-                .flatten();
-            let Some(floor) = floor else {
-                return Ok(());
-            };
-            if !i64::try_from(source_epoch.0).is_ok_and(|epoch| epoch > floor) {
-                return Ok(());
-            }
-            let existing = conn
-                .query_row_cached(
-                    "SELECT qualified_order FROM cgka_processed_transport_ids
-                 WHERE group_id = ?1 AND content_id = ?2 AND qualified_order IS NOT NULL
-                 ORDER BY qualified_order LIMIT 1",
-                    params![group_id.as_slice(), content_id.as_slice()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .storage()?;
-            if existing.is_some() {
-                return Ok(());
-            }
-            let wrapper = conn
-                .query_row_cached(
-                    "SELECT id FROM cgka_processed_transport_ids
-                 WHERE group_id = ?1 AND content_id = ?2 ORDER BY id LIMIT 1",
-                    params![group_id.as_slice(), content_id.as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .storage()?;
-            let Some(wrapper) = wrapper else {
-                return Ok(());
-            };
-            let at_ms = u64_to_i64(now_ms)?;
-            let due = u64_to_i64(
-                now_ms
-                    .checked_add(SIBLING_WELCOME_RESEND_WAIT_MS)
-                    .ok_or_else(|| {
-                        StorageError::Backend("sibling Welcome deadline overflow".into())
-                    })?,
-            )?;
-            let order = u64_to_i64(next_order(&conn)?)?;
+            let wrapper: Option<Vec<u8>> = conn.query_row_cached(
+                "SELECT id FROM cgka_processed_transport_ids WHERE group_id = ?1 AND content_id = ?2
+                 AND source_resolved = 0 AND source_has_leaf = 1 ORDER BY source_observed_order LIMIT 1",
+                params![group_id.as_slice(), content_id.as_slice()], |row| row.get(0),
+            ).optional().storage()?;
+            let Some(wrapper) = wrapper else { return Ok(()); };
             conn.execute_cached(
-                "UPDATE cgka_processed_transport_ids SET qualified_order = ?2,
-                     qualified_at_ms = ?3, qualified_slot = ?4 WHERE id = ?1",
-                params![wrapper, order, at_ms, slot],
-            )
-            .storage()?;
+                "UPDATE cgka_processed_transport_ids SET qualified_slot = ?2, qualified_tag_key = ?3, source_resolved = 1 WHERE id = ?1",
+                params![wrapper, slot, verified_tag_key],
+            ).storage()?;
+            // read_entry verified this exact roster key's signature over the
+            // source leaf key and slot. Different MLS keys can therefore be
+            // aliases of one device principal; another roster key/slot cannot.
             conn.execute_cached(
-                "UPDATE sibling_welcome_resends SET activity_id = ?3,
-                     activity_order = ?4, activity_at_ms = ?5, due_at_ms = ?6
-                 WHERE device_group_id = ?1 AND target_slot = ?2
-                     AND publication_order < ?4 AND activity_id IS NULL",
-                params![
-                    group_id.as_slice(),
-                    slot,
-                    content_id.as_slice(),
-                    order,
-                    at_ms,
-                    due
-                ],
-            )
-            .storage()?;
+                "UPDATE cgka_processed_transport_ids SET source_resolved = 2
+                 WHERE group_id = ?1 AND qualified_slot = ?2 AND qualified_tag_key = ?3
+                   AND source_application_id = (SELECT source_application_id FROM cgka_processed_transport_ids WHERE id = ?4)
+                   AND id != (SELECT id FROM cgka_processed_transport_ids WHERE group_id = ?1 AND qualified_slot = ?2 AND qualified_tag_key = ?3
+                     AND source_application_id = (SELECT source_application_id FROM cgka_processed_transport_ids WHERE id = ?4)
+                     ORDER BY source_observed_order LIMIT 1)",
+                params![group_id.as_slice(), slot, verified_tag_key, wrapper],
+            ).storage()?;
+            // Earliest authenticated source observation wins even if its
+            // proof/attribution was delayed. This can tighten, never slide a
+            // deadline later. A coalesced alias cannot remain timing evidence.
+            conn.execute_cached(
+                "UPDATE sibling_welcome_resends AS r SET (activity_id, activity_order, activity_at_ms, due_at_ms) =
+                   (SELECT p.content_id, p.source_observed_order, p.source_observed_at_ms, p.source_observed_at_ms + ?3
+                    FROM cgka_processed_transport_ids AS p WHERE p.group_id = r.device_group_id AND p.qualified_slot = r.target_slot
+                      AND p.source_resolved = 1 AND p.source_epoch > (SELECT sibling_resend_after_epoch FROM cgka_groups WHERE id = p.group_id)
+                      AND p.source_observed_order > r.publication_order ORDER BY p.source_observed_order LIMIT 1)
+                 WHERE r.device_group_id = ?1 AND r.target_slot = ?2 AND r.publication_order IS NOT NULL AND
+                   (r.activity_id IS NULL OR EXISTS(SELECT 1 FROM cgka_processed_transport_ids AS a WHERE a.group_id = ?1 AND a.content_id = r.activity_id AND a.source_resolved = 2)
+                    OR EXISTS(SELECT 1 FROM cgka_processed_transport_ids AS p WHERE p.group_id = ?1 AND p.qualified_slot = ?2 AND p.source_resolved = 1 AND p.source_epoch > (SELECT sibling_resend_after_epoch FROM cgka_groups WHERE id = p.group_id)
+                      AND p.source_observed_order > r.publication_order AND p.source_observed_order < r.activity_order))",
+                params![group_id.as_slice(), slot, u64_to_i64(SIBLING_WELCOME_RESEND_WAIT_MS)?],
+            ).storage()?;
             Ok(())
         })
+    }
+
+    /// Mark a definitively unattributable accepted source without timing it as
+    /// activity. Unavailable source proof is left pending by the caller.
+    pub fn ignore_sibling_welcome_activity(
+        &self,
+        group_id: &GroupId,
+        content_id: &MessageId,
+    ) -> StorageResult<()> {
+        self.lock()?.execute_cached(
+            "UPDATE cgka_processed_transport_ids SET source_resolved = 1
+             WHERE group_id = ?1 AND content_id = ?2 AND source_resolved = 0 AND source_has_leaf = 1",
+            params![group_id.as_slice(), content_id.as_slice()],
+        ).storage()?;
+        Ok(())
     }
 
     /// Persist a successful generation using only the fanout's immutable first
@@ -221,13 +300,15 @@ impl SqliteAppStorage {
             .storage()?;
             let first: Option<(Vec<u8>, i64, i64)> = conn
                 .query_row_cached(
-                    "SELECT p.content_id, p.qualified_order, p.qualified_at_ms
+                    "SELECT p.content_id, p.source_observed_order, p.source_observed_at_ms
                  FROM sibling_welcome_resends AS r
                  JOIN cgka_processed_transport_ids AS p
                    ON p.group_id = r.device_group_id AND p.qualified_slot = r.target_slot
                  WHERE r.welcome_id = ?1 AND r.activity_id IS NULL
-                   AND r.publication_order = ?2 AND p.qualified_order > r.publication_order
-                 ORDER BY p.qualified_order LIMIT 1",
+                   AND r.publication_order = ?2 AND p.source_resolved = 1
+                   AND p.source_epoch > (SELECT sibling_resend_after_epoch FROM cgka_groups WHERE id = p.group_id)
+                   AND p.source_observed_order > r.publication_order
+                 ORDER BY p.source_observed_order LIMIT 1",
                     params![welcome_id, u64_to_i64(observation.order)?],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -260,9 +341,42 @@ impl SqliteAppStorage {
 }
 
 #[cfg(test)]
+fn observe_source(
+    store: &SqliteAccountStorage,
+    group: &GroupId,
+    id: &MessageId,
+    epoch: cgka_traits::EpochId,
+    now: u64,
+) {
+    use cgka_traits::storage::{
+        AuthenticatedDeviceGroupLeaf, AuthenticatedDeviceGroupSource, MessageStorage,
+    };
+    store
+        .observe_authenticated_device_group_source(
+            group,
+            id,
+            &AuthenticatedDeviceGroupSource {
+                identity: id.clone(),
+                application_id: Some(id.clone()),
+                epoch,
+                sender: cgka_traits::MemberId::new(vec![1; 32]),
+                leaf_index: 1,
+                leaf: Some(AuthenticatedDeviceGroupLeaf {
+                    signature_key: vec![2; 32],
+                    device_tag: Some(vec![3]),
+                    slot_hint: Some([3; 32]),
+                }),
+            },
+            now,
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::base::test_support::{gid, mid, sample_group};
+    use cgka_traits::EpochId;
     use cgka_traits::storage::{GroupStorage, MessageStorage};
     use cgka_traits::{
         FanoutTargetStatus, MemberId, OutboundFanout, Timestamp, TransportEndpoint,
@@ -319,7 +433,10 @@ mod tests {
         // Contract: a qualified content id is immutable across wrapper replay,
         // source-row rewinds, and later successful Welcome generations. This
         // is the cheapest owner of the persisted order/deadline transaction.
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-observation.db");
+        let key = crate::SqlCipherKey::new("synthetic native observation").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let app = store.app_storage();
         let slot = [3; 32];
@@ -338,8 +455,43 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(1), &mid(11))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(11), EpochId(0), &slot, 100)
+        let partial = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+            identity: mid(211),
+            application_id: Some(mid(11)),
+            epoch: EpochId(0),
+            sender: MemberId::new(vec![1; 32]),
+            leaf_index: 1,
+            leaf: None,
+        };
+        store.lock().unwrap().execute_batch("CREATE TRIGGER fail_native_observation BEFORE UPDATE OF source_proof ON cgka_processed_transport_ids BEGIN SELECT RAISE(ABORT, 'injected source failure'); END;").unwrap();
+        let error = store
+            .with_transaction(|store| {
+                store.put_processed_transport_content(&gid(1), &mid(19), &mid(29))?;
+                store.observe_authenticated_device_group_source(&gid(1), &mid(29), &partial, 100)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, StorageError::Backend(ref message) if message.contains("injected source failure"))
+        );
+        assert!(
+            !store.has_processed_transport_id(&mid(19)).unwrap(),
+            "native observation failure rolls back its admission marker"
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_native_observation")
             .unwrap();
+        store
+            .observe_authenticated_device_group_source(&gid(1), &mid(11), &partial, 100)
+            .unwrap();
+        assert!(
+            store
+                .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+                .unwrap()
+                .is_empty()
+        );
+
         assert_eq!(
             app.sibling_welcome_carrier_reservation(b"welcome").unwrap(),
             Some((b"carrier1".to_vec(), 1))
@@ -347,6 +499,106 @@ mod tests {
         let first = accept(&store, 2, 100);
         app.record_sibling_welcome_publication(b"welcome", b"carrier1", first)
             .unwrap();
+        drop(app);
+        store.close().unwrap();
+        drop(store);
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = store.app_storage();
+        // A new encryption at a later source epoch cannot freshen the same
+        // earlier event while its original source proof is unavailable.
+        store
+            .put_processed_transport_content(&gid(1), &mid(21), &mid(31))
+            .unwrap();
+        let known_alias = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+            identity: mid(11),
+            application_id: Some(mid(11)),
+            epoch: EpochId(1),
+            sender: MemberId::new(vec![1; 32]),
+            leaf_index: 1,
+            leaf: Some(cgka_traits::storage::AuthenticatedDeviceGroupLeaf {
+                signature_key: vec![2; 32],
+                device_tag: Some(vec![3]),
+                slot_hint: Some(slot),
+            }),
+        };
+        store
+            .observe_authenticated_device_group_source(&gid(1), &mid(31), &known_alias, 101)
+            .unwrap();
+        assert!(
+            store
+                .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+                .unwrap()
+                .is_empty(),
+            "ambiguous alias holds until exact old source proof resolves"
+        );
+        // A distinct known source with the same app id stays independent once
+        // the partial proof establishes that it was the other sender.
+        store
+            .put_processed_transport_content(&gid(1), &mid(22), &mid(32))
+            .unwrap();
+        let distinct = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+            identity: mid(32),
+            leaf_index: 2,
+            leaf: Some(cgka_traits::storage::AuthenticatedDeviceGroupLeaf {
+                signature_key: vec![9; 32],
+                device_tag: Some(vec![4]),
+                slot_hint: Some([4; 32]),
+            }),
+            ..known_alias.clone()
+        };
+        store
+            .observe_authenticated_device_group_source(&gid(1), &mid(32), &distinct, 102)
+            .unwrap();
+        // Exact-source proof and current-roster attribution arrive after the
+        // publication. The native prepublication stamp must remain old.
+        observe_source(&store, &gid(1), &mid(11), EpochId(0), 9_999);
+        let pending = store
+            .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+            .unwrap();
+        assert!(
+            pending.iter().any(|(id, _)| *id == mid(32)),
+            "a different authenticated source cannot be coalesced away"
+        );
+        assert!(
+            !pending.iter().any(|(id, _)| *id == mid(31)),
+            "same-source alias coalesces to earliest native observation"
+        );
+        app.ignore_sibling_welcome_activity(&gid(1), &mid(32))
+            .unwrap();
+        store
+            .put_processed_transport_content(&gid(1), &mid(23), &mid(33))
+            .unwrap();
+        let leaf_rekey_alias = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+            identity: mid(33),
+            leaf: Some(cgka_traits::storage::AuthenticatedDeviceGroupLeaf {
+                signature_key: vec![8; 32],
+                device_tag: Some(vec![3]),
+                slot_hint: Some(slot),
+            }),
+            ..known_alias.clone()
+        };
+        store
+            .observe_authenticated_device_group_source(&gid(1), &mid(33), &leaf_rekey_alias, 103)
+            .unwrap();
+
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(11), &slot, &[3; 32])
+            .unwrap();
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(33), &slot, &[3; 32])
+            .unwrap();
+        let alias_state: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_resolved FROM cgka_processed_transport_ids WHERE content_id = ?1",
+                params![mid(33).as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            alias_state, 2,
+            "different MLS keys verified by the same current device tag key coalesce to the earlier observation"
+        );
+
         assert_eq!(
             app.sibling_welcome_carrier_reservation(b"welcome").unwrap(),
             None,
@@ -375,7 +627,64 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(3), &mid(12))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(12), EpochId(0), &slot, 99)
+        for n in 40..80 {
+            store
+                .put_processed_transport_content(&gid(1), &mid(n), &mid(n + 40))
+                .unwrap();
+            let partial = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+                identity: mid(n + 40),
+                application_id: Some(mid(n + 40)),
+                ..partial.clone()
+            };
+            store
+                .observe_authenticated_device_group_source(&gid(1), &mid(n + 40), &partial, 98)
+                .unwrap();
+        }
+        for n in 140..180 {
+            let unready = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+                identity: mid(n + 40),
+                application_id: Some(mid(n + 40)),
+                leaf: Some(cgka_traits::storage::AuthenticatedDeviceGroupLeaf {
+                    signature_key: vec![7; 32],
+                    device_tag: Some(vec![7]),
+                    slot_hint: Some([7; 32]),
+                }),
+                ..partial.clone()
+            };
+            store
+                .put_processed_transport_content(&gid(1), &mid(n), &mid(n + 40))
+                .unwrap();
+            store
+                .observe_authenticated_device_group_source(&gid(1), &mid(n + 40), &unready, 98)
+                .unwrap();
+        }
+        observe_source(&store, &gid(1), &mid(12), EpochId(0), 99);
+        let eligible = store
+            .pending_authenticated_device_group_sources(&gid(1), true, Some(&[[7; 32]]), 32)
+            .unwrap();
+        assert_eq!(
+            eligible.len(),
+            1,
+            "current-key-unready prefix cannot consume the healthy proof-present result budget"
+        );
+        assert_eq!(eligible[0].0, mid(12));
+
+        assert_eq!(
+            store
+                .pending_authenticated_device_group_sources(&gid(1), false, None, 32)
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(
+            store
+                .pending_authenticated_device_group_sources(&gid(1), true, Some(&[[7; 32]]), 32)
+                .unwrap()[0]
+                .0,
+            mid(12),
+            "unavailable older source proof must not starve healthy activity"
+        );
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(12), &slot, &[3; 32])
             .unwrap();
         assert!(app.due_sibling_welcome_resends(600_098).unwrap().is_empty());
         assert_eq!(
@@ -385,7 +694,8 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(4), &mid(13))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(13), EpochId(0), &slot, 200)
+        observe_source(&store, &gid(1), &mid(13), EpochId(0), 200);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(13), &slot, &[3; 32])
             .unwrap();
         app.record_sibling_welcome_publication(b"welcome", b"carrier1", first)
             .unwrap();
@@ -421,7 +731,8 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(6), &mid(14))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(14), EpochId(0), &slot, 301)
+        observe_source(&store, &gid(1), &mid(14), EpochId(0), 301);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(14), &slot, &[3; 32])
             .unwrap();
         app.record_sibling_welcome_publication(b"welcome", b"carrier2", second)
             .unwrap();
@@ -457,7 +768,8 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(8), &mid(14))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(14), EpochId(0), &slot, 500)
+        observe_source(&store, &gid(1), &mid(14), EpochId(0), 500);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(14), &slot, &[3; 32])
             .unwrap();
         assert!(
             app.due_sibling_welcome_resends(1_000_000)
@@ -468,7 +780,8 @@ mod tests {
         store
             .put_processed_transport_content(&gid(1), &mid(9), &mid(15))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(15), EpochId(0), &slot, 501)
+        observe_source(&store, &gid(1), &mid(15), EpochId(0), 501);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(15), &slot, &[3; 32])
             .unwrap();
         assert_eq!(app.due_sibling_welcome_resends(600_501).unwrap().len(), 1);
         store.delete_group(&gid(1)).unwrap();
@@ -478,6 +791,7 @@ mod tests {
                 .is_empty()
         );
         assert!(!store.has_processed_transport_id(&mid(9)).unwrap());
+        store.close().unwrap();
     }
 
     #[test]
@@ -573,6 +887,7 @@ mod tests {
 mod cutover_tests {
     use super::*;
     use crate::base::test_support::{gid, mid, sample_group};
+    use cgka_traits::EpochId;
     use cgka_traits::storage::{GroupStorage, MessageStorage};
 
     #[test]
@@ -605,19 +920,22 @@ mod cutover_tests {
         store
             .put_processed_transport_content(&gid(1), &mid(1), &mid(11))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(11), EpochId(7), &[3; 32], 101)
+        observe_source(&store, &gid(1), &mid(11), EpochId(7), 101);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(11), &[3; 32], &[3; 32])
             .unwrap();
         store.put_group(&sample_group(gid(1), 8, 0)).unwrap();
         store
             .put_processed_transport_content(&gid(1), &mid(2), &mid(11))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(11), EpochId(7), &[3; 32], 102)
+        observe_source(&store, &gid(1), &mid(11), EpochId(7), 102);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(11), &[3; 32], &[3; 32])
             .unwrap();
         store.rollback_group_to_snapshot(&gid(1), "floor").unwrap();
         store
             .put_processed_transport_content(&gid(1), &mid(3), &mid(11))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(11), EpochId(7), &[3; 32], 103)
+        observe_source(&store, &gid(1), &mid(11), EpochId(7), 103);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(11), &[3; 32], &[3; 32])
             .unwrap();
         assert!(
             app.due_sibling_welcome_resends(1_000_000)
@@ -626,9 +944,36 @@ mod cutover_tests {
         );
         store.put_group(&sample_group(gid(1), 8, 0)).unwrap();
         store
+            .put_processed_transport_content(&gid(1), &mid(5), &mid(15))
+            .unwrap();
+        let alias = cgka_traits::storage::AuthenticatedDeviceGroupSource {
+            identity: mid(15),
+            application_id: Some(mid(11)),
+            epoch: EpochId(8),
+            sender: cgka_traits::MemberId::new(vec![1; 32]),
+            leaf_index: 1,
+            leaf: Some(cgka_traits::storage::AuthenticatedDeviceGroupLeaf {
+                signature_key: vec![8; 32],
+                device_tag: Some(vec![3]),
+                slot_hint: Some([3; 32]),
+            }),
+        };
+        store
+            .observe_authenticated_device_group_source(&gid(1), &mid(15), &alias, 104)
+            .unwrap();
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(15), &[3; 32], &[3; 32])
+            .unwrap();
+        assert!(
+            app.due_sibling_welcome_resends(1_000_000)
+                .unwrap()
+                .is_empty(),
+            "later-source-epoch leaf rekey cannot upgrade an already observed pre-floor event under the same device tag principal"
+        );
+        store
             .put_processed_transport_content(&gid(1), &mid(4), &mid(12))
             .unwrap();
-        app.observe_sibling_welcome_activity(&gid(1), &mid(12), EpochId(8), &[3; 32], 104)
+        observe_source(&store, &gid(1), &mid(12), EpochId(8), 104);
+        app.qualify_sibling_welcome_activity(&gid(1), &mid(12), &[3; 32], &[3; 32])
             .unwrap();
         assert_eq!(app.due_sibling_welcome_resends(600_104).unwrap().len(), 1);
     }

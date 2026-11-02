@@ -659,8 +659,13 @@ impl<S: StorageProvider> Engine<S> {
                 EngineError::Other(format!("invalid retained sibling Welcome: {error:?}"))
             })?
             .to;
-        if !roster.devices.contains_key(&target) {
+        let Some(entry) = roster.devices.get(&target) else {
             return Ok(SiblingWelcomeResendOutcome::Complete);
+        };
+        if entry.status == cgka_traits::app_components::DeviceStatusV1::Leaving
+            || entry.tag_signature_key.is_none()
+        {
+            return Ok(SiblingWelcomeResendOutcome::Held);
         }
         let participated = self.has_own_device_participation(&record.group_id, roster, &target)?;
         if participated {

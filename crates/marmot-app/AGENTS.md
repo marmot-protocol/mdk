@@ -254,11 +254,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
   delivered one again before D70's fixed wait. `sibling_welcome_resends` owns one indexed timing row per original
-  Welcome: the first durable accepted-publication observation, then the first newly qualified target-device DG
-  activity and a fixed 600-second deadline. Any authenticated trusted-DG traffic qualifies through its sending leaf
-  and the current roster keys; the named cross transaction keeps immutable content qualification outside snapshots
-  in the existing processed-wrapper ledger. Replay, rewrap and later traffic never rearm or slide the wait. Each
-  successful new carrier needs fresh later activity. D91 freezes the existing local DG's epoch at upgrade; only
+  Welcome: the first durable accepted-publication observation, then the first newly observed target-device DG
+  activity and a fixed 600-second deadline. Application, accepted member Commit and Proposal traffic qualify through immutable
+  authenticated source-epoch leaf proof and current roster keys. Native acceptance owns first local time/order in the
+  existing processed-wrapper ledger outside snapshots; app attribution never allocates or changes a stamp. Missing
+  source proof is recovered from exact ciphertext under a retained anchor, never a later occupant at the same index.
+  Empty-effect batches and ordinary maintenance project bounded proof-present work independently of unavailable proof. Replay, rewrap and later traffic never rearm or slide the wait. Each
+  successful new carrier needs fresh later activity. Persist the current roster tag key actually used to verify the
+  source leaf key with its slot: this verified DG device principal coalesces valid-app aliases across MLS leaf rekeys,
+  while a different tag-key incarnation or another device with the same inner event id remains independent. Unknown
+  earlier source proof holds only aliases of that event; current-key-unready hints never grant attribution. D91 freezes the existing local DG's epoch at upgrade; only
   later-epoch traffic qualifies, while new local groups qualify immediately and initial delivery is unchanged.
   Due work reuses the engine-owned Welcome/ref/expiry/origin, consumes no KeyPackage and makes no Add or history offer.
   A current matching Update/Commit target leaf suppresses repair; the Add's tagged KeyPackage leaf alone does not.

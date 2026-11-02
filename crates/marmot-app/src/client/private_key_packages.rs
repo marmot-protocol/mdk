@@ -933,6 +933,7 @@ impl AppClient {
     /// never have left. One from a slot other than this device's, or to a
     /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
+        self.observe_pending_sibling_welcome_activity()?;
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
@@ -963,6 +964,7 @@ impl AppClient {
                 | marmot_session::SiblingWelcomeResendOutcome::Rearmed => {}
             }
         }
+        let excluded = self.excluded_sibling_slots(&exchange)?;
         let mut sent = 0usize;
         for owed in self
             .runtime
@@ -979,7 +981,21 @@ impl AppClient {
             let Ok(welcome) = SiblingWelcome::decode(&owed.content) else {
                 continue;
             };
-            if welcome.from != exchange.own_slot || !exchange.is_sibling(&welcome.to) {
+            if welcome.from != exchange.own_slot
+                || !exchange.is_sibling(&welcome.to)
+                || excluded.contains(&welcome.to)
+                || !exchange
+                    .roster
+                    .devices
+                    .get(&welcome.to)
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.status,
+                            cgka_traits::app_components::DeviceStatusV1::Active
+                                | cgka_traits::app_components::DeviceStatusV1::Inactive
+                        ) && entry.tag_signature_key.is_some()
+                    })
+            {
                 continue;
             }
             let mut event = self.device_group_event(

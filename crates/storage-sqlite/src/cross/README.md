@@ -41,11 +41,24 @@ not table references the test can see.
 Step 8 decides per table which store each lands in.
 
 The sibling-Welcome observation crossing (migration 0169) preserves wrapper-id deduplication and adds indexed content
-bindings to that same lifetime-of-group ledger. Qualification is first established under current trusted-roster
-attribution and never reset by wrapper replay, message upserts, format promotion or MLS snapshots. Its order and the
+bindings to that same lifetime-of-group ledger. The native accepted-source transaction records immutable first local
+observation and a versioned sending-epoch member/leaf proof for protocol-marked device-roster groups only. Direct native
+acceptance and actual selected replay share this owner; candidate probes never stamp it. Missing old source-leaf proof
+may be attached only after exact ciphertext reauthentication, without changing its first stamp. Later app attribution
+under the current trusted roster cannot retime any already-observed content. A valid app's native identity is bound to
+its exact source leaf key/tag; after verification its aliases coalesce only under the current roster's verified tag key
+and slot. That key attests the source leaf key, so MLS rekey under an unchanged tag principal preserves the earliest
+observation; different tag-key incarnations never cross-merge. Unknown old source proof holds only aliases sharing that
+inner event identity. `source_resolved` distinguishes pending(0), completed qualification/ignore(1), and verified alias(2);
+only canonical qualified1 rows arm timing. Key-unready source hints filter pending reads, never grant attribution. Proof-present and missing-proof pending
+scans are independently indexed and bounded at32; healthy facts project before unavailable-proof recovery. Wrapper
+replay, message upserts, format promotion and MLS snapshots never reset provenance. Native source order and the
 fanout's first acceptance order share a scalar local clock; the corresponding observation time measures the fixed
 wait. The one per-Welcome app row retains identities and timing only, with a prepared-carrier timestamp high-water
 reserved atomically with the engine carrier association on the session’s own connection before handoff; the app and
 runtime can otherwise hold separate connections to this same file. Existing local group epochs are
 frozen at upgrade as the conservative qualification cutoff; new local groups use -1. No raw-ingress retention changes,
 second seen-message ledger or new scheduler are introduced.
+
+Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
+arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.

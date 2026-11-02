@@ -388,3 +388,9 @@ Engine-behavior assertions need an `Engine<S>` and a storage backend, so they li
 `storage-sqlite` in-memory mode (encrypted file-backed only when the test needs it). Pure-data logic (state
 transitions, diff helpers, policy ordering, codecs, caches) uses in-crate `#[cfg(test)]` modules; `src/` has many, and
 `src/openmls_projection/tests/` and `src/message_processor/tests/` hold `--lib` replay and measurement tests.
+
+`account_devices/device_tag.rs::accepted_device_group_application_commit_and_proposal_retain_their_exact_source`
+owns native accepted source proof for direct application/standalone Proposal and selected Commit replay. It proves
+buffering/probes do not observe, source epoch/leaf/current-roster attribution, and rewrapped duplicate immutability.
+The scalar order, delayed partial-proof attribution, deadline and file restart/snapshot contracts belong to SQLite's
+`cross::sibling_welcome_resends` temporal owner; app orchestration remains in its existing lost-Welcome owner.

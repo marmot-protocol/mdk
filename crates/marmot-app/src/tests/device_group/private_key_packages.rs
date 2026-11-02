@@ -2073,6 +2073,20 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
     use cgka_traits::storage::MessageStorage as _;
     let (mut devices, device_group, [chat]) = tagging_devices_with_chats::<1>().await;
     let phone_slot = slot(&devices.phone);
+    devices
+        .phone
+        .runtime
+        .edit_device_roster_entry(&device_group, &phone_slot, &[], |entry| {
+            entry.settings.add_to_all_chats = false;
+        })
+        .await
+        .unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(
+        !roster(&devices.laptop, &device_group).devices[&phone_slot]
+            .settings
+            .add_to_all_chats
+    );
     add_the_phone_unpublished(&mut devices, &chat).await;
     let original_owed = owed(&devices.laptop).remove(0);
     // A delayed first publication carries a legitimately older rumor, but
@@ -2209,5 +2223,56 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
             .unwrap()
             .is_empty(),
         "a successful generation needs fresh activity"
+    );
+    devices
+        .phone
+        .runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: device_group.clone(),
+        })
+        .await
+        .unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert_eq!(
+        storage
+            .due_sibling_welcome_resends(crate::client::recovery::wall_now_ms().unwrap() + 600_001)
+            .unwrap()
+            .len(),
+        1,
+        "a real target Commit with no app message arms the next successful generation"
+    );
+    devices
+        .phone
+        .runtime
+        .edit_device_roster_entry(&device_group, &phone_slot, &[], |entry| {
+            entry.status = cgka_traits::app_components::DeviceStatusV1::Leaving;
+        })
+        .await
+        .unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    account_database(&devices.laptop_app)
+        .execute(
+            "UPDATE sibling_welcome_resends SET due_at_ms = 0 WHERE welcome_id = ?1",
+            rusqlite::params![welcome_id.as_slice()],
+        )
+        .unwrap();
+    let before_leaving = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(
+        devices.relay.published_events.lock().unwrap().len(),
+        before_leaving,
+        "Leaving cannot start another carrier"
+    );
+    devices
+        .laptop
+        .remove_linked_device(&hex::encode(phone_slot))
+        .await
+        .unwrap();
+    let before_gone = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(
+        devices.relay.published_events.lock().unwrap().len(),
+        before_gone,
+        "gone target cannot start another carrier"
     );
 }

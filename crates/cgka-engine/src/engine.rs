@@ -154,7 +154,7 @@ impl<S: StorageProvider> Drop for OperationAuditScope<'_, S> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SystemWallClock;
+pub(crate) struct SystemWallClock;
 
 impl WallClock for SystemWallClock {
     fn now(&self) -> cgka_traits::Timestamp {
