@@ -155,19 +155,26 @@ async fn a_direct_client_runs_no_runner_with_the_gate_off() {
 /// Read through the real account host's debt turn, then publish the production
 /// survey to the same status watch the runner uses. No relay work is scripted.
 async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Survey {
+    let counts = client.recovery_runner_live_counts().await.counts;
     let AccountRunner {
         runner, mut turns, ..
     } = client.build_recovery_runner().await;
     let host = runner.host.clone();
     let surveyed = tokio::spawn(async move {
         let result = host
-            .debt_turn(|turn| {
+            .debt_turn(move |turn| {
+                let turn = super::super::DebtTurn {
+                    live_counts: &counts,
+                    ..*turn
+                };
                 assert!(
-                    super::super::admission::live_fences(turn).unwrap().is_empty(),
+                    super::super::admission::live_fences(&turn)
+                        .unwrap()
+                        .is_empty(),
                     "restart debt and an empty live count never fence"
                 );
                 super::super::select::survey(
-                    turn,
+                    &turn,
                     &RecoveryRunnerPolicy::default(),
                     &super::super::admission::Stalled::default(),
                 )
@@ -187,7 +194,7 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
 /// clears the group's catching-up status (mdk#2862).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
-    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use crate::client::recovery_coverage::scenario_tests::{fixture_on, reactivate_client};
     let Fixture {
         client,
         storage,
@@ -199,6 +206,7 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
         vec!["wss://a.example".into(), "wss://b.example".into()],
         false,
         None,
+        Some(Duration::from_secs(120)),
     )
     .await;
     let app = client.app.clone();
@@ -227,6 +235,12 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
     }
     assert_eq!(ledger.recovery_coverage_goal(&route.route).unwrap(), None);
     assert!(client.state.last_transport_timestamp.is_some());
+    assert!(
+        app.relay_plane
+            .subscription_rebuild_since(app.load_state("alice").unwrap().last_transport_timestamp)
+            .is_some(),
+        "the persisted cursor must select the production incremental REQ path"
+    );
     drop(client);
 
     // Open on the existing plane, without network maintenance: the goal must
@@ -235,8 +249,12 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
         .local_client_with_relay_plane("alice", &app.relay_plane, None)
         .await
         .unwrap();
+    assert!(reopened.state.last_transport_timestamp.is_some());
     assert!(
-        ledger.recovery_coverage_goal(&route.route).unwrap().is_some(),
+        ledger
+            .recovery_coverage_goal(&route.route)
+            .unwrap()
+            .is_some(),
         "account open must give a cursor-present group's route a goal"
     );
     assert!(
@@ -253,6 +271,18 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
     assert!(off.notices.is_empty());
 
     reopened.app = reopened.app.clone().with_recovery_runner_owning_debt();
+    reactivate_client(&mut reopened).await;
+    let counts = reopened.recovery_runner_live_counts().await.counts;
+    let group_counts = counts
+        .iter()
+        .filter(|count| count.routes.contains(&route.route))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        group_counts.len(),
+        2,
+        "both relays answered the quiet group"
+    );
+    assert!(group_counts.iter().all(|count| count.oldest_seen.is_none()));
     for (proved, relay) in route.required.iter().enumerate() {
         let survey = restart_goal_survey(&mut reopened).await;
         let remaining = survey
@@ -266,7 +296,10 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
             assert!(!candidate.blocked);
         }
         assert_eq!(
-            reopened.account_recovery_status().unwrap().catching_up_group_ids_hex,
+            reopened
+                .account_recovery_status()
+                .unwrap()
+                .catching_up_group_ids_hex,
             [hex::encode(group.as_slice())]
         );
         ledger
@@ -283,8 +316,19 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
             .unwrap();
     }
     let survey = restart_goal_survey(&mut reopened).await;
-    assert!(survey.candidates.iter().all(|candidate| candidate.key.route != route.route));
-    assert!(reopened.account_recovery_status().unwrap().catching_up_group_ids_hex.is_empty());
+    assert!(
+        survey
+            .candidates
+            .iter()
+            .all(|candidate| candidate.key.route != route.route)
+    );
+    assert!(
+        reopened
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex
+            .is_empty()
+    );
 }
 
 /// A group becoming current during an open account gets a goal before the
@@ -299,7 +343,13 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
         _dir,
         _pump,
         relay: _relay,
-    } = fixture_on(vec!["wss://a.example".into()], true, None).await;
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
     let ledger = storage.app_storage();
     let route = group_routes(&client).pop().unwrap();
     let before = unix_now_seconds();
@@ -314,12 +364,18 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
     assert!(goal >= before - 30 * DAY);
     assert!(goal <= unix_now_seconds() - 30 * DAY);
     assert_eq!(
-        client.account_recovery_status().unwrap().catching_up_group_ids_hex,
+        client
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex,
         [hex::encode(group.as_slice())]
     );
     let mut wake = wake(&client);
     restart_goal_survey(&mut client).await;
-    assert!(!woken(&mut wake), "unchanged routes must not keep waking an idle runner");
+    assert!(
+        !woken(&mut wake),
+        "unchanged routes must not keep waking an idle runner"
+    );
     assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), Some(goal));
 }
 

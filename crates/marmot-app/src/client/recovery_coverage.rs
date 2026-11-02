@@ -599,7 +599,8 @@ impl AppClient {
     }
 
     /// Settle what routing replacements changed since the recovery runner's
-    /// last debt turn (mdk#2660 section 3). A (route, relay) a replacement
+    /// last debt turn (mdk#2660 section 3), giving every current route its
+    /// standing goal before the turn reads debt. A (route, relay) a replacement
     /// dropped is retired as gone once this turn confirms it: the routes still
     /// do not carry it, and its group is terminal or still has a route
     /// installed (the inbox: still has a relay). A group left with none may
@@ -639,6 +640,8 @@ impl AppClient {
             }
         }
         let settled = (|| {
+            let current = self.current_coverage_routes();
+            self.widen_standing_goals(app, &current.iter().collect::<Vec<_>>(), now)?;
             for (route, relays) in &gone {
                 let ended = !carried.iter().any(|(carried, _)| carried == *route);
                 app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
@@ -646,10 +649,10 @@ impl AppClient {
             app.reopen_returned_recovery_units(|route, relay| {
                 carried.contains(&(route.clone(), relay.to_owned()))
             })?;
-            Ok::<_, cgka_traits::storage::StorageError>(())
+            Ok::<_, AppError>(())
         })();
         if let Err(error) = settled {
-            log_failure("settle_recovery_route_changes", &AppError::from(error));
+            log_failure("settle_recovery_route_changes", &error);
             self.routing.restore_route_changes(changes);
         }
     }
@@ -751,6 +754,25 @@ impl AppClient {
             self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
+    }
+
+    /// Every open owes each current route's retained window, even with a
+    /// transport cursor. Durable coverage leaves only its unproven restart
+    /// gap as debt. Widen the ledger directly: an IncrementalHistory request
+    /// would also give the old comparison owner work in the hybrid. The
+    /// runner's first routing-change turn retries a failed best-effort write.
+    pub(crate) fn record_open_coverage_goals(&self) {
+        let current = self.current_coverage_routes();
+        let result = self.coverage_storage().and_then(|storage| {
+            self.widen_standing_goals(
+                &storage.app_storage(),
+                &current.iter().collect::<Vec<_>>(),
+                unix_now_seconds(),
+            )
+        });
+        if let Err(error) = result {
+            log_failure("record_open_coverage_goals", &error);
+        }
     }
 
     /// Startup incremental history wants every current route from its

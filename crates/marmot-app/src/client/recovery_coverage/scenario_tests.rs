@@ -49,25 +49,27 @@ pub(in crate::client) async fn fixture() -> Fixture {
 /// [`fixture`], with the relay returning one stored event created at
 /// `stored` before each EOSE, or none.
 pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
-    fixture_on(vec![RELAY.into()], false, stored).await
+    fixture_on(vec![RELAY.into()], false, stored, None).await
 }
 
 pub(in crate::client) async fn fixture_on(
     relays: Vec<String>,
     runner_owns_debt: bool,
     stored: Option<u64>,
+    lookback: Option<std::time::Duration>,
 ) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = crate::MarmotApp::with_relays_and_config(
+    let mut app = crate::MarmotApp::with_relays_and_config(
         dir.path(),
         relays,
         crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay.clone());
+    app.relay_plane = transport_nostr::MarmotRelayPlane::new(lookback, relay.clone());
     let app = if runner_owns_debt {
         app.with_recovery_runner_owning_debt()
     } else {
@@ -110,13 +112,16 @@ pub(in crate::client) async fn fixture_on(
 /// Start the account's REQs again, as a reconnect does, and wait until the
 /// new generation's boundaries are admitted.
 pub(super) async fn reactivate(fixture: &mut Fixture) {
-    fixture.client.prepare_transport().await.unwrap();
+    reactivate_client(&mut fixture.client).await;
+}
+
+pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
+    client.prepare_transport().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            fixture.client.synchronize_native_replay().await.unwrap();
-            let observation = fixture.client.adapter.replay_admission().await;
-            if fixture
-                .client
+            client.synchronize_native_replay().await.unwrap();
+            let observation = client.adapter.replay_admission().await;
+            if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
             {

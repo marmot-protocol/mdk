@@ -519,14 +519,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
+  at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
+  loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
   routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
   requests (`record_recovery_request`), native
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  replaces the obligations. Every account open widens every current route's standing goal, cursor or not; a runner
+  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
+  without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
+  what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
   uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
