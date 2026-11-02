@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-22
+updated: 2026-11-02
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -252,7 +252,7 @@ Hosts can also send app-defined custom events: any non-reserved application even
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
 every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
 update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token, and the
-device-group kinds 457, 459, 460, 461, 473, 475 and 476) are rejected on the custom send path, so apps cannot forge
+device-group kinds 457, 458, 459, 460, 461, 473, 475 and 476) are rejected on the custom send path, so apps cannot forge
 protocol events.
 A device-group kind received in any group other than the account's device group is ignored: no row, message or
 notification.
