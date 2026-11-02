@@ -13855,6 +13855,8 @@ MarmotStatus marmot_chat_selection_last_departure(const struct MarmotChatSelecti
 
 /**
  * Retire this selection owner without freeing the handle. Idempotent.
+ * Read and retain admitted mutation/departure outcomes before retirement;
+ * later readback returns MARMOT_STATUS_CHAT_SELECTION_CLOSED.
  * # Safety
  * selection must remain live for this call.
  */
@@ -13862,6 +13864,8 @@ MarmotStatus marmot_chat_selection_close(const struct MarmotChatSelection *selec
 
 /**
  * Retire this selection owner without freeing the handle. Idempotent.
+ * Read and retain admitted mutation/departure outcomes before retirement;
+ * later readback returns MARMOT_STATUS_CHAT_SELECTION_CLOSED.
  * # Safety
  * selection must remain live for this call.
  */
@@ -13869,6 +13873,7 @@ MarmotStatus marmot_chat_selection_cancel(const struct MarmotChatSelection *sele
 
 /**
  * Retire and free one selection. NULL is a no-op; returned records remain caller-owned.
+ * Read and retain admitted mutation/departure outcomes before freeing the handle.
  * # Safety
  * selection must be NULL or a library-owned handle with no active calls.
  */
@@ -15221,16 +15226,6 @@ void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *
  * this library.
  */
 void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_chat_selection_operand_free(struct MarmotChatSelectionOperand *ptr);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

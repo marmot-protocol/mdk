@@ -141,7 +141,7 @@ copy slot: u32, copy kind: MarmotChatSelectionLeafKind,
 #[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
 json_str needle,
 } }
-c_mirror! { MarmotChatSelectionOperand from ChatSelectionOperandFfi, free marmot_chat_selection_operand_free, list(MarmotChatSelectionOperandList, marmot_chat_selection_operand_list_free) {
+c_mirror! { MarmotChatSelectionOperand from ChatSelectionOperandFfi, list(MarmotChatSelectionOperandList, marmot_chat_selection_operand_list_free) {
 copy candidate_slot: u64, str group_id_hex,
 #[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
 json_str row_group_name,
@@ -1104,14 +1104,10 @@ mod tests {
         unavailable.roster_peer_id_hex = None;
         unavailable.welcomer_id_hex = None;
         unavailable.conversation_kind = None;
-        let roots = MarmotChatSelectionOperandList::from(vec![full.clone(), absent, unavailable]);
+        let roots = MarmotChatSelectionOperandList::from(vec![full, absent, unavailable]);
         let root = memory::boxed(roots);
         unsafe {
             marmot_chat_selection_operand_list_free(root);
-        }
-        let single = memory::boxed(MarmotChatSelectionOperand::from(full));
-        unsafe {
-            marmot_chat_selection_operand_free(single);
         }
         for ids in [vec!["one".into(), "two".into()], Vec::new()] {
             let page = memory::boxed(MarmotChatSelectionPage::from(ChatSelectionPageFfi {

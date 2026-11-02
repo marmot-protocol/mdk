@@ -406,6 +406,8 @@ unsafe fn read_answers(
 }
 
 /// Retire this selection owner without freeing the handle. Idempotent.
+/// Read and retain admitted mutation/departure outcomes before retirement;
+/// later readback returns MARMOT_STATUS_CHAT_SELECTION_CLOSED.
 /// # Safety
 /// selection must remain live for this call.
 #[unsafe(no_mangle)]
@@ -420,6 +422,8 @@ pub unsafe extern "C" fn marmot_chat_selection_close(
 }
 
 /// Retire this selection owner without freeing the handle. Idempotent.
+/// Read and retain admitted mutation/departure outcomes before retirement;
+/// later readback returns MARMOT_STATUS_CHAT_SELECTION_CLOSED.
 /// # Safety
 /// selection must remain live for this call.
 #[unsafe(no_mangle)]
@@ -434,6 +438,7 @@ pub unsafe extern "C" fn marmot_chat_selection_cancel(
 }
 
 /// Retire and free one selection. NULL is a no-op; returned records remain caller-owned.
+/// Read and retain admitted mutation/departure outcomes before freeing the handle.
 /// # Safety
 /// selection must be NULL or a library-owned handle with no active calls.
 #[unsafe(no_mangle)]
