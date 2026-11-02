@@ -2100,10 +2100,7 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
     let phone_slot = slot(&devices.phone);
     devices
         .phone
-        .runtime
-        .edit_device_roster_entry(&device_group, &phone_slot, &[], |entry| {
-            entry.settings.add_to_all_chats = false;
-        })
+        .update_linked_device_settings(&hex::encode(phone_slot), Some(false), None, None)
         .await
         .unwrap();
     deliver_all(&mut devices.laptop, &devices.relay).await;
