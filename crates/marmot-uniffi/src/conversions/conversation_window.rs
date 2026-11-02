@@ -467,6 +467,7 @@ fn presented_timeline_with_tokens(
         deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
         invalidation_status: row.invalidation_status.clone(),
         imported_from: row.imported_from.clone().map(Into::into),
+        history_import_provenance: row.history_import_provenance.clone().map(Into::into),
     }
 }
 impl From<app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
@@ -682,7 +683,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         deletion_source,
         invalidation_status,
         imported_from,
-        history_import_provenance: _,
+        history_import_provenance,
     } = row;
     (
         (
@@ -717,6 +718,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             if trusted { group_system.as_ref() } else { None },
             poll,
             imported_from,
+            history_import_provenance,
         ),
     )
 }

@@ -64,3 +64,40 @@ impl From<ChatHistoryImport> for ChatHistoryImportFfi {
         }
     }
 }
+
+/// Identity of an archive, not proof of original writer/authorship or past membership.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct BackupHistorySourceFfi {
+    pub recovery_public_key_hex: String,
+    pub backup_id_hex: String,
+    pub head_sha256_hex: String,
+    pub written_at: u64,
+}
+impl From<marmot_app::BackupHistorySource> for BackupHistorySourceFfi {
+    fn from(value: marmot_app::BackupHistorySource) -> Self {
+        Self {
+            recovery_public_key_hex: hex::encode(value.recovery_public_key),
+            backup_id_hex: hex::encode(value.backup_id),
+            head_sha256_hex: hex::encode(value.head_sha256),
+            written_at: value.written_at,
+        }
+    }
+}
+/// Complete import source. Backup imports never invent a device slot/label.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum HistoryImportProvenanceFfi {
+    Device { device_slot_id_hex: String },
+    Backup { source: BackupHistorySourceFfi },
+}
+impl From<marmot_app::HistoryImportProvenance> for HistoryImportProvenanceFfi {
+    fn from(value: marmot_app::HistoryImportProvenance) -> Self {
+        match value {
+            marmot_app::HistoryImportProvenance::Device(slot) => Self::Device {
+                device_slot_id_hex: hex::encode(slot),
+            },
+            marmot_app::HistoryImportProvenance::Backup(source) => Self::Backup {
+                source: source.into(),
+            },
+        }
+    }
+}

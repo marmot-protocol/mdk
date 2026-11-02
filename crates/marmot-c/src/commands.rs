@@ -38,6 +38,10 @@ use crate::types::audit::{
     MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
     MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
+use crate::types::backups::{
+    MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus, MarmotBackupSettings,
+    MarmotRecoveryWords,
+};
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
     MarmotExistingDirectConversation,
@@ -800,6 +804,33 @@ c_cmd! {
     /// device is renamed or removed. Free with
     /// `marmot_chat_history_import_list_free`.
     async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
+
+    /// Generate shown-once words. Never log/persist; free with marmot_recovery_words_free.
+    async fn marmot_begin_recovery_words(account_ref: str) -> rec(MarmotRecoveryWords) = begin_recovery_words;
+    /// Confirm the two words at MDK's positions, in order. Inputs borrowed;
+    /// clear host copies. Errors keep the core confirmation flow retryable.
+    async fn marmot_confirm_recovery_words(account_ref: str, answers/answers_len: str_arr) -> unit = confirm_recovery_words;
+    /// Forget pending words, without changing active account backup settings.
+    async fn marmot_cancel_recovery_words(account_ref: str) -> unit = cancel_recovery_words;
+    /// Turn off future backups; previously written archives remain.
+    async fn marmot_turn_off_backups(account_ref: str) -> unit = turn_off_backups;
+    /// Current account settings; free with marmot_backup_settings_free.
+    async fn marmot_backup_settings(account_ref: str) -> rec(MarmotBackupSettings) = backup_settings;
+    /// Report Wi-Fi/charging on worker start and changes; both are required
+    /// for new background passes. A replacement worker defaults closed.
+    /// Admitted work settles after false; manual restoration is unaffected.
+    async fn marmot_set_backup_background_conditions(account_ref: str, wifi: flag, charging: flag) -> unit = set_backup_background_conditions;
+    /// Begin manual history-only restore. Words borrowed, never retained by
+    /// C; clear host copies. Free status with marmot_backup_restore_status_free.
+    async fn marmot_begin_backup_restore(account_ref: str, words: str) -> rec(MarmotBackupRestoreStatus) = begin_backup_restore;
+    /// Cancel only this operation; stale valid tokens return false,
+    /// malformed tokens INVALID_HEX. Committed history remains.
+    async fn marmot_cancel_backup_restore(account_ref: str, operation: str) -> scalar(bool) = cancel_backup_restore;
+    /// Aggregate progress; free with marmot_backup_restore_status_free.
+    async fn marmot_backup_restore_status(account_ref: str) -> rec(MarmotBackupRestoreStatus) = backup_restore_status;
+    /// Private availability hints for this CURRENT chat; no implicit join.
+    /// Free with marmot_backup_history_availability_list_free.
+    async fn marmot_backup_history_availability(account_ref: str, group_id_hex: str) -> rec(MarmotBackupHistoryAvailabilityList) = backup_history_availability;
 
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user

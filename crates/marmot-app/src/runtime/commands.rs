@@ -1282,6 +1282,7 @@ impl AccountManager {
         account_ref: &str,
         answers: Vec<String>,
     ) -> Result<(), AppError> {
+        let answers = Zeroizing::new(answers);
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
@@ -1309,6 +1310,25 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
+    }
+
+    pub async fn set_backup_background_conditions(
+        &self,
+        account_ref: &str,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetBackupBackgroundConditions {
+                wifi,
+                charging,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
     }
 
     pub async fn begin_backup_restore(

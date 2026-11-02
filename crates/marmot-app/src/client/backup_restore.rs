@@ -27,6 +27,27 @@ impl fmt::Debug for BackupRestoreWords {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackupRestoreId(pub(crate) [u8; 16]);
 
+impl BackupRestoreId {
+    /// Opaque host token for this ephemeral operation. It is not a recovery
+    /// key, membership proof, or persistent resume cursor.
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Decode the exact token returned by MDK. A syntactically valid stale
+    /// token still cannot cancel another operation; the worker checks its id.
+    pub fn from_hex(token: &str) -> Option<Self> {
+        if token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        Some(Self(hex::decode(token).ok()?.try_into().ok()?))
+    }
+}
+
 /// No secret, event content, writer attribution or network endpoint is exposed
 /// in restore progress. Completed prefix counts remain after cancellation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -855,6 +876,26 @@ mod tests {
     use crate::backup_archive::{IndexBlob, seal_backup_bundle};
     use crate::history_bundle::{BundledEvent, ChatPosition};
     use cgka_traits::MarmotAppEvent;
+
+    #[test]
+    fn restore_operation_tokens_have_an_exact_bounded_host_codec() {
+        let token = "ab".repeat(16);
+        assert_eq!(BackupRestoreId([0xab; 16]).to_hex(), token);
+        assert_eq!(
+            BackupRestoreId::from_hex(&token),
+            Some(BackupRestoreId([0xab; 16]))
+        );
+        for invalid in [
+            String::new(),
+            "ab".repeat(15),
+            "ab".repeat(17),
+            "AB".repeat(16),
+            "zz".repeat(16),
+            format!(" {token}"),
+        ] {
+            assert_eq!(BackupRestoreId::from_hex(&invalid), None);
+        }
+    }
 
     #[test]
     fn recovery_input_is_redacted_and_only_twelve_checksum_valid_english_words_open() {

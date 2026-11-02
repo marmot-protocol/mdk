@@ -545,13 +545,18 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
     },
     ConfirmRecoveryWords {
-        answers: Vec<String>,
+        answers: Zeroizing<Vec<String>>,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     CancelRecoveryWords {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     TurnOffBackups {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    SetBackupBackgroundConditions {
+        wifi: bool,
+        charging: bool,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     BeginBackupRestore {
@@ -1959,6 +1964,7 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         history_blobs: HistoryBlobFlights::default(),
+        backup_background_allowed: Default::default(),
         worker_lifetime: media_http_worker_lifetime,
     };
     // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
@@ -2467,6 +2473,7 @@ async fn run_app_runtime_account_worker(
                         // Ordinary transfers return the same credits used by
                         // restore; resume only after completion released one.
                         dispatch_backup_restore(&mut client, &media_http);
+                        dispatch_backup_pass(&mut client, &media_http);
                         // A fetched history imports messages; show them, and
                         // the chat's history state, now, not at the next
                         // maintenance pass.
@@ -4477,6 +4484,9 @@ struct MediaHttpContext {
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
     /// The history upload and fetch running, at most one of each.
     history_blobs: HistoryBlobFlights,
+    /// Reported platform facts, never persisted. A replacement worker starts
+    /// closed; admitted passes retain their existing settlement contract.
+    backup_background_allowed: std::sync::atomic::AtomicBool,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
@@ -4551,6 +4561,22 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
             }
         }
     }
+    dispatch_backup_pass(client, media_http);
+    dispatch_backup_restore(client, media_http);
+}
+
+/// Admit new background backup work only under currently reported host
+/// facts. Once admitted, the whole pass and its settlement finish unchanged.
+fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    if !media_http.backup_background_allowed.load(Ordering::Relaxed) {
+        return;
+    }
+    let permit = || {
+        (media_http.permits.available_permits() > 1)
+            .then(|| media_http.permits.clone().try_acquire_owned().ok())
+            .flatten()
+    };
     if !media_http.history_blobs.backup.load(Ordering::Relaxed)
         && let Some(permit) = permit()
     {
@@ -4574,7 +4600,6 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
             }
         }
     }
-    dispatch_backup_restore(client, media_http);
 }
 
 /// Manual restoration never drives a writer pass, deletes or publication.
@@ -6414,6 +6439,20 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::TurnOffBackups { respond } => Box::pin(async move {
             let result = client.turn_off_backups().await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::SetBackupBackgroundConditions {
+            wifi,
+            charging,
+            respond,
+        } => Box::pin(async move {
+            media_http
+                .backup_background_allowed
+                .store(wifi && charging, std::sync::atomic::Ordering::Relaxed);
+            if wifi && charging {
+                dispatch_history_blobs(client, media_http);
+            }
+            let _ = respond.send(Ok(()));
             true
         }),
         AccountWorkerCommand::BeginBackupRestore { words, respond } => Box::pin(async move {
@@ -9655,6 +9694,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime,
             },
             rx,
@@ -10896,6 +10936,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -11944,6 +11985,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);

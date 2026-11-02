@@ -33,25 +33,25 @@ pub(super) struct LocalBlossom {
     pub(super) refuse_uploads: Arc<AtomicBool>,
     pub(super) deleters: Arc<Mutex<Vec<String>>>,
     pub(super) reads: Arc<Mutex<Vec<String>>>,
-    get_gate: Arc<Mutex<Vec<BlossomGetGate>>>,
+    get_gate: Arc<Mutex<Vec<BlossomHttpGate>>>,
 }
 
-struct BlossomGetGate {
+struct BlossomHttpGate {
     hash: String,
     started: tokio::sync::oneshot::Sender<()>,
     released: std::sync::mpsc::Receiver<()>,
 }
 
-pub(super) struct BlossomGetHold {
+pub(super) struct BlossomHttpHold {
     started: tokio::sync::oneshot::Receiver<()>,
     release: Option<std::sync::mpsc::Sender<()>>,
 }
 
-impl BlossomGetHold {
+impl BlossomHttpHold {
     pub(super) async fn entered(&mut self) {
         (&mut self.started)
             .await
-            .expect("the actual GET reaches the server");
+            .expect("the actual HTTP request reaches the server");
     }
 
     pub(super) fn release(mut self) {
@@ -61,7 +61,7 @@ impl BlossomGetHold {
     }
 }
 
-impl Drop for BlossomGetHold {
+impl Drop for BlossomHttpHold {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
@@ -70,18 +70,33 @@ impl Drop for BlossomGetHold {
 }
 
 impl LocalBlossom {
+    /// Hold the next genuine upload before the server accepts its bytes.
+    pub(super) fn hold_upload(&self) -> BlossomHttpHold {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.get_gate.lock().unwrap().push(BlossomHttpGate {
+            hash: String::new(),
+            started,
+            released,
+        });
+        BlossomHttpHold {
+            started: wait,
+            release: Some(release),
+        }
+    }
+
     /// Hold a real HTTP GET before serving its bytes; no client retry,
     /// membership or cancellation decision is supplied by this fixture.
-    pub(super) fn hold_get(&self, hash: &str) -> BlossomGetHold {
+    pub(super) fn hold_get(&self, hash: &str) -> BlossomHttpHold {
         let (started, wait) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let mut gate = self.get_gate.lock().unwrap();
-        gate.push(BlossomGetGate {
+        gate.push(BlossomHttpGate {
             hash: hash.into(),
             started,
             released,
         });
-        BlossomGetHold {
+        BlossomHttpHold {
             started: wait,
             release: Some(release),
         }
@@ -95,7 +110,7 @@ pub(super) fn local_blossom() -> LocalBlossom {
     let refuse_uploads = Arc::<AtomicBool>::default();
     let deleters = Arc::<Mutex<Vec<String>>>::default();
     let reads = Arc::<Mutex<Vec<String>>>::default();
-    let get_gate = Arc::<Mutex<Vec<BlossomGetGate>>>::default();
+    let get_gate = Arc::<Mutex<Vec<BlossomHttpGate>>>::default();
     let (served, refused, signed) = (blobs.clone(), refuse_uploads.clone(), deleters.clone());
     let (read_log, gate) = (reads.clone(), get_gate.clone());
     std::thread::spawn(move || {
@@ -145,7 +160,7 @@ fn serve_blossom(
     refuse_uploads: &AtomicBool,
     deleters: &Mutex<Vec<String>>,
     reads: &Mutex<Vec<String>>,
-    gate: &Mutex<Vec<BlossomGetGate>>,
+    gate: &Mutex<Vec<BlossomHttpGate>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut request = String::new();
@@ -188,6 +203,17 @@ fn serve_blossom(
             respond("500 Internal Server Error", b"")
         }
         (Some("PUT"), Some("/upload")) => {
+            let held = {
+                let mut gates = gate.lock().unwrap();
+                gates
+                    .iter()
+                    .position(|held| held.hash.is_empty())
+                    .map(|position| gates.remove(position))
+            };
+            if let Some(held) = held {
+                let _ = held.started.send(());
+                let _ = held.released.recv();
+            }
             let hash = hex::encode(Sha256::digest(&body));
             blobs.lock().unwrap().insert(hash.clone(), body);
             respond("200 OK", format!(r#"{{"sha256":"{hash}"}}"#).as_bytes())
