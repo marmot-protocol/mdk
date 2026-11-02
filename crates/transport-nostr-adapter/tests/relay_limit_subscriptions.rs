@@ -2970,14 +2970,13 @@ async fn maintenance_replay_is_ordered() {
 /// Drain and place replay until admission has no outstanding work. Silence
 /// between pages is not completion, and a saturated range may finish incomplete.
 async fn distinct_deliveries(fx: &Fixture, wait: Duration) -> usize {
+    const IDLE: Duration = Duration::from_millis(1_500);
     let mut changes = fx.adapter.replay_changes(&fx.account).await.unwrap();
     let mut seen = HashSet::new();
     tokio::time::timeout(wait, async {
         loop {
             changes.borrow_and_update();
-            if !fx.adapter.take_replay_status(&fx.account).await.pending {
-                return seen.len();
-            }
+            let pending = fx.adapter.take_replay_status(&fx.account).await.pending;
             tokio::select! {
                 delivery = fx.adapter.receive() => {
                     let delivery = delivery.unwrap().expect("the replay receiver stays open");
@@ -2989,6 +2988,9 @@ async fn distinct_deliveries(fx: &Fixture, wait: Duration) -> usize {
                 changed = changes.changed() => {
                     changed.expect("the account remains active while replaying");
                 }
+                // Preserve the observation of late withheld tails, but never
+                // let silence end a replay that still has outstanding work.
+                _ = tokio::time::sleep(IDLE), if !pending => return seen.len(),
             }
         }
     })
