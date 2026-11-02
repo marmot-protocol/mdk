@@ -1063,3 +1063,52 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         }
     }
 }
+
+/// Runtime startup defers MLS hydration. Its standing goal must still use
+/// the persisted Welcome hint, since a later goal cannot narrow it (#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
+    use cgka_traits::storage::GroupStorage;
+    let Fixture {
+        client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec![RELAY.into()],
+        false,
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )
+    .await;
+    let app = client.app.clone();
+    let route = client
+        .current_coverage_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    assert_eq!(storage.app_storage().recovery_coverage_goal(&route).unwrap(), None);
+    let welcome_at = unix_now_seconds() - 60 * 60;
+    let mut record = storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+    drop(client);
+
+    let reopened = app
+        .local_client_with_relay_plane_and_hydration("alice", &app.relay_plane, None, true, None)
+        .await
+        .unwrap();
+    let error = crate::AppError::from(reopened.runtime.group_record(&group).unwrap_err());
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    assert_eq!(
+        storage.app_storage().recovery_coverage_goal(&route).unwrap(),
+        Some(welcome_at - 15 * 60),
+        "deferred startup must not pin the group to the 30-day retention floor"
+    );
+}

@@ -466,6 +466,121 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(passes(&client), 2);
 }
 
+async fn serve_goal_future<T>(
+    client: &mut AppClient,
+    turns: &mut tokio::sync::mpsc::Receiver<RunnerTurn>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            turn = turns.recv() => turn.unwrap().serve(client).await,
+        }
+    }
+}
+
+/// Failed mandatory goal writes must schedule a bounded local retry, retain
+/// the prior status, and recover without a new route/receipt wake (#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_route_goal_writes_retry_without_spinning_or_a_new_wake() {
+    for failed_steps in [1, 4] {
+        failed_route_goal_writes(failed_steps).await;
+    }
+}
+
+async fn failed_route_goal_writes(failed_steps: usize) {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        relay: _relay,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    restart_goal_survey(&mut client).await;
+    let now = unix_now_seconds();
+    for route in client.recovery_runner_routes() {
+        for relay in route.required.iter().chain(&route.best_effort) {
+            ledger
+                .record_recovery_coverage(
+                    &[RecoveryCoverageSlice {
+                        route: &route.route,
+                        relay,
+                        since_seconds: 0,
+                        until_seconds: now + DAY,
+                        proof: RecoveryCoverageProof::Comparison,
+                    }],
+                    now,
+                )
+                .unwrap();
+        }
+    }
+    let mut account = client.build_recovery_runner().await;
+    let group = client.create_group("goal write failure", &[]).await.unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    let previous_status = client.routing.recovery_runner_catching_up_now();
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_route_goal BEFORE INSERT ON account_recovery_coverage_goals
+             BEGIN SELECT RAISE(FAIL, 'route goal write failed'); END;",
+        )
+        .unwrap();
+    let mut wake = wake(&client);
+    for _ in 0..failed_steps {
+        let before = unix_now_seconds();
+        let step = serve_goal_future(
+            &mut client,
+            &mut account.turns,
+            Box::pin(account.runner.step()),
+        )
+        .await;
+        let super::super::Step::Idle { next_due: Some(due) } = step else {
+            panic!("a failed goal write must schedule a local retry, not report no debt");
+        };
+        assert!(due > before, "persistent failure must not spin");
+        assert!(due <= unix_now_seconds() + 60, "use the bounded local retry policy");
+        assert!(!woken(&mut wake), "failed preparation must not self-wake");
+        assert!(client.routing.recovery_runner_catching_up_now() == previous_status);
+        assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+    }
+    faults.execute_batch("DROP TRIGGER fail_route_goal").unwrap();
+    assert!(!woken(&mut wake), "removing the fault supplied no unrelated wake");
+    let host = account.runner.host.clone();
+    let survey = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(|turn| {
+            super::super::select::survey(
+                turn,
+                &RecoveryRunnerPolicy::default(),
+                &super::super::admission::Stalled::default(),
+            )
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(survey.candidates.iter().any(|candidate| candidate.key.route == route));
+    assert!(ledger.recovery_coverage_goal(&route).unwrap().is_some());
+    host.surveyed(survey.catching_up);
+    assert!(client.account_recovery_status().unwrap().catching_up_group_ids_hex.contains(&hex::encode(group.as_slice())));
+}
+
 /// With the gate on, a directly owned client's `next_event()` runs one pass
 /// in place when it meets delivery loss, after the recovery it already runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
