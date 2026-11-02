@@ -129,8 +129,8 @@ debug events, captured in process; they carry aggregate fields only. A live mess
 succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
 seconds after the last send to arrive.
 
-Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner, and in these runs it does the
-startup recovery itself. So the wire bounds count both of bob's owners, and the runner's own numbers are recorded:
+Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner. Either can contribute to
+startup recovery, so the wire bounds count both of bob's owners, and the runner's own numbers are recorded:
 its attempts, those that asked a relay and ended without progress (a re-check that finishes is an answer), and when
 it reported the account caught up. The runner is held only to what it does beside the earlier owner. 5g adds the
 runner-alone bounds, a positive control for live fences and the upgrade journey, where they can run against the
@@ -148,6 +148,16 @@ switch-over.
   holds it only invalidated, whether the relay holds its event, and bob's audited outcome for it. It also tallies
   bob's inbound outcomes and each member's refused queued intents. The evidence directory keeps each member's audit
   and a per-send delivery list keyed by audit refs (hashes), for reading a miss offline.
+  The original loop entry now forces bob behind: after all public epochs agree, bob closes, s1 schedules a manual
+  own-leaf update through the public maintenance API, and the online peers apply it before publishing the backlog.
+  `public_app_runner_stalled_relay_does_not_loop_bob_current` uses the same journey and every assertion, with all
+  members at one epoch when bob closes. Neither case changes `settle_maintenance` or production timing. Both must
+  recover exactly. `epoch-case.json` and the report name the requested case, epochs before close and at reconnect,
+  and the audited epoch-stall arm count (null if audit collection failed). Bob's last public observation during
+  close is separate from the first live epoch read after reopening and its elapsed time; the latter may already
+  reflect recovery, or be null if unavailable. The report also records bounded by-id group
+  requests separately from aggregate runner traces; traces alone do not identify a route. Both loops are selected
+  by the manual command below, or run either exact test name separately for alternating gate-on/control series.
 - `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:

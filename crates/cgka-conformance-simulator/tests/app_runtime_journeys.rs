@@ -721,6 +721,12 @@ async fn public_app_runner_stalled_relay_does_not_loop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_stalled_relay_does_not_loop_bob_current() {
+    recovery_runner_proofs::stalled_relay_loop_bob_current().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
 async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
     recovery_runner_proofs::owed_history().await;
 }

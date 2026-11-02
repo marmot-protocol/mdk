@@ -5,8 +5,8 @@
 //! one store and publish the production NIP-11 document.
 //!
 //! Until the gate flips (5g), the earlier recovery owner still runs beside
-//! the runner, and in these runs it does the startup recovery itself. So the
-//! wire bounds count both of bob's owners, and the runner's own numbers (read
+//! the runner. Either owner can contribute at startup, so the wire bounds
+//! count both of bob's owners, and the runner's own numbers (read
 //! from its debug trace) are recorded; the runner is held only to what it
 //! does beside the earlier owner, such as re-proving after a reconnect. 5g
 //! adds the runner-alone bounds, the fence control and the upgrade journey.
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use cgka_conformance_simulator::app_runtime::{HistoryRequestV1, RelayDeliveryPath};
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
+    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup, SubjectSelfUpdate,
 };
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
@@ -1169,8 +1169,125 @@ where
 /// about 20 s later, for as long as the app ran. The account must recover
 /// from the healthy endpoint, live messages must keep arriving, and the
 /// stalled endpoint's attempts must thin out instead of repeating.
+#[derive(Clone, Copy)]
+enum LoopCase {
+    BobBehind,
+    BobCurrent,
+}
+
+impl LoopCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::BobBehind => "bob-behind",
+            Self::BobCurrent => "bob-current",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BobBehind => "runner-loop-bob-behind",
+            Self::BobCurrent => "runner-loop-bob-current",
+        }
+    }
+
+    fn matches(self, bob: u64, peers: &BTreeMap<String, u64>) -> bool {
+        let Some(first) = peers.values().next() else {
+            return false;
+        };
+        peers.values().all(|epoch| epoch == first)
+            && match self {
+                Self::BobBehind => *first > bob,
+                Self::BobCurrent => *first == bob,
+            }
+    }
+}
+
+async fn loop_epochs(
+    subject: &AppRuntimeHarness,
+    group: &GroupId,
+    members: &[String],
+) -> TestResult<BTreeMap<String, u64>> {
+    let mut epochs = BTreeMap::new();
+    for member in members {
+        epochs.insert(member.clone(), subject.probe(member)?.epoch(group).await?);
+    }
+    Ok(epochs)
+}
+
+/// Force the missing-epoch and plain-reconnect cases at public boundaries,
+/// without changing the post-join maintenance helper or any production timing.
+async fn prepare_loop_case(
+    subject: &mut AppRuntimeHarness,
+    group: &GroupId,
+    members: &[String],
+    case: LoopCase,
+) -> TestResult<Value> {
+    wait_for(
+        "all loop members at one epoch",
+        Duration::from_secs(600),
+        async || {
+            let epochs = loop_epochs(subject, group, members).await?;
+            Ok(epochs
+                .values()
+                .all(|epoch| Some(epoch) == epochs.values().next()))
+        },
+    )
+    .await?;
+    let before = loop_epochs(subject, group, members).await?;
+    let bob = before["bob"];
+    subject.set_online("bob", false).await?;
+    let peers = members
+        .iter()
+        .filter(|member| *member != "bob")
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches!(case, LoopCase::BobBehind) {
+        // The public manual operation schedules the same own-leaf maintenance
+        // used by periodic rotation. Its production quiet/jitter windows stand.
+        subject
+            .self_update(SubjectSelfUpdate {
+                action_id: "loop-sender-maintenance",
+                client: SENDERS[0],
+                pending: "loop-sender-maintenance",
+            })
+            .await?;
+        wait_for(
+            "sender maintenance reaches every online member",
+            Duration::from_secs(600),
+            async || {
+                subject.run_due_maintenance(&peers).await?;
+                Ok(case.matches(bob, &loop_epochs(subject, group, &peers).await?))
+            },
+        )
+        .await?;
+    }
+    let after = loop_epochs(subject, group, &peers).await?;
+    if !case.matches(bob, &after) {
+        return Err(format!(
+            "{} setup has wrong epochs: bob={bob}, peers={after:?}",
+            case.name()
+        )
+        .into());
+    }
+    Ok(json!({
+        "requested": case.name(),
+        "epochs_before_offline": before,
+        "bob_before_stop_epoch": bob,
+        "peers_after_stop": after,
+        "manual_maintenance_sender": matches!(case, LoopCase::BobBehind).then_some(SENDERS[0]),
+    }))
+}
+
 pub(super) async fn stalled_relay_loop() {
-    let report = run_proof("runner-loop", async |subject, out| {
+    stalled_relay_loop_case(LoopCase::BobBehind).await;
+}
+
+pub(super) async fn stalled_relay_loop_bob_current() {
+    stalled_relay_loop_case(LoopCase::BobCurrent).await;
+}
+
+async fn stalled_relay_loop_case(case: LoopCase) {
+    let report = run_proof(case.label(), async |subject, out| {
         let started = Instant::now();
         let clients = clients();
         let group = create(subject, "loop", &clients).await?;
@@ -1180,7 +1297,8 @@ pub(super) async fn stalled_relay_loop() {
         for member in &clients {
             subject.probe(member)?.start_audit_log().await?;
         }
-        subject.set_online("bob", false).await?;
+        let mut epoch_case = prepare_loop_case(subject, &group, &clients, case).await?;
+        save(out, "epoch-case.json", &epoch_case)?;
         let sent = publish(subject, &group, "loop-", LOOP_MESSAGES).await?;
         let backlog = payloads(&sent);
         note(started, "backlog published");
@@ -1189,10 +1307,34 @@ pub(super) async fn stalled_relay_loop() {
         // Every connection from here on is bob's: the others keep theirs.
         let traffic = subject.relay_traffic(&[u64::MAX, u64::MAX], false).await?;
         let bob_sessions = traffic.iter().map(|relay| relay.next_session).collect::<Vec<_>>();
+        // The close captures this last public observation before shutdown.
+        // Keep it distinct from the first live read: recovery may already have
+        // applied the missing commit before that read returns.
+        let stopped = subject.observations(&["bob".to_owned()]).await?;
+        let stopped = stopped.first().ok_or("no stopped bob observation")?;
+        let visible_backlog = stopped.application.visible_plaintexts.iter()
+            .filter(|text| text.starts_with("loop-")).count();
+        if stopped.local.online || visible_backlog != 0 {
+            return Err("bob must be stopped and owe the entire backlog before reconnect".into());
+        }
+        let bob_epoch = stopped.protocol.epoch;
+        let peers = clients.iter().filter(|member| *member != "bob").cloned().collect::<Vec<_>>();
+        let peer_epochs = loop_epochs(subject, &group, &peers).await?;
+        if !case.matches(bob_epoch, &peer_epochs) {
+            return Err(format!("{} reconnect has wrong epochs: bob={bob_epoch}, peers={peer_epochs:?}", case.name()).into());
+        }
+        epoch_case["bob_stopped_at_reconnect"] = json!(!stopped.local.online);
+        epoch_case["bob_visible_backlog_at_reconnect"] = json!(visible_backlog);
+        epoch_case["bob_last_close_observation_epoch"] = json!(bob_epoch);
+        epoch_case["peers_at_reconnect"] = json!(peer_epochs);
+        save(out, "epoch-case.json", &epoch_case)?;
         let t0 = Instant::now();
         let trace_t0 = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
         let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
+        epoch_case["bob_first_live_epoch"] = json!(bob.epoch(&group).await.ok());
+        epoch_case["bob_first_live_epoch_read_ms"] = json!(t0.elapsed().as_millis());
+        save(out, "epoch-case.json", &epoch_case)?;
         let live = Live::start(alice, bob.clone(), group.clone(), Duration::from_secs(2), TICK_PREFIX);
         let mut recovered = None;
         while t0.elapsed() < LOOP_WINDOW {
@@ -1218,6 +1360,10 @@ pub(super) async fn stalled_relay_loop() {
         if let Ok(records) = &mut audit {
             audit_order(records);
         }
+        epoch_case["epoch_stall_arm_count"] = json!(audit.as_ref().ok().map(|records| {
+            audit_rows(records, "epoch_stall_backfill_armed").count()
+        }));
+        save(out, "epoch-case.json", &epoch_case)?;
         let records = audit.as_deref().unwrap_or_default();
         let mut delivery =
             delivery_view(subject, &bob, &group, &sent, &sent_ticks, &bob_sessions, records).await;
@@ -1246,6 +1392,14 @@ pub(super) async fn stalled_relay_loop() {
         let trace_half = trace_t0 + window_ms / 2;
         let runner = [trace_between(trace_t0, trace_half), trace_between(trace_half, trace_t0 + window_ms)];
         let proof = json!({
+            "epoch_case": epoch_case,
+            // Wire observation, kept separate from the aggregate runner trace:
+            // bounded by-id group requests, not route identities in tracing.
+            "bounded_group_id_fetches": history.iter().map(|requests| {
+                requests.iter().filter(|request| request.verb == "REQ"
+                    && request.route.as_deref() == Some(route.as_str())
+                    && request.until.is_some() && request.ids > 0).count()
+            }).collect::<Vec<_>>(),
             "backlog": backlog.len(),
             "recovered_seconds": recovered,
             "timeline_exact": complete,
