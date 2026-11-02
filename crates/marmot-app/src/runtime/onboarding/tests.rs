@@ -128,6 +128,14 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         vec![legacy_finding],
     );
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    c.set(
+        OnboardingStep::SingleDevice,
+        OnboardingStatus::NeedsInput,
+        vec![
+            finding(OnboardingIssue::MultiDeviceUnsupported),
+            finding(OnboardingIssue::OtherInstallationPossible),
+        ],
+    );
     c.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
         discovery: OnboardingDeviceDiscovery::OtherInstallationPossible,
         other_packages: vec![OnboardingDevicePackage {
@@ -141,6 +149,8 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         discovery_complete: true,
         acknowledged_at: None,
     });
+    let revision = c.snapshot.revision;
+    let recovery_epoch = c.snapshot.recovery_epoch.clone();
     let mut old = serde_json::to_value(&c).unwrap();
     let legacy = old["snapshot"]["steps"][0]["findings"][0]
         .as_object_mut()
@@ -162,15 +172,58 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         .as_object_mut()
         .unwrap()
         .remove("usable");
+    let retained_bytes = serde_json::to_vec(&old).unwrap();
     manager
         .app
         .account_home()
-        .set_account_onboarding(&id, &serde_json::to_vec(&old).unwrap())
+        .set_account_onboarding(&id, &retained_bytes)
         .unwrap();
     first.shutdown_and_close().await.unwrap();
     let reopened = runtime(directory.path(), network);
     let manager = reopened.accounts();
     let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_onboarding(&id)
+            .unwrap()
+            .unwrap(),
+        retained_bytes,
+        "projecting the old notice does not rewrite retained evidence"
+    );
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(snapshot.recovery_epoch, recovery_epoch);
+    assert!(!snapshot.ready);
+    let device_step = &snapshot.steps[OnboardingStep::SingleDevice.index()];
+    assert_eq!(device_step.status, OnboardingStatus::NeedsInput);
+    assert!(
+        device_step
+            .actions
+            .contains(&OnboardingAction::ContinueAnyway)
+    );
+    assert!(
+        device_step
+            .actions
+            .contains(&OnboardingAction::CancelOnboarding)
+    );
+    assert_eq!(
+        device_step
+            .findings
+            .iter()
+            .map(|finding| finding.issue)
+            .collect::<Vec<_>>(),
+        vec![OnboardingIssue::OtherInstallationPossible],
+        "legacy projection retires only the obsolete capability claim"
+    );
+    let notice = snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(
+        notice.discovery,
+        OnboardingDeviceDiscovery::OtherInstallationPossible
+    );
+    assert!(notice.discovery_complete);
+    assert_eq!(notice.acknowledged_at, None);
+    assert_eq!(notice.other_packages[0].slot_id, "foreign");
     let legacy = &snapshot.steps[0].findings[0];
     assert_eq!(legacy.issue, OnboardingIssue::TimedOut);
     assert_eq!(legacy.context, OnboardingFindingContext::Unknown);
@@ -3983,6 +4036,14 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let assert_no_capability_claim = |checkpoint: &OnboardingCheckpoint| {
+        assert!(
+            checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()]
+                .findings
+                .iter()
+                .all(|finding| finding.issue != OnboardingIssue::MultiDeviceUnsupported)
+        );
+    };
     manager
         .check_onboarding_single_device(&mut c)
         .await
@@ -3990,14 +4051,11 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
     assert!(notice.discovery_complete);
+    assert_no_capability_claim(&c);
     assert_eq!(
         c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
         OnboardingStatus::NeedsInput
     );
-    manager.save_onboarding(&mut c).unwrap();
-    for finding in &c.snapshot.steps[OnboardingStep::SingleDevice.index()].findings {
-        assert_eq!(finding.observed_revision, Some(c.snapshot.revision));
-    }
     assert!(
         c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .actions
@@ -4011,6 +4069,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::Unknown);
     assert!(!notice.discovery_complete);
+    assert_no_capability_claim(&c);
     network.fail_reads.store(false, Ordering::SeqCst);
     network.events.lock().push(signed(
         &keys,
@@ -4033,6 +4092,11 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .iter()
             .any(|f| f.issue == OnboardingIssue::Malformed)
     );
+    assert_no_capability_claim(&c);
+    manager.save_onboarding(&mut c).unwrap();
+    for finding in &c.snapshot.steps[OnboardingStep::SingleDevice.index()].findings {
+        assert_eq!(finding.observed_revision, Some(c.snapshot.revision));
+    }
     network.events.lock().clear();
     network.events.lock().push(signed(
         &keys,
@@ -4055,6 +4119,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .iter()
             .any(|f| f.issue == OnboardingIssue::FutureDated)
     );
+    assert_no_capability_claim(&c);
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }

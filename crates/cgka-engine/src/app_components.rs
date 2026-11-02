@@ -2408,6 +2408,20 @@ mod tests {
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };
+        let actual_ids: BTreeSet<_> = ext.dictionary().entries().map(|entry| entry.id()).collect();
+        let expected_ids = required
+            .ids
+            .iter()
+            .copied()
+            .chain([APP_COMPONENTS_COMPONENT_ID])
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_ids, expected_ids);
+        if required.contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) {
+            assert_eq!(
+                ext.dictionary().get(&GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+                Some([0u8; 5].as_slice())
+            );
+        }
         for entry in ext.dictionary().entries() {
             // `app_components` itself is the negotiated id list, validated via
             // the update path's APP_COMPONENTS_COMPONENT_ID arm — include it.
@@ -2429,10 +2443,13 @@ mod tests {
     fn the_device_roster_is_advertisable_only_in_test_policy_builds() {
         // Its wire format is unreleased until its spec lands (mdk#2628 3.1).
         let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
-        assert_eq!(
-            validate_supported_app_components(&supported).is_ok(),
-            cfg!(feature = "test-policy-overrides")
-        );
+        if cfg!(feature = "test-policy-overrides") {
+            validate_supported_app_components(&supported).unwrap();
+        } else {
+            assert!(matches!(validate_supported_app_components(&supported),
+                Err(EngineError::Other(reason)) if reason ==
+                "engine cannot advertise protocol app component 0x800e: it does not implement it"));
+        }
     }
 
     #[test]
@@ -2518,8 +2535,10 @@ mod tests {
             data: encode_components_list(&BTreeSet::new()),
         };
 
-        assert!(validate_initial_app_component(&component).is_err());
-        assert!(validate_app_component_update(&component).is_err());
+        assert!(matches!(validate_initial_app_component(&component),
+            Err(EngineError::Other(reason)) if reason == "group creation request cannot override engine-owned app components"));
+        assert!(matches!(validate_app_component_update(&component),
+            Err(EngineError::Other(reason)) if reason == "safe_aad group-component state is not supported yet"));
     }
 
     #[test]
@@ -2640,8 +2659,15 @@ mod tests {
             "{error}"
         );
 
-        assert!(validate_initial_app_component(&component).is_err());
-        assert!(refuse_local_group_context_entry(DEVICE_TAG_COMPONENT_ID).is_err());
+        for result in [
+            validate_initial_app_component(&component),
+            refuse_local_group_context_entry(DEVICE_TAG_COMPONENT_ID),
+        ] {
+            assert!(
+                matches!(result, Err(EngineError::Other(reason)) if reason ==
+                "app component 0x800f lives only in LeafNodes and cannot be set in GroupContext")
+            );
+        }
         refuse_local_group_context_entry(DEVICE_ROSTER_COMPONENT_ID)
             .expect("only never-required LeafNode ids are refused");
     }
@@ -2655,17 +2681,36 @@ mod tests {
         for canonical in [b"image/png".as_slice(), b"image/jpeg".as_slice()] {
             validate_group_image(&component(canonical)).expect("canonical media type");
         }
-        for non_canonical in [
-            b"Image/PNG".as_slice(),
-            b"image/png; charset=utf-8".as_slice(),
-            b"image/jpg".as_slice(),
-            b" image/png ".as_slice(),
-            b"image/png/extra".as_slice(),
-            b"image/(png)".as_slice(),
+        for (non_canonical, expected) in [
+            (
+                b"Image/PNG".as_slice(),
+                "group image media type is not canonical",
+            ),
+            (
+                b"image/png; charset=utf-8".as_slice(),
+                "group image media type is not canonical",
+            ),
+            (
+                b"image/jpg".as_slice(),
+                "group image media type is not canonical",
+            ),
+            (
+                b" image/png ".as_slice(),
+                "group image media type is not canonical",
+            ),
+            (
+                b"image/png/extra".as_slice(),
+                "media type must contain exactly one slash",
+            ),
+            (
+                b"image/(png)".as_slice(),
+                "media type contains an invalid token byte",
+            ),
         ] {
             assert!(
-                validate_group_image(&component(non_canonical)).is_err(),
-                "non-canonical media type {:?} must be rejected",
+                matches!(validate_group_image(&component(non_canonical)),
+                Err(EngineError::Serialize(reason)) if reason == format!("invalid group image component: {expected}")),
+                "media type {:?}",
                 String::from_utf8_lossy(non_canonical)
             );
         }
@@ -2680,14 +2725,20 @@ mod tests {
         // It must round-trip through the image validator as "absent".
         validate_group_image(&absent).expect("five-empty-fields is the absent state");
         // The previous (buggy) zero-byte encoding must NOT validate.
-        assert!(validate_group_image(&[]).is_err());
+        assert!(
+            matches!(validate_group_image(&[]), Err(EngineError::Serialize(reason))
+            if reason == "invalid group image component: group image hash length decode failed: missing QUIC varint")
+        );
     }
 
     #[test]
     fn message_retention_state_is_big_endian_seconds() {
         assert_eq!(decode_message_retention(&42u64.to_be_bytes()).unwrap(), 42);
         assert_eq!(decode_message_retention(&0u64.to_be_bytes()).unwrap(), 0);
-        assert!(decode_message_retention(&[0u8; 7]).is_err());
+        assert!(
+            matches!(decode_message_retention(&[0u8; 7]), Err(EngineError::Serialize(reason))
+            if reason == "message-retention component must be 8 bytes, got 7")
+        );
     }
 
     #[test]
@@ -2760,8 +2811,10 @@ mod tests {
             .expect("a later commit may atomically unrequire and remove the component");
 
         let intrinsic_remove = AppDataUpdateProposal::remove(APP_COMPONENTS_COMPONENT_ID);
-        validate_standalone_app_data_update(&intrinsic_remove)
-            .expect_err("app_components can never be removed");
+        assert!(
+            matches!(validate_standalone_app_data_update(&intrinsic_remove),
+            Err(EngineError::Other(reason)) if reason == "app_components component cannot be removed")
+        );
     }
 
     #[test]
@@ -2801,8 +2854,10 @@ mod tests {
         )
         .expect("a no-data component has no state to keep");
         // On a legacy group 0x800d is an opaque id, whose required data stays.
-        validate_app_data_update_batch_against(required, ProtocolProfile::Legacy, updates.iter())
-            .expect_err("legacy validity is unchanged");
+        assert!(
+            matches!(validate_app_data_update_batch_against(required, ProtocolProfile::Legacy, updates.iter()),
+            Err(EngineError::Other(reason)) if reason == "required Marmot app components cannot be removed")
+        );
     }
 
     #[test]
@@ -2909,7 +2964,7 @@ mod tests {
     }
 
     #[test]
-    fn current_profile_group_context_preserves_unknown_optional_state() {
+    fn current_profile_group_context_accepts_unknown_optional_state() {
         let mut extensions = current_profile_extensions(
             [
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
@@ -2980,19 +3035,181 @@ mod tests {
             data: v2.clone(),
         })
         .unwrap();
-        assert!(
-            validate_initial_app_component(&AppComponentData {
-                component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
-                data: v2,
-            })
-            .is_err()
-        );
-        assert!(
-            validate_initial_app_component(&AppComponentData {
-                component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-                data: v1,
-            })
-            .is_err()
-        );
+        for (id, bytes, expected) in [
+            (
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                v2,
+                "invalid encrypted media V1 component: encrypted media format must be encrypted-media-v1",
+            ),
+            (
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                v1,
+                "invalid encrypted media V2 component: encrypted media format must be encrypted-media-v2",
+            ),
+        ] {
+            assert!(
+                matches!(validate_initial_app_component(&AppComponentData { component_id: id, data: bytes }),
+                Err(EngineError::Serialize(reason)) if reason == expected)
+            );
+        }
+    }
+    #[test]
+    fn process_message_rejection_taxonomy_keeps_parent_dependent_failures_retryable() {
+        use ProposalRejectionCategory::{InvalidEncoding, InvalidSignature, UnsupportedProposal};
+        type Error = ProcessMessageError<std::io::Error>;
+        let proposal = ContentType::Proposal;
+        let commit = ContentType::Commit;
+        let rows = [
+            (
+                proposal,
+                Error::UnsupportedProposalType,
+                Some(UnsupportedProposal),
+            ),
+            (
+                proposal,
+                Error::IncompatibleWireFormat,
+                Some(InvalidEncoding),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::WrongEpoch),
+                None,
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::UnknownMember),
+                None,
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::InvalidMembershipTag),
+                None,
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::MissingMembershipTag),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::InvalidSignature),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::UnauthorizedExternalSender),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::NoExternalSendersExtension),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::InvalidLeafNodeSignature),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::InvalidSenderType),
+                Some(InvalidSignature),
+            ),
+            (
+                proposal,
+                Error::ValidationError(ValidationError::WrongGroupId),
+                Some(InvalidEncoding),
+            ),
+            (
+                commit,
+                Error::ValidationError(ValidationError::WrongWireFormat),
+                Some(InvalidEncoding),
+            ),
+            (
+                commit,
+                Error::ValidationError(ValidationError::UnknownMember),
+                None,
+            ),
+            (
+                commit,
+                Error::ValidationError(ValidationError::InvalidSignature),
+                None,
+            ),
+            (
+                ContentType::Application,
+                Error::UnsupportedProposalType,
+                None,
+            ),
+            (
+                proposal,
+                Error::StorageError(std::io::Error::other("local storage")),
+                None,
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::ProposalValidationError(
+                    ProposalValidationError::InsufficientCapabilities,
+                )),
+                Some(UnsupportedProposal),
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::ProposalValidationError(
+                    ProposalValidationError::UnsupportedProposalType,
+                )),
+                Some(UnsupportedProposal),
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::ProposalValidationError(
+                    ProposalValidationError::UnknownMember,
+                )),
+                Some(InvalidSignature),
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::ProposalValidationError(
+                    ProposalValidationError::UpdateFromNonMember,
+                )),
+                Some(InvalidSignature),
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::ProposalValidationError(
+                    ProposalValidationError::DuplicateSignatureKey,
+                )),
+                Some(InvalidEncoding),
+            ),
+            (
+                commit,
+                Error::InvalidCommit(StageCommitError::MissingProposal),
+                None,
+            ),
+        ];
+        for (content, error, expected) in rows {
+            assert_eq!(
+                classify_process_message_rejection(&error, content),
+                expected,
+                "{content:?}: {error:?}"
+            );
+        }
+        for content in [
+            ContentType::Proposal,
+            ContentType::Commit,
+            ContentType::Application,
+        ] {
+            for validation in [
+                ValidationError::UnknownMember,
+                ValidationError::InvalidMembershipTag,
+            ] {
+                assert_eq!(
+                    is_parent_dependent_process_message_error(
+                        &Error::ValidationError(validation),
+                        content
+                    ),
+                    content == ContentType::Proposal
+                );
+            }
+        }
     }
 }

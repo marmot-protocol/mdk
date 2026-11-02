@@ -173,8 +173,10 @@ validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 Repair approval requires a completed freshness query from every onboarding
 source, including relays in the signed relay declaration and public indexers.
 An unavailable source blocks replacement even when another returns a record.
-It requires single-device acknowledgment before KeyPackage publication and offers
-advisory detection of packages that may belong to another installation.
+It requires acknowledgment of sign-in's chat/history limits before KeyPackage publication,
+without a blanket multi-device-unsupported finding, and offers advisory detection of
+packages that may belong to another installation. Plain sign-in does not restore
+existing chats/messages; device linking remains disabled in normal released builds.
 Account onboarding gates normal worker commands until required checks and
 KeyPackage publication complete. Hosts can cancel an interactive attempt at any
 step, including approved or ready checkpoints: the account stays signed out, the
