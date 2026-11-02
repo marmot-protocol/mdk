@@ -140,11 +140,11 @@ impl SiblingChatGaps {
         }
     }
 
-    fn lower_claim_until(&self, gap: &Gap, own: &DeviceSlotId) -> Option<u64> {
+    fn lower_claim_until(&self, gap: &Gap, own: &DeviceSlotId, now: u64) -> Option<u64> {
         self.claims
             .get(gap)?
             .iter()
-            .find_map(|(slot, expiry)| (slot < own).then_some(*expiry))
+            .find_map(|(slot, expiry)| (slot < own && *expiry > now).then_some(*expiry))
     }
 }
 
@@ -362,10 +362,11 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
             }
-            if let Some(expiry) = self
-                .sibling_chat_gaps
-                .lower_claim_until(&gap, &exchange.own_slot)
-            {
+            if let Some(expiry) = self.sibling_chat_gaps.lower_claim_until(
+                &gap,
+                &exchange.own_slot,
+                unix_now_seconds(),
+            ) {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
@@ -409,10 +410,11 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 continue;
             }
-            if let Some(until) = self
-                .sibling_chat_gaps
-                .lower_claim_until(&gap, &exchange.own_slot)
-            {
+            if let Some(until) = self.sibling_chat_gaps.lower_claim_until(
+                &gap,
+                &exchange.own_slot,
+                unix_now_seconds(),
+            ) {
                 self.sibling_chat_gaps.schedule(chat.clone(), until);
                 continue;
             }
@@ -519,12 +521,13 @@ mod tests {
         let mut state = SiblingChatGaps::default();
         let gap = (GroupId::new(vec![1, 2, 3]), [0x22; 32]);
         state.retain_claim(Claim::decode(CLAIM, 100, 200).unwrap().unwrap());
-        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32]), Some(700));
-        assert_eq!(state.lower_claim_until(&gap, &[0x01; 32]), None);
+        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 200), Some(700));
+        assert_eq!(state.lower_claim_until(&gap, &[0x01; 32], 200), None);
         state.retain_claim(Claim::decode(CLAIM, 100, 699).unwrap().unwrap());
-        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32]), Some(700));
+        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 699), Some(700));
+        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 700), None);
         state.expire(700);
-        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32]), None);
+        assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 700), None);
         assert!(Claim::decode(CLAIM, 100, 700).unwrap().is_none());
         assert!(Claim::decode(CLAIM, 201, 200).unwrap().is_none());
         assert!(Claim::decode(CLAIM, u64::MAX, u64::MAX).unwrap().is_none());
