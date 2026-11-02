@@ -75,6 +75,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
     application handoff after catch-up (horizon boundary, restart, bounded turns, and independent send gate).
+    Also frozen admission role/source integrity through public advance, superseded own-removal recovery (remaining
+    targets or already satisfied), and fresh-material reinvite recovery across real forks, paced lookup, admin grants,
+    and genuine replacement-Welcome offers.
 
 - **File:** `distributed_convergence/historical_application_sender.rs`
   - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct

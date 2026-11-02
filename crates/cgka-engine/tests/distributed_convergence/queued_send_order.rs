@@ -527,11 +527,23 @@ async fn an_invite_behind_a_queued_message_never_shows_it_to_the_invitee() {
     dave.join_welcome(welcome_for(&published.welcomes, b"dave"))
         .await
         .unwrap();
+    dave.drain_events();
+    assert_eq!(
+        dave.ingest(published.messages[0].clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PreMembership
+        }
+    );
+    // Keep the original complete publication window, including the commit
+    // already installed by the Welcome, without hiding infrastructure errors.
+    for message in &published.messages[1..] {
+        dave.ingest(message.clone()).await.unwrap();
+    }
     assert!(
-        read(&mut dave, &group_id, &published.messages)
-            .await
+        !dave
+            .drain_events()
             .iter()
-            .all(|seen| !seen.starts_with("sent before the invite")),
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
         "dave never reads a message sent before his invite"
     );
     assert_eq!(
@@ -543,6 +555,48 @@ async fn an_invite_behind_a_queued_message_never_shows_it_to_the_invitee() {
     );
     assert_eq!(published.kinds, vec!["message", "commit"]);
     assert!(invite_queued, "the invite waits behind the queued message");
+
+    let post_join = send_app(&mut alice, &group_id, b"sent after the invite".to_vec()).await;
+    let routed = route(post_join, &group_id);
+    assert_eq!(
+        dave.ingest(routed.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    );
+    let received: Vec<_> = dave
+        .drain_events()
+        .into_iter()
+        .filter(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+        .collect();
+    let [
+        GroupEvent::MessageReceived {
+            group_id: received_group,
+            message_id,
+            sender,
+            epoch: received_epoch,
+            payload,
+            ..
+        },
+    ] = received.as_slice()
+    else {
+        panic!("one readable post-join control: {received:?}")
+    };
+    assert_eq!(received_group, &group_id);
+    assert_eq!(message_id, &content_id(&routed));
+    assert_eq!(sender, &alice.self_id());
+    assert_eq!(*received_epoch, EpochId(epoch + 1));
+    assert_eq!(app_content(payload), b"sent after the invite");
+    assert_eq!(
+        dave.ingest(routed).await.unwrap(),
+        IngestOutcome::Ignored {
+            category: cgka_traits::ingest::InputRejectionCategory::Duplicate,
+        }
+    );
+    assert!(
+        !dave
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. }))
+    );
 }
 
 /// A removal made while a message waits in the queue is committed after it,
