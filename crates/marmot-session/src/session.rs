@@ -48,7 +48,8 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    DeviceGroupWelcomeExpectation, MaintenanceStorage, RosterTagKey, StorageError,
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, OutboundFanoutStorage, RosterTagKey,
+    StorageError,
 };
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -1233,6 +1234,27 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
+    pub async fn prepare_create_group_with_siblings_and_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        context: AuditEventContext,
+    ) -> SessionResult<CreateGroupEffects> {
+        let (group_id, result) = self
+            .engine
+            .create_group_with_siblings_and_audit_context(
+                request,
+                optional_app_components,
+                siblings,
+                Some(context),
+            )
+            .await?;
+        let effects = self.collect_effects(vec![result]);
+        Ok(CreateGroupEffects { group_id, effects })
+    }
+
     /// Create a group under a group id chosen before it exists, as a device
     /// link needs; see `Engine::create_group_with_chosen_id_and_audit_context`.
     pub async fn create_group_with_chosen_id_and_audit_context(
@@ -1410,6 +1432,11 @@ impl AccountDeviceSession {
         Ok(self.engine.owed_sibling_welcomes(now)?)
     }
 
+    /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
+    pub fn carried_sibling_welcomes(&self) -> SessionResult<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self.engine.carried_sibling_welcomes()?)
+    }
+
     /// See [`cgka_engine::Engine::carry_sibling_welcome`].
     pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
         Ok(self.engine.carry_sibling_welcome(id, carrier)?)
@@ -1427,6 +1454,17 @@ impl AccountDeviceSession {
         carrier: &[u8],
     ) -> SessionResult<bool> {
         Ok(self.engine.sibling_welcome_send_failed(id, carrier)?)
+    }
+
+    /// A carrier's durable retry survives hydration deferral too. Read the
+    /// account-owned fanout records directly rather than the live-group view.
+    pub(crate) fn sibling_welcome_carrier_in_flight(&self, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.storage.list_outbound_fanouts()?.iter().any(|fanout| {
+            fanout.outcome().outstanding_targets > 0
+                && fanout.application_message().is_some_and(|application| {
+                    hex::decode(&application.app_event_id).is_ok_and(|id| id == carrier)
+                })
+        }))
     }
 
     pub async fn advance_convergence(

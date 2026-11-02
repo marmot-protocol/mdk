@@ -101,6 +101,7 @@ pub(crate) mod recovery;
 mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
+pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
 pub(crate) mod sign_out;
 mod small_state;
@@ -860,6 +861,9 @@ pub struct AppClient {
     /// The siblings this client found `leaving`, by slot, and when it
     /// decides to remove each: after its own random delay (mdk#2628 D67).
     pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
+    /// Advisory claims and only the chats whose sibling membership needs a
+    /// check (mdk#2628 3.5e). Transient: a restart checks known chats anew.
+    pub(crate) sibling_chat_gaps: sibling_chat_gaps::SiblingChatGaps,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
@@ -1597,7 +1601,12 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
-        self.add_linked_devices_to_chats(&held).await;
+        let sibling_add_attempts = self.add_linked_devices_to_chats(&held).await;
+        self.fill_sibling_chat_gaps(
+            &held,
+            linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
+        )
+        .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
@@ -2592,6 +2601,13 @@ impl AppClient {
         );
 
         request.members = members;
+        let siblings = self.founding_sibling_key_packages(
+            &request,
+            &optional_app_components,
+            &constructable,
+            &nostr_routing.relays,
+        );
+        let has_founding_siblings = !siblings.is_empty();
         let founding_probe = (self.audit_v5_enabled() || cfg!(test))
             .then_some(())
             .and_then(|()| {
@@ -2606,9 +2622,10 @@ impl AppClient {
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
-            .prepare_create_group_with_optional_app_components_and_audit_context(
+            .prepare_create_group_with_siblings_and_audit_context(
                 request,
                 optional_app_components,
+                siblings,
                 audit_context.clone(),
             )
             .await;
@@ -2720,6 +2737,20 @@ impl AppClient {
                 error_kind = error.privacy_safe_kind(),
                 "canonical group creation needs local projection reconciliation"
             );
+        }
+        // Creation is canonical and its Welcomes are durable. Drive initial
+        // sibling delivery now, as for a later Add; any optional device-group
+        // read or delivery failure leaves it owed for maintenance.
+        if has_founding_siblings {
+            match self.epoch_gap_held_groups() {
+                Ok(held) => self.send_owed_sibling_welcomes(&held).await,
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "create_group",
+                    error_kind = error.privacy_safe_kind(),
+                    "initial sibling Welcome waits for device-group state"
+                ),
+            }
         }
         Ok(CanonicalCreatedGroup {
             group_id,
@@ -6602,19 +6633,23 @@ impl AppClient {
             .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)?)
     }
 
-    /// Groups whose due self-updates wait for epoch-gap recovery. Automatic
+    /// Whether a group's due self-update waits for epoch-gap recovery. Automatic
     /// rotation has nobody to ask, so the hold is bounded by
     /// [`EPOCH_GAP_SELF_UPDATE_HOLD_MS`]: forged gap evidence can delay
     /// rotation but never suppress it.
+    fn epoch_gap_holds_group(&self, group_id: &GroupId, now_ms: u64) -> Result<bool, AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        Ok(self
+            .epoch_gap_open_since(group_id, epoch)?
+            .is_some_and(|since| self_update_waits_for_epoch_gap(since, now_ms)))
+    }
+
+    /// Every group currently held by the same bounded epoch-gap predicate.
     fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
         let now_ms = recovery::wall_now_ms()?;
         let mut held = Vec::new();
         for group_id in self.runtime.live_group_ids()? {
-            let epoch = self.runtime.group_record(&group_id)?.epoch;
-            if self
-                .epoch_gap_open_since(&group_id, epoch)?
-                .is_some_and(|since| self_update_waits_for_epoch_gap(since, now_ms))
-            {
+            if self.epoch_gap_holds_group(&group_id, now_ms)? {
                 held.push(group_id);
             }
         }

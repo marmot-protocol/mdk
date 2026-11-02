@@ -212,7 +212,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   it with `device_group_event` and sends it with `send_device_group_event`), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
-  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460,
+  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 458, 459, 460,
   461, 473, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and the
   stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
   withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
@@ -249,9 +249,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
   and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
   reports that 461 published marks it delivered (`settle_sibling_welcome_carriers`, from `retain_effect_projection`);
+  settlement locates carried rows independently of new-send eligibility, so a source chat held by convergence,
+  hydration, or a pending Commit still records its exact carrier's outcome without starting a new delivery;
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
-  before the engine settles it, and a carrier not in that set was sent before this run or never settled, so its Welcome
-  is sent again; a second 461 joins nothing twice. Never send a delivered one again: resending is 3.5e. The Add spends
+  before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
+  fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
+  delivered one again in these paths. Post-publication resend remains an unimplemented 3.5e follow-on under D70;
+  the current gap-filling flow does not resend a delivered Welcome. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
@@ -265,6 +269,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `next_private_key_package` names before taking it, so a chat that would refuse never spends one;
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
+- Fill missing sibling chat memberships in `client/sibling_chat_gaps.rs` (mdk#2628 3.5e, D82–D84), through
+  kind-458 advisory claims and the existing private Add path. Claim content must match its canonical bytes; a leaving
+  device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
+  after ten minutes, and never authorize an Add; replay cannot extend one. Only changed/due chats load their
+  MLS trees, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
+  exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Missing or unusable
+  selected private stock waits without public fallback; the current stock picker does not search later allocations
+  for chat compatibility. Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling
+  presence at actual direct/queued preparation.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history

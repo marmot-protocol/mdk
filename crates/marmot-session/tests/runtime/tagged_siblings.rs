@@ -394,6 +394,7 @@ mod tagged_siblings {
         adder: &mut Device,
         device_group: &GroupId,
         owed: &OwedSiblingWelcome,
+        wall: &TestWallClock,
     ) -> TransportMessage {
         let event = MarmotAppEvent::new(
             hex::encode(adder.runtime.self_id().as_slice()),
@@ -411,7 +412,11 @@ mod tagged_siblings {
         );
         let before = group_messages(adder).len();
         let pin = adder.runtime.epoch_pin(device_group).unwrap();
-        let effects = adder
+        adder.adapter.fail_endpoints_as(
+            vec![TransportEndpoint(RELAY.into())],
+            TransportEndpointFailureKind::PossiblyExposed,
+        );
+        let first = adder
             .runtime
             .send(SendIntent::AppMessage {
                 group_id: device_group.clone(),
@@ -420,6 +425,29 @@ mod tagged_siblings {
             })
             .await
             .unwrap();
+        assert!(
+            first
+                .unresolved_app_messages
+                .iter()
+                .any(|m| m.app_event_id == event.id)
+        );
+        assert!(
+            !adder
+                .runtime
+                .sibling_welcome_send_failed(&owed.id, &carrier)
+                .unwrap()
+        );
+        assert_eq!(
+            adder.runtime.owed_sibling_welcomes(Timestamp(NOW)).unwrap()[0]
+                .carrier
+                .as_deref(),
+            Some(carrier.as_slice())
+        );
+        adder
+            .adapter
+            .fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
+        wall.set(wall.0.load(Ordering::SeqCst) + 3_600);
+        let effects = adder.runtime.resume_outbound_fanouts().await.unwrap();
         assert!(
             effects
                 .published_app_messages
@@ -432,10 +460,11 @@ mod tagged_siblings {
                 .sibling_welcome_delivered(&owed.id, &carrier)
                 .unwrap()
         );
-        let [message] = &group_messages(adder)[before..] else {
-            panic!("one device-group message");
+        let [first, retry] = &group_messages(adder)[before..] else {
+            panic!("the frozen device-group message is attempted twice");
         };
-        message.clone()
+        assert_eq!(first, retry);
+        retry.clone()
     }
 
     /// `sibling` reads `message` in `device_group` and joins the chat through

@@ -26,6 +26,161 @@ use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
 use std::sync::{Arc, Mutex};
 
+/// A valid private KeyPackage whose MLS key differs from the device's tag
+/// key. Another implementation may rotate its MLS signer independently;
+/// device-group.md binds private hand-offs by tag, not by one shared signer.
+fn with_another_mls_key(
+    sibling: &Device,
+    template: &SiblingKeyPackage,
+    roster: &cgka_traits::app_components::DeviceRosterV1,
+) -> SiblingKeyPackage {
+    let parsed = parse_key_package(&template.key_package);
+    let leaf = parsed.leaf_node();
+    let signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).unwrap();
+    let mut dictionary = leaf
+        .extensions()
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    let proof = dictionary
+        .get(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+        .unwrap();
+    let created_at = u64::from_be_bytes(proof[32..40].try_into().unwrap());
+    dictionary.insert(
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        account_identity_proof_component(
+            &pad32(b"bob"),
+            signer.public(),
+            DEFAULT_CIPHERSUITE,
+            DEFAULT_CIPHERSUITE.signature_algorithm(),
+            created_at,
+            proof_signer(b"bob").as_ref(),
+        )
+        .unwrap(),
+    );
+    dictionary.insert(
+        cgka_traits::app_components::DEVICE_TAG_COMPONENT_ID,
+        cgka_engine::device_tag::seal_device_tag(
+            &RustCrypto::default(),
+            &roster.leaf_tag_key,
+            &template.slot,
+            &device_signer(sibling),
+            signer.public(),
+        )
+        .unwrap(),
+    );
+    let mut extensions = leaf.extensions().clone();
+    extensions
+        .add_or_replace(Extension::AppDataDictionary(
+            AppDataDictionaryExtension::new(dictionary),
+        ))
+        .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .key_package_lifetime(*parsed.life_time())
+        .leaf_node_capabilities(leaf.capabilities().clone())
+        .leaf_node_extensions(extensions)
+        .build(
+            DEFAULT_CIPHERSUITE,
+            &OpenMlsRustCrypto::default(),
+            &signer,
+            CredentialWithKey {
+                credential: leaf.credential().clone(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    SiblingKeyPackage {
+        slot: template.slot,
+        key_package: KeyPackage::new(
+            MlsMessageOut::from(bundle.key_package().clone())
+                .tls_serialize_detached()
+                .unwrap(),
+        )
+        .with_protocol_profile(ProtocolProfile::Current),
+    }
+}
+
+/// A selected Add by another sibling defeats an earlier presence read,
+/// including when a device uses different MLS signers for its allocations.
+/// Re-check the slot before a direct send and at a queued Add's actual drain.
+#[tokio::test]
+async fn a_sibling_added_while_its_add_waits_is_not_added_again_at_drain() {
+    // Exercise authenticated-slot detection with both orientations of distinct MLS signers.
+    for existing_uses_distinct_mls_key in [false, true] {
+        let (mut phone, mut devices, device_group) = tagged_devices(b"bob", 2).await;
+        let mut laptop = devices.remove(0);
+        let mut tablet = devices.remove(0);
+        let mut alice = chat_device(b"alice");
+        let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut tablet]).await;
+        let template = handed(&mut laptop, slot(2), slot(1));
+        let roster = super::device_roster::roster_of(&phone, &device_group);
+        let candidate = if existing_uses_distinct_mls_key {
+            template
+        } else {
+            with_another_mls_key(&laptop, &template, &roster)
+        };
+        assert_eq!(
+            phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+            None
+        );
+        let first = handed(&mut laptop, slot(2), slot(3));
+        let first = if existing_uses_distinct_mls_key {
+            with_another_mls_key(&laptop, &first, &roster)
+        } else {
+            first
+        };
+        let add = send_commit(&mut tablet, add_own_devices(&gid, vec![first]), &gid).await;
+        phone
+            .engine
+            .buffer_openmls_convergence_message_at(&gid, add, 1_000)
+            .unwrap();
+        let SendResult::Queued { intent_id, .. } = phone
+            .engine
+            .send(add_own_devices(&gid, vec![candidate.clone()]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected the Add to queue while the competing Add settles")
+        };
+        phone
+            .engine
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        phone.engine.drain_events();
+        let prepared = phone
+            .engine
+            .converge_and_drain_queued_outbound_intents(&gid, 1_000_100)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 0, "a stale queued Add must stage no Commit");
+        assert!(
+            phone
+                .storage
+                .list_queued_outbound_intents(&gid)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(phone.engine.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { intent_id: refused, .. } if *refused == intent_id
+        )));
+        assert!(sibling_rows(&phone, &gid).is_empty());
+        assert_eq!(
+            phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+            Some(SiblingAddRefusal::KeyPackage),
+            "the selected tree already holds this sibling under another MLS key"
+        );
+        assert_refused(
+            phone
+                .engine
+                .send(add_own_devices(&gid, vec![candidate]))
+                .await,
+            "the chat already holds the sibling",
+        );
+    }
+}
+
 /// `device`'s sibling Welcome rows in `gid`.
 fn sibling_rows(device: &Device, gid: &GroupId) -> Vec<(MessageState, StoredMessagePayload)> {
     device
@@ -322,6 +477,170 @@ async fn a_sibling_welcome_fails_with_its_commit() {
         .map(|(state, _)| state)
         .collect();
     assert_eq!(states, vec![MessageState::Failed; 2]);
+}
+
+/// A losing Add can still be selected again. A reopen keeps its Welcome
+/// held, without publishing it or permanently retiring it from a lost event.
+#[tokio::test]
+async fn a_losing_sibling_add_holds_its_welcome_across_restart() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let rival = send_commit(
+        &mut m.alice,
+        SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("selected branch".into()),
+            description: None,
+        },
+        &gid,
+    )
+    .await;
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    let own = send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    assert!(m.bob.engine.carry_sibling_welcome(&id, b"carrier").unwrap());
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    m.bob = super::device_roster::roster_device_on(storage, b"bob");
+    assert!(
+        owed(&m.bob).is_empty(),
+        "unhydrated state holds rather than withdraws"
+    );
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    m.bob.engine.hydrate_all_stored_groups().unwrap();
+    assert_eq!(owed(&m.bob)[0].carrier.as_deref(), Some(&b"carrier"[..]));
+    m.bob.engine.ingest(rival).await.unwrap();
+    m.bob
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        m.bob.engine.stored_message_state(&own.id).unwrap(),
+        Some(MessageState::ConvergenceDeferred)
+    );
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
+    assert!(
+        bob.engine
+            .sibling_welcome_delivered(&id, b"carrier")
+            .unwrap()
+    );
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Processed
+    );
+}
+
+/// Missing evidence and an unsettled chat hold new delivery. Proven terminal
+/// invalidation retires the row durably, even if the origin later reads live.
+#[tokio::test]
+async fn sibling_welcome_origin_unknown_and_settling_hold_but_terminal_retires_after_reopen() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin: cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(origin),
+        ..
+    } = StoredMessagePayload::decode(&m.bob.storage.get_message(&id).unwrap().payload).unwrap()
+    else {
+        panic!("expected a confirmed Add origin");
+    };
+    let commit = m.bob.storage.get_message(&origin).unwrap();
+    m.bob.storage.delete_message(&origin).unwrap();
+    assert!(owed(&m.bob).is_empty());
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    m.bob = super::device_roster::roster_device_on(storage, b"bob");
+    m.bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(!m.bob.engine.carry_sibling_welcome(&id, b"unknown").unwrap());
+    m.bob.storage.put_message(&commit).unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    let SendResult::GroupEvolution { pending, .. } = m
+        .bob
+        .engine
+        .send(SendIntent::SelfUpdate { group_id: gid })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a pending Commit");
+    };
+    assert!(owed(&m.bob).is_empty());
+    assert!(
+        !m.bob
+            .engine
+            .carry_sibling_welcome(&id, b"settling")
+            .unwrap()
+    );
+    m.bob.engine.publish_failed(pending).await.unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    m.bob
+        .storage
+        .update_message_state(&origin, MessageState::EpochInvalidated)
+        .unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    bob.storage.put_message(&commit).unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"retired").unwrap());
+}
+
+/// Development binaries once discarded an outbound Welcome's origin. Such
+/// persisted rows cannot guess that their Add remains selected after upgrade.
+#[tokio::test]
+async fn an_unproven_development_sibling_welcome_is_not_handed_off_after_reopen() {
+    use cgka_traits::message::SiblingWelcomeOrigin;
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    let mut record = m.bob.storage.get_message(&id).unwrap();
+    let mut legacy = StoredMessagePayload::decode(&record.payload).unwrap();
+    let StoredMessagePayload::OutboundSiblingWelcome { origin, .. } = &mut legacy else {
+        panic!("one outbound sibling Welcome");
+    };
+    *origin = SiblingWelcomeOrigin::LegacyUnproven;
+    record.payload = legacy.encode().unwrap();
+    m.bob.storage.put_message(&record).unwrap();
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
 }
 
 /// Each sibling Add the sender cannot back with a sibling Welcome is refused
@@ -693,4 +1012,234 @@ async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
     assert!(queued(&m.bob).is_empty());
     assert!(sibling_rows(&m.bob, &gid).is_empty());
     assert!(owed(&m.bob).is_empty());
+}
+
+/// Creation's one canonical founding Add retains a sibling's private
+/// Welcome separately from the ordinary invitee's transport Welcome. Both
+/// receivers join the same epoch, and the private key is consumed only by
+/// its sibling route.
+#[tokio::test]
+async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let mut unusable = private.clone();
+    unusable.key_package.source = Some(KeyPackageSource {
+        event_id: MessageId::new(vec![7; 32]),
+    });
+    let request = founding_request(vec![public]);
+    let (gid, result) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            request,
+            Vec::new(),
+            vec![unusable, private.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("canonical founding create")
+    };
+    assert_eq!(
+        welcomes.len(),
+        1,
+        "only the other account uses transport delivery"
+    );
+    assert_eq!(creator.engine.group_record(&gid).unwrap().epoch, EpochId(1));
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 3);
+    assert!(load_group(&creator, &gid).pending_commit().is_none());
+    let deliveries = owed(&creator);
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        SiblingWelcome::decode(&deliveries[0].content)
+            .unwrap()
+            .key_package_ref,
+        key_package_ref(&private.key_package)
+    );
+    assert!(matches!(
+        &sibling_rows(&creator, &gid)[..],
+        [(
+            MessageState::Sent,
+            StoredMessagePayload::OutboundSiblingWelcome { .. }
+        )]
+    ));
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
+    );
+    assert_joins_from(&mut siblings[0], &deliveries[0], &gid, &creator).await;
+    assert!(
+        siblings[0]
+            .engine
+            .issued_private_key_packages()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        other.engine.members(&gid).unwrap(),
+        creator.engine.members(&gid).unwrap()
+    );
+}
+
+/// A published KeyPackage never qualifies for the optional private route.
+/// Its omission preserves the ordinary founder and its transport Welcome.
+#[tokio::test]
+async fn an_inadmissible_founding_sibling_does_not_block_other_accounts() {
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let mut private = handed(&mut siblings[0], slot(2), slot(1));
+    private.key_package.source = Some(KeyPackageSource {
+        event_id: MessageId::new(vec![7; 32]),
+    });
+    let (gid, result) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            founding_request(vec![public]),
+            Vec::new(),
+            vec![private],
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("canonical ordinary creation despite optional sibling refusal")
+    };
+    assert_eq!(welcomes.len(), 1);
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
+    );
+    assert!(sibling_rows(&creator, &gid).is_empty());
+    assert!(owed(&creator).is_empty());
+}
+
+fn founding_request(members: Vec<KeyPackage>) -> CreateGroupRequest {
+    use cgka_traits::app_components::{
+        NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+    };
+    CreateGroupRequest {
+        name: "founding siblings".into(),
+        description: String::new(),
+        members,
+        required_features: Vec::new(),
+        initial_admins: Vec::new(),
+        app_components: vec![AppComponentData {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            data: encode_nostr_routing_v1(
+                &NostrRoutingV1::new([0x43; 32], vec![RELAY.to_owned()]).unwrap(),
+            )
+            .unwrap(),
+        }],
+    }
+}
+
+/// Explicit founding siblings never bypass the ordinary founders' component
+/// negotiation: if another account's client lacks account-devices, the chat
+/// may still be created as before, but never with these sibling additions.
+#[tokio::test]
+async fn founding_siblings_cannot_bypass_the_other_founders_capabilities() {
+    use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = device_advertising(
+        b"bob",
+        &[NOSTR_ROUTING_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+    );
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let request = founding_request(vec![public]);
+    let (gid, _) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(request, Vec::new(), vec![private], None)
+        .await
+        .unwrap();
+    assert!(!requires_account_devices(&creator.engine, &gid));
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert!(owed(&creator).is_empty());
+}
+
+/// Eligibility can end after a caller selected private stock. The engine's
+/// authoritative clock omits that sibling before staging; the ordinary
+/// founder still receives and joins its canonical Welcome.
+#[tokio::test]
+async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
+    struct AtTime(u64);
+    impl cgka_traits::maintenance::WallClock for AtTime {
+        fn now(&self) -> Timestamp {
+            Timestamp(self.0)
+        }
+        fn now_ms(&self) -> u64 {
+            self.0 * 1_000
+        }
+    }
+    impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
+        fn next_u64(&self) -> u64 {
+            0
+        }
+    }
+    let (creator, mut siblings, device_group) = tagged_devices(b"alice", 1).await;
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let not_after = cgka_engine::key_package::key_package_metadata(&private.key_package)
+        .unwrap()
+        .not_after;
+    let Device { engine, storage } = creator;
+    drop(engine);
+    let clock = Arc::new(AtTime(not_after));
+    let mut supported: Vec<_> = default_group_components().into_iter().collect();
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
+    ]);
+    let mut engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .supported_app_components(supported)
+        .peeler(Box::<MockPeeler>::default())
+        .maintenance_sources(clock.clone(), clock)
+        .build()
+        .unwrap();
+    engine.hydrate_all_stored_groups().unwrap();
+    engine.set_device_tag_group(Some(device_group)).unwrap();
+    let mut creator = Device { engine, storage };
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let (gid, result) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            founding_request(vec![public]),
+            Vec::new(),
+            vec![private],
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("ordinary founding creation")
+    };
+    assert_eq!(welcomes.len(), 1);
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
+    );
+    assert!(sibling_rows(&creator, &gid).is_empty());
 }

@@ -87,7 +87,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one
-    (3.5b-2), for the app's 461 sender. The request and hand-off checks read device tags through `member_device_tag_claim_at`.
+    (3.5b-2), for the app's 461 sender. A live retry keeps its carrier association even when the app reports an
+    ambiguous send failure (3.5f); already-handed-off fanout finishes under the ordinary transport contract.
+    Carried-row settlement is separate from Ready-filtered new-send eligibility, so exact carrier outcomes settle
+    even while the originating chat is unhydrated, deferred, or settling.
+    The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

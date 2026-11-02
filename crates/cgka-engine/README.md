@@ -73,6 +73,16 @@ atomic require-and-populate API.
 
 ## Background recovery
 
+**Experimental sibling Welcome delivery.** A retained sibling Welcome records the exact confirmed Add that produced
+it, or canonical creation for a founding sibling (mdk#2628 3.5d).
+Before a new carrier is created, owed-work and carrier transitions check
+that origin from stored state. A deferred Add holds delivery because its branch may be selected again; terminal
+invalidation or a terminal chat retires the old Welcome. The association and terminal condition survive restart.
+An already handed-off carrier finishes under its transport's publication rules and may arrive after branch loss.
+Exact existing-carrier outcomes still settle while its origin is held. Older development rows without an origin
+are retired rather than guessed; re-add the sibling to affected chats to recreate pending old delivery work after
+upgrading.
+
 **Resumable candidate reconstruction.** Live convergence and background deferred peeling retain candidate-search
 progress between calls. Each evaluator slice admits at most 32 probes and observes the caller's cooperative time
 budget; a started probe always finishes. Live state is restored before the evaluator returns pending work, and

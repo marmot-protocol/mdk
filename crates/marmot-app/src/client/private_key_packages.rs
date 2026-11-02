@@ -198,6 +198,9 @@ impl AppClient {
             .collect::<Result<Vec<_>, AppError>>()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let kept = storage.insert_received_private_key_packages(&received)?;
+        if kept > 0 {
+            self.sibling_gap_stock_arrived(&hand_off.from);
+        }
         tracing::debug!(
             target: TRACE_TARGET,
             method = "receive_key_package_hand_off",
@@ -863,18 +866,14 @@ impl AppClient {
         }
         let result = self
             .runtime
-            .owed_sibling_welcomes(Timestamp(0))
+            .carried_sibling_welcomes()
             .map_err(AppError::from)
-            .and_then(|owed| {
-                for owed in owed {
-                    let Some(carrier) = owed.carrier else {
-                        continue;
-                    };
+            .and_then(|carried| {
+                for (id, carrier) in carried {
                     if published.contains(&carrier) {
-                        self.runtime.sibling_welcome_delivered(&owed.id, &carrier)?;
+                        self.runtime.sibling_welcome_delivered(&id, &carrier)?;
                     } else if failed.contains(&carrier) {
-                        self.runtime
-                            .sibling_welcome_send_failed(&owed.id, &carrier)?;
+                        self.runtime.sibling_welcome_send_failed(&id, &carrier)?;
                     }
                 }
                 Ok(())
