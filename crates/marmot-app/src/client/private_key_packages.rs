@@ -696,10 +696,6 @@ impl AppClient {
         sibling: &DeviceSlotId,
         now: u64,
     ) -> Result<(), AppError> {
-        // Recompute only the chat-derived upper bound. A held/uncertain chat
-        // cannot justify an old burst, while healthy chats and baseline stock
-        // still progress. Never reset the request clock or cancel a carrier.
-        let (cap, chat_error) = self.invitation_chat_stock_cap(exchange, *sibling)?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let issuer_slot_hex = hex::encode(sibling);
         let usable = storage
@@ -708,21 +704,32 @@ impl AppClient {
             .filter(|record| record.issuer_slot_hex == issuer_slot_hex && record.usable_at(now))
             .count();
         let need = storage.private_key_package_need(&issuer_slot_hex)?;
-        let wanted = need
-            .as_ref()
-            .map_or(1, |need| need.need)
-            .min(cap.unwrap_or(u32::MAX));
-        if usable >= wanted as usize {
+        let recorded_want = need.as_ref().map_or(1, |need| need.need);
+        // Normal cleanup is based on the original recorded need. A temporary
+        // narrower cap must retain its clock for a later acceptance.
+        if usable >= recorded_want as usize {
             if need.is_some() {
                 storage.delete_private_key_package_need(&issuer_slot_hex)?;
             }
-            return chat_error.map_or(Ok(()), Err);
+            return Ok(());
         }
         if need
             .as_ref()
             .and_then(|need| need.requested_at)
             .is_some_and(|requested_at| now < requested_at.saturating_add(REQUEST_INTERVAL_SECS))
         {
+            return Ok(());
+        }
+        // Consult chats only for an otherwise-new burst; baseline, satisfied
+        // and throttled requests need no chat reads. Unreadable chats justify
+        // no burst while healthy chats and the baseline continue independently.
+        let (cap, chat_error) = if recorded_want > 1 {
+            self.invitation_chat_stock_cap(exchange, *sibling)?
+        } else {
+            (None, None)
+        };
+        let wanted = recorded_want.min(cap.unwrap_or(u32::MAX));
+        if usable >= wanted as usize {
             return chat_error.map_or(Ok(()), Err);
         }
         let want = wanted
@@ -735,7 +742,7 @@ impl AppClient {
         };
         storage.put_private_key_package_need(&PrivateKeyPackageNeed {
             issuer_slot_hex: issuer_slot_hex.clone(),
-            need: wanted,
+            need: recorded_want,
             requested_at: Some(now),
         })?;
         if !self

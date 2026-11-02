@@ -209,6 +209,7 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
     use base64::Engine as _;
+    use cgka_traits::storage::GroupStorage as _;
     use marmot_session::{KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, PrivateKeyPackageHandOff};
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
@@ -360,12 +361,7 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
         tablet_issued, 10,
         "the independent healthy slot's baseline request proceeds"
     );
-    assert!(
-        stock
-            .private_key_package_need(&laptop.slot_hex())
-            .unwrap()
-            .is_none()
-    );
+    let narrowed_unrequested = stock.private_key_package_need(&laptop.slot_hex()).unwrap();
     assert_eq!(
         stock
             .private_key_package_need(&tablet.slot_hex())
@@ -376,6 +372,103 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
     );
     assert_eq!(held_from(&phone, &laptop), 2);
     assert_eq!(taken_from(&phone, &laptop), 0);
+
+    // Tablet learns the actual original decisions, then carries later
+    // retained winners. A new permitted burst publishes a real request;
+    // decline/reaccept must never erase its original hour-throttle clock.
+    phone.client.drive_small_state().await;
+    deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    let mut requested_at = None;
+    for (version, declined) in [(2, false), (3, true), (4, false)] {
+        let decisions: Vec<_> = pending
+            .iter()
+            .map(|chat| {
+                let chat_hex = hex::encode(chat.as_slice());
+                let generation = phone
+                    .app
+                    .account_storage("alice")
+                    .unwrap()
+                    .invitation_admission(chat)
+                    .unwrap()
+                    .unwrap()
+                    .generation;
+                assert!(
+                    tablet
+                        .app
+                        .account_storage("alice")
+                        .unwrap()
+                        .app_storage()
+                        .invitation_decision(&chat_hex, &generation)
+                        .unwrap()
+                        .is_some()
+                );
+                storage_sqlite::InvitationDecision {
+                    group_id_hex: chat_hex,
+                    generation,
+                    version,
+                    declined,
+                }
+            })
+            .collect();
+        let [(content, _)] = <[_; 1]>::try_from(
+            crate::small_state::encode_invitation_decision_updates(&decisions),
+        )
+        .unwrap();
+        assert!(
+            tablet
+                .client
+                .send_device_group_message(
+                    &group,
+                    crate::small_state::KIND_SMALL_STATE_UPDATE,
+                    content
+                )
+                .await
+                .unwrap()
+        );
+        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+        for decision in &decisions {
+            assert_eq!(
+                stock
+                    .invitation_decision(&decision.group_id_hex, &decision.generation)
+                    .unwrap(),
+                Some(decision.clone())
+            );
+        }
+        // Same three actual missing-chat obligations, without admitting an
+        // Add here: stock remains two and this owner measures request clocks.
+        if !declined {
+            phone
+                .client
+                .want_private_key_packages(&laptop_slot, 3)
+                .unwrap();
+        }
+        let before = relay.published_event_ids().len();
+        phone.client.sibling_key_package_upkeep(&[]).await;
+        let current = stock
+            .private_key_package_need(&laptop.slot_hex())
+            .unwrap()
+            .expect("a reduced cap must not clear an unmet original burst");
+        assert_eq!(current.need, 3);
+        if version == 2 {
+            assert!(current.requested_at.is_some());
+            assert!(
+                relay.published_event_ids().len() > before,
+                "the permitted burst really publishes a request"
+            );
+            requested_at = current.requested_at;
+        } else {
+            assert_eq!(current.requested_at, requested_at);
+            assert_eq!(
+                relay.published_event_ids().len(),
+                before,
+                "decline/reaccept must preserve the original request throttle"
+            );
+        }
+    }
+    let narrowed_unrequested =
+        narrowed_unrequested.expect("unmet raw need is retained even before a first request");
+    assert_eq!(narrowed_unrequested.need, 3);
+    assert!(narrowed_unrequested.requested_at.is_none());
 }
 
 /// A real pending admin invitation can be declined while ordinary Leave is
