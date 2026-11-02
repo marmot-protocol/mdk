@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
+  D81). Migration 0165 drops the unused `cgka_announced_key_packages` table
+  and its age index; migration 0144 stays unchanged. Device rosters and the
+  own-slot compromise warning are unaffected.
+
 - Methods with no caller outside their own tests are gone (mdk#2816):
   `SqliteAppStorage::remove_group_push_token`,
   `remove_group_push_tokens_for_member` (use

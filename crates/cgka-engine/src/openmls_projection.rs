@@ -15,7 +15,7 @@ use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload};
-use cgka_traits::storage::{AnnouncedKeyPackage, RosterTagKey, StorageError, StorageProvider};
+use cgka_traits::storage::{RosterTagKey, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::{
@@ -346,10 +346,6 @@ struct OpenMlsReplayOutput {
     final_epoch: u64,
     final_members: Vec<Member>,
     epoch_authenticators: BTreeMap<u64, String>,
-    /// What each roster state a canonical apply reached announced, for the
-    /// caller to record in the apply's transaction (mdk#2628 D31 item 7).
-    /// Empty for a candidate probe.
-    announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
     /// The tag signature keys each roster state a canonical apply reached
     /// listed, in the order it reached them, for the caller to record in the
     /// apply's transaction (mdk#2761). Empty for a candidate probe.
@@ -367,7 +363,6 @@ pub(crate) struct AppliedGroupChanges {
 pub(crate) struct OpenMlsApplyOutput {
     pub(crate) observations: Vec<OpenMlsReplayObservation>,
     pub(crate) group_changes: Vec<AppliedGroupChanges>,
-    pub(crate) announced_key_packages: BTreeSet<AnnouncedKeyPackage>,
     pub(crate) roster_tag_keys: Vec<RosterTagKey>,
 }
 
@@ -2672,9 +2667,8 @@ fn probe_candidate_path<S: StorageProvider>(
 
 /// Apply the selected stored branch with rollback protection and retain replay anchors.
 /// Returns the stable public replay observations; engine presentation deltas stay internal.
-/// The announced KeyPackages the apply collects are dropped too: only the engine's
-/// convergence pass records them (`announced_key_packages.rs`), as it does the
-/// roster tag keys (`roster_tag_keys.rs`).
+/// The roster tag keys the apply collects are dropped too: only the engine's
+/// convergence pass records them (`roster_tag_keys.rs`).
 pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3159,7 +3153,6 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
         Ok(OpenMlsApplyOutput {
             observations: output.observations,
             group_changes: output.group_changes,
-            announced_key_packages: output.announced_key_packages,
             roster_tag_keys: output.roster_tag_keys,
         })
     })
@@ -3730,7 +3723,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
 
     let mut observations = Vec::new();
     let mut group_changes = Vec::new();
-    let mut announced_key_packages = BTreeSet::new();
     let mut roster_tag_keys = Vec::new();
     let mut epoch_authenticators = BTreeMap::from([(
         mls_group.epoch().as_u64(),
@@ -3848,9 +3840,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             if let Some(max_rewind) = retain_replayed_anchors {
                 crate::maintenance::require_replay_rotation(storage, group_id, &mls_group)
                     .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
-                announced_key_packages.extend(crate::announced_key_packages::roster_announcements(
-                    &mls_group,
-                ));
                 roster_tag_keys.extend(crate::roster_tag_keys::roster_tag_keys(&mls_group));
                 let intermediate = OpenMlsReplayOutput {
                     observations: Vec::new(),
@@ -3858,7 +3847,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     final_epoch: resulting_epoch,
                     final_members: marmot_members(&mls_group),
                     epoch_authenticators: BTreeMap::new(),
-                    announced_key_packages: BTreeSet::new(),
                     roster_tag_keys: Vec::new(),
                 };
                 update_group_record_from_replay(storage, group_id, &intermediate)?;
@@ -4181,9 +4169,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     // Persist every resulting epoch, not only the final tip:
                     // input held for the next generation can still fork from
                     // any intermediate epoch inside the rewind horizon.
-                    announced_key_packages.extend(
-                        crate::announced_key_packages::roster_announcements(&mls_group),
-                    );
                     roster_tag_keys.extend(crate::roster_tag_keys::roster_tag_keys(&mls_group));
                     let intermediate = OpenMlsReplayOutput {
                         observations: Vec::new(),
@@ -4191,7 +4176,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         final_epoch: mls_group.epoch().as_u64(),
                         final_members: marmot_members(&mls_group),
                         epoch_authenticators: BTreeMap::new(),
-                        announced_key_packages: BTreeSet::new(),
                         roster_tag_keys: Vec::new(),
                     };
                     update_group_record_from_replay(storage, group_id, &intermediate)?;
@@ -4309,7 +4293,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
         epoch_authenticators,
-        announced_key_packages,
         roster_tag_keys,
     })
 }

@@ -199,12 +199,6 @@ impl<S: StorageProvider> Engine<S> {
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
-                    crate::announced_key_packages::record_roster_announcements(
-                        storage,
-                        &group_id,
-                        &mls_group,
-                        self.wall_clock.now(),
-                    )?;
                     crate::roster_tag_keys::record_roster_tag_keys(
                         storage,
                         &group_id,
