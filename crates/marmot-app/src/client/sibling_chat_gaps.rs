@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
-use cgka_traits::engine::{GroupEvent, SiblingKeyPackage};
+use cgka_traits::engine::GroupEvent;
 use cgka_traits::{EpochId, GroupId};
 use serde::{Deserialize, Serialize};
 
@@ -447,20 +447,11 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
-            let Some(key_package) = self.next_private_key_package(slot)? else {
+            if self
+                .next_private_key_package_for_chat(chat, slot)?
+                .is_none()
+            {
                 self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                continue;
-            };
-            if let Some(refusal) = self.runtime.sibling_add_refusal(
-                chat,
-                &SiblingKeyPackage {
-                    slot: *slot,
-                    key_package,
-                },
-            )? {
-                if refusal == cgka_traits::error::SiblingAddRefusal::KeyPackage {
-                    self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                }
                 continue;
             }
             let Some(content) = Claim::content(exchange.own_slot, *slot, chat) else {
@@ -508,28 +499,15 @@ impl AppClient {
             {
                 continue;
             }
-            // Sending the claim may have advanced local effects. Validate
-            // the stock selected now, immediately before the existing take.
-            let Some(key_package) = self.next_private_key_package(slot)? else {
+            // Sending the claim may have advanced local effects. Select
+            // compatible stock again and pass that exact record to the Add;
+            // a clock/preference change cannot consume another allocation.
+            let Some(candidate) = self.next_private_key_package_for_chat(chat, slot)? else {
                 self.sibling_chat_gaps.waiting_for_stock.insert(gap);
                 continue;
             };
-            if self
-                .runtime
-                .sibling_add_refusal(
-                    chat,
-                    &SiblingKeyPackage {
-                        slot: *slot,
-                        key_package,
-                    },
-                )?
-                .is_some()
-            {
-                self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                continue;
-            }
             *budget -= 1;
-            self.add_sibling_to_chat(chat, slot).await?;
+            self.add_sibling_to_chat(chat, slot, candidate).await?;
             self.sibling_chat_gaps
                 .waiting_for_stock
                 .remove(&(chat.clone(), *slot));

@@ -125,6 +125,37 @@ impl SqliteAppStorage {
         Ok(Some(taken))
     }
 
+    /// Claim exactly the received record the caller validated, if it is still
+    /// held, unchanged and unexpired at `now`. Never substitute another row
+    /// when ranking changes or the selected record is no longer eligible.
+    /// The single atomic update keeps the used ref and erases its bytes, as
+    /// [`Self::take_received_private_key_package`] does.
+    pub fn take_received_private_key_package_exact(
+        &self,
+        candidate: &ReceivedPrivateKeyPackage,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let taken = self
+            .lock()?
+            .execute_cached(
+                "UPDATE private_key_packages_received SET taken_at = ?7, key_package = X''
+             WHERE key_package_ref_hex = ?1 AND issuer_slot_hex = ?2
+               AND not_before = ?3 AND not_after = ?4 AND key_package = ?5
+               AND received_at = ?6 AND taken_at IS NULL AND not_after > ?7",
+                params![
+                    candidate.key_package_ref_hex,
+                    candidate.issuer_slot_hex,
+                    u64_to_i64(candidate.not_before)?,
+                    u64_to_i64(candidate.not_after)?,
+                    candidate.key_package,
+                    u64_to_i64(candidate.received_at)?,
+                    u64_to_i64(now)?,
+                ],
+            )
+            .storage()?;
+        Ok(taken == 1)
+    }
+
     /// Discard every handed-over KeyPackage that expired by `now`. Returns
     /// how many went.
     pub fn delete_expired_received_private_key_packages(&self, now: u64) -> StorageResult<usize> {
@@ -364,6 +395,117 @@ mod tests {
             2
         );
         assert!(store.received_private_key_packages().unwrap().is_empty());
+    }
+
+    /// Selection may cross halfway while its candidate is checked. Claiming
+    /// that candidate must not spend the newly preferred allocation instead.
+    #[test]
+    fn exact_claim_does_not_rerank_across_halfway() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let a = received("a", "aa", 0);
+        let b = received("b", "aa", 10);
+        store
+            .insert_received_private_key_packages(&[a.clone(), b.clone()])
+            .unwrap();
+        let candidate = store
+            .next_received_private_key_package("aa", 49)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate, a);
+        assert_eq!(
+            store.next_received_private_key_package("aa", 50).unwrap(),
+            Some(b.clone())
+        );
+        assert!(
+            store
+                .take_received_private_key_package_exact(&candidate, 50)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .take_received_private_key_package_exact(&candidate, 50)
+                .unwrap()
+        );
+        assert_eq!(store.received_private_key_packages().unwrap(), vec![b]);
+    }
+
+    /// An exact claim is fenced on the complete received record, expiry and
+    /// unused state. A failed or repeated claim never consumes other stock.
+    #[test]
+    fn exact_claim_refuses_stale_records_without_spending_other_stock() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let a = received("a", "aa", 0);
+        let b = received("b", "aa", 10);
+        let held = vec![a.clone(), b.clone()];
+        store.insert_received_private_key_packages(&held).unwrap();
+        let mut mismatches = vec![a.clone(); 6];
+        mismatches[0].key_package_ref_hex = "b".into();
+        mismatches[1].issuer_slot_hex = "bb".into();
+        mismatches[2].not_before = 1;
+        mismatches[3].not_after = 101;
+        mismatches[4].key_package.push(4);
+        mismatches[5].received_at = 1;
+        for candidate in mismatches {
+            assert!(
+                !store
+                    .take_received_private_key_package_exact(&candidate, 20)
+                    .unwrap()
+            );
+            assert_eq!(store.received_private_key_packages().unwrap(), held);
+        }
+        assert!(
+            !store
+                .take_received_private_key_package_exact(&a, 100)
+                .unwrap()
+        );
+        assert_eq!(store.received_private_key_packages().unwrap(), held);
+        // A failed write is atomic too: the candidate and every other row
+        // remain available, rather than falling back after the failure.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_exact_take AFTER UPDATE ON private_key_packages_received
+             BEGIN SELECT RAISE(ABORT, 'exact claim refused'); END;",
+            )
+            .unwrap();
+        let error = store
+            .take_received_private_key_package_exact(&b, 100)
+            .unwrap_err();
+        assert!(
+            matches!(error, cgka_traits::storage::StorageError::Backend(ref message)
+            if message.contains("exact claim refused")),
+            "{error}"
+        );
+        assert_eq!(store.received_private_key_packages().unwrap(), held);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_exact_take")
+            .unwrap();
+        assert!(
+            store
+                .take_received_private_key_package_exact(&b, 100)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .take_received_private_key_package_exact(&b, 100)
+                .unwrap()
+        );
+        assert_eq!(store.received_private_key_packages().unwrap(), vec![a]);
+        assert_eq!(store.insert_received_private_key_packages(&[b]).unwrap(), 0);
+        let remaining_bytes: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT length(key_package) FROM private_key_packages_received
+             WHERE key_package_ref_hex = 'b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_bytes, 0);
     }
 
     /// A KeyPackage this device used is not kept again when it is handed over
