@@ -129,6 +129,18 @@ impl AppClient {
         Ok(Some(group))
     }
 
+    fn invitation_generation_matches(
+        &self,
+        group_id: &GroupId,
+        generation: &[u8; 32],
+    ) -> Result<bool, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .invitation_admission(group_id)?
+            .is_some_and(|admission| admission.generation == *generation))
+    }
+
     /// Recheck after the Leave path's sync, immediately before handing work
     /// to the native owner. A newer accept cancels unrequested work only.
     pub(super) fn invitation_decline_is_current(
@@ -137,10 +149,7 @@ impl AppClient {
     ) -> Result<bool, AppError> {
         let group_id = GroupId::new(hex::decode(&expected.group_id_hex)?);
         let account = self.app.account_storage(&self.state.label)?;
-        let matches = account
-            .invitation_admission(&group_id)?
-            .is_some_and(|admission| admission.generation == expected.generation);
-        if !matches {
+        if !self.invitation_generation_matches(&group_id, &expected.generation)? {
             return Ok(false);
         }
         if account.leave_request(&group_id)?.is_some() {
@@ -185,10 +194,7 @@ impl AppClient {
         let group_id = GroupId::new(hex::decode(&decision.group_id_hex)?);
         let account = self.app.account_storage(&self.state.label)?;
         let storage = account.app_storage();
-        if account
-            .invitation_admission(&group_id)?
-            .is_none_or(|admission| admission.generation != decision.generation)
-        {
+        if !self.invitation_generation_matches(&group_id, &decision.generation)? {
             // Retain the value, with no work until an exact native admission
             // re-arms it. Unknown values never cause a join or a fetch.
             storage.defer_uninstalled_invitation_decision(decision)?;
