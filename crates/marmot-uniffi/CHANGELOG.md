@@ -188,6 +188,11 @@
 
 ### Changed
 
+- Every text send queued while offline publishes as soon as the host reports
+  restored connectivity, not only the first (mdk#2762). Later sends no longer
+  wait out a retry clock of up to an hour behind it, also after a cold start
+  that is already online or a transport reopen, which get no connectivity
+  report from the host.
 - `removed_device_leftover_chats` also counts chats that keep the leaf of a
   device the account's device group stopped listing without a removal, such
   as after a failed link (mdk#2761). Release builds hold no device group, so

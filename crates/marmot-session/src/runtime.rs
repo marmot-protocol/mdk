@@ -1106,6 +1106,11 @@ where
         self.session.outbound_fanouts_for_group(group_id)
     }
 
+    /// Groups holding a stored frozen fanout, including unhydrated ones (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        self.session.outbound_fanout_group_ids()
+    }
+
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
         self.session.put_outbound_fanout(fanout)
     }
@@ -3941,6 +3946,7 @@ where
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
+        let mut earliest = None;
         for fanout in self.session.outbound_fanouts_for_group(group_id)? {
             let outcome = fanout.outcome();
             if outcome.accepted_targets > 0
@@ -3957,19 +3963,27 @@ where
                 }
                 continue;
             }
-            let mut earliest = None;
             for index in fanout.outstanding_target_indexes() {
                 if let Some(delay_ms) = frozen_fanout_target_retry_delay_ms(&fanout, index, now_ms)
                 {
                     earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
                 }
             }
-            // The first incomplete fanout is the group-scoped ordering
-            // barrier, so later NotAttempted records cannot pull this cutoff
-            // forward and cause a scheduler polling loop.
-            return Ok(earliest);
+            // The first fanout still below its required acknowledgements, or
+            // awaiting MLS confirmation, is the group-scoped ordering barrier,
+            // so later NotAttempted records cannot pull this cutoff forward and
+            // cause a scheduler polling loop. A fanout that met quorum and owes
+            // only secondary replication is not a barrier: the fanouts behind
+            // it are driven in the same pass, so their clocks count too
+            // (mdk#2762).
+            let outcome = fanout.outcome();
+            if matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || outcome.accepted_targets < fanout.request().required_acks.max(1)
+            {
+                return Ok(earliest);
+            }
         }
-        Ok(None)
+        Ok(earliest)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -4253,6 +4267,22 @@ where
         Ok(())
     }
 
+    /// Whether the owner has asked the current pass to yield dispensable
+    /// secondary relay work to a waiting foreground send.
+    fn secondary_retry_yield_requested(&self) -> bool {
+        self.publication_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|progress| {
+                progress
+                    .secondary_retry_yield
+                    .clone()
+                    .now_or_never()
+                    .is_some()
+            })
+    }
+
     async fn resume_outbound_fanouts_for_group(
         &mut self,
         group_id: Option<&GroupId>,
@@ -4280,12 +4310,20 @@ where
                     Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None))
                         .await?;
                 if status.retry_deferred
+                    && (!status.met_required_acks || self.secondary_retry_yield_requested())
                     && let Some(fanout_group) = fanout_group
                 {
                     // Preserve per-group staging order. An older exact event
-                    // that is still in durable backoff is a barrier for newer
-                    // fanouts in this group, but must not block unrelated
-                    // groups during an account-wide drain.
+                    // that is still in durable backoff below its required
+                    // acknowledgements is a barrier for newer fanouts in this
+                    // group, but must not block unrelated groups during an
+                    // account-wide drain. Secondary replication after quorum
+                    // is not a barrier, as for queued intents: a send one relay
+                    // accepted must not hold later sends behind another
+                    // relay's backoff of up to an hour (mdk#2762). Once the
+                    // owner asks secondary work to yield for a foreground
+                    // send, the pass stops here as before, so it does not go
+                    // on to wait on later fanouts' stalled relays instead.
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {

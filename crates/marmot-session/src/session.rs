@@ -1820,6 +1820,11 @@ impl AccountDeviceSession {
         Ok(self.engine.outbound_fanouts_for_group(group_id)?)
     }
 
+    /// Groups holding a stored frozen fanout, including unhydrated ones (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        Ok(self.engine.outbound_fanout_group_ids()?)
+    }
+
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> SessionResult<()> {
         self.engine.delete_outbound_fanout(message_id)?;
         Ok(())

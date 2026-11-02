@@ -34,7 +34,6 @@
 
 mod account_devices_activation;
 pub mod account_identity_proof;
-mod announced_key_packages;
 pub mod app_components;
 
 pub(crate) mod app_payload;

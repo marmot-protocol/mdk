@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
-use crate::client::sign_ins::{Announcement, SlotOutcome};
+use crate::client::sign_ins::SlotOutcome;
 use crate::{
     CompromiseWarningReason, ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn,
     UnrecognizedSignInState,
@@ -628,12 +628,7 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     // The laptop it linked is a roster device now, and leaves the list.
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     let report = phone.check_sign_ins().await.unwrap();
-    assert_eq!(
-        report.slots[&laptop_slot],
-        SlotOutcome::KnownDevice {
-            announced: Announcement::Matches
-        }
-    );
+    assert_eq!(report.slots[&laptop_slot], SlotOutcome::KnownDevice);
 }
 
 /// Rejecting a sign-in in a device group is one roster commit. A sibling

@@ -2414,12 +2414,6 @@ impl<S: StorageProvider> Engine<S> {
                     None
                 };
                 storage.put_convergence_pass(&completed_pass)?;
-                crate::announced_key_packages::record_announcements(
-                    storage,
-                    group_id,
-                    &output.announced_key_packages,
-                    self.wall_clock.now(),
-                )?;
                 crate::roster_tag_keys::record_tag_keys(
                     storage,
                     group_id,

@@ -902,12 +902,6 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
-                        crate::announced_key_packages::record_roster_announcements(
-                            storage,
-                            &group_id,
-                            &mls_group,
-                            enrolled_at,
-                        )?;
                         crate::roster_tag_keys::record_roster_tag_keys(
                             storage,
                             &group_id,
@@ -1799,9 +1793,6 @@ impl<S: StorageProvider> Engine<S> {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
-            crate::announced_key_packages::record_roster_announcements(
-                storage, &group_id, &mls_group, joined_at,
-            )?;
             crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
             )?;
