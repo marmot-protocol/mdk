@@ -1560,7 +1560,13 @@ async fn linked_devices() -> (Devices, GroupId) {
 /// Each new KeyPackage is announced before it is published, and both devices
 /// see every roster commit.
 async fn tagging_devices() -> (Devices, GroupId) {
-    let (mut devices, group) = linked_devices().await;
+    let (devices, group) = linked_devices().await;
+    tag_linked_devices(devices, group).await
+}
+
+/// Tag an already linked pair, including chats it established before private
+/// stock was available. Later-Add tests keep those chats as their input.
+async fn tag_linked_devices(mut devices: Devices, group: GroupId) -> (Devices, GroupId) {
     let start = devices.relay.published_events.lock().unwrap().len();
     let (mut phone_cursor, mut laptop_cursor) = (start, start);
     devices.laptop.run_due_maintenance().await.unwrap();
@@ -1579,6 +1585,25 @@ async fn tagging_devices() -> (Devices, GroupId) {
         );
     }
     (devices, group)
+}
+
+/// Chats already held before the laptop tags and receives private stock.
+/// Creating them later would now put the phone in their founding Adds (3.5d),
+/// while these tests own the later-Add and sibling-Welcome contracts.
+async fn tagging_devices_with_chats<const N: usize>() -> (Devices, GroupId, [GroupId; N]) {
+    let (mut devices, group) = linked_devices().await;
+    let mut chats = Vec::with_capacity(N);
+    for _ in 0..N {
+        chats.push(
+            devices
+                .laptop
+                .create_group("existing chat", &[])
+                .await
+                .unwrap(),
+        );
+    }
+    let (devices, group) = tag_linked_devices(devices, group).await;
+    (devices, group, chats.try_into().unwrap())
 }
 
 fn own_slot(client: &AppClient) -> String {

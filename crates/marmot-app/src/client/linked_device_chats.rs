@@ -1,4 +1,6 @@
-//! Adding a newly linked device to this device's chats (mdk#2628 3.5c, D70).
+//! Adding linked siblings to chats (mdk#2628 3.5c/3.5d, D14/D70).
+//! A new chat includes eligible siblings from private stock in its founding
+//! Add; the post-link pass below handles older chats the approver already holds.
 //!
 //! Once a link this device approved is made, this device, and only it, adds
 //! the new device to each of its chats that takes a same-account Add, when
@@ -175,6 +177,107 @@ impl AppClient {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Private KeyPackages for a new chat's founding Add (3.5d). The
+    /// old-chat opt-in never excludes a sibling from a newly created chat.
+    /// Missing stock is requested for a later use, never looked up in
+    /// public slots. Reads/admission finish before taking any KeyPackage;
+    /// once taken it is never put back, including after a failed creation.
+    pub(crate) fn founding_sibling_key_packages(
+        &mut self,
+        request: &cgka_traits::engine::CreateGroupRequest,
+        optional_components: &[cgka_traits::app_components::AppComponentData],
+        constructable: &cgka_traits::capabilities::GroupCapabilities,
+        relays: &[String],
+    ) -> Result<Vec<SiblingKeyPackage>, AppError> {
+        use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, default_group_components};
+        if !self.app.device_groups_enabled()
+            || !cgka_traits::app_components::valid_sibling_welcome_relays(relays)
+            || self.runtime.new_protocol_profile() != cgka_traits::group::ProtocolProfile::Current
+            || !constructable
+                .app_components
+                .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+        {
+            return Ok(Vec::new());
+        }
+        let Some(exchange) = self.device_group_exchange()? else {
+            return Ok(Vec::new());
+        };
+        if !exchange.tagged || self.epoch_gap_held_groups()?.contains(&exchange.group_id) {
+            return Ok(Vec::new());
+        }
+        let excluded = self.excluded_sibling_slots(&exchange)?;
+        let requirements = self
+            .runtime
+            .create_key_package_requirements(request)
+            .map_err(marmot_session::SessionError::from)?;
+        // This is advisory selection only. The engine fixes its requirements
+        // before adding these siblings and checks them again. Default
+        // components negotiate only when all ordinary founders support them;
+        // explicit requirements and the selected image must stay supported.
+        let mut fixed = default_group_components()
+            .into_iter()
+            .filter(|id| constructable.app_components.contains(*id))
+            .collect::<std::collections::BTreeSet<_>>();
+        fixed.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        fixed.extend(
+            request
+                .app_components
+                .iter()
+                .map(|entry| entry.component_id),
+        );
+        fixed.extend(optional_components.iter().map(|entry| entry.component_id));
+        let account = self.app.account_home().account(&self.state.label)?;
+        let account = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex)?);
+        let mut selected = Vec::new();
+        for slot in exchange.siblings() {
+            let entry = &exchange.roster.devices[&slot];
+            if excluded.contains(&slot)
+                || !matches!(
+                    entry.status,
+                    DeviceStatusV1::Active | DeviceStatusV1::Inactive
+                )
+                || entry.tag_signature_key.is_none()
+            {
+                continue;
+            }
+            let Some(key_package) = self.next_private_key_package(&slot)? else {
+                self.want_private_key_packages(&slot, 1)?;
+                continue;
+            };
+            let valid = marmot_session::validate_received_private_key_package(
+                &key_package,
+                &account,
+                &exchange.roster,
+                &slot,
+                unix_now_seconds(),
+            )
+            .ok();
+            if !valid
+                .is_some_and(|metadata| fixed.iter().all(|id| metadata.app_components.contains(id)))
+                || requirements.validate(&key_package).is_err()
+            {
+                self.want_private_key_packages(&slot, 1)?;
+                continue;
+            }
+            selected.push(SiblingKeyPackage { slot, key_package });
+        }
+        // Validate every sibling before mutating stock. App storage is
+        // serialized on this account's worker, so the next row is still the
+        // one inspected above. Taking early is safe: failed creates burn at
+        // most one package per sibling and upkeep supplies replacements.
+        let mut taken_siblings = Vec::with_capacity(selected.len());
+        for sibling in selected {
+            match self.take_private_key_package(&sibling.slot)? {
+                Some(taken) if taken == sibling.key_package => taken_siblings.push(sibling),
+                // A lifetime can end between the advisory read and the take.
+                // Skip instead of failing creation or using an unchecked next
+                // package; a taken package is never returned to the stock.
+                _ => self.want_private_key_packages(&sibling.slot, 1)?,
+            }
+        }
+        Ok(taken_siblings)
+    }
+
     /// Local link outcomes govern only entries this device currently
     /// approved (the same ownership condition as failed-link undo). Another
     /// approver's later link is not blocked by this device's old outcome.
@@ -235,32 +338,20 @@ impl AppClient {
     ) -> Result<Vec<NewDevice>, AppError> {
         let group_id_hex = hex::encode(exchange.group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        let removing = storage
-            .device_removals()?
-            .into_iter()
-            .filter(|removal| removal.group_id_hex == group_id_hex)
-            .map(|removal| removal.slot_hex)
-            .collect::<std::collections::HashSet<_>>();
-        let held_as_removed = self
-            .remembered_tag_keys(&exchange.group_id)?
-            .into_iter()
-            .filter(|key| key.held_as_removed)
-            .map(|key| key.slot)
-            .collect::<std::collections::HashSet<_>>();
+        let excluded = self.excluded_sibling_slots(exchange)?;
         Ok(storage
             .device_links()?
             .into_iter()
             .filter(|link| {
                 link.outcome == DeviceLinkOutcome::Linked
                     && link.group_id_hex == group_id_hex
-                    && !removing.contains(&link.slot_hex)
                     && link
                         .decided_at
                         .is_some_and(|at| now < at.saturating_add(LINK_CHAT_ADD_SECS))
             })
             .filter_map(|link| {
                 let slot = device_slot(&link.slot_hex).ok()?;
-                if held_as_removed.contains(&slot) {
+                if excluded.contains(&slot) {
                     return None;
                 }
                 let entry = exchange.roster.devices.get(&slot)?;

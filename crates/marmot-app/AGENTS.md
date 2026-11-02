@@ -157,10 +157,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
   only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
   cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
-  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A roster device's
-  KeyPackage matches its slot when the trusted roster announces it now or the engine recorded it from a roster state
-  applied in the last 30 days (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts
-  read the list as `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
+  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A slot the trusted
+  roster lists as a device is known, regardless of its published KeyPackage (D81). Hosts read the list as
+  `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
   (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
   payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
   Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed

@@ -2600,6 +2600,12 @@ impl AppClient {
         );
 
         request.members = members;
+        let siblings = self.founding_sibling_key_packages(
+            &request,
+            &optional_app_components,
+            &constructable,
+            &nostr_routing.relays,
+        )?;
         let founding_probe = (self.audit_v5_enabled() || cfg!(test))
             .then_some(())
             .and_then(|()| {
@@ -2614,9 +2620,10 @@ impl AppClient {
         let mls_started_at = Instant::now();
         let prepared = self
             .runtime
-            .prepare_create_group_with_optional_app_components_and_audit_context(
+            .prepare_create_group_with_siblings_and_audit_context(
                 request,
                 optional_app_components,
+                siblings,
                 audit_context.clone(),
             )
             .await;

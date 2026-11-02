@@ -373,6 +373,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<ChosenGroup>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         if let Some(chosen) = &chosen {
@@ -534,6 +535,38 @@ impl<S: StorageProvider> Engine<S> {
             }
             (false, None) => {}
         }
+        // Siblings are added after the ordinary negotiation, so they cannot
+        // negotiate away a requirement chosen for the creator and other accounts.
+        let ordinary_member_count = parsed_kps.len();
+        if !siblings.is_empty() {
+            if self.new_protocol_profile != ProtocolProfile::Current
+                || !required_caps
+                    .app_components
+                    .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+                || required_caps
+                    .app_components
+                    .contains(DEVICE_ROSTER_COMPONENT_ID)
+            {
+                return Err(EngineError::Other(
+                    "founding siblings need a current-profile chat requiring account-devices"
+                        .into(),
+                ));
+            }
+            for sibling in &siblings {
+                let parsed = self.parse_key_package(&sibling.key_package)?;
+                let had = capabilities_of_key_package(&parsed);
+                if sibling.key_package.protocol_profile != self.new_protocol_profile
+                    || !required_caps.missing_from(&had).is_empty()
+                    || !required_role_caps.missing_from(&had).is_empty()
+                    || !optional_ids.missing_from(&had.app_components).is_empty()
+                {
+                    return Err(EngineError::Other(
+                        "a founding sibling does not meet the chat's fixed requirements".into(),
+                    ));
+                }
+                parsed_kps.push(parsed);
+            }
+        }
         let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
         // 2. Build the group config with leaf capabilities, MLS
@@ -647,6 +680,14 @@ impl<S: StorageProvider> Engine<S> {
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
         let mut new_group_guard = (self.new_protocol_profile == ProtocolProfile::Current)
             .then(|| NewGroupCleanupGuard::arm(&self.storage, group_id.clone()));
+
+        let sibling_plan = if siblings.is_empty() {
+            None
+        } else {
+            // Reuse the same private-KeyPackage/tag/slot/relay admission as a
+            // later same-account Add, before staging the founding Add.
+            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
+        };
 
         // Admin-leaf coupling at creation (mdk#737): every admin key MUST
         // correspond to a member of the initial group (creator + invitees).
@@ -808,6 +849,17 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
+        let sibling_welcomes = match (&sibling_plan, &welcome_bytes) {
+            (Some(plan), Some(bytes)) => crate::own_account_devices::build_sibling_welcomes(
+                plan,
+                &siblings,
+                &parsed_kps[ordinary_member_count..],
+                bytes,
+                &crate::message_processor::content_dedup_id(bytes),
+            )?,
+            _ => Vec::new(),
+        };
+
         if self.new_protocol_profile == ProtocolProfile::Legacy {
             // Every check that can refuse the creation runs before its first
             // write. A current-profile create runs them inside its creation
@@ -852,7 +904,10 @@ impl<S: StorageProvider> Engine<S> {
                 .iter()
                 .map(|welcome| welcome.id.as_slice().to_vec())
                 .collect::<BTreeSet<_>>();
-            if welcomes.len() != parsed_kps.len() || unique_welcome_ids.len() != parsed_kps.len() {
+            if welcomes.len() != ordinary_member_count
+                || unique_welcome_ids.len() != ordinary_member_count
+                || sibling_welcomes.len() != siblings.len()
+            {
                 return Err(EngineError::Backend(
                     "founding creation did not produce one distinct Welcome per invitee".into(),
                 ));
@@ -902,12 +957,6 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
-                        crate::announced_key_packages::record_roster_announcements(
-                            storage,
-                            &group_id,
-                            &mls_group,
-                            enrolled_at,
-                        )?;
                         crate::roster_tag_keys::record_roster_tag_keys(
                             storage,
                             &group_id,
@@ -929,6 +978,28 @@ impl<S: StorageProvider> Engine<S> {
                             .map_err(|error| {
                                 EngineError::Serialize(format!(
                                     "encode founding Welcome: {error:?}"
+                                ))
+                            })?;
+                            storage.put_message(&MessageRecord {
+                                id: welcome.id.clone(),
+                                group_id: group_id.clone(),
+                                epoch: canonical_epoch,
+                                state: MessageState::Sent,
+                                payload,
+                                deferred_peel: None,
+                            })?;
+                        }
+                        for welcome in &sibling_welcomes {
+                            let payload = StoredMessagePayload::outbound_sibling_welcome(
+                                welcome.content.clone(),
+                                welcome.key_package_ref.clone(),
+                                welcome.deliver_until,
+                                None,
+                            )
+                            .encode()
+                            .map_err(|error| {
+                                EngineError::Serialize(format!(
+                                    "encode founding sibling Welcome: {error:?}"
                                 ))
                             })?;
                             storage.put_message(&MessageRecord {
@@ -1799,9 +1870,6 @@ impl<S: StorageProvider> Engine<S> {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
-            crate::announced_key_packages::record_roster_announcements(
-                storage, &group_id, &mls_group, joined_at,
-            )?;
             crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
             )?;
