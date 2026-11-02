@@ -979,9 +979,45 @@ impl AppClient {
         let account_storage = self.app.account_storage(&self.state.label)?;
         let storage = account_storage.app_storage();
         let now_ms = super::recovery::wall_now_ms()?;
+        let mut gone = None;
         for (id, carrier) in storage.due_sibling_welcome_resends(now_ms)? {
+            use cgka_traits::message::{MessageState, StoredMessagePayload};
+            use cgka_traits::storage::{MessageStorage as _, StorageError};
+            let original_id = MessageId::new(id.clone());
+            let target = match account_storage.get_message(&original_id) {
+                Ok(record) if record.state != MessageState::Failed => {
+                    match StoredMessagePayload::decode(&record.payload) {
+                        Ok(StoredMessagePayload::OutboundSiblingWelcome { welcome, .. }) => {
+                            SiblingWelcome::decode(&welcome)
+                                .ok()
+                                .map(|welcome| welcome.to)
+                        }
+                        _ => None, // The engine retains its existing terminal/decode handling.
+                    }
+                }
+                Ok(_) | Err(StorageError::NotFound) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(target) = target
+                && !exchange.roster.devices.contains_key(&target)
+            {
+                // Expiry/origin retirement still precedes a temporary hold.
+                if self
+                    .runtime
+                    .sibling_welcome_resend_has_ended(&original_id, Timestamp(now_ms / 1_000))?
+                {
+                    storage.delete_sibling_welcome_resend(&id)?;
+                    continue;
+                }
+                if gone.is_none() {
+                    gone = Some(self.gone_device_slots(&exchange.group_id, &exchange.roster)?);
+                }
+                if !gone.as_ref().is_some_and(|slots| slots.contains(&target)) {
+                    continue;
+                }
+            }
             match self.runtime.rearm_sibling_welcome(
-                &MessageId::new(id.clone()),
+                &original_id,
                 &carrier,
                 Timestamp(now_ms / 1_000),
                 &exchange.roster,

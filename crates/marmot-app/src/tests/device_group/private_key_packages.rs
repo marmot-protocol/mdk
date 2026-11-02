@@ -2285,6 +2285,119 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         before_leaving,
         "Leaving cannot start another carrier"
     );
+    // A real accepted roster can omit a slot without a removal record. If
+    // its remembered keys aged out, that absence is not authoritative gone.
+    // The key-retention owner covers the clock; age only its produced rows.
+    use cgka_traits::app_components::{
+        AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1,
+        DeviceRosterUpdateV1, encode_device_roster_update_v1,
+    };
+    let old_entry = roster(&devices.laptop, &device_group).devices[&phone_slot].clone();
+    let roster_change = |operation| SendIntent::UpdateAppComponents {
+        group_id: device_group.clone(),
+        updates: vec![AppComponentData {
+            component_id: DEVICE_ROSTER_COMPONENT_ID,
+            data: encode_device_roster_update_v1(
+                &DeviceRosterUpdateV1::new(vec![operation]).unwrap(),
+            )
+            .unwrap(),
+        }],
+    };
+    devices
+        .laptop
+        .runtime
+        .send(roster_change(DeviceRosterOperationV1::RemoveDevice(
+            phone_slot,
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !roster(&devices.laptop, &device_group)
+            .devices
+            .contains_key(&phone_slot)
+    );
+    assert!(matches!(
+        devices.laptop.runtime.epoch_state(&device_group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_pending_convergence_inputs(&device_group)
+            .unwrap()
+    );
+    let key_cutoff = crate::unix_now_seconds()
+        .saturating_sub(cgka_traits::storage::ROSTER_TAG_KEY_RETENTION_SECS);
+    assert!(
+        cgka_traits::storage::RosterTagKeyStorage::roster_tag_keys(
+            &store,
+            &device_group,
+            key_cutoff,
+        )
+        .unwrap()
+        .iter()
+        .any(|key| key.slot == phone_slot),
+        "the actual roster supplied remembered device keys"
+    );
+    connection
+        .execute(
+            "UPDATE cgka_roster_tag_keys SET last_seen_at=0 WHERE group_id=?1 AND slot=?2",
+            rusqlite::params![device_group.as_slice(), phone_slot.as_slice()],
+        )
+        .unwrap();
+    assert!(
+        cgka_traits::storage::RosterTagKeyStorage::roster_tag_keys(
+            &store,
+            &device_group,
+            crate::unix_now_seconds()
+                .saturating_sub(cgka_traits::storage::ROSTER_TAG_KEY_RETENTION_SECS),
+        )
+        .unwrap()
+        .iter()
+        .all(|key| key.slot != phone_slot)
+    );
+    let before_unknown = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(
+        store.get_message(welcome_id).unwrap().state,
+        MessageState::Processed,
+        "unproven roster absence must not retire the retained Welcome"
+    );
+    assert_eq!(
+        devices.relay.published_events.lock().unwrap().len(),
+        before_unknown
+    );
+    assert_eq!(
+        storage
+            .due_sibling_welcome_resends(now + 2_000_000)
+            .unwrap()
+            .len(),
+        1,
+        "unproven absence retains its original due obligation"
+    );
+    // Restore this non-user state byte-for-byte, including its user marker.
+    // A real accepted roster sighting refreshes the remembered key again.
+    devices
+        .laptop
+        .runtime
+        .send(roster_change(DeviceRosterOperationV1::SetDevice(
+            phone_slot, old_entry,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_message(welcome_id).unwrap().state,
+        MessageState::Processed,
+        "explicit removal starts with live retained repair debt"
+    );
+    assert_eq!(
+        storage
+            .due_sibling_welcome_resends(now + 2_000_000)
+            .unwrap()
+            .len(),
+        1
+    );
     devices
         .laptop
         .remove_linked_device(&hex::encode(phone_slot))
@@ -2296,5 +2409,16 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         devices.relay.published_events.lock().unwrap().len(),
         before_gone,
         "gone target cannot start another carrier"
+    );
+    assert_eq!(
+        store.get_message(welcome_id).unwrap().state,
+        MessageState::Failed,
+        "proven removal permanently retires the previously live Welcome"
+    );
+    assert!(
+        storage
+            .due_sibling_welcome_resends(now + 2_000_000)
+            .unwrap()
+            .is_empty()
     );
 }

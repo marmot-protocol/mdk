@@ -616,6 +616,8 @@ impl<S: StorageProvider> Engine<S> {
     /// targets of its previous carrier. Current selected device tags identify
     /// the target, while only an Update/Commit leaf proves participation.
     /// Unknown, unreadable or settling state never authorizes a new delivery.
+    /// Before supplying a roster that omits the target, the host establishes
+    /// authoritative gone-slot evidence; unproven absence keeps repair held.
     pub fn rearm_sibling_welcome(
         &self,
         id: &MessageId,
