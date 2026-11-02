@@ -135,9 +135,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
     receive-state/output rollback and retry after a direct application's pending-output write fails (mdk#2872), including
-    encrypted close/reopen and the following sender generation. Also owns the snapshot-guard durability pair: a guard whose
-    rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
-    candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
+    encrypted close/reopen and the following sender generation. Guard cleanup and startup recovery differ: ordinary
+    `Drop` attempts release even after rollback failure, while startup recovery retains an image when restoration
+    fails and rejects unsafe hydration. A historical peel context is derived once per candidate generation rather
+    than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
     write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
