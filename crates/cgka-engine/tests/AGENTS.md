@@ -27,6 +27,9 @@ cargo insta review
 `MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>` opened with `in_memory_for_test()`, which skips
 SQLCipher's per-allocation memory locking; `sqlite_storage.rs` keeps the encrypted file-backed backend on the same rail.
 
+Snapshot-guard source policy is defined in [`../src/snapshot_guard.rs`](../src/snapshot_guard.rs): ordinary `Drop`
+attempts release even after rollback failure.
+
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
 carries no epoch hint, so a device that never entered that epoch state reads opaque bytes. Tests whose subject is
@@ -140,9 +143,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
     receive-state/output rollback and retry after a direct application's pending-output write fails (mdk#2872), including
-    encrypted close/reopen and the following sender generation. Also owns the snapshot-guard durability pair: a guard whose
-    rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
-    candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
+    encrypted close/reopen and the following sender generation. A historical peel context is derived once per candidate
+    generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
     write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
@@ -160,7 +162,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     release with `--ignored --nocapture`; it reports timings and never asserts a threshold
 
 - **File:** `hydration_quarantine.rs`
-  - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
+  - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open.
+    `hydration_recovers_interrupted_candidate_branch_probe` preserves the recovery image and live work when restore is
+    refused; `hydration_recovers_the_outermost_of_two_nested_interrupted_guards` refuses outer restoration when nested
+    cleanup fails, retaining both images and live work. Both fixtures check quarantine and successful public retry
+    after the private refusal is disarmed, plus a same-storage rebuild.
 
 - **File:** `two_phase_hydration.rs`
   - **Owns:** mdk#1161 two-phase hydration — cheap-pass seeding vs `GroupNotHydrated` gating, `ensure_hydrated`
