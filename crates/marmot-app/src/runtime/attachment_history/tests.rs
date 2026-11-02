@@ -431,6 +431,7 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
     ] {
         let raw = tag(mime);
         let entry = storage_sqlite::AttachmentHistoryEntry {
+            reaction_artwork: false,
             message_id_hex: "private-message".into(),
             source_message_id_hex: "private-source".into(),
             attachment_index: 9,
@@ -665,4 +666,183 @@ fn attachment_roles_validate_definitions_without_changing_parser_outcomes() {
             .collect::<Vec<_>>();
         assert_eq!(attachment_role(&attachment, &tags), expected);
     }
+}
+
+/// #2151: event-scoped lookup filters the exact reaction shortcode before the
+/// shared role parser runs, preserves original indices and bounds metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reaction_artwork_lookup_keeps_source_identity_and_safe_fallbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relays(dir.path(), Vec::new());
+    let store = app.account_storage("alice").unwrap();
+    let group = GroupId::new(vec![0xab; 16]);
+    let group_hex = hex::encode(group.as_slice());
+    store
+        .app_storage()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".into(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_hex.clone(),
+                    endpoint: String::new(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: None,
+                    direct_member_ids_hex: None,
+                    presentation_member_ids_hex: None,
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: vec![],
+                    self_membership: Default::default(),
+                    components: vec![],
+                }],
+                ..Default::default()
+            },
+            100,
+            300,
+        )
+        .unwrap();
+    let root = StoredAppEvent {
+        group_id_hex: group_hex,
+        message_id_hex: "01".repeat(32),
+        source_message_id_hex: Some("02".repeat(32)),
+        source_epoch: Some(1),
+        direction: "received".into(),
+        sender: "cd".repeat(32),
+        plaintext: "root".into(),
+        kind: 9,
+        tags: Vec::new(),
+        recorded_at: 1,
+        received_at: 1,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    store.app_storage().record_app_event(&root).unwrap();
+    let runtime = app.runtime();
+    let url = format!("https://media.example/{}.bin", "11".repeat(32));
+    let emoji = |code: &str, url: &str| vec!["emoji".to_owned(), code.to_owned(), url.to_owned()];
+    let mut legacy_image = tag(" \tIMAGE \t/png; legacy");
+    legacy_image[1] = "v encrypted-media-v1".into();
+    let mut rejected_image = tag("image/png");
+    rejected_image.push("nonce duplicate".into());
+    for (i, (tags, expected_index)) in [
+        (vec![tag("image/png")], None),
+        (vec![tag("image/png"), emoji("other", &url)], None),
+        (
+            vec![
+                tag("image/png"),
+                emoji("wave", "https://absent.example/art"),
+                emoji("wave", &url),
+            ],
+            None,
+        ),
+        (
+            vec![
+                vec!["imeta".into(), "v future".into()],
+                tag("image/png"),
+                emoji("wave", &url),
+            ],
+            Some(1),
+        ),
+        (vec![tag("audio/ogg"), emoji("wave", &url)], None),
+        (vec![legacy_image, emoji("wave", &url)], Some(0)),
+        (
+            vec![
+                tag("image/png"),
+                emoji("wave", "\u{a0}\u{2003}"),
+                emoji("wave", &url),
+            ],
+            Some(0),
+        ),
+        (
+            vec![rejected_image, tag("image/png"), emoji("wave", &url)],
+            Some(1),
+        ),
+        (
+            vec![tag("image/png"), tag("image/png"), emoji("wave", &url)],
+            Some(0),
+        ),
+        (
+            vec![
+                tag("image/png"),
+                emoji("wave", &url),
+                vec!["padding".into(), "x".repeat(16384)],
+            ],
+            None,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut reaction = root.clone();
+        reaction.message_id_hex = format!("{:064x}", i + 100);
+        reaction.source_message_id_hex = Some(format!("{:064x}", i + 200));
+        reaction.kind = 7;
+        reaction.plaintext = ":wave:".into();
+        reaction.tags = vec![vec!["e".into(), root.message_id_hex.clone()]];
+        reaction.tags.extend(tags);
+        store.app_storage().record_app_event(&reaction).unwrap();
+        let artwork = runtime
+            .reaction_attachment("alice", &group, &reaction.message_id_hex)
+            .await
+            .unwrap();
+        match (artwork, expected_index) {
+            (None, None) => {}
+            (Some(artwork), Some(expected_index)) => {
+                assert_eq!(artwork.message_id_hex, reaction.message_id_hex);
+                assert_eq!(
+                    Some(artwork.source_message_id_hex),
+                    reaction.source_message_id_hex
+                );
+                assert!(
+                    matches!(artwork.attachment,MediaAttachmentOutcome::Accepted {attachment_index,..} if attachment_index==expected_index)
+                );
+            }
+            _ => panic!("wrong artwork fallback for source case {i}"),
+        }
+    }
+    // Named but rejected artwork remains parser-local, never a Shared orphan
+    // in either discovery surface. Accepted duplicate slots keep their role.
+    let AttachmentPageRead::Page(page) = runtime
+        .attachment_history_page("alice", &group, 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("missing group page")
+    };
+    assert!(!page.entries.is_empty());
+    assert!(
+        page.entries
+            .iter()
+            .all(|entry| entry.role == AttachmentRole::InlineEmoji),
+        "reaction candidates leaked as Shared gallery entries"
+    );
+    let super::super::account_attachment_history::AccountAttachmentPageRead::Page(page) = runtime
+        .account_attachment_history_page("alice", Default::default(), 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("missing account page")
+    };
+    assert!(!page.entries.is_empty());
+    assert!(
+        page.entries
+            .iter()
+            .all(|entry| entry.entry.role == AttachmentRole::InlineEmoji),
+        "reaction candidates leaked as Shared account entries"
+    );
+    assert!(runtime.accounts.workers.lock().await.is_empty());
+    runtime.shutdown_and_close().await.unwrap();
 }

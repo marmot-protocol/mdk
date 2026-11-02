@@ -1727,6 +1727,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
     }
+    crate::app::attachment_history::refresh_reaction_attachment_sources_tx(tx, group_id_hex, None)?;
     crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
         tx,
         group_id_hex,
@@ -1828,8 +1829,10 @@ fn secure_prune_selected_app_events_tx(
         } else {
             !encrypted_media_component_ids(&event.tags).is_empty()
         };
-        if event.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && carries_encrypted_media
+        if matches!(
+            event.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && carries_encrypted_media
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -1879,6 +1882,15 @@ fn secure_prune_selected_app_events_tx(
     )?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    // Reactions have no timeline row themselves. Losing a target must still
+    // revoke their slots, even when retention omits that target from reprojection.
+    for message_id in &pruned_message_ids {
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id),
+        )?;
+    }
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
     for message_id in affected_message_ids {
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
@@ -2155,6 +2167,11 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         )
         .storage()?;
         reports::refresh(tx, group_id_hex, message_id_hex)?;
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
         crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
             tx,
             group_id_hex,
@@ -2163,8 +2180,21 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         return Ok(());
     };
 
+    let was_live: bool = tx.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2 AND deleted=0 AND invalidation_status IS NULL)",
+        params![group_id_hex, message_id_hex], |r| r.get(0),
+    ).storage()?;
     upsert_message_timeline_row_tx(tx, &row)?;
     reports::refresh(tx, group_id_hex, message_id_hex)?;
+    // Reaction additions change the tally, not the target's source liveness.
+    // Refresh dependent artwork only when that liveness actually changes.
+    if was_live != (!row.deleted && row.invalidation_status.is_none()) {
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
+    }
     if let Some(stream_start) = stream_start {
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
@@ -2322,7 +2352,9 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
     let deleted_reaction_ids =
         deleted_reaction_ids_for_target_tx(tx, &row.group_id_hex, &reactions)?;
     for reaction in reactions {
-        if deleted_reaction_ids.contains(&reaction.message_id_hex) {
+        if deleted_reaction_ids.contains(&reaction.message_id_hex)
+            || tag_value(&reaction.tags, EVENT_REF_TAG) != Some(row.message_id_hex.as_str())
+        {
             continue;
         }
         row.reactions.user_reactions.push(TimelineUserReaction {
@@ -3143,7 +3175,10 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
             reply_preview_targets.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_REACTION => {
-            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+            // There is no timeline row, but the event owns an artwork source
+            // whose delivery, withdrawal or retargeting must still reproject.
+            ids.insert(message_id_hex.to_owned());
+            ids.extend(tag_value(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_POLL_RESPONSE => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));

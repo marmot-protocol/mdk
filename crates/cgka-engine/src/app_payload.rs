@@ -49,8 +49,8 @@ pub(crate) fn decrypted_payload_ref(payload: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(payload)))
 }
 
-/// Encrypted-media exporter secret of `group`'s live epoch for a chat event
-/// that references attachments; `None` for everything else, so plain text
+/// Encrypted-media exporter secret of `group`'s live epoch for a chat or reaction
+/// event that references attachments; `None` for everything else, so plain text
 /// carries no secret. Callers pass the group only while it sits at the
 /// message's source epoch: a later pass step may prune that epoch's anchor.
 pub(crate) fn encrypted_media_source_secret(
@@ -64,13 +64,15 @@ pub(crate) fn encrypted_media_source_secret(
     Ok(encrypted_media_exporter_secret(group, crypto)?.map(cgka_traits::EncryptedMediaSecret::new))
 }
 
-/// Whether `app_event` is a chat that references attachments (`imeta`).
+/// Whether `app_event` is a chat or reaction referencing attachments (`imeta`).
 pub(crate) fn references_encrypted_media(app_event: &MarmotAppEvent) -> bool {
-    app_event.kind == cgka_traits::MARMOT_APP_EVENT_KIND_CHAT
-        && app_event
-            .tags
-            .iter()
-            .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
+    matches!(
+        app_event.kind,
+        cgka_traits::MARMOT_APP_EVENT_KIND_CHAT | cgka_traits::MARMOT_APP_EVENT_KIND_REACTION
+    ) && app_event
+        .tags
+        .iter()
+        .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
 }
 
 /// Encrypted-media exporter secret of `group`'s epoch; `None` when its own

@@ -120,6 +120,14 @@
 
 ### Added
 
+- `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
+  resolves one active custom-emoji reaction's matching encrypted image to its
+  original attachment source slot (mdk#2151). Use ordinary host-managed
+  acquisition and opaque local reads; no group-wide `list_media` scan or
+  `download_media` fallback is required. The additive source migration backfills
+  retained eligible reactions. See `ATTACHMENT-HISTORY.md` for adoption and
+  reaction replacement/removal behavior.
+
 - `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
   the groups whose history is still being fetched (`catching_up_group_ids_hex`),
   whether the inbox's is (`inbox_catching_up`), and every notice as
