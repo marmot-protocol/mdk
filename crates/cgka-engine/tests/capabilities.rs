@@ -24,6 +24,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use storage_sqlite::SqliteAccountStorage;
 
+#[path = "capabilities/leaf_advertisement.rs"]
+mod leaf_advertisement;
+
 mod support;
 use support::proof_signer;
 
@@ -173,7 +176,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
     r
 }
 
-fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
+fn build_client(id: &[u8], registry: FeatureRegistry) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(id))
@@ -370,7 +373,7 @@ async fn batched_app_components_match_per_id_reads() {
             },
             vec![AppComponentData {
                 component_id: TEST_APP_COMPONENT,
-                data: state,
+                data: state.clone(),
             }],
         )
         .await
@@ -389,6 +392,11 @@ async fn batched_app_components_match_per_id_reads() {
     assert_eq!(batched, individual);
     assert!(batched[0].is_some());
     assert!(batched[1].is_none());
+    assert_eq!(batched[0], Some(state));
+    let mut profile = vec![13];
+    profile.extend_from_slice(b"batched-reads");
+    profile.push(0);
+    assert_eq!(batched[2], Some(profile));
 
     let unknown = cgka_traits::GroupId::new(vec![0xAB; 16]);
     assert!(matches!(
@@ -429,7 +437,13 @@ async fn optional_initial_component_state_requires_creator_support() {
 async fn group_creation_rejects_component_duplicated_across_required_and_optional_state() {
     let mut supported = default_group_components();
     supported.insert(TEST_APP_COMPONENT);
-    let mut alice = build_engine_with_components(b"alice", supported);
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_engine_on_storage_with_registry_and_components(
+        b"alice",
+        storage.clone(),
+        FeatureRegistry::new(),
+        supported,
+    );
 
     let error = alice
         .create_group_with_optional_app_components(
@@ -456,14 +470,40 @@ async fn group_creation_rejects_component_duplicated_across_required_and_optiona
         matches!(error, EngineError::Other(ref message) if message == "group creation request contains duplicate app components"),
         "expected duplicate-component rejection, got {error:?}"
     );
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "duplicate-required-state".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            initial_admins: vec![],
+            app_components: vec![
+                AppComponentData {
+                    component_id: TEST_APP_COMPONENT,
+                    data: vec![1],
+                },
+                AppComponentData {
+                    component_id: TEST_APP_COMPONENT,
+                    data: vec![2],
+                },
+            ],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Other(reason) if reason == "group creation request contains duplicate app components")
+    );
+    assert!(storage.list_groups().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn upgrade_group_capabilities_rejects_app_component_without_group_state() {
     let mut supported = default_group_components();
     supported.insert(TEST_APP_COMPONENT);
-    let mut alice = build_engine_with_registry_and_components(
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_engine_on_storage_with_registry_and_components(
         b"alice",
+        storage.clone(),
         registry_selfremove_required_and_component_optional(),
         supported.clone(),
     );
@@ -515,6 +555,28 @@ async fn upgrade_group_capabilities_rejects_app_component_without_group_state() 
             .contains("drops required app component 0x8101")
     );
 
+    // Inspect persisted MLS state before any public read or send can repair
+    // an orphan pending commit. A later successful send alone can mask it.
+    {
+        use cgka_traits::storage::StorageProvider as _;
+        use openmls_traits::OpenMlsProvider as _;
+        let crypto = openmls_rust_crypto::RustCrypto::default();
+        let provider = cgka_engine::provider::EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            storage.mls_storage(),
+        );
+        let group = openmls::group::MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            group.pending_commit().is_none(),
+            "a refused upgrade must leave no staged MLS commit before recovery"
+        );
+    }
+
     assert!(matches!(
         alice
             .feature_status(&group_id, &Feature("test-app-component"))
@@ -529,6 +591,18 @@ async fn upgrade_group_capabilities_rejects_app_component_without_group_state() 
             .app_components
             .contains(TEST_APP_COMPONENT)
     );
+    let epoch = alice.epoch(&group_id).unwrap();
+    let update = alice
+        .send(cgka_traits::engine::SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = update else {
+        panic!("self-update");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap().0, epoch.0 + 1);
 }
 
 #[tokio::test]
@@ -668,6 +742,13 @@ async fn transport_required_when_transport_inactive_behaves_like_optional() {
         .feature_status(&group_id, &Feature("nostr-transport"))
         .unwrap();
     assert!(matches!(st, FeatureStatus::Upgradeable), "got: {st:?}");
+    assert!(
+        !alice
+            .upgradeable_capabilities(&group_id)
+            .unwrap()
+            .extensions
+            .contains(&0xF2EB)
+    );
 }
 
 // Exhaustive capability matrix.
@@ -889,14 +970,17 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
     // Both alice and bob support reactions; the feature is Optional.
     // After upgrade, reactions becomes part of the group's RequiredCaps,
     // so feature_status returns Available instead of Upgradeable.
-    let mut alice = build_client(
-        b"alice",
-        registry_selfremove_required_and_reactions_optional(),
+    let mut registry = registry_selfremove_required_and_reactions_optional();
+    registry.register(
+        Feature("optional-extension"),
+        CapabilityRequirement {
+            requires: Capability::Extension(0xf211),
+            level: RequirementLevel::Optional,
+            description: "optional test extension",
+        },
     );
-    let mut bob = build_client(
-        b"bob",
-        registry_selfremove_required_and_reactions_optional(),
-    );
+    let mut alice = build_client(b"alice", registry.clone());
+    let mut bob = build_client(b"bob", registry);
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, create) = alice
         .create_group(CreateGroupRequest {
@@ -909,11 +993,21 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
         })
         .await
         .unwrap();
-    let pending = match create {
-        SendResult::GroupCreated { pending, .. } => pending,
-        _ => unreachable!(),
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = create
+    else {
+        panic!("legacy create");
     };
     alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert!(matches!(
+        alice
+            .feature_status(&group_id, &Feature("optional-extension"))
+            .unwrap(),
+        FeatureStatus::Upgradeable
+    ));
 
     // Pre-upgrade: reactions is Upgradeable.
     assert!(matches!(
@@ -928,16 +1022,43 @@ async fn upgrade_group_capabilities_promotes_optional_to_required() {
         .upgrade_group_capabilities(&group_id)
         .await
         .expect("upgrade");
-    let pending = match res {
+    let (pending, commit) = match res {
         cgka_traits::engine::SendResult::GroupEvolution {
-            pending, welcomes, ..
+            pending,
+            welcomes,
+            msg,
         } => {
             assert!(welcomes.is_empty(), "GCE upgrade has no welcomes");
-            pending
+            (pending, msg)
         }
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
+    let error = alice
+        .upgrade_group_capabilities(&group_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, EngineError::InvalidTransition(transition)
+        if transition.from == "PendingPublish" && transition.to == "Upgrade" && transition.reason == "upgrade requires Stable"));
     alice.confirm_published(pending).await.unwrap();
+    bob.ingest(commit).await.unwrap();
+    let result = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    for engine in [&alice, &bob] {
+        let required = engine
+            .group_record(&group_id)
+            .unwrap()
+            .required_capabilities;
+        assert!(required.extensions.contains(&0xf211));
+        assert!(required.proposals.contains(&REACTIONS_PROPOSAL));
+        assert!(matches!(
+            engine
+                .feature_status(&group_id, &Feature("optional-extension"))
+                .unwrap(),
+            FeatureStatus::Available
+        ));
+    }
 
     // Post-upgrade: reactions is Available.
     assert!(matches!(
@@ -1871,6 +1992,102 @@ async fn every_key_package_of_an_account_bounds_what_a_new_group_can_require() {
         matches!(error, EngineError::MissingRequiredCapabilities { .. }),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn account_devices_becomes_eligible_only_for_explicit_activation() {
+    use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
+    use cgka_traits::engine::SendIntent;
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let open = |supports: bool| {
+        let mut supported = default_group_components();
+        if supports {
+            supported.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        }
+        let mut registry = FeatureRegistry::new();
+        registry.register(
+            Feature("account-devices"),
+            CapabilityRequirement {
+                requires: Capability::AppComponent(ACCOUNT_DEVICES_COMPONENT_ID),
+                level: RequirementLevel::Optional,
+                description: "explicit activation",
+            },
+        );
+        let mut engine = EngineBuilder::new(storage.clone())
+            .identity(pad32(b"explicit-activation"))
+            .account_identity_proof_signer(proof_signer(b"explicit-activation"))
+            .feature_registry(registry)
+            .supported_app_components(supported)
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap();
+        engine.hydrate_all_stored_groups().unwrap();
+        engine
+    };
+    let mut engine = open(false);
+    let (gid, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "old supported set".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(created, SendResult::FoundingGroupCreated { .. }));
+    assert!(
+        !engine
+            .group_record(&gid)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+    );
+    drop(engine);
+    let mut engine = open(true);
+    assert!(
+        engine
+            .own_leaf_missing_app_components(&gid)
+            .unwrap()
+            .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+    );
+    let update = engine
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = update else {
+        panic!("self-update");
+    };
+    engine.confirm_published(pending).await.unwrap();
+    assert!(
+        engine
+            .own_leaf_missing_app_components(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        engine
+            .feature_status(&gid, &Feature("account-devices"))
+            .unwrap(),
+        FeatureStatus::Upgradeable
+    ));
+    assert!(
+        !engine
+            .upgradeable_capabilities(&gid)
+            .unwrap()
+            .app_components
+            .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+    );
+    let before = engine.group_record(&gid).unwrap();
+    assert!(matches!(engine.upgrade_group_capabilities(&gid).await,
+        Err(EngineError::Other(reason)) if reason == "no upgradeable capabilities to apply"));
+    let after = engine.group_record(&gid).unwrap();
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.required_capabilities, before.required_capabilities);
 }
 
 /// Metadata filtering expands implicit MLS support without accepting explicit
