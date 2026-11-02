@@ -468,7 +468,8 @@ pub enum SiblingAddRefusal {
     NotTagged,
     /// The KeyPackage cannot add that sibling to this chat: it is published,
     /// expired, another account's, not tagged as the sibling's slot, or does
-    /// not advertise or prove what the chat requires.
+    /// not advertise or prove what the chat requires, or the chat already
+    /// holds the sibling.
     KeyPackage,
 }
 
