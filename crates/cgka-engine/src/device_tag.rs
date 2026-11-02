@@ -460,6 +460,16 @@ pub(crate) fn bind_application_source_identity(
     source.identity = cgka_traits::MessageId::new(hash.finalize().to_vec());
 }
 
+/// Performance hints only: one current group, a keyset cursor and at most 128
+/// failed anchor fingerprints. Neither a cache hit nor a page skip resolves a
+/// durable fact or releases its ambiguous aliases.
+#[derive(Default)]
+pub(crate) struct SourceRecoveryProgress {
+    group: Option<GroupId>,
+    cursor: Option<cgka_traits::MessageId>,
+    attempts: std::collections::VecDeque<(cgka_traits::MessageId, [u8; 32])>,
+}
+
 impl<S: StorageProvider> Engine<S> {
     /// Retry a bounded set of partial accepted facts against their exact
     /// ciphertext and retained source epoch. The rewind is always restored;
@@ -471,60 +481,115 @@ impl<S: StorageProvider> Engine<S> {
         use cgka_traits::message::StoredMessagePayload;
         use openmls_traits::OpenMlsProvider as _;
         self.ensure_group_live(group_id)?;
-        for (id, partial) in self
-            .storage
-            .pending_authenticated_device_group_sources(group_id, false, None, 32)?
-        {
+        let mut progress = self.device_group_source_recovery.lock().map_err(|_| {
+            EngineError::Backend("device-group source recovery lock poisoned".into())
+        })?;
+        if progress.group.as_ref() != Some(group_id) {
+            *progress = SourceRecoveryProgress {
+                group: Some(group_id.clone()),
+                ..Default::default()
+            };
+        }
+        let batch = self.storage.pending_authenticated_device_group_sources(
+            group_id,
+            false,
+            None,
+            progress.cursor.as_ref(),
+            32,
+        )?;
+        if batch.is_empty() {
+            progress.cursor = None;
+            return Ok(());
+        }
+        for (id, partial) in batch {
+            // Advance even when this row has lost its message/anchor or errors.
+            // The next pass must not retry an irrecoverable oldest prefix forever.
+            progress.cursor = Some(id.clone());
             let record = match self.storage.get_message(&id) {
                 Ok(record) => record,
                 Err(cgka_traits::storage::StorageError::NotFound) => continue,
                 Err(error) => return Err(error.into()),
             };
+            let Some(snapshot) = crate::app_payload::retained_source_snapshot(
+                &self.storage,
+                group_id,
+                partial.epoch,
+            )?
+            else {
+                continue;
+            };
+            let fingerprint = self
+                .storage
+                .group_snapshot_fingerprint(group_id, &snapshot)?;
+            if fingerprint.is_some_and(|fingerprint| {
+                progress
+                    .attempts
+                    .iter()
+                    .any(|(prior, digest)| prior == &id && *digest == fingerprint)
+            }) {
+                continue;
+            }
             let stored = StoredMessagePayload::decode(&record.payload)
                 .map_err(|_| EngineError::Backend("decode device-group source record".into()))?;
             let Some(wire) = stored.as_openmls_wire() else {
                 continue;
             };
-            let recovered = crate::openmls_projection::with_retained_anchor_group(
-                &self.storage,
-                &self.crypto,
-                group_id,
-                partial.epoch,
-                crate::snapshot_guard::RewindSite::ModerationSource,
-                &format!("{:032x}", rand::random::<u128>()),
-                |_, provider| {
-                    let Some(mut group) = MlsGroup::load(
-                        provider.storage(),
-                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
-                    )
-                    .map_err(|_| EngineError::Backend("load device-group source state".into()))?
-                    else {
-                        return Ok(None);
-                    };
-                    let (_, protocol) =
-                        crate::openmls_projection::project_protocol_message(&wire.payload)
+            // This optional projection may be skipped by the app. A failed
+            // guard restoration must therefore roll the entire rewind back,
+            // not leave a historical tree that later readiness could read.
+            let fallback = format!(
+                "moderation-source-restore-source-{:032x}",
+                rand::random::<u128>()
+            );
+            let recovered = self
+                .storage
+                .with_group_savepoint(group_id, &fallback, |storage| {
+                    crate::openmls_projection::with_retained_anchor_group(
+                        storage,
+                        &self.crypto,
+                        group_id,
+                        partial.epoch,
+                        crate::snapshot_guard::RewindSite::ModerationSource,
+                        &format!("{:032x}", rand::random::<u128>()),
+                        |_, provider| {
+                            let Some(mut group) = MlsGroup::load(
+                                provider.storage(),
+                                &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                            )
                             .map_err(|_| {
-                                EngineError::Backend("decode device-group source message".into())
-                            })?;
-                    let Some(processed) = protocol
-                        .and_then(|protocol| group.process_message(provider, protocol).ok())
-                    else {
-                        return Ok(None);
-                    };
-                    let mut source = authenticated_source(&group, &processed, &id)?;
-                    if let openmls::prelude::ProcessedMessageContent::ApplicationMessage(bytes) =
-                        processed.into_content()
-                        && let Some(source) = source.as_mut()
-                    {
-                        bind_application_source_identity(source, &bytes.into_bytes());
-                    }
-                    Ok(source.filter(|source| {
-                        source.epoch == partial.epoch
-                            && source.sender == partial.sender
-                            && source.leaf_index == partial.leaf_index
-                    }))
-                },
-            )?;
+                                EngineError::Backend("load device-group source state".into())
+                            })?
+                            else {
+                                return Ok(None);
+                            };
+                            let (_, protocol) =
+                                crate::openmls_projection::project_protocol_message(&wire.payload)
+                                    .map_err(|_| {
+                                        EngineError::Backend(
+                                            "decode device-group source message".into(),
+                                        )
+                                    })?;
+                            let Some(processed) = protocol.and_then(|protocol| {
+                                group.process_message(provider, protocol).ok()
+                            }) else {
+                                return Ok(None);
+                            };
+                            let mut source = authenticated_source(&group, &processed, &id)?;
+                            if let openmls::prelude::ProcessedMessageContent::ApplicationMessage(
+                                bytes,
+                            ) = processed.into_content()
+                                && let Some(source) = source.as_mut()
+                            {
+                                bind_application_source_identity(source, &bytes.into_bytes());
+                            }
+                            Ok(source.filter(|source| {
+                                source.epoch == partial.epoch
+                                    && source.sender == partial.sender
+                                    && source.leaf_index == partial.leaf_index
+                            }))
+                        },
+                    )
+                })?;
             if let Some(source) = recovered {
                 self.storage.observe_authenticated_device_group_source(
                     group_id,
@@ -532,6 +597,13 @@ impl<S: StorageProvider> Engine<S> {
                     &source,
                     self.wall_clock.now_ms(),
                 )?;
+                progress.attempts.retain(|(prior, _)| prior != &id);
+            } else if let Some(fingerprint) = fingerprint {
+                progress.attempts.retain(|(prior, _)| prior != &id);
+                progress.attempts.push_back((id, fingerprint));
+                if progress.attempts.len() > 128 {
+                    progress.attempts.pop_front();
+                }
             }
         }
         Ok(())
@@ -558,7 +630,13 @@ impl<S: StorageProvider> Engine<S> {
             .filter_map(|(slot, entry)| entry.tag_signature_key.is_none().then_some(*slot))
             .collect();
         self.storage
-            .pending_authenticated_device_group_sources(group_id, true, Some(&key_unready), 32)?
+            .pending_authenticated_device_group_sources(
+                group_id,
+                true,
+                Some(&key_unready),
+                None,
+                32,
+            )?
             .into_iter()
             .map(|(id, source)| {
                 let claim = if source.sender == *self.identity.self_id() {

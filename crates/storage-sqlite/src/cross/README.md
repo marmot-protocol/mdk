@@ -51,7 +51,10 @@ and slot. That key attests the source leaf key, so MLS rekey under an unchanged 
 observation; different tag-key incarnations never cross-merge. Unknown old source proof holds only aliases sharing that
 inner event identity. `source_resolved` distinguishes pending(0), completed qualification/ignore(1), and verified alias(2);
 only canonical qualified1 rows arm timing. Key-unready source hints filter pending reads, never grant attribution. Proof-present and missing-proof pending
-scans are independently indexed and bounded at32; healthy facts project before unavailable-proof recovery. Wrapper
+scans are independently indexed and bounded at32; healthy facts project before unavailable-proof recovery. The latter
+uses content-id keyset pages plus a group-scoped ephemeral cursor and at most128 anchor-fingerprint retry hints, so
+unavailable old facts cannot permanently block later recovery. The recovery rewind joins the existing group savepoint,
+so a failed historical restore cannot leave an old selected view before its optional projection error is isolated. A cache hit never resolves a fact or releases an alias. Wrapper
 replay, message upserts, format promotion and MLS snapshots never reset provenance. Native source order and the
 fanout's first acceptance order share a scalar local clock; the corresponding observation time measures the fixed
 wait. The one per-Welcome app row retains identities and timing only, with a prepared-carrier timestamp high-water
@@ -62,3 +65,9 @@ second seen-message ledger or new scheduler are introduced.
 
 Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
 arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.
+
+Retirement walks the existing per-Welcome primary key in bounded batches, including unarmed rows; it stores no second
+expiry or origin. The engine marks expiry terminal before the app deletes timing/high-water state, so a backward clock
+or a late carrier outcome cannot make the original owed again. Group deletion, including terminal local deletion that
+keeps a disband tombstone, removes rows where either the chat or device group matches. Transport fanout settlement
+retains its own durable owner and is independent of retirement of this timing metadata.

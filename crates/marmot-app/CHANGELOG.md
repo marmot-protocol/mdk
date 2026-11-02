@@ -93,6 +93,14 @@
 
 ### Added
 
+- A published sibling Welcome lost before joining is repaired after the
+  target's first newly observed authenticated device-group message and a
+  fixed ten-minute wait (mdk#2628 D70/D89–91). Repair reuses its exact Welcome
+  and private KeyPackage, creates no Add or history offer, and stops on
+  matching device participation, expiry or terminal origin. Each successful
+  generation needs fresh activity; legacy unknown timing stays held. Only
+  behind `dev_device_groups`.
+
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
   ten-minute advisory claim to reduce competing Adds; the selected tree is
@@ -104,7 +112,7 @@
   Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
-  duplicate cleanup and delivered-Welcome resend remain deferred. Only
+  duplicate cleanup remains deferred. Only
   behind `dev_device_groups`.
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once

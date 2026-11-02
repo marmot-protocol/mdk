@@ -87,7 +87,10 @@ upgrading.
 its source epoch and exact member leaf proof in the existing processed-wrapper ledger. The first local observation is
 captured with receive/apply; candidate probes never capture it. Later app attribution under a trusted current roster
 reuses that stamp. Missing historical source proof can be filled by exact ciphertext reauthentication against a retained
-anchor, without guessing a current leaf or making earlier content fresh. Native valid-app aliases bind the authenticated
+anchor, without guessing a current leaf or making earlier content fresh. Recovery pages past unavailable old facts;
+a bounded in-memory fingerprint cache avoids repeating failed work against unchanged anchors.
+`sibling_welcome_resend_has_ended` checks unarmed repair work too and durably terminalizes expiry before its timing
+metadata is retired, so a backward host clock cannot make that original sendable again. Native valid-app aliases bind the authenticated
 source leaf key/tag, so two devices can send the same account event id independently. Current-roster tag verification
 attests each source leaf key and provides the stable device principal for coalescing aliases across MLS leaf rekeys;
 a different roster tag key remains a different incarnation. Bounded proof-present work stays independent of unavailable

@@ -37,7 +37,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
              WHERE source_resolved = 0;
          CREATE INDEX idx_processed_transport_source_slot ON cgka_processed_transport_ids(group_id, source_slot_hint, source_observed_order) WHERE source_resolved = 0 AND source_has_leaf = 1;
          CREATE INDEX idx_processed_transport_source_application ON cgka_processed_transport_ids(group_id, source_application_id, source_has_leaf, source_observed_order) WHERE source_application_id IS NOT NULL;
-         CREATE INDEX idx_processed_transport_unavailable_source ON cgka_processed_transport_ids(group_id, source_observed_order) WHERE source_has_leaf = 0;
+         CREATE INDEX idx_processed_transport_unavailable_source ON cgka_processed_transport_ids(group_id, content_id) WHERE source_has_leaf = 0;
          CREATE INDEX idx_processed_transport_qualified_principal ON cgka_processed_transport_ids(group_id, qualified_slot, qualified_tag_key, source_application_id, source_observed_order) WHERE qualified_slot IS NOT NULL;
          CREATE TABLE sibling_welcome_resends (
              welcome_id BLOB PRIMARY KEY,

@@ -487,7 +487,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+                .pending_authenticated_device_group_sources(&gid(1), true, None, None, 32)
                 .unwrap()
                 .is_empty()
         );
@@ -526,7 +526,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+                .pending_authenticated_device_group_sources(&gid(1), true, None, None, 32)
                 .unwrap()
                 .is_empty(),
             "ambiguous alias holds until exact old source proof resolves"
@@ -553,7 +553,7 @@ mod tests {
         // publication. The native prepublication stamp must remain old.
         observe_source(&store, &gid(1), &mid(11), EpochId(0), 9_999);
         let pending = store
-            .pending_authenticated_device_group_sources(&gid(1), true, None, 32)
+            .pending_authenticated_device_group_sources(&gid(1), true, None, None, 32)
             .unwrap();
         assert!(
             pending.iter().any(|(id, _)| *id == mid(32)),
@@ -660,7 +660,7 @@ mod tests {
         }
         observe_source(&store, &gid(1), &mid(12), EpochId(0), 99);
         let eligible = store
-            .pending_authenticated_device_group_sources(&gid(1), true, Some(&[[7; 32]]), 32)
+            .pending_authenticated_device_group_sources(&gid(1), true, Some(&[[7; 32]]), None, 32)
             .unwrap();
         assert_eq!(
             eligible.len(),
@@ -671,14 +671,20 @@ mod tests {
 
         assert_eq!(
             store
-                .pending_authenticated_device_group_sources(&gid(1), false, None, 32)
+                .pending_authenticated_device_group_sources(&gid(1), false, None, None, 32)
                 .unwrap()
                 .len(),
             32
         );
         assert_eq!(
             store
-                .pending_authenticated_device_group_sources(&gid(1), true, Some(&[[7; 32]]), 32)
+                .pending_authenticated_device_group_sources(
+                    &gid(1),
+                    true,
+                    Some(&[[7; 32]]),
+                    None,
+                    32
+                )
                 .unwrap()[0]
                 .0,
             mid(12),

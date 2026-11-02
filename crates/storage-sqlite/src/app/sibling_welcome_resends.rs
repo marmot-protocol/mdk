@@ -67,6 +67,31 @@ impl SqliteAppStorage {
             .transpose()
     }
 
+    /// Bounded keyset walk of the existing per-Welcome owner, including rows
+    /// whose activity wait has not armed. No expiry or origin is mirrored here.
+    pub fn sibling_welcome_resend_batch(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<Vec<Vec<u8>>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT welcome_id FROM sibling_welcome_resends WHERE welcome_id > ?1 ORDER BY welcome_id LIMIT ?2"
+        ).storage()?;
+        stmt.query_map(
+            params![
+                after.unwrap_or_default(),
+                i64::try_from(limit).map_err(|_| cgka_traits::StorageError::Backend(
+                    "resend batch limit overflow".into()
+                ))?
+            ],
+            |row| row.get(0),
+        )
+        .storage()?
+        .collect::<Result<_, _>>()
+        .storage()
+    }
+
     /// Indexed due work, as original Welcome and current carrier identities.
     /// The engine rechecks selected origin, expiry and participation before
     /// rearming; transport must settle the previous carrier first.

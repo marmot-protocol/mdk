@@ -404,3 +404,9 @@ The scalar order, delayed partial-proof attribution, deadline and file restart/s
 owns rollback on a real proposal-admission profile read failure: file-backed SQL trigger, independent group/MLS reads,
 wrapper/source absence and exact retry. Propagate storage errors inside native acceptance; only actual policy
 `InvalidTransition` remains the outer terminal rejection path.
+
+`account_devices/device_tag.rs::partial_device_group_source_recovery_pages_past_unavailable_history` owns fair bounded
+source recovery past a genuinely admitted unavailable-history prefix, preserving pending facts and selected state.
+`account_devices/sibling_welcomes.rs::sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire` owns
+terminal expiry before metadata retirement, exact late-outcome handling and clock-rollback re-registration rejection.
+The existing participation owner also proves rearm audit events follow outer commit/savepoint rollback discipline.

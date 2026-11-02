@@ -75,6 +75,15 @@ where
             .rearm_sibling_welcome(id, carrier, now, roster)?)
     }
 
+    /// Inspect terminal/expired retained repair work without preparing a carrier.
+    pub fn sibling_welcome_resend_has_ended(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> AccountResult<bool> {
+        Ok(self.session.sibling_welcome_resend_has_ended(id, now)?)
+    }
+
     /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
     pub fn carried_sibling_welcomes(&self) -> AccountResult<Vec<(MessageId, Vec<u8>)>> {
         Ok(self.session.carried_sibling_welcomes()?)

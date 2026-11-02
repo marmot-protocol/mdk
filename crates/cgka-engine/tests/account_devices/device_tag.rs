@@ -868,7 +868,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         let roster = roster_of(&phone, &gid);
         for (id, _) in phone
             .storage
-            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
             .unwrap()
         {
             phone
@@ -914,7 +914,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         let app_id = hash_id(&application.payload);
         let facts = phone
             .storage
-            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
             .unwrap();
         let (_, source) = facts.iter().find(|(id, _)| *id == app_id).unwrap_or_else(|| panic!("accepted application fact missing: convergence={through_convergence}, facts={facts:?}, state={:?}", phone.storage.get_message(&app_id).unwrap().state));
         assert_eq!(source.epoch, source_epoch);
@@ -987,7 +987,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         assert!(
             phone
                 .storage
-                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
                 .unwrap()
                 .is_empty(),
             "unauthenticated buffering/probes cannot observe source activity"
@@ -998,7 +998,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
             .unwrap();
         let facts = phone
             .storage
-            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
             .unwrap();
         let (_, source) = facts.iter().find(|(id, _)| *id == commit_id).unwrap();
         assert_eq!(
@@ -1019,7 +1019,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         assert_eq!(
             phone
                 .storage
-                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
                 .unwrap(),
             facts
         );
@@ -1050,7 +1050,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         assert!(
             phone
                 .storage
-                .pending_authenticated_device_group_sources(&gid, true, None, 32)
+                .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
                 .unwrap()
                 .is_empty(),
             "a valid application alias cannot become fresh after attribution/epoch change"
@@ -1140,7 +1140,7 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         }
         let malformed = phone
             .storage
-            .pending_authenticated_device_group_sources(&gid, true, None, 32)
+            .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
             .unwrap();
         assert_eq!(
             malformed.len(),
@@ -1343,4 +1343,197 @@ async fn device_group_proposal_profile_read_failure_keeps_native_receive_retryab
     );
     drop(observer);
     storage.close().unwrap();
+}
+
+/// A lifetime-old unavailable prefix must not prevent later exact-source
+/// recovery. All facts are produced by real past-epoch native admission.
+#[tokio::test]
+async fn partial_device_group_source_recovery_pages_past_unavailable_history() {
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source-recovery.sqlite");
+    let key = SqlCipherKey::raw([0x63; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let (mut phone, mut siblings, gid) = super::tagged_siblings::tag_devices(vec![
+        roster_device_on(storage, b"source-page"),
+        roster_device(b"source-page"),
+    ])
+    .await;
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let mut laptop = siblings.remove(0);
+    let roster = roster_of(&phone, &gid);
+    let mut old = Vec::new();
+    for n in 0..33 {
+        let payload = cgka_traits::MarmotAppEvent::new(
+            hex::encode(laptop.engine.self_id().as_slice()),
+            n,
+            49_999,
+            vec![],
+            "unavailable",
+        )
+        .encode()
+        .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = laptop
+            .engine
+            .send(SendIntent::AppMessage {
+                group_id: gid.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("application");
+        };
+        old.push(route_to_group(&msg, &gid));
+    }
+    let update = send_commit(
+        &mut phone,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &update, &gid).await;
+    for message in old {
+        phone.engine.ingest(message).await.unwrap();
+    }
+    assert_eq!(
+        phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, false, None, None, 64)
+            .unwrap()
+            .len(),
+        33
+    );
+    for snapshot in phone.storage.list_group_snapshots(&gid).unwrap() {
+        phone
+            .storage
+            .release_group_snapshot(&gid, &snapshot)
+            .unwrap();
+    }
+    let payload = cgka_traits::MarmotAppEvent::new(
+        hex::encode(laptop.engine.self_id().as_slice()),
+        100,
+        49_999,
+        vec![],
+        "recoverable",
+    )
+    .encode()
+    .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = laptop
+        .engine
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("application");
+    };
+    let update = send_commit(
+        &mut phone,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut laptop, &update, &gid).await;
+    let recoverable = route_to_group(&msg, &gid);
+    let id = hash_id(&recoverable.payload);
+    phone.engine.ingest(recoverable).await.unwrap();
+    assert_eq!(
+        phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, false, None, None, 64)
+            .unwrap()
+            .len(),
+        34
+    );
+    let before = phone.storage.group_replay_state_fingerprint(&gid).unwrap();
+    // Fail the real guard's restoration after its anchor rewind succeeded.
+    // The enclosing native savepoint must restore selected state despite this.
+    let current_epoch = phone.engine.epoch(&gid).unwrap().0;
+    observer.execute_batch(&format!("CREATE TRIGGER fail_source_restore BEFORE INSERT ON cgka_groups WHEN NEW.epoch={current_epoch} BEGIN SELECT RAISE(ABORT, 'injected source restore failure'); END;")).unwrap();
+    let mut saw_restore_failure = false;
+    for _ in 0..3 {
+        match phone.engine.recover_pending_device_group_sources(&gid) {
+            Err(EngineError::Storage(cgka_traits::StorageError::Backend(message)))
+                if message.contains("injected source restore failure") =>
+            {
+                saw_restore_failure = true;
+                break;
+            }
+            Ok(()) => {}
+            other => panic!("unexpected recovery: {other:?}"),
+        }
+    }
+    assert!(
+        saw_restore_failure,
+        "must reach the later recoverable row despite unavailable prefix"
+    );
+    assert_eq!(
+        phone.storage.group_replay_state_fingerprint(&gid).unwrap(),
+        before,
+        "failed optional recovery must restore selected state"
+    );
+    let persisted_epoch: i64 = observer
+        .query_row(
+            "SELECT epoch FROM cgka_groups WHERE id=?1",
+            [gid.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_epoch,
+        i64::try_from(current_epoch).unwrap(),
+        "independent observer must see selected epoch after failed rewind restoration"
+    );
+    assert_eq!(
+        load_group(&phone, &gid).epoch().as_u64(),
+        current_epoch,
+        "live selected OpenMLS view survives optional recovery failure"
+    );
+    assert_eq!(
+        phone.engine.epoch_pin(&gid).unwrap().epoch.0,
+        current_epoch,
+        "actual send/read selected pin stays current"
+    );
+    observer
+        .execute_batch("DROP TRIGGER fail_source_restore")
+        .unwrap();
+    for _ in 0..4 {
+        phone
+            .engine
+            .recover_pending_device_group_sources(&gid)
+            .unwrap();
+    }
+    assert!(
+        phone
+            .engine
+            .pending_device_group_activity(&gid, &roster)
+            .unwrap()
+            .iter()
+            .any(|(content, _, slot_id)| content == &id && *slot_id == Some(slot(2))),
+        "later exact ciphertext/source anchor must be recovered beyond unavailable prefix"
+    );
+    assert_eq!(
+        phone
+            .storage
+            .pending_authenticated_device_group_sources(&gid, false, None, None, 64)
+            .unwrap()
+            .len(),
+        33,
+        "unavailable facts remain pending, not permission to release aliases"
+    );
+    assert_eq!(
+        phone.storage.group_replay_state_fingerprint(&gid).unwrap(),
+        before,
+        "recovery restores selected state"
+    );
 }

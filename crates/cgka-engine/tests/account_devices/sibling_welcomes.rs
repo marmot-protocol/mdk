@@ -42,6 +42,15 @@ impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
 }
 
 fn reopen_at_time(device: Device, account: &[u8], now: u64) -> Device {
+    reopen_at_time_recording(device, account, now, None)
+}
+
+fn reopen_at_time_recording(
+    device: Device,
+    account: &[u8],
+    now: u64,
+    recorder: Option<Box<dyn marmot_forensics::ForensicRecorder>>,
+) -> Device {
     let Device { engine, storage } = device;
     drop(engine);
     let clock = Arc::new(AtTime(now));
@@ -51,16 +60,20 @@ fn reopen_at_time(device: Device, account: &[u8], now: u64) -> Device {
         DEVICE_ROSTER_COMPONENT_ID,
         cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
     ]);
-    let mut engine = EngineBuilder::new(storage.clone())
+    let builder = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
         .peeler(Box::<MockPeeler>::default())
-        .maintenance_sources(clock.clone(), clock)
-        .build()
-        .unwrap();
+        .maintenance_sources(clock.clone(), clock);
+    let builder = if let Some(recorder) = recorder {
+        builder.recorder(recorder)
+    } else {
+        builder
+    };
+    let mut engine = builder.build().unwrap();
     engine.hydrate_all_stored_groups().unwrap();
     Device { engine, storage }
 }
@@ -1310,13 +1323,79 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
                 .any(|(_, claim)| *claim
                     == cgka_traits::app_components::DeviceTagClaim::Device(slot(2)))
         );
+        #[derive(Clone)]
+        struct Records(Arc<Mutex<Vec<marmot_forensics::AuditRecord>>>);
+        impl marmot_forensics::ForensicRecorder for Records {
+            fn record(&self, record: marmot_forensics::AuditRecord) {
+                self.0.lock().unwrap().push(record);
+            }
+        }
+        let records = Records(Arc::default());
+        phone = reopen_at_time_recording(phone, b"bob", NOW, Some(Box::new(records.clone())));
+        let transitions = || {
+            records
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.kind,
+                        marmot_forensics::AuditEventKind::MessageStateChanged { .. }
+                    )
+                })
+                .count()
+        };
         let epoch = phone.engine.epoch(&gid).unwrap();
+        let baseline = transitions();
+        let store = phone.storage.clone();
+        let aborted: Result<(), EngineError> = store.with_transaction(|outer| {
+            outer.with_transaction(|_| {
+                assert_eq!(
+                    phone.engine.rearm_sibling_welcome(
+                        &original.id,
+                        b"first",
+                        Timestamp(NOW),
+                        &roster
+                    )?,
+                    Rearmed
+                );
+                assert_eq!(
+                    transitions(),
+                    baseline,
+                    "nested write must not append before owning commit"
+                );
+                Ok::<_, EngineError>(())
+            })?;
+            Err(EngineError::Other("abort rearm owner".into()))
+        });
+        assert!(
+            matches!(aborted, Err(EngineError::Other(message)) if message == "abort rearm owner")
+        );
         assert_eq!(
-            phone
-                .engine
-                .rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &roster)
-                .unwrap(),
-            Rearmed
+            transitions(),
+            baseline,
+            "rolled-back rearm cannot be audited as committed"
+        );
+        assert_eq!(
+            store.get_message(&original.id).unwrap().state,
+            MessageState::Processed
+        );
+        store.with_transaction(|outer| {
+            let aborted: Result<(), EngineError> = outer.with_group_savepoint(&gid, "rearm-audit-inner", |_| {
+                phone.engine.rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &roster)?;
+                Err(EngineError::Other("abort inner rearm".into()))
+            });
+            assert!(matches!(aborted, Err(EngineError::Other(message)) if message == "abort inner rearm"));
+            assert_eq!(store.get_message(&original.id).unwrap().state, MessageState::Processed);
+            assert_eq!(phone.engine.rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &roster)?, Rearmed);
+            assert_eq!(transitions(), baseline);
+            Ok::<_, EngineError>(())
+        }).unwrap();
+        assert_eq!(
+            transitions(),
+            baseline + 1,
+            "exactly the committed Processed-to-Sent rearm must be audited"
         );
         let repaired = owed(&phone).remove(0);
         assert_eq!(repaired.content, original.content);
@@ -1334,6 +1413,19 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
             .engine
             .sibling_welcome_delivered(&original.id, b"second")
             .unwrap();
+        if target_uses_update_proposal {
+            assert_eq!(
+                phone
+                    .engine
+                    .rearm_sibling_welcome(&original.id, b"second", Timestamp(NOW), &roster)
+                    .unwrap(),
+                Rearmed
+            );
+            assert_eq!(
+                phone.storage.get_message(&original.id).unwrap().state,
+                MessageState::Sent
+            );
+        }
         let welcome = SiblingWelcome::decode(&original.content).unwrap();
         assert_eq!(
             laptop
@@ -1393,4 +1485,109 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
         );
         assert!(owed(&phone).is_empty());
     }
+}
+
+/// Ended metadata cannot outlive an unarmed/rearmed obligation or permit
+/// lower-timestamp registration after the host clock rolls backwards.
+#[tokio::test]
+async fn sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire() {
+    use cgka_engine::SiblingWelcomeResendOutcome::{Complete, Rearmed};
+    let (mut phone, mut siblings, device_group) = tagged_devices(b"expiry-owner", 1).await;
+    let mut laptop = siblings.remove(0);
+    let gid = found_routed_group(&mut phone, &mut []).await;
+    let candidate = handed(&mut laptop, slot(2), slot(1));
+    send_commit(&mut phone, add_own_devices(&gid, vec![candidate]), &gid).await;
+    let original = owed(&phone).remove(0);
+    phone
+        .engine
+        .carry_sibling_welcome(&original.id, b"first")
+        .unwrap();
+    phone
+        .engine
+        .sibling_welcome_delivered(&original.id, b"first")
+        .unwrap();
+    let roster = super::device_roster::roster_of(&phone, &device_group);
+    assert_eq!(
+        phone
+            .engine
+            .rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &roster)
+            .unwrap(),
+        Rearmed
+    );
+    let record = phone.storage.get_message(&original.id).unwrap();
+    let StoredMessagePayload::OutboundSiblingWelcome { deliver_until, .. } =
+        StoredMessagePayload::decode(&record.payload).unwrap()
+    else {
+        panic!("retained welcome");
+    };
+    let storage = phone.storage.clone();
+    assert!(
+        storage
+            .reserve_sibling_welcome_carrier::<EngineError>(
+                &original.id,
+                &device_group,
+                &slot(2),
+                b"prepared",
+                NOW,
+                || phone
+                    .engine
+                    .carry_sibling_welcome(&original.id, b"prepared")
+            )
+            .unwrap()
+    );
+    assert!(
+        storage
+            .app_storage()
+            .due_sibling_welcome_resends(u64::MAX / 2)
+            .unwrap()
+            .is_empty(),
+        "not armed: retirement must not rely only on due rows"
+    );
+    assert!(
+        phone
+            .engine
+            .sibling_welcome_resend_has_ended(&original.id, deliver_until)
+            .unwrap()
+    );
+    assert_eq!(
+        phone
+            .engine
+            .rearm_sibling_welcome(&original.id, b"first", deliver_until, &roster)
+            .unwrap(),
+        Complete,
+        "Sent/carrier mismatch cannot hide expiry"
+    );
+    storage
+        .app_storage()
+        .delete_sibling_welcome_resend(original.id.as_slice())
+        .unwrap();
+    assert_eq!(
+        storage.get_message(&original.id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(
+        phone
+            .engine
+            .owed_sibling_welcomes(Timestamp(NOW))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !phone
+            .engine
+            .sibling_welcome_delivered(&original.id, b"prepared")
+            .unwrap(),
+        "late outcome cannot resurrect terminal original"
+    );
+    assert!(
+        matches!(storage.reserve_sibling_welcome_carrier::<EngineError>(&original.id, &device_group, &slot(2), b"rollback", NOW-1, || phone.engine.carry_sibling_welcome(&original.id, b"rollback")), Err(EngineError::Storage(cgka_traits::StorageError::Backend(message))) if message == "sibling Welcome readiness changed")
+    );
+    assert!(
+        storage
+            .app_storage()
+            .sibling_welcome_resend_batch(None, 32)
+            .unwrap()
+            .is_empty(),
+        "failed attach rolls back registration after retired high-water"
+    );
 }

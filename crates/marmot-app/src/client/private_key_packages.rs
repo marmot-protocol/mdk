@@ -922,6 +922,28 @@ impl AppClient {
         }
     }
 
+    fn retire_ended_sibling_welcome_resends(&mut self) -> Result<(), AppError> {
+        // Retirement prepares/sends nothing and remains possible while DG
+        // readiness holds new carriers. The engine durably terminalizes expiry
+        // before we forget timing/high-water state.
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let batch = storage
+            .sibling_welcome_resend_batch(self.sibling_welcome_retirement_cursor.as_deref(), 32)?;
+        if batch.is_empty() {
+            self.sibling_welcome_retirement_cursor = None;
+        }
+        for id in batch {
+            self.sibling_welcome_retirement_cursor = Some(id.clone());
+            if self.runtime.sibling_welcome_resend_has_ended(
+                &MessageId::new(id.clone()),
+                Timestamp(unix_now_seconds()),
+            )? {
+                storage.delete_sibling_welcome_resend(&id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Nothing goes out until this device's own leaf is tagged, since its
     /// sibling would refuse it. Each 461 is pinned to the epoch whose tag was
     /// read: the engine encrypts it under that epoch or refuses it before
@@ -933,7 +955,14 @@ impl AppClient {
     /// never have left. One from a slot other than this device's, or to a
     /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
-        self.observe_pending_sibling_welcome_activity()?;
+        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
+            tracing::warn!(target: "marmot_app::client::private_key_packages", method = "try_send_owed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
+        }
+        if let Err(error) = self.retire_ended_sibling_welcome_resends() {
+            tracing::warn!(target: "marmot_app::client::private_key_packages", method = "try_send_owed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(), "could not retire ended sibling Welcome timing");
+        }
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };

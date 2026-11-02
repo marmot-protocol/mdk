@@ -485,11 +485,14 @@ pub trait MessageStorage {
 
     /// Bounded pending facts with (or without) exact source-leaf proof. Keeping
     /// these scans separate prevents unavailable old proof from starving traffic.
+    /// Partial-proof pages use ascending content ids strictly after `after`;
+    /// proof-present attribution keeps first-observation order and passes None.
     fn pending_authenticated_device_group_sources(
         &self,
         _group_id: &GroupId,
         _with_leaf: bool,
         _key_unready_slots: Option<&[crate::app_components::DeviceSlotId]>,
+        _after: Option<&MessageId>,
         _limit: usize,
     ) -> StorageResult<Vec<(MessageId, AuthenticatedDeviceGroupSource)>> {
         Ok(Vec::new())

@@ -2057,7 +2057,32 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .all(|welcome| welcome.carrier.is_none())
     );
     devices.laptop.set_device_tag_key().await.unwrap();
+    // A damaged optional activity fact must not suppress this INITIAL send.
+    // Real DG selected-state/tag/hold reads above remain independently required.
+    let source_store = account_database(&devices.laptop_app);
+    let damaged = source_store.query_row(
+        "SELECT id, source_proof, source_resolved FROM cgka_processed_transport_ids WHERE source_has_leaf=1 LIMIT 1",
+        [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)),
+    ).unwrap();
+    source_store.execute("UPDATE cgka_processed_transport_ids SET source_proof=x'ff', source_resolved=0 WHERE id=?1", [&damaged.0]).unwrap();
+    let projection_error = devices
+        .laptop
+        .observe_pending_sibling_welcome_activity()
+        .unwrap_err();
+    assert!(
+        matches!(
+            projection_error.as_engine_error(),
+            Some(cgka_traits::EngineError::Storage(
+                cgka_traits::StorageError::Serialization(_)
+            ))
+        ) || matches!(
+            projection_error,
+            crate::AppError::Storage(cgka_traits::StorageError::Serialization(_))
+        ),
+        "must reach the corrupt optional proof: {projection_error:?}"
+    );
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    source_store.execute("UPDATE cgka_processed_transport_ids SET source_proof=?2, source_resolved=?3 WHERE id=?1", rusqlite::params![damaged.0, damaged.1, damaged.2]).unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
     devices.phone.join_stashed_sibling_welcomes().await;
     assert!(devices.phone.state_group_record(&chat).is_some());

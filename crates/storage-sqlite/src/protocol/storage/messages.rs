@@ -266,6 +266,35 @@ fn promotion_crash_pause(promoted: usize) {
     }
 }
 
+fn pending_device_group_sources_sql(
+    with_leaf: bool,
+    blocked_slots: usize,
+    has_after: bool,
+) -> String {
+    let mut sql = "SELECT content_id, source_proof FROM cgka_processed_transport_ids AS p WHERE group_id = ?1 AND source_has_leaf = ?2".to_owned();
+    if with_leaf {
+        sql.push_str(" AND source_resolved = 0 AND (source_application_id IS NULL OR NOT EXISTS (SELECT 1 FROM cgka_processed_transport_ids AS old WHERE old.group_id = p.group_id AND old.source_application_id = p.source_application_id AND old.source_has_leaf = 0 AND old.source_observed_order < p.source_observed_order))");
+    }
+    if with_leaf && blocked_slots != 0 {
+        sql.push_str(" AND (source_slot_hint IS NULL OR source_slot_hint NOT IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", blocked_slots)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push_str("))");
+    }
+    if !with_leaf && has_after {
+        sql.push_str(" AND content_id > ?");
+    }
+    sql.push_str(if with_leaf {
+        " ORDER BY source_observed_order LIMIT ?"
+    } else {
+        " ORDER BY content_id LIMIT ?"
+    });
+    sql
+}
+
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         let write = || {
@@ -880,6 +909,7 @@ impl MessageStorage for SqliteAccountStorage {
         group_id: &GroupId,
         with_leaf: bool,
         key_unready_slots: Option<&[cgka_traits::app_components::DeviceSlotId]>,
+        after: Option<&MessageId>,
         limit: usize,
     ) -> StorageResult<
         Vec<(
@@ -889,20 +919,7 @@ impl MessageStorage for SqliteAccountStorage {
     > {
         let conn = self.lock()?;
         let blocked = key_unready_slots.unwrap_or_default();
-        let mut sql = "SELECT content_id, source_proof FROM cgka_processed_transport_ids AS p WHERE group_id = ?1 AND source_has_leaf = ?2".to_owned();
-        if with_leaf {
-            sql.push_str(" AND source_resolved = 0 AND (source_application_id IS NULL OR NOT EXISTS (SELECT 1 FROM cgka_processed_transport_ids AS old WHERE old.group_id = p.group_id AND old.source_application_id = p.source_application_id AND old.source_has_leaf = 0 AND old.source_observed_order < p.source_observed_order))");
-        }
-        if with_leaf && !blocked.is_empty() {
-            sql.push_str(" AND (source_slot_hint IS NULL OR source_slot_hint NOT IN (");
-            sql.push_str(
-                &std::iter::repeat_n("?", blocked.len())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            sql.push_str("))");
-        }
-        sql.push_str(" ORDER BY source_observed_order LIMIT ?");
+        let sql = pending_device_group_sources_sql(with_leaf, blocked.len(), after.is_some());
         let mut args = vec![
             rusqlite::types::Value::Blob(group_id.as_slice().to_vec()),
             rusqlite::types::Value::Integer(i64::from(with_leaf)),
@@ -913,6 +930,9 @@ impl MessageStorage for SqliteAccountStorage {
                     .iter()
                     .map(|slot| rusqlite::types::Value::Blob(slot.to_vec())),
             );
+        }
+        if !with_leaf && let Some(after) = after {
+            args.push(rusqlite::types::Value::Blob(after.as_slice().to_vec()));
         }
         args.push(rusqlite::types::Value::Integer(
             i64::try_from(limit)
@@ -2943,5 +2963,31 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec![mid(1)]);
+    }
+    /// Partial history pagination seeks its content boundary directly, without
+    /// sorting retained history. Exercise the exact production query builder.
+    #[test]
+    fn partial_source_recovery_pages_seek_without_sorting_retained_history() {
+        let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let conn = store.lock().unwrap();
+        let query = super::pending_device_group_sources_sql(false, 0, true);
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map(rusqlite::params![vec![1u8], 0, vec![2u8], 32], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH") && detail.contains("content_id>?")),
+            "partial page must seek content boundary: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+            "partial page must not sort lifetime history: {plan:?}"
+        );
     }
 }
