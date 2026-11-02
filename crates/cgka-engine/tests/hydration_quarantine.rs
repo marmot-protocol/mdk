@@ -1791,6 +1791,38 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
         );
     };
 
+    unknown(
+        alice.app_components(&group_id, &[component]).map(drop),
+        "app_components",
+    );
+    unknown(alice.epoch_pin(&group_id).map(drop), "epoch_pin");
+    unknown(alice.own_leaf_hash(&group_id).map(drop), "own_leaf_hash");
+    unknown(alice.check_group_live(&group_id), "check_group_live");
+
+    let roster = cgka_traits::app_components::DeviceRosterV1::default();
+    unknown(
+        alice
+            .member_device_tag_claim(&group_id, EpochId(0), 0, &roster)
+            .map(drop),
+        "member_device_tag_claim",
+    );
+    unknown(
+        alice
+            .member_device_tag_claim_at(&group_id, EpochId(0), 0, &roster)
+            .map(drop),
+        "member_device_tag_claim_at",
+    );
+    unknown(
+        alice.own_account_leaf_claims(&group_id, &roster).map(drop),
+        "own_account_leaf_claims",
+    );
+    unknown(
+        alice
+            .own_account_leaves_tagged_by(&group_id, &[0; 32], &[])
+            .map(drop),
+        "own_account_leaves_tagged_by",
+    );
+
     unknown(alice.members(&group_id).map(drop), "members");
     unknown(alice.epoch(&group_id).map(drop), "epoch");
     assert!(
@@ -2518,6 +2550,7 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
     let mut initial = build_engine(storage.clone());
     let group = create_confirmed_group(&mut initial).await;
     let epoch = storage.get_group(&group).unwrap().epoch;
+    let invalid_group = create_confirmed_group(&mut initial).await;
     drop(initial);
 
     // Plant a bogus marker that cannot match the real tree.
@@ -2540,4 +2573,74 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
         refreshed, b"stale-marker-does-not-match",
         "stale marker must be overwritten with the real content-bound marker"
     );
+    drop(reopened);
+
+    // Corrupt the actual public MLS tree through its existing storage boundary.
+    // The tree remains loadable, so only member validation can reject it.
+    fn shorten_bytes(value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(bytes)
+                if !bytes.is_empty() && bytes.iter().all(serde_json::Value::is_u64) =>
+            {
+                *value = serde_json::json!([1, 2, 3]);
+                true
+            }
+            serde_json::Value::Array(values) => values.iter_mut().any(shorten_bytes),
+            serde_json::Value::Object(fields) => fields.values_mut().any(shorten_bytes),
+            _ => false,
+        }
+    }
+    fn invalidate_leaf(value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(identity) = fields.get_mut("serialized_credential_content") {
+                    return shorten_bytes(identity);
+                }
+                fields.values_mut().any(invalidate_leaf)
+            }
+            serde_json::Value::Array(values) => values.iter_mut().any(invalidate_leaf),
+            _ => false,
+        }
+    }
+    use openmls_traits::storage::StorageProvider as MlsStorage;
+    let mls_id = openmls::group::GroupId::from_slice(invalid_group.as_slice());
+    let tree: openmls::treesync::TreeSync = MlsStorage::tree(storage.mls_storage(), &mls_id)
+        .unwrap()
+        .expect("stored public tree");
+    let mut encoded = serde_json::to_value(tree).unwrap();
+    assert!(
+        invalidate_leaf(&mut encoded),
+        "fixture must corrupt an actual leaf"
+    );
+    let invalid_tree: openmls::treesync::TreeSync =
+        serde_json::from_slice(&serde_json::to_vec(&encoded).unwrap()).unwrap();
+    MlsStorage::write_tree(storage.mls_storage(), &mls_id, &invalid_tree).unwrap();
+    storage
+        .put_validated_tree_marker(&invalid_group, b"stale-invalid-tree")
+        .unwrap();
+    let loaded = openmls::group::MlsGroup::load(storage.mls_storage(), &mls_id)
+        .unwrap()
+        .expect("the invalid tree still loads");
+    assert_eq!(
+        loaded
+            .own_leaf_node()
+            .unwrap()
+            .credential()
+            .serialized_content(),
+        [1, 2, 3]
+    );
+    drop(loaded);
+
+    let mut rejected = build_engine(storage);
+    rejected.hydrate_all_stored_groups().unwrap();
+    assert_eq!(rejected.epoch(&group).unwrap(), epoch);
+    assert_eq!(
+        rejected.quarantined_groups(),
+        vec![(
+            invalid_group.clone(),
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )]
+    );
+    assert!(matches!(rejected.group_context(&invalid_group),
+        Err(EngineError::UnknownGroup(id)) if id == invalid_group));
 }

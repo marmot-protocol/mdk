@@ -468,7 +468,8 @@ mod tests {
 
         // The transition is rejected ...
         assert!(
-            result.is_err(),
+            matches!(result, Err(EngineError::InvalidTransition(ref transition))
+                if transition.from == "Unrecoverable" && transition.to == "PendingPublish"),
             "begin_pending from Unrecoverable must fail"
         );
         // ... and crucially the group's state map entry survives unchanged.
@@ -612,7 +613,11 @@ mod tests {
         let mut em = EpochManager::new();
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(3));
-        assert!(em.repair_to_stable(&group_id, EpochId(4)).is_err());
+        assert!(matches!(
+            em.repair_to_stable(&group_id, EpochId(4)),
+            Err(EngineError::InvalidTransition(transition))
+                if transition.from == "Stable" && transition.to == "Stable"
+        ));
         assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
         assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
     }

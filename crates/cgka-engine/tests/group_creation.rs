@@ -851,6 +851,12 @@ async fn create_group_accepts_invited_initial_admin() {
         .await
         .expect("an invited co-admin is accepted");
     assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+    let mut expected_admins = vec![
+        <[u8; 32]>::try_from(alice.self_id().as_slice()).unwrap(),
+        <[u8; 32]>::try_from(bob.self_id().as_slice()).unwrap(),
+    ];
+    expected_admins.sort();
+    assert_eq!(alice.admin_pubkeys(&group_id).unwrap(), expected_admins);
 }
 
 /// mdk#746: an invitee whose KeyPackage omits an engine-owned mandatory
@@ -889,9 +895,23 @@ async fn create_group_rejects_invitee_missing_mandatory_component() {
 async fn directory_key_package_helpers_validate_against_own_ciphersuite() {
     let mut alice = build_client(b"alice", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
-    let meta = key_package_metadata(&kp).expect("key_package_metadata validates the proof");
-    assert!(!meta.credential_identity_hex.is_empty());
-    assert!(is_last_resort_key_package(&kp).expect("last-resort check validates the proof"));
+    let alternate = key_package_with_account_identity_proof_for_ciphersuite(
+        b"directory-own-suite",
+        Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
+    );
+    for (package, suite, identity, last_resort) in [
+        (kp, 0x0001, alice.self_id().as_slice().to_vec(), true),
+        (alternate, 0x0003, pad32(b"directory-own-suite"), false),
+    ] {
+        let meta = key_package_metadata(&package).expect("metadata validates the package's proof");
+        assert_eq!(meta.ciphersuite, suite);
+        assert_eq!(meta.credential_identity_hex, hex::encode(identity));
+        assert_eq!(
+            is_last_resort_key_package(&package)
+                .expect("last-resort validates the package's proof"),
+            last_resort
+        );
+    }
 }
 
 #[tokio::test]
@@ -911,11 +931,15 @@ async fn invite_path_validates_proof_against_key_package_ciphersuite() {
             initial_admins: vec![],
         })
         .await
-        .expect_err("the engine does not negotiate the alternate ciphersuite yet");
+        .expect_err("the fixture does not advertise all required capabilities");
 
     assert!(
-        !matches!(error, EngineError::InvalidAccountIdentityProof(_)),
-        "the valid proof must be checked against the KeyPackage suite before later suite negotiation rejects it: {error:?}"
+        matches!(
+            &error,
+            EngineError::MissingRequiredCapabilities { required, had }
+                if required.proposals.contains(&10) && !had.proposals.contains(&10)
+        ),
+        "the valid alternate-suite proof reaches capability admission: {error:?}"
     );
 }
 
@@ -1451,7 +1475,7 @@ async fn welcome_index_keeps_lifecycle() {
 async fn current_group_initial_retention_is_canonical_for_creator_invitee_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("founding-retention.sqlite");
-    let database_key = SqlCipherKey::new("founding retention restart key").unwrap();
+    let database_key = SqlCipherKey::raw([0x42; 32]);
     let storage = SqliteAccountStorage::open_encrypted(&database, &database_key).unwrap();
     let supported = default_group_components()
         .into_iter()
@@ -1844,16 +1868,16 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         alice.disbanding_in_progress(&group_id).unwrap(),
         "the client-facing gate becomes visible with the durable request"
     );
+    let refused = alice
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "must be gated"),
+            expected_epoch: None,
+        })
+        .await;
     assert!(
-        alice
-            .send(cgka_traits::engine::SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload: app_payload_for(&alice, "must be gated"),
-                expected_epoch: None,
-            })
-            .await
-            .is_err(),
-        "durable request acceptance gates ordinary outbound work immediately"
+        matches!(refused, Err(EngineError::InvalidTransition(transition))
+        if transition.from == "Disbanding" && transition.to == "app_message")
     );
 
     let prepared = alice.advance_convergence(&group_id).await.unwrap();
@@ -1932,7 +1956,10 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
         }
     ));
     assert!(
-        storage.get_message(&late_message_id).is_err(),
+        matches!(
+            storage.get_message(&late_message_id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ),
         "late terminal traffic must not become a retryable message row"
     );
     let state_changes = alice
@@ -1987,7 +2014,12 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     );
     assert!(tombstone_only.quarantined_groups().is_empty());
     assert!(
-        tombstone_only.group_record(&group_id).is_err(),
+        matches!(
+            tombstone_only.group_record(&group_id),
+            Err(EngineError::Storage(
+                cgka_traits::storage::StorageError::NotFound
+            ))
+        ),
         "full group metadata is optional after the user deletes local history"
     );
 }
@@ -3502,12 +3534,19 @@ async fn delete_key_package_is_idempotent_noop_when_absent() {
     // Deleting a KeyPackage that is not (or no longer) in storage must be a
     // no-op rather than an error, so the publisher-failure cleanup path is safe
     // to call idempotently across retries (mdk#160).
-    let mut alice = build_client(b"a", selfremove_registry());
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_profile_client_on_storage(b"a", storage.clone(), ProtocolProfile::Legacy);
     let kp = alice.fresh_key_package().await.unwrap();
+    let kept = alice.fresh_key_package().await.unwrap();
 
     alice.delete_key_package(&kp).await.unwrap();
     // Second delete: the bundle is already gone, but this still succeeds.
     alice.delete_key_package(&kp).await.unwrap();
+    let owned =
+        cgka_engine::key_package::durably_owned_key_packages(&storage, ProtocolProfile::Legacy)
+            .unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].bytes(), kept.bytes());
 }
 
 #[tokio::test]
@@ -3543,9 +3582,11 @@ async fn delete_key_package_removes_bundle_so_welcome_cannot_be_joined() {
 
     // The private bundle was deleted, so Bob cannot join: OpenMLS finds no
     // matching KeyPackage in storage for the Welcome's referenced hash.
-    bob.join_welcome(welcome)
+    let error = bob
+        .join_welcome(welcome)
         .await
         .expect_err("join must fail after the key package bundle was deleted");
+    assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
 }
 
 #[tokio::test]
@@ -3860,7 +3901,10 @@ async fn join_welcome_rejects_wrong_recipient() {
 
     // Eve should not be able to consume bob's welcome.
     let err = eve.join_welcome(bob_welcome).await.err().unwrap();
-    assert!(matches!(err, EngineError::Peeler(_)));
+    assert!(
+        matches!(err, EngineError::Peeler(PeelerError::Malformed(reason))
+        if reason == "welcome not addressed to this client")
+    );
 }
 
 #[tokio::test]
@@ -4274,6 +4318,310 @@ async fn one_convergence_pass_preserves_rename_before_disband() {
     assert_eq!(terminal.members.len(), 2);
     assert!(bob.advance_convergence(&group_id).await.unwrap().is_empty());
     assert!(bob.drain_events().is_empty());
+}
+
+#[tokio::test]
+async fn exporter_secret_returns_full_cached_secret_at_exact_length() {
+    let mut alice = build_profile_client_on_storage(
+        b"alice-context-view",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        ProtocolProfile::Legacy,
+    );
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("expected a legacy creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let ctx = alice.group_context(&group_id).unwrap();
+    let secret = ctx
+        .exporter_secret("marmot/group-event", 32)
+        .expect("32-byte cached exporter");
+    assert_eq!(secret.len(), 32);
+}
+
+#[tokio::test]
+async fn snapshot_names_do_not_embed_plaintext_group_id() {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_client_on_storage(b"alice", FeatureRegistry::new(), storage.clone());
+    let mut bob = build_client(b"bob", FeatureRegistry::new());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("expected a legacy creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    // Exercise snapshot creation on founding, invitation and profile update.
+    let mut carol = build_client(b"carol", FeatureRegistry::new());
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invited = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = invited else {
+        panic!("expected an invitation commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let updated = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = updated else {
+        panic!("expected a profile commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let snapshots = storage.list_group_snapshots(&gid).unwrap();
+    assert!(
+        !snapshots.is_empty(),
+        "we expect at least one retained-anchor snapshot"
+    );
+    let plaintext_id = hex::encode(gid.as_slice());
+    for name in &snapshots {
+        assert!(
+            !name.contains(&plaintext_id),
+            "snapshot name must not embed plaintext group id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn group_context_exports_the_staged_source_then_confirmation_or_rollback() {
+    use cgka_traits::types::EpochId;
+    const DOMAINS: [(&str, &[u8]); 3] = [
+        ("marmot/group-event", b"group-event"),
+        ("marmot/encrypted-media", b"encrypted-media"),
+        ("marmot/agent-text-stream-quic", b"agent-text-stream-quic"),
+    ];
+    fn checked_context(
+        engine: &Engine<SqliteAccountStorage>,
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+        epoch: u64,
+        pending: bool,
+        route: &[u8],
+    ) -> GroupContextSnapshot {
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        let crypto = openmls_rust_crypto::RustCrypto::default();
+        let context = engine.group_context(group_id).unwrap();
+        assert_eq!(context.epoch(), EpochId(epoch));
+        assert_eq!(context.transport_group_id().as_deref(), Some(route));
+        for (label, exporter_context) in DOMAINS {
+            let expected = if pending {
+                group.pending_commit().unwrap().export_secret(
+                    &crypto,
+                    "marmot",
+                    exporter_context,
+                    32,
+                )
+            } else {
+                group.export_secret(&crypto, "marmot", exporter_context, 32)
+            }
+            .unwrap();
+            let actual = context
+                .exporter_secret(label, 32)
+                .expect("every exporter domain is present");
+            assert!(
+                actual.as_slice() == expected,
+                "{label} must use its specified MLS source and domain"
+            );
+        }
+        let snapshot =
+            GroupContextSnapshot::from_context(context.as_ref(), &DOMAINS.map(|(label, _)| label));
+        for (i, (left, _)) in DOMAINS.iter().enumerate() {
+            for (right, _) in DOMAINS.iter().skip(i + 1) {
+                assert!(snapshot.exporter_secret(left) != snapshot.exporter_secret(right));
+            }
+        }
+        snapshot
+    }
+    for confirm in [false, true] {
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let components = default_group_components()
+            .into_iter()
+            .chain([NOSTR_ROUTING_COMPONENT_ID])
+            .collect::<Vec<_>>();
+        let mut alice = EngineBuilder::new(storage.clone())
+            .legacy_compatibility_profile()
+            .identity(pad32(b"context-source-alice"))
+            .account_identity_proof_signer(proof_signer(b"context-source-alice"))
+            .supported_app_components(components.clone())
+            .peeler(Box::new(MockPeeler::default()))
+            .build()
+            .unwrap();
+        let mut bob = build_client_with_components(b"context-source-bob", components);
+        let route = [0x5a; 32];
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "context sources".into(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(
+                        &NostrRoutingV1::new(route, vec!["wss://relay.example".into()]).unwrap(),
+                    )
+                    .unwrap(),
+                }],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("expected a legacy founding publication");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        assert_eq!(
+            bob.join_welcome(welcomes.remove(0)).await.unwrap(),
+            group_id
+        );
+        assert_ne!(group_id.as_slice(), route);
+        let before = checked_context(&alice, &storage, &group_id, 1, false, &route);
+        let bob_context = bob.group_context(&group_id).unwrap();
+        assert_eq!(
+            GroupContextSnapshot::from_context(
+                bob_context.as_ref(),
+                &DOMAINS.map(|(label, _)| label)
+            ),
+            before
+        );
+        drop(bob_context);
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("self update must stage an MLS commit");
+        };
+        let staged = checked_context(&alice, &storage, &group_id, 2, true, &route);
+        for (label, _) in DOMAINS {
+            assert!(before.exporter_secret(label) != staged.exporter_secret(label));
+        }
+        if confirm {
+            alice.confirm_published(pending).await.unwrap();
+            assert_eq!(
+                checked_context(&alice, &storage, &group_id, 2, false, &route),
+                staged
+            );
+        } else {
+            alice.publish_failed(pending).await.unwrap();
+            assert_eq!(
+                checked_context(&alice, &storage, &group_id, 1, false, &route),
+                before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn creator_refuses_unsupported_required_and_optional_components_before_state() {
+    const UNSUPPORTED: u16 = 0xf411;
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_profile_client_on_storage(
+        b"creator-admission",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let retained = alice.fresh_key_package().await.unwrap();
+    for optional in [false, true] {
+        let component = AppComponentData {
+            component_id: UNSUPPORTED,
+            data: vec![1],
+        };
+        let request = CreateGroupRequest {
+            name: "refused".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: if optional {
+                vec![]
+            } else {
+                vec![component.clone()]
+            },
+            initial_admins: vec![],
+        };
+        let result = alice
+            .create_group_with_optional_app_components(
+                request,
+                if optional { vec![component] } else { vec![] },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(EngineError::MissingRequiredCapabilities { required, had })
+            if required.app_components.contains(UNSUPPORTED) && !had.app_components.contains(UNSUPPORTED))
+        );
+        assert!(storage.list_groups().unwrap().is_empty());
+        assert!(alice.live_group_ids().unwrap().is_empty());
+        assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+        assert!(alice.drain_events().is_empty());
+        let owned = cgka_engine::key_package::durably_owned_key_packages(
+            &storage,
+            ProtocolProfile::Current,
+        )
+        .unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].bytes(), retained.bytes());
+    }
+    let chosen = GroupId::new(vec![0x61, 0x62, 0x63]);
+    let (group_id, result) = alice
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: "valid retry".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            chosen.clone(),
+            None,
+            Timestamp(u64::MAX),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(group_id, chosen);
+    assert!(matches!(result, SendResult::FoundingGroupCreated { welcomes } if welcomes.is_empty()));
+    assert_eq!(alice.group_record(&group_id).unwrap().epoch.0, 0);
 }
 
 #[tokio::test]

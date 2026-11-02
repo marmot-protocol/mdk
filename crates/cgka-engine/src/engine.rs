@@ -2190,10 +2190,11 @@ impl<S: StorageProvider> Engine<S> {
             && !restored_pending
             && !restored_durable_evolution
         {
-            // Clear the staged commit transactionally (preserves the #421
-            // crash-safety fix): the MLS storage mutation must be atomic so a
-            // crash mid-clear cannot leave torn group state.
-            self.storage
+            // Retire the staged Welcomes, clear the pending MLS commit and
+            // persist its corrected mirror in one durable unit (#421, #2422).
+            // Losing the pending marker before the mirror is durable would
+            // let a later hydration promote the canceled invitees as members.
+            let recovered_epoch = self.storage
                 .with_transaction(|storage| {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
                     crate::message_processor::transition_staged_invite_welcomes(
@@ -2211,17 +2212,17 @@ impl<S: StorageProvider> Engine<S> {
                         .clear_pending_commit(
                             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
                         )
-                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    crate::test_crash_hooks::pause_if_requested("orphan-pending-after-clear");
+                    let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+                    group.epoch = recovered_epoch;
+                    group.members = crate::group_lifecycle::marmot_members(&mls_group);
+                    group.required_capabilities =
+                        crate::capability_manager::required_capabilities_from_group(&mls_group);
+                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
+                    storage.put_group(&group)?;
+                    Ok::<_, EngineError>(recovered_epoch)
                 })
-                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            let recovered_epoch = EpochId(mls_group.epoch().as_u64());
-            group.epoch = recovered_epoch;
-            group.members = crate::group_lifecycle::marmot_members(&mls_group);
-            group.required_capabilities =
-                crate::capability_manager::required_capabilities_from_group(&mls_group);
-            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-            self.storage
-                .put_group(&group)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             self.audit_group(
                 group_id,
