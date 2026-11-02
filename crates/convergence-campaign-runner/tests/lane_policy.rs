@@ -176,6 +176,13 @@ fn nightly_slow_properties_keep_wide_counts_without_rebuilding_every_test_target
                 command.contains("--test proptest_invariants"),
                 "{recipe} must scope slow builds to the property-test target (issue #2858)"
             );
+            if recipe == "simulator-full" {
+                assert!(
+                    command.trim_start().starts_with("cargo nextest run ")
+                        && !command.contains("--no-run"),
+                    "nightly must execute the wide property tests"
+                );
+            }
         }
         assert!(
             body.contains("{{simulator-dedicated-filter}} and not binary(proptest_invariants)"),
