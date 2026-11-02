@@ -2377,6 +2377,12 @@ fn capture_candidate_tip_context<S: StorageProvider>(
     else {
         return Ok(None);
     };
+    // A removal can be a reachable candidate even though it evicts us.
+    // Such a tip cannot export a peel secret; it contributes no context,
+    // while the pass still owns whether that branch wins (mdk#2861).
+    if !mls_group.is_active() {
+        return Ok(None);
+    }
     let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     Ok(Some(CandidateTipState {
