@@ -811,6 +811,17 @@ class RunnerEvidenceTests(unittest.TestCase):
                     self.assertEqual(log.stat().st_size, ci_runner.TAIL_BYTES)
                     self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
+    def test_command_inherits_caller_umask_while_reports_stay_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/ci_runner.py"), "run", "umask",
+                 "--", sys.executable, "-c",
+                 "import os; os.mkdir('child-output'); assert os.stat('child-output').st_mode & 0o777 == 0o755"],
+                cwd=tmp, env={**os.environ, "RUNNER_TEMP": tmp}, umask=0o022, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for report in (Path(tmp) / "mdk-ci-reports").iterdir():
+                self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+
     def test_evidence_write_error_preserves_the_command_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             with unittest.mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp}):

@@ -96,7 +96,7 @@ def manifest(archive: Path) -> None:
     print(json.dumps(document), flush=True)
 
 
-def extract(archive: Path) -> None:
+def extract(archive: Path, child_umask: int = -1) -> None:
     snapshot("before-archive-verification")
     document = json.loads(manifest_path(archive).read_text())
     if (document.get("version") != 1
@@ -111,7 +111,7 @@ def extract(archive: Path) -> None:
     root = str(Path.cwd())
     subprocess.run(["cargo", "nextest", "list", "--archive-file", str(archive),
                     "--extract-to", root, "--workspace-remap", root,
-                    "--list-type", "binaries-only"], stdout=subprocess.DEVNULL, check=True)
+                    "--list-type", "binaries-only"], stdout=subprocess.DEVNULL, check=True, umask=child_umask)
     # Tests reuse the extracted metadata and binaries, so no test holds the
     # multi-gigabyte compressed copy alongside its expanded contents.
     archive.unlink()
@@ -119,7 +119,7 @@ def extract(archive: Path) -> None:
     require_space(0)
 
 
-def run(label: str, command: list[str]) -> int:
+def run(label: str, command: list[str], child_umask: int = -1) -> int:
     if not re.fullmatch(r"[a-z0-9-]+", label) or not command:
         raise ValueError("a CI label and command are required")
     name = label + "-" + uuid.uuid4().hex
@@ -169,7 +169,7 @@ def run(label: str, command: list[str]) -> int:
         # A separate process group lets the wrapper forward cancellation once
         # to the command and its descendants, while staying alive to drain it.
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              bufsize=0, start_new_session=True) as child:
+                              bufsize=0, start_new_session=True, umask=child_umask) as child:
             if interrupted:
                 forward(interrupted, None)
             assert child.stdout is not None
@@ -216,7 +216,8 @@ def run(label: str, command: list[str]) -> int:
 
 
 def main() -> int:
-    os.umask(0o077)
+    # Keep evidence private without changing Cargo/test filesystem semantics.
+    child_umask = os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("prepare")
@@ -232,9 +233,9 @@ def main() -> int:
         elif args.action == "manifest":
             manifest(args.archive)
         elif args.action == "extract":
-            extract(args.archive)
+            extract(args.archive, child_umask)
         else:
-            return run(args.label, args.command[1:] if args.command[:1] == ["--"] else args.command)
+            return run(args.label, args.command[1:] if args.command[:1] == ["--"] else args.command, child_umask)
         return 0
     except (OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as error:
         print(f"CI infrastructure error: {error}", file=sys.stderr)
