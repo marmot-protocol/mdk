@@ -33,7 +33,7 @@ pub(super) struct LocalBlossom {
     pub(super) refuse_uploads: Arc<AtomicBool>,
     pub(super) deleters: Arc<Mutex<Vec<String>>>,
     pub(super) reads: Arc<Mutex<Vec<String>>>,
-    get_gate: Arc<Mutex<Option<BlossomGetGate>>>,
+    get_gate: Arc<Mutex<Vec<BlossomGetGate>>>,
 }
 
 struct BlossomGetGate {
@@ -76,8 +76,7 @@ impl LocalBlossom {
         let (started, wait) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let mut gate = self.get_gate.lock().unwrap();
-        assert!(gate.is_none());
-        *gate = Some(BlossomGetGate {
+        gate.push(BlossomGetGate {
             hash: hash.into(),
             started,
             released,
@@ -96,7 +95,7 @@ pub(super) fn local_blossom() -> LocalBlossom {
     let refuse_uploads = Arc::<AtomicBool>::default();
     let deleters = Arc::<Mutex<Vec<String>>>::default();
     let reads = Arc::<Mutex<Vec<String>>>::default();
-    let get_gate = Arc::<Mutex<Option<BlossomGetGate>>>::default();
+    let get_gate = Arc::<Mutex<Vec<BlossomGetGate>>>::default();
     let (served, refused, signed) = (blobs.clone(), refuse_uploads.clone(), deleters.clone());
     let (read_log, gate) = (reads.clone(), get_gate.clone());
     std::thread::spawn(move || {
@@ -146,7 +145,7 @@ fn serve_blossom(
     refuse_uploads: &AtomicBool,
     deleters: &Mutex<Vec<String>>,
     reads: &Mutex<Vec<String>>,
-    gate: &Mutex<Option<BlossomGetGate>>,
+    gate: &Mutex<Vec<BlossomGetGate>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut request = String::new();
@@ -194,15 +193,13 @@ fn serve_blossom(
             respond("200 OK", format!(r#"{{"sha256":"{hash}"}}"#).as_bytes())
         }
         (Some("GET"), Some(path)) => {
-            let hash = &path[1..];
+            let hash = path[1..].strip_suffix(".bin").unwrap_or(&path[1..]);
             reads.lock().unwrap().push(hash.into());
             let held = {
                 let mut gate = gate.lock().unwrap();
-                if gate.as_ref().is_some_and(|gate| gate.hash == hash) {
-                    gate.take()
-                } else {
-                    None
-                }
+                gate.iter()
+                    .position(|held| held.hash == hash)
+                    .map(|position| gate.remove(position))
             };
             if let Some(held) = held {
                 let _ = held.started.send(());

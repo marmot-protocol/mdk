@@ -1,4 +1,4 @@
-//! Nonsecret backup-index availability, never membership or restored content.
+//! Private backup-index availability, never membership or restored content.
 //! Keys here are PUBLIC recovery halves, not words, entropy or archive keys.
 
 use crate::base::connection::CachedSql;

@@ -17,6 +17,56 @@ async fn restore(client: &mut AppClient, words: &Words) -> crate::BackupRestoreS
     client.backup_restore_status()
 }
 
+/// The first relay completes empty while the pointer-holding relay does
+/// not finish. Positive views expose real signed publications from that
+/// relay's retained prefix; this fixture supplies no restore/import result.
+struct PartialPointerView {
+    relay: Arc<ScriptedPushRelayClient>,
+    visible: bool,
+    any_completed: bool,
+}
+
+#[async_trait]
+impl transport_nostr::DirectoryRelayFetcher for PartialPointerView {
+    async fn fetch_directory_events(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
+        let mut records = self.relay.fetch_directory_events(request).await?;
+        if !self.visible
+            || !records.iter().any(|record| {
+                record
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.0 == "wss://unfinished-pointer.example")
+            })
+        {
+            records.clear();
+        }
+        Ok(records)
+    }
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        let complete_endpoints: Vec<_> = request
+            .endpoints
+            .iter()
+            .filter(|endpoint| self.any_completed && endpoint.0 == "wss://completed-empty.example")
+            .cloned()
+            .collect();
+        let complete =
+            !request.endpoints.is_empty() && complete_endpoints.len() == request.endpoints.len();
+        let records = self.fetch_directory_events(request).await?;
+        Ok(transport_nostr::DirectoryFetchOutcome {
+            records,
+            complete,
+            complete_endpoints,
+        })
+    }
+}
+
 async fn write_backup(client: &mut AppClient) {
     let pass = client
         .prepare_backup_pass()
@@ -35,6 +85,99 @@ fn first_message(client: &AppClient, chat: &GroupId) -> String {
         .event
         .id
         .clone()
+}
+
+/// Incomplete discovery never proves absence, including a positive empty
+/// pointer that may have been superseded on the unfinished relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_backup_pointer_views_preserve_the_private_catalog_and_report_partial() {
+    let blossom = local_blossom();
+    let (mut devices, chat, words) = lone_writer(&blossom).await;
+    write_backup(&mut devices.phone).await;
+    add_laptop(&mut devices, &chat).await;
+    assert_eq!(
+        restore(&mut devices.laptop, &words).await.phase,
+        BackupRestorePhase::Complete
+    );
+    assert_eq!(
+        devices.laptop.backup_history_availability(&chat).unwrap()[0].backups,
+        1
+    );
+    let account = devices.laptop.app.account_home().account("alice").unwrap();
+    let directory = devices.laptop.app.directory();
+    let mut entry = directory
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap_or_else(|| directory.empty_directory_record_for_test(&account.account_id_hex));
+    entry.relay_lists.nip65.created_at = unix_now_seconds();
+    entry.relay_lists.nip65.relays = vec![
+        "wss://completed-empty.example".into(),
+        "wss://unfinished-pointer.example".into(),
+    ];
+    entry.relay_lists.refresh();
+    directory.save_directory_entry_for_test(&entry).unwrap();
+    let complete_plane = devices.laptop.app.relay_plane.clone();
+    for (visible, any_completed, expected) in [
+        (false, true, BackupRestorePhase::Unavailable),
+        (true, true, BackupRestorePhase::Partial),
+        (true, false, BackupRestorePhase::Partial),
+    ] {
+        devices.laptop.app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            None,
+            devices.relay.clone(),
+            Arc::new(PartialPointerView {
+                relay: devices.relay.clone(),
+                visible,
+                any_completed,
+            }),
+            false,
+        );
+        let status = restore(&mut devices.laptop, &words).await;
+        assert_eq!(status.phase, expected);
+        assert_eq!(
+            devices.laptop.backup_history_availability(&chat).unwrap()[0].backups,
+            1,
+            "an unfinished view cannot prune the earlier complete catalog"
+        );
+        assert!(
+            devices.laptop.prepare_backup_restore().unwrap().is_none(),
+            "terminal partial/unavailable results release the secret-backed job"
+        );
+    }
+    let at = pointer_event(&devices.relay, &words.public)
+        .unwrap()
+        .created_at
+        + 1;
+    publish_pointer_at(
+        &devices.phone,
+        &devices.relay,
+        &words.public,
+        Vec::new(),
+        at,
+    )
+    .await;
+    assert_eq!(
+        restore(&mut devices.laptop, &words).await.phase,
+        BackupRestorePhase::Partial
+    );
+    assert_eq!(
+        devices.laptop.backup_history_availability(&chat).unwrap()[0].backups,
+        1,
+        "a valid but incomplete empty pointer is not authoritative absence"
+    );
+    devices.laptop.app.relay_plane = complete_plane;
+    assert_eq!(
+        restore(&mut devices.laptop, &words).await.phase,
+        BackupRestorePhase::Complete
+    );
+    assert!(
+        devices
+            .laptop
+            .backup_history_availability(&chat)
+            .unwrap()
+            .is_empty(),
+        "a completed signed empty pointer can prune its own key's catalog"
+    );
 }
 
 /// A real writer's archive fills only the reader's current chat. Unknown
@@ -102,8 +245,49 @@ async fn backup_restore_imports_only_current_memberships_and_catalog_survives_a_
     let before_state = reader.small_state_items().unwrap();
     let before_key = reader.kept_recovery_key().unwrap();
     let before_pin = devices.laptop.runtime.epoch_pin(&chat).unwrap();
+    let unrelated = devices
+        .laptop
+        .create_group("not in the archive", &[])
+        .await
+        .unwrap();
     let published = devices.relay.published_event_ids();
+    drop(devices.laptop);
+    let plane = MarmotRelayPlane::new(None, devices.relay.clone());
+    devices.laptop = devices
+        .laptop_app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&chat)
+    );
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&unrelated)
+    );
     let status = restore(&mut devices.laptop, &words).await;
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&chat)
+    );
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&unrelated),
+        "restore hydrates indexed current candidates, not an account-wide barrier"
+    );
     assert_eq!(status.phase, BackupRestorePhase::Complete);
     assert_eq!(status.imported_events, 1);
     let added = reader
@@ -151,8 +335,35 @@ async fn backup_restore_imports_only_current_memberships_and_catalog_survives_a_
     drop(devices.laptop);
     devices.laptop_app.close_storage().unwrap();
     let reopened = device_group_app_at(&devices._dirs[1], devices.relay.clone());
-    devices.laptop = reopened.client("alice").await.unwrap();
+    let plane = MarmotRelayPlane::new(None, devices.relay.clone());
+    devices.laptop = reopened
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
     devices.laptop_app = reopened;
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&chat)
+    );
+    assert_eq!(
+        devices
+            .laptop
+            .backup_history_availability(&chat)
+            .unwrap()
+            .len(),
+        1,
+        "a current cold chat still exposes its persisted private availability hint"
+    );
+    assert!(
+        devices
+            .laptop
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&unrelated)
+    );
     let reader = storage(&devices.laptop_app);
     assert_eq!(
         devices.laptop.backup_restore_status().phase,
@@ -409,6 +620,33 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
             "cancelled prepared content imports nothing"
         );
     }
+    // Ordinary encrypted-media downloads share the worker's HTTP credits.
+    let media_chat = devices
+        .laptop
+        .create_group("media capacity", &[])
+        .await
+        .unwrap();
+    let uploaded = devices
+        .laptop
+        .upload_media(
+            &media_chat,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "ordinary.txt".into(),
+                    media_type: "text/plain".into(),
+                    plaintext: b"ordinary transfer".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let media_reference = uploaded.attachments[0].reference.clone();
     let Devices {
         _dirs,
         relay,
@@ -427,6 +665,23 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
     runtime.reconcile_accounts().await.unwrap();
     let mut watch = runtime.watch_backup_restore("alice").await.unwrap();
+    let mut media_holds = Vec::new();
+    let mut downloads = Vec::new();
+    for _ in 0..3 {
+        let mut held = blossom.hold_get(&media_reference.ciphertext_sha256);
+        let download_runtime = runtime.clone();
+        let group = media_chat.clone();
+        let reference = media_reference.clone();
+        downloads.push(tokio::spawn(async move {
+            download_runtime
+                .download_media("alice", &group, reference)
+                .await
+        }));
+        tokio::time::timeout(Duration::from_secs(5), held.entered())
+            .await
+            .unwrap();
+        media_holds.push(held);
+    }
     let mut hold = blossom.hold_get(&ordered[1].1);
     let first = runtime
         .begin_backup_restore("alice", BackupRestoreWords::new(words.phrase.clone()))
@@ -434,9 +689,28 @@ async fn manual_backup_restore_cancels_and_closes_while_a_blob_is_held() {
         .unwrap()
         .operation
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), hold.entered())
+    assert_eq!(
+        runtime.backup_restore_status("alice").await.unwrap().phase,
+        BackupRestorePhase::Discovering,
+        "three ordinary transfers reserve the background lane"
+    );
+    media_holds.remove(0).release();
+    assert_eq!(
+        downloads.remove(0).await.unwrap().unwrap().plaintext,
+        b"ordinary transfer"
+    );
+    tokio::time::timeout(Duration::from_secs(5), hold.entered())
         .await
-        .unwrap();
+        .expect("returning ordinary media capacity resumes restore without a maintenance tick");
+    for held in media_holds {
+        held.release();
+    }
+    for download in downloads {
+        assert_eq!(
+            download.await.unwrap().unwrap().plaintext,
+            b"ordinary transfer"
+        );
+    }
     assert!(
         reader
             .timeline_message(&hex::encode(ordered[0].0.as_slice()), &ids[&ordered[0].0])

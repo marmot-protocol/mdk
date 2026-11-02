@@ -147,8 +147,12 @@ use tokio::sync::watch;
 
 const TARGET: &str = "marmot_app::client::backup_restore";
 
-fn completed_phase(status: &BackupRestoreStatus) -> BackupRestorePhase {
-    if status.failed_archives > 0 || status.failed_bundles > 0 || status.skipped_bundles > 0 {
+fn completed_phase(status: &BackupRestoreStatus, discovery_complete: bool) -> BackupRestorePhase {
+    if !discovery_complete
+        || status.failed_archives > 0
+        || status.failed_bundles > 0
+        || status.skipped_bundles > 0
+    {
         BackupRestorePhase::Partial
     } else {
         BackupRestorePhase::Complete
@@ -189,6 +193,7 @@ struct RestoreJob {
     entropy: Zeroizing<[u8; 16]>,
     public_key: [u8; 32],
     discovering: bool,
+    discovery_complete: bool,
     pending: VecDeque<PointerEntry>,
     current: Option<RestoreArchive>,
     cancellation: watch::Sender<()>,
@@ -208,16 +213,18 @@ struct RestoreBlob {
 }
 
 /// Number before filtering: a later eligible chat never becomes blob zero.
-fn plan_blobs(index: &BackupIndex, members: &HashSet<GroupId>) -> VecDeque<RestoreBlob> {
+fn plan_blobs(index: &BackupIndex, members: &HashSet<GroupId>, now: u64) -> VecDeque<RestoreBlob> {
     index
         .blobs()
         .filter_map(|(number, chat, blob)| {
             let group = GroupId::new(hex::decode(&chat.chat).ok()?);
-            members.contains(&group).then(|| RestoreBlob {
-                number,
-                chat: group,
-                chat_hex: chat.chat.clone(),
-                blob: blob.clone(),
+            (members.contains(&group) && blob.expires.is_none_or(|at| at > now)).then(|| {
+                RestoreBlob {
+                    number,
+                    chat: group,
+                    chat_hex: chat.chat.clone(),
+                    blob: blob.clone(),
+                }
             })
         })
         .collect()
@@ -253,7 +260,7 @@ pub(crate) struct BackupRestoreOutcome {
 }
 
 enum RestoreDone {
-    Discover(Result<Vec<PointerEntry>, AppError>),
+    Discover(Result<super::backup_writer::BackupPointerDiscovery, AppError>),
     Head {
         entry: PointerEntry,
         result: Result<OpenedHead, AppError>,
@@ -308,9 +315,10 @@ impl BackupRestoreWork {
                 account,
                 key,
             } => RestoreDone::Discover(
-                super::backup_writer::read_backup_pointer(&plane, &endpoints, &account, &key)
-                    .await
-                    .map(|(entries, _)| entries),
+                super::backup_writer::read_backup_pointer_discovery(
+                    &plane, &endpoints, &account, &key,
+                )
+                .await,
             ),
             RestoreWorkKind::Head { entry, key } => {
                 let result = match read_locator(&entry.head, &transport).await {
@@ -405,6 +413,7 @@ impl AppClient {
             entropy,
             public_key,
             discovering: true,
+            discovery_complete: false,
             pending: VecDeque::new(),
             current: None,
             cancellation,
@@ -447,7 +456,7 @@ impl AppClient {
 
     /// No account projection or other device's account membership proves this
     /// device is in the selected tree. A failed read is never permission.
-    fn restore_chat_is_member(&self, chat: &GroupId) -> bool {
+    fn restore_chat_is_member(&mut self, chat: &GroupId) -> bool {
         let hex = hex::encode(chat.as_slice());
         if !self
             .state
@@ -456,6 +465,18 @@ impl AppClient {
             .any(|group| group.group_id_hex == hex)
             || self.skips_quarantined_group_reads(chat)
             || self.is_device_group(chat).ok() != Some(false)
+        {
+            return false;
+        }
+        // Catalog ids alone never create a native group. Hydrate only a
+        // known held, nonterminal ordinary chat through the existing owner.
+        let Ok(Some(stored)) = self.stored_group(chat) else {
+            return false;
+        };
+        if stored.removed
+            || stored.disbanded.is_some()
+            || stored.unrecoverable
+            || self.runtime.ensure_group_hydrated(chat).is_err()
         {
             return false;
         }
@@ -475,7 +496,7 @@ impl AppClient {
     }
 
     pub(crate) fn backup_history_availability(
-        &self,
+        &mut self,
         chat: &GroupId,
     ) -> Result<Vec<BackupHistoryAvailability>, AppError> {
         if !self.app.device_groups_enabled() || !self.restore_chat_is_member(chat) {
@@ -576,7 +597,8 @@ impl AppClient {
             }
         };
         let Some(kind) = kind else {
-            self.backup_restore.status.phase = completed_phase(&self.backup_restore.status);
+            self.backup_restore.status.phase =
+                completed_phase(&self.backup_restore.status, job.discovery_complete);
             self.backup_restore.publish();
             return Ok(None);
         };
@@ -605,7 +627,16 @@ impl AppClient {
             .take()
             .expect("matching restore job");
         match outcome.kind {
-            RestoreDone::Discover(Ok(entries)) => {
+            RestoreDone::Discover(Ok(discovery)) => {
+                // A partial empty view cannot prove absence. Keep the private
+                // catalog and release the ephemeral secrets for manual retry.
+                if !discovery.complete && discovery.created_at.is_none() {
+                    self.backup_restore.status.phase = BackupRestorePhase::Unavailable;
+                    self.backup_restore.publish();
+                    return;
+                }
+                job.discovery_complete = discovery.complete;
+                let entries = discovery.entries;
                 let listed = entries
                     .iter()
                     .map(|entry| {
@@ -617,6 +648,9 @@ impl AppClient {
                 let result = listed
                     .ok_or_else(|| restore_error("backup_format"))
                     .and_then(|listed| {
+                        if !discovery.complete {
+                            return Ok(());
+                        }
                         self.app
                             .account_storage(&self.state.label)?
                             .app_storage()
@@ -718,7 +752,8 @@ impl AppClient {
         {
             // All content is settled: do not retain secrets until another
             // media credit happens to become available for prepare(None).
-            self.backup_restore.status.phase = completed_phase(&self.backup_restore.status);
+            self.backup_restore.status.phase =
+                completed_phase(&self.backup_restore.status, job.discovery_complete);
             drop(job);
         } else {
             self.backup_restore.job = Some(job);
@@ -760,11 +795,33 @@ impl AppClient {
                 &chats,
             )?;
         self.backup_restore.availability_changed = true;
-        let members = chats
-            .into_iter()
-            .filter(|chat| self.restore_chat_is_member(chat))
-            .collect();
-        let blobs = plan_blobs(&head.index, &members);
+        let now = crate::unix_now_seconds();
+        let mut members = HashSet::new();
+        for (chat, entry) in chats.into_iter().zip(&head.index.chats) {
+            if self.restore_chat_is_member(&chat) {
+                members.insert(chat);
+            } else if self
+                .state
+                .groups
+                .iter()
+                .any(|group| group.group_id_hex == entry.chat)
+            {
+                // Unknown catalog-only chats are outside this history-only
+                // operation. A held candidate we cannot read/admit is a skip,
+                // never a silently successful empty restore.
+                let skipped = entry
+                    .blobs
+                    .iter()
+                    .filter(|blob| blob.expires.is_none_or(|at| at > now))
+                    .count();
+                self.backup_restore.status.skipped_bundles = self
+                    .backup_restore
+                    .status
+                    .skipped_bundles
+                    .saturating_add(skipped as u64);
+            }
+        }
+        let blobs = plan_blobs(&head.index, &members, now);
         if blobs.is_empty() {
             return Ok(None);
         }
@@ -868,8 +925,12 @@ mod tests {
                 .unwrap();
             ciphertexts.push(sealed.ciphertext);
         }
-        let mut selected = plan_blobs(&index, &HashSet::from([chats[1].clone()]));
-        assert_eq!(selected.len(), 1);
+        let selected_membership = plan_blobs(&index, &HashSet::from([chats[1].clone()]), 0);
+        assert_eq!(selected_membership.len(), 1);
+        assert_eq!(selected_membership[0].number, 1);
+        index.chats[0].blobs[0].expires = Some(50);
+        let mut selected = plan_blobs(&index, &HashSet::from(chats.clone()), 50);
+        assert_eq!(selected.len(), 1, "an all-expired blob is not fetched");
         let item = selected.pop_front().unwrap();
         let opened = open_backup_bundle(
             &key,

@@ -104,14 +104,38 @@ fn backup_error(reason: &'static str) -> AppError {
     AppError::DeviceGroupRefused(reason)
 }
 
-/// Read-only pointer discovery shared by writing and manual restoration.
-/// No ledger, deletion, publication, writer or recovery-setting action occurs.
+/// Read-only discovery evidence. A partial relay view may supply a usable
+/// pointer, but cannot prove absence or authorize catalog pruning.
+pub(super) struct BackupPointerDiscovery {
+    pub entries: Vec<PointerEntry>,
+    pub created_at: Option<u64>,
+    pub complete: bool,
+    any_complete: bool,
+}
+
+/// The writer retains its existing requirement that at least one relay
+/// answered in full before it can use this pass's pointer for deletion.
 pub(super) async fn read_backup_pointer(
     relay_plane: &crate::MarmotRelayPlane,
     endpoints: &[TransportEndpoint],
     account_id_hex: &str,
     key: &[u8],
 ) -> Result<(Vec<PointerEntry>, u64), AppError> {
+    let discovery =
+        read_backup_pointer_discovery(relay_plane, endpoints, account_id_hex, key).await?;
+    if !discovery.any_complete {
+        return Err(backup_error("backup_pointer_unavailable"));
+    }
+    Ok((discovery.entries, discovery.created_at.unwrap_or(0)))
+}
+
+/// No ledger, deletion, publication, writer or recovery-setting action occurs.
+pub(super) async fn read_backup_pointer_discovery(
+    relay_plane: &crate::MarmotRelayPlane,
+    endpoints: &[TransportEndpoint],
+    account_id_hex: &str,
+    key: &[u8],
+) -> Result<BackupPointerDiscovery, AppError> {
     let address = backup_address(key);
     let query = DirectoryEventQuery::address(
         KIND_BACKUP_POINTER,
@@ -123,9 +147,14 @@ pub(super) async fn read_backup_pointer(
         .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
         .await
         .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-    if outcome.complete_endpoints.is_empty() {
-        return Err(backup_error("backup_pointer_unavailable"));
-    }
+    let any_complete = !outcome.complete_endpoints.is_empty();
+    // An empty request is never evidence that no pointer exists. Require
+    // completion from at least one endpoint that was actually requested.
+    let complete = outcome.complete
+        && outcome
+            .complete_endpoints
+            .iter()
+            .any(|endpoint| endpoints.contains(endpoint));
     // Of two versions, the newer stands; on a tie, the lower id (NIP-01).
     let newest = outcome
         .records
@@ -137,11 +166,19 @@ pub(super) async fn read_backup_pointer(
                 && event.tag_values("d").contains(&address.as_str())
         })
         .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
-    let Some(event) = newest else {
-        return Ok((Vec::new(), 0));
+    let (entries, created_at) = match newest {
+        Some(event) => (
+            BackupPointer::open(&event.content, key)?.backups,
+            Some(event.created_at),
+        ),
+        None => (Vec::new(), None),
     };
-    let backups = BackupPointer::open(&event.content, key)?.backups;
-    Ok((backups, event.created_at))
+    Ok(BackupPointerDiscovery {
+        entries,
+        created_at,
+        complete,
+        any_complete,
+    })
 }
 
 /// Run `f` on the blocking pool: SQLite, AEAD and hashing on a runtime

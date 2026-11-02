@@ -124,6 +124,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("avatar_identity_demand", Side::App),
     ("backup_condemned_blobs", Side::App),
     ("backup_recovery_key", Side::App),
+    ("backup_restore_catalog", Side::App),
+    ("backup_restore_catalog_chats", Side::App),
     ("backup_run_blobs", Side::App),
     ("backup_runs", Side::App),
     ("backup_schedule", Side::App),

@@ -493,12 +493,15 @@ The Rust runtime accepts words for one on-demand operation with
 copies the caller retains; the Rust input guard has redacted Debug output and zeroizes its owned phrase. This is
 best-effort erasure of owned buffers, not a guarantee about upstream parser/hash scratch or compiler/register copies. Restore
 uses those words independently of the account's current recovery key and never changes that key or enables backups.
-It considers every archive in a completely discovered pointer, one bounded blob at a time through the existing media
-lane. An incomplete discovery is unavailable, not an empty pointer.
+It considers every listed archive, one bounded unexpired blob at a time through the existing media lane. A valid
+pointer from an incomplete relay view can recover history with a Partial result; a missing pointer in that view is
+Unavailable. Only fully completed discovery covering at least one requested relay can prune cached private catalog metadata.
 
 Restore imports only into ordinary chats whose selected MLS tree currently contains this device's own leaf. It checks
-before content fetch and again when the worker applies the result; another device's membership is insufficient. An
-unknown chat gets only nonsecret availability metadata in the encrypted account database, without a transcript, MLS
+before content fetch and again when the worker applies the result; another device's membership is insufficient.
+A known current chat is loaded on demand without loading unrelated chats; an unreadable held candidate is skipped
+and leaves a Partial result. An
+unknown chat gets only private availability metadata in the encrypted account database, without a transcript, MLS
 group, routing, membership or KeyPackage. After a real later join, the restore watch wakes and
 `backup_history_availability(account_ref, group_id)` can say that history may be available and identify the public key
 of the words needed. No automatic join, re-add, history-absence proof or full account disaster recovery is performed.

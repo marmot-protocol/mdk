@@ -1,4 +1,4 @@
-//! Migration 0168: nonsecret backup catalog and honest history provenance.
+//! Migration 0168: private backup catalog and honest history provenance.
 //! Existing sibling imports retain their slot; backup imports have no device
 //! attribution. Both use the same import mark for retention/unread/media rules.
 use crate::SqliteResultExt;

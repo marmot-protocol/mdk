@@ -141,7 +141,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never drive `BackupPass` from its manual dispatcher: that pass deletes and publishes. Use the shared read-only
   pointer discovery and bounded media credits; retain the credit through serialized completion. Check the actual
   selected own signature-key member at content preparation and application, fail closed on unreadable/removed/DG
-  state, and create no group/route/membership from catalog metadata. Preserve global archive ordinals before filtering.
+  state, and create no group/route/membership from catalog metadata. Hydrate only existing indexed candidates, never
+  an account-wide barrier. Preserve global archive ordinals before membership/expiry filtering. Incomplete pointer
+  discovery never prunes the private catalog; a positive partial view stays Partial and absence stays Unavailable.
+  Dispatch waiting restore work after the shared media completion returns its permit.
   Import through the shared plaintext-history validator and its atomic content/key/provenance/projection boundary;
   `HistoryImportProvenance::Backup` never invents a roster slot. Keep the optional small-state archive unused. Words,
   entropy and archive keys stay zeroizing and job-local, drop on cancel/close/terminal completion, and never persist
@@ -978,8 +981,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
 
 Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
-current own-leaf admission before GET and serialized apply, catalog reopen/later real join, partial prefix/manual retry,
-and public worker cancel/shutdown with a real held HTTP response. The ordinal/filter and redacted parser owners live in
+current own-leaf admission before GET and serialized apply, cold indexed-chat hydration without loading unrelated chats,
+incomplete pointer/catalog preservation, catalog reopen/later real join, partial prefix/manual retry,
+and public worker media-capacity resumption/cancel/shutdown with real held HTTP responses. The ordinal/filter and redacted parser owners live in
 `client/backup_restore.rs`; SQLite owns atomic import/key/provenance rollback and batched timeline/conversation source
 hydration. Reuse existing archive-crypto, deletion/retention, unread, attachment and shared media-credit owners rather
 than replaying those matrices here.

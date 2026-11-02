@@ -2464,6 +2464,9 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // Ordinary transfers return the same credits used by
+                        // restore; resume only after completion released one.
+                        dispatch_backup_restore(&mut client, &media_http);
                         // A fetched history imports messages; show them, and
                         // the chat's history state, now, not at the next
                         // maintenance pass.
