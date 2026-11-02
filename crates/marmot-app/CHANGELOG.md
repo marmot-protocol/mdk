@@ -117,6 +117,13 @@
   Missed invitations with that setting off await a re-invite. Automatic
   duplicate cleanup and delivered-Welcome resend remain deferred. Only
   behind `dev_device_groups`.
+
+- Custom emoji reaction artwork is available through the bounded local
+  `MarmotAppRuntime::reaction_attachment` lookup (mdk#2151). Pass its original
+  message/source/slot to host-managed acquisition and opaque local reads.
+  Reaction-only media preserves its authenticated source-epoch key; deletion,
+  retraction and convergence withdrawal revoke its acquisition source.
+
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no

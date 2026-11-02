@@ -70,6 +70,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_reaction_attachment` resolves one active custom-emoji reaction to an
+  owned nullable `MarmotAttachmentEntry`, freed with
+  `marmot_attachment_entry_free` (mdk#2151). Acquisition and local reads use its
+  original source slot. NULL with `MARMOT_STATUS_OK` means unavailable. Existing
+  record layouts are unchanged; use matching headers and libraries.
+
 - `marmot_account_recovery_status` writes an owned
   `MarmotAccountRecoveryStatus`: the groups whose history is still being
   fetched (`catching_up_group_ids_hex`), whether the inbox's is
