@@ -106,67 +106,79 @@ fn with_another_mls_key(
 /// Re-check the slot before a direct send and at a queued Add's actual drain.
 #[tokio::test]
 async fn a_sibling_added_while_its_add_waits_is_not_added_again_at_drain() {
-    let (mut phone, mut devices, device_group) = tagged_devices(b"bob", 2).await;
-    let mut laptop = devices.remove(0);
-    let mut tablet = devices.remove(0);
-    let mut alice = chat_device(b"alice");
-    let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut tablet]).await;
-    let template = handed(&mut laptop, slot(2), slot(1));
-    let roster = super::device_roster::roster_of(&phone, &device_group);
-    let candidate = with_another_mls_key(&laptop, &template, &roster);
-    assert_eq!(
-        phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
-        None
-    );
-    let first = handed(&mut laptop, slot(2), slot(3));
-    let add = send_commit(&mut tablet, add_own_devices(&gid, vec![first]), &gid).await;
-    phone
-        .engine
-        .buffer_openmls_convergence_message_at(&gid, add, 1_000)
-        .unwrap();
-    let SendResult::Queued { intent_id, .. } = phone
-        .engine
-        .send(add_own_devices(&gid, vec![candidate.clone()]))
-        .await
-        .unwrap()
-    else {
-        panic!("expected the Add to queue while the competing Add settles")
-    };
-    phone
-        .engine
-        .converge_stored_openmls_messages_at(&gid, 1_000_000)
-        .unwrap();
-    phone.engine.drain_events();
-    let prepared = phone
-        .engine
-        .converge_and_drain_queued_outbound_intents(&gid, 1_000_100)
-        .await
-        .unwrap();
-    assert_eq!(prepared.len(), 0, "a stale queued Add must stage no Commit");
-    assert!(
-        phone
-            .storage
-            .list_queued_outbound_intents(&gid)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(phone.engine.drain_events().iter().any(|event| matches!(
-        event,
-        GroupEvent::QueuedIntentRefused { intent_id: refused, .. } if *refused == intent_id
-    )));
-    assert!(sibling_rows(&phone, &gid).is_empty());
-    assert_eq!(
-        phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
-        Some(SiblingAddRefusal::KeyPackage),
-        "the selected tree already holds this sibling under another MLS key"
-    );
-    assert_refused(
+    // Exercise both the authenticated-slot check and the pre-link signer fallback.
+    for existing_uses_distinct_mls_key in [false, true] {
+        let (mut phone, mut devices, device_group) = tagged_devices(b"bob", 2).await;
+        let mut laptop = devices.remove(0);
+        let mut tablet = devices.remove(0);
+        let mut alice = chat_device(b"alice");
+        let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut tablet]).await;
+        let template = handed(&mut laptop, slot(2), slot(1));
+        let roster = super::device_roster::roster_of(&phone, &device_group);
+        let candidate = if existing_uses_distinct_mls_key {
+            template
+        } else {
+            with_another_mls_key(&laptop, &template, &roster)
+        };
+        assert_eq!(
+            phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+            None
+        );
+        let first = handed(&mut laptop, slot(2), slot(3));
+        let first = if existing_uses_distinct_mls_key {
+            with_another_mls_key(&laptop, &first, &roster)
+        } else {
+            first
+        };
+        let add = send_commit(&mut tablet, add_own_devices(&gid, vec![first]), &gid).await;
         phone
             .engine
-            .send(add_own_devices(&gid, vec![candidate]))
-            .await,
-        "the chat already holds the sibling",
-    );
+            .buffer_openmls_convergence_message_at(&gid, add, 1_000)
+            .unwrap();
+        let SendResult::Queued { intent_id, .. } = phone
+            .engine
+            .send(add_own_devices(&gid, vec![candidate.clone()]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected the Add to queue while the competing Add settles")
+        };
+        phone
+            .engine
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        phone.engine.drain_events();
+        let prepared = phone
+            .engine
+            .converge_and_drain_queued_outbound_intents(&gid, 1_000_100)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 0, "a stale queued Add must stage no Commit");
+        assert!(
+            phone
+                .storage
+                .list_queued_outbound_intents(&gid)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(phone.engine.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::QueuedIntentRefused { intent_id: refused, .. } if *refused == intent_id
+        )));
+        assert!(sibling_rows(&phone, &gid).is_empty());
+        assert_eq!(
+            phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
+            Some(SiblingAddRefusal::KeyPackage),
+            "the selected tree already holds this sibling under another MLS key"
+        );
+        assert_refused(
+            phone
+                .engine
+                .send(add_own_devices(&gid, vec![candidate]))
+                .await,
+            "the chat already holds the sibling",
+        );
+    }
 }
 
 /// `device`'s sibling Welcome rows in `gid`.
