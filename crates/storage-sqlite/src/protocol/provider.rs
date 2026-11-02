@@ -53,12 +53,6 @@ impl StorageProvider for SqliteAccountStorage {
         Some(self)
     }
 
-    fn announced_key_package_storage(
-        &self,
-    ) -> Option<&dyn cgka_traits::storage::AnnouncedKeyPackageStorage> {
-        Some(self)
-    }
-
     fn roster_tag_key_storage(&self) -> Option<&dyn cgka_traits::storage::RosterTagKeyStorage> {
         Some(self)
     }
