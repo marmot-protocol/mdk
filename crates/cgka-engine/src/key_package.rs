@@ -248,6 +248,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<KeyPackageRequirements, EngineError> {
+        self.ensure_group_live(group_id)?;
         let record = self.storage.get_group(group_id)?;
         self.with_mls_group(group_id, |group| {
             let mut required = record.required_capabilities.clone();
