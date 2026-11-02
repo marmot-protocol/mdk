@@ -639,10 +639,12 @@
   already was for queued sends. And a connectivity edge soon after a cold
   start skipped groups the session had only seeded; the wake now hydrates the
   groups that hold retained sends first. A restart that is online already
-  gets no connectivity edge from its host, so the worker also wakes unsent
-  retained sends once its startup sync succeeds. Sends that met quorum keep
-  their secondary replication schedule.
-
+  gets no connectivity edge from its host, and neither does a transport that
+  dies and reopens while the network stays up. So the worker also wakes unsent
+  retained sends once its startup sync succeeds and once a reopened transport
+  is ready. A transport starts even with every relay unreachable, so each
+  start or reopen costs one retry of each woken send, which keeps its attempt
+  count. Sends that met quorum keep their secondary replication schedule.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

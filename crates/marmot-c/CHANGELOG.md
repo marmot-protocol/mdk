@@ -162,6 +162,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Every text send queued while offline publishes as soon as the host reports
+  restored connectivity, not only the first (mdk#2762). Later sends no longer
+  wait out a retry clock of up to an hour behind it, also after a cold start
+  that is already online or a transport reopen, which get no connectivity
+  report from the host.
 - The NIP-46 connection asks for `sign_event:30078` too: the account's
   backup pointer (mdk#2628 item 4.4b).
 - `marmot_removed_device_leftover_chats` also counts chats that keep the leaf

@@ -165,7 +165,7 @@ impl OfflineQueue {
         // waits for this send's own event: with several relays, the previous send's later
         // attempts would satisfy a bare count and leave this one untried.
         let relays = self.relay_count;
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let attempted = self.relay.attempted_event_ids();
                 let tried_everywhere = attempted
@@ -361,17 +361,56 @@ async fn long_offline_batch_survives_restart_and_publishes_on_reconnect() {
     queue.send_offline(OfflineFailure::Unavailable).await;
     queue.send_offline(OfflineFailure::PossiblyExposed).await;
     queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    let published = queue.relay.published_event_ids();
+    let retained_attempts = |queue: &OfflineQueue| {
+        queue
+            .relay
+            .attempted_event_ids()
+            .into_iter()
+            .filter(|id| !published.contains(id))
+            .count()
+    };
+    let attempts_before_restart = retained_attempts(&queue);
     queue.restart_after_long_offline(7, false).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // Let the startup wake spend its retry while the relay still fails. Allowing
+    // publishes before it lands would let that retry succeed with no edge.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retained_attempts(&queue) <= attempts_before_restart {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the startup wake must retry the head of the batch while offline");
+    queue.runtime.drain_in_flight_work().await.unwrap();
     queue.relay.allow_publishes();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert!(
-        queue.unpublished() > 0,
+    assert_eq!(
+        queue.unpublished(),
+        3,
         "without a connectivity edge the batch keeps its backed-off clocks"
     );
     queue.reconnect().await;
     queue
         .assert_all_published_once_in_order(Duration::from_secs(8), "after restart")
+        .await;
+    queue.runtime.shutdown().await;
+}
+
+/// A transport that dies and reopens while the host's network stays up gets no
+/// connectivity edge. The reopen reaching the relays must release the batch on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_batch_publishes_after_a_transport_reopen() {
+    let mut queue = OfflineQueue::online().await;
+    for _ in 0..3 {
+        queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    }
+    queue.relay.allow_publishes();
+    queue
+        .app
+        .relay_plane
+        .simulate_notification_consumer_exit_for_test();
+    queue
+        .assert_all_published_once_in_order(Duration::from_secs(8), "transport reopen")
         .await;
     queue.runtime.shutdown().await;
 }

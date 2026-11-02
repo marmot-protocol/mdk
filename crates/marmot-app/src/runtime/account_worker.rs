@@ -1831,22 +1831,9 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
-            // A start gets no host connectivity edge, so the retry clocks a
-            // previous process left on unsent retained sends, backed off
-            // towards an hour while offline, would hold them after a start
-            // that is already online (mdk#2762). Wake them once. Starting the
-            // transport does not prove a relay is reachable, so this costs one
-            // retry per woken send; a failed retry resumes its backoff from
-            // its kept attempt count. Sends that met quorum keep their
-            // secondary replication schedule.
-            if let Err(error) = client.wake_retained_sends(RetainedSendWake::BelowQuorum) {
-                tracing::warn!(
-                    target: "marmot_app::account_worker",
-                    method = "startup_retained_send_wake",
-                    error_kind = error.privacy_safe_kind(),
-                    "retained sends could not be woken after the startup sync",
-                );
-            }
+            // A start gets no host connectivity edge, so wake the sends a
+            // previous process left backed off (mdk#2762).
+            wake_retained_sends_after_transport_start(&mut client, "startup_retained_send_wake");
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
@@ -3158,6 +3145,14 @@ async fn run_app_runtime_account_worker(
                                             );
                                         }
                                     }
+                                    // A reopen while the host's network
+                                    // stayed up gets no connectivity edge to
+                                    // release sends backed off by the outage
+                                    // that closed the old transport (mdk#2762).
+                                    wake_retained_sends_after_transport_start(
+                                        &mut reopened,
+                                        "reopen_retained_send_wake",
+                                    );
                                     let pending = reopened
                                         .retry_pending_push_registration_shares_best_effort()
                                         .await;
@@ -7855,6 +7850,29 @@ impl ScheduledConvergence {
             .min()
             .unwrap_or_else(|| TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
         self.timer.as_mut().reset(deadline);
+    }
+}
+
+/// Wake unsent retained sends when a transport starts or reopens, which no host
+/// connectivity edge reports.
+///
+/// Their retry clocks may have backed off towards an hour during an outage that has
+/// since ended without an edge, as on a cold start that is already online or a
+/// reopen after the old transport died while the network stayed up. Starting the
+/// transport does not prove a relay is reachable, as activation succeeds with every
+/// relay unreachable, so each start or reopen costs one retry of each woken send. A
+/// failed retry keeps its attempt count and resumes its backoff from it. Sends that
+/// met quorum keep their secondary replication schedule. A start whose sync failed
+/// gets no wake here; its sends wait out their backoff unless a reopen or a
+/// connectivity edge wakes them first.
+fn wake_retained_sends_after_transport_start(client: &mut AppClient, method: &'static str) {
+    if let Err(error) = client.wake_retained_sends(RetainedSendWake::BelowQuorum) {
+        tracing::warn!(
+            target: "marmot_app::account_worker",
+            method = method,
+            error_kind = error.privacy_safe_kind(),
+            "retained sends could not be woken after a transport start",
+        );
     }
 }
 
