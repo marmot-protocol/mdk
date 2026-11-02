@@ -148,18 +148,17 @@ impl AppClient {
                         continue;
                     }
                 }
-                let key_package = match self.next_private_key_package_for_chat(&chat, &device.slot)
-                {
-                    Ok(Some(key_package)) => key_package,
+                let candidate = match self.next_private_key_package_for_chat(&chat, &device.slot) {
+                    Ok(Some(candidate)) => candidate,
                     Ok(None) => continue,
                     Err(error) => {
                         first_error.get_or_insert(error);
-                        break;
+                        continue;
                     }
                 };
                 *budget -= 1;
                 if let Err(error) = self
-                    .add_sibling_to_chat(&chat, &device.slot, key_package)
+                    .add_sibling_to_chat(&chat, &device.slot, candidate)
                     .await
                 {
                     first_error.get_or_insert(error);
