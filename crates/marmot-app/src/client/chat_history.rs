@@ -72,6 +72,23 @@ impl AppClient {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         self.history_chat(group_id)?;
         let bundle = open_history_bundle(key, ciphertext_sha256, ciphertext)?;
+        self.import_plaintext_history_bundle(
+            group_id,
+            &storage_sqlite::HistoryImportProvenance::Device(*source_slot),
+            bundle,
+        )
+        .map(|(_, update)| update)
+    }
+
+    /// Shared plaintext validation/application after either the sibling or
+    /// backup archive envelope has opened. Backup callers additionally check
+    /// authoritative current own-leaf membership immediately before this call.
+    pub(super) fn import_plaintext_history_bundle(
+        &mut self,
+        group_id: &GroupId,
+        source: &storage_sqlite::HistoryImportProvenance,
+        bundle: HistoryBundle,
+    ) -> Result<(usize, Option<AppProjectionUpdate>), AppError> {
         if !bundle.names_chat(group_id.as_slice()) {
             return Err(AppError::DeviceGroupRefused("history_bundle_chat"));
         }
@@ -91,20 +108,20 @@ impl AppClient {
                 "dropping history bundle events outside its stretch or with a misplaced verdict",
             );
         }
-        self.import_chat_history(group_id, source_slot, &events)
+        self.import_chat_history(group_id, source, &events)
     }
 
-    /// Import `events` into the chat `group_id` as history the device at
-    /// `source_slot` sent. Drops an event whose id does not match its content,
+    /// Import `events` into `group_id` with their actual device or backup
+    /// provenance. Drops an event whose id does not match its content,
     /// a group-system row (those are local to each device), a chat message
     /// whose encrypted-media reference the live path would reject, and each
     /// attachment key that names none of its message's attachments.
     fn import_chat_history(
         &mut self,
         group_id: &GroupId,
-        source_slot: &DeviceSlotId,
+        source: &storage_sqlite::HistoryImportProvenance,
         events: &[ImportedAppEvent],
-    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+    ) -> Result<(usize, Option<AppProjectionUpdate>), AppError> {
         let group_id_hex = self.history_chat(group_id)?;
         let allow_loopback_http = self.app.allow_loopback_blob_endpoints();
         let importable = events
@@ -129,12 +146,8 @@ impl AppClient {
         if self.linked_devices_changed {
             self.refresh_device_labels();
         }
-        self.app.import_account_app_events(
-            &self.state.label,
-            &group_id_hex,
-            source_slot,
-            &importable,
-        )
+        self.app
+            .import_account_app_events(&self.state.label, &group_id_hex, source, &importable)
     }
 
     /// The chat's group id as hex, once this device advertises the roster and
@@ -324,6 +337,7 @@ fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
     .id;
     id == event.message_id_hex
         && event.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
+        && !super::device_group::is_device_group_kind(event.kind)
         && (event.kind != MARMOT_APP_EVENT_KIND_CHAT
             || media_imeta_tags_preserve_message(&event.tags, allow_loopback_http))
 }

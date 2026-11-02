@@ -1311,6 +1311,96 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn begin_backup_restore(
+        &self,
+        account_ref: &str,
+        words: crate::BackupRestoreWords,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BeginBackupRestore { words, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn cancel_backup_restore(
+        &self,
+        account_ref: &str,
+        operation: crate::BackupRestoreId,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CancelBackupRestore { operation, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn backup_restore_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BackupRestoreStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn watch_backup_restore(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreWatch, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::WatchBackupRestore { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn history_import_provenance(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        event_id: &str,
+    ) -> Result<Option<crate::HistoryImportProvenance>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::HistoryImportProvenance {
+                group_id: group_id.clone(),
+                event_id: event_id.into(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn backup_history_availability(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::BackupHistoryAvailability>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BackupHistoryAvailability {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
     pub async fn backup_settings(
         &self,
         account_ref: &str,

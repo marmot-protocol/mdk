@@ -9,8 +9,9 @@ mod edits;
 mod opening;
 mod presentation;
 pub use chat_history::{
-    AppEventImport, HistoryExportEvent, HistoryExportRow, HistoryImportSource, ImportedAppEvent,
-    ImportedFileKey, LatestHistoryImport,
+    AppEventImport, BackupHistorySource, HistoryExportEvent, HistoryExportRow,
+    HistoryImportProvenance, HistoryImportSource, ImportedAppEvent, ImportedFileKey,
+    LatestHistoryImport,
 };
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
@@ -22,11 +23,10 @@ pub use presentation::ConversationPresentationPage;
 
 use crate::app::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;
 
-/// The slot of the device a timeline row was imported from, or NULL for a
-/// row that arrived live.
-use chat_history::TIMELINE_IMPORT_LABEL_SQL;
-const TIMELINE_IMPORT_SOURCE_SQL: &str = "(SELECT imported.source_slot FROM app_event_imports imported WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
 use crate::base::connection::CachedSql;
+use chat_history::{
+    TIMELINE_IMPORT_LABEL_SQL, TIMELINE_IMPORT_PROVENANCE_SQL, history_import_provenance_from_row,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
@@ -287,10 +287,15 @@ pub struct TimelineMessageRecord {
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
     /// The device this row came from in a chat history it sent (mdk#2628
-    /// 4.2d); `None` for a row that arrived live. A host draws "Imported
-    /// from" where rows change from imported to live.
+    /// 4.2d). This legacy sibling-only field is `None` for live or backup
+    /// rows; `app_event_import_provenance` identifies the complete source.
     #[serde(default)]
     pub imported_from: Option<HistoryImportSource>,
+    /// Complete import source, carried by incremental updates and batched
+    /// timeline/conversation reads. Backup identity proves neither a device
+    /// writer nor historical authorship. Live rows have none.
+    #[serde(default)]
+    pub history_import_provenance: Option<HistoryImportProvenance>,
 }
 
 impl std::fmt::Debug for TimelineMessageRecord {
@@ -3552,12 +3557,15 @@ fn timeline_records_by_ids_tx(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              WHERE timeline.group_id_hex = ?
                AND timeline.message_id_hex IN ({placeholders})"
         );
@@ -3816,12 +3824,15 @@ fn timeline_query_sql(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              {where_sql}
              {order_sql}
              LIMIT ?"
@@ -4239,12 +4250,15 @@ fn visible_timeline_record(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM visible_message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              WHERE timeline.group_id_hex = ?1
                AND timeline.message_id_hex = ?2
              LIMIT 1"),
@@ -4331,6 +4345,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
                     Box::new(e),
                 )
             })?,
+        history_import_provenance: history_import_provenance_from_row(row)?,
         imported_from: row
             .get::<_, Option<Vec<u8>>>("imported_source_slot")?
             .map(|slot| -> rusqlite::Result<_> {

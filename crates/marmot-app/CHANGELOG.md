@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded
+  downloads, ephemeral recovery words, explicit cancellation, partial results, later-join availability hints and
+  typed core backup provenance. Archived preferences and automatic membership recovery remain outside this flow.
+
 ### Breaking changes
 
 - `sign_out_and_wipe` signs out through the account's other devices

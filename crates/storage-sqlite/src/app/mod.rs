@@ -7,6 +7,7 @@ pub(crate) mod attachment_history;
 pub(crate) mod avatar_cache;
 pub(crate) mod backup_ledger;
 pub(crate) mod backup_recovery_key;
+pub(crate) mod backup_restore;
 pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;
 pub(crate) mod compromise_warning;

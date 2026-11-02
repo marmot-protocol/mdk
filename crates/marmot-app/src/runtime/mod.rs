@@ -2800,6 +2800,67 @@ impl MarmotAppRuntime {
         self.accounts.turn_off_backups(account_ref).await
     }
 
+    /// Begin an ephemeral, history-only restore with user-supplied words.
+    /// Completion is observed through the status/watch APIs; secrets are never
+    /// persisted or resumed after reconnect/close. Backups/settings are unchanged.
+    pub async fn begin_backup_restore(
+        &self,
+        account_ref: &str,
+        words: crate::BackupRestoreWords,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.begin_backup_restore(account_ref, words).await
+    }
+
+    /// Stop this operation, dropping its secrets; committed history stays.
+    pub async fn cancel_backup_restore(
+        &self,
+        account_ref: &str,
+        operation: crate::BackupRestoreId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .cancel_backup_restore(account_ref, operation)
+            .await
+    }
+
+    pub async fn backup_restore_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.backup_restore_status(account_ref).await
+    }
+
+    /// Progress and payload-free availability changes, including actual joins.
+    /// Query availability only for the current chat; metadata never joins one.
+    pub async fn watch_backup_restore(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreWatch, AppError> {
+        self.accounts.watch_backup_restore(account_ref).await
+    }
+
+    /// The complete source for an application's content-derived event id,
+    /// not its transport id. A backup source never asserts device authorship.
+    pub async fn history_import_provenance(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        event_id: &str,
+    ) -> Result<Option<crate::HistoryImportProvenance>, AppError> {
+        self.accounts
+            .history_import_provenance(account_ref, group_id, event_id)
+            .await
+    }
+
+    pub async fn backup_history_availability(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::BackupHistoryAvailability>, AppError> {
+        self.accounts
+            .backup_history_availability(account_ref, group_id)
+            .await
+    }
+
     /// Where the account's backups stand: whether they are on and whether
     /// this device writes them, as the device group's roster holds them now
     /// (with no device group, as this device keeps them). A change a fork

@@ -2791,6 +2791,19 @@ impl AppClient {
                     return Err(error);
                 }
             };
+            for event in &projected_effects.events {
+                use cgka_traits::engine::GroupEvent;
+                if matches!(
+                    event,
+                    GroupEvent::GroupJoined { .. }
+                        | GroupEvent::LocalGroupCopyTerminated { .. }
+                        | GroupEvent::LocalGroupCopyRestored { .. }
+                        | GroupEvent::GroupHydrationRecovered { .. }
+                        | GroupEvent::GroupUnrecoverable { .. }
+                ) {
+                    self.backup_restore.availability_changed = true;
+                }
+            }
             // Only post-engine-success batches own this pin. Projection has
             // settled; release before any checkpoint can seal a newer cursor.
             if let Some(id) = &pending.source_delivery_id {

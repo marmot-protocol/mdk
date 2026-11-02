@@ -104,6 +104,46 @@ fn backup_error(reason: &'static str) -> AppError {
     AppError::DeviceGroupRefused(reason)
 }
 
+/// Read-only pointer discovery shared by writing and manual restoration.
+/// No ledger, deletion, publication, writer or recovery-setting action occurs.
+pub(super) async fn read_backup_pointer(
+    relay_plane: &crate::MarmotRelayPlane,
+    endpoints: &[TransportEndpoint],
+    account_id_hex: &str,
+    key: &[u8],
+) -> Result<(Vec<PointerEntry>, u64), AppError> {
+    let address = backup_address(key);
+    let query = DirectoryEventQuery::address(
+        KIND_BACKUP_POINTER,
+        account_id_hex,
+        address.clone(),
+        POINTER_FETCH_LIMIT,
+    );
+    let outcome = relay_plane
+        .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
+        .await
+        .map_err(|_| backup_error("backup_pointer_unavailable"))?;
+    if outcome.complete_endpoints.is_empty() {
+        return Err(backup_error("backup_pointer_unavailable"));
+    }
+    // Of two versions, the newer stands; on a tie, the lower id (NIP-01).
+    let newest = outcome
+        .records
+        .into_iter()
+        .map(|record| record.event)
+        .filter(|event| {
+            event.kind == KIND_BACKUP_POINTER
+                && event.pubkey == account_id_hex
+                && event.tag_values("d").contains(&address.as_str())
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
+    let Some(event) = newest else {
+        return Ok((Vec::new(), 0));
+    };
+    let backups = BackupPointer::open(&event.content, key)?.backups;
+    Ok((backups, event.created_at))
+}
+
 /// Run `f` on the blocking pool: SQLite, AEAD and hashing on a runtime
 /// thread would stall every account's tasks.
 async fn blocking<T: Send + 'static>(
@@ -262,38 +302,13 @@ impl BackupPass {
     /// from no answer would drop every backup, and when the newest pointer
     /// does not open.
     async fn fetch_pointer(&self) -> Result<(Vec<PointerEntry>, u64), AppError> {
-        let address = backup_address(&self.key);
-        let query = DirectoryEventQuery::address(
-            KIND_BACKUP_POINTER,
+        read_backup_pointer(
+            &self.app.relay_plane,
+            &self.endpoints,
             &self.account_id_hex,
-            address.clone(),
-            POINTER_FETCH_LIMIT,
-        );
-        let outcome = self
-            .app
-            .relay_plane
-            .fetch_directory_events_with_completion(self.endpoints.clone(), vec![query])
-            .await
-            .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-        if outcome.complete_endpoints.is_empty() {
-            return Err(backup_error("backup_pointer_unavailable"));
-        }
-        // Of two versions, the newer stands; on a tie, the lower id (NIP-01).
-        let newest = outcome
-            .records
-            .into_iter()
-            .map(|record| record.event)
-            .filter(|event| {
-                event.kind == KIND_BACKUP_POINTER
-                    && event.pubkey == self.account_id_hex
-                    && event.tag_values("d").contains(&address.as_str())
-            })
-            .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
-        let Some(event) = newest else {
-            return Ok((Vec::new(), 0));
-        };
-        let backups = BackupPointer::open(&event.content, &self.key)?.backups;
-        Ok((backups, event.created_at))
+            &self.key,
+        )
+        .await
     }
 
     /// Delete each condemned blob whose delete is due, unless `listed`
@@ -618,7 +633,7 @@ impl BackupPass {
 impl MarmotApp {
     /// The relays the account's backup pointer goes to and is read from:
     /// its NIP-65 write relays, else the directory's.
-    fn backup_pointer_endpoints(&self, account_id_hex: &str) -> Vec<TransportEndpoint> {
+    pub(super) fn backup_pointer_endpoints(&self, account_id_hex: &str) -> Vec<TransportEndpoint> {
         self.outbox_endpoints(
             account_id_hex,
             self.directory().directory_source_relays(&[]),

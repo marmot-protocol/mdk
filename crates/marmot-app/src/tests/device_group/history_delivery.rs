@@ -32,6 +32,61 @@ pub(super) struct LocalBlossom {
     pub(super) blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub(super) refuse_uploads: Arc<AtomicBool>,
     pub(super) deleters: Arc<Mutex<Vec<String>>>,
+    pub(super) reads: Arc<Mutex<Vec<String>>>,
+    get_gate: Arc<Mutex<Option<BlossomGetGate>>>,
+}
+
+struct BlossomGetGate {
+    hash: String,
+    started: tokio::sync::oneshot::Sender<()>,
+    released: std::sync::mpsc::Receiver<()>,
+}
+
+pub(super) struct BlossomGetHold {
+    started: tokio::sync::oneshot::Receiver<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl BlossomGetHold {
+    pub(super) async fn entered(&mut self) {
+        (&mut self.started)
+            .await
+            .expect("the actual GET reaches the server");
+    }
+
+    pub(super) fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for BlossomGetHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl LocalBlossom {
+    /// Hold a real HTTP GET before serving its bytes; no client retry,
+    /// membership or cancellation decision is supplied by this fixture.
+    pub(super) fn hold_get(&self, hash: &str) -> BlossomGetHold {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut gate = self.get_gate.lock().unwrap();
+        assert!(gate.is_none());
+        *gate = Some(BlossomGetGate {
+            hash: hash.into(),
+            started,
+            released,
+        });
+        BlossomGetHold {
+            started: wait,
+            release: Some(release),
+        }
+    }
 }
 
 pub(super) fn local_blossom() -> LocalBlossom {
@@ -40,11 +95,17 @@ pub(super) fn local_blossom() -> LocalBlossom {
     let blobs = Arc::<Mutex<HashMap<String, Vec<u8>>>>::default();
     let refuse_uploads = Arc::<AtomicBool>::default();
     let deleters = Arc::<Mutex<Vec<String>>>::default();
+    let reads = Arc::<Mutex<Vec<String>>>::default();
+    let get_gate = Arc::<Mutex<Option<BlossomGetGate>>>::default();
     let (served, refused, signed) = (blobs.clone(), refuse_uploads.clone(), deleters.clone());
+    let (read_log, gate) = (reads.clone(), get_gate.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let (served, refused, signed) = (served.clone(), refused.clone(), signed.clone());
-            std::thread::spawn(move || serve_blossom(stream, &served, &refused, &signed));
+            let (reads, gate) = (read_log.clone(), gate.clone());
+            std::thread::spawn(move || {
+                serve_blossom(stream, &served, &refused, &signed, &reads, &gate)
+            });
         }
     });
     LocalBlossom {
@@ -52,6 +113,8 @@ pub(super) fn local_blossom() -> LocalBlossom {
         blobs,
         refuse_uploads,
         deleters,
+        reads,
+        get_gate,
     }
 }
 
@@ -82,6 +145,8 @@ fn serve_blossom(
     blobs: &Mutex<HashMap<String, Vec<u8>>>,
     refuse_uploads: &AtomicBool,
     deleters: &Mutex<Vec<String>>,
+    reads: &Mutex<Vec<String>>,
+    gate: &Mutex<Option<BlossomGetGate>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut request = String::new();
@@ -128,10 +193,26 @@ fn serve_blossom(
             blobs.lock().unwrap().insert(hash.clone(), body);
             respond("200 OK", format!(r#"{{"sha256":"{hash}"}}"#).as_bytes())
         }
-        (Some("GET"), Some(path)) => match blobs.lock().unwrap().get(&path[1..]) {
-            Some(blob) => respond("200 OK", blob),
-            None => respond("404 Not Found", b""),
-        },
+        (Some("GET"), Some(path)) => {
+            let hash = &path[1..];
+            reads.lock().unwrap().push(hash.into());
+            let held = {
+                let mut gate = gate.lock().unwrap();
+                if gate.as_ref().is_some_and(|gate| gate.hash == hash) {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(held) = held {
+                let _ = held.started.send(());
+                let _ = held.released.recv();
+            }
+            match blobs.lock().unwrap().get(hash) {
+                Some(blob) => respond("200 OK", blob),
+                None => respond("404 Not Found", b""),
+            }
+        }
         (Some("DELETE"), Some(path)) => match delete_authorizer(&authorization, &path[1..]) {
             None => respond("401 Unauthorized", b""),
             Some(signer) => {
@@ -252,7 +333,7 @@ fn phone_named(devices: &Devices, label: &str) -> HistoryImportSource {
 }
 
 /// The phone adds the laptop's tagged KeyPackage to `chat`; the laptop joins.
-async fn add_laptop(devices: &mut Devices, chat: &GroupId) {
+pub(super) async fn add_laptop(devices: &mut Devices, chat: &GroupId) {
     let mut cursor = published_count(&devices.relay);
     let key_package = published_key_package(&mut devices.laptop, &devices.relay).await;
     let effects = devices

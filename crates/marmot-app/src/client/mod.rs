@@ -76,6 +76,7 @@ mod chat_history;
 pub use chat_history::DevSealedHistoryBundle;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use chat_history::newest_bundles_start;
+pub(crate) mod backup_restore;
 pub(crate) mod backup_writer;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;
@@ -866,6 +867,7 @@ pub struct AppClient {
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
+    pub(crate) backup_restore: backup_restore::BackupRestore,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.

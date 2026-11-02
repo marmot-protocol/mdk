@@ -376,3 +376,20 @@ query still enumerates all deferred metadata so an unattempted row beyond a prev
 
 
 Media upgrades 0104 and 0105 preserve existing payload pages during account open. Retained legacy bodies gain a sentinel length column with validation/accounting on mutation; they retain the legacy byte-array bound, while larger files use the chunk tables. Already-upgraded stores keep their compatible physical layout. Partial upgrades replace only parent metadata: the migration runner suspends connection-local foreign-key enforcement before BEGIN, validates the affected parent/child references before commit, and restores the original setting on success, rollback and unwind. Checkpoint chunks are preserved in place; no migration ledger is relabeled. Optional encrypted-open observation reports fixed phases and schema numbers without paths, SQL, keys or user data.
+
+### Backup history provenance and catalog
+
+Migration 0168 keeps existing sibling import slots and permits a checked alternative backup source in
+`app_event_imports`. `import_app_events` remains supported for siblings;
+`import_app_events_with_provenance` inserts actual device-or-backup provenance atomically with new content, carried
+attachment keys and its returned projection. Existing live rows win. The same joined source supplies the additive
+`TimelineMessageRecord::history_import_provenance` in incremental, paged and conversation reads. The legacy
+`imported_from`/device-label fields remain sibling-only. Backup identity identifies fetched archive bytes, not a
+verified writer, historical author or membership grant. Imported rows retain the existing unread, retention and media
+key lifecycle.
+
+`backup_restore_catalog` and its indexed chat metadata contain recovery **public** keys and archive availability in
+the encrypted account database. An index is never a transcript, group, route or membership. Replacing an archive's
+index is atomic, and pruning one completely discovered key's pointer leaves other old keys and imported provenance
+alone. The app owns actual current-own-leaf admission and ephemeral secret/job lifecycle; words, entropy, recovery
+private keys and archive keys never belong in these tables.

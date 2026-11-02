@@ -224,6 +224,10 @@ pub use client::AppClient;
 #[cfg(feature = "test-policy-overrides")]
 #[doc(hidden)]
 pub use client::DevSealedHistoryBundle;
+pub use client::backup_restore::{
+    BackupHistoryAvailability, BackupRestoreId, BackupRestorePhase, BackupRestoreStatus,
+    BackupRestoreWatch, BackupRestoreWords,
+};
 pub use client::backups::{BackupSettings, RecoveryWords};
 pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
 #[cfg(feature = "test-policy-overrides")]
@@ -336,12 +340,13 @@ pub use notifications::{
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
 pub use storage_sqlite::{
-    ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
-    HistoryImportSource, MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage,
-    TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, TimelinePagination, TimelineReactionSummary, TimelineReplyPreview,
-    TimelineUserReaction, select_reusable_direct_conversation,
+    BackupHistorySource, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
+    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,
+    DeletionSource, ExistingDirectConversation, HistoryImportProvenance, HistoryImportSource,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
+    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    select_reusable_direct_conversation,
 };
 #[cfg(test)]
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
@@ -2180,6 +2185,7 @@ impl MarmotApp {
             inactive_siblings: None,
             leaving_siblings: HashMap::new(),
             pending_recovery_words: None,
+            backup_restore: Default::default(),
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,
             sign_in_schedule: Default::default(),
@@ -7223,21 +7229,22 @@ impl MarmotApp {
         &self,
         label: &str,
         group_id_hex: &str,
-        source_slot: &cgka_traits::app_components::DeviceSlotId,
+        source: &storage_sqlite::HistoryImportProvenance,
         events: &[storage_sqlite::ImportedAppEvent],
-    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+    ) -> Result<(usize, Option<AppProjectionUpdate>), AppError> {
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let import = storage.app_storage().import_app_events(
+            let import = storage.app_storage().import_app_events_with_provenance(
                 group_id_hex,
-                source_slot,
+                source,
                 events,
                 unix_now_seconds(),
             )?;
             if import.update.changes.is_empty() {
-                return Ok(None);
+                return Ok((import.imported, None));
             }
-            self.app_projection_update(label, import.update).map(Some)
+            self.app_projection_update(label, import.update)
+                .map(|update| (import.imported, Some(update)))
         })
     }
 
