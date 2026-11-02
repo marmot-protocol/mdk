@@ -56,3 +56,79 @@ CREATE INDEX backup_restore_catalog_by_chat
     )
     .storage()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::base::migrations::run_through;
+    use rusqlite::{Connection, Error, ErrorCode, params};
+
+    /// Existing sibling provenance survives the nullable-column upgrade;
+    /// backup provenance is an alternative, never a fabricated sibling.
+    #[test]
+    fn backup_source_upgrade_preserves_sibling_imports_and_requires_one_complete_source() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 167).unwrap();
+        for message in ["legacy", "backup"] {
+            conn.execute(
+                "INSERT INTO app_events
+                 (group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+                 VALUES ('chat',?1,'received','sender','held history',9,'[]',11,12)",
+                [message],
+            ).unwrap();
+        }
+        let slot: Vec<u8> = (1..=32).collect();
+        conn.execute(
+            "INSERT INTO app_event_imports(group_id_hex,message_id_hex,source_slot,imported_at)
+             VALUES ('chat','legacy',?1,137)",
+            [&slot],
+        )
+        .unwrap();
+        run_through(&mut conn, 168).unwrap();
+        let preserved: (Vec<u8>, i64, String) = conn
+            .query_row(
+                "SELECT i.source_slot,i.imported_at,e.plaintext FROM app_event_imports i
+             JOIN app_events e USING(group_id_hex,message_id_hex)
+             WHERE i.group_id_hex='chat' AND i.message_id_hex='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (slot.clone(), 137, "held history".into()));
+        conn.execute(
+            "INSERT INTO app_event_imports(group_id_hex,message_id_hex,source_slot,imported_at,
+             backup_recovery_key,backup_id,backup_head_sha256,backup_written_at)
+             VALUES ('chat','backup',NULL,149,?1,?2,?3,127)",
+            params![
+                [2u8; 32].as_slice(),
+                [3u8; 16].as_slice(),
+                [4u8; 32].as_slice()
+            ],
+        )
+        .unwrap();
+        type BackupSourceRow = (Option<Vec<u8>>, i64, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+        let backup: BackupSourceRow = conn.query_row(
+            "SELECT source_slot,imported_at,backup_recovery_key,backup_id,backup_head_sha256,backup_written_at
+             FROM app_event_imports WHERE group_id_hex='chat' AND message_id_hex='backup'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).unwrap();
+        assert_eq!(
+            backup,
+            (None, 149, vec![2; 32], vec![3; 16], vec![4; 32], 127)
+        );
+        for change in [
+            "source_slot=zeroblob(32)",
+            "backup_id=NULL",
+            "backup_recovery_key=NULL,backup_id=NULL,backup_head_sha256=NULL,backup_written_at=NULL",
+        ] {
+            let error = conn.execute(
+                &format!("UPDATE app_event_imports SET {change} WHERE group_id_hex='chat' AND message_id_hex='backup'"), [],
+            ).unwrap_err();
+            assert!(
+                matches!(error, Error::SqliteFailure(ref code,Some(ref message))
+                if code.code==ErrorCode::ConstraintViolation && message.contains("history_import_source")),
+                "the source-shape check must reject the invalid row: {error:?}"
+            );
+        }
+    }
+}
