@@ -5187,3 +5187,138 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 [Source](src/deployment.rs#L90)
 
 </details>
+
+<details>
+<summary>Backup recovery and observation</summary>
+
+### `BackupRestoreSubscription::next`
+
+```rust
+pub async fn next(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
+```
+
+Wait for the next aggregate progress or availability revision; `None` means the worker closed. This receive is cancellation-safe. Closing the observer does not cancel restore; use the named operation command.
+
+[Source](src/subscriptions.rs#L534)
+
+### `BackupRestoreSubscription::snapshot`
+
+```rust
+pub fn snapshot(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
+```
+
+Take the initial status exactly once; later calls return `None`. Use `next` for changes or `backupRestoreStatus` for a fresh read. This observer owns neither recovery words nor the operation.
+
+[Source](src/subscriptions.rs#L530)
+
+### `Marmot::backup_history_availability`
+
+```rust
+pub async fn backup_history_availability( &self, account_ref: String, group_id_hex: String, ) -> Result<Vec<BackupHistoryAvailabilityFfi>, MarmotKitError>
+```
+
+Read private words-again hints for a currently joined chat, using its variable-length MLS group id. A hint does not prove downloadable content or create membership. Re-read after a restore-watch revision or real join.
+
+[Source](src/commands/backups.rs#L122)
+
+### `Marmot::backup_restore_status`
+
+```rust
+pub async fn backup_restore_status( &self, account_ref: String, ) -> Result<BackupRestoreStatusFfi, MarmotKitError>
+```
+
+Read aggregate status without changing the operation. `Complete` means eligible work settled, not global completeness or proof that a pointer existed. Counts retain committed prefixes after cancellation.
+
+[Source](src/commands/backups.rs#L101)
+
+### `Marmot::backup_settings`
+
+```rust
+pub async fn backup_settings( &self, account_ref: String, ) -> Result<BackupSettingsFfi, MarmotKitError>
+```
+
+Read the selected account backup settings, including whether this device writes. Use this authoritative read after setup or a concurrent setting change; submitting a change is not proof it remains selected.
+
+[Source](src/commands/backups.rs#L48)
+
+### `Marmot::begin_backup_restore`
+
+```rust
+pub async fn begin_backup_restore( &self, account_ref: String, words: String, ) -> Result<BackupRestoreStatusFfi, MarmotKitError>
+```
+
+Start one ephemeral manual history-only restore per account from old recovery words. Only current own-leaf member chats can receive history; current keys and archived preferences stay unchanged. Keep the returned opaque operation token for cancellation. Clear host-owned word copies promptly; generated strings are not secure buffers.
+
+[Source](src/commands/backups.rs#L72)
+
+### `Marmot::begin_recovery_words`
+
+```rust
+pub async fn begin_recovery_words( &self, account_ref: String, ) -> Result<RecoveryWordsFfi, MarmotKitError>
+```
+
+Generate twelve new words for backup setup and two 1-based confirmation positions. Show once and confirm answers in that order. Never persist or log the words; this is separate from restoring with existing words.
+
+[Source](src/commands/backups.rs#L17)
+
+### `Marmot::cancel_backup_restore`
+
+```rust
+pub async fn cancel_backup_restore( &self, account_ref: String, operation: String, ) -> Result<bool, MarmotKitError>
+```
+
+Cancel only the named account-scoped operation. A stale valid token returns false; a malformed token is rejected. Committed history remains. Retry requires words again; dropping a watch does not call this command.
+
+[Source](src/commands/backups.rs#L86)
+
+### `Marmot::cancel_recovery_words`
+
+```rust
+pub async fn cancel_recovery_words(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Forget a pending recovery-word confirmation without changing existing account backups. Clear host-managed display/input copies separately.
+
+[Source](src/commands/backups.rs#L40)
+
+### `Marmot::confirm_recovery_words`
+
+```rust
+pub async fn confirm_recovery_words( &self, account_ref: String, answers: Vec<String>, ) -> Result<(), MarmotKitError>
+```
+
+Confirm the two requested words in position order. Busy or error results keep the core setup for another try. MDK guards its owned queued answers; caller/generated copies still need host handling. Read backup settings again to render the selected outcome.
+
+[Source](src/commands/backups.rs#L29)
+
+### `Marmot::set_backup_background_conditions`
+
+```rust
+pub async fn set_backup_background_conditions( &self, account_ref: String, wifi: bool, charging: bool, ) -> Result<(), MarmotKitError>
+```
+
+Report Wi-Fi and charging facts on worker start and changes. Both are required before the next background writer pass; replacement workers default closed. An admitted whole pass settles after false. This wakes existing due/backoff/resource checks, never forces a backup, and does not gate manual restore.
+
+[Source](src/commands/backups.rs#L58)
+
+### `Marmot::turn_off_backups`
+
+```rust
+pub async fn turn_off_backups(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Disable future account backups through the selected account setting. Existing archives remain; this is not archive deletion or cancellation of an already admitted pass.
+
+[Source](src/commands/backups.rs#L44)
+
+### `Marmot::watch_backup_restore`
+
+```rust
+pub async fn watch_backup_restore( &self, account_ref: String, ) -> Result<Arc<BackupRestoreSubscription>, MarmotKitError>
+```
+
+Observe one initial snapshot and later progress/availability revisions. Closing the watch stops observation only. Keep its account context and cancel explicitly with the operation token when desired.
+
+[Source](src/commands/backups.rs#L113)
+
+</details>

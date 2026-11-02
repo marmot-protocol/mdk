@@ -621,6 +621,20 @@ typedef enum MarmotLinkedDeviceStatus {
 } MarmotLinkedDeviceStatus;
 
 /**
+ * Aggregate operation phase. Complete does not prove global recovery or
+ * that a pointer existed; render committed-prefix counts independently.
+ */
+typedef enum MarmotBackupRestorePhase {
+  MARMOT_BACKUP_RESTORE_PHASE_IDLE,
+  MARMOT_BACKUP_RESTORE_PHASE_DISCOVERING,
+  MARMOT_BACKUP_RESTORE_PHASE_RESTORING,
+  MARMOT_BACKUP_RESTORE_PHASE_COMPLETE,
+  MARMOT_BACKUP_RESTORE_PHASE_PARTIAL,
+  MARMOT_BACKUP_RESTORE_PHASE_UNAVAILABLE,
+  MARMOT_BACKUP_RESTORE_PHASE_CANCELLED,
+} MarmotBackupRestorePhase;
+
+/**
  * Where an unrecognized sign-in stands on this device.
  */
 typedef enum MarmotUnrecognizedSignInState {
@@ -1525,6 +1539,11 @@ typedef struct MarmotAttachmentHistoryVersion MarmotAttachmentHistoryVersion;
  * Close/free before freeing its client. Never free during an active call.
  */
 typedef struct MarmotAttachmentTransferSubscription MarmotAttachmentTransferSubscription;
+
+/**
+ * Observer only. Free/clear stops observation, never cancels restore.
+ */
+typedef struct MarmotBackupRestoreSubscription MarmotBackupRestoreSubscription;
 
 /**
  * Account-private block list changes.
@@ -2958,6 +2977,56 @@ typedef struct MarmotChatHistoryImportList {
   struct MarmotChatHistoryImport *items;
   uintptr_t len;
 } MarmotChatHistoryImportList;
+
+/**
+ * Shown-once recovery words. Clear host copies and promptly free this
+ * record; ordinary managed/FFI strings are not secure buffers.
+ */
+typedef struct MarmotRecoveryWords {
+  char **words;
+  uintptr_t words_len;
+  uint32_t *confirm_positions;
+  uintptr_t confirm_positions_len;
+} MarmotRecoveryWords;
+
+/**
+ * Current account backup settings, not a publication receipt.
+ */
+typedef struct MarmotBackupSettings {
+  bool enabled;
+  bool this_device_writes;
+} MarmotBackupSettings;
+
+/**
+ * Aggregate operation facts. No words, key, content or membership proof.
+ */
+typedef struct MarmotBackupRestoreStatus {
+  char *operation;
+  enum MarmotBackupRestorePhase phase;
+  uint64_t imported_bundles;
+  uint64_t imported_events;
+  uint64_t failed_archives;
+  uint64_t failed_bundles;
+  uint64_t skipped_bundles;
+  uint64_t revision;
+} MarmotBackupRestoreStatus;
+
+/**
+ * Private words-again hint for an actual current chat, not download proof.
+ */
+typedef struct MarmotBackupHistoryAvailability {
+  char *recovery_public_key_hex;
+  uint64_t newest_written_at;
+  uint32_t backups;
+} MarmotBackupHistoryAvailability;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotBackupHistoryAvailabilityList {
+  struct MarmotBackupHistoryAvailability *items;
+  uintptr_t len;
+} MarmotBackupHistoryAvailabilityList;
 
 /**
  * A sign-in of this account that this device does not recognize.
@@ -4925,6 +4994,40 @@ typedef struct MarmotTimelineEditSummary {
 } MarmotTimelineEditSummary;
 
 /**
+ * Backup identity only, never verified historical writer/authorship.
+ */
+typedef struct MarmotBackupHistorySource {
+  char *recovery_public_key_hex;
+  char *backup_id_hex;
+  char *head_sha256_hex;
+  uint64_t written_at;
+} MarmotBackupHistorySource;
+
+/**
+ * Complete row provenance. Backup never fabricates a device slot or label.
+ */
+typedef enum MarmotHistoryImportProvenance_Tag {
+  MARMOT_HISTORY_IMPORT_PROVENANCE_DEVICE,
+  MARMOT_HISTORY_IMPORT_PROVENANCE_BACKUP,
+} MarmotHistoryImportProvenance_Tag;
+
+typedef struct MarmotHistoryImportProvenance_Device_Body {
+  char *device_slot_id_hex;
+} MarmotHistoryImportProvenance_Device_Body;
+
+typedef struct MarmotHistoryImportProvenance_Backup_Body {
+  struct MarmotBackupHistorySource source;
+} MarmotHistoryImportProvenance_Backup_Body;
+
+typedef struct MarmotHistoryImportProvenance {
+  MarmotHistoryImportProvenance_Tag tag;
+  union {
+    MarmotHistoryImportProvenance_Device_Body DEVICE;
+    MarmotHistoryImportProvenance_Backup_Body BACKUP;
+  };
+} MarmotHistoryImportProvenance;
+
+/**
  * One materialized timeline row.
  */
 typedef struct MarmotTimelineMessageRecord {
@@ -5016,6 +5119,10 @@ typedef struct MarmotTimelineMessageRecord {
    * where rows change from imported to live.
    */
   struct MarmotHistoryImportSource *imported_from;
+  /**
+   * Complete typed provenance; legacy imported_from remains sibling-only.
+   */
+  struct MarmotHistoryImportProvenance *history_import_provenance;
 } MarmotTimelineMessageRecord;
 
 /**
@@ -6445,6 +6552,13 @@ typedef struct MarmotBlockListSnapshot {
  * the call) and finally with NULL when the stream closes.
  */
 typedef void (*MarmotBlockListCallback)(const struct MarmotBlockListSnapshot *item, void *user_data);
+
+/**
+ * Callback invoked with each item (borrowed; valid only during
+ * the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotBackupRestoreCallback)(const struct MarmotBackupRestoreStatus *item,
+                                            void *user_data);
 
 typedef struct MarmotAttachmentTransferStatus {
   char *reference;
@@ -8202,6 +8316,144 @@ MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
 MarmotStatus marmot_chat_history_imports(const struct MarmotClient *client,
                                          const char *account_ref,
                                          struct MarmotChatHistoryImportList **out);
+
+/**
+ * Generate shown-once words. Never log/persist; free with marmot_recovery_words_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_begin_recovery_words(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotRecoveryWords **out);
+
+/**
+ * Confirm the two words at MDK's positions, in order. Inputs borrowed;
+ * clear host copies. Errors keep the core confirmation flow retryable.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_confirm_recovery_words(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *const *answers,
+                                           uintptr_t answers_len);
+
+/**
+ * Forget pending words, without changing active account backup settings.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cancel_recovery_words(const struct MarmotClient *client,
+                                          const char *account_ref);
+
+/**
+ * Turn off future backups; previously written archives remain.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_turn_off_backups(const struct MarmotClient *client, const char *account_ref);
+
+/**
+ * Current account settings; free with marmot_backup_settings_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_backup_settings(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    struct MarmotBackupSettings **out);
+
+/**
+ * Report Wi-Fi/charging on worker start and changes; both are required
+ * for new background passes. A replacement worker defaults closed.
+ * Admitted work settles after false; manual restoration is unaffected.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_backup_background_conditions(const struct MarmotClient *client,
+                                                     const char *account_ref,
+                                                     uint8_t wifi,
+                                                     uint8_t charging);
+
+/**
+ * Begin manual history-only restore. Words borrowed, never retained by
+ * C; clear host copies. Free status with marmot_backup_restore_status_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_begin_backup_restore(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *words,
+                                         struct MarmotBackupRestoreStatus **out);
+
+/**
+ * Cancel only this operation; stale valid tokens return false,
+ * malformed tokens INVALID_HEX. Committed history remains.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cancel_backup_restore(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *operation,
+                                          bool *out);
+
+/**
+ * Aggregate progress; free with marmot_backup_restore_status_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_backup_restore_status(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          struct MarmotBackupRestoreStatus **out);
+
+/**
+ * Private availability hints for this CURRENT chat; no implicit join.
+ * Free with marmot_backup_history_availability_list_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_backup_history_availability(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                struct MarmotBackupHistoryAvailabilityList **out);
 
 /**
  * Whether this device's KeyPackage refresh is overdue because its device
@@ -12751,6 +13003,76 @@ MarmotStatus marmot_block_list_subscription_snapshot(const struct MarmotBlockLis
                                                      struct MarmotBlockListSnapshot **out);
 
 /**
+ *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_backup_restore_status_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` must be a valid pointer.
+ */
+MarmotStatus marmot_backup_restore_subscription_next(const struct MarmotBackupRestoreSubscription *sub,
+                                                     uint32_t timeout_ms,
+                                                     struct MarmotBackupRestoreStatus **out);
+
+/**
+ * Install a callback pump for this subscription. `callback` runs
+ * on a runtime worker thread with a borrowed item pointer (valid
+ * only during the call; do not store or free it) and a final
+ * NULL item on close. `callback` and `user_data` access must be
+ * thread-safe. Fails if a callback is already installed.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function
+ * pointer. `user_data` must outlive every callback invocation —
+ * clear/free only *request* cancellation without waiting (see
+ * the module docs).
+ */
+MarmotStatus marmot_backup_restore_subscription_set_callback(const struct MarmotBackupRestoreSubscription *sub,
+                                                             MarmotBackupRestoreCallback callback,
+                                                             void *user_data);
+
+/**
+ * Request cancellation of this subscription's callback pump, if
+ * any. Non-blocking: a callback already running keeps executing
+ * after this returns (see the module docs).
+ *
+ * # Safety
+ * `sub` must be a live handle.
+ */
+MarmotStatus marmot_backup_restore_subscription_clear_callback(const struct MarmotBackupRestoreSubscription *sub);
+
+/**
+ * Free the subscription handle. Requests callback-pump
+ * cancellation without waiting (a callback may still be running
+ * after this returns — do not free `user_data` on that basis).
+ * NULL is a no-op. Free every handle before the client that
+ * created it.
+ *
+ * # Safety
+ * `sub` must be NULL or an unfreed handle pointer.
+ */
+void marmot_backup_restore_subscription_free(struct MarmotBackupRestoreSubscription *sub);
+
+/**
+ * Observe restore progress. Free the subscription before its client;
+ * explicit cancel is a separate operation-token command.
+ *
+ * # Safety
+ * client and account_ref must be valid; out_sub must be writable.
+ */
+MarmotStatus marmot_watch_backup_restore(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotBackupRestoreSubscription **out_sub);
+
+/**
+ * Initial status exactly once; subsequent calls return OK with NULL.
+ * Free a non-NULL result with marmot_backup_restore_status_free.
+ *
+ * # Safety
+ * sub must be live and out writable.
+ */
+MarmotStatus marmot_backup_restore_subscription_snapshot(const struct MarmotBackupRestoreSubscription *sub,
+                                                         struct MarmotBackupRestoreStatus **out);
+
+/**
  * Open a bounded progress stream. First next returns the initial snapshot.
  * # Safety
  * Inputs must be live, targets NULL only with zero length, out writable.
@@ -13310,6 +13632,45 @@ void marmot_audit_otlp_config_v5_free(struct MarmotAuditOtlpConfigV5 *ptr);
  * this library.
  */
 void marmot_audit_log_tracker_update_result_v5_free(struct MarmotAuditLogTrackerUpdateResultV5 *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_recovery_words_free(struct MarmotRecoveryWords *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_backup_settings_free(struct MarmotBackupSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_backup_restore_status_free(struct MarmotBackupRestoreStatus *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_backup_history_availability_list_free(struct MarmotBackupHistoryAvailabilityList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -461,7 +461,8 @@ when rows are read, so a rename shows after `LinkedDevicesChanged`. The additive
 identifies either `Device(slot)` or `Backup(source)` in core timeline pages, incremental projections and conversation
 windows. Live rows have no provenance. The legacy `imported_from` field remains sibling-only: its absence alone does
 not distinguish live history from a backup. A backup is "restored from backup", never an unnamed device; its public
-archive identity proves neither its writer nor historical authorship. The UniFFI and C timeline/conversation DTOs carry the same typed provenance; their legacy sibling field stays unchanged.
+archive identity proves neither its writer nor historical authorship. The UniFFI and C timeline/conversation DTOs
+carry the same typed provenance; their legacy sibling field stays unchanged.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
