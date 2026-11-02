@@ -259,6 +259,44 @@ impl MarmotAppRuntime {
         })
         .await
     }
+    /// Resolve a custom reaction's own encrypted image without scanning group
+    /// history. Returns only a validated image named by the reaction content's
+    /// first well-formed emoji definition. No download starts here; pass the
+    /// returned source slot to the normal acquisition and opaque local-read APIs.
+    /// Oversized metadata or no matching live artwork returns `None`.
+    pub async fn reaction_attachment(
+        &self,
+        account_ref: &str,
+        group: &GroupId,
+        reaction_message_id_hex: &str,
+    ) -> Result<Option<AttachmentEntry>, AppError> {
+        if reaction_message_id_hex.len() != 64
+            || !reaction_message_id_hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(AppError::InvalidEncryptedMedia(
+                "invalid reaction message id".into(),
+            ));
+        }
+        let reaction = reaction_message_id_hex.to_ascii_lowercase();
+        let group = hex::encode(group.as_slice());
+        self.attachment_read(account_ref, move |storage, loopback| {
+            for entry in storage.app_storage().reaction_attachment_candidates(
+                &group,
+                &reaction,
+                crate::unix_now_seconds(),
+            )? {
+                let entry = present(entry, loopback)?;
+                if entry.role == AttachmentRole::InlineEmoji {
+                    return Ok(Some(entry));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
     /// Compare against the baseline retained with loaded rows, even after exhaustion.
     /// Equality means unchanged; requires_restart_since distinguishes destructive
     /// changes from additions above/below an already passed paging boundary.

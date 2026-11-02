@@ -125,13 +125,12 @@ fn page_sql(cursor: bool) -> String {
         String::new()
     };
     format!("SELECT {KEY_COLUMNS},attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,slot_json,
-        (SELECT json_group_array(json(e.value)) FROM message_timeline t,
+        (SELECT json_group_array(json(e.value)) FROM (SELECT tags_json FROM message_timeline WHERE group_id_hex=attachment_history.group_id_hex AND message_id_hex=attachment_history.message_id_hex
+              UNION ALL SELECT tags_json FROM app_events WHERE group_id_hex=attachment_history.group_id_hex AND message_id_hex=attachment_history.message_id_hex AND kind=7) t,
             json_each(CASE WHEN json_valid(t.tags_json) THEN
                 CASE WHEN json_type(t.tags_json)='array' THEN t.tags_json ELSE '[]' END
                 ELSE '[]' END) e
-         WHERE t.group_id_hex=attachment_history.group_id_hex
-           AND t.message_id_hex=attachment_history.message_id_hex
-           AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END) AS emoji_tags_json
+         WHERE CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END) AS emoji_tags_json
         FROM attachment_history INDEXED BY idx_attachment_history_page
         WHERE group_id_hex=?1 AND visible=1{seek}
         ORDER BY order_class DESC,order_primary DESC,order_phase DESC,order_at DESC,message_id_hex DESC,attachment_order DESC
@@ -169,6 +168,36 @@ fn version_tx(
 }
 
 impl SqliteAppStorage {
+    /// Point-read at most 100 original slots from one live reaction. Source
+    /// metadata is capped at 16 KiB and only definitions naming its content's
+    /// shortcode are returned. No group history or message bodies are loaded.
+    pub fn reaction_attachment_candidates(
+        &self,
+        group: &str,
+        reaction: &str,
+        now: u64,
+    ) -> Result<Vec<AttachmentHistoryEntry>, StorageError> {
+        self.connection.with_deferred_read(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT h.message_id_hex,h.attachment_index,h.source_message_id_hex,
+                h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,
+                (SELECT json_group_array(json(e.value) ORDER BY CAST(e.key AS INTEGER)) FROM json_each(a.tags_json) e
+                 WHERE CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji'
+                   AND ':'||json_extract(e.value,'$[1]')||':'=a.plaintext ELSE 0 END) AS emoji_tags_json
+                FROM app_events a CROSS JOIN attachment_history h
+                  ON h.group_id_hex=a.group_id_hex AND h.message_id_hex=a.message_id_hex
+                JOIN account_groups g ON g.group_id_hex=a.group_id_hex
+                WHERE a.group_id_hex=?1 AND a.message_id_hex=?2 AND a.kind=7 AND a.invalidated=0
+                  AND h.visible=1 AND g.pending_confirmation=0
+                  AND length(CAST(a.tags_json AS BLOB))<=16384 AND json_valid(a.tags_json)
+                  AND length(CAST(a.plaintext AS BLOB))<=64
+                  AND h.attachment_index<100 AND length(CAST(h.slot_json AS BLOB))<=16384
+                  AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?3)
+                ORDER BY h.attachment_index LIMIT 100").storage()?;
+            stmt.query_map(rusqlite::params![group,reaction,crate::u64_to_i64(now)?],entry_from_row)
+                .storage()?.collect::<Result<Vec<_>,_>>().storage()
+        })
+    }
+
     /// Cheap authoritative change signal, including after the final page.
     /// Compare for equality to discover changes, then use
     /// [`AttachmentHistoryVersion::requires_restart_since`] to distinguish an
@@ -268,6 +297,66 @@ impl SqliteAppStorage {
             })
         })
     }
+}
+
+/// Rebuild only reactions associated with one changed timeline row, or every
+/// reaction after an existing whole-group rebuild. Modifier events remain in
+/// app_events; this source projection never introduces timeline rows.
+pub(crate) fn refresh_reaction_attachment_sources_tx(
+    conn: &Connection,
+    group: &str,
+    target: Option<&str>,
+) -> Result<(), StorageError> {
+    // Earlier migration bodies also rebuild timelines. Their schema has no
+    // reaction source view yet; migration 0167 performs the initial backfill.
+    if !conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM cgka_schema_migrations WHERE version=167)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .storage()?
+    {
+        return Ok(());
+    }
+    let ids = {
+        let sql = if target.is_some() {
+            "SELECT message_id_hex FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2 AND kind=7
+             UNION SELECT a.message_id_hex FROM message_modifier_edges e CROSS JOIN app_events a
+               ON a.group_id_hex=e.group_id_hex AND a.message_id_hex=e.modifier_message_id_hex
+             WHERE e.group_id_hex=?1 AND e.target_message_id_hex=?2 AND e.kind=7 AND a.kind=7"
+        } else {
+            "SELECT message_id_hex FROM app_events WHERE group_id_hex=?1 AND kind=7 AND ?2 IS NULL"
+        };
+        let mut stmt = conn.prepare_cached(sql).storage()?;
+        stmt.query_map(rusqlite::params![group, target], |r| r.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+    };
+    for message in ids {
+        // Keep unchanged slots and their jobs/cursors through target updates
+        // and whole-timeline rebuilds. Only a changed source is replaced.
+        conn.execute_cached("DELETE FROM attachment_history AS h WHERE group_id_hex=?1 AND message_id_hex=?2
+            AND NOT EXISTS (SELECT 1 FROM reaction_attachment_history_source s
+                WHERE s.group_id_hex=h.group_id_hex AND s.message_id_hex=h.message_id_hex
+                  AND s.attachment_index=h.attachment_index AND s.source_message_id_hex=h.source_message_id_hex
+                  AND s.source_epoch IS h.source_epoch AND s.sender=h.sender
+                  AND s.timeline_at=h.timeline_at AND s.received_at=h.received_at
+                  AND s.order_class=h.order_class AND s.order_primary=h.order_primary
+                  AND s.order_phase=h.order_phase AND s.order_at=h.order_at
+                  AND s.slot_json=h.slot_json AND s.visible=h.visible)",rusqlite::params![group,message]).storage()?;
+        conn.execute_cached("INSERT OR IGNORE INTO attachment_history(group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
+            source_epoch,sender,timeline_at,received_at,order_class,order_primary,order_phase,order_at,slot_json,visible)
+            SELECT * FROM reaction_attachment_history_source WHERE group_id_hex=?1 AND message_id_hex=?2",
+            rusqlite::params![group,message]).storage()?;
+        crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
+            conn,
+            group,
+            Some(&message),
+        )?;
+    }
+    Ok(())
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentHistoryEntry> {

@@ -1725,6 +1725,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
     }
+    crate::app::attachment_history::refresh_reaction_attachment_sources_tx(tx, group_id_hex, None)?;
     crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
         tx,
         group_id_hex,
@@ -1826,8 +1827,10 @@ fn secure_prune_selected_app_events_tx(
         } else {
             !encrypted_media_component_ids(&event.tags).is_empty()
         };
-        if event.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && carries_encrypted_media
+        if matches!(
+            event.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && carries_encrypted_media
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -1877,6 +1880,15 @@ fn secure_prune_selected_app_events_tx(
     )?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    // Reactions have no timeline row themselves. Losing a target must still
+    // revoke their slots, even when retention omits that target from reprojection.
+    for message_id in &pruned_message_ids {
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id),
+        )?;
+    }
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
     for message_id in affected_message_ids {
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
@@ -2153,6 +2165,11 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         )
         .storage()?;
         reports::refresh(tx, group_id_hex, message_id_hex)?;
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
         crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
             tx,
             group_id_hex,
@@ -2163,6 +2180,11 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
 
     upsert_message_timeline_row_tx(tx, &row)?;
     reports::refresh(tx, group_id_hex, message_id_hex)?;
+    crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+        tx,
+        group_id_hex,
+        Some(message_id_hex),
+    )?;
     if let Some(stream_start) = stream_start {
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }

@@ -18,6 +18,7 @@ per feature.
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
+  [custom reaction artwork](#custom-reaction-artwork),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
@@ -235,6 +236,16 @@ window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
 `CleanedBySetting`. Page cursors are borrowed from their page: keep the page alive
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
+
+## Custom reaction artwork
+
+`marmot_reaction_attachment` performs a bounded local lookup using the exact
+reaction event ID. It blocks off the UI thread and writes a standalone owned
+`MarmotAttachmentEntry`, or NULL with `MARMOT_STATUS_OK` when unavailable. Free
+the standalone result with `marmot_attachment_entry_free`; never use that free
+for an entry borrowed from a page. Use its original source target with ordinary
+attachment acquisition and local reads. See the
+[shared reaction contract](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork).
 
 ## File-backed media upload
 

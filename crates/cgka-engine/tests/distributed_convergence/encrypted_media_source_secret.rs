@@ -1,10 +1,11 @@
-//! A media application replayed inside a convergence pass carries its
+//! A media chat or reaction replayed inside a convergence pass carries its
 //! source-epoch encrypted-media secret, captured while replay authenticates
 //! it: later commits in the same pass prune that epoch's retained anchor
 //! before the application event is drained.
 
 use super::*;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
 
 #[tokio::test]
 async fn replayed_media_application_carries_source_secret_past_anchor_horizon() {
@@ -41,7 +42,8 @@ async fn replayed_media_application_carries_source_secret_past_anchor_horizon() 
         .unwrap()
         .exporter_secret(GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
         .expect("sender exports the E+1 media secret");
-    backlog.push(send_media(&mut alice, &group_id).await);
+    backlog.push(send_media(&mut alice, &group_id, MARMOT_APP_EVENT_KIND_CHAT).await);
+    backlog.push(send_media(&mut alice, &group_id, MARMOT_APP_EVENT_KIND_REACTION).await);
     backlog.push(send_app(&mut alice, &group_id, b"plain text".to_vec()).await);
     for _ in 0..6 {
         backlog.push(self_update(&mut alice, &group_id).await);
@@ -62,26 +64,36 @@ async fn replayed_media_application_carries_source_secret_past_anchor_horizon() 
             .unwrap();
     }
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(start + 7));
-    assert_eq!(
+    assert!(
         carol
             .retained_encrypted_media_exporter_secret(&group_id, EpochId(start + 1))
-            .unwrap(),
-        None,
+            .unwrap()
+            .is_none(),
         "the pass prunes the media application's source anchor"
     );
     let mut received = received_messages(&mut carol);
     received.sort_by(|a, b| a.0.cmp(&b.0));
     let [
+        (reaction_content, reaction_epoch, Some(reaction_secret)),
         (media_content, media_epoch, Some(media_secret)),
         (plain_content, _, None),
     ] = received.as_slice()
     else {
-        panic!("expected a secret on the media message only: {received:?}");
+        panic!("expected secrets on attachment-bearing messages only: {received:?}");
     };
+    assert_eq!(reaction_content, b":party:");
+    assert_eq!(*reaction_epoch, EpochId(start + 1));
+    assert!(
+        reaction_secret.as_bytes() == sender_secret.as_slice(),
+        "reaction carries its authenticated source key"
+    );
     assert_eq!(media_content, b"photo");
     assert_eq!(*media_epoch, EpochId(start + 1));
     assert_eq!(plain_content, b"plain text");
-    assert_eq!(media_secret.as_bytes(), sender_secret.as_slice());
+    assert!(
+        media_secret.as_bytes() == sender_secret.as_slice(),
+        "chat media carries its authenticated source key"
+    );
 }
 
 /// A media application that arrives after the receiver already left its
@@ -121,12 +133,13 @@ async fn late_media_application_carries_source_secret_past_anchor_horizon() {
         .unwrap()
         .exporter_secret(GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
         .expect("sender exports the E+1 media secret");
-    let media = send_media(&mut alice, &group_id).await;
+    let media = send_media(&mut alice, &group_id, MARMOT_APP_EVENT_KIND_CHAT).await;
+    let reaction = send_media(&mut alice, &group_id, MARMOT_APP_EVENT_KIND_REACTION).await;
     let plain = send_app(&mut alice, &group_id, b"plain text".to_vec()).await;
     for _ in 0..2 {
         on_time.push(self_update(&mut alice, &group_id).await);
     }
-    let mut late = vec![media, plain];
+    let mut late = vec![media, reaction, plain];
     for _ in 0..4 {
         late.push(self_update(&mut alice, &group_id).await);
     }
@@ -153,46 +166,72 @@ async fn late_media_application_carries_source_secret_past_anchor_horizon() {
             .unwrap();
     }
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(start + 7));
-    assert_eq!(
+    assert!(
         carol
             .retained_encrypted_media_exporter_secret(&group_id, EpochId(start + 1))
-            .unwrap(),
-        None,
+            .unwrap()
+            .is_none(),
         "the pass prunes the late media application's source anchor"
     );
 
     let mut received = received_messages(&mut carol);
     received.sort_by(|a, b| a.0.cmp(&b.0));
     let [
+        (reaction_content, reaction_epoch, Some(reaction_secret)),
         (media_content, media_epoch, Some(media_secret)),
         (plain_content, _, None),
     ] = received.as_slice()
     else {
-        panic!("expected a secret on the late media message only: {received:?}");
+        panic!("expected secrets on late attachment-bearing messages only: {received:?}");
     };
+    assert_eq!(reaction_content, b":party:");
+    assert_eq!(*reaction_epoch, EpochId(start + 1));
+    assert!(
+        reaction_secret.as_bytes() == sender_secret.as_slice(),
+        "reaction carries its authenticated source key"
+    );
     assert_eq!(media_content, b"photo");
     assert_eq!(*media_epoch, EpochId(start + 1));
     assert_eq!(plain_content, b"plain text");
-    assert_eq!(media_secret.as_bytes(), sender_secret.as_slice());
+    assert!(
+        media_secret.as_bytes() == sender_secret.as_slice(),
+        "chat media carries its authenticated source key"
+    );
 }
 
 async fn send_media(
     engine: &mut Engine<SqliteAccountStorage>,
     group_id: &GroupId,
+    kind: u64,
 ) -> TransportMessage {
-    let payload = MarmotAppEvent::new(
-        hex::encode(engine.self_id().as_slice()),
-        1_700_000_000,
-        MARMOT_APP_EVENT_KIND_CHAT,
-        vec![vec![
-            "imeta".into(),
-            "url https://blossom.example/attachment".into(),
-            "m image/png".into(),
-        ]],
-        "photo",
-    )
-    .encode()
-    .unwrap();
+    let mut tags = vec![vec![
+        "imeta".into(),
+        "url https://blossom.example/attachment".into(),
+        "m image/png".into(),
+    ]];
+    let author = hex::encode(engine.self_id().as_slice());
+    let content = if kind == MARMOT_APP_EVENT_KIND_REACTION {
+        let target = MarmotAppEvent::new(
+            &author,
+            1_700_000_000,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            tags.clone(),
+            "photo",
+        )
+        .id;
+        tags.push(vec!["e".into(), target]);
+        tags.push(vec![
+            "emoji".into(),
+            "party".into(),
+            "https://blossom.example/attachment".into(),
+        ]);
+        ":party:"
+    } else {
+        "photo"
+    };
+    let payload = MarmotAppEvent::new(author, 1_700_000_000, kind, tags, content)
+        .encode()
+        .unwrap();
     match engine
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),

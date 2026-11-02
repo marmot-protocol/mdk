@@ -173,10 +173,10 @@ fn sql(seek: bool) -> String {
     };
     format!("SELECT timeline_at,message_id_hex,attachment_order,
         attachment_index,source_message_id_hex,source_epoch,sender,received_at,
-        substr(slot_json,1,32769) AS slot_json,substr((SELECT json_group_array(json(e.value)) FROM message_timeline t,
+        substr(slot_json,1,32769) AS slot_json,substr((SELECT json_group_array(json(e.value)) FROM (SELECT tags_json FROM message_timeline WHERE group_id_hex=h.group_id_hex AND message_id_hex=h.message_id_hex
+                UNION ALL SELECT tags_json FROM app_events WHERE group_id_hex=h.group_id_hex AND message_id_hex=h.message_id_hex AND kind=7) t,
             json_each(CASE WHEN json_valid(t.tags_json) THEN CASE WHEN json_type(t.tags_json)='array' THEN t.tags_json ELSE '[]' END ELSE '[]' END)e
-            WHERE t.group_id_hex=h.group_id_hex AND t.message_id_hex=h.message_id_hex
-            AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769) AS emoji_tags_json,group_id_hex,retention_expires_at
+            WHERE CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769) AS emoji_tags_json,group_id_hex,retention_expires_at
         FROM attachment_history h INDEXED BY idx_account_attachment_history_page
         WHERE visible=1 AND timeline_at>=?1 AND timeline_at<=?2{seek}
         ORDER BY timeline_at DESC,group_id_hex DESC,message_id_hex DESC,attachment_order DESC LIMIT ?3")

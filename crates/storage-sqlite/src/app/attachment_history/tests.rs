@@ -737,3 +737,149 @@ fn attachment_history_metadata_is_source_scoped_and_not_an_album_copy() {
         assert!(result.next_cursor.is_some());
     }
 }
+
+// #2151: reactions are modifier events, never standalone timeline rows. Their
+// image slots must still follow the real event projection and author deletion.
+#[test]
+fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reactions.sqlite3");
+    let key = crate::SqlCipherKey::raw([0x42; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    sql(
+        &store,
+        "INSERT INTO account_groups(group_id_hex,endpoint,updated_at,pending_confirmation) VALUES('aa','',0,0)",
+    );
+    let mut event = crate::StoredAppEvent {
+        group_id_hex: "aa".into(),
+        message_id_hex: "chat".into(),
+        source_message_id_hex: Some("source-chat".into()),
+        source_epoch: Some(7),
+        direction: "received".into(),
+        sender: "alice".into(),
+        plaintext: "hello".into(),
+        kind: 9,
+        tags: Vec::new(),
+        recorded_at: 10,
+        received_at: 10,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    app.record_app_event(&event).unwrap();
+    let root = event.clone();
+    event.message_id_hex = "reaction".into();
+    event.source_message_id_hex = Some("source-reaction".into());
+    event.kind = 7;
+    event.plaintext = ":party:".into();
+    event.tags = vec![
+        vec!["e".into(), "chat".into()],
+        vec![
+            "emoji".into(),
+            "party".into(),
+            "https://example.com/party".into(),
+        ],
+        vec!["imeta".into(), "url https://example.com/party".into()],
+    ];
+    app.record_app_event(&event).unwrap();
+    let original = event.clone();
+    // The public resolver's database read is a point lookup even in a chat
+    // with substantial unrelated retained event history.
+    sql(&store,"WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+        INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+        SELECT 'aa',printf('unrelated-%04d',i),'received','alice','',9,'[]',1,1 FROM n");
+    let candidates = crate::base::query_work_test_support::measured(
+        &store,
+        "reaction attachment point lookup",
+        2000,
+        || {
+            app.reaction_attachment_candidates("aa", "reaction", 10)
+                .unwrap()
+        },
+    );
+    assert_eq!(candidates.len(), 1);
+    let p = page(&app);
+    assert_eq!(
+        p.entries.len(),
+        1,
+        "a kind-7 event must own an acquirable slot"
+    );
+    assert_eq!(p.entries[0].message_id_hex, "reaction");
+    assert_eq!(p.entries[0].source_message_id_hex, "source-reaction");
+    assert_eq!(p.entries[0].attachment_index, 0);
+    assert_eq!(p.entries[0].emoji_tags, vec![event.tags[1].clone()]);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM message_timeline WHERE message_id_hex='reaction'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    app.rebuild_message_timeline_for_group("aa").unwrap();
+    let rebuilt = page(&app);
+    assert_eq!(rebuilt.entries.len(), 1);
+    assert_eq!(
+        rebuilt.version, p.version,
+        "unchanged reaction slots survive timeline rebuilds"
+    );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    assert_eq!(page(&app).entries[0].message_id_hex, "reaction");
+    event.message_id_hex = "forged-delete".into();
+    event.source_message_id_hex = Some("source-forged-delete".into());
+    event.kind = 5;
+    event.sender = "mallory".into();
+    event.tags = vec![vec!["e".into(), "reaction".into()]];
+    app.record_app_event(&event).unwrap();
+    assert_eq!(
+        page(&app).entries.len(),
+        1,
+        "a different author cannot revoke the source"
+    );
+    event.message_id_hex = "delete".into();
+    event.source_message_id_hex = Some("source-delete".into());
+    event.sender = "alice".into();
+    app.record_app_event(&event).unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "author retraction revokes its reaction artwork"
+    );
+    app.invalidate_app_event_by_message_id("aa", "delete", "branch_selection_withdrawn")
+        .unwrap();
+    assert_eq!(
+        page(&app).entries.len(),
+        1,
+        "withdrawn deletion no longer revokes artwork"
+    );
+    app.invalidate_app_event_by_message_id("aa", "reaction", "branch_selection_withdrawn")
+        .unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "withdrawn reaction has no live source"
+    );
+    let mut retained = original;
+    retained.message_id_hex = "second-reaction".into();
+    retained.source_message_id_hex = Some("source-second-reaction".into());
+    app.record_app_event(&retained).unwrap();
+    assert_eq!(page(&app).entries.len(), 1);
+    app.record_app_event_with_retention(
+        &root,
+        Some(cgka_traits::app_event::AppMessageRetentionDecision {
+            retention_seconds: 10,
+            expires_at: Some(20),
+        }),
+    )
+    .unwrap();
+    app.secure_prune_expired_app_events("aa", 20, "self", &|_, _| false)
+        .unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "retention of the target revokes surviving reaction sources"
+    );
+}
