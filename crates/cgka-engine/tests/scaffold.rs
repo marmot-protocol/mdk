@@ -69,17 +69,23 @@ impl TransportPeeler for StubPeeler {
 #[test]
 fn builder_rejects_missing_identity() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .account_identity_proof_signer(proof_signer(b"id"))
         .peeler(Box::new(StubPeeler))
         .build();
-    assert!(matches!(res, Err(EngineError::Other(_))));
+    assert!(
+        matches!(res, Err(EngineError::Other(reason)) if reason == "identity bytes are required")
+    );
 }
 
 #[test]
 fn builder_rejects_missing_peeler() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
-        .identity(b"id".to_vec())
+        .identity(valid_identity(b"id"))
+        .account_identity_proof_signer(proof_signer(b"id"))
         .build();
-    assert!(matches!(res, Err(EngineError::Other(_))));
+    assert!(
+        matches!(res, Err(EngineError::Other(reason)) if reason == "TransportPeeler is required")
+    );
 }
 
 #[test]
@@ -118,12 +124,27 @@ async fn empty_engine_methods_return_typed_results() {
     assert!(engine.drain_auto_proposals().is_empty());
 
     // Sending to an unknown group returns a typed error, not a panic.
+    let unknown = cgka_traits::GroupId::new(vec![0; 4]);
+    let payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "message to an absent group",
+    )
+    .encode()
+    .unwrap();
     let res = engine
         .send(cgka_traits::engine::SendIntent::AppMessage {
-            group_id: cgka_traits::GroupId::new(vec![0; 4]),
-            payload: vec![],
+            group_id: unknown.clone(),
+            payload,
             expected_epoch: None,
         })
         .await;
-    assert!(res.is_err());
+    assert!(matches!(
+        res,
+        Err(EngineError::Storage(
+            cgka_traits::storage::StorageError::NotFound
+        ))
+    ));
 }

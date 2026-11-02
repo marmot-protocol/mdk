@@ -63,3 +63,46 @@ impl GroupContext for GroupContextView {
         self.transport_group_id.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENGINE_EXPORTER_LABEL: &str = "marmot/group-event";
+
+    fn context() -> GroupContextView {
+        GroupContextView::new(
+            EpochId(7),
+            HashMap::from([(
+                ENGINE_EXPORTER_LABEL.into(),
+                SecretBytes::new((0u8..32).collect()),
+            )]),
+            None,
+        )
+    }
+
+    #[test]
+    fn exporter_secret_returns_prefix_when_caller_asks_for_less() {
+        let ctx = context();
+        let prefix = ctx.exporter_secret(ENGINE_EXPORTER_LABEL, 16).unwrap();
+        assert_eq!(prefix.len(), 16);
+        assert_eq!(prefix.as_slice(), &(0u8..16).collect::<Vec<_>>());
+        let full = ctx.exporter_secret(ENGINE_EXPORTER_LABEL, 32).unwrap();
+        assert_eq!(&full[..16], &prefix[..]);
+    }
+
+    #[test]
+    fn exporter_secret_returns_none_when_caller_asks_for_more_than_cached() {
+        let ctx = context();
+        assert!(
+            ctx.exporter_secret(ENGINE_EXPORTER_LABEL, 33).is_none(),
+            "over-length request must be rejected, not silently truncated"
+        );
+    }
+
+    #[test]
+    fn exporter_secret_returns_none_for_unknown_label() {
+        let ctx = context();
+        assert!(ctx.exporter_secret("unknown-label", 32).is_none());
+    }
+}

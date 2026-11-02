@@ -43,10 +43,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group
-
-- **File:** `group_context_view.rs`
-  - **Owns:** `GroupContextView` exporter-secret length contract
+    writes no group; creator component admission, exact-length and staged-source exporter assembly, and snapshot-name privacy.
+    Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
   - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
@@ -163,11 +161,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
     retention-window route retirement across rotation and restart
 
-- **File:** `snapshot_privacy.rs`
-  - **Owns:** Snapshot names do not expose plaintext group ids
-
 - **File:** `sqlite_storage.rs`
-  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
+  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke, sender-ratchet migration,
+    history-key continuity, safe-export source/puncture persistence, and local-forget atomicity and restart behavior
 
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
@@ -320,8 +316,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
-  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, no-op default behavior, and
-    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and
+    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
+    Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
 
 ```sh
 cargo test -p cgka-engine

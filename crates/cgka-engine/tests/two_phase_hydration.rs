@@ -253,6 +253,86 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
     assert_eq!(reopened.live_group_ids().unwrap(), vec![group_id.clone()]);
     assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
 
+    // Additional accessors stay closed until full hydration promotes this seed.
+    let component = cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
+    let roster = cgka_traits::app_components::DeviceRosterV1::default();
+    for (name, result) in [
+        ("record", reopened.group_record(&group_id).map(drop)),
+        ("context", reopened.group_context(&group_id).map(drop)),
+        ("admins", reopened.admin_pubkeys(&group_id).map(drop)),
+        (
+            "component",
+            reopened.app_component(&group_id, component).map(drop),
+        ),
+        (
+            "components",
+            reopened.app_components(&group_id, &[component]).map(drop),
+        ),
+        ("epoch pin", reopened.epoch_pin(&group_id).map(drop)),
+        ("own leaf", reopened.own_leaf_index(&group_id).map(drop)),
+        ("own leaf hash", reopened.own_leaf_hash(&group_id).map(drop)),
+        ("live check", reopened.check_group_live(&group_id)),
+        (
+            "feature",
+            reopened
+                .feature_status(&group_id, &Feature("self-remove"))
+                .map(drop),
+        ),
+        (
+            "upgradeable capabilities",
+            reopened.upgradeable_capabilities(&group_id).map(drop),
+        ),
+        (
+            "disbanding blockers",
+            reopened.disbanding_support_blockers(&group_id).map(drop),
+        ),
+        (
+            "device claim",
+            reopened
+                .member_device_tag_claim(&group_id, EpochId(0), 0, &roster)
+                .map(drop),
+        ),
+        (
+            "historical device claim",
+            reopened
+                .member_device_tag_claim_at(&group_id, EpochId(0), 0, &roster)
+                .map(drop),
+        ),
+        (
+            "own account claims",
+            reopened
+                .own_account_leaf_claims(&group_id, &roster)
+                .map(drop),
+        ),
+        (
+            "own account tag scan",
+            reopened
+                .own_account_leaves_tagged_by(&group_id, &[0; 32], &[])
+                .map(drop),
+        ),
+        (
+            "safe epoch",
+            reopened
+                .current_safe_export_epoch(&group_id, component)
+                .map(drop),
+        ),
+        (
+            "safe secret",
+            reopened
+                .safe_export_secret_with_epoch(&group_id, component)
+                .map(drop),
+        ),
+        (
+            "safe secret trait",
+            reopened.safe_export_secret(&group_id, component).map(drop),
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(EngineError::GroupNotHydrated(id)) if id == group_id),
+            "{name} must require full hydration"
+        );
+    }
+
     // Every gated accessor fails closed with the retryable variant — never a
     // partial view, never UnknownGroup.
     assert!(matches!(
@@ -665,7 +745,10 @@ async fn failed_promotion_in_convergence_buffer_persists_no_row() {
         },
     );
     assert!(
-        result.is_err(),
+        matches!(
+            &result,
+            Err(cgka_engine::openmls_projection::OpenMlsProjectionError::MissingGroup)
+        ),
         "failed promotion must propagate: {result:?}"
     );
     assert_eq!(
