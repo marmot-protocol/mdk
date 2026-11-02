@@ -244,12 +244,10 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
     assert_eq!(reopened.live_group_ids().unwrap(), vec![group_id.clone()]);
     assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
 
-    // Every read stays closed until the full hydration promotes this seed.
+    // Additional accessors stay closed until full hydration promotes this seed.
     let component = cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
     let roster = cgka_traits::app_components::DeviceRosterV1::default();
     for (name, result) in [
-        ("members", reopened.members(&group_id).map(drop)),
-        ("epoch", reopened.epoch(&group_id).map(drop)),
         ("record", reopened.group_record(&group_id).map(drop)),
         ("context", reopened.group_context(&group_id).map(drop)),
         ("admins", reopened.admin_pubkeys(&group_id).map(drop)),
@@ -325,6 +323,17 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
             "{name} must require full hydration"
         );
     }
+
+    // Every gated accessor fails closed with the retryable variant — never a
+    // partial view, never UnknownGroup.
+    assert!(matches!(
+        reopened.members(&group_id),
+        Err(EngineError::GroupNotHydrated(id)) if id == group_id
+    ));
+    assert!(matches!(
+        reopened.epoch(&group_id),
+        Err(EngineError::GroupNotHydrated(id)) if id == group_id
+    ));
 
     // Explicit promotion makes the group fully live.
     reopened.ensure_hydrated(&group_id).expect("hydrate");

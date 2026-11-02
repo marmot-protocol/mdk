@@ -1776,6 +1776,38 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
         );
     };
 
+    unknown(
+        alice.app_components(&group_id, &[component]).map(drop),
+        "app_components",
+    );
+    unknown(alice.epoch_pin(&group_id).map(drop), "epoch_pin");
+    unknown(alice.own_leaf_hash(&group_id).map(drop), "own_leaf_hash");
+    unknown(alice.check_group_live(&group_id), "check_group_live");
+
+    let roster = cgka_traits::app_components::DeviceRosterV1::default();
+    unknown(
+        alice
+            .member_device_tag_claim(&group_id, EpochId(0), 0, &roster)
+            .map(drop),
+        "member_device_tag_claim",
+    );
+    unknown(
+        alice
+            .member_device_tag_claim_at(&group_id, EpochId(0), 0, &roster)
+            .map(drop),
+        "member_device_tag_claim_at",
+    );
+    unknown(
+        alice.own_account_leaf_claims(&group_id, &roster).map(drop),
+        "own_account_leaf_claims",
+    );
+    unknown(
+        alice
+            .own_account_leaves_tagged_by(&group_id, &[0; 32], &[])
+            .map(drop),
+        "own_account_leaves_tagged_by",
+    );
+
     unknown(alice.members(&group_id).map(drop), "members");
     unknown(alice.epoch(&group_id).map(drop), "epoch");
     assert!(
@@ -1823,37 +1855,6 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
     unknown(
         alice.safe_export_secret(&group_id, component).map(drop),
         "safe_export_secret",
-    );
-    unknown(
-        alice.app_components(&group_id, &[component]).map(drop),
-        "app_components",
-    );
-    unknown(alice.epoch_pin(&group_id).map(drop), "epoch_pin");
-    unknown(alice.own_leaf_hash(&group_id).map(drop), "own_leaf_hash");
-    unknown(alice.check_group_live(&group_id), "check_group_live");
-
-    let roster = cgka_traits::app_components::DeviceRosterV1::default();
-    unknown(
-        alice
-            .member_device_tag_claim(&group_id, EpochId(0), 0, &roster)
-            .map(drop),
-        "member_device_tag_claim",
-    );
-    unknown(
-        alice
-            .member_device_tag_claim_at(&group_id, EpochId(0), 0, &roster)
-            .map(drop),
-        "member_device_tag_claim_at",
-    );
-    unknown(
-        alice.own_account_leaf_claims(&group_id, &roster).map(drop),
-        "own_account_leaf_claims",
-    );
-    unknown(
-        alice
-            .own_account_leaves_tagged_by(&group_id, &[0; 32], &[])
-            .map(drop),
-        "own_account_leaves_tagged_by",
     );
 }
 
