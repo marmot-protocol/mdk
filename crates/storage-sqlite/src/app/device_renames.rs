@@ -2,7 +2,7 @@
 //! renamed (mdk#2628 item 3.6, D37). See migration 0137.
 //!
 //! User edits of labels or settings write a fresh rename id. NULL settings
-//! retain label-only recovery for records from before migration 0167. The row keeps the
+//! retain label-only recovery for records from before migration 0171. The row keeps the
 //! ids this device's rename wrote and the ids the entry held where its renames
 //! were built, so after a fork this device reads from the winning roster's id
 //! alone whether its rename applied, was lost with nothing renaming the device

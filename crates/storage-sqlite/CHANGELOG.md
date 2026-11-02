@@ -4,7 +4,7 @@
 
 ### Breaking changes
 
-- Migration 0167 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
+- Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
 
 - Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
   D81). Migration 0165 drops the unused `cgka_announced_key_packages` table

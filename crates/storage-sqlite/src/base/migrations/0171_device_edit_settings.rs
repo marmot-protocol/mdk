@@ -1,4 +1,4 @@
-//! Migration 0167: D37 user edits also retain device settings (mdk#2628 D86).
+//! Migration 0171: D37 user edits also retain device settings (mdk#2628 D86).
 //! NULL keeps existing records label-only; no settings are invented on upgrade.
 
 use crate::SqliteResultExt;

@@ -323,8 +323,8 @@ mod migration_0164_backup_ledger;
 mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
-#[path = "migrations/0167_device_edit_settings.rs"]
-mod migration_0167_device_edit_settings;
+#[path = "migrations/0171_device_edit_settings.rs"]
+mod migration_0171_device_edit_settings;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1283,10 +1283,10 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0166_blossom_history_deliveries::apply,
     },
     Migration {
-        version: 167,
-        name: "0167_device_edit_settings",
+        version: 171,
+        name: "0171_device_edit_settings",
         suspend_foreign_keys: &[],
-        apply: migration_0167_device_edit_settings::apply,
+        apply: migration_0171_device_edit_settings::apply,
     },
 ];
 
@@ -1648,7 +1648,7 @@ mod tests {
     /// Legacy provenance remains label-only; settings were not part of its
     /// intention and must never be synthesized by upgrading a database.
     #[test]
-    fn migration_0167_keeps_legacy_renames_label_only() {
+    fn migration_0171_keeps_legacy_renames_label_only() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_through(&mut conn, 166).unwrap();
         conn.execute(
@@ -1656,7 +1656,7 @@ mod tests {
             params![vec![3_u8; 16], vec![0_u8; 17]],
         )
         .unwrap();
-        run_through(&mut conn, 167).unwrap();
+        run_through(&mut conn, 171).unwrap();
         let row: (String, Vec<u8>, Vec<u8>, Option<u8>) = conn.query_row(
             "SELECT label, written, replaced, settings FROM device_renames WHERE slot_id_hex = 'aa'", [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
