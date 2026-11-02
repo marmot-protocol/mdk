@@ -241,8 +241,8 @@ mod tests {
         assert_eq!(decline.version, 2);
         storage.mark_invitation_decisions_sent(&[first]).unwrap();
         assert_eq!(
-            storage.unsent_invitation_decisions().unwrap(),
-            [decline.clone()]
+            storage.unsent_invitation_decisions().unwrap().as_slice(),
+            std::slice::from_ref(&decline)
         );
         let accepted = InvitationDecision {
             version: 3,
@@ -250,7 +250,7 @@ mod tests {
             ..decline.clone()
         };
         storage
-            .merge_invitation_decisions(&[accepted.clone()])
+            .merge_invitation_decisions(std::slice::from_ref(&accepted))
             .unwrap();
         assert!(
             !storage.invitation_decision_work().unwrap()[0].decline_owed,

@@ -570,8 +570,11 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     );
 
     assert_eq!(
-        phone_storage().unsent_invitation_decisions().unwrap(),
-        [decision.clone()]
+        phone_storage()
+            .unsent_invitation_decisions()
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&decision)
     );
     assert_eq!(
         laptop_storage().unsent_invitation_decisions().unwrap(),

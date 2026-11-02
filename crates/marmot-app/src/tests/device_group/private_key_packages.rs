@@ -2117,8 +2117,10 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
         declined: false,
         ..declined.clone()
     };
-    let [(content, _)] =
-        <[_; 1]>::try_from(encode_invitation_decision_updates(&[accepted.clone()])).unwrap();
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&accepted),
+    ))
+    .unwrap();
     assert!(
         devices
             .laptop
@@ -2187,8 +2189,10 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
         version: 4,
         ..accepted
     };
-    let [(content, _)] =
-        <[_; 1]>::try_from(encode_invitation_decision_updates(&[later.clone()])).unwrap();
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&later),
+    ))
+    .unwrap();
     assert!(
         devices
             .phone
