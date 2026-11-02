@@ -132,7 +132,6 @@ async fn drop_a_removal_decided_elsewhere(
     if pass_between {
         phone.client.run_due_maintenance().await.unwrap();
     }
-    laptop.cursor = relay.published_events.lock().unwrap().len();
     let epoch = |device: &Device| device.client.runtime.group_record(group).unwrap().epoch;
     let phone_epoch = epoch(phone);
     let mut renames = 0;
