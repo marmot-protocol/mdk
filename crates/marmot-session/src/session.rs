@@ -1456,6 +1456,9 @@ impl AccountDeviceSession {
         fanout: &mut cgka_traits::OutboundFanout,
         now_ms: u64,
     ) -> SessionResult<()> {
+        if let Some(group_id) = fanout.group_id() {
+            self.engine.check_group_live(group_id)?;
+        }
         Ok(self.storage.put_observed_outbound_fanout(fanout, now_ms)?)
     }
 
