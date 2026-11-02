@@ -707,6 +707,20 @@ Observe initial transfer state and complete replacements for bounded source slot
 <details>
 <summary>commands/attachment_history.rs</summary>
 
+### `Marmot::reaction_attachment`
+
+**Current.**
+
+```rust
+pub async fn reaction_attachment( &self, account_ref: String, group_id_hex: String, reaction_message_id_hex: String, ) -> Result<Option<AttachmentEntryFfi>, MarmotKitError>
+```
+
+Bounded local lookup for one active custom-emoji reaction, keyed by its `reactionMessageIdHex` within the account and chat. Returns the validated image attachment matching that reaction's shortcode, with its original message/source IDs and attachment index, or `None` when unavailable or unmatched. Starts no download. Use the target with ordinary automatic or explicit attachment acquisition and opaque local reads; re-resolve when the earliest active reaction ID changes. Never fetch an emoji tag URL directly. See [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork).
+
+The reaction ID must contain exactly 64 hexadecimal characters; malformed IDs return `InvalidMediaReference`. The lookup considers original `imeta` indices 0–99 only, source tag JSON and each candidate slot up to 16 KiB, and reaction content up to 64 UTF-8 bytes including colons. Oversized metadata, artwork outside those indices, or no eligible match returns `None`. The first well-formed definition of the exact content shortcode wins; later duplicates cannot replace an unmatched first definition.
+
+[Source](src/commands/attachment_history.rs#L15)
+
 ### `Marmot::attachment_history_page`
 
 **Current.**
@@ -717,7 +731,7 @@ pub async fn attachment_history_page( &self, account_ref: String, group_id_hex: 
 
 Read 1..=100 attachment slots in canonical newest-first order. Rejected slots consume the limit. Filter categories within returned pages; an empty filtered page is not exhaustion while has_more is true. No downloads are started. Keep cursors/versions in memory only and restart after runtime reconstruction.
 
-[Source](src/commands/attachment_history.rs#L15)
+[Source](src/commands/attachment_history.rs#L33)
 
 ### `Marmot::attachment_history_version`
 
@@ -729,7 +743,7 @@ pub async fn attachment_history_version( &self, account_ref: String, group_id_he
 
 Cheap local refresh signal, including for a fully loaded or empty library. Compare against the baseline version captured when the current collection began: replacing that baseline with a newer page can hide a destructive change to earlier rows.
 
-[Source](src/commands/attachment_history.rs#L37)
+[Source](src/commands/attachment_history.rs#L55)
 
 </details>
 

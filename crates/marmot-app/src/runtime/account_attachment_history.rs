@@ -1,5 +1,5 @@
 //! Account-wide attachment pages without group fan-out or host-owned indexes.
-use super::{MarmotAppRuntime, attachment_history::present};
+use super::{MarmotAppRuntime, attachment_history::present_for_history};
 use crate::AppError;
 pub use storage_sqlite::{
     AccountAttachmentCursor, AccountAttachmentQuery, AccountAttachmentVersion,
@@ -55,12 +55,16 @@ impl MarmotAppRuntime {
                             entries: page
                                 .entries
                                 .into_iter()
-                                .map(|e| {
-                                    Ok(AccountAttachmentEntry {
-                                        metadata_limited: e.metadata_limited,
-                                        group_id_hex: e.group_id_hex,
-                                        entry: present(e.attachment, loopback)?,
-                                    })
+                                .filter_map(|e| {
+                                    present_for_history(e.attachment, loopback)
+                                        .map(|entry| {
+                                            entry.map(|entry| AccountAttachmentEntry {
+                                                metadata_limited: e.metadata_limited,
+                                                group_id_hex: e.group_id_hex,
+                                                entry,
+                                            })
+                                        })
+                                        .transpose()
                                 })
                                 .collect::<Result<_, AppError>>()?,
                             version: page.version,

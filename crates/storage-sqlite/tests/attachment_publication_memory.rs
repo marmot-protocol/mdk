@@ -103,6 +103,7 @@ fn claimed_job(
         })
         .unwrap();
     let selected = AttachmentHistoryEntry {
+        reaction_artwork: false,
         message_id_hex: message.repeat(32),
         attachment_index: 0,
         source_message_id_hex: source.repeat(32),
