@@ -528,12 +528,13 @@ impl<S: StorageProvider> Engine<S> {
         }))
     }
 
-    /// Every sibling Welcome this device owes at `now`, in its live groups
-    /// (device-group.md, "Sending a sibling Welcome"). The host sends each as
-    /// a kind-461 message in the device group. One with a `carrier` already
-    /// has a 461 on its way, and gets another only once that one failed. A
-    /// disbanded chat owes none: its sibling would join a group every other
-    /// member has left.
+    /// Sibling Welcomes Ready for delivery at `now` in their live chats
+    /// (device-group.md, "Sending a sibling Welcome"). Held origins are
+    /// omitted; use [`Self::carried_sibling_welcomes`] to settle exact existing
+    /// carriers even while held. The host sends each as a kind-461 message in
+    /// the device group. One with a `carrier` already has a 461 on its way,
+    /// and gets another only once that one failed. A disbanded chat owes none:
+    /// its sibling would join a group every other member has left.
     pub fn owed_sibling_welcomes(
         &self,
         now: Timestamp,

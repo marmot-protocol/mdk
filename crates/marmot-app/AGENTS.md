@@ -249,8 +249,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   settlement locates carried rows independently of new-send eligibility, so a source chat held by convergence,
   hydration, or a pending Commit still records its exact carrier's outcome without starting a new delivery;
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
-  before the engine settles it, and a carrier not in that set was sent before this run or never settled, so its Welcome
-  is sent again; a second 461 joins nothing twice. Never send a delivered one again: resending is 3.5e. The Add spends
+  before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
+  fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
+  delivered one again: resending is 3.5e. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
