@@ -32,6 +32,9 @@ use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 mod support;
 use support::proof_signer;
 
+#[path = "pending_commit_recovery/recovery_mirror.rs"]
+mod recovery_mirror;
+
 fn pad32(name: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
     use sha2::{Digest, Sha256};
