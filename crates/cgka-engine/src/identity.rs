@@ -298,6 +298,7 @@ pub(crate) fn local_copy_is_member(record: &Group, identity: &MemberId) -> bool 
 #[cfg(test)]
 mod tests {
     use super::validate_credential_identity;
+    use cgka_traits::EngineError;
     use k256::schnorr::SigningKey;
 
     /// A deterministic valid x-only secp256k1 public key derived from a seed.
@@ -325,9 +326,11 @@ mod tests {
 
     #[test]
     fn rejects_wrong_length() {
-        assert!(validate_credential_identity(&[0u8; 31]).is_err());
-        assert!(validate_credential_identity(&[0u8; 33]).is_err());
-        assert!(validate_credential_identity(b"alice").is_err());
+        for bytes in [&[0u8; 31][..], &[0u8; 33][..], b"alice".as_slice()] {
+            assert!(matches!(validate_credential_identity(bytes),
+                Err(EngineError::InvalidCredentialIdentity(reason))
+                if reason == format!("credential identity must be exactly 32 bytes; got {}", bytes.len())));
+        }
     }
 
     #[test]
@@ -336,15 +339,21 @@ mod tests {
         // zero-padded label is not a curve point in general.
         let mut padded = vec![0u8; 32];
         padded[..5].copy_from_slice(b"david");
-        assert!(validate_credential_identity(&padded).is_err());
+        assert!(matches!(validate_credential_identity(&padded),
+            Err(EngineError::InvalidCredentialIdentity(reason))
+            if reason == "credential identity is not a valid x-only secp256k1 public key"));
     }
 
     #[test]
     fn rejects_all_zero_and_field_overflow() {
         // All-zero x is not a valid x-only point.
-        assert!(validate_credential_identity(&[0u8; 32]).is_err());
+        assert!(matches!(validate_credential_identity(&[0u8; 32]),
+            Err(EngineError::InvalidCredentialIdentity(reason))
+            if reason == "credential identity is not a valid x-only secp256k1 public key"));
         // x >= field prime p must be rejected (all-0xFF overflows p).
-        assert!(validate_credential_identity(&[0xFFu8; 32]).is_err());
+        assert!(matches!(validate_credential_identity(&[0xFFu8; 32]),
+            Err(EngineError::InvalidCredentialIdentity(reason))
+            if reason == "credential identity is not a valid x-only secp256k1 public key"));
     }
 }
 

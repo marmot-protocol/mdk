@@ -34,10 +34,6 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
-- **File:** `application_data_wire.rs`
-  - **Owns:** OpenMLS integration-contract tests for the MLS application-data carriers Marmot uses (pins fork codec
-    behavior the engine relies on)
-
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
@@ -54,9 +50,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
-    included), KeyPackage-based `constructable_capabilities`, capability matrix
+    included), KeyPackage-based `constructable_capabilities`, capability matrix. Pure OpenMLS carrier codecs live in
+    `../src/wire_format/tests/application_data_wire.rs`
 
-- **File:** `leaf_advertisement.rs`
+- **File:** `capabilities/leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
     would change the leaf
 

@@ -772,16 +772,21 @@ mod tests {
         assert_eq!(event.created_at, Timestamp::zero());
         assert_eq!(event.content, "");
         assert!(event.id.is_some());
-        assert!(event.tags.iter().any(|tag| {
-            tag.as_slice() == ["d".to_owned(), ACCOUNT_IDENTITY_PROOF_DOMAIN.to_owned()]
-        }));
-        assert!(event.tags.iter().any(|tag| {
-            tag.as_slice()
-                == [
-                    "version".to_owned(),
-                    LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION.to_string(),
-                ]
-        }));
+        assert_eq!(
+            event
+                .tags
+                .iter()
+                .map(|tag| tag.as_slice().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["d", "marmot.account-identity-proof.v2"],
+                vec!["extension", "0xf2f1"],
+                vec!["version", "2"],
+                vec!["ciphersuite", "1"],
+                vec!["signature_scheme", "2055"],
+                vec!["mls_signature_key", "6c6561662d6b6579"],
+            ]
+        );
     }
 
     #[test]
@@ -821,7 +826,7 @@ mod tests {
     #[test]
     fn current_proof_rejects_zero_and_out_of_range_timestamps() {
         let keys = nostr::prelude::Keys::generate();
-        for created_at in [0, MAX_NIP01_TIMESTAMP + 1] {
+        for created_at in [0, 9_007_199_254_740_992] {
             let request = AccountIdentityProofRequest::current(
                 keys.public_key().to_bytes(),
                 [0xAB; 32],
@@ -829,7 +834,23 @@ mod tests {
                 SignatureScheme::ED25519,
                 created_at,
             );
-            assert!(request.proof_event().is_err());
+            assert_eq!(
+                request.proof_event().unwrap_err(),
+                "current proof timestamp must be in 1..=9007199254740991"
+            );
+        }
+        for created_at in [1, 9_007_199_254_740_991] {
+            let request = AccountIdentityProofRequest::current(
+                keys.public_key().to_bytes(),
+                [0xAB; 32],
+                Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+                SignatureScheme::ED25519,
+                created_at,
+            );
+            assert_eq!(
+                request.proof_event().unwrap().created_at.as_secs(),
+                created_at
+            );
         }
     }
 
@@ -883,11 +904,128 @@ mod tests {
         let tampered = request(&keys, b"leaf-key-b");
         let signed_tampered = tampered.proof_event().unwrap().finalize(&keys).unwrap();
 
-        assert!(
+        assert_eq!(
             original
                 .signature_from_signed_event(signed_tampered)
-                .is_err(),
-            "a proof signature for another leaf key must not verify for this request"
+                .unwrap_err(),
+            "signed proof event does not match proof request"
         );
+        let other_keys = nostr::prelude::Keys::generate();
+        let other_request = request(&other_keys, b"leaf-key-a");
+        let other_signed = other_request
+            .proof_event()
+            .unwrap()
+            .finalize(&other_keys)
+            .unwrap();
+        assert_eq!(
+            original
+                .signature_from_signed_event(other_signed)
+                .unwrap_err(),
+            "proof event signer does not match account identity"
+        );
+    }
+    #[test]
+    fn signed_legacy_proofs_bind_each_leaf_field_and_require_exact_framing() {
+        use openmls::prelude::{Capabilities, CredentialWithKey, KeyPackage};
+        use openmls_basic_credential::SignatureKeyPair;
+        let keys = nostr::prelude::Keys::generate();
+        let suite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        let signer = SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
+        let valid = AccountIdentityProofRequest::new(
+            keys.public_key().to_bytes().to_vec(),
+            signer.to_public_vec(),
+            suite,
+            suite.signature_algorithm(),
+        );
+        let encode_signed = |request: AccountIdentityProofRequest| {
+            let event = request.proof_event().unwrap().finalize(&keys).unwrap();
+            let signature = request.signature_from_signed_event(event).unwrap();
+            encode_proof(&AccountIdentityProof { request, signature })
+        };
+        let leaf_with = |raw: Vec<u8>| {
+            KeyPackage::builder()
+                .leaf_node_capabilities(Capabilities::new(
+                    None,
+                    Some(&[suite]),
+                    Some(&[account_identity_proof_capability()]),
+                    None,
+                    None,
+                ))
+                .leaf_node_extensions(
+                    Extensions::single(Extension::Unknown(
+                        ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+                        UnknownExtension(raw),
+                    ))
+                    .unwrap(),
+                )
+                .build(
+                    suite,
+                    &provider,
+                    &signer,
+                    CredentialWithKey {
+                        credential: BasicCredential::new(keys.public_key().to_bytes().to_vec())
+                            .into(),
+                        signature_key: signer.public().into(),
+                    },
+                )
+                .unwrap()
+                .key_package()
+                .leaf_node()
+                .clone()
+        };
+        let raw = encode_signed(valid.clone());
+        let leaf = leaf_with(raw.clone());
+        assert_eq!(
+            validate_leaf_account_identity_proof(&leaf, suite).unwrap(),
+            ProtocolProfile::Legacy
+        );
+        for (change, expected) in [
+            (
+                0,
+                "proof MLS signature key does not match leaf signature key",
+            ),
+            (1, "proof ciphersuite does not match expected ciphersuite"),
+            (2, "proof signature scheme does not match ciphersuite"),
+        ] {
+            let mut request = valid.clone();
+            match change {
+                0 => request.mls_signature_public_key = vec![0x55; 32],
+                1 => request.ciphersuite = 2,
+                2 => request.signature_scheme = 0x0403,
+                _ => unreachable!(),
+            }
+            // The account signature is valid for the deliberately different binding.
+            // Skipping that binding guard must therefore admit the leaf.
+            let leaf = leaf_with(encode_signed(request));
+            assert!(matches!(validate_leaf_account_identity_proof(&leaf, suite),
+                Err(EngineError::InvalidAccountIdentityProof(reason)) if reason == expected));
+        }
+        let mut wrong_version = raw.clone();
+        wrong_version[0] = 3;
+        let mut trailing = raw.clone();
+        trailing.push(0);
+        for (bytes, expected) in [
+            (wrong_version, "unsupported proof version 3"),
+            (trailing, "proof has trailing bytes"),
+        ] {
+            assert!(
+                matches!(validate_leaf_account_identity_proof(&leaf_with(bytes), suite),
+                Err(EngineError::InvalidAccountIdentityProof(reason)) if reason == expected)
+            );
+        }
+        for (len, field) in [
+            (0, "missing version"),
+            (1, "ciphersuite is truncated"),
+            (3, "signature scheme is truncated"),
+            (5, "account identity is truncated"),
+            (37, "MLS signature key length is truncated"),
+            (39, "MLS signature public key is truncated"),
+            (71, "signature is truncated"),
+            (raw.len() - 1, "signature is truncated"),
+        ] {
+            assert!(matches!(decode_legacy_proof(&raw[..len]),
+                Err(EngineError::InvalidAccountIdentityProof(reason)) if reason == format!("proof {field}")));
+        }
     }
 }

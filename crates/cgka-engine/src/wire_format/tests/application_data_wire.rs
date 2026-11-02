@@ -89,7 +89,10 @@ fn application_data_dictionary_rejects_duplicate_and_out_of_order_components() {
     ]
     .tls_serialize_detached()
     .unwrap();
-    assert!(AppDataDictionary::tls_deserialize_exact(duplicate).is_err());
+    assert!(
+        matches!(AppDataDictionary::tls_deserialize_exact(duplicate),
+        Err(tls_codec::Error::DecodingError(reason)) if reason == "duplicate entries")
+    );
 
     let out_of_order = vec![
         ComponentData::from_parts(OPAQUE_COMPONENT_ID, vec![0x01].into()),
@@ -97,7 +100,10 @@ fn application_data_dictionary_rejects_duplicate_and_out_of_order_components() {
     ]
     .tls_serialize_detached()
     .unwrap();
-    assert!(AppDataDictionary::tls_deserialize_exact(out_of_order).is_err());
+    assert!(
+        matches!(AppDataDictionary::tls_deserialize_exact(out_of_order),
+        Err(tls_codec::Error::DecodingError(reason)) if reason == "entries not in order")
+    );
 }
 
 #[test]
@@ -117,11 +123,15 @@ fn application_data_extension_rejects_malformed_length_framing() {
             .unwrap(),
     );
 
-    assert!(Extension::tls_deserialize_exact(malformed).is_err());
+    assert!(matches!(Extension::tls_deserialize_exact(malformed),
+        Err(tls_codec::Error::DecodingError(reason)) if reason == "trailing bytes in app_data_dictionary extension"));
 
     let mut truncated = app_data_extension().tls_serialize_detached().unwrap();
     truncated.pop();
-    assert!(Extension::tls_deserialize_exact(truncated).is_err());
+    assert!(matches!(
+        Extension::tls_deserialize_exact(truncated),
+        Err(tls_codec::Error::EndOfStream)
+    ));
 }
 
 #[test]
@@ -130,6 +140,7 @@ fn app_data_update_proposals_roundtrip_and_reject_malformed_operations() {
 
     let update = AppDataUpdateProposal::update(OPAQUE_COMPONENT_ID, OPAQUE_COMPONENT_BYTES);
     let update_bytes = update.tls_serialize_detached().unwrap();
+    assert_eq!(update_bytes, [0x90, 0x01, 1, 4, 0xde, 0xad, 0xbe, 0xef]);
     let decoded = AppDataUpdateProposal::tls_deserialize_exact(update_bytes.clone()).unwrap();
     assert_eq!(decoded.component_id(), OPAQUE_COMPONENT_ID);
     assert!(matches!(
@@ -138,6 +149,7 @@ fn app_data_update_proposals_roundtrip_and_reject_malformed_operations() {
     ));
 
     let remove = AppDataUpdateProposal::remove(OPAQUE_COMPONENT_ID);
+    assert_eq!(remove.tls_serialize_detached().unwrap(), [0x90, 0x01, 2]);
     let decoded =
         AppDataUpdateProposal::tls_deserialize_exact(remove.tls_serialize_detached().unwrap())
             .unwrap();
@@ -149,9 +161,15 @@ fn app_data_update_proposals_roundtrip_and_reject_malformed_operations() {
     // mutating a positional byte in an otherwise-valid proposal.
     let mut unknown_operation = OPAQUE_COMPONENT_ID.to_be_bytes().to_vec();
     unknown_operation.push(0xff);
-    assert!(AppDataUpdateProposal::tls_deserialize_exact(unknown_operation).is_err());
+    assert!(matches!(
+        AppDataUpdateProposal::tls_deserialize_exact(unknown_operation),
+        Err(tls_codec::Error::UnknownValue(0xff))
+    ));
 
     let mut truncated = update_bytes;
     truncated.pop();
-    assert!(AppDataUpdateProposal::tls_deserialize_exact(truncated).is_err());
+    assert!(matches!(
+        AppDataUpdateProposal::tls_deserialize_exact(truncated),
+        Err(tls_codec::Error::EndOfStream)
+    ));
 }

@@ -3636,7 +3636,7 @@ mod tests {
             }
             let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
             let control = FullHistoryRepairControl {
-                started: Instant::now(),
+                started: tokio::time::Instant::now(),
                 timeout: if pass == FairnessPass::RefillBoundary {
                     Duration::from_secs(8)
                 } else {
@@ -4847,7 +4847,7 @@ mod tests {
             false
         };
         let control = FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: Duration::from_millis(300),
             cancelled: &cancelled,
         };
