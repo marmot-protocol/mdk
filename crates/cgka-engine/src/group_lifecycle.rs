@@ -538,35 +538,33 @@ impl<S: StorageProvider> Engine<S> {
         // Siblings are added after the ordinary negotiation, so they cannot
         // negotiate away a requirement chosen for the creator and other accounts.
         let ordinary_member_count = parsed_kps.len();
-        if !siblings.is_empty() {
-            if self.new_protocol_profile != ProtocolProfile::Current
-                || !required_caps
-                    .app_components
-                    .contains(ACCOUNT_DEVICES_COMPONENT_ID)
-                || required_caps
-                    .app_components
-                    .contains(DEVICE_ROSTER_COMPONENT_ID)
-            {
-                return Err(EngineError::Other(
-                    "founding siblings need a current-profile chat requiring account-devices"
-                        .into(),
-                ));
-            }
-            for sibling in &siblings {
-                let parsed = self.parse_key_package(&sibling.key_package)?;
+        let sibling_candidates = if self.new_protocol_profile == ProtocolProfile::Current
+            && required_caps
+                .app_components
+                .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+            && !required_caps
+                .app_components
+                .contains(DEVICE_ROSTER_COMPONENT_ID)
+        {
+            let mut candidates = Vec::new();
+            for sibling in siblings {
+                let Ok(parsed) = self.parse_key_package(&sibling.key_package) else {
+                    continue;
+                };
                 let had = capabilities_of_key_package(&parsed);
                 if sibling.key_package.protocol_profile != self.new_protocol_profile
                     || !required_caps.missing_from(&had).is_empty()
                     || !required_role_caps.missing_from(&had).is_empty()
                     || !optional_ids.missing_from(&had.app_components).is_empty()
                 {
-                    return Err(EngineError::Other(
-                        "a founding sibling does not meet the chat's fixed requirements".into(),
-                    ));
+                    continue;
                 }
-                parsed_kps.push(parsed);
+                candidates.push((sibling, parsed));
             }
-        }
+            candidates
+        } else {
+            Vec::new()
+        };
         let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
         // 2. Build the group config with leaf capabilities, MLS
@@ -681,13 +679,25 @@ impl<S: StorageProvider> Engine<S> {
         let mut new_group_guard = (self.new_protocol_profile == ProtocolProfile::Current)
             .then(|| NewGroupCleanupGuard::arm(&self.storage, group_id.clone()));
 
-        let sibling_plan = if siblings.is_empty() {
-            None
-        } else {
-            // Reuse the same private-KeyPackage/tag/slot/relay admission as a
-            // later same-account Add, before staging the founding Add.
-            Some(self.sibling_welcome_plan(&mls_group, &siblings)?)
-        };
+        let mut siblings = Vec::new();
+        let mut sibling_plan = None;
+        for (sibling, parsed) in sibling_candidates {
+            siblings.push(sibling);
+            // These candidates are optional. Reuse authoritative later-Add
+            // admission against the creator-only parent before any Add is
+            // staged, retaining only candidates it can admit together. A stale
+            // package or unavailable device group cannot poison the ordinary
+            // founders or the other eligible siblings.
+            match self.checked_sibling_welcome_plan(&mls_group, &siblings) {
+                Ok(Ok(plan)) => {
+                    sibling_plan = Some(plan);
+                    parsed_kps.push(parsed);
+                }
+                _ => {
+                    siblings.pop();
+                }
+            }
+        }
 
         // Admin-leaf coupling at creation (mdk#737): every admin key MUST
         // correspond to a member of the initial group (creator + invitees).
@@ -995,6 +1005,7 @@ impl<S: StorageProvider> Engine<S> {
                                 welcome.key_package_ref.clone(),
                                 welcome.deliver_until,
                                 None,
+                                cgka_traits::message::SiblingWelcomeOrigin::CanonicalFounding,
                             )
                             .encode()
                             .map_err(|error| {

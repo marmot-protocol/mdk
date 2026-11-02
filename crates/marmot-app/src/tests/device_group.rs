@@ -1362,9 +1362,23 @@ async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_not
     assert!(phone.runtime.group_record(&group).is_err());
     unavailable(&mut phone);
     unavailable(&mut phone);
+    let chat = phone
+        .create_group("chat during deferred quarantine", &[])
+        .await
+        .unwrap();
+    assert_eq!(phone.runtime.members(&chat).unwrap().len(), 1);
+    assert_eq!(
+        phone.runtime.group_record(&chat).unwrap().epoch,
+        cgka_traits::EpochId(0)
+    );
     drop(phone);
     let mut phone = phone_app.client("alice").await.unwrap();
     unavailable(&mut phone);
+    let chat = phone
+        .create_group("chat during eager quarantine", &[])
+        .await
+        .unwrap();
+    assert_eq!(phone.runtime.members(&chat).unwrap().len(), 1);
 
     let mut removed = stored();
     removed.removed = true;

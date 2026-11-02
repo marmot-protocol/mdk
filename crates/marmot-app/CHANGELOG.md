@@ -637,6 +637,28 @@
   It makes that record once: not again after a roster state it applied held
   it, even across a restart or after branch selection dropped it.
   Release builds hold no device group.
+- Every text send a device queued while offline now publishes as soon as the
+  host reports restored connectivity (mdk#2762). The wake used to clear only
+  targets whose dial had failed. A send that a stale socket swallowed as the
+  device dropped offline is possibly exposed, so it kept its ambiguity backoff
+  of 30 s doubling to an hour, through a cold restart, and held every later
+  send in its group behind it. The wake now makes possibly-exposed targets
+  eligible too. Their retry resends the same signed event, which a relay that
+  already stored it acknowledges as a duplicate, and their attempt counts are
+  kept, so a retry that fails again resumes the backoff. Two more barriers
+  held later sends behind the first. A send that met quorum but still owed
+  another relay blocked every later retained send in its group, and set the
+  group's wakeup to its own clock. Only a send below its required
+  acknowledgements, or awaiting MLS confirmation, is a barrier now, as it
+  already was for queued sends. And a connectivity edge soon after a cold
+  start skipped groups the session had only seeded; the wake now hydrates the
+  groups that hold retained sends first. A restart that is online already
+  gets no connectivity edge from its host, and neither does a transport that
+  dies and reopens while the network stays up. So the worker also wakes unsent
+  retained sends once its startup sync succeeds and once a reopened transport
+  is ready. A transport starts even with every relay unreachable, so each
+  start or reopen costs one retry of each woken send, which keeps its attempt
+  count. Sends that met quorum keep their secondary replication schedule.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

@@ -1384,6 +1384,98 @@ async fn a_sibling_welcome_in_flight_is_not_sent_again() {
     assert_eq!(stashed(&devices.phone), 0);
 }
 
+/// A source chat settling another Commit hides its Welcome from the send
+/// list, but app effects still settle its exact existing carrier. A failed
+/// one waits for Ready, and a published one never gets a second 461.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carried_sibling_welcome_outcomes_settle_while_the_chat_is_held() {
+    use cgka_traits::storage::MessageStorage as _;
+    use cgka_traits::{MessageState, StoredMessagePayload};
+    let (mut devices, device_group, chats) = tagging_devices_with_chats::<2>().await;
+    let mut rows = Vec::new();
+    let mut pending = Vec::new();
+    for (chat, carrier) in chats.into_iter().zip([vec![0xfd; 32], vec![0xfe; 32]]) {
+        add_the_phone_unpublished(&mut devices, &chat).await;
+        let welcome = owed(&devices.laptop)
+            .into_iter()
+            .find(|row| row.group_id == chat)
+            .unwrap();
+        assert!(
+            devices
+                .laptop
+                .runtime
+                .carry_sibling_welcome(&welcome.id, &carrier)
+                .unwrap()
+        );
+        devices
+            .laptop
+            .sibling_welcome_carriers
+            .insert(carrier.clone());
+        let effects = devices
+            .laptop
+            .runtime
+            .session_mut()
+            .send(SendIntent::SelfUpdate { group_id: chat })
+            .await
+            .unwrap();
+        let Some(PublishWork::GroupEvolution { pending: token, .. }) =
+            effects.publish.into_iter().next()
+        else {
+            panic!("expected a pending Commit");
+        };
+        pending.push(token);
+        rows.push((welcome.id, carrier));
+    }
+    assert!(owed(&devices.laptop).is_empty());
+    let effects = marmot_session::AccountDeviceEffects {
+        published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+            group_id: device_group.clone(),
+            app_event_id: hex::encode(&rows[0].1),
+            message_id: MessageId::new(vec![1]),
+            source_epoch: cgka_traits::EpochId(0),
+            retention: cgka_traits::app_event::AppMessageRetentionDecision::new(10, 0),
+            authority: None,
+        }],
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
+            group_id: device_group,
+            app_event_id: hex::encode(&rows[1].1),
+            message_id: MessageId::new(vec![2]),
+            reason: "every target refused".into(),
+        }],
+        ..Default::default()
+    };
+    devices.laptop.settle_sibling_welcome_carriers(&effects);
+    let storage = group_storage(&devices.laptop);
+    assert_eq!(
+        storage.get_message(&rows[0].0).unwrap().state,
+        MessageState::Processed
+    );
+    let failed = storage.get_message(&rows[1].0).unwrap();
+    assert_eq!(failed.state, MessageState::Sent);
+    assert!(matches!(
+        StoredMessagePayload::decode(&failed.payload).unwrap(),
+        StoredMessagePayload::OutboundSiblingWelcome { carrier: None, .. }
+    ));
+    assert!(devices.laptop.sibling_welcome_carriers.is_empty());
+    let before = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 0);
+    for token in pending {
+        devices
+            .laptop
+            .runtime
+            .session_mut()
+            .publish_failed(token)
+            .await
+            .unwrap();
+    }
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 1);
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 1);
+    assert!(owed(&devices.laptop).is_empty());
+}
+
 /// A 461 whose publication cannot be settled, because the engine write
 /// fails, leaves the in-flight set anyway: the next pass finds its carrier
 /// from no 461 of this run, so it sends the Welcome again, and settles that
@@ -1739,6 +1831,9 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .unwrap()
             .tagged
     );
+    // The host's maintenance pause keeps the initial Welcome unsent while
+    // the creator's device-group tag is lost after canonical creation.
+    devices.laptop.pause_maintenance();
     let chat = devices
         .laptop
         .create_group("sender ready", &[])
@@ -1770,6 +1865,7 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .unwrap()
             .tagged
     );
+    devices.laptop.resume_maintenance();
     let before = devices.relay.published_events.lock().unwrap().len();
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     assert_eq!(devices.relay.published_events.lock().unwrap().len(), before);

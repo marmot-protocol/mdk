@@ -121,7 +121,8 @@ pub(crate) use sync::ScriptedComparisons;
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
-    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
+    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, RetainedSendWake,
+    SyncMode,
 };
 #[cfg(test)]
 pub(crate) use sync::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
@@ -2605,7 +2606,8 @@ impl AppClient {
             &optional_app_components,
             &constructable,
             &nostr_routing.relays,
-        )?;
+        );
+        let has_founding_siblings = !siblings.is_empty();
         let founding_probe = (self.audit_v5_enabled() || cfg!(test))
             .then_some(())
             .and_then(|()| {
@@ -2735,6 +2737,20 @@ impl AppClient {
                 error_kind = error.privacy_safe_kind(),
                 "canonical group creation needs local projection reconciliation"
             );
+        }
+        // Creation is canonical and its Welcomes are durable. Drive initial
+        // sibling delivery now, as for a later Add; any optional device-group
+        // read or delivery failure leaves it owed for maintenance.
+        if has_founding_siblings {
+            match self.epoch_gap_held_groups() {
+                Ok(held) => self.send_owed_sibling_welcomes(&held).await,
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "create_group",
+                    error_kind = error.privacy_safe_kind(),
+                    "initial sibling Welcome waits for device-group state"
+                ),
+            }
         }
         Ok(CanonicalCreatedGroup {
             group_id,
@@ -6617,19 +6633,23 @@ impl AppClient {
             .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)?)
     }
 
-    /// Groups whose due self-updates wait for epoch-gap recovery. Automatic
+    /// Whether a group's due self-update waits for epoch-gap recovery. Automatic
     /// rotation has nobody to ask, so the hold is bounded by
     /// [`EPOCH_GAP_SELF_UPDATE_HOLD_MS`]: forged gap evidence can delay
     /// rotation but never suppress it.
+    fn epoch_gap_holds_group(&self, group_id: &GroupId, now_ms: u64) -> Result<bool, AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        Ok(self
+            .epoch_gap_open_since(group_id, epoch)?
+            .is_some_and(|since| self_update_waits_for_epoch_gap(since, now_ms)))
+    }
+
+    /// Every group currently held by the same bounded epoch-gap predicate.
     fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
         let now_ms = recovery::wall_now_ms()?;
         let mut held = Vec::new();
         for group_id in self.runtime.live_group_ids()? {
-            let epoch = self.runtime.group_record(&group_id)?.epoch;
-            if self
-                .epoch_gap_open_since(&group_id, epoch)?
-                .is_some_and(|since| self_update_waits_for_epoch_gap(since, now_ms))
-            {
+            if self.epoch_gap_holds_group(&group_id, now_ms)? {
                 held.push(group_id);
             }
         }

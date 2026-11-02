@@ -989,6 +989,23 @@ impl<S: StorageProvider> Engine<S> {
             .collect())
     }
 
+    /// Groups that hold a stored frozen fanout, hydrated or not, once each in
+    /// staging order. Quarantined groups are left out. [`Self::outbound_fanouts`]
+    /// hides unhydrated groups, so a host wake reads this first and hydrates
+    /// just these groups before it wakes their fanouts (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        let mut group_ids: Vec<GroupId> = Vec::new();
+        for fanout in self.storage.list_outbound_fanouts()? {
+            if let Some(group_id) = fanout.group_id()
+                && !self.quarantined_groups.contains_key(group_id)
+                && !group_ids.contains(group_id)
+            {
+                group_ids.push(group_id.clone());
+            }
+        }
+        Ok(group_ids)
+    }
+
     /// Read one live group's frozen fanouts in original staging order without
     /// scanning every other group's durable outbox.
     pub fn outbound_fanouts_for_group(
@@ -1301,6 +1318,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Create a chat with private KeyPackages authenticated by the trusted device group.
     /// Siblings cannot weaken the requirements negotiated for `req.members`; their
     /// Welcomes are retained atomically with creation for delivery inside the device group.
+    /// Siblings are optional: candidates whose eligibility cannot be established are
+    /// omitted before staging, while ordinary-founder and creation failures remain errors.
     pub async fn create_group_with_siblings_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
