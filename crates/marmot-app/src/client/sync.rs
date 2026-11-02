@@ -218,7 +218,7 @@ const FULL_HISTORY_ADMISSION_RESERVE_DIVISOR: u32 = 6;
 const RECOVERY_JOB_CANCEL_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) struct FullHistoryRepairControl<'a> {
-    started: Instant,
+    started: tokio::time::Instant,
     timeout: Duration,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
@@ -241,7 +241,7 @@ impl FullHistoryRepairControl<'_> {
 
     /// When the comparison pass must end, leaving the admission reserve.
     pub(crate) fn network_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started) + self.network_budget()
+        self.started + self.network_budget()
     }
 
     fn network_budget(&self) -> Duration {
@@ -253,7 +253,7 @@ impl FullHistoryRepairControl<'_> {
     /// follows gets a whole one.
     fn for_job(&self) -> Self {
         FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: self.timeout,
             cancelled: self.cancelled,
         }
@@ -5979,7 +5979,7 @@ impl AppClient {
                 .await;
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,
             cancelled,
         })
