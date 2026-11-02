@@ -364,6 +364,28 @@ fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id:
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
 }
 
+fn assert_profile(
+    engine: &Engine<SqliteAccountStorage>,
+    gid: &GroupId,
+    name: &str,
+    description: &str,
+) {
+    let record = engine.group_record(gid).unwrap();
+    assert_eq!(
+        (record.name.as_str(), record.description.as_str()),
+        (name, description)
+    );
+    assert_eq!(
+        engine
+            .app_component(gid, GROUP_PROFILE_COMPONENT_ID)
+            .unwrap(),
+        Some(encode_component_vectors(&[
+            name.as_bytes(),
+            description.as_bytes()
+        ]))
+    );
+}
+
 /// Engine that supports the Nostr routing component (the default component set
 /// does not), so a group can carry — and later rotate — a `nostr_group_id`.
 fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
@@ -520,6 +542,23 @@ fn raw_app_data_commit(
     group_id: &GroupId,
     proposals: Vec<AppDataUpdateProposal>,
 ) -> TransportMessage {
+    raw_commit(
+        storage,
+        sender,
+        group_id,
+        proposals
+            .into_iter()
+            .map(|proposal| Proposal::AppDataUpdate(Box::new(proposal)))
+            .collect(),
+    )
+}
+
+fn raw_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    proposals: Vec<Proposal>,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -540,11 +579,7 @@ fn raw_app_data_commit(
 
     let mut builder = mls_group
         .commit_builder()
-        .add_proposals(
-            proposals
-                .into_iter()
-                .map(|proposal| Proposal::AppDataUpdate(Box::new(proposal))),
-        )
+        .add_proposals(proposals)
         .load_psks(provider.storage())
         .expect("load PSKs");
     let mut app_data = builder.app_data_dictionary_updater();
@@ -774,12 +809,27 @@ async fn update_group_data_renames_group_and_advances_epoch() {
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
 
+    let projected = alice.group_record(&gid).unwrap();
+    assert_eq!(
+        (projected.name.as_str(), projected.description.as_str()),
+        ("new name", "new desc")
+    );
+    assert_eq!(
+        alice
+            .app_component(&gid, GROUP_PROFILE_COMPONENT_ID)
+            .unwrap(),
+        Some(encode_component_vectors(&[
+            b"original",
+            b"orig description"
+        ]))
+    );
     // Alice's projected epoch is 2 already (PendingPublish).
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
 
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
 
+    assert_profile(&alice, &gid, "new name", "new desc");
     // Bob ingests the commit and his epoch + name follow.
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
@@ -794,6 +844,7 @@ async fn update_group_data_renames_group_and_advances_epoch() {
     ));
     converge_buffered_commit(&mut bob, &gid);
     assert_eq!(bob.epoch(&gid).unwrap().0, 2);
+    assert_profile(&bob, &gid, "new name", "new desc");
 }
 
 #[tokio::test]
@@ -1078,7 +1129,16 @@ async fn inbound_commit_cannot_unrequire_current_admin_policy() {
 #[tokio::test]
 async fn current_profile_component_update_preserves_active_lifecycle_for_peer() {
     let mut alice = build_current(b"alice-lifecycle-update");
-    let mut bob = build_current(b"bob-lifecycle-update");
+    let clock = cgka_engine::ManualConvergenceClock::new(0, 1_800_000_000_000);
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .identity(pad32(b"bob-lifecycle-update"))
+        .account_identity_proof_signer(proof_signer(b"bob-lifecycle-update"))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .unwrap();
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (gid, create) = alice
         .create_group(CreateGroupRequest {
@@ -1125,7 +1185,7 @@ async fn current_profile_component_update_preserves_active_lifecycle_for_peer() 
         IngestOutcome::Buffered { .. }
     ));
     for _ in 0..24 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        clock.advance_ms(250);
         bob.advance_convergence(&gid).await.unwrap();
         if bob.group_record(&gid).unwrap().name == "after" {
             break;
@@ -1430,7 +1490,9 @@ async fn invalid_admin_policy_component_is_rejected() {
         .err()
         .unwrap();
 
-    assert!(matches!(err, EngineError::Serialize(_)));
+    assert!(
+        matches!(err, EngineError::Serialize(reason) if reason == "admin policy must contain one or more 32-byte keys")
+    );
 }
 
 #[tokio::test]
@@ -1674,6 +1736,52 @@ async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
             .app_components
             .contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
     );
+    // Legacy profile state is removable; a later partial update starts with
+    // the absent canonical profile, rather than reviving the old description.
+    let (alice, storage, mut bob, _, gid) = create_admin_pair_with_storage().await;
+    let mut required = alice
+        .group_record(&gid)
+        .unwrap()
+        .required_capabilities
+        .app_components
+        .ids;
+    assert!(required.remove(&GROUP_PROFILE_COMPONENT_ID));
+    let commit = raw_app_data_commit(
+        &storage,
+        &alice.self_id(),
+        &gid,
+        vec![
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&required),
+            ),
+            AppDataUpdateProposal::remove(GROUP_PROFILE_COMPONENT_ID),
+        ],
+    );
+    bob.ingest(commit).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    assert_eq!(
+        bob.app_component(&gid, GROUP_PROFILE_COMPONENT_ID).unwrap(),
+        None
+    );
+    let record = bob.group_record(&gid).unwrap();
+    assert_eq!(
+        (record.name.as_str(), record.description.as_str()),
+        ("", "")
+    );
+    let result = bob
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("fresh profile".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = result else {
+        panic!("partial update");
+    };
+    bob.confirm_published(pending).await.unwrap();
+    assert_profile(&bob, &gid, "fresh profile", "");
 }
 
 #[tokio::test]
@@ -1696,6 +1804,7 @@ async fn update_group_data_with_only_name_preserves_description() {
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
 
+    assert_profile(&alice, &gid, "renamed", "orig description");
     let events = alice.drain_events();
     assert!(
         events.iter().any(|event| matches!(
@@ -1718,6 +1827,7 @@ async fn update_group_data_with_only_name_preserves_description() {
 async fn update_group_data_publish_failed_rolls_back() {
     let (mut alice, _bob, gid) = create_pair().await;
 
+    assert_profile(&alice, &gid, "original", "orig description");
     let res = alice
         .send(SendIntent::UpdateGroupData {
             group_id: gid.clone(),
@@ -1731,9 +1841,24 @@ async fn update_group_data_publish_failed_rolls_back() {
         _ => unreachable!(),
     };
 
+    let projected = alice.group_record(&gid).unwrap();
+    assert_eq!(
+        (projected.name.as_str(), projected.description.as_str()),
+        ("doomed", "never published")
+    );
+    assert_eq!(
+        alice
+            .app_component(&gid, GROUP_PROFILE_COMPONENT_ID)
+            .unwrap(),
+        Some(encode_component_vectors(&[
+            b"original",
+            b"orig description"
+        ]))
+    );
     alice.publish_failed(pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
 
+    assert_profile(&alice, &gid, "original", "orig description");
     // The group is immediately re-usable.
     let res = alice
         .send(SendIntent::UpdateGroupData {
@@ -1747,6 +1872,7 @@ async fn update_group_data_publish_failed_rolls_back() {
         alice.confirm_published(pending).await.unwrap();
     }
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_profile(&alice, &gid, "kept", "orig description");
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -1756,14 +1882,18 @@ async fn update_group_data_with_no_fields_errors() {
     let (mut alice, _bob, gid) = create_pair().await;
     let err = alice
         .send(SendIntent::UpdateGroupData {
-            group_id: gid,
+            group_id: gid.clone(),
             name: None,
             description: None,
         })
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, EngineError::Other(_)));
+    assert!(
+        matches!(err, EngineError::Other(reason) if reason == "UpdateGroupData with no fields to change")
+    );
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    assert_profile(&alice, &gid, "original", "orig description");
 }
 
 // ── Multi-client convergence: B1 regression ─────────────────────────────────
@@ -2973,8 +3103,9 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
     async fn advance_selfremove_auto_commit(
         engine: &mut Engine<SqliteAccountStorage>,
         group_id: &GroupId,
+        clock: &cgka_engine::ManualConvergenceClock,
     ) {
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        clock.advance_ms(75);
         let results = engine.advance_convergence(group_id).await.unwrap();
         assert!(
             results.is_empty(),
@@ -2982,8 +3113,22 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
         );
     }
 
-    let (mut alice, alice_storage) = build_with_storage(b"alice");
-    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let clock = cgka_engine::ManualConvergenceClock::new(0, 1_800_000_000_000);
+    let clocked = |id: &[u8]| {
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let engine = EngineBuilder::new(storage.clone())
+            .legacy_compatibility_profile()
+            .identity(pad32(id))
+            .account_identity_proof_signer(proof_signer(id))
+            .feature_registry(registry())
+            .peeler(Box::new(MockPeeler))
+            .convergence_clock(std::sync::Arc::new(clock.clone()))
+            .build()
+            .unwrap();
+        (engine, storage)
+    };
+    let (mut alice, alice_storage) = clocked(b"alice");
+    let (mut bob, bob_storage) = clocked(b"bob");
     let mut carol = build(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -3053,8 +3198,8 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
     };
     alice.ingest(route_to_group(&proposal, &gid)).await.unwrap();
     bob.ingest(route_to_group(&proposal, &gid)).await.unwrap();
-    advance_selfremove_auto_commit(&mut alice, &gid).await;
-    advance_selfremove_auto_commit(&mut bob, &gid).await;
+    advance_selfremove_auto_commit(&mut alice, &gid, &clock).await;
+    advance_selfremove_auto_commit(&mut bob, &gid, &clock).await;
     let mut alice_auto = alice.drain_auto_publish();
     let mut bob_auto = bob.drain_auto_publish();
     assert_eq!(alice_auto.len(), 1);
@@ -3508,14 +3653,20 @@ async fn update_group_data_during_pending_publish_is_rejected() {
     // Now try update — must reject.
     let err = alice
         .send(SendIntent::UpdateGroupData {
-            group_id: gid,
+            group_id: gid.clone(),
             name: Some("x".into()),
             description: None,
         })
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, EngineError::InvalidTransition(_)));
+    assert!(matches!(err, EngineError::InvalidTransition(transition)
+        if transition.from == "PendingPublish" && transition.to == "UpdateAppComponents"
+        && transition.reason == "update_app_components requires Stable"));
+    assert!(matches!(
+        alice.epoch_state(&gid),
+        Some(cgka_traits::EpochState::PendingPublish(_))
+    ));
 }
 
 // ── #105 group avatar-url component ──────────────────────────────────────────
@@ -3579,7 +3730,10 @@ async fn invalid_group_avatar_url_component_is_rejected() {
         .err()
         .unwrap();
 
-    assert!(matches!(err, EngineError::Serialize(_)), "got {err:?}");
+    assert!(
+        matches!(err, EngineError::Serialize(ref reason) if reason == "invalid group avatar URL component: group avatar URL scheme must be https"),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -3654,15 +3808,15 @@ async fn moderation_uses_authenticated_source_policy_after_admin_demotion() {
     )
     .encode()
     .unwrap();
-    assert!(
+    assert!(matches!(
         bob.send(SendIntent::AppMessage {
             group_id: gid,
             payload,
             expected_epoch: None
         })
         .await
-        .is_err()
-    );
+        , Err(EngineError::InvalidAppMessagePayload(reason)) if reason == "group admin authority required"
+    ));
 }
 
 #[tokio::test]
@@ -4273,4 +4427,289 @@ async fn batched_group_changes_preserve_each_members_reaction_targets() {
         target_ids(bob.drain_events()).is_empty(),
         "duplicate delivery must not mint new targets"
     );
+}
+
+#[tokio::test]
+async fn inbound_lifecycle_commits_require_the_complete_terminal_shape() {
+    use openmls::messages::proposals::RemoveProposal;
+    use tls_codec::Deserialize as _;
+    for case in 0..5 {
+        let (mut alice, storage) = build_current_with_storage(b"lifecycle-shape-alice");
+        let mut bob = build_current(b"lifecycle-shape-bob");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (gid, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "active".into(),
+                description: "source description".into(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+            panic!("current creation");
+        };
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        let before = bob.group_record(&gid).unwrap();
+        let lifecycle = if case == 0 {
+            GroupLifecycleV1::Active
+        } else {
+            GroupLifecycleV1::Disbanded
+        };
+        let mut proposals = vec![Proposal::AppDataUpdate(Box::new(
+            AppDataUpdateProposal::update(
+                GROUP_LIFECYCLE_COMPONENT_ID,
+                cgka_traits::app_components::encode_group_lifecycle_v1(lifecycle),
+            ),
+        ))];
+        if case != 0 && case != 1 {
+            proposals.push(Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    encode_admin_policy_for_test(&[alice.self_id().as_slice().to_vec()]),
+                ),
+            )));
+        }
+        if case != 0 && case != 2 {
+            let index = bob.own_leaf_index(&gid).unwrap();
+            proposals.push(Proposal::Remove(Box::new(
+                RemoveProposal::tls_deserialize_exact(index.to_be_bytes()).unwrap(),
+            )));
+        }
+        if case == 3 {
+            proposals.push(Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    GROUP_PROFILE_COMPONENT_ID,
+                    encode_component_vectors(&[b"forbidden", b"terminal mutation"]),
+                ),
+            )));
+        }
+        let commit = raw_commit(&storage, &alice.self_id(), &gid, proposals);
+        bob.ingest(commit.clone()).await.unwrap();
+        let result = bob
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            result.convergence_status,
+            ConvergenceStatus::Settled,
+            "case {case}: {result:?}"
+        );
+        if case == 4 {
+            assert_eq!(
+                result.accepted_commits.len(),
+                1,
+                "valid terminal control: {result:?}"
+            );
+            assert!(matches!(
+                bob.epoch_state(&gid),
+                Some(cgka_traits::EpochState::Disbanded(_))
+            ));
+        } else {
+            assert!(
+                result.accepted_commits.is_empty(),
+                "case {case}: {result:?}"
+            );
+            assert!(
+                result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id
+                        == hex::encode(content_id(&commit).as_slice())
+                        && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState),
+                "case {case}: {result:?}"
+            );
+            let after = bob.group_record(&gid).unwrap();
+            assert_eq!(after.epoch, before.epoch);
+            assert_eq!(after.members, before.members);
+            assert_eq!(after.required_capabilities, before.required_capabilities);
+            assert_profile(&bob, &gid, "active", "source description");
+            assert_eq!(
+                decode_group_lifecycle_v1(
+                    &bob.app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                GroupLifecycleV1::Active
+            );
+            let update = bob
+                .send(SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                })
+                .await
+                .unwrap();
+            let SendResult::GroupEvolution { pending, .. } = update else {
+                panic!("receiver remains usable");
+            };
+            bob.confirm_published(pending).await.unwrap();
+            assert_eq!(bob.epoch(&gid).unwrap().0, before.epoch.0 + 1);
+        }
+    }
+}
+
+fn raw_update_path_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    gid: &GroupId,
+    account: &[u8],
+    legacy: bool,
+) -> TransportMessage {
+    use cgka_engine::account_identity_proof::{
+        account_identity_proof_component, account_identity_proof_extension,
+    };
+    use openmls::extensions::{AppDataDictionaryExtension, Extension, ExtensionType, Extensions};
+    use openmls::prelude::{BasicCredential, Capabilities, CredentialWithKey, LeafNodeParameters};
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    let binding = storage.account_device_signer(sender).unwrap().unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let leaf = group.own_leaf_node().unwrap();
+    let mut dictionary = leaf
+        .extensions()
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    let proof_signer = proof_signer(account);
+    let mut extensions = Vec::new();
+    if legacy {
+        dictionary.remove(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        extensions.push(
+            account_identity_proof_extension(
+                &pad32(account),
+                &signer.to_public_vec(),
+                DEFAULT_CIPHERSUITE,
+                DEFAULT_CIPHERSUITE.signature_algorithm(),
+                proof_signer.as_ref(),
+            )
+            .unwrap(),
+        );
+    } else {
+        dictionary.insert(
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+            account_identity_proof_component(
+                &pad32(account),
+                &signer.to_public_vec(),
+                DEFAULT_CIPHERSUITE,
+                DEFAULT_CIPHERSUITE.signature_algorithm(),
+                1_700_000_000,
+                proof_signer.as_ref(),
+            )
+            .unwrap(),
+        );
+    }
+    extensions.push(Extension::AppDataDictionary(
+        AppDataDictionaryExtension::new(dictionary),
+    ));
+    let mut extension_types = leaf.capabilities().extensions().to_vec();
+    if legacy {
+        extension_types.push(ExtensionType::Unknown(0xf2f1));
+    }
+    let params = LeafNodeParameters::builder()
+        .with_extensions(Extensions::from_vec(extensions).unwrap())
+        .with_credential_with_key(CredentialWithKey {
+            credential: BasicCredential::new(pad32(account)).into(),
+            signature_key: signer.public().into(),
+        })
+        .with_capabilities(Capabilities::new(
+            None,
+            Some(&[DEFAULT_CIPHERSUITE]),
+            Some(&extension_types),
+            Some(leaf.capabilities().proposals()),
+            None,
+        ))
+        .build();
+    let (commit, _, _) = group
+        .self_update(&provider, &signer, params)
+        .unwrap()
+        .into_contents();
+    let bytes = commit.tls_serialize_detached().unwrap();
+    TransportMessage {
+        id: hash_id(&bytes),
+        payload: bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-update-path".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn inbound_update_path_keeps_the_authenticated_account_and_profile() {
+    let account = b"path-alice";
+    for case in 0..3 {
+        let (mut alice, storage) = build_current_with_storage(account);
+        let mut bob = build_current(b"path-bob");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (gid, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "bound identity".into(),
+                description: "source".into(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+            panic!("current creation");
+        };
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        let before = bob.group_record(&gid).unwrap();
+        let replacement = if case == 0 {
+            b"path-another-account".as_slice()
+        } else {
+            account.as_slice()
+        };
+        let commit =
+            raw_update_path_commit(&storage, &alice.self_id(), &gid, replacement, case == 1);
+        bob.ingest(commit.clone()).await.unwrap();
+        let result = bob
+            .converge_stored_openmls_messages_at(&gid, 1_000_000)
+            .unwrap();
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+        if case == 2 {
+            assert_eq!(
+                result.accepted_commits.len(),
+                1,
+                "valid signed control: {result:?}"
+            );
+            assert_eq!(bob.epoch(&gid).unwrap().0, before.epoch.0 + 1);
+        } else {
+            assert!(
+                result.accepted_commits.is_empty(),
+                "case {case}: {result:?}"
+            );
+            assert!(
+                result
+                    .dropped_messages
+                    .iter()
+                    .any(|dropped| dropped.message_id
+                        == hex::encode(content_id(&commit).as_slice())
+                        && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState),
+                "case {case}: {result:?}"
+            );
+            let after = bob.group_record(&gid).unwrap();
+            assert_eq!(after.epoch, before.epoch);
+            assert_eq!(after.members, before.members);
+            assert_profile(&bob, &gid, "bound identity", "source");
+        }
+    }
 }

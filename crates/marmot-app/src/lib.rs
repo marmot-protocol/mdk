@@ -97,6 +97,7 @@ mod directory_tests;
 mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
+mod backup_archive;
 mod error;
 #[cfg(any(test, feature = "test-support"))]
 pub mod error_kind_table;
@@ -2154,6 +2155,7 @@ impl MarmotApp {
             send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
+            received_private_key_package_generation: 0,
             runtime: open.runtime,
             engine_storage: open.engine_storage,
             _session_guard: open.session_guard,
@@ -2269,6 +2271,7 @@ impl MarmotApp {
                 open.pairing_inbox,
             )),
         };
+        client.record_open_coverage_goals();
         // Loss the open imported, and the startup history request, become
         // audit rows once the client that records them exists.
         client.record_recovery_loss_imports(recovery_loss_imports);

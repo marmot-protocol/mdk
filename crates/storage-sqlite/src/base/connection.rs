@@ -2157,9 +2157,9 @@ mod tests {
                             .write_group_state(&mls_id, &TestGroupState(b"partial".to_vec()))
                             .map_err(|e| StorageError::Backend(e.to_string()))?;
                         let wakeup = savepoint_wakeup.clone();
-                        inner.connection.after_commit(move || {
+                        inner.after_commit(Box::new(move || {
                             wakeup.fetch_add(1, Ordering::SeqCst);
-                        });
+                        }));
                         generation_inside = inner.mls_write_generation();
                         Err(StorageError::Backend("abandon the unit".into()))
                     });
@@ -2174,9 +2174,10 @@ mod tests {
                 );
                 assert_eq!(outer.get_group(&gid(1))?.epoch, EpochId(1));
                 let wakeup = outer_wakeup.clone();
-                outer.connection.after_commit(move || {
+                outer.after_commit(Box::new(move || {
                     wakeup.fetch_add(1, Ordering::SeqCst);
-                });
+                }));
+                assert_eq!(outer_wakeup.load(Ordering::SeqCst), 0);
                 outer.put_group(&sample_group(gid(2), 1, 1))
             })
             .unwrap();
@@ -2238,12 +2239,17 @@ mod tests {
         use cgka_traits::storage::GroupStorage;
 
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let observed = Arc::new(AtomicU32::new(0));
         store
             .with_transaction(|outer| -> StorageResult<()> {
                 let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _: StorageResult<()> =
                         outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
                             inner.put_group(&sample_group(gid(1), 1, 1))?;
+                            let observed = observed.clone();
+                            inner.after_commit(Box::new(move || {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                            }));
                             panic!("abandon the unit by panicking");
                         });
                 }));
@@ -2253,6 +2259,7 @@ mod tests {
             .unwrap();
         assert!(store.get_group(&gid(1)).is_err());
         assert!(store.get_group(&gid(2)).is_ok());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2543,9 +2550,15 @@ mod tests {
         let (writer, reader) = writer_with_a_reading_connection(&dir);
 
         let mut closure_calls = 0;
+        let observed = Arc::new(AtomicU32::new(0));
         let result: StorageResult<()> = writer.with_transaction(|storage| {
             closure_calls += 1;
-            insert_boundary_probe(storage, 1)
+            insert_boundary_probe(storage, 1)?;
+            let observed = observed.clone();
+            storage.after_commit(Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }));
+            Ok(())
         });
 
         assert!(
@@ -2568,6 +2581,7 @@ mod tests {
             writer.lock().unwrap().is_autocommit(),
             "failed COMMIT must be rolled back before ownership is released",
         );
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
 
         reader.lock().unwrap().execute_batch("COMMIT").unwrap();
         writer
@@ -2599,11 +2613,16 @@ mod tests {
         }
 
         let mut closure_calls = 0;
+        let observed = Arc::new(AtomicU32::new(0));
         let result: StorageResult<()> = store.with_transaction(|storage| {
             closure_calls += 1;
             let conn = storage.lock()?;
             conn.execute("INSERT INTO deferred_child (parent_id) VALUES (7)", [])
                 .storage()?;
+            let observed = observed.clone();
+            storage.after_commit(Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }));
             Ok(())
         });
 
@@ -2623,6 +2642,7 @@ mod tests {
             .storage()
             .unwrap();
         assert_eq!(child_count, 0);
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
         drop(conn);
         store
             .with_transaction(|storage| {
@@ -3088,13 +3108,19 @@ mod tests {
                  BEGIN SELECT RAISE(ROLLBACK, 'vetoed'); END;",
             )
             .unwrap();
+            let observed = Arc::new(AtomicU32::new(0));
             let outcome: Outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 store.with_transaction(|s| {
                     write(s, "INSERT INTO auto_rollback VALUES('lost')")?;
+                    let observed = observed.clone();
+                    s.after_commit(Box::new(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }));
                     callback(s)
                 })
             }));
             assert!(expected(&outcome), "{case}: {outcome:?}");
+            assert_eq!(observed.load(Ordering::SeqCst), 0, "{case}");
             let latched = store.connection.transaction_unusable_error();
             assert!(
                 latched.is_none(),
@@ -3107,7 +3133,14 @@ mod tests {
             assert!(conn.is_autocommit(), "{case}");
             drop(conn);
             store
-                .with_transaction(|s| write(s, "INSERT INTO auto_rollback VALUES('next')"))
+                .with_transaction(|s| {
+                    write(s, "INSERT INTO auto_rollback VALUES('next')")?;
+                    let observed = observed.clone();
+                    s.after_commit(Box::new(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }));
+                    Ok::<_, StorageError>(())
+                })
                 .unwrap_or_else(|error| {
                     panic!("{case}: the next transaction must commit: {error}")
                 });
@@ -3121,6 +3154,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap();
             assert_eq!(rows, ["next"], "{case}");
+            assert_eq!(observed.load(Ordering::SeqCst), 1, "{case}");
         }
     }
 

@@ -10,6 +10,17 @@
 - `AppError` adds `GroupCreateAdminNotMember` for founding admin references
   outside the founding membership. Update exhaustive error matches.
 
+- Uploaded media references carry local `source_epoch_identity` provenance.
+  Preserve it through host storage and reference round trips. Media and custom
+  reaction sends require that exact upload branch, including a branch switch at
+  the same epoch number, and refuse missing or stale provenance with
+  `MediaReferenceStaleEpoch`. Older and received references remain downloadable;
+  upload their verified bytes again before sending. The `imeta` wire format is
+  unchanged. Attachment-bearing reactions receive the same engine pin and
+  no-retention guarantee as media messages (mdk#2840, mdk#2151). Rust callers
+  constructing `MediaAttachmentOutcome::Accepted` box its `reference`; the
+  Swift, Kotlin, and C outcome shapes are unchanged.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It
@@ -99,11 +110,32 @@
 
 ### Added
 
+- Custom emoji reaction artwork is available through the bounded local
+  `MarmotAppRuntime::reaction_attachment` lookup (mdk#2151). Pass its original
+  message/source/slot to host-managed acquisition and opaque local reads.
+  Reaction-only media preserves its authenticated source-epoch key; deletion,
+  retraction and convergence withdrawal revoke its acquisition source.
+
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
   relay is sent again by the next maintenance pass. Only behind
   `dev_device_groups`; nothing outside tests adds a sibling yet.
+- The backup writer writes the account's backup once a day (mdk#2628 item
+  4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
+  as blobs on the deployment's Blossom servers under a fresh archive key, and
+  a head that seals that key to the recovery key and indexes the blobs for
+  the key's public half. A kind 30078 backup pointer, addressed and encrypted
+  under the public half, lists the kept backups: the newest two and any older
+  one still the last to hold some of a chat's history, at most 16. A backup
+  counts only once a relay accepts its pointer; one no relay accepts is
+  published again for a day, then abandoned. Blobs of dropped or abandoned
+  backups are deleted (BUD-02) while the pointer fetched in that pass lists
+  no backup they belong to. A device takes over writing when the writer
+  leaves the roster or is leaving, or lists nothing for a week, through the
+  roster's compare-and-set. Runs from maintenance, only behind
+  `dev_device_groups`. Enabling it outside dev needs the White Noise relays
+  to accept kind 30078 (D50); today they refuse it.
 - `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
   `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
   the recovery words an account's backups will be sealed to, and turn backups
@@ -386,6 +418,19 @@
 
 ### Changed
 
+- Interactive sign-in replaces the blanket `MultiDeviceUnsupported` finding
+  with guidance that signing in alone does not restore existing chats or
+  messages (mdk#2628). Old checkpoints omit only that obsolete finding when
+  read. Discovery evidence, explicit acknowledgment, revision/recovery-epoch
+  checks and the KeyPackage publication gate stay unchanged. Existing host
+  apps must adopt the updated notice localization; device linking remains
+  disabled in normal released builds. Existing enum, DTO and method names
+  remain compatible.
+
+- Sign-in checks no longer load the unused roster announcement history or
+  attach an internal `Announcement` label (mdk#2863, D81). Slot
+  classification and the own-slot compromise warning keep their behavior.
+
 - MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628).
   New KeyPackages list it. A device whose published KeyPackage does not
   replaces it in the same slot at its next maintenance, holding the old one's
@@ -598,6 +643,11 @@
 
 ### Fixed
 
+- Received media sources and available decryption keys commit together, so a
+  failed key write remains retryable after restart instead of acknowledging
+  unusable artwork. Authenticated carried keys and retained canonical source
+  exporters replace stale same-epoch cache entries (mdk#2840).
+
 - A device cleans up after every device its device group's roster stops
   listing, not only one whose `removed` record it still reads (mdk#2761):
   it removes that device's tagged leaves from chats that take a
@@ -614,6 +664,28 @@
   It makes that record once: not again after a roster state it applied held
   it, even across a restart or after branch selection dropped it.
   Release builds hold no device group.
+- Every text send a device queued while offline now publishes as soon as the
+  host reports restored connectivity (mdk#2762). The wake used to clear only
+  targets whose dial had failed. A send that a stale socket swallowed as the
+  device dropped offline is possibly exposed, so it kept its ambiguity backoff
+  of 30 s doubling to an hour, through a cold restart, and held every later
+  send in its group behind it. The wake now makes possibly-exposed targets
+  eligible too. Their retry resends the same signed event, which a relay that
+  already stored it acknowledges as a duplicate, and their attempt counts are
+  kept, so a retry that fails again resumes the backoff. Two more barriers
+  held later sends behind the first. A send that met quorum but still owed
+  another relay blocked every later retained send in its group, and set the
+  group's wakeup to its own clock. Only a send below its required
+  acknowledgements, or awaiting MLS confirmation, is a barrier now, as it
+  already was for queued sends. And a connectivity edge soon after a cold
+  start skipped groups the session had only seeded; the wake now hydrates the
+  groups that hold retained sends first. A restart that is online already
+  gets no connectivity edge from its host, and neither does a transport that
+  dies and reopens while the network stays up. So the worker also wakes unsent
+  retained sends once its startup sync succeeds and once a reopened transport
+  is ready. A transport starts even with every relay unreachable, so each
+  start or reopen costs one retry of each woken send, which keeps its attempt
+  count. Sends that met quorum keep their secondary replication schedule.
 - An invite, device link or legacy-profile group create whose Welcome cannot
   be wrapped for the transport, such as an invite of a private KeyPackage, is
   refused with nothing written. Each used to fail after writing its commit or

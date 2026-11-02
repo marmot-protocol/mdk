@@ -312,6 +312,9 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         media_type: "image/jpeg".into(),
         version: crate::media::EncryptedMediaVersion::V2.as_str().into(),
         source_epoch: 0,
+        source_epoch_identity: Some(hex::encode(
+            alice.runtime.epoch_pin(&chat).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
@@ -321,6 +324,21 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         AppMessageIntent::Media {
             message_tags: Vec::new(),
             caption: None,
+            attachments: vec![reference.clone()],
+        },
+    )
+    .await;
+    let reaction = send(
+        &mut alice,
+        &chat,
+        AppMessageIntent::Reaction {
+            target_message_id: photo.clone(),
+            emoji: ":photo:".into(),
+            tags: vec![vec![
+                "emoji".into(),
+                "photo".into(),
+                reference.locators[0].value.clone(),
+            ]],
             attachments: vec![reference.clone()],
         },
     )
@@ -355,6 +373,7 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     bob.accept_group_invite(&chat).unwrap();
     let source = crate::media::MediaAttachmentReference {
         source_epoch: epoch,
+        source_epoch_identity: None,
         ..reference.clone()
     };
     assert!(
@@ -367,6 +386,19 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .unwrap()
         .bundle;
+    assert!(
+        bundle
+            .events
+            .iter()
+            .find(|event| event.event.id == reaction)
+            .unwrap()
+            .keys
+            == Some(vec![crate::history_bundle::FileKey {
+                ciphertext_sha256: ciphertext_sha256.clone(),
+                key: file_key.clone()
+            }]),
+        "reaction artwork must carry its per-file key to later devices"
+    );
     let event = bundle
         .events
         .iter_mut()
@@ -406,10 +438,27 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .attachment_history_page(&chat_hex, 10, None)
         .unwrap()
         .entries;
-    assert_eq!(slots.len(), 1);
-    assert_eq!(slots[0].message_id_hex, photo);
-    assert_eq!(slots[0].source_message_id_hex, photo);
-    assert_eq!(slots[0].source_epoch, Some(epoch));
+    assert_eq!(slots.len(), 2);
+    for id in [&photo, &reaction] {
+        let slot = slots
+            .iter()
+            .find(|slot| &slot.message_id_hex == id)
+            .unwrap();
+        assert_eq!(&slot.source_message_id_hex, id);
+        assert_eq!(slot.source_epoch, Some(epoch));
+        assert!(
+            storage
+                .imported_media_file_keys(&chat_hex, id)
+                .unwrap()
+                .iter()
+                .map(|key| hex::encode(*key.key))
+                .collect::<Vec<_>>()
+                == vec![file_key.clone()],
+            "the imported source retains exactly its named file key"
+        );
+    }
+    bob.cache_attachment_source_epoch_secret(&chat, &reaction, &source)
+        .expect("the imported key opens reaction artwork");
     bob.cache_attachment_source_epoch_secret(&chat, &photo, &source)
         .expect("the imported key opens the photo");
     let prepared = bob
@@ -465,6 +514,19 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         .unwrap()
         .unwrap()
         .bundle;
+    assert!(
+        passed_on
+            .events
+            .iter()
+            .find(|event| event.event.id == reaction)
+            .unwrap()
+            .keys
+            == Some(vec![crate::history_bundle::FileKey {
+                ciphertext_sha256: ciphertext_sha256.clone(),
+                key: file_key.clone()
+            }]),
+        "a later export must preserve the reaction key"
+    );
     let event = passed_on
         .events
         .iter()

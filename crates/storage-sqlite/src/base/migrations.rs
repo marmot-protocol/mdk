@@ -317,6 +317,10 @@ mod migration_0161_small_state;
 mod migration_0162_imported_media_file_keys;
 #[path = "migrations/0163_backup_recovery_key.rs"]
 mod migration_0163_backup_recovery_key;
+#[path = "migrations/0164_backup_ledger.rs"]
+mod migration_0164_backup_ledger;
+#[path = "migrations/0165_drop_announced_key_packages.rs"]
+mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
 
@@ -335,6 +339,9 @@ pub(crate) struct Migration {
     pub(crate) suspend_foreign_keys: &'static [&'static str],
     pub(crate) apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
+
+#[path = "migrations/0167_reaction_attachment_sources.rs"]
+mod migration_0167_reaction_attachment_sources;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1259,10 +1266,28 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0163_backup_recovery_key::apply,
     },
     Migration {
+        version: 164,
+        name: "0164_backup_ledger",
+        suspend_foreign_keys: &[],
+        apply: migration_0164_backup_ledger::apply,
+    },
+    Migration {
+        version: 165,
+        name: "0165_drop_announced_key_packages",
+        suspend_foreign_keys: &[],
+        apply: migration_0165_drop_announced_key_packages::apply,
+    },
+    Migration {
         version: 166,
         name: "0166_blossom_history_deliveries",
         suspend_foreign_keys: &[],
         apply: migration_0166_blossom_history_deliveries::apply,
+    },
+    Migration {
+        version: 167,
+        name: "0167_reaction_attachment_sources",
+        suspend_foreign_keys: &[],
+        apply: migration_0167_reaction_attachment_sources::apply,
     },
 ];
 
@@ -1620,6 +1645,44 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../../fixtures/storage-v1-v0.9.12.bin");
+
+    /// D81 retires the unused announcement history without changing the
+    /// device group's authoritative record. Exercise a populated upgrade.
+    #[test]
+    fn migration_0165_drops_announced_key_packages_and_keeps_the_group() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 164).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 7, x'00');
+             INSERT INTO cgka_announced_key_packages
+                 (group_id, slot, key_package_ref, last_seen_at)
+                 VALUES (x'aa', zeroblob(32), x'bb', 100);",
+        )
+        .unwrap();
+
+        run_through(&mut conn, 165).unwrap();
+
+        let objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('cgka_announced_key_packages', 'cgka_announced_key_packages_by_age')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            objects, 0,
+            "the retired table and its age index must be gone"
+        );
+        let group: (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT epoch, record FROM cgka_groups WHERE id = x'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(group, (7, vec![0]));
+    }
 
     #[test]
     fn presentation_upgrade_adds_durable_storage_without_rewriting_group_names() {

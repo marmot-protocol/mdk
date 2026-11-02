@@ -1011,50 +1011,6 @@ pub trait PrivateKeyPackageStorage {
     fn delete_issued_private_key_package(&self, key_package_ref: &[u8]) -> StorageResult<()>;
 }
 
-// ── AnnouncedKeyPackageStorage ─────────────────────────────────────────────
-
-/// A KeyPackage a device-group roster announced for one of its device slots
-/// (mdk#2628 D31 item 7).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AnnouncedKeyPackage {
-    /// The device's KeyPackage slot, the Nostr `d` its roster entry is keyed
-    /// by.
-    pub slot: [u8; 32],
-    pub key_package_ref: Vec<u8>,
-}
-
-/// How long an announcement is kept after the last roster state this device
-/// applied that announced it: as long as a KeyPackage publication stays
-/// fresh, so a relay still serving it after a newer announcement is covered.
-/// A slot whose roster entry still announces it needs no record.
-pub const ANNOUNCED_KEY_PACKAGE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// How many announcements each slot of a group keeps, newest first.
-pub const ANNOUNCED_KEY_PACKAGES_PER_SLOT: usize = 16;
-
-/// Every KeyPackage a device-group roster this device held announced, by
-/// group and slot (mdk#2628 D31 item 7). The engine records each roster
-/// state it applies; nothing in the engine reads them back.
-pub trait AnnouncedKeyPackageStorage {
-    /// Record `announced` as seen in `group_id`'s roster at `seen_at`. A pair
-    /// already recorded keeps the later of the two times.
-    fn record_announced_key_packages(
-        &self,
-        group_id: &GroupId,
-        announced: &[AnnouncedKeyPackage],
-        seen_at: u64,
-    ) -> StorageResult<()>;
-    /// Drop every record last seen before `before`, and each group slot's
-    /// records beyond its `per_slot` most recently seen.
-    fn prune_announced_key_packages(&self, before: u64, per_slot: usize) -> StorageResult<()>;
-    /// What `group_id`'s rosters announced, last seen at or after `since`.
-    fn announced_key_packages(
-        &self,
-        group_id: &GroupId,
-        since: u64,
-    ) -> StorageResult<Vec<AnnouncedKeyPackage>>;
-}
-
 // ── RosterTagKeyStorage ────────────────────────────────────────────────────
 
 /// A tag signature key a device-group roster listed for one of its slots, in
@@ -1086,7 +1042,8 @@ pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
 /// Every tag signature key a device-group roster this device held listed, by
 /// group and slot (mdk#2761). The engine records each roster state it
 /// applies; nothing in the engine reads them back. The app reads them to
-/// clean up after a device whose key the roster no longer lists.
+/// clean up after a device whose key the roster no longer lists, and to add
+/// no device in a slot held as removed to its chats.
 pub trait RosterTagKeyStorage {
     /// Record `keys` as seen in `group_id`'s roster at `seen_at`, in the
     /// order this device applied the roster states that listed them: a key
@@ -1340,12 +1297,6 @@ pub trait StorageProvider:
         None
     }
 
-    /// Optional store of the KeyPackages device-group rosters announced
-    /// (mdk#2628 D31 item 7). A backend without one records none.
-    fn announced_key_package_storage(&self) -> Option<&dyn AnnouncedKeyPackageStorage> {
-        None
-    }
-
     /// Optional store of the tag signature keys device-group rosters listed
     /// (mdk#2761). A backend without one records none.
     fn roster_tag_key_storage(&self) -> Option<&dyn RosterTagKeyStorage> {
@@ -1378,6 +1329,23 @@ pub trait StorageProvider:
     {
         f(self)
     }
+
+    /// Observe a successful write only after its owning storage unit commits.
+    ///
+    /// An implementation must defer `callback` through the outermost transaction
+    /// and any rollbackable savepoint, discarding it on rollback, failed commit,
+    /// or panic. Outside such a unit, it may run immediately after the caller's
+    /// successful write. Callbacks must not panic and are best-effort observers,
+    /// never part of the write's success or a completeness guarantee.
+    ///
+    /// The default drops the callback. A backend opts in only when it can uphold
+    /// this ordering, including its snapshot-backed savepoint fallback; running
+    /// immediately merely because an inner transaction returned would announce
+    /// work an enclosing unit can still undo. Unsupported backends therefore
+    /// omit positive stored-state audit evidence rather than record tentative
+    /// writes as committed. Wrappers may forward only when their complete
+    /// transaction and savepoint semantics share that boundary.
+    fn after_commit(&self, _callback: Box<dyn FnOnce() + Send + 'static>) {}
 
     /// Run `f` as one unit that a failure undoes without ending the caller's
     /// transaction. When `f` returns `Err`, `group_id`'s state as

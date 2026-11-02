@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
+  D81). Migration 0165 drops the unused `cgka_announced_key_packages` table
+  and its age index; migration 0144 stays unchanged. Device rosters and the
+  own-slot compromise warning are unaffected.
+
 - Methods with no caller outside their own tests are gone (mdk#2816):
   `SqliteAppStorage::remove_group_push_token`,
   `remove_group_push_tokens_for_member` (use
@@ -33,6 +38,19 @@
   `history_imports_generation` reads it; `set_device_labels` writes only when
   the names differ.
 
+- Migration 0164 adds the backup ledger (mdk#2628 item 4.4b):
+  `backup_runs` and `backup_run_blobs` (each backup this device is writing
+  until a relay accepts its pointer, and its blobs, recorded before upload),
+  `backup_condemned_blobs` (blobs to delete while no pointer lists their
+  backup) and `backup_schedule` (the next pass, and the writer this device
+  last saw named for a key). Nothing secret is stored. `SqliteAppStorage`
+  gains `backup_schedule`, `schedule_backup_pass`, `note_backup_writer`,
+  `begin_backup_run`, `record_backup_run_blob`, `record_backup_run_head`,
+  `backup_runs`, `finish_backup_run`, `abandon_backup_run`,
+  `condemn_backup_blobs`, `due_condemned_backup_blobs`,
+  `next_condemned_backup_try`, `defer_condemned_backup_blob`,
+  `forget_condemned_backup_blob` and `forget_backups_except`, with the types
+  `BackupRun`, `BackupRunHead`, `BackupSchedule` and `CondemnedBackupBlob`.
 - Migration 0163 advances account storage to schema 163 (mdk#2628 item 4.4a).
   It adds `backup_recovery_key`, at most one row: the public half of the
   recovery key that words confirmed while this device trusts no device group
@@ -418,6 +436,13 @@
   and every copy shared one store epoch and skipped incremental auto-vacuum.
 
 ### Added
+
+- Migration 0167 indexes active kind-7 reaction attachments from retained app
+  events without creating timeline rows (mdk#2151), backfilling existing
+  artwork and sharing normal acquisition, permission and retention behavior.
+  `reaction_attachment_candidates` provides bounded message-scoped source
+  discovery. Incremental projection and rebuilds preserve unchanged slots;
+  authenticated reaction retractions and withdrawals revoke changed sources.
 
 - `dismiss_recovery_route_park_on` dismisses a route's broken units on the
   given relays and its remainder, checking the revision against them only;

@@ -87,6 +87,7 @@ pub use app::avatar_cache::{
     DatabaseAvatarBody, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
     MAX_AVATAR_DIMENSION,
 };
+pub use app::backup_ledger::{BackupRun, BackupRunHead, BackupSchedule, CondemnedBackupBlob};
 pub use app::chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
     ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,

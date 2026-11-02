@@ -157,7 +157,11 @@ async fn chat_without_account_devices(devices: &mut Devices) -> (tempfile::TempD
 /// Commit the removal of the device in `slot` on `phone` as a removal
 /// another device decided reaches it: the commit alone, with no decision
 /// recorded here and no clean-up run.
-async fn commit_removal_decided_elsewhere(phone: &mut AppClient, group: &GroupId, slot: [u8; 32]) {
+pub(in crate::tests) async fn commit_removal_decided_elsewhere(
+    phone: &mut AppClient,
+    group: &GroupId,
+    slot: [u8; 32],
+) {
     let before = roster(phone, group);
     phone
         .unlink_device_from_group(
@@ -1972,7 +1976,7 @@ async fn a_device_the_roster_stops_listing_is_cleaned_up_after_by_its_remembered
 /// Deliver what the relay has to `client` and advance its device group's
 /// convergence `passes` times. The device group is hidden, so convergence
 /// runs through the runtime.
-async fn converge_device_group(
+pub(in crate::tests) async fn converge_device_group(
     client: &mut AppClient,
     relay: &ScriptedPushRelayClient,
     cursor: &mut usize,

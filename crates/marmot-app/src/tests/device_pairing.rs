@@ -20,6 +20,8 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
+mod linked_device_chats;
+
 /// One of Alice's devices, with its own cursor over the shared relay.
 struct Device {
     _dir: tempfile::TempDir,
@@ -152,6 +154,16 @@ async fn link(
     new: &mut Device,
     label: &str,
 ) -> GroupId {
+    link_with(relay, existing, new, DeviceLinkChoices::new(label)).await
+}
+
+/// [`link`], with `choices` for the new device.
+async fn link_with(
+    relay: &ScriptedPushRelayClient,
+    existing: &mut Device,
+    new: &mut Device,
+    choices: DeviceLinkChoices,
+) -> GroupId {
     let started = new.op(DeviceLinkOp::Start).await;
     assert_eq!(
         started.new_device,
@@ -171,12 +183,7 @@ async fn link(
         waiting.new_device,
         Some(NewDeviceLinkState::WaitingForOtherDevice)
     );
-    let linking = existing
-        .op(DeviceLinkOp::Link {
-            prompt_id,
-            choices: DeviceLinkChoices::new(label),
-        })
-        .await;
+    let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
     assert_eq!(
         linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
         DeviceLinkPromptState::Linking

@@ -110,12 +110,6 @@ mod device_group_welcome;
 #[path = "account_devices/device_tag.rs"]
 mod device_tag;
 
-// The rosters a device applied record what they announced (mdk#2628 D31
-// item 7).
-#[cfg(feature = "test-policy-overrides")]
-#[path = "account_devices/announced_key_packages.rs"]
-mod announced_key_packages;
-
 // The rosters a device applied record the tag signature keys they listed
 // (mdk#2761).
 #[cfg(feature = "test-policy-overrides")]

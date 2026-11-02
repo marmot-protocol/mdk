@@ -102,6 +102,14 @@ Connectors use the same API both to attach a recent ID-bearing chat window to an
 on-demand history tool. This is also the recovery path after `resync_required`; clients should re-page the
 materialized timeline rather than attempting to reconstruct history from the lossy event stream.
 
+## Media reference provenance
+
+`AgentControlMediaRef.source_epoch_identity` is optional local upload metadata.
+Preserve it when forwarding a returned upload reference within the local control
+plane. References reconstructed from received `imeta` tags omit it, and remain
+valid download inputs. Sending a reference without known upload provenance
+requires a fresh upload; the field is never carried in Marmot events.
+
 ## Run the tests
 
 ```sh

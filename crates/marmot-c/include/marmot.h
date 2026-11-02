@@ -1784,6 +1784,10 @@ typedef struct MarmotMediaAttachmentReference {
    */
   uint32_t version;
   uint64_t source_epoch;
+  /**
+   * Nullable local upload branch identity; preserve unchanged when sending.
+   */
+  char *source_epoch_identity;
   char *dim;
   char *thumbhash;
 } MarmotMediaAttachmentReference;
@@ -7082,6 +7086,30 @@ MarmotStatus marmot_attachment_local_assets(const struct MarmotClient *client,
                                             struct MarmotAttachmentLocalAssetList **out);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_entry_free(struct MarmotAttachmentEntry *ptr);
+
+/**
+ * Resolve one active custom-emoji reaction's encrypted artwork without network work.
+ * Writes NULL with MARMOT_STATUS_OK when no eligible matching artwork is available.
+ * Use the returned original source slot with attachment acquisition and local reads.
+ * Free a non-NULL result with marmot_attachment_entry_free. Blocking: call off the UI thread.
+ * # Safety
+ * Client and strings must be live; out must be writable.
+ */
+MarmotStatus marmot_reaction_attachment(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *reaction_message_id_hex,
+                                        struct MarmotAttachmentEntry **out);
+
+/**
  * Deep-free a page result and its cursor/version. NULL is a no-op.
  * # Safety
  * Value must be NULL or an owned result, not freed or borrowed by an active call.
@@ -8248,6 +8276,30 @@ MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client,
 MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *client,
                                                   const char *account_ref,
                                                   uint32_t *out);
+
+/**
+ * How many chats this device is in can't take any device of this
+ * account, linked or not: they don't require
+ * `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+ * can carry, or already hold this account's limit of 20 leaves. Once a
+ * link this device approved is made, the new device is added to this
+ * device's other chats when its "add to all my chats" setting is on,
+ * for a week after the link. A chat that can take this account's
+ * devices but whose requirements the new device's KeyPackages don't
+ * meet is passed over and not counted, so zero does not mean the new
+ * device reaches every chat. A chat admin can turn the component on;
+ * removing a device frees its leaves. Zero while device
+ * groups are off. Not evented: read it when showing the device list.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   uint32_t *out);
 
 /**
  * List the sign-ins of this account that this device does not

@@ -202,6 +202,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Media send scripts must preserve the complete upload `media` JSON object, including local `source_epoch_identity`
+  (mdk#2840). A list or plaintext-hash lookup cannot reconstruct upload provenance, so those references must be uploaded
+  again before sending; downloads remain supported. Sends refuse missing provenance and changed upload branches, even
+  at the same epoch number, before publication.
+
 - `messages send-event` refuses the device-group kinds 457, 459, 460, 461, 473, 475 and 476 with
   `reserved_app_event_kind`, and one received in a chat makes no timeline row or message (mdk#2628). They are read only
   in the account's device group.

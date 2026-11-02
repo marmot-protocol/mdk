@@ -737,3 +737,270 @@ fn attachment_history_metadata_is_source_scoped_and_not_an_album_copy() {
         assert!(result.next_cursor.is_some());
     }
 }
+
+// #2151: reactions are modifier events, never standalone timeline rows. Their
+// image slots must still follow the real event projection and author deletion.
+#[test]
+fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reactions.sqlite3");
+    let key = crate::SqlCipherKey::raw([0x42; 32]);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    sql(
+        &store,
+        "INSERT INTO account_groups(group_id_hex,endpoint,updated_at,pending_confirmation) VALUES('aa','',0,0)",
+    );
+    let mut event = crate::StoredAppEvent {
+        group_id_hex: "aa".into(),
+        message_id_hex: "chat".into(),
+        source_message_id_hex: Some("source-chat".into()),
+        source_epoch: Some(7),
+        direction: "received".into(),
+        sender: "alice".into(),
+        plaintext: "hello".into(),
+        kind: 9,
+        tags: Vec::new(),
+        recorded_at: 10,
+        received_at: 10,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    app.record_app_event(&event).unwrap();
+    let root = event.clone();
+    event.message_id_hex = "reaction".into();
+    event.source_message_id_hex = Some("source-reaction".into());
+    event.kind = 7;
+    event.plaintext = ":party:".into();
+    event.tags = vec![
+        vec!["e".into(), "chat".into()],
+        vec![
+            "emoji".into(),
+            "party".into(),
+            "https://example.com/party".into(),
+        ],
+        vec![
+            "imeta".into(),
+            "v encrypted-media-v2".into(),
+            "m image/png".into(),
+            "locator blossom-v1 https://example.com/party".into(),
+            format!("ciphertext_sha256 {}", "11".repeat(32)),
+            format!("plaintext_sha256 {}", "22".repeat(32)),
+            format!("nonce {}", "33".repeat(12)),
+            "filename party.png".into(),
+        ],
+    ];
+    // A reaction carries artwork, never an otherwise unrepresented shared file.
+    for (i, (content, tags)) in [
+        (
+            "+",
+            vec![vec![
+                "imeta",
+                "m video/mp4",
+                "locator blossom-v1 https://example.com/video",
+            ]],
+        ),
+        (
+            ":party:",
+            vec![
+                vec![
+                    "imeta",
+                    "m image/png",
+                    "locator blossom-v1 https://example.com/unrelated",
+                ],
+                vec!["emoji", "party", "https://example.com/party"],
+            ],
+        ),
+        (
+            ":party:",
+            vec![
+                vec![
+                    "imeta",
+                    "m video/mp4",
+                    "locator blossom-v1 https://example.com/party",
+                ],
+                vec!["emoji", "party", "https://example.com/party"],
+            ],
+        ),
+        (
+            ":party\0!:",
+            vec![
+                vec![
+                    "imeta",
+                    "m image/png",
+                    "locator blossom-v1 https://example.com/party",
+                ],
+                vec!["emoji", "party\0!", "https://example.com/party"],
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut unrelated = event.clone();
+        unrelated.message_id_hex = format!("unrelated-reaction-{i}");
+        unrelated.source_message_id_hex = Some(format!("source-unrelated-reaction-{i}"));
+        unrelated.plaintext = content.into();
+        unrelated.tags = vec![vec!["e".into(), "chat".into()]];
+        unrelated.tags.extend(
+            tags.into_iter()
+                .map(|t| t.into_iter().map(str::to_owned).collect()),
+        );
+        // Keep each negative slot structurally valid: the source-role filter,
+        // rather than a downstream media-parser rejection, must exclude it.
+        for slot in unrelated
+            .tags
+            .iter_mut()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            slot.extend(
+                event.tags[2]
+                    .iter()
+                    .skip(1)
+                    .filter(|field| !field.starts_with("m ") && !field.starts_with("locator "))
+                    .cloned(),
+            );
+        }
+        app.record_app_event(&unrelated).unwrap();
+        assert!(
+            page(&app).entries.is_empty(),
+            "unrelated reaction slot {i} entered discovery"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM attachment_worker_demand", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0,
+            "unrelated reaction slot {i} created automatic demand"
+        );
+    }
+    app.record_app_event(&event).unwrap();
+    let original = event.clone();
+    // The public resolver's database read is a point lookup even in a chat
+    // with substantial unrelated retained event history.
+    sql(&store,"WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+        INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+        SELECT 'aa',printf('unrelated-%04d',i),'received','alice','',9,'[]',1,1 FROM n");
+    let candidates = crate::base::query_work_test_support::measured(
+        &store,
+        "reaction attachment point lookup",
+        2000,
+        || {
+            app.reaction_attachment_candidates("aa", "reaction", 10)
+                .unwrap()
+        },
+    );
+    assert_eq!(candidates.len(), 1);
+    // A busy target can have many plain reactions. Adding one more must not
+    // reprocess every sibling's attachment state during catch-up.
+    sql(&store, "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<499)
+        INSERT INTO app_events(group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+        SELECT 'aa',printf('plain-%04d',i),printf('source-plain-%04d',i),7,'received','bob','+',7,'[[\"e\",\"chat\"]]',10,10 FROM n;
+        INSERT INTO message_modifier_edges(group_id_hex,modifier_message_id_hex,target_message_id_hex,kind,sender,recorded_at)
+        SELECT 'aa',message_id_hex,'chat',7,sender,recorded_at FROM app_events WHERE message_id_hex GLOB 'plain-*'");
+    let mut newest = event.clone();
+    newest.message_id_hex = "newest-plain".into();
+    newest.source_message_id_hex = Some("source-newest-plain".into());
+    newest.plaintext = "+".into();
+    newest.tags = vec![vec!["e".into(), "chat".into()]];
+    crate::base::query_work_test_support::measured(
+        &store,
+        "adding a plain reaction to a busy target",
+        400_000,
+        || app.record_app_event(&newest).unwrap(),
+    );
+    let p = page(&app);
+    assert_eq!(
+        p.entries.len(),
+        1,
+        "a kind-7 event must own an acquirable slot"
+    );
+    assert_eq!(p.entries[0].message_id_hex, "reaction");
+    assert_eq!(p.entries[0].source_message_id_hex, "source-reaction");
+    assert_eq!(p.entries[0].attachment_index, 0);
+    assert_eq!(p.entries[0].emoji_tags, vec![event.tags[1].clone()]);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM message_timeline WHERE message_id_hex='reaction'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    app.rebuild_message_timeline_for_group("aa").unwrap();
+    let rebuilt = page(&app);
+    assert_eq!(rebuilt.entries.len(), 1);
+    assert_eq!(
+        rebuilt.version, p.version,
+        "unchanged reaction slots survive timeline rebuilds"
+    );
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    assert_eq!(page(&app).entries[0].message_id_hex, "reaction");
+    event.message_id_hex = "forged-delete".into();
+    event.source_message_id_hex = Some("source-forged-delete".into());
+    event.kind = 5;
+    event.sender = "mallory".into();
+    event.tags = vec![vec!["e".into(), "reaction".into()]];
+    app.record_app_event(&event).unwrap();
+    assert_eq!(
+        page(&app).entries.len(),
+        1,
+        "a different author cannot revoke the source"
+    );
+    event.message_id_hex = "delete".into();
+    event.source_message_id_hex = Some("source-delete".into());
+    event.sender = "alice".into();
+    app.record_app_event(&event).unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "author retraction revokes its reaction artwork"
+    );
+    app.invalidate_app_event_by_message_id("aa", "delete", "branch_selection_withdrawn")
+        .unwrap();
+    assert_eq!(
+        page(&app).entries.len(),
+        1,
+        "withdrawn deletion no longer revokes artwork"
+    );
+    app.invalidate_app_event_by_message_id("aa", "reaction", "branch_selection_withdrawn")
+        .unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "withdrawn reaction has no live source"
+    );
+    let mut other = root.clone();
+    other.message_id_hex = "other-target".into();
+    other.source_message_id_hex = Some("source-other-target".into());
+    app.record_app_event(&other).unwrap();
+    let mut retained = original;
+    retained.tags.push(vec!["e".into(), other.message_id_hex]);
+    retained.message_id_hex = "second-reaction".into();
+    retained.source_message_id_hex = Some("source-second-reaction".into());
+    app.record_app_event(&retained).unwrap();
+    assert_eq!(page(&app).entries.len(), 1);
+    app.record_app_event_with_retention(
+        &root,
+        Some(cgka_traits::app_event::AppMessageRetentionDecision {
+            retention_seconds: 10,
+            expires_at: Some(20),
+        }),
+    )
+    .unwrap();
+    app.secure_prune_expired_app_events("aa", 20, "self", &|_, _| false)
+        .unwrap();
+    assert!(
+        page(&app).entries.is_empty(),
+        "retention of the first target revokes artwork despite a live second e target"
+    );
+}

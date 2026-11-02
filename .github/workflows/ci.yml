@@ -277,6 +277,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -307,6 +312,15 @@ jobs:
             -p cgka-engine \
             -p transport-nostr-peeler
 
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
+
   rust-clippy:
     name: Rust check and clippy
     env:
@@ -321,6 +335,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -342,6 +361,15 @@ jobs:
       - name: Run clippy with all features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
+
   c-smoke:
     name: C bindings smoke
     needs: changes
@@ -354,6 +382,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -388,6 +421,15 @@ jobs:
 
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   # Pull requests run this only with the `ci:apple` or `ci:full` label; merge
   # groups always run it, so it gates merging.
@@ -444,6 +486,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -462,6 +509,15 @@ jobs:
         # Keep in sync with `just test-convergence-policy-pin`.
         run: cargo test -p cgka-engine --test convergence_policy_pin --locked
 
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
+
   # Pre-checks build the workspace tests here and run the quick ones in place.
   # Full runs archive them for the test shards. Master pushes build them only
   # to save the Rust caches; the jobs that run them need the full mode.
@@ -477,6 +533,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -504,11 +565,11 @@ jobs:
       # end. About two thirds of the workspace tests finish inside that window.
       - name: Run quick workspace tests
         if: needs.changes.outputs.ci_mode == 'precheck'
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile precheck -E "$WORKSPACE_FILTER"
+        run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest run --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile precheck -E "$WORKSPACE_FILTER"
 
       - name: Verify workspace shard coverage
         if: needs.changes.outputs.ci_mode != 'precheck'
-        run: bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
+        run: python3 scripts/ci_runner.py run workspace-build -- bash scripts/check_ci_partitions.sh slice:14 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
         if: always() && needs.changes.outputs.ci_mode != 'precheck'
@@ -521,18 +582,33 @@ jobs:
 
       - name: Archive workspace tests
         if: needs.changes.outputs.ci_mode != 'precheck'
-        run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
+        run: python3 scripts/ci_runner.py run rust-test-build -- cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
+
+      - name: Verify and describe test archive
+        if: needs.changes.outputs.ci_mode != 'precheck'
+        run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rust-test
-          path: tests.tar.zst
+          path: |
+            tests.tar.zst
+            tests.tar.zst.manifest.json
           compression-level: 0
           overwrite: true
           retention-days: 1
           if-no-files-found: error
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   # Fourteen shards keep the slowest one near 15 minutes. Each shard's tests run
   # four at a time, so its time tracks its total test time, and the slowest
@@ -562,6 +638,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -582,12 +663,24 @@ jobs:
         with:
           name: rust-test
 
+      - name: Verify and extract test archive
+        run: python3 scripts/ci_runner.py extract tests.tar.zst
+
       - name: Run workspace tests
         timeout-minutes: 30
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition slice:${{ matrix.partition }}/14 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+        run: python3 scripts/ci_runner.py run rust-test -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --partition slice:${{ matrix.partition }}/14 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
@@ -601,6 +694,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -619,9 +717,14 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
+      - name: Install uv for sender and receiver compatibility
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.4"
+
       - name: Test consent and both diagnostic exporters
         run: |
-          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib product_analytics:: --locked
+          cargo test -p marmot-observability --features otlp-export,product-analytics-export --lib --locked -- --include-ignored
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib usage_diagnostics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
@@ -630,6 +733,15 @@ jobs:
           cargo test -p marmot-app --features otlp-export,product-analytics-export --test relay_telemetry_otlp --locked
           cargo test -p marmot-c --features otlp-export,product-analytics-export,alloc-audit product_analytics --locked
           cargo test -p agent-connector --features otlp-export,product-analytics-export usage_diagnostics:: --locked
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   cli-e2e-build:
     name: Build CLI tests
@@ -643,6 +755,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -668,18 +785,33 @@ jobs:
         run: bash scripts/check_ci_partitions.sh count:2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
 
       - name: Archive CLI tests
-        run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
+        run: python3 scripts/ci_runner.py run cli-e2e-build -- cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
+
+      - name: Verify and describe test archive
+        if: needs.changes.outputs.ci_mode != 'precheck'
+        run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cli-e2e
-          path: tests.tar.zst
+          path: |
+            tests.tar.zst
+            tests.tar.zst.manifest.json
           compression-level: 0
           overwrite: true
           retention-days: 1
           if-no-files-found: error
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   cli-e2e:
     name: CLI e2e (mock relay, ${{ matrix.partition }}/2)
@@ -697,6 +829,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -717,12 +854,24 @@ jobs:
         with:
           name: cli-e2e
 
+      - name: Verify and extract test archive
+        run: python3 scripts/ci_runner.py extract tests.tar.zst
+
       - name: Run CLI end-to-end tests
         # Dedicated job: this subprocess-heavy suite is capped by the `cli-e2e`
         # test-group and the `ci` profile adds retries + a hung-test backstop.
         # The real-relay test self-skips here; it has its own `Relay CLI E2E`
         # job with a docker relay stack.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/2 --profile ci
+        run: python3 scripts/ci_runner.py run cli-e2e -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --partition count:${{ matrix.partition }}/2 --profile ci
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-runtime-build:
     name: Build relay runtime tests
@@ -736,6 +885,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -761,18 +915,33 @@ jobs:
         run: bash scripts/check_ci_partitions.sh count:2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci -E 'binary(relay_runtime)'
 
       - name: Archive relay runtime tests
-        run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
+        run: python3 scripts/ci_runner.py run relay-runtime-build -- cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile ci --archive-file tests.tar.zst
+
+      - name: Verify and describe test archive
+        if: needs.changes.outputs.ci_mode != 'precheck'
+        run: python3 scripts/ci_runner.py manifest tests.tar.zst
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: relay-runtime
-          path: tests.tar.zst
+          path: |
+            tests.tar.zst
+            tests.tar.zst.manifest.json
           compression-level: 0
           overwrite: true
           retention-days: 1
           if-no-files-found: error
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-runtime:
     name: Relay runtime tests (${{ matrix.partition }}/2)
@@ -790,6 +959,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -810,6 +984,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.132
 
+      - name: Verify and extract test archive
+        run: python3 scripts/ci_runner.py extract tests.tar.zst
+
       - name: Run relay runtime tests serially
         # Preserve the former cargo-test lane's no-retry behavior. Ignored
         # tests stay out of the queue: the 1,600-message
@@ -817,11 +994,20 @@ jobs:
         # and runs nightly in simulator-nightly.yml with these same flags.
         env:
           RUST_BACKTRACE: "1"
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
+        run: python3 scripts/ci_runner.py run relay-runtime -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --profile ci --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
 
       - name: Run held peer-index upgrade lookup
         if: matrix.partition == 1
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" --profile default --retries 0 -E 'binary(startup_hydration) & test(=existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held)'
+        run: python3 scripts/ci_runner.py run relay-runtime -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --profile default --retries 0 -E 'binary(startup_hydration) & test(=existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held)'
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-e2e:
     name: Relay CLI E2E
@@ -835,6 +1021,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -855,6 +1046,9 @@ jobs:
         with:
           name: cli-e2e
 
+      - name: Verify and extract test archive
+        run: python3 scripts/ci_runner.py extract tests.tar.zst
+
       - name: Start local relay stack
         run: docker compose up -d setup nostr-rs-relay strfry-nostr-relay
 
@@ -866,7 +1060,7 @@ jobs:
       - name: Run real relay CLI E2E
         env:
           MDK_E2E_REQUIRE_RELAYS: "1"
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        run: python3 scripts/ci_runner.py run relay-e2e -- cargo nextest run --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
 
       - name: Dump local relay logs
         if: failure()
@@ -875,6 +1069,15 @@ jobs:
       - name: Stop local relay stack
         if: always()
         run: docker compose down -v
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   conformance-build:
     name: Build simulator tests
@@ -888,6 +1091,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -918,18 +1126,33 @@ jobs:
         run: bash scripts/check_ci_partitions.sh count:2 -p cgka-conformance-simulator --locked --profile ci -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
 
       - name: Archive default-feature simulator tests
-        run: cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
+        run: python3 scripts/ci_runner.py run conformance-build -- cargo nextest archive -p cgka-conformance-simulator --locked --profile ci --archive-file simulator.tar.zst
+
+      - name: Verify and describe test archive
+        if: needs.changes.outputs.ci_mode != 'precheck'
+        run: python3 scripts/ci_runner.py manifest simulator.tar.zst
 
       - name: Upload simulator test archive
         if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: simulator-tests
-          path: simulator.tar.zst
+          path: |
+            simulator.tar.zst
+            simulator.tar.zst.manifest.json
           compression-level: 0
           overwrite: true
           retention-days: 1
           if-no-files-found: error
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   conformance:
     name: Simulator and vectors (${{ matrix.lane }})
@@ -956,6 +1179,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -980,15 +1208,15 @@ jobs:
         with:
           name: simulator-tests
 
-      - name: Extract simulator test binaries
-        run: cargo nextest list --archive-file simulator.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --list-type binaries-only > /dev/null
+      - name: Verify and extract test archive
+        run: python3 scripts/ci_runner.py extract simulator.tar.zst
 
       - name: Run archived simulator tests
         env:
           SIM_GROUPS: ${{ matrix.groups }}
         run: |
           set -euo pipefail
-          nextest=(cargo nextest run
+          nextest=(python3 scripts/ci_runner.py run simulator -- cargo nextest run
             --cargo-metadata target/nextest/cargo-metadata.json
             --binaries-metadata target/nextest/binaries-metadata.json
             --workspace-remap "$GITHUB_WORKSPACE"
@@ -1028,6 +1256,15 @@ jobs:
             exit 1
           fi
 
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
+
   conformance-extras:
     name: Convergence gates and simulator doctests
     needs: changes
@@ -1039,6 +1276,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Prepare runner disk
+        env:
+          MDK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 scripts/ci_runner.py prepare
 
       - name: Install Rust toolchain
         run: |
@@ -1068,7 +1310,7 @@ jobs:
         run: just convergence-lane-policy
 
       - name: Validate convergence failure-corpus lifecycle
-        run: cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
+        run: python3 scripts/ci_runner.py run conformance-extras -- cargo nextest run -p convergence-campaign-runner --test failure_corpus --locked
 
       - name: Run focused convergence regressions
         run: just focused-convergence-regressions
@@ -1078,6 +1320,15 @@ jobs:
 
       - name: Verify TLA liveness and counterexample
         run: just tla-liveness tla-liveness-counterexample
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mdk-ci-reports
+          retention-days: 7
+          if-no-files-found: warn
 
   formal:
     name: Tamarin proofs
@@ -1115,7 +1366,24 @@ jobs:
             -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 \
             -o DPkg::Lock::Timeout=60 \
-            install -y --no-install-recommends graphviz maude
+            install -y --no-install-recommends graphviz unzip
+
+      - name: Install Maude
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/maude.zip"
+          curl --fail --location --silent --show-error \
+            https://github.com/maude-lang/Maude/releases/download/Maude3.5.1/Maude-3.5.1-linux-x86_64.zip \
+            --output "$archive"
+          echo "72ed1ca87e3b3d0dfc6ee1436baf154bf04c45ff97d521bec040c5e8dfc8f92c  $archive" | sha256sum --check --strict
+          directory="$RUNNER_TEMP/maude-3.5.1"
+          mkdir -p "$directory"
+          unzip -q "$archive" -d "$directory"
+          chmod 755 "$directory/maude"
+          echo "$directory" >> "$GITHUB_PATH"
+          echo "MAUDE_LIB=$directory" >> "$GITHUB_ENV"
+          export PATH="$directory:$PATH" MAUDE_LIB="$directory"
+          maude --version | grep -Fx '3.5.1'
 
       - name: Install Tamarin
         env:
@@ -1125,6 +1393,7 @@ jobs:
           curl -L --fail --show-error --silent \
             "https://github.com/tamarin-prover/tamarin-prover/releases/download/${TAMARIN_VERSION}/tamarin-prover-${TAMARIN_VERSION}-linux64-ubuntu.tar.gz" \
             -o /tmp/tamarin-prover.tar.gz
+          echo "201be06f469e47cff554df6ca93db8366fc2c69d70c61fcbd1370a1074b469c6  /tmp/tamarin-prover.tar.gz" | sha256sum --check --strict
           tar -xzf /tmp/tamarin-prover.tar.gz -C /tmp
           sudo install -m 0755 /tmp/tamarin-prover /usr/local/bin/tamarin-prover
           tamarin-prover --version
@@ -1298,6 +1567,7 @@ jobs:
     continue-on-error: true
     permissions:
       actions: write
+      checks: read
       contents: read
 
     steps:
@@ -1320,10 +1590,10 @@ jobs:
           fi
           dropped=0
           while (( SECONDS < deadline )); do
-            # One line per job: name, status, conclusion. A failed request is
-            # retried on the next poll.
+            # One line per job: name, status, conclusion, check URL. Retry a
+            # failed request on the next poll.
             if jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
-                --jq '.jobs[] | [.name, .status, .conclusion // ""] | @tsv')"; then
+                --jq '.jobs[] | [.name, .status, .conclusion // "", .check_run_url // ""] | @tsv')"; then
               # Required CI starts only once every other job has finished.
               if awk -F '\t' '$1 == "Required CI" { found = 1 } END { exit !found }' <<<"$jobs"; then
                 exit 0
@@ -1333,6 +1603,16 @@ jobs:
               failed="$(awk -F '\t' '$2 == "completed" && $3 != "success" && $3 != "skipped"' <<<"$jobs")"
               if [[ -n "$failed" ]]; then
                 printf 'Cancelling the run after:\n%s\n' "$failed"
+                # A dead runner may never upload logs or artifacts. Preserve
+                # its server-side failure annotations on this healthy runner
+                # before cancellation; unavailable annotations never block it.
+                while IFS=$'\t' read -r name _status _conclusion check; do
+                  if [[ -n "$check" ]]; then
+                    printf 'Failure annotations for %s:\n' "$name"
+                    gh api "$check/annotations" \
+                      --jq '.[] | select(.annotation_level == "failure") | .message' || true
+                  fi
+                done <<<"$failed"
                 gh run cancel "$RUN_ID" && exit 0
               elif [[ -n "$HEAD_REF" ]]; then
                 # The queue deletes a dropped group's branch and may give its

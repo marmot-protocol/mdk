@@ -41,6 +41,25 @@ fn received_from(client: &AppClient, issuer: &DeviceSlotId) -> Vec<ReceivedPriva
         .collect()
 }
 
+/// Direct Add tests deliberately skip preflight to exercise engine refusal
+/// after an allocation is spent. Normal app callers select compatible stock.
+fn private_candidate(client: &AppClient, issuer: &DeviceSlotId) -> ReceivedPrivateKeyPackage {
+    devices_storage(client)
+        .received_private_key_packages_from(&hex::encode(issuer), crate::unix_now_seconds())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn take_private_key_package(client: &AppClient, issuer: &DeviceSlotId) -> KeyPackage {
+    let record = devices_storage(client)
+        .take_received_private_key_package(&hex::encode(issuer), crate::unix_now_seconds())
+        .unwrap()
+        .unwrap();
+    AppClient::received_private_key_package(&record)
+}
+
 fn group_messages_since(relay: &ScriptedPushRelayClient, since: usize) -> usize {
     published_kinds(relay, since)
         .into_iter()
@@ -187,10 +206,74 @@ async fn a_device_takes_only_its_siblings_own_key_packages() {
     assert!(received_from(&devices.phone, &phone_slot).is_empty());
     assert_eq!(issued(&devices.phone).len(), phone_issued);
 
-    // The same leaf's hand-off of its own KeyPackages is kept.
+    // The insertion can fail after its first write too. Such a hand-off
+    // certifies no new stock; the issuer can hand the same unspent keys over
+    // again once the write works, without changing the allocation protocol.
+    let chat = devices
+        .phone
+        .create_group("receive stock", &[])
+        .await
+        .unwrap();
+    let mut selection = Default::default();
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none()
+    );
+    let database = phone_database(&devices);
+    database
+        .execute_batch(
+            "CREATE TRIGGER refuse_private_stock AFTER INSERT ON private_key_packages_received
+         BEGIN SELECT RAISE(ABORT, 'private hand-off write refused'); END;",
+        )
+        .unwrap();
     devices.laptop.run_due_maintenance().await.unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
+    assert!(received_from(&devices.phone, &laptop_slot).is_empty());
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none(),
+        "a failed insert supplies no candidate to the retained context"
+    );
+    database
+        .execute_batch("DROP TRIGGER refuse_private_stock")
+        .unwrap();
+    let retry = PrivateKeyPackageHandOff {
+        from: laptop_slot,
+        to: phone_slot,
+        key_packages: issued(&devices.laptop)
+            .into_iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .map(|record| KeyPackage::new(record.key_package))
+            .collect(),
+    };
+    assert_eq!(retry.key_packages.len(), 10);
+    devices
+        .laptop
+        .send_device_group_message(
+            &group,
+            KIND_PRIVATE_KEY_PACKAGE_HAND_OFF,
+            base64::engine::general_purpose::STANDARD.encode(retry.encode().unwrap()),
+        )
+        .await
+        .unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(received_from(&devices.phone, &laptop_slot).len(), 10);
+    let selected = devices
+        .phone
+        .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+        .unwrap()
+        .expect("the same retained context sees an authentic resend once insertion commits");
+    assert!(
+        issued(&devices.laptop)
+            .iter()
+            .any(|record| hex::encode(&record.key_package_ref) == selected.key_package_ref_hex)
+    );
 }
 
 /// A sibling takes one KeyPackage to add the issuer to a chat, asks for a
@@ -200,11 +283,7 @@ async fn a_sibling_takes_asks_for_more_and_discards_private_key_packages() {
     let (mut devices, _) = tagging_devices().await;
     let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
 
-    let taken = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let taken = take_private_key_package(&devices.laptop, &phone_slot);
     let metadata = marmot_session::key_package_metadata(&taken).unwrap();
     assert!(!metadata.last_resort);
     assert!(
@@ -465,14 +544,6 @@ async fn expired_private_key_packages_go_while_maintenance_is_paused_or_frozen()
     assert!(received_from(&phone, &laptop_slot).is_empty());
 }
 
-/// A chat the laptop makes and adds the phone to, and the sibling Welcome
-/// that Add leaves owed.
-async fn chat_adding_the_phone(devices: &mut Devices) -> (GroupId, SiblingWelcome) {
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
-    let welcome = adding_the_phone(devices, &chat).await;
-    (chat, welcome)
-}
-
 /// The laptop adds the phone to `chat` with one of the phone's private
 /// KeyPackages, and the test takes the sibling Welcome that leaves owed off
 /// the laptop's list, so only the test sends it.
@@ -486,11 +557,7 @@ async fn adding_the_phone(devices: &mut Devices, chat: &GroupId) -> SiblingWelco
 /// sibling Welcome owed.
 async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
     let phone_slot = slot(&devices.phone);
-    let key_package = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let key_package = take_private_key_package(&devices.laptop, &phone_slot);
     confirm_unpublished(
         &mut devices.laptop,
         SendIntent::AddOwnAccountDevices {
@@ -568,8 +635,9 @@ async fn re_adding_the_phone(
 async fn chat_re_adding_the_phone(
     devices: &mut Devices,
     group: &GroupId,
+    chat: GroupId,
 ) -> (GroupId, SiblingWelcome, NostrTransportEvent) {
-    let (chat, welcome) = chat_adding_the_phone(devices).await;
+    let welcome = adding_the_phone(devices, &chat).await;
     send_sibling_welcome(&mut devices.laptop, group, &welcome).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     devices.phone.run_due_maintenance().await.unwrap();
@@ -646,8 +714,8 @@ fn stashed(client: &AppClient) -> usize {
 /// refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_adds_this_device_to_a_chat() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
 
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
@@ -676,8 +744,8 @@ async fn a_sibling_welcome_adds_this_device_to_a_chat() {
 /// sender's leaf comes from that epoch's retained anchor, so it is stashed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_from_an_earlier_device_group_epoch_is_stashed() {
-    let (mut devices, group) = tagging_devices().await;
-    let (_, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
     let mut cursor = devices.relay.published_events.lock().unwrap().len();
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
     let epoch = devices.laptop.runtime.group_record(&group).unwrap().epoch;
@@ -700,8 +768,8 @@ async fn a_sibling_welcome_from_an_earlier_device_group_epoch_is_stashed() {
 /// carrier, whose KeyPackage that join used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, again, removal) = chat_re_adding_the_phone(&mut devices, &group).await;
+    let (mut devices, group, [chat_0]) = tagging_devices_with_chats::<1>().await;
+    let (chat, again, removal) = chat_re_adding_the_phone(&mut devices, &group, chat_0).await;
     let epoch = devices.phone.runtime.group_record(&chat).unwrap().epoch;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
@@ -750,8 +818,8 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_sibling_welcome_joins_a_chat_whose_copy_is_unrecoverable() {
     use cgka_traits::storage::GroupStorage as _;
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group).await;
+    let (mut devices, group, [chat_0]) = tagging_devices_with_chats::<1>().await;
+    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group, chat_0).await;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     devices.phone.run_due_maintenance().await.unwrap();
@@ -780,8 +848,8 @@ async fn a_held_sibling_welcome_joins_a_chat_whose_copy_is_unrecoverable() {
 async fn a_join_from_the_stash_tells_the_host_of_the_offers_it_retires() {
     use cgka_traits::storage::{GroupStorage as _, WelcomeStorage as _};
     use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group).await;
+    let (mut devices, group, [chat_0]) = tagging_devices_with_chats::<1>().await;
+    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group, chat_0).await;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     devices.phone.run_due_maintenance().await.unwrap();
@@ -844,11 +912,16 @@ async fn a_held_sibling_welcome_goes_only_once_it_can_never_join() {
     use cgka_traits::storage::{
         GroupStorage as _, MessageStorage as _, PrivateKeyPackageStorage as _,
     };
-    let (mut devices, group) = tagging_devices().await;
-    let (withdrawn, withdrawn_welcome, _) = chat_re_adding_the_phone(&mut devices, &group).await;
-    let (expired, expired_welcome, _) = chat_re_adding_the_phone(&mut devices, &group).await;
-    let (disbanded, disbanded_welcome, _) = chat_re_adding_the_phone(&mut devices, &group).await;
-    let (forgotten, forgotten_welcome, _) = chat_re_adding_the_phone(&mut devices, &group).await;
+    let (mut devices, group, [chat_0, chat_1, chat_2, chat_3]) =
+        tagging_devices_with_chats::<4>().await;
+    let (withdrawn, withdrawn_welcome, _) =
+        chat_re_adding_the_phone(&mut devices, &group, chat_0).await;
+    let (expired, expired_welcome, _) =
+        chat_re_adding_the_phone(&mut devices, &group, chat_1).await;
+    let (disbanded, disbanded_welcome, _) =
+        chat_re_adding_the_phone(&mut devices, &group, chat_2).await;
+    let (forgotten, forgotten_welcome, _) =
+        chat_re_adding_the_phone(&mut devices, &group, chat_3).await;
     for welcome in [
         &withdrawn_welcome,
         &expired_welcome,
@@ -956,8 +1029,8 @@ async fn a_chat_forgotten_before_any_pass_joins_from_a_sibling_welcome_sent_agai
 /// from the same Welcome sent again after the forget.
 async fn forget_then_send_again(held_first: bool) {
     use cgka_traits::storage::GroupStorage as _;
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group).await;
+    let (mut devices, group, [chat_0]) = tagging_devices_with_chats::<1>().await;
+    let (chat, again, _) = chat_re_adding_the_phone(&mut devices, &group, chat_0).await;
     send_sibling_welcome(&mut devices.laptop, &group, &again).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     if held_first {
@@ -994,8 +1067,8 @@ async fn forget_then_send_again(held_first: bool) {
 /// that sibling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
     let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
     let refs = |client: &AppClient| -> Vec<Vec<u8>> {
         issued(client)
@@ -1083,8 +1156,8 @@ async fn a_device_stashes_only_a_sibling_welcome_it_can_trust() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_withdrawn_sibling_welcome_joins_nothing() {
     use cgka_traits::storage::MessageStorage as _;
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
     let issued_before = issued(&devices.phone);
     fn invalidate(client: &AppClient, carrier: &MessageId) {
         let storage = client.app.account_storage("alice").unwrap();
@@ -1197,8 +1270,8 @@ fn account_database(app: &MarmotApp) -> rusqlite::Connection {
 /// read works again, and the phone joins the chat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_whose_admission_read_fails_is_kept_on_retry() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
 
     let connection = phone_database(&devices);
@@ -1224,8 +1297,8 @@ async fn a_sibling_welcome_whose_admission_read_fails_is_kept_on_retry() {
 /// phone joins the chat once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
-    let (mut devices, group) = tagging_devices().await;
-    let (chat, welcome) = chat_adding_the_phone(&mut devices).await;
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
+    let welcome = adding_the_phone(&mut devices, &chat).await;
     send_sibling_welcome(&mut devices.laptop, &group, &welcome).await;
 
     let connection = phone_database(&devices);
@@ -1268,13 +1341,16 @@ async fn a_sibling_welcome_whose_stash_write_fails_is_kept_on_retry() {
 /// consuming the KeyPackage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
-    let (mut devices, _) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     let phone_slot = slot(&devices.phone);
     let before = devices.relay.published_events.lock().unwrap().len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert_eq!(group_messages_since(&devices.relay, before), 2);
@@ -1299,8 +1375,7 @@ async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
 /// joins from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_whose_461_reached_no_one_is_sent_again() {
-    let (mut devices, _) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     add_the_phone_unpublished(&mut devices, &chat).await;
 
     devices.relay.reject_next_publish();
@@ -1323,11 +1398,7 @@ async fn a_sibling_welcome_whose_461_reached_no_one_is_sent_again() {
 /// never sent is dropped, and the Welcome goes in a new 461.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_owed_across_a_restart_is_sent_once() {
-    let (mut devices, _) = tagging_devices().await;
-    let (owed_chat, carried_chat) = (
-        devices.laptop.create_group("owed", &[]).await.unwrap(),
-        devices.laptop.create_group("carried", &[]).await.unwrap(),
-    );
+    let (mut devices, _, [owed_chat, carried_chat]) = tagging_devices_with_chats::<2>().await;
     add_the_phone_unpublished(&mut devices, &owed_chat).await;
     add_the_phone_unpublished(&mut devices, &carried_chat).await;
     let carried = owed(&devices.laptop)
@@ -1360,8 +1431,7 @@ async fn a_sibling_welcome_owed_across_a_restart_is_sent_once() {
 /// leaves the carrier alone and sends no second 461.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_in_flight_is_not_sent_again() {
-    let (mut devices, _) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     add_the_phone_unpublished(&mut devices, &chat).await;
     let [carried] = &owed(&devices.laptop)[..] else {
         panic!("one owed sibling Welcome");
@@ -1393,14 +1463,105 @@ async fn a_sibling_welcome_in_flight_is_not_sent_again() {
     assert_eq!(stashed(&devices.phone), 0);
 }
 
+/// A source chat settling another Commit hides its Welcome from the send
+/// list, but app effects still settle its exact existing carrier. A failed
+/// one waits for Ready, and a published one never gets a second 461.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carried_sibling_welcome_outcomes_settle_while_the_chat_is_held() {
+    use cgka_traits::storage::MessageStorage as _;
+    use cgka_traits::{MessageState, StoredMessagePayload};
+    let (mut devices, device_group, chats) = tagging_devices_with_chats::<2>().await;
+    let mut rows = Vec::new();
+    let mut pending = Vec::new();
+    for (chat, carrier) in chats.into_iter().zip([vec![0xfd; 32], vec![0xfe; 32]]) {
+        add_the_phone_unpublished(&mut devices, &chat).await;
+        let welcome = owed(&devices.laptop)
+            .into_iter()
+            .find(|row| row.group_id == chat)
+            .unwrap();
+        assert!(
+            devices
+                .laptop
+                .runtime
+                .carry_sibling_welcome(&welcome.id, &carrier)
+                .unwrap()
+        );
+        devices
+            .laptop
+            .sibling_welcome_carriers
+            .insert(carrier.clone());
+        let effects = devices
+            .laptop
+            .runtime
+            .session_mut()
+            .send(SendIntent::SelfUpdate { group_id: chat })
+            .await
+            .unwrap();
+        let Some(PublishWork::GroupEvolution { pending: token, .. }) =
+            effects.publish.into_iter().next()
+        else {
+            panic!("expected a pending Commit");
+        };
+        pending.push(token);
+        rows.push((welcome.id, carrier));
+    }
+    assert!(owed(&devices.laptop).is_empty());
+    let effects = marmot_session::AccountDeviceEffects {
+        published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+            group_id: device_group.clone(),
+            app_event_id: hex::encode(&rows[0].1),
+            message_id: MessageId::new(vec![1]),
+            source_epoch: cgka_traits::EpochId(0),
+            retention: cgka_traits::app_event::AppMessageRetentionDecision::new(10, 0),
+            authority: None,
+        }],
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
+            group_id: device_group,
+            app_event_id: hex::encode(&rows[1].1),
+            message_id: MessageId::new(vec![2]),
+            reason: "every target refused".into(),
+        }],
+        ..Default::default()
+    };
+    devices.laptop.settle_sibling_welcome_carriers(&effects);
+    let storage = group_storage(&devices.laptop);
+    assert_eq!(
+        storage.get_message(&rows[0].0).unwrap().state,
+        MessageState::Processed
+    );
+    let failed = storage.get_message(&rows[1].0).unwrap();
+    assert_eq!(failed.state, MessageState::Sent);
+    assert!(matches!(
+        StoredMessagePayload::decode(&failed.payload).unwrap(),
+        StoredMessagePayload::OutboundSiblingWelcome { carrier: None, .. }
+    ));
+    assert!(devices.laptop.sibling_welcome_carriers.is_empty());
+    let before = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 0);
+    for token in pending {
+        devices
+            .laptop
+            .runtime
+            .session_mut()
+            .publish_failed(token)
+            .await
+            .unwrap();
+    }
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 1);
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(group_messages_since(&devices.relay, before), 1);
+    assert!(owed(&devices.laptop).is_empty());
+}
+
 /// A 461 whose publication cannot be settled, because the engine write
 /// fails, leaves the in-flight set anyway: the next pass finds its carrier
 /// from no 461 of this run, so it sends the Welcome again, and settles that
 /// one delivered. The phone joins the chat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_whose_settling_fails_is_sent_again() {
-    let (mut devices, _) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     add_the_phone_unpublished(&mut devices, &chat).await;
     let [owed_welcome] = <[_; 1]>::try_from(owed(&devices.laptop)).unwrap();
     let connection = account_database(&devices.laptop_app);
@@ -1436,8 +1597,7 @@ async fn a_sibling_welcome_whose_settling_fails_is_sent_again() {
 /// after that Commit fails sends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_pinned_sibling_welcome_is_sent_by_the_next_pass() {
-    let (mut devices, group) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
     add_the_phone_unpublished(&mut devices, &chat).await;
     let effects = devices
         .laptop
@@ -1487,8 +1647,7 @@ async fn a_refused_pinned_sibling_welcome_is_sent_by_the_next_pass() {
 /// selected branch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_refused_by_a_same_number_rival_is_sent_by_the_next_pass() {
-    let (mut devices, group) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, group, [chat]) = tagging_devices_with_chats::<1>().await;
     add_the_phone_unpublished(&mut devices, &chat).await;
     let settling = |ms| CanonicalizationPolicy {
         settlement_quiescence_ms: ms,
@@ -1567,14 +1726,17 @@ async fn a_sibling_welcome_refused_by_a_same_number_rival_is_sent_by_the_next_pa
 /// handed back. Adding the phone again goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_waits_for_its_commit() {
-    let (mut devices, _) = tagging_devices().await;
-    let chat = devices.laptop.create_group("chat", &[]).await.unwrap();
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     let phone_slot = slot(&devices.phone);
     let stock = received_from(&devices.laptop, &phone_slot).len();
     devices.relay.reject_next_publish();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.privacy_safe_kind(), "publish");
@@ -1585,7 +1747,11 @@ async fn a_sibling_welcome_waits_for_its_commit() {
 
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
@@ -1620,7 +1786,11 @@ async fn a_refused_sibling_add_spends_its_key_package() {
     let before = devices.relay.published_events.lock().unwrap().len();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1638,7 +1808,7 @@ async fn a_refused_sibling_add_spends_its_key_package() {
 /// is not handed back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
-    let (mut devices, _) = tagging_devices().await;
+    let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
     let bob_id = AccountHome::open(devices._dirs[1].path())
         .create_account("bob")
         .unwrap()
@@ -1646,9 +1816,9 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     remember_test_member_inbox(&devices.laptop_app, &bob_id, "wss://relay.example");
     let mut bob = devices.laptop_app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
-    let chat = devices
+    devices
         .laptop
-        .create_group("chat", &[&bob_id])
+        .invite_members(&chat, &[&bob_id])
         .await
         .unwrap();
     deliver_all(&mut bob, &devices.relay).await;
@@ -1676,7 +1846,11 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let stock = received_from(&devices.laptop, &phone_slot).len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert!(
@@ -1702,4 +1876,113 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     assert_eq!(devices.laptop.runtime.members(&chat).unwrap().len(), 2);
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
     assert!(owed(&devices.laptop).is_empty());
+}
+
+/// Holding a sibling's private stock does not make this device's own leaf
+/// ready to carry its Welcome. Founding skips siblings until the leaf is
+/// tagged, and a later loss of readiness holds the initial carrier unsent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
+    let (mut devices, group) = linked_devices().await;
+    let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
+    devices.phone.sibling_key_package_upkeep(&[]).await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let held = received_from(&devices.laptop, &phone_slot).len();
+    assert!(
+        held > 0,
+        "the sibling handed over real private stock before this device tagged"
+    );
+    assert!(
+        !devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+    let alone = devices
+        .laptop
+        .create_group("before sender ready", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        devices
+            .laptop
+            .runtime
+            .group_record(&alone)
+            .unwrap()
+            .members
+            .len(),
+        1
+    );
+    assert_eq!(received_from(&devices.laptop, &phone_slot).len(), held);
+
+    devices.laptop.set_device_tag_key().await.unwrap();
+    assert!(
+        devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+    // The host's maintenance pause keeps the initial Welcome unsent while
+    // the creator's device-group tag is lost after canonical creation.
+    devices.laptop.pause_maintenance();
+    let chat = devices
+        .laptop
+        .create_group("sender ready", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        devices
+            .laptop
+            .runtime
+            .group_record(&chat)
+            .unwrap()
+            .members
+            .len(),
+        2
+    );
+    devices
+        .laptop
+        .runtime
+        .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+            entry.tag_signature_key = None;
+        })
+        .await
+        .unwrap();
+    assert!(
+        !devices
+            .laptop
+            .device_group_exchange()
+            .unwrap()
+            .unwrap()
+            .tagged
+    );
+    devices.laptop.resume_maintenance();
+    let before = devices.relay.published_events.lock().unwrap().len();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    assert_eq!(devices.relay.published_events.lock().unwrap().len(), before);
+    let owed = devices
+        .laptop
+        .runtime
+        .owed_sibling_welcomes(Timestamp(unix_now_seconds()))
+        .unwrap();
+    assert_eq!(
+        owed.iter()
+            .filter(|welcome| welcome.group_id == chat)
+            .count(),
+        1
+    );
+    assert!(
+        owed.iter()
+            .filter(|welcome| welcome.group_id == chat)
+            .all(|welcome| welcome.carrier.is_none())
+    );
+    devices.laptop.set_device_tag_key().await.unwrap();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    devices.phone.join_stashed_sibling_welcomes().await;
+    assert!(devices.phone.state_group_record(&chat).is_some());
 }

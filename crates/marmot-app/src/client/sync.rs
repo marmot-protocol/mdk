@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -218,7 +218,7 @@ const FULL_HISTORY_ADMISSION_RESERVE_DIVISOR: u32 = 6;
 const RECOVERY_JOB_CANCEL_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) struct FullHistoryRepairControl<'a> {
-    started: Instant,
+    started: tokio::time::Instant,
     timeout: Duration,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
@@ -241,7 +241,7 @@ impl FullHistoryRepairControl<'_> {
 
     /// When the comparison pass must end, leaving the admission reserve.
     pub(crate) fn network_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started) + self.network_budget()
+        self.started + self.network_budget()
     }
 
     fn network_budget(&self) -> Duration {
@@ -253,7 +253,7 @@ impl FullHistoryRepairControl<'_> {
     /// follows gets a whole one.
     fn for_job(&self) -> Self {
         FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: self.timeout,
             cancelled: self.cancelled,
         }
@@ -834,24 +834,21 @@ struct EventProjectionProgress {
     terminal_cleanup: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
+/// Which retained sends [`AppClient::wake_retained_sends`] wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSendWake {
+    /// Every retryable target, as for a host connectivity edge.
+    All,
+    /// Only sends still below their required acknowledgements, the ones a
+    /// user sees as unsent, and sends still awaiting MLS confirmation.
+    BelowQuorum,
+}
+
 impl AppClient {
-    /// Persist a host connectivity-restored edge into every exact fanout whose
-    /// prior attempt was proven unavailable, then schedule its group for an
-    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    /// Persist a host connectivity-restored edge into every exact fanout with a
+    /// retryable target, then schedule its group for an immediate worker pass.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
-        let mut woken_targets = 0;
-        for mut fanout in self.runtime.outbound_fanouts()? {
-            let woken = fanout.wake_retryable_unavailable_targets();
-            if woken == 0 {
-                continue;
-            }
-            let group_id = fanout.group_id().cloned();
-            self.runtime.put_outbound_fanout(&fanout)?;
-            if let Some(group_id) = group_id {
-                self.pending_convergence_groups.insert(group_id);
-            }
-            woken_targets += woken;
-        }
+        let woken_targets = self.wake_retained_sends(RetainedSendWake::All)?;
         self.app.product_analytics.observe(
             crate::ProductFamily::Connectivity,
             "reconnect",
@@ -863,6 +860,66 @@ impl AppClient {
             crate::ProductUnit::Attempt,
             None,
         );
+        Ok(woken_targets)
+    }
+
+    /// Clear the retry clock of every retryable target of a retained send, then
+    /// schedule its group for an immediate worker pass. Attempt counts stay, so
+    /// a retry that fails again resumes its backoff. Possibly-exposed targets
+    /// wake too: their retry resends the same signed event, which a relay that
+    /// already holds it acknowledges as a duplicate. Leaving them on the
+    /// ambiguity clock held a reconnecting device's queued sends for up to an
+    /// hour (mdk#2762).
+    ///
+    /// A group the session opened only seeded hides its fanouts until it is
+    /// hydrated, so each group that holds one is hydrated first. Otherwise a
+    /// wake soon after a cold start would skip exactly the sends a previous
+    /// process left behind. A group that fails to hydrate moves to quarantine
+    /// and keeps its fanouts frozen, as at open.
+    ///
+    /// [`RetainedSendWake::BelowQuorum`] leaves sends that met their required
+    /// acknowledgements, and await no MLS confirmation, to the secondary
+    /// replication schedule.
+    pub(crate) fn wake_retained_sends(
+        &mut self,
+        scope: RetainedSendWake,
+    ) -> Result<usize, AppError> {
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        if !unhydrated.is_empty() {
+            for group_id in self.runtime.outbound_fanout_group_ids()? {
+                if unhydrated.contains(&group_id)
+                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::sync",
+                        method = "wake_retained_sends",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "group with retained sends could not hydrate for the wake",
+                    );
+                }
+            }
+        }
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.outbound_fanouts()? {
+            // A send that met quorum but still awaits MLS confirmation remains
+            // a group barrier, so its clock must not hold the group either.
+            if scope == RetainedSendWake::BelowQuorum
+                && fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1)
+                && !matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            {
+                continue;
+            }
+            let woken = fanout.wake_targets_for_restored_connectivity();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
         Ok(woken_targets)
     }
 
@@ -5922,7 +5979,7 @@ impl AppClient {
                 .await;
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,
             cancelled,
         })
@@ -6537,8 +6594,13 @@ impl AppClient {
             }
             return Ok(());
         }
-        let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
+        let retains_encrypted_media = matches!(
+            message.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && media_imeta_tags_are_valid(
+            &message.tags,
+            self.app.allow_loopback_blob_endpoints(),
+        );
         if let Err(error) = self
             .app
             .directory()
@@ -6568,28 +6630,68 @@ impl AppClient {
             origin_commit_id: None,
             moderation_grant,
         };
-        let projection_update = self.app.record_account_app_event_at(
-            &self.state.label,
-            &message_projection,
-            message.received_at,
-        )?;
-        if retains_encrypted_media
-            && self
-                .remember_received_encrypted_media_secret(
+        // The engine's retained-anchor read can require a separate database
+        // savepoint. Resolve it before taking the app write transaction, then
+        // commit the available key together with its source slots.
+        let source_media_secret = if retains_encrypted_media {
+            match carried_media_secret {
+                Some(secret) => Some(cgka_traits::SecretBytes::new(secret.as_bytes().to_vec())),
+                None => match self
+                    .exportable_encrypted_media_secret(&message.group_id, message.source_epoch)
+                {
+                    Ok(secret) => secret,
+                    Err(error)
+                        if matches!(&error, AppError::Storage(_))
+                            || matches!(
+                                error.as_engine_error(),
+                                Some(cgka_traits::EngineError::Storage(_))
+                            ) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        // Late/legacy events can outlive their retained source
+                        // exporter. Preserve that content and any existing
+                        // cached material when historic keys are unavailable.
+                        tracing::warn!(
+                            target: "marmot_app::media",
+                            method = "project_received_message",
+                            error_code = "encrypted_media_secret_cache_skipped",
+                            "source media key unavailable for a legacy received message",
+                        );
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        let projection_update = if let Some(secret) = source_media_secret {
+            // An acknowledged source must carry its available media key. A
+            // required-key failure rolls back the source and leaves its durable
+            // engine outbox event available after retry or restart.
+            let storage = self.app.account_storage(&self.state.label)?;
+            cgka_traits::StorageProvider::with_transaction(&storage, |_| {
+                let update = self.app.record_account_app_event_at(
+                    &self.state.label,
+                    &message_projection,
+                    message.received_at,
+                )?;
+                self.remember_received_encrypted_media_secret(
                     &message.group_id,
                     message.source_epoch,
                     &message.tags,
-                    carried_media_secret,
-                )
-                .is_err()
-        {
-            tracing::warn!(
-                target: "marmot_app::media",
-                method = "project_received_message",
-                error_code = "encrypted_media_secret_cache_skipped",
-                "failed to cache encrypted media source epoch secret",
-            );
-        }
+                    secret.as_slice(),
+                )?;
+                Ok::<_, AppError>(update)
+            })?
+        } else {
+            self.app.record_account_app_event_at(
+                &self.state.label,
+                &message_projection,
+                message.received_at,
+            )?
+        };
         summary.projection_updates.push(projection_update);
         self.prune_plaintext_retention_for_group(&message.group_id)?;
         Ok(())
@@ -7645,6 +7747,7 @@ mod live_cursor_checkpoint_tests {
     fn a_fenced_drain_checkpoint_keeps_spilling_what_live_promotion_exposed() {
         run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
             let mut fixture = LiveCursorFixture::open().await;
+            let (spill_gate, writing) = fixture.hold_spill_writes();
             let cursor_before = fixture.cursor_before;
             let promoting = fixture.probe(cursor_before + 4_000, "promoting");
             queue_in_order(&fixture, [promoting.clone()]).await;
@@ -7658,13 +7761,15 @@ mod live_cursor_checkpoint_tests {
             let second = fixture
                 .delivery(fixture.probe(cursor_before + 1_001, "second"))
                 .await;
-            // The spill writer has not run yet, so its hand-off fences the
-            // drain checkpoint that follows, which a later ingest would
-            // otherwise have moved past the live promotion.
+            // Hold the real spill write through the checkpoint. Even a writer
+            // scheduled immediately must leave its hand-off fencing the cursor.
             fixture
                 .app
                 .relay_plane
                 .route_account_delivery_for_test(first);
+            tokio::time::timeout(std::time::Duration::from_secs(5), writing.notified())
+                .await
+                .expect("the spill writer reaches its store gate");
             assert!(fixture.client.adapter.delivery_loss_blocks_cursor());
             fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
             fixture
@@ -7686,6 +7791,7 @@ mod live_cursor_checkpoint_tests {
                     .is_none(),
                 "a delivery only the live promotion exposed is still spilled"
             );
+            drop(spill_gate);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while fixture
                     .app
@@ -8796,6 +8902,125 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// #2151: the projection must preserve the source key carried by an
+    /// authenticated reaction after retention retired the previous cached key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_reaction_preserves_its_carried_media_source_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://reaction-projection.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("reaction key", &[]).await.unwrap();
+        let (source, secret) = client.encrypted_media_secret(&group).unwrap();
+        let carried = cgka_traits::EncryptedMediaSecret::new(secret);
+        let reference = crate::MediaAttachmentReference {
+            locators: vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: "https://media.example/party".into(),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "party.png".into(),
+            media_type: "image/png".into(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: source,
+            source_epoch_identity: None,
+            dim: None,
+            thumbhash: None,
+        };
+        let storage = app.account_storage("alice").unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // Retention can retire the current epoch's cached key before another
+        // attachment arrives in that same epoch. Use the real storage sweep to
+        // reach that state rather than inventing a future source epoch.
+        storage
+            .app_storage()
+            .record_app_event_with_retention(
+                &storage_sqlite::StoredAppEvent {
+                    group_id_hex: group_hex.clone(),
+                    message_id_hex: "51".repeat(32),
+                    source_message_id_hex: Some("52".repeat(32)),
+                    source_epoch: Some(source),
+                    direction: "received".into(),
+                    sender: account.account_id_hex.clone(),
+                    plaintext: String::new(),
+                    kind: 9,
+                    tags: vec![reference.imeta_tag()],
+                    recorded_at: 1,
+                    received_at: 1,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+                Some(cgka_traits::app_event::AppMessageRetentionDecision {
+                    retention_seconds: 1,
+                    expires_at: Some(2),
+                }),
+            )
+            .unwrap();
+        storage
+            .app_storage()
+            .secure_prune_expired_app_events(&group_hex, 2, &account.account_id_hex, &|_, _| false)
+            .unwrap();
+        assert!(
+            storage
+                .app_storage()
+                .encrypted_media_epoch_secret(
+                    &hex::encode(group.as_slice()),
+                    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source
+                )
+                .unwrap()
+                .is_none()
+        );
+        client
+            .project_received_message(
+                crate::ReceivedMessage {
+                    authority: None,
+                    message_id_hex: "41".repeat(32),
+                    source_message_id_hex: "42".repeat(32),
+                    sender: account.account_id_hex,
+                    sender_display_name: None,
+                    group_id: group.clone(),
+                    source_epoch: source,
+                    retention: None,
+                    plaintext: ":party:".into(),
+                    kind: 7,
+                    tags: vec![
+                        vec!["e".into(), "43".repeat(32)],
+                        vec![
+                            "emoji".into(),
+                            "party".into(),
+                            "https://media.example/party".into(),
+                        ],
+                        reference.imeta_tag(),
+                    ],
+                    recorded_at: 1,
+                    received_at: 1,
+                },
+                None,
+                Some(&carried),
+                None,
+                &mut SyncSummary::default(),
+            )
+            .unwrap();
+        let remembered = storage
+            .app_storage()
+            .encrypted_media_epoch_secret(
+                &hex::encode(group.as_slice()),
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source,
+            )
+            .unwrap();
+        assert!(
+            remembered.as_deref() == Some(carried.as_bytes()),
+            "reaction-only media must retain the authenticated source key"
+        );
+    }
 
     /// Contract fixture: provide exhaustive, durably admitted endpoint proof.
     /// Scripted SDK EOSE is deliberately insufficient to produce this proof.

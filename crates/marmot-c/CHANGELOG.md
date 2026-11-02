@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotMediaAttachmentReference` adds nullable `source_epoch_identity`
+  (mdk#2840), changing its layout and every record embedding it. Preserve this
+  local upload metadata when sending a returned reference. A missing identity
+  or a changed upload branch requires a fresh upload; downloads remain supported.
+  Use matching regenerated headers and libraries.
+
 - `marmot_sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
   first asks them to take it out, which can block for about 30 seconds, and
@@ -63,6 +69,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Drop the call and use matching regenerated headers and libraries.
 
 ### Added
+
+- `marmot_reaction_attachment` resolves one active custom-emoji reaction to an
+  owned nullable `MarmotAttachmentEntry`, freed with
+  `marmot_attachment_entry_free` (mdk#2151). Acquisition and local reads use its
+  original source slot. NULL with `MARMOT_STATUS_OK` means unavailable. Existing
+  record layouts are unchanged; use matching headers and libraries.
 
 - `marmot_account_recovery_status` writes an owned
   `MarmotAccountRecoveryStatus`: the groups whose history is still being
@@ -162,6 +174,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Every text send queued while offline publishes as soon as the host reports
+  restored connectivity, not only the first (mdk#2762). Later sends no longer
+  wait out a retry clock of up to an hour behind it, also after a cold start
+  that is already online or a transport reopen, which get no connectivity
+  report from the host.
+- The NIP-46 connection asks for `sign_event:30078` too: the account's
+  backup pointer (mdk#2628 item 4.4b).
 - `marmot_removed_device_leftover_chats` also counts chats that keep the leaf
   of a device the account's device group stopped listing without a removal,
   such as after a failed link (mdk#2761). Release builds hold no device

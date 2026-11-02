@@ -23,7 +23,9 @@ use crate::media::{
 use crate::{AppError, AppProjectionUpdate, unix_now_seconds};
 use cgka_traits::MarmotAppEvent;
 use cgka_traits::app_components::DeviceSlotId;
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+};
 use cgka_traits::types::GroupId;
 use std::collections::BTreeSet;
 use storage_sqlite::{ImportedAppEvent, SqliteAccountStorage, SqliteAppStorage};
@@ -328,15 +330,18 @@ fn importable(event: &ImportedAppEvent, allow_loopback_http: bool) -> bool {
             || media_imeta_tags_preserve_message(&event.tags, allow_loopback_http))
 }
 
-/// The encrypted-media references of a chat message, each with `epoch` as
-/// its source epoch. Empty for any other kind.
+/// The encrypted-media references of a chat message or reaction, each with
+/// `epoch` as its source epoch. Empty for any other kind.
 fn chat_media_references(
     kind: u64,
     tags: &[Vec<String>],
     epoch: u64,
     allow_loopback_http: bool,
 ) -> Vec<MediaAttachmentReference> {
-    if kind != MARMOT_APP_EVENT_KIND_CHAT {
+    if !matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+    ) {
         return Vec::new();
     }
     tags.iter()
@@ -404,7 +409,7 @@ fn attachment_keys(
     Ok(keys)
 }
 
-/// Drops each key that names none of the chat message's attachments.
+/// Drops each key that names none of the chat message's or reaction's attachments.
 fn keep_keys_naming_attachments(event: &mut ImportedAppEvent, allow_loopback_http: bool) {
     if event.file_keys.is_empty() {
         return;

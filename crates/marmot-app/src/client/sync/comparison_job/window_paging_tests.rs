@@ -1,5 +1,5 @@
 use super::*;
-use cgka_traits::{MemberId, TransportEndpoint};
+use cgka_traits::{MemberId, TransportAdapterError, TransportEndpoint};
 use nostr_relay_builder::prelude::{
     BoxedFuture, Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
     PolicyResult, QueryPolicy,
@@ -8,7 +8,13 @@ use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use transport_nostr_adapter::{NostrAcquisitionLimits, NostrReconciliationItem, NostrRelayEvent};
+use transport_nostr_adapter::{
+    NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionResult, NostrPublishOutcome,
+    NostrReconciliationItem, NostrRelayClient, NostrRelayEvent, NostrSdkRelayClient,
+    NostrSubscription,
+};
+
+use transport_nostr_peeler::NostrTransportEvent;
 
 const ROUTE: [u8; 32] = [0x61; 32];
 const HISTORY_START: u64 = 1_700_000_000;
@@ -59,6 +65,71 @@ impl Drop for ReleaseGate {
     fn drop(&mut self) {
         self.0.released.store(true, Ordering::SeqCst);
         self.0.release.notify_waiters();
+    }
+}
+
+/// Observe real SDK completion, rather than the relay merely receiving a REQ.
+/// Every result reaches the paging owner unchanged.
+struct ObservedWindowClient {
+    sdk: NostrSdkRelayClient,
+    oldest_pages: Mutex<HashSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl NostrRelayClient for ObservedWindowClient {
+    async fn acquire_history(
+        &self,
+        request: NostrAcquisitionRequest,
+        cancellation: NostrAcquisitionCancellation,
+    ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
+        let result = self.sdk.acquire_history(request, cancellation).await?;
+        for page in &result.endpoints {
+            if page.end == NostrAcquisitionEnd::RequestPolicySatisfied
+                && page
+                    .events
+                    .iter()
+                    .any(|event| event.created_at == HISTORY_START)
+            {
+                self.oldest_pages
+                    .lock()
+                    .unwrap()
+                    .insert(page.endpoint.as_str().to_owned());
+            }
+        }
+        Ok(result)
+    }
+
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.sdk.subscribe(subscription).await
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.sdk.unsubscribe(subscription).await
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account: &MemberId,
+        replacements: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
+        self.sdk.unsubscribe_account(account, replacements).await
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.sdk
+            .publish_event(endpoints, event, required_acks)
+            .await
     }
 }
 
@@ -388,7 +459,8 @@ async fn lost_page_is_fetched_again() {
     fixture.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// This test controls the shared deadline while real SDK sockets finish their pages.
+#[tokio::test(flavor = "current_thread")]
 async fn relay_cut_keeps_other_page() {
     let healthy = WindowFixture::start((0..700).map(|index| HISTORY_START + index), 0, None).await;
     let duplicate =
@@ -404,6 +476,13 @@ async fn relay_cut_keeps_other_page() {
     )
     .await;
     let _release = ReleaseGate(gate.clone());
+    // Local acquisition fixture: no account publisher or external relay.
+    #[allow(clippy::disallowed_methods)]
+    let observed = Arc::new(ObservedWindowClient {
+        sdk: NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder()),
+        oldest_pages: Default::default(),
+    });
+    let plane = MarmotRelayPlane::new_with_loopback(None, observed.clone(), true);
     let mut request = healthy.request(NostrAcquisitionLimits {
         max_endpoints: 3,
         max_duration: Duration::from_secs(1),
@@ -412,20 +491,54 @@ async fn relay_cut_keeps_other_page() {
     request
         .endpoints
         .extend([duplicate.endpoint.clone(), stalled.endpoint.clone()]);
-    let (events, progress) = tokio::time::timeout(
-        Duration::from_secs(5),
-        fetch_epoch_gap_window(
-            &healthy.plane,
+    tokio::time::pause();
+    let (events, progress) = {
+        let fetch = fetch_epoch_gap_window(
+            &plane,
             request,
             &[],
             &healthy.cache,
             (0, 0, 0),
             GOAL,
             tokio::time::Instant::now() + Duration::from_secs(1),
-        ),
-    )
-    .await
-    .expect("the stalled older page must respect the shared deadline");
+        );
+        tokio::pin!(fetch);
+        let watchdog = std::time::Instant::now();
+        let mut deadline_advanced = false;
+        loop {
+            // A ready yield keeps Tokio from auto-advancing past real socket I/O.
+            // Completion is observed in this same task, so both healthy scans
+            // return to join_all before the shared clock is advanced.
+            tokio::select! {
+                biased;
+                result = &mut fetch => {
+                    assert!(deadline_advanced, "the stalled scan must wait for its deadline");
+                    break result;
+                }
+                () = tokio::task::yield_now() => {
+                    assert!(
+                        watchdog.elapsed() < Duration::from_secs(5),
+                        "the stalled older page must respect the shared deadline"
+                    );
+                    let healthy_finished = {
+                        let pages = observed.oldest_pages.lock().unwrap();
+                        pages.contains(healthy.endpoint.as_str())
+                            && pages.contains(duplicate.endpoint.as_str())
+                    };
+                    if !deadline_advanced && healthy_finished && gate.entered.load(Ordering::SeqCst) {
+                        deadline_advanced = true;
+                        tokio::time::advance(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::resume();
+    assert_eq!(
+        observed.oldest_pages.lock().unwrap().len(),
+        2,
+        "both healthy relays must finish real oldest-page acquisition before the cut"
+    );
     assert!(
         gate.entered.load(Ordering::SeqCst),
         "the cut must occur after a full newest page"
@@ -458,6 +571,8 @@ async fn relay_cut_keeps_other_page() {
         stalled.ids.first(),
         "requests that arrive after release must reach the oldest input"
     );
+    plane.shutdown().await;
+    observed.sdk.shutdown().await;
     healthy.shutdown().await;
     duplicate.shutdown().await;
     stalled.shutdown().await;

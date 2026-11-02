@@ -38,6 +38,7 @@ use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -532,6 +533,9 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     RemovedDeviceLeftoverChats {
+        respond: oneshot::Sender<Result<u32, AppError>>,
+    },
+    ChatsClosedToLinkedDevices {
         respond: oneshot::Sender<Result<u32, AppError>>,
     },
     SignOutThroughSiblingsStep {
@@ -1827,6 +1831,9 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
+            // A start gets no host connectivity edge, so wake the sends a
+            // previous process left backed off (mdk#2762).
+            wake_retained_sends_after_transport_start(&mut client, "startup_retained_send_wake");
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
@@ -3138,6 +3145,14 @@ async fn run_app_runtime_account_worker(
                                             );
                                         }
                                     }
+                                    // A reopen while the host's network
+                                    // stayed up gets no connectivity edge to
+                                    // release sends backed off by the outage
+                                    // that closed the old transport (mdk#2762).
+                                    wake_retained_sends_after_transport_start(
+                                        &mut reopened,
+                                        "reopen_retained_send_wake",
+                                    );
                                     let pending = reopened
                                         .retry_pending_push_registration_shares_best_effort()
                                         .await;
@@ -4441,12 +4456,14 @@ struct MediaHttpContext {
 struct HistoryBlobFlights {
     upload: std::sync::atomic::AtomicBool,
     fetch: std::sync::atomic::AtomicBool,
+    backup: std::sync::atomic::AtomicBool,
 }
 
-/// Starts the next due history upload and history fetch on the media
-/// executor, unless one of that kind is running, keeping a slot free for
-/// commands as avatar acquisition does. Each runs off the worker; its
-/// completion sends or imports here, then starts the next.
+/// Starts the next due history upload, history fetch and backup pass on the
+/// media executor, unless one of that kind is running, keeping a slot free
+/// for commands as avatar acquisition does. Each runs off the worker; its
+/// completion sends, imports or publishes here, and a history's then starts
+/// the next.
 fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext) {
     use std::sync::atomic::Ordering;
     let permit = || {
@@ -4497,6 +4514,29 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
                 "history fetch deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.backup.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_backup_pass() {
+            Ok(Some(pass)) => {
+                media_http
+                    .history_blobs
+                    .backup
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    pass.run(),
+                    MediaHttpCompletion::BackupPass,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "backup pass deferred")
             }
         }
     }
@@ -4602,6 +4642,7 @@ enum MediaHttpCompletion {
     },
     HistoryUpload(crate::client::HistoryUploadOutcome),
     HistoryFetch(crate::client::HistoryFetchOutcome),
+    BackupPass(crate::client::BackupPassOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4811,6 +4852,15 @@ async fn complete_media_http(
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
+            return;
+        }
+        MediaHttpCompletion::BackupPass(outcome) => {
+            client.finish_backup_pass(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .backup
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         MediaHttpCompletion::Attachment {
@@ -6247,6 +6297,15 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ChatsClosedToLinkedDevices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.chats_closed_to_linked_devices(),
             );
             true
         }),
@@ -7791,6 +7850,29 @@ impl ScheduledConvergence {
             .min()
             .unwrap_or_else(|| TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
         self.timer.as_mut().reset(deadline);
+    }
+}
+
+/// Wake unsent retained sends when a transport starts or reopens, which no host
+/// connectivity edge reports.
+///
+/// Their retry clocks may have backed off towards an hour during an outage that has
+/// since ended without an edge, as on a cold start that is already online or a
+/// reopen after the old transport died while the network stayed up. Starting the
+/// transport does not prove a relay is reachable, as activation succeeds with every
+/// relay unreachable, so each start or reopen costs one retry of each woken send. A
+/// failed retry keeps its attempt count and resumes its backoff from it. Sends that
+/// met quorum keep their secondary replication schedule. A start whose sync failed
+/// gets no wake here; its sends wait out their backoff unless a reopen or a
+/// connectivity edge wakes them first.
+fn wake_retained_sends_after_transport_start(client: &mut AppClient, method: &'static str) {
+    if let Err(error) = client.wake_retained_sends(RetainedSendWake::BelowQuorum) {
+        tracing::warn!(
+            target: "marmot_app::account_worker",
+            method = method,
+            error_kind = error.privacy_safe_kind(),
+            "retained sends could not be woken after a transport start",
+        );
     }
 }
 

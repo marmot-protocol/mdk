@@ -34,31 +34,28 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
-- **File:** `application_data_wire.rs`
-  - **Owns:** OpenMLS integration-contract tests for the MLS application-data carriers Marmot uses (pins fork codec
-    behavior the engine relies on)
-
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group
-
-- **File:** `group_context_view.rs`
-  - **Owns:** `GroupContextView` exporter-secret length contract
+    writes no group; creator component admission, exact-length and staged-source exporter assembly, and snapshot-name privacy.
+    Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
-  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
+  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip, exact buffered-malformed retirement, and
+    encrypted own-echo persistence. The pure canonical-disposition/public-outcome mapper is pinned in
+    `../src/message_processor/ingest.rs::tests`
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
-    included), KeyPackage-based `constructable_capabilities`, capability matrix
+    included), KeyPackage-based `constructable_capabilities`, capability matrix. Pure OpenMLS carrier codecs live in
+    `../src/wire_format/tests/application_data_wire.rs`
 
-- **File:** `leaf_advertisement.rs`
+- **File:** `capabilities/leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
     would change the leaf
 
@@ -71,7 +68,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
-    `peel_deferred -> peel_deferred` audit row.
+    `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return
+    deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
+    continuation, restore live state between slices and eventually deliver the real rival application exactly once.
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
@@ -119,21 +118,26 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     matrix enables that feature explicitly for settlement/rewind fixtures.
 
 - **File:** `mip03_guards.rs`
-  - **Owns:** Committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
+  - **Owns:** Ordinary commit/proposal admission and admin policy guards, own SelfRemove echo filtering,
+    admin-not-last and admin-self-remove. Direct target-side auto-committer decision proof remains a gap.
 
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
 
 - **File:** `pending_commit_recovery.rs`
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving
-    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
+    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150). Its `recovery_mirror`
+    module owns rollback and retry after the corrected mirror write fails, keeping the complete staged Welcome,
+    pending MLS state and group record in one durable unit (mdk#2422).
 
 - **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
     seam that projects the record. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
-    stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
+    stored convergence so it is eventually applied. `record_write_atomicity/application_receive_retry.rs` owns
+    receive-state/output rollback and retry after a direct application's pending-output write fails (mdk#2872), including
+    encrypted close/reopen and the following sender generation. Also owns the snapshot-guard durability pair: a guard whose
     rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
@@ -161,11 +165,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
     retention-window route retirement across rotation and restart
 
-- **File:** `snapshot_privacy.rs`
-  - **Owns:** Snapshot names do not expose plaintext group ids
-
 - **File:** `sqlite_storage.rs`
-  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
+  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke, sender-ratchet migration,
+    history-key continuity, safe-export source/puncture persistence, and local-forget atomicity and restart behavior
 
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
@@ -176,6 +178,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     hydration, both standalone and inside an outer transaction.
     Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must
     recover live state and queued work, discard scratch progress, and select the same winning branch.
+    Its `orphan_pending` module kills recovery after clearing an orphan pending commit and checks the complete
+    original MLS, group and message rows survive together before hydration retries (mdk#2422).
     Every parent spawns and waits through `spawn_crash_child` / `CrashChild::kill_when_ready`; the ready bound is
     120 s (`MDK_CGKA_CRASH_READY_TIMEOUT_SECS` overrides). Keep child fixture peers on the migrated in-memory template
     so setup cost does not eat that bound on loaded CI runners.
@@ -276,8 +280,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
     and sibling accepts, an added sibling joins through its sibling Welcome and a removed one sees its removal; restart
     treats them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets,
-    never a self-update or a Leave, and only while the group requires 0x800d. A successful Add needs the device roster,
-    so those tests run in test-policy builds only.
+    never a self-update or a Leave, and only while the group requires 0x800d. A refused queued same-account Add is
+    retired and announced exactly once without blocking the self-update behind it; this queue-progress proof does
+    not pin which validation layer refused it. Same-account leaf-limit refusal with a valid tagged sender and private
+    KeyPackage is owned by `sibling_welcomes.rs`. A successful Add needs the device roster, so those tests run in
+    test-policy builds only.
 
 - **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
   - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
@@ -286,12 +293,25 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged adder, a chat
     that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
     refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
-    by then.
+    by then. A sibling that lands through another adder while its Add waits is refused at drain, before a direct
+    retry, and by the advisory check; distinct MLS signers exercise authenticated slot presence in both signer orientations
+    (mdk#2628 3.5e). These tagged fixtures do not independently isolate the pre-link signature-key fallback. The read-only pre-check a host runs before it takes a KeyPackage
+    (`sibling_add_refusal`, `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
+    included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
+    invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
+
+  The sibling-Welcome owner also covers 3.5f: a real losing Add holds its Welcome across reopen instead of becoming
+  sendable or terminal from a lost event, missing origin evidence and a settling chat hold delivery, terminal origin
+  invalidation stays retired after reopen, and legacy development rows with no provable origin are not handed off
+  after reopen. Exact delivered carrier outcomes settle even while held. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
+  compatibility live in `cgka-traits` `message::stored_payload_codec_tests`.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
-  - **Owns:** No tests. Its fixtures (`tagged_devices`, `found_routed_group`, `handed`, `assert_joins_from`) are how
-    the gated same-account tests in `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a
-    sibling: tagged devices, a chat that names relays, and a join through the sibling Welcome the Add owes.
+  - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
+    `found_group_routed_with`, `handed`, `assert_joins_from`) are how the gated same-account tests in
+    `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a sibling: tagged devices, a chat
+    that names relays, optionally with further leaves of an account, and a join through the sibling Welcome the Add
+    owes.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
@@ -302,8 +322,14 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
-  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, no-op default behavior, and
-    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and
+    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
+    Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
+
+`record_write_atomicity/application_receive_retry.rs` also owns committed stored-message audit evidence: real
+receive-output and second sent-row failures leave no state transition in the actual V5 log, retry/reopen retain
+truthful transitions, and a public Welcome-state mutation waits for an external caller's outermost transaction.
+Keep the independent SQLCipher row reads and reopens in the file-backed cases.
 
 ```sh
 cargo test -p cgka-engine

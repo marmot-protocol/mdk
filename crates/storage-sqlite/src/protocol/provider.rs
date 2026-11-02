@@ -53,12 +53,6 @@ impl StorageProvider for SqliteAccountStorage {
         Some(self)
     }
 
-    fn announced_key_package_storage(
-        &self,
-    ) -> Option<&dyn cgka_traits::storage::AnnouncedKeyPackageStorage> {
-        Some(self)
-    }
-
     fn roster_tag_key_storage(&self) -> Option<&dyn cgka_traits::storage::RosterTagKeyStorage> {
         Some(self)
     }
@@ -80,6 +74,10 @@ impl StorageProvider for SqliteAccountStorage {
         F: FnOnce(&Self) -> Result<T, E>,
     {
         self.connection.with_transaction(|| f(self))
+    }
+
+    fn after_commit(&self, callback: Box<dyn FnOnce() + Send + 'static>) {
+        self.connection.after_commit(callback);
     }
 
     fn with_group_savepoint<T, E, F>(

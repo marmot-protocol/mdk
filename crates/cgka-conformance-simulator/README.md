@@ -129,7 +129,7 @@ The `Justfile` wraps the CI lanes:
 | --- | --- |
 | `just conformance` / `just conformance-slow` | The whole crate under nextest, default or slow property-test counts |
 | `just simulator-smoke` | PR-lane coverage without dedicated verification binaries or multi-minute generated batches |
-| `just simulator-full` | Nightly generic coverage with `conformance-slow` |
+| `just simulator-full` | Nightly generic coverage with default features, plus `conformance-slow` counts for the property target |
 | `just adversarial-reliability-ci` | Adversarial catalog, test-policy A/B, resource sweeps, and one isolated process-campaign case |
 | `just convergence-verification-ci` | Route assurance, independent reference model, lifecycle model, mutation adequacy, protocol-decision gate, and TLA+ liveness |
 | `just convergence-nightly-lane` / `just convergence-weekly-lane` | Scheduled lanes; weekly adds a four-case isolated campaign |

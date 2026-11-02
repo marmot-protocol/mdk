@@ -151,6 +151,14 @@ version.
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. Account setup
 requires acknowledgements from its operational relays.
 
+Interactive sign-in keeps a notice before initial KeyPackage publication: signing
+in alone does not restore existing chats or messages. The historical `SingleDevice`
+step and acknowledgment APIs retain their names and consent rules, but current
+findings no longer declare all multi-device use unsupported. See the shared
+[notice copy and advisory discovery limits](../marmot-uniffi/README.md#single-device-notice).
+Hosts adopt that presentation through localization; MDK owns the pause, discovery
+and publication gate.
+
 - KeyPackages are published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay
   list.
 - Generated account setup can supply public indexers for copies of the relay lists and kind `0` metadata. Indexers are
@@ -404,6 +412,11 @@ order. Send fairness remains #1947 work. All automatic history triggers use the 
 bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
 
 ## Linked devices
+
+While device groups are enabled, creating a chat includes linked siblings from the start when this device holds compatible
+private KeyPackages for them. This applies even with "Add to all my chats" off, which covers older chats. Missing private
+KeyPackages never delay creation or fall back to public slots; the missing device needs a later Add or invite. Sibling
+Welcomes travel privately through the device group, independently of the other accounts' Welcome deliveries.
 
 `MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
 the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries

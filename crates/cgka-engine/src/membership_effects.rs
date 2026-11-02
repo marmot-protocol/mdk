@@ -254,16 +254,22 @@ mod tests {
             .emit_canonical_membership_effects(&group, &unchanged)
             .unwrap();
         assert!(engine.drain_events().is_empty());
-        // Model the previous authenticated tree's different leaf key. Index and
-        // account alone would miss this transition and retain the old token.
+        // Pure diff control: model a different key in the immutable snapshot.
+        // This does not assert that an inbound tree authenticated that key.
         let mut replaced = engine.canonical_membership_snapshot(&group).unwrap();
         replaced.leaves[0].1[0] ^= 0xff;
         engine
             .emit_canonical_membership_effects(&group, &replaced)
             .unwrap();
         let events = engine.drain_events();
-        assert!(
-            matches!(&events[..], [GroupEvent::GroupMemberLeavesRemoved { leaves, departed_members, .. }] if leaves.len() == 1 && departed_members.is_empty())
+        assert_eq!(
+            events,
+            vec![GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group.clone(),
+                epoch: engine.epoch(&group).unwrap(),
+                leaves: vec![replaced.leaves[0].0.clone()],
+                departed_members: vec![],
+            }]
         );
         let current = engine.canonical_membership_snapshot(&group).unwrap();
         engine

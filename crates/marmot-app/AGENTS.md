@@ -38,7 +38,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `chat_history.rs` (a
-  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_notices.rs` ("history may be incomplete"
+  chat's history exported as sealed bundles and a sibling's bundle imported with its attachment keys, never for a device group), `history_delivery.rs` (owing from the engine's sibling adds, sending inline or through Blossom, parking, fetching and importing sealed history deliveries), `backup_writer.rs` (the backup pass: the pointer fetch, the archive upload, retention, condemned-blob deletes and takeover), `history_imports.rs` (the host surface of imported history: the per-chat state query and the device names storage resolves rows' sources against), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -129,6 +129,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   drops it onto another account entry (its re-issue is a conflict, so it is refused at the drop), or once branch
   selection can no longer drop it. Until its publication has an outcome, and from a drop until its re-issue is
   committed or refused, the gate answers another change with `device_group_busy`.
+- Write backups only through the backup pass (`src/client/backup_writer.rs`, mdk#2628 4.4b, D71, D79): prepared and
+  finished on the worker, run off it on the media lane. A backup counts only once a relay accepts a pointer listing it;
+  never treat an upload or a sent pointer as done. Record each blob in the ledger (`backup_run_blobs`) before its
+  upload, and condemn a dropped backup's blobs before the pointer that drops it goes out. Delete a condemned blob only
+  while the pointer fetched in that same pass, from a relay that answered in full, lists no backup it belongs to,
+  and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
+  the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
+  The archive key lives only in the pass: never store or log it, the words or a blob's contents.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -149,10 +157,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   re-arms the rest. A rejection settled from another device's commit is lost when that commit loses convergence, and
   only a device that made the rejection restores it. A slot is its `d` as published, compared as bytes; one the roster
   cannot name is rejected on this device only. A rejection names the slot alone (`rejected_slot`), never its KeyPackage:
-  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A roster device's
-  KeyPackage matches its slot when the trusted roster announces it now or the engine recorded it from a roster state
-  applied in the last 30 days (`announced_key_packages`, D31 item 7); only this classification reads that record. Hosts
-  read the list as `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
+  the account key can copy any KeyPackage, a real device's included, into a slot the user rejects. A slot the trusted
+  roster lists as a device is known, regardless of its published KeyPackage (D81). Hosts read the list as
+  `unrecognized_sign_ins`. A check or answer that changes it, and every roster change
   (`note_device_roster_changed`), sets `unrecognized_sign_ins_changed`, drained at the device-group seams into one
   payload-free `UnrecognizedSignInsChanged`; every client opens with it set.
   Start fresh (D54, `start_fresh`) answers every before-this-device sign-in Not now, including baseline slots listed
@@ -239,11 +246,32 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
   and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
   reports that 461 published marks it delivered (`settle_sibling_welcome_carriers`, from `retain_effect_projection`);
+  settlement locates carried rows independently of new-send eligibility, so a source chat held by convergence,
+  hydration, or a pending Commit still records its exact carrier's outcome without starting a new delivery;
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
-  before the engine settles it, and a carrier not in that set was sent before this run or never settled, so its Welcome
-  is sent again; a second 461 joins nothing twice. Never send a delivered one again: resending is 3.5e. The Add spends
+  before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
+  fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
+  delivered one again: resending is 3.5e. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
+- Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
+  approved its link, once that link is decided made, for `LINK_CHAT_ADD_SECS`, and only while the roster lists the
+  device as active, linked by this device, with "add to all my chats" on, and this device has recorded no removal of its
+  slot (`device_removals`) nor applied a roster state that held the slot as `removed` (`held_as_removed`, while it keeps
+  that record's key). Other devices add it only through gap filling (3.5e). Read the chats anew on each maintenance
+  pass, in chat-list order; a chat holds the device when a leaf of this account carries its tag or its tag signature
+  key. Pass over a chat while this device's commit there is queued, in flight or settling (`group_quiet`), so no Add is
+  doubled. Check the Add with the engine's read-only `sibling_add_refusal` against the KeyPackage
+  `next_private_key_package_for_chat` selects from compatible private stock before taking that exact record,
+  so a chat that would refuse never spends one and a changed stock preference never spends another allocation.
+  Each pass shares one issuer-filtered received-stock batch and authenticates its metadata once. Cache only
+  time-independent capability matches by the engine's complete `KeyPackageRequirements` and signed advertisement
+  class; use the current clock for ordering/expiry and full engine admission before exact claim. Refresh a batch
+  when its trusted device-group pin changes or a hand-off commits genuinely new stock, including through a pending
+  native projection retry. Failed/duplicate inserts do not advance the memory-only received-stock generation.
+  Never retain a selection context across maintenance passes.
+  `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
+  `LINK_CHAT_ADDS_PER_PASS` chats a pass.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history
@@ -500,14 +528,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
+  at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
+  loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
   routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
   requests (`record_recovery_request`), native
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  replaces the obligations. Every account open widens every current route's standing goal, cursor or not; a runner
+  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
+  without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
+  what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
   uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
@@ -538,7 +570,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
   every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
-  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
+  MLS hydration, and an overly early goal cannot narrow later. Propagate metadata read errors instead of treating
+  them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
+  un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
@@ -554,12 +589,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  loss branch. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  changes and returns its storage error without running the debt read. The existing admission/survey local-failure
+  backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
+  The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
   adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
   stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
   through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
   route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
-  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
+  the ledger on every wake. Its own routing-change settlement widens goals without a wake because the same turn
+  immediately reads the debt. Every ledger and retry-state write happens in a worker turn; the
   credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
   tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
@@ -886,7 +925,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `history_bundle.rs` (the history bundle's encoding, filling in chat order and sealing; tests in
   `history_bundle/tests.rs`), `history_delivery.rs` (the sealed history delivery's encoding, sealing context,
-  inline limits and Blossom server rules), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
+  inline limits and Blossom server rules), `backup_archive.rs` (the backup archive's blobs, head and index, the backup pointer's
+  encoding and address, and retention; tests in `backup_archive/tests.rs`), `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `relay_caps.rs` (each relay's NIP-11
   `max_limit` and NIP-77 support for the history sweep, cached per relay; unknown caps on any failure), `profile_pseudonyms.rs` (cosmetic display names; not a
