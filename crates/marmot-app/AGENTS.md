@@ -146,6 +146,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
   the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
+- Manual backup restore (`src/client/backup_restore.rs`, mdk#2628 4.4c, D93) owns one ephemeral account-worker job.
+  Never drive `BackupPass` from its manual dispatcher: that pass deletes and publishes. Use the shared read-only
+  pointer discovery and bounded media credits; retain the credit through serialized completion. Check the actual
+  selected own signature-key member at content preparation and application, fail closed on unreadable/removed/DG
+  state, and create no group/route/membership from catalog metadata. Hydrate only existing indexed candidates, never
+  an account-wide barrier. Preserve global archive ordinals before membership/expiry filtering. Incomplete pointer
+  discovery never prunes the private catalog; a positive partial view stays Partial and absence stays Unavailable.
+  Dispatch waiting restore work after the shared media completion returns its permit.
+  Import through the shared plaintext-history validator and its atomic content/key/provenance/projection boundary;
+  `HistoryImportProvenance::Backup` never invents a roster slot. Keep the optional small-state archive unused. Words,
+  entropy and archive keys stay zeroizing and job-local, drop on cancel/close/terminal completion, and never persist
+  for automatic retry. The restore watch carries only aggregate status and availability wakeups after retained
+  projection; a real later join can expose a cached hint, never an automatic join. Core timeline provenance is batched;
+  legacy `imported_from` stays sibling-only and foreign backup DTOs/controls are separate 4.4d adoption.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -1012,6 +1026,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `media-benchmarks`: internal surface for the media transport benchmarks.
 - `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
+
+Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
+current own-leaf admission before GET and serialized apply, cold indexed-chat hydration without loading unrelated chats,
+incomplete pointer/catalog preservation, catalog reopen/later real join, partial prefix/manual retry,
+and public worker media-capacity resumption/cancel/shutdown with real held HTTP responses. The ordinal/filter and redacted parser owners live in
+`client/backup_restore.rs`; SQLite owns atomic import/key/provenance rollback and batched timeline/conversation source
+hydration. Reuse existing archive-crypto, deletion/retention, unread, attachment and shared media-credit owners rather
+than replaying those matrices here.
 
 ## Verification
 

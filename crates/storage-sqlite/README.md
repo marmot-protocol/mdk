@@ -410,6 +410,23 @@ best-effort activity evidence: queued traffic is not proof of live post-publicat
 Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
 arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.
 
+### Backup history provenance and catalog
+
+Migration 0168 keeps existing sibling import slots and permits a checked alternative backup source in
+`app_event_imports`. `import_app_events` remains supported for siblings;
+`import_app_events_with_provenance` inserts actual device-or-backup provenance atomically with new content, carried
+attachment keys and its returned projection. Existing live rows win. The same joined source supplies the additive
+`TimelineMessageRecord::history_import_provenance` in incremental, paged and conversation reads. The legacy
+`imported_from`/device-label fields remain sibling-only. Backup identity identifies fetched archive bytes, not a
+verified writer, historical author or membership grant. Imported rows retain the existing unread, retention and media
+key lifecycle.
+
+`backup_restore_catalog` and its indexed chat metadata contain recovery **public** keys and archive availability in
+the encrypted account database. An index is never a transcript, group, route or membership. Replacing an archive's
+index is atomic, and pruning one completely discovered key's pointer leaves other old keys and imported provenance
+alone. The app owns actual current-own-leaf admission and ephemeral secret/job lifecycle; words, entropy, recovery
+private keys and archive keys never belong in these tables.
+
 ## Reaction artwork sources
 
 Active kind-7 reactions retain their encrypted `imeta` slots in the attachment

@@ -323,6 +323,8 @@ mod migration_0164_backup_ledger;
 mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
+#[path = "migrations/0168_backup_restore.rs"]
+mod migration_0168_backup_restore;
 #[path = "migrations/0169_sibling_welcome_resends.rs"]
 mod migration_0169_sibling_welcome_resends;
 
@@ -1292,6 +1294,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0167_reaction_attachment_sources",
         suspend_foreign_keys: &[],
         apply: migration_0167_reaction_attachment_sources::apply,
+    },
+    Migration {
+        version: 168,
+        name: "0168_backup_restore",
+        suspend_foreign_keys: &[],
+        apply: migration_0168_backup_restore::apply,
     },
     Migration {
         version: 169,

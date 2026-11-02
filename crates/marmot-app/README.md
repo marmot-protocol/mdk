@@ -474,10 +474,15 @@ A device removed while it signs out finishes signing out and is not unlinked.
 ### Chat history from another device
 
 A device linked with "Bring chat history" receives each chat's history from the device that added it (mdk#2628 4.2).
-Each imported `TimelineMessageRecord` names its source in `imported_from` (`HistoryImportSource`: the device's slot and
-its roster name now); a row that arrived live has none. Draw "Imported from <device>" where rows change from imported
-to live, and say "another device" for an empty name: a device with no name, one no longer linked, or before this device
-first read the roster. Names are resolved when rows are read, so a rename shows after `LinkedDevicesChanged`.
+Each sibling-imported `TimelineMessageRecord` names its source in `imported_from` (`HistoryImportSource`: the device's
+slot and its roster name now). Draw "Imported from <device>" for that source, and say "another device" for an empty
+name: a device with no name, one no longer linked, or before this device first read the roster. Names are resolved
+when rows are read, so a rename shows after `LinkedDevicesChanged`. The additive `history_import_provenance` field
+identifies either `Device(slot)` or `Backup(source)` in core timeline pages, incremental projections and conversation
+windows. Live rows have no provenance. The legacy `imported_from` field remains sibling-only: its absence alone does
+not distinguish live history from a backup. A backup is "restored from backup", never an unnamed device; its public
+archive identity proves neither its writer nor historical authorship. Existing foreign DTOs still expose only sibling
+provenance; complete backup bindings are a separate adoption step.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
@@ -504,9 +509,47 @@ refused as `device_group_busy` while the device group can't take the change, inc
 device's is still in flight. `backup_settings` says whether backups are on and whether this device writes them, as the
 device group's roster holds them now. Two devices changing backups at once can drop one change: MDK commits it again
 only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
-are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. Nothing writes
-backups yet, and every call is refused as `DeviceGroupRefused("roster_unsupported")` in release builds until the backup
-spec lands.
+are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. The selected
+writer writes bounded backup passes during maintenance; only an accepted pointer publication counts as a backup.
+These experimental flows require `dev_device_groups` (off by default), and builds without experimental device-group
+support refuse them as `DeviceGroupRefused("roster_unsupported")`.
+
+### Manual backup history restore
+
+The Rust runtime accepts words for one on-demand operation with
+`begin_backup_restore(account_ref, BackupRestoreWords::new(words))`. Move the owned input into MDK and clear any
+copies the caller retains; the Rust input guard has redacted Debug output and zeroizes its owned phrase. This is
+best-effort erasure of owned buffers, not a guarantee about upstream parser/hash scratch or compiler/register copies. Restore
+uses those words independently of the account's current recovery key and never changes that key or enables backups.
+It considers every listed archive, one bounded unexpired blob at a time through the existing media lane. A valid
+pointer from an incomplete relay view can recover history with a Partial result; a missing pointer in that view is
+Unavailable. Only fully completed discovery covering at least one requested relay can prune cached private catalog metadata.
+
+Restore imports only into ordinary chats whose selected MLS tree currently contains this device's own leaf. It checks
+before content fetch and again when the worker applies the result; another device's membership is insufficient.
+A known current chat is loaded on demand without loading unrelated chats; an unreadable held candidate is skipped
+and leaves a Partial result. An
+unknown chat gets only private availability metadata in the encrypted account database, without a transcript, MLS
+group, routing, membership or KeyPackage. After a real later join, the restore watch wakes and
+`backup_history_availability(account_ref, group_id)` can say that history may be available and identify the public key
+of the words needed. No automatic join, re-add, history-absence proof or full account disaster recovery is performed.
+Archived read positions, pins, mutes, archive choices and invitation decisions are not applied.
+
+`begin_backup_restore` returns a status with an opaque operation handle; a second active job is refused as
+`backup_restore_busy`. Read `backup_restore_status` or use `watch_backup_restore` for aggregate progress. Complete
+means the eligible work from that pointer settled, not that all past history was found; Partial keeps successful
+imports when a blob fails or membership disappears. Existing live rows win, imported rows create no unread counts,
+and the shared history validator handles retained content and attachment keys. Core row provenance identifies the
+actual backup source; `history_import_provenance` also queries an exact held event when needed.
+
+`cancel_backup_restore(account_ref, operation)` names the job so an old action cannot cancel a newer one. Cancellation
+and worker shutdown drop the operation's words, entropy and archive keys and stop active work; valid committed history
+stays. Already-running bounded crypto work may finish off the worker; it owns no database lease, cannot apply a
+cancelled result, and drops its keys with that work. Closing a watch only stops observing. No secret-backed job or
+cursor is persisted or resumed: a later explicit
+attempt supplies words again. Core Rust operation handles and methods are available here; complete UniFFI/C controls,
+provenance DTOs and operation-token codecs remain separate work. Restore uses the same experimental device-group gate
+as the writer.
 
 ### Overdue KeyPackage refresh
 
