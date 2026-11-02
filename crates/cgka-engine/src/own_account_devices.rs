@@ -51,7 +51,7 @@ const REMOVE: &str = "RemoveOwnAccountDevices";
 
 /// What every sibling Welcome of one Add carries besides its own fields,
 /// settled before anything is staged.
-struct SiblingWelcomePlan {
+pub(crate) struct SiblingWelcomePlan {
     from: DeviceSlotId,
     relays: Vec<String>,
 }
@@ -438,7 +438,7 @@ impl<S: StorageProvider> Engine<S> {
     /// unexpired, its device tag reading as that slot in that roster, another
     /// roster device, one KeyPackage each. The chat names one to 16 relays for
     /// the new member to fetch from.
-    fn sibling_welcome_plan(
+    pub(crate) fn sibling_welcome_plan(
         &self,
         mls_group: &MlsGroup,
         siblings: &[SiblingKeyPackage],
@@ -743,7 +743,7 @@ fn sibling_welcome_relays(mls_group: &MlsGroup) -> Result<Option<Vec<String>>, E
 /// and carrying the staged Commit's Welcome (device-group.md, "Sending a
 /// sibling Welcome"). It is deliverable until the KeyPackage's lifetime ends,
 /// after which the sibling no longer holds its key.
-fn build_sibling_welcomes(
+pub(crate) fn build_sibling_welcomes(
     plan: &SiblingWelcomePlan,
     siblings: &[SiblingKeyPackage],
     parsed_kps: &[openmls::prelude::KeyPackage],

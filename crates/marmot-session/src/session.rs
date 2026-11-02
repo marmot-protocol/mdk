@@ -1233,6 +1233,27 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    /// Prepare a chat whose founding Add includes authenticated private sibling KeyPackages.
+    pub async fn prepare_create_group_with_siblings_and_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        context: AuditEventContext,
+    ) -> SessionResult<CreateGroupEffects> {
+        let (group_id, result) = self
+            .engine
+            .create_group_with_siblings_and_audit_context(
+                request,
+                optional_app_components,
+                siblings,
+                Some(context),
+            )
+            .await?;
+        let effects = self.collect_effects(vec![result]);
+        Ok(CreateGroupEffects { group_id, effects })
+    }
+
     /// Create a group under a group id chosen before it exists, as a device
     /// link needs; see `Engine::create_group_with_chosen_id_and_audit_context`.
     pub async fn create_group_with_chosen_id_and_audit_context(

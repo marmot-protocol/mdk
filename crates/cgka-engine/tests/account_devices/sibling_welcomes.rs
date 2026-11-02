@@ -694,3 +694,158 @@ async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
     assert!(sibling_rows(&m.bob, &gid).is_empty());
     assert!(owed(&m.bob).is_empty());
 }
+
+/// Creation's one canonical founding Add retains a sibling's private
+/// Welcome separately from the ordinary invitee's transport Welcome. Both
+/// receivers join the same epoch, and the private key is consumed only by
+/// its sibling route.
+#[tokio::test]
+async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let request = founding_request(vec![public]);
+    let (gid, result) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            request,
+            Vec::new(),
+            vec![private.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("canonical founding create")
+    };
+    assert_eq!(
+        welcomes.len(),
+        1,
+        "only the other account uses transport delivery"
+    );
+    assert_eq!(creator.engine.group_record(&gid).unwrap().epoch, EpochId(1));
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 3);
+    assert!(load_group(&creator, &gid).pending_commit().is_none());
+    let deliveries = owed(&creator);
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        SiblingWelcome::decode(&deliveries[0].content)
+            .unwrap()
+            .key_package_ref,
+        key_package_ref(&private.key_package)
+    );
+    assert!(matches!(
+        &sibling_rows(&creator, &gid)[..],
+        [(
+            MessageState::Sent,
+            StoredMessagePayload::OutboundSiblingWelcome { .. }
+        )]
+    ));
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
+    );
+    assert_joins_from(&mut siblings[0], &deliveries[0], &gid, &creator).await;
+    assert!(
+        siblings[0]
+            .engine
+            .issued_private_key_packages()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        other.engine.members(&gid).unwrap(),
+        creator.engine.members(&gid).unwrap()
+    );
+}
+
+/// A refusal for the private route leaves no discoverable new group or
+/// Welcome behind, even when the ordinary invitee was valid. The shared
+/// admission rejects published source metadata before canonical creation.
+#[tokio::test]
+async fn a_founding_sibling_refused_for_its_welcome_leaves_no_group() {
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let mut private = handed(&mut siblings[0], slot(2), slot(1));
+    private.key_package.source = Some(KeyPackageSource {
+        event_id: MessageId::new(vec![7; 32]),
+    });
+    let before = creator.storage.list_groups().unwrap();
+    let error = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            founding_request(vec![public]),
+            Vec::new(),
+            vec![private],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Other(ref reason) if reason.contains("a published KeyPackage never adds a sibling"))
+    );
+    assert_eq!(creator.storage.list_groups().unwrap(), before);
+    assert!(owed(&creator).is_empty());
+}
+
+fn founding_request(members: Vec<KeyPackage>) -> CreateGroupRequest {
+    use cgka_traits::app_components::{
+        NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+    };
+    CreateGroupRequest {
+        name: "founding siblings".into(),
+        description: String::new(),
+        members,
+        required_features: Vec::new(),
+        initial_admins: Vec::new(),
+        app_components: vec![AppComponentData {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            data: encode_nostr_routing_v1(
+                &NostrRoutingV1::new([0x43; 32], vec![RELAY.to_owned()]).unwrap(),
+            )
+            .unwrap(),
+        }],
+    }
+}
+
+/// Explicit founding siblings never bypass the ordinary founders' component
+/// negotiation: if another account's client lacks account-devices, the chat
+/// may still be created as before, but never with these sibling additions.
+#[tokio::test]
+async fn founding_siblings_cannot_bypass_the_other_founders_capabilities() {
+    use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
+    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
+    let mut other = device_advertising(
+        b"bob",
+        &[NOSTR_ROUTING_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+    );
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let before = creator.storage.list_groups().unwrap();
+    let request = founding_request(vec![public]);
+    let error = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(
+            request.clone(),
+            Vec::new(),
+            vec![private],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Other(ref reason) if reason.contains("requiring account-devices"))
+    );
+    assert_eq!(creator.storage.list_groups().unwrap(), before);
+    let (gid, _) = creator.engine.create_group(request).await.unwrap();
+    assert!(!requires_account_devices(&creator.engine, &gid));
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert!(owed(&creator).is_empty());
+}
