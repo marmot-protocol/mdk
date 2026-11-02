@@ -406,6 +406,15 @@
 
 ### Changed
 
+- Interactive sign-in replaces the blanket `MultiDeviceUnsupported` finding
+  with guidance that signing in alone does not restore existing chats or
+  messages (mdk#2628). Old checkpoints omit only that obsolete finding when
+  read. Discovery evidence, explicit acknowledgment, revision/recovery-epoch
+  checks and the KeyPackage publication gate stay unchanged. Existing host
+  apps must adopt the updated notice localization; device linking remains
+  disabled in normal released builds. Existing enum, DTO and method names
+  remain compatible.
+
 - Sign-in checks no longer load the unused roster announcement history or
   attach an internal `Announcement` label (mdk#2863, D81). Slot
   classification and the own-slot compromise warning keep their behavior.
