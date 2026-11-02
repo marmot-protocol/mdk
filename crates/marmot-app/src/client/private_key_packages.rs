@@ -648,39 +648,68 @@ impl AppClient {
         Ok(())
     }
 
-    /// The KeyPackage [`Self::take_private_key_package`] would take from
-    /// `issuer` now, left in place.
-    pub(crate) fn next_private_key_package(
-        &mut self,
+    /// Unused, unexpired stock from one issuer in the storage's expiry/ref
+    /// order. Compatibility belongs to the caller's engine admission checks.
+    pub(crate) fn private_key_package_candidates(
+        &self,
         issuer: &DeviceSlotId,
-    ) -> Result<Option<KeyPackage>, AppError> {
+        now: u64,
+    ) -> Result<Vec<ReceivedPrivateKeyPackage>, AppError> {
+        let issuer = hex::encode(issuer);
         Ok(self
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .next_received_private_key_package(&hex::encode(issuer), unix_now_seconds())?
-            .map(|record| {
-                KeyPackage::new(record.key_package)
-                    .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
-            }))
+            .received_private_key_packages()?
+            .into_iter()
+            .filter(|record| record.issuer_slot_hex == issuer && record.not_after > now)
+            .collect())
     }
 
-    /// Take one KeyPackage `issuer` handed this device, to add that sibling
-    /// to a chat (3.5): a usable one first. `None` when it holds none
-    /// unexpired; never a public KeyPackage instead.
-    pub(crate) fn take_private_key_package(
+    /// Select compatible stock using the existing preference: the usable
+    /// candidate expiring first, else the unexpired candidate expiring last.
+    /// The selected record must be passed unchanged to `add_sibling_to_chat`.
+    pub(crate) fn next_private_key_package_for_chat(
         &mut self,
+        chat: &GroupId,
         issuer: &DeviceSlotId,
-    ) -> Result<Option<KeyPackage>, AppError> {
+    ) -> Result<Option<ReceivedPrivateKeyPackage>, AppError> {
+        let now = unix_now_seconds();
+        let mut fallback = None;
+        for record in self.private_key_package_candidates(issuer, now)? {
+            let sibling = SiblingKeyPackage {
+                slot: *issuer,
+                key_package: Self::received_private_key_package(&record),
+            };
+            if self.runtime.sibling_add_refusal(chat, &sibling)?.is_some() {
+                continue;
+            }
+            if record.usable_at(now) {
+                return Ok(Some(record));
+            }
+            fallback = Some(record);
+        }
+        Ok(fallback)
+    }
+
+    pub(crate) fn received_private_key_package(record: &ReceivedPrivateKeyPackage) -> KeyPackage {
+        KeyPackage::new(record.key_package.clone())
+            .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+    }
+
+    pub(crate) fn take_private_key_package_exact(
+        &self,
+        issuer: &DeviceSlotId,
+        candidate: &ReceivedPrivateKeyPackage,
+    ) -> Result<bool, AppError> {
+        if candidate.issuer_slot_hex != hex::encode(issuer) {
+            return Ok(false);
+        }
         Ok(self
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .take_received_private_key_package(&hex::encode(issuer), unix_now_seconds())?
-            .map(|record| {
-                KeyPackage::new(record.key_package)
-                    .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
-            }))
+            .take_received_private_key_package_exact(candidate, unix_now_seconds())?)
     }
 
     /// Add the sibling in `sibling` to `chat` with a KeyPackage it handed
@@ -697,10 +726,12 @@ impl AppClient {
         &mut self,
         chat: &GroupId,
         sibling: &DeviceSlotId,
+        candidate: ReceivedPrivateKeyPackage,
     ) -> Result<(), AppError> {
-        let key_package = self
-            .take_private_key_package(sibling)?
-            .ok_or(AppError::DeviceGroupRefused("no_private_key_package"))?;
+        if !self.take_private_key_package_exact(sibling, &candidate)? {
+            return Err(AppError::DeviceGroupRefused("no_private_key_package"));
+        }
+        let key_package = Self::received_private_key_package(&candidate);
         let audit_context = Self::local_human_action_context(
             "add_own_account_devices",
             vec!["members"],

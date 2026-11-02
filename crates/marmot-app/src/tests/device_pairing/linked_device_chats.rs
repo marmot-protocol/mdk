@@ -780,3 +780,270 @@ async fn a_later_link_by_another_approver_outlives_a_local_failed_link() {
         "the current entry's approver owns its link outcome"
     );
 }
+
+/// Older clients can participate in the device group without supporting a
+/// chat's optional retention component. Mint that client's authentic private
+/// package with its persisted signer and private bundle, never altered bytes.
+fn older_private_package_without_retention(
+    issuer: &Device,
+    receiver: &Device,
+    group: &GroupId,
+    template: &cgka_traits::storage::IssuedPrivateKeyPackage,
+) -> KeyPackage {
+    use cgka_engine::device_tag::seal_device_tag;
+    use cgka_engine::provider::EngineOpenMlsProvider;
+    use cgka_traits::app_components::{
+        APP_COMPONENTS_COMPONENT_ID, DEVICE_TAG_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+        decode_components_list, encode_components_list,
+    };
+    use cgka_traits::storage::{AccountDeviceSignerStorage as _, StorageProvider as _};
+    use openmls::extensions::{AppDataDictionaryExtension, Extension};
+    use openmls::prelude::{
+        CredentialWithKey, KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn,
+        MlsMessageOut, ProtocolVersion,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use tls_codec::{Deserialize as _, Serialize as _};
+
+    let storage = issuer.app.account_storage("alice").unwrap();
+    let account = issuer.app.account_home().account("alice").unwrap();
+    let identity = MemberId::new(hex::decode(account.account_id_hex).unwrap());
+    let binding = storage.account_device_signer(&identity).unwrap().unwrap();
+    let suite = cgka_engine::DEFAULT_CIPHERSUITE;
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        suite.signature_algorithm(),
+    )
+    .unwrap();
+    let MlsMessageBodyIn::KeyPackage(template) =
+        MlsMessageIn::tls_deserialize_exact(&template.key_package)
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected a KeyPackage")
+    };
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let template = template.validate(&crypto, ProtocolVersion::Mls10).unwrap();
+    let leaf = template.leaf_node();
+    let mut dictionary = leaf
+        .extensions()
+        .app_data_dictionary()
+        .unwrap()
+        .dictionary()
+        .clone();
+    let mut supported =
+        decode_components_list(dictionary.get(&APP_COMPONENTS_COMPONENT_ID).unwrap()).unwrap();
+    supported.remove(&GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&supported),
+    );
+    let slot = hex::decode(issuer.slot_hex()).unwrap().try_into().unwrap();
+    dictionary.insert(
+        DEVICE_TAG_COMPONENT_ID,
+        seal_device_tag(
+            &crypto,
+            &issuer.roster(group).leaf_tag_key,
+            &slot,
+            &signer,
+            signer.public(),
+        )
+        .unwrap(),
+    );
+    let mut extensions = leaf.extensions().clone();
+    extensions
+        .add_or_replace(Extension::AppDataDictionary(
+            AppDataDictionaryExtension::new(dictionary),
+        ))
+        .unwrap();
+    let now = crate::unix_now_seconds();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(leaf.capabilities().clone())
+        .leaf_node_extensions(extensions)
+        .key_package_lifetime(Lifetime::init(now - 3600, now + 29 * 24 * 3600))
+        .build(
+            suite,
+            &EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+                &crypto,
+                storage.mls_storage(),
+            ),
+            &signer,
+            CredentialWithKey {
+                credential: leaf.credential().clone(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    let message: MlsMessageOut = bundle.key_package().clone().into();
+    let package = KeyPackage::new(message.tls_serialize_detached().unwrap())
+        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current);
+    let metadata = marmot_session::key_package_metadata(&package).unwrap();
+    storage
+        .private_key_package_storage()
+        .unwrap()
+        .put_issued_private_key_package(&cgka_traits::storage::IssuedPrivateKeyPackage {
+            key_package_ref: hex::decode(&metadata.key_package_ref_hex).unwrap(),
+            recipient_slot: hex::decode(receiver.slot_hex())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            not_before: metadata.not_before,
+            not_after: metadata.not_after,
+            key_package: package.bytes().to_vec(),
+            issued_at: now,
+            hand_off_queued: true,
+            counted: true,
+            request_id: None,
+        })
+        .unwrap();
+    package
+}
+
+async fn hand_over_stock(
+    relay: &ScriptedPushRelayClient,
+    phone: &mut Device,
+    laptop: &mut Device,
+    group: &GroupId,
+    key_packages: Vec<KeyPackage>,
+) {
+    use base64::Engine as _;
+    let hand_off = marmot_session::PrivateKeyPackageHandOff {
+        from: hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap(),
+        to: hex::decode(phone.slot_hex()).unwrap().try_into().unwrap(),
+        key_packages,
+    };
+    laptop
+        .client
+        .send_device_group_message(
+            group,
+            marmot_session::KIND_PRIVATE_KEY_PACKAGE_HAND_OFF,
+            base64::engine::general_purpose::STANDARD.encode(hand_off.encode().unwrap()),
+        )
+        .await
+        .unwrap();
+    deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+}
+
+async fn compatible_private_stock_reaches_the_chat(founding: bool) {
+    use cgka_traits::app_components::GROUP_MESSAGE_RETENTION_COMPONENT_ID;
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let options = || AppCreateGroupOptions {
+        disappearing_message_secs: 60,
+        ..AppCreateGroupOptions::default()
+    };
+    let existing = if founding {
+        None
+    } else {
+        Some(
+            phone
+                .client
+                .create_group_with_options("existing retention", &[], options())
+                .await
+                .unwrap(),
+        )
+    };
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let issuer = laptop.slot_hex();
+    let receiver = phone.slot_hex();
+    let newer = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .find(|record| hex::encode(record.recipient_slot) == receiver)
+        .unwrap();
+    let older = older_private_package_without_retention(&laptop, &phone, &group, &newer);
+    let older_metadata = marmot_session::key_package_metadata(&older).unwrap();
+    let newer_package = KeyPackage::new(newer.key_package)
+        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current);
+    let newer_metadata = marmot_session::key_package_metadata(&newer_package).unwrap();
+    assert!(older_metadata.not_after < newer_metadata.not_after);
+    assert!(
+        !older_metadata
+            .app_components
+            .contains(&GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+    );
+    assert!(
+        newer_metadata
+            .app_components
+            .contains(&GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+    );
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    storage
+        .delete_received_private_key_packages_from(&issuer)
+        .unwrap();
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![older]).await;
+    assert_eq!(
+        held_from(&phone, &laptop),
+        1,
+        "the real trusted hand-off admits A"
+    );
+    let no_compatible = if founding {
+        phone
+            .client
+            .create_group_with_options("no compatible stock", &[], options())
+            .await
+            .unwrap()
+    } else {
+        phone.client.add_linked_devices_to_chats(&[]).await;
+        existing.clone().unwrap()
+    };
+    assert_eq!(leaves_of(&phone, &laptop, &no_compatible, &group), 0);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert!(storage.private_key_package_need(&issuer).unwrap().is_some());
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![newer_package]).await;
+    assert_eq!(held_from(&phone, &laptop), 2);
+    let chat = if founding {
+        phone
+            .client
+            .create_group_with_options("compatible stock", &[], options())
+            .await
+            .unwrap()
+    } else {
+        phone.client.add_linked_devices_to_chats(&[]).await;
+        existing.unwrap()
+    };
+    assert_eq!(
+        leaves_of(&phone, &laptop, &chat, &group),
+        1,
+        "newer compatible B must be reached behind older incompatible A (#2869)"
+    );
+    let remaining = storage.received_private_key_packages().unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .filter(|row| row.issuer_slot_hex == issuer)
+            .map(|row| &row.key_package_ref_hex)
+            .collect::<Vec<_>>(),
+        vec![&older_metadata.key_package_ref_hex]
+    );
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert!(
+        phone
+            .client
+            .runtime
+            .app_component(&chat, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+            .unwrap()
+            .is_some(),
+        "selection preserves the chat requirement"
+    );
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    laptop.client.run_due_maintenance().await.unwrap();
+    assert!(
+        joined(&laptop, &chat),
+        "the selected B has its real private bundle and Welcome"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_link_add_reaches_compatible_private_stock_behind_older_stock() {
+    compatible_private_stock_reaches_the_chat(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn founding_add_reaches_compatible_private_stock_behind_older_stock() {
+    compatible_private_stock_reaches_the_chat(true).await;
+}

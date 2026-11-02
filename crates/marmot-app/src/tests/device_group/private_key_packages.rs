@@ -41,6 +41,25 @@ fn received_from(client: &AppClient, issuer: &DeviceSlotId) -> Vec<ReceivedPriva
         .collect()
 }
 
+/// Direct Add tests deliberately skip preflight to exercise engine refusal
+/// after an allocation is spent. Normal app callers select compatible stock.
+fn private_candidate(client: &AppClient, issuer: &DeviceSlotId) -> ReceivedPrivateKeyPackage {
+    client
+        .private_key_package_candidates(issuer, crate::unix_now_seconds())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn take_private_key_package(client: &AppClient, issuer: &DeviceSlotId) -> KeyPackage {
+    let record = devices_storage(client)
+        .take_received_private_key_package(&hex::encode(issuer), crate::unix_now_seconds())
+        .unwrap()
+        .unwrap();
+    AppClient::received_private_key_package(&record)
+}
+
 fn group_messages_since(relay: &ScriptedPushRelayClient, since: usize) -> usize {
     published_kinds(relay, since)
         .into_iter()
@@ -200,11 +219,7 @@ async fn a_sibling_takes_asks_for_more_and_discards_private_key_packages() {
     let (mut devices, _) = tagging_devices().await;
     let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
 
-    let taken = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let taken = take_private_key_package(&devices.laptop, &phone_slot);
     let metadata = marmot_session::key_package_metadata(&taken).unwrap();
     assert!(!metadata.last_resort);
     assert!(
@@ -478,11 +493,7 @@ async fn adding_the_phone(devices: &mut Devices, chat: &GroupId) -> SiblingWelco
 /// sibling Welcome owed.
 async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
     let phone_slot = slot(&devices.phone);
-    let key_package = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let key_package = take_private_key_package(&devices.laptop, &phone_slot);
     confirm_unpublished(
         &mut devices.laptop,
         SendIntent::AddOwnAccountDevices {
@@ -1271,7 +1282,11 @@ async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
     let before = devices.relay.published_events.lock().unwrap().len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert_eq!(group_messages_since(&devices.relay, before), 2);
@@ -1653,7 +1668,11 @@ async fn a_sibling_welcome_waits_for_its_commit() {
     devices.relay.reject_next_publish();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.privacy_safe_kind(), "publish");
@@ -1664,7 +1683,11 @@ async fn a_sibling_welcome_waits_for_its_commit() {
 
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
@@ -1699,7 +1722,11 @@ async fn a_refused_sibling_add_spends_its_key_package() {
     let before = devices.relay.published_events.lock().unwrap().len();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1755,7 +1782,11 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let stock = received_from(&devices.laptop, &phone_slot).len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert!(

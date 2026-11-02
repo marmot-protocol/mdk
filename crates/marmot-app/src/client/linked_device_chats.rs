@@ -44,7 +44,7 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::SiblingKeyPackage;
-use storage_sqlite::{ChatListQuery, DeviceLinkOutcome};
+use storage_sqlite::{ChatListQuery, DeviceLinkOutcome, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
 use super::device_group::{Exchange, device_slot};
@@ -139,28 +139,20 @@ impl AppClient {
                         continue;
                     }
                 }
-                let key_package = match self.next_private_key_package(&device.slot) {
+                let key_package = match self.next_private_key_package_for_chat(&chat, &device.slot)
+                {
                     Ok(Some(key_package)) => key_package,
-                    Ok(None) => break,
+                    Ok(None) => continue,
                     Err(error) => {
                         first_error.get_or_insert(error);
                         break;
                     }
                 };
-                let sibling = SiblingKeyPackage {
-                    slot: device.slot,
-                    key_package,
-                };
-                match self.runtime.sibling_add_refusal(&chat, &sibling) {
-                    Ok(None) => {}
-                    Ok(Some(_)) => continue,
-                    Err(error) => {
-                        first_error.get_or_insert(error.into());
-                        continue;
-                    }
-                }
                 budget -= 1;
-                if let Err(error) = self.add_sibling_to_chat(&chat, &device.slot).await {
+                if let Err(error) = self
+                    .add_sibling_to_chat(&chat, &device.slot, key_package)
+                    .await
+                {
                     first_error.get_or_insert(error);
                 }
             }
@@ -200,9 +192,9 @@ impl AppClient {
             }
         };
         let mut taken_siblings = Vec::with_capacity(selected.len());
-        for sibling in selected {
-            match self.take_private_key_package(&sibling.slot) {
-                Ok(Some(taken)) if taken == sibling.key_package => taken_siblings.push(sibling),
+        for (sibling, candidate) in selected {
+            match self.take_private_key_package_exact(&sibling.slot, &candidate) {
+                Ok(true) => taken_siblings.push(sibling),
                 // Expiry or a failed read/write while taking one candidate
                 // omits it. Never retry creation or return a possibly spent
                 // package to stock; other admitted candidates remain usable.
@@ -239,7 +231,7 @@ impl AppClient {
         optional_components: &[cgka_traits::app_components::AppComponentData],
         constructable: &cgka_traits::capabilities::GroupCapabilities,
         relays: &[String],
-    ) -> Result<Vec<SiblingKeyPackage>, AppError> {
+    ) -> Result<Vec<(SiblingKeyPackage, ReceivedPrivateKeyPackage)>, AppError> {
         use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, default_group_components};
         if !self.app.device_groups_enabled()
             || !cgka_traits::app_components::valid_sibling_welcome_relays(relays)
@@ -297,26 +289,35 @@ impl AppClient {
             {
                 continue;
             }
-            let Some(key_package) = self.next_private_key_package(&slot)? else {
-                self.want_founding_private_key_package(&slot);
-                continue;
-            };
-            let valid = marmot_session::validate_received_private_key_package(
-                &key_package,
-                &account,
-                &exchange.roster,
-                &slot,
-                unix_now_seconds(),
-            )
-            .ok();
-            if !valid
-                .is_some_and(|metadata| fixed.iter().all(|id| metadata.app_components.contains(id)))
-                || requirements.validate(&key_package).is_err()
-            {
-                self.want_founding_private_key_package(&slot);
-                continue;
+            let now = unix_now_seconds();
+            let mut compatible = None;
+            for record in self.private_key_package_candidates(&slot, now)? {
+                let key_package = Self::received_private_key_package(&record);
+                let valid = marmot_session::validate_received_private_key_package(
+                    &key_package,
+                    &account,
+                    &exchange.roster,
+                    &slot,
+                    now,
+                )
+                .ok();
+                if !valid.is_some_and(|metadata| {
+                    fixed.iter().all(|id| metadata.app_components.contains(id))
+                }) || requirements.validate(&key_package).is_err()
+                {
+                    continue;
+                }
+                let usable = record.usable_at(now);
+                compatible = Some((SiblingKeyPackage { slot, key_package }, record));
+                if usable {
+                    break;
+                }
             }
-            selected.push(SiblingKeyPackage { slot, key_package });
+            if let Some(candidate) = compatible {
+                selected.push(candidate);
+            } else {
+                self.want_founding_private_key_package(&slot);
+            }
         }
         Ok(selected)
     }

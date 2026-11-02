@@ -262,7 +262,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   pass, in chat-list order; a chat holds the device when a leaf of this account carries its tag or its tag signature
   key. Pass over a chat while this device's commit there is queued, in flight or settling (`group_quiet`), so no Add is
   doubled. Check the Add with the engine's read-only `sibling_add_refusal` against the KeyPackage
-  `next_private_key_package` names before taking it, so a chat that would refuse never spends one;
+  `next_private_key_package_for_chat` selects from compatible private stock before taking that exact record,
+  so a chat that would refuse never spends one and a changed stock preference never spends another allocation;
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
