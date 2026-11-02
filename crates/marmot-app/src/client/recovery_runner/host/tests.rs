@@ -194,6 +194,12 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
 /// clears the group's catching-up status (mdk#2862).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
+    for fail_open_write in [false, true] {
+        cursor_reopen_owes_restart_gap(fail_open_write).await;
+    }
+}
+
+async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
     use crate::client::recovery_coverage::scenario_tests::{fixture_on, reactivate_client};
     let Fixture {
         client,
@@ -241,6 +247,15 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
             .is_some(),
         "the persisted cursor must select the production incremental REQ path"
     );
+    let faults = fail_open_write.then(|| fault_connection(&client));
+    if let Some(faults) = &faults {
+        faults
+            .execute_batch(
+                "CREATE TRIGGER fail_open_goal BEFORE INSERT ON account_recovery_coverage_goals
+                 BEGIN SELECT RAISE(FAIL, 'open goal write failed'); END;",
+            )
+            .unwrap();
+    }
     drop(client);
 
     // Open on the existing plane, without network maintenance: the goal must
@@ -250,13 +265,16 @@ async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
         .await
         .unwrap();
     assert!(reopened.state.last_transport_timestamp.is_some());
-    assert!(
-        ledger
-            .recovery_coverage_goal(&route.route)
-            .unwrap()
-            .is_some(),
-        "account open must give a cursor-present group's route a goal"
-    );
+    let goal = ledger.recovery_coverage_goal(&route.route).unwrap();
+    if let Some(faults) = faults {
+        assert_eq!(goal, None, "the failed open write left no group goal");
+        faults.execute_batch("DROP TRIGGER fail_open_goal").unwrap();
+    } else {
+        assert!(
+            goal.is_some(),
+            "account open must give a cursor-present group's route a goal"
+        );
+    }
     assert!(
         ledger
             .pending_recovery_demands()
@@ -351,9 +369,27 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
     )
     .await;
     let ledger = storage.app_storage();
-    let route = group_routes(&client).pop().unwrap();
+    let first_route = group_routes(&client).pop().unwrap();
+    restart_goal_survey(&mut client).await;
+    let first_goal = ledger.recovery_coverage_goal(&first_route).unwrap();
+    assert!(first_goal.is_some());
+    let second_group = client
+        .create_group("after the first survey", &[])
+        .await
+        .unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(second_group.as_slice()))
+        .unwrap()
+        .route;
     let before = unix_now_seconds();
+    let mut settling_wake = wake(&client);
     let survey = restart_goal_survey(&mut client).await;
+    assert!(
+        !woken(&mut settling_wake),
+        "settling a route change must not wake its own runner"
+    );
     let candidate = survey
         .candidates
         .iter()
@@ -363,12 +399,15 @@ async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it()
     let goal = ledger.recovery_coverage_goal(&route).unwrap().unwrap();
     assert!(goal >= before - 30 * DAY);
     assert!(goal <= unix_now_seconds() - 30 * DAY);
+    let catching_up = client
+        .account_recovery_status()
+        .unwrap()
+        .catching_up_group_ids_hex;
+    assert!(catching_up.contains(&hex::encode(group.as_slice())));
+    assert!(catching_up.contains(&hex::encode(second_group.as_slice())));
     assert_eq!(
-        client
-            .account_recovery_status()
-            .unwrap()
-            .catching_up_group_ids_hex,
-        [hex::encode(group.as_slice())]
+        ledger.recovery_coverage_goal(&first_route).unwrap(),
+        first_goal
     );
     let mut wake = wake(&client);
     restart_goal_survey(&mut client).await;

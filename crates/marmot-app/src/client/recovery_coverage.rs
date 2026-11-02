@@ -641,7 +641,11 @@ impl AppClient {
         }
         let settled = (|| {
             let current = self.current_coverage_routes();
-            self.widen_standing_goals(app, &current.iter().collect::<Vec<_>>(), now)?;
+            // This turn reads the new debt immediately. Do not wake its own
+            // runner, especially if a later write keeps the changes pending.
+            for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now) {
+                app.widen_recovery_coverage_goals(&routes, floor)?;
+            }
             for (route, relays) in &gone {
                 let ended = !carried.iter().any(|(carried, _)| carried == *route);
                 app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
@@ -736,13 +740,12 @@ impl AppClient {
             .max(retention_floor(now))
     }
 
-    /// Widen each current route's goal to its standing floor.
-    fn widen_standing_goals(
+    /// Group standing goals by floor so one write can widen each set.
+    fn standing_goals(
         &self,
-        app: &SqliteAppStorage,
         routes: &[&CurrentRoute],
         now: u64,
-    ) -> Result<(), AppError> {
+    ) -> BTreeMap<u64, Vec<TransportReconciliationRoute>> {
         let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
         for current in routes {
             by_floor
@@ -750,7 +753,19 @@ impl AppClient {
                 .or_default()
                 .push(current.route.clone());
         }
-        for (floor, routes) in by_floor {
+        by_floor
+    }
+
+    /// Widen each current route's goal to its standing floor and wake the
+    /// runner. Its own routing-change turn uses the same grouping without a
+    /// wake: that turn already reads what it widened.
+    fn widen_standing_goals(
+        &self,
+        app: &SqliteAppStorage,
+        routes: &[&CurrentRoute],
+        now: u64,
+    ) -> Result<(), AppError> {
+        for (floor, routes) in self.standing_goals(routes, now) {
             self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
