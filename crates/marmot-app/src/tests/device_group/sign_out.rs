@@ -613,6 +613,7 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
             .runtime
             .edit_device_roster_entry(&group, &phone_slot, &[], |entry| {
                 entry.settings.add_to_all_chats = false;
+                entry.rename_id = Some(crate::client::device_renames::fresh_rename_id());
             })
             .await
             .unwrap(),
