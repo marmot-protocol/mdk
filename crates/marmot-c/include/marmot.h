@@ -8219,7 +8219,11 @@ MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client,
  * Values also use zero=false, nonzero=true. Earlier lost edits recover
  * first; retry `device_group_busy` while they settle. Disabling add-to-all
  * does not leave chats; enabling history does not backfill joined chats.
- * Keep does not cancel explicit removal. Re-read on LinkedDevicesChanged.
+ * Keep does not cancel explicit removal. Refused with nothing sent while
+ * device groups are off (`roster_unsupported`), without a trusted device
+ * group (`no_device_group`), for an unknown slot (`unknown_device`), or
+ * while its roster cannot be read (`roster_unavailable`). Re-read on
+ * LinkedDevicesChanged.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

@@ -830,7 +830,11 @@ c_cmd! {
     /// Values also use zero=false, nonzero=true. Earlier lost edits recover
     /// first; retry `device_group_busy` while they settle. Disabling add-to-all
     /// does not leave chats; enabling history does not backfill joined chats.
-    /// Keep does not cancel explicit removal. Re-read on LinkedDevicesChanged.
+    /// Keep does not cancel explicit removal. Refused with nothing sent while
+    /// device groups are off (`roster_unsupported`), without a trusted device
+    /// group (`no_device_group`), for an unknown slot (`unknown_device`), or
+    /// while its roster cannot be read (`roster_unavailable`). Re-read on
+    /// LinkedDevicesChanged.
     async fn marmot_update_linked_device_settings(account_ref: str, slot_id_hex: str, has_add_to_all_chats/add_to_all_chats: opt_flag, has_bring_history/bring_history: opt_flag, has_keep_while_inactive/keep_while_inactive: opt_flag) -> unit = update_linked_device_settings;
     /// Remove another of this account's devices, by its `slot_id_hex` from
     /// `marmot_linked_devices`, from the device group and every chat, and
