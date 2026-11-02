@@ -162,6 +162,14 @@ through `marmot_onboarding_snapshot_free`; do not free the arrays separately.
 See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interactive-account-onboarding)
 before interpreting query success as relay capability or publication evidence.
 
+The historical `SingleDevice` onboarding step is a sign-in chat/history notice,
+not a blanket claim that multi-device use is unsupported. Its notice, actions,
+acknowledgment calls and publication gate are unchanged; `MultiDeviceUnsupported`
+is retained for compatibility and omitted from current findings. Adopt the shared
+[notice copy and evidence limits](../marmot-uniffi/README.md#single-device-notice)
+in host localization with a published binding artifact. Continue is still an
+explicit acknowledgment, not permission to link devices or dismiss sign-in prompts.
+
 For a general or inbox onboarding relay failure, call
 `marmot_propose_onboarding_relay_repair` and inspect the optional
 `proposal->relay_repair` in the returned snapshot. Its ordered before/after

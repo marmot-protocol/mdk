@@ -93,7 +93,6 @@ impl AccountManager {
         } else {
             OnboardingDeviceDiscovery::Unknown
         };
-        findings.insert(0, finding(OnboardingIssue::MultiDeviceUnsupported));
         checkpoint.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
             discovery,
             other_packages: packages,
@@ -108,7 +107,7 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Acknowledge the one-device limitation for this onboarding attempt. This
+    /// Acknowledge the sign-in chat/history notice for this onboarding attempt. This
     /// authorizes normal setup publication, never deletion of another slot.
     /// Persist before resuming so cancellation/restart cannot lose the choice.
     pub async fn acknowledge_onboarding_single_device(
