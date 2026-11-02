@@ -69,7 +69,12 @@ pub(in crate::client) async fn fixture_on(
         crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay.clone());
-    app.relay_plane = transport_nostr::MarmotRelayPlane::new(lookback, relay.clone());
+    app.relay_plane = transport_nostr::MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        lookback,
+        relay.clone(),
+        relay.clone(),
+        app.config.allow_loopback_relay_endpoints,
+    );
     let app = if runner_owns_debt {
         app.with_recovery_runner_owning_debt()
     } else {
