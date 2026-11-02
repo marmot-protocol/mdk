@@ -648,11 +648,26 @@ impl AppClient {
         Ok(())
     }
 
+    /// The KeyPackage [`Self::take_private_key_package`] would take from
+    /// `issuer` now, left in place.
+    pub(crate) fn next_private_key_package(
+        &mut self,
+        issuer: &DeviceSlotId,
+    ) -> Result<Option<KeyPackage>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .next_received_private_key_package(&hex::encode(issuer), unix_now_seconds())?
+            .map(|record| {
+                KeyPackage::new(record.key_package)
+                    .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+            }))
+    }
+
     /// Take one KeyPackage `issuer` handed this device, to add that sibling
     /// to a chat (3.5): a usable one first. `None` when it holds none
     /// unexpired; never a public KeyPackage instead.
-    // 3.5 and 3.6 call this; until then only tests do.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) fn take_private_key_package(
         &mut self,
         issuer: &DeviceSlotId,
@@ -678,8 +693,6 @@ impl AppClient {
     /// the engine took the Add reads the same as a refusal, and a KeyPackage
     /// returned then could reach two Welcomes. Upkeep asks the sibling for
     /// more.
-    // 3.5c calls this; until then only tests do.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) async fn add_sibling_to_chat(
         &mut self,
         chat: &GroupId,
@@ -879,8 +892,6 @@ impl AppClient {
     /// Need `want` usable KeyPackages from `issuer`, a burst for adding it to
     /// many chats (3.5). A larger need than before is asked for at the next
     /// upkeep, not an hour after the last request.
-    // 3.5 and 3.6 call this; until then only tests do.
-    #[cfg_attr(not(all(test, feature = "test-policy-overrides")), allow(dead_code))]
     pub(crate) fn want_private_key_packages(
         &mut self,
         issuer: &DeviceSlotId,

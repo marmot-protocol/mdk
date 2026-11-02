@@ -450,6 +450,28 @@ impl std::fmt::Display for AccountDevicesActivationRefusal {
     }
 }
 
+/// Why a same-account Add of one sibling to a chat would be refused now
+/// (device-group.md, "Sibling Welcomes"). The first three are facts about
+/// the chat, the same for every sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingAddRefusal {
+    /// The chat does not require `marmot.group.account-devices.v1`, so it
+    /// takes no same-account Add.
+    AccountDevicesNotRequired,
+    /// The chat does not name one to 16 relays, none repeated once parsed,
+    /// for a sibling Welcome to carry.
+    ChatRelays,
+    /// The chat already holds `max_leaves_per_account` leaves of this
+    /// account, so an Add of another would make its state invalid.
+    AccountLeaves,
+    /// This device is not tagged in a device group it trusts.
+    NotTagged,
+    /// The KeyPackage cannot add that sibling to this chat: it is published,
+    /// expired, another account's, not tagged as the sibling's slot, or does
+    /// not advertise or prove what the chat requires.
+    KeyPackage,
+}
+
 /// Errors returned by the peeler. The split mirrors the four-method peeler
 /// surface (group/welcome × peel/wrap).
 #[derive(Debug, thiserror::Error)]
