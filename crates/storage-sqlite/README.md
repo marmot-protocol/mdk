@@ -393,3 +393,15 @@ the encrypted account database. An index is never a transcript, group, route or 
 index is atomic, and pruning one completely discovered key's pointer leaves other old keys and imported provenance
 alone. The app owns actual current-own-leaf admission and ephemeral secret/job lifecycle; words, entropy, recovery
 private keys and archive keys never belong in these tables.
+
+## Reaction artwork sources
+
+Active kind-7 reactions retain their encrypted `imeta` slots in the attachment
+index even though reactions are modifiers and have no standalone timeline row.
+Migration 0167 backfills these sources from retained events. Normal event
+projection maintains them in the same transaction as reaction tallies; unchanged
+slots survive timeline rebuilds. Author retractions, convergence withdrawals,
+retention and group deletion revoke their sources through the ordinary
+acquisition lifecycle. Host applications resolve artwork through
+[`reaction_attachment`](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork)
+and use the returned source slot with existing acquisition and local-read APIs.

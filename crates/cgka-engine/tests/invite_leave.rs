@@ -41,8 +41,22 @@ use tls_codec::{Deserialize as _, Serialize as _};
 mod support;
 use support::proof_signer;
 
-async fn advance_selfremove_auto_commit<E: CgkaEngine>(engine: &mut E, group_id: &GroupId) {
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+async fn advance_selfremove_auto_commit(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    clock: &cgka_engine::ManualConvergenceClock,
+) {
+    let due = engine
+        .scheduled_self_remove_auto_commit_delay_ms(group_id)
+        .unwrap()
+        .expect("real scheduler deadline");
+    clock.advance_ms(due);
+    assert_eq!(
+        engine
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)
+            .unwrap(),
+        Some(0)
+    );
     let results = engine.advance_convergence(group_id).await.unwrap();
     assert!(
         results.is_empty(),
@@ -256,6 +270,22 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_client_on_storage(id, storage.clone());
     (engine, storage)
+}
+
+fn build_clock_client(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    clock: &cgka_engine::ManualConvergenceClock,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .unwrap()
 }
 
 fn load_group_and_signer(
@@ -583,6 +613,7 @@ async fn sibling_device_membership_preserves_activity_targets() {
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
 
     for voluntary_leave in [false, true] {
+        let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
         // Use current-profile proofs and independent stores: duplicate signature
         // keys are forbidden, but distinct devices may authenticate the same account.
         let current_device = |label: &[u8]| {
@@ -591,6 +622,7 @@ async fn sibling_device_membership_preserves_activity_targets() {
                 .account_identity_proof_signer(proof_signer(label))
                 .feature_registry(selfremove_registry())
                 .peeler(Box::new(MockPeeler))
+                .convergence_clock(std::sync::Arc::new(clock.clone()))
                 .build()
                 .unwrap()
         };
@@ -715,7 +747,7 @@ async fn sibling_device_membership_preserves_activity_targets() {
         let proposal = route_group_commit(msg, &group_id);
         bob.ingest(proposal.clone()).await.unwrap();
         alice.ingest(proposal).await.unwrap();
-        advance_selfremove_auto_commit(&mut alice, &group_id).await;
+        advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
         let mut publications = alice.drain_auto_publish();
         assert_eq!(publications.len(), 1);
         let publication = publications.remove(0);
@@ -1348,7 +1380,7 @@ async fn invite_adds_only_devices_not_already_in_the_group() {
         })
         .await;
     assert!(
-        matches!(nothing_to_add, Err(EngineError::Other(_))),
+        matches!(nothing_to_add, Err(EngineError::Other(ref reason)) if reason == "the invite adds no device: each one is already in the group"),
         "got {nothing_to_add:?}"
     );
     assert_eq!(alice.epoch(&group_id).unwrap(), epoch);
@@ -2242,7 +2274,7 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        matches!(blocked, Err(EngineError::InvalidTransition(ref t)) if t.from == "Removed" && t.to == "app_message" && t.reason == "local group copy is marked removed (self-evicted)"),
         "send on a removed copy must fail terminally, got {blocked:?}"
     );
 
@@ -2253,7 +2285,7 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        matches!(blocked, Err(EngineError::InvalidTransition(ref t)) if t.from == "Removed" && t.to == "leave" && t.reason == "local group copy is marked removed (self-evicted)"),
         "leave on a removed copy must fail terminally, got {blocked:?}"
     );
 }
@@ -3010,7 +3042,10 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
         .join_welcome(stale_david_welcome)
         .await
         .expect_err("an older Welcome must not downgrade active group state");
-    assert!(matches!(downgrade_error, EngineError::InvalidTransition(_)));
+    assert!(
+        matches!(downgrade_error, EngineError::InvalidTransition(ref t) if t.from == "ActiveMember" && t.to == "JoinWelcome" && t.reason == "replacement Welcome requires trusted removal evidence or explicit recipient confirmation"),
+        "{downgrade_error:?}"
+    );
     assert_eq!(david.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         david.members(&group_id).unwrap(),
@@ -3334,7 +3369,11 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     assert_eq!(offer.rejoin.as_ref().unwrap().welcomer, bob.self_id());
     let mut rewrapped = unauthorized_newer_welcome.clone();
     rewrapped.id = cgka_traits::MessageId::new(vec![0x91; 32]);
-    assert!(carol.join_welcome(rewrapped.clone()).await.is_err());
+    let error = carol.join_welcome(rewrapped.clone()).await.unwrap_err();
+    assert!(
+        matches!(error, EngineError::InvalidTransition(ref t) if t.from == "ActiveMember" && t.to == "JoinWelcome" && t.reason == "replacement Welcome requires trusted removal evidence or explicit recipient confirmation"),
+        "{error:?}"
+    );
     assert_eq!(
         carol
             .pending_group_rejoins_for(Some(&group_id))
@@ -3445,10 +3484,31 @@ async fn join_accepts_welcome_from_fork_with_self_promoted_admin() {
         joined_group_id, group_id,
         "david joins the forked group (same group id)"
     );
-    assert!(
-        david.members(&group_id).is_ok(),
-        "david should hold the joined (forked) group state"
+    let mut joined_members = david
+        .members(&group_id)
+        .unwrap()
+        .into_iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
+    joined_members.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected_members = vec![
+        alice.self_id(),
+        bob.self_id(),
+        carol.self_id(),
+        david.self_id(),
+    ];
+    expected_members.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(
+        joined_members, expected_members,
+        "bootstrap installs the complete authenticated fork roster"
     );
+    let mut expected_admins = vec![
+        <[u8; 32]>::try_from(alice.self_id().as_slice()).unwrap(),
+        <[u8; 32]>::try_from(bob.self_id().as_slice()).unwrap(),
+    ];
+    expected_admins.sort();
+    assert_eq!(david.admin_pubkeys(&group_id).unwrap(), expected_admins);
+    assert_eq!(david.epoch(&group_id).unwrap(), cgka_traits::EpochId(2));
 }
 
 #[tokio::test]
@@ -3463,7 +3523,7 @@ async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
     let mut alice = build_client(b"alice");
     let (mut bob, bob_storage) = build_with_storage(b"bob");
     let mut carol = build_client(b"carol");
-    let mut david = build_client(b"david");
+    let (mut david, david_storage) = build_with_storage(b"david");
     let mallory = build_client(b"mallory"); // valid account key, never a member
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -3520,9 +3580,19 @@ async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
         matches!(err, EngineError::InvalidWelcome),
         "expected terminal invalid-Welcome rejection, got {err:?}"
     );
+    assert!(david.members(&group_id).is_err());
+    assert!(matches!(
+        david_storage.get_group(&group_id),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
     assert!(
-        david.members(&group_id).is_err(),
-        "david must not hold any joined group state after a rejected join"
+        MlsGroup::load(
+            david_storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice())
+        )
+        .unwrap()
+        .is_none(),
+        "a rejected Welcome must not leave stranded MLS state"
     );
 }
 
@@ -3535,18 +3605,20 @@ async fn engine_rejects_malformed_local_credential_identity_at_build() {
     let err = try_build_raw_identity_client(b"bob")
         .err()
         .expect("building an engine with a 3-byte identity must fail");
-    let message = err.to_string();
     assert!(
-        message.contains("invalid credential identity"),
-        "unexpected error: {message}"
+        matches!(err, EngineError::Other(ref reason) if reason == "invalid credential identity: credential identity must be exactly 32 bytes; got 3"),
+        "unexpected error: {err:?}"
     );
 
     // A 32-byte value that is not a valid curve point is also rejected.
     let mut not_a_point = vec![0u8; 32];
     not_a_point[..5].copy_from_slice(b"david");
+    let err = try_build_raw_identity_client(&not_a_point)
+        .err()
+        .expect("a non-curve identity must be rejected");
     assert!(
-        try_build_raw_identity_client(&not_a_point).is_err(),
-        "a 32-byte non-curve identity must be rejected"
+        matches!(err, EngineError::Other(ref reason) if reason == "invalid credential identity: credential identity is not a valid x-only secp256k1 public key"),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -3554,7 +3626,9 @@ async fn engine_rejects_malformed_local_credential_identity_at_build() {
 
 #[tokio::test]
 async fn selfremove_local_selection_uses_lowest_complete_message_digest_after_restart() {
-    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_clock_client(b"alice", alice_storage.clone(), &clock);
     let (mut bob, bob_storage) = build_with_storage(b"bob");
     let (mut carol, carol_storage) = build_with_storage(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -3609,9 +3683,9 @@ async fn selfremove_local_selection_uses_lowest_complete_message_digest_after_re
         }
     ));
     drop(alice);
-    let mut alice = build_client_on_storage(b"alice", alice_storage.clone());
+    let mut alice = build_clock_client(b"alice", alice_storage.clone(), &clock);
     alice.hydrate_all_stored_groups().unwrap();
-    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
 
     let crypto = RustCrypto::default();
     let provider =
@@ -3644,9 +3718,14 @@ async fn selfremove_local_selection_uses_lowest_complete_message_digest_after_re
 
 #[tokio::test]
 async fn non_selected_selfremove_alternative_remains_processable_by_peer_commit() {
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
     let (mut alice, _alice_storage) = build_with_storage(b"alice");
     let (mut bob, bob_storage) = build_with_storage(b"bob");
-    let mut carol = build_client(b"carol");
+    let mut carol = build_clock_client(
+        b"carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
 
@@ -3693,7 +3772,7 @@ async fn non_selected_selfremove_alternative_remains_processable_by_peer_commit(
         carol.ingest(alternative.clone()).await.unwrap(),
         IngestOutcome::Processed
     ));
-    advance_selfremove_auto_commit(&mut carol, &group_id).await;
+    advance_selfremove_auto_commit(&mut carol, &group_id, &clock).await;
     let mut peer_publish = carol.drain_auto_publish();
     assert_eq!(peer_publish.len(), 1);
     let peer_publish = peer_publish.remove(0);
@@ -3719,7 +3798,9 @@ async fn non_selected_selfremove_alternative_remains_processable_by_peer_commit(
 
 #[tokio::test]
 async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_proposals() {
-    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_clock_client(b"alice", alice_storage.clone(), &clock);
     let (mut bob, bob_storage) = build_with_storage(b"bob");
     let (mut carol, carol_storage) = build_with_storage(b"carol");
     let (mut dave, dave_storage) = build_with_storage(b"dave");
@@ -3759,7 +3840,7 @@ async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_p
             IngestOutcome::Processed
         ));
     }
-    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
 
     let crypto = RustCrypto::default();
     let provider =
@@ -3783,7 +3864,7 @@ async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_
     for reopen in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("alice.sqlite3");
-        let key = storage_sqlite::SqlCipherKey::new("synthetic leave deadline key").unwrap();
+        let key = storage_sqlite::SqlCipherKey::raw([63; 32]);
         let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
         let build = |storage| {
             EngineBuilder::new(storage)
@@ -3898,6 +3979,7 @@ async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_
 
 #[tokio::test]
 async fn selfremove_full_flow_with_auto_commit() {
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome
     //   bob (non-admin) sends SelfRemove → Proposal
@@ -3906,7 +3988,11 @@ async fn selfremove_full_flow_with_auto_commit() {
     //   alice confirms publish → epoch 2 applies locally
     //   bob ingests alice's commit → bob's epoch advances, sees himself
     //                                removed
-    let mut alice = build_client(b"alice");
+    let mut alice = build_clock_client(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -3957,7 +4043,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         .await
         .unwrap_err();
     assert!(
-        matches!(blocked, EngineError::InvalidTransition(_)),
+        matches!(blocked, EngineError::InvalidTransition(ref t) if t.from == "Leaving" && t.to == "app_message" && t.reason == "leave requested"),
         "leaver must not send app data after SelfRemove proposal; got {blocked:?}"
     );
 
@@ -3988,7 +4074,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         vec![group_id.clone()]
     );
 
-    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
 
     // Alice has a projected pending epoch/member set, but the group is not
     // Stable/applied yet. New sends wait for publish confirmation — retained,
@@ -4175,7 +4261,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        matches!(blocked, Err(EngineError::InvalidTransition(ref t)) if t.from == "Leaving" && t.to == "app_message" && t.reason == "leave requested"),
         "leaver must be blocked before restart; got {blocked:?}"
     );
 
@@ -4190,7 +4276,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        matches!(blocked, Err(EngineError::InvalidTransition(ref t)) if t.from == "Leaving" && t.to == "app_message" && t.reason == "leave requested"),
         "leaver must still be blocked after restart; got {blocked:?}"
     );
 }
@@ -4198,7 +4284,7 @@ async fn selfremove_leaving_gate_survives_engine_rebuild() {
 #[tokio::test]
 async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
     let mut alice = build_client(b"alice");
-    let mut bob = build_client(b"bob");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
     let (group_id, create) = alice
@@ -4242,7 +4328,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         })
         .await;
     assert!(
-        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        matches!(blocked, Err(EngineError::InvalidTransition(ref t)) if t.from == "Leaving" && t.to == "app_message" && t.reason == "leave requested"),
         "leaver must be blocked while SelfRemove is current; got {blocked:?}"
     );
 
@@ -4292,6 +4378,23 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         "stale SelfRemove should produce one fresh proposal for the new epoch"
     );
 
+    assert_eq!(
+        bob_storage
+            .leave_request(&group_id)
+            .unwrap()
+            .unwrap()
+            .last_proposed_epoch,
+        Some(cgka_traits::EpochId(2))
+    );
+    let row = bob_storage.get_message(&reproposals[0].id).unwrap();
+    assert_eq!(row.epoch, cgka_traits::EpochId(2));
+    let wire = MlsMessageIn::tls_deserialize_exact(reproposals[0].payload.as_slice()).unwrap();
+    let protocol: ProtocolMessage = match wire.extract() {
+        MlsMessageBodyIn::PublicMessage(message) => message.into(),
+        other => panic!("SelfRemove must be a real public proposal: {other:?}"),
+    };
+    assert_eq!(protocol.epoch().as_u64(), 2);
+
     let app_send = bob
         .send(SendIntent::AppMessage {
             group_id: group_id.clone(),
@@ -4300,7 +4403,7 @@ async fn selfremove_leave_request_reproposes_when_later_epoch_keeps_member() {
         })
         .await;
     assert!(
-        matches!(app_send, Err(EngineError::InvalidTransition(_))),
+        matches!(app_send, Err(EngineError::InvalidTransition(ref t)) if t.from == "Leaving" && t.to == "app_message" && t.reason == "leave requested"),
         "durable leave request must keep app sends blocked; got {app_send:?}"
     );
 
@@ -4411,9 +4514,14 @@ async fn repeat_leave_in_the_same_epoch_is_classified_by_the_engine() {
 /// commit is staged; after staging, publish-before-apply blocks new sends.
 #[tokio::test]
 async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_messages() {
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
-    let mut carol = build_client(b"carol");
+    let mut carol = build_clock_client(
+        b"carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
 
@@ -4483,7 +4591,7 @@ async fn observed_selfremove_proposal_delays_commit_then_retains_outbound_app_me
         .unwrap();
     assert!(matches!(send_result, SendResult::ApplicationMessage { .. }));
 
-    advance_selfremove_auto_commit(&mut carol, &group_id).await;
+    advance_selfremove_auto_commit(&mut carol, &group_id, &clock).await;
 
     // Carol now has a projected pending epoch/member set, but the commit is not
     // canonical until its publish obligation is confirmed.
@@ -4561,18 +4669,482 @@ async fn leave_requires_stable_epoch_state() {
         })
         .await
         .unwrap();
-    assert!(matches!(pending_invite, SendResult::GroupEvolution { .. }));
+    let SendResult::GroupEvolution { pending, .. } = pending_invite else {
+        panic!("pending invite")
+    };
 
     let err = alice
-        .send(SendIntent::Leave { group_id })
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
         .await
         .unwrap_err();
-    assert!(matches!(err, EngineError::InvalidTransition(_)));
+    assert!(
+        matches!(err, EngineError::InvalidTransition(ref t) if t.from == "PendingPublish" && t.to == "Leave" && t.reason == "leave requires Stable"),
+        "{err:?}"
+    );
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn historical_legacy_group_enables_lifecycle_after_authentic_leaf_refresh() {
+    use cgka_traits::app_components::{
+        APP_COMPONENTS_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+        GroupLifecycleV1, GroupProfileV1, encode_components_list, encode_group_lifecycle_v1,
+        encode_group_profile_v1,
+    };
+    use openmls::prelude::{
+        AppDataDictionary, AppDataDictionaryExtension, CredentialWithKey, Extension, Extensions,
+        MlsGroupCreateConfig,
+    };
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_clock_client(b"historical-alice", alice_storage.clone(), &clock);
+    let mut carol = build_clock_client(
+        b"historical-carol",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    let bob_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let old_supported = [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID];
+    let mut bob = EngineBuilder::new(bob_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"historical-bob"))
+        .account_identity_proof_signer(proof_signer(b"historical-bob"))
+        .supported_app_components(old_supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let bob_id = bob.self_id();
+    let founder = clone_key_package_for_invite(&bob.fresh_key_package().await.unwrap());
+    let alice_kp = clone_key_package_for_invite(&alice.fresh_key_package().await.unwrap());
+    let carol_kp = clone_key_package_for_invite(&carol.fresh_key_package().await.unwrap());
+    let binding = bob_storage.account_device_signer(&bob_id).unwrap().unwrap();
+    let signer = SignatureKeyPair::read(
+        bob_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, bob_storage.mls_storage());
+    // Historical protocol producer: create this context directly, never alter
+    // an MDK-created group's required components or seed a staged commit.
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&old_supported.into_iter().collect()),
+    );
+    dictionary.insert(
+        GROUP_PROFILE_COMPONENT_ID,
+        encode_group_profile_v1(&GroupProfileV1 {
+            name: "historical".into(),
+            description: String::new(),
+        })
+        .unwrap(),
+    );
+    dictionary.insert(
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        encode_admin_policy_for_test(&[
+            bob_id.as_slice().to_vec(),
+            alice.self_id().as_slice().to_vec(),
+        ]),
+    );
+    let config = MlsGroupCreateConfig::builder().ciphersuite(DEFAULT_CIPHERSUITE)
+        .capabilities(founder.leaf_node().capabilities().clone())
+        .with_leaf_node_extensions(founder.leaf_node().extensions().clone()).unwrap()
+        .wire_format_policy(cgka_engine::wire_format::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .with_group_context_extensions(Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(openmls::extensions::RequiredCapabilitiesExtension::new(
+                &[openmls::prelude::ExtensionType::AppDataDictionary, openmls::prelude::ExtensionType::Unknown(cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)],
+                &[openmls::prelude::ProposalType::AppDataUpdate], &[],
+            )),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ]).unwrap())
+        .use_ratchet_tree_extension(true).build();
+    let mut historical = MlsGroup::new(
+        &provider,
+        &signer,
+        &config,
+        CredentialWithKey {
+            credential: founder.leaf_node().credential().clone(),
+            signature_key: founder.leaf_node().signature_key().clone(),
+        },
+    )
+    .unwrap();
+    let (_, welcome, _) = historical
+        .add_members(&provider, &signer, &[alice_kp, carol_kp])
+        .unwrap();
+    historical.merge_pending_commit(&provider).unwrap();
+    let gid = GroupId::new(historical.group_id().as_slice().to_vec());
+    let welcome: MlsMessageOut = welcome;
+    let bytes = welcome.tls_serialize_detached().unwrap();
+    for recipient in [&mut alice, &mut carol] {
+        let transport = MockPeeler
+            .wrap_welcome(
+                &EncryptedPayload {
+                    ciphertext: bytes.clone(),
+                    aad: vec![],
+                },
+                &recipient.self_id(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recipient.join_welcome(transport).await.unwrap(), gid);
+    }
+    assert_eq!(
+        alice.disbanding_support_blockers(&gid).unwrap(),
+        vec![bob_id.clone()]
+    );
+    let original = alice_storage.get_group(&gid).unwrap();
+    assert_eq!(
+        alice
+            .app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+            .unwrap(),
+        None
+    );
+    assert!(
+        matches!(alice.send(SendIntent::EnableDisbanding { group_id: gid.clone() }).await,
+        Err(EngineError::DisbandingUnsupportedMembers { group_id, members }) if group_id == gid && members == vec![bob_id.clone()])
+    );
+    assert_eq!(alice_storage.get_group(&gid).unwrap(), original);
+    assert!(
+        MlsGroup::load(alice_storage.mls_storage(), historical.group_id())
+            .unwrap()
+            .unwrap()
+            .pending_commit()
+            .is_none()
+    );
+
+    // The historical peer upgrades its advertised support with an actual
+    // signed UpdatePath, using freshly produced proof-bearing leaf extensions.
+    drop(bob);
+    let mut bob = build_client_on_storage(b"historical-bob", bob_storage.clone());
+    let refreshed = clone_key_package_for_invite(&bob.fresh_key_package().await.unwrap());
+    let bundle = historical
+        .self_update(
+            &provider,
+            &signer,
+            LeafNodeParameters::builder()
+                .with_extensions(refreshed.leaf_node().extensions().clone())
+                .build(),
+        )
+        .unwrap();
+    let refresh = proposal_transport(bundle.into_commit(), &gid);
+    historical.merge_pending_commit(&provider).unwrap();
+    alice.ingest(refresh.clone()).await.unwrap();
+    carol.ingest(refresh).await.unwrap();
+    clock.advance_ms(1_000);
+    alice.advance_convergence(&gid).await.unwrap();
+    carol.advance_convergence(&gid).await.unwrap();
+    assert!(alice.disbanding_support_blockers(&gid).unwrap().is_empty());
+    let source = alice_storage.get_group(&gid).unwrap();
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::EnableDisbanding {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("enable stages a commit")
+    };
+    alice.publish_failed(pending).await.unwrap();
+    assert_eq!(alice_storage.get_group(&gid).unwrap(), source);
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::EnableDisbanding {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("enable retry")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol.ingest(msg).await.unwrap();
+    clock.advance_ms(1_000);
+    carol.advance_convergence(&gid).await.unwrap();
+    for client in [&alice, &carol] {
+        assert_eq!(
+            client
+                .app_component(&gid, GROUP_LIFECYCLE_COMPONENT_ID)
+                .unwrap(),
+            Some(encode_group_lifecycle_v1(GroupLifecycleV1::Active))
+        );
+        assert!(
+            client
+                .group_record(&gid)
+                .unwrap()
+                .required_capabilities
+                .app_components
+                .contains(GROUP_LIFECYCLE_COMPONENT_ID)
+        );
+    }
+    assert_eq!(alice.epoch(&gid).unwrap(), carol.epoch(&gid).unwrap());
+    assert!(
+        matches!(alice.send(SendIntent::EnableDisbanding { group_id: gid.clone() }).await.unwrap(), SendResult::NoChange { group_id } if group_id == gid)
+    );
+    assert!(
+        MlsGroup::load(alice_storage.mls_storage(), historical.group_id())
+            .unwrap()
+            .unwrap()
+            .pending_commit()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn public_remove_refusals_leave_no_state_and_duplicate_targets_remove_once() {
+    let (mut alice, storage) = build_with_storage(b"remove-refusals-alice");
+    let mut bob = build_client(b"remove-refusals-bob");
+    let mut carol = build_client(b"remove-refusals-carol");
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "refusals".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("legacy create")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes[0].clone()).await.unwrap();
+    carol.join_welcome(welcomes[1].clone()).await.unwrap();
+    let original = storage.get_group(&gid).unwrap();
+    let source_epoch = alice.epoch(&gid).unwrap();
+    let mut messages = storage.list_messages(&gid, source_epoch).unwrap();
+    messages.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    let unknown = MemberId::new(pad32(b"remove-refusals-unknown"));
+    let cases = [
+        vec![],
+        vec![alice.self_id()],
+        vec![carol.self_id(), unknown.clone()],
+    ];
+    for (index, targets) in cases.into_iter().enumerate() {
+        let error = alice
+            .send(SendIntent::RemoveMembers {
+                group_id: gid.clone(),
+                members: targets,
+            })
+            .await
+            .unwrap_err();
+        match index {
+            0 => assert!(
+                matches!(error, EngineError::Other(ref reason) if reason == "remove requires at least one member"),
+                "{error:?}"
+            ),
+            1 => assert!(
+                matches!(error, EngineError::Other(ref reason) if reason == "use SendIntent::Leave to remove the local member"),
+                "{error:?}"
+            ),
+            2 => assert!(
+                matches!(error, EngineError::UnknownMember { ref group_id, ref member } if group_id == &gid && member == &unknown),
+                "{error:?}"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(storage.get_group(&gid).unwrap(), original);
+        let mut current_rows = storage.list_messages(&gid, source_epoch).unwrap();
+        current_rows.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+        assert_eq!(current_rows, messages);
+        let fresh = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(gid.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh.epoch().as_u64(), source_epoch.0);
+        assert!(
+            fresh.pending_commit().is_none(),
+            "a refusal cannot leave MLS work"
+        );
+        assert!(alice.epoch_state(&gid).unwrap().is_stable());
+        assert!(alice.drain_auto_publish().is_empty());
+    }
+    // This positive API control reaches native OpenMLS deduplication too; it
+    // does not isolate MDK's auxiliary target-list deduplication.
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: gid.clone(),
+            members: vec![carol.self_id(), carol.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("duplicate targets still stage one removal")
+    };
+    let fresh = MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fresh.pending_commit().unwrap().remove_proposals().count(),
+        1
+    );
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(msg).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    let mut bob_members = bob.members(&gid).unwrap();
+    let mut alice_members = alice.members(&gid).unwrap();
+    bob_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    alice_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    assert_eq!(bob_members, alice_members);
+    assert_eq!(bob.members(&gid).unwrap().len(), 2);
+    let SendResult::ApplicationMessage { msg, .. } = bob
+        .send(SendIntent::AppMessage {
+            group_id: gid,
+            payload: app_payload_for(&bob, b"surviving member"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("surviving member remains usable")
+    };
+    assert!(matches!(
+        alice.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+#[tokio::test]
+async fn pure_self_update_excludes_an_authentic_stored_peer_proposal() {
+    let (mut alice, alice_storage) = build_with_storage(b"pure-alice");
+    let (mut bob, bob_storage) = build_with_storage(b"pure-bob");
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "pure update".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("legacy create")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let proposal = raw_self_update_proposal(&bob_storage, &bob.self_id(), &gid);
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let (mut source, _) = load_group_and_signer(&alice_storage, &alice.self_id(), &gid);
+    let before_leaf = source
+        .own_leaf_node()
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    let message = MlsMessageIn::tls_deserialize_exact(proposal.payload.as_slice()).unwrap();
+    let protocol: ProtocolMessage = match message.extract() {
+        MlsMessageBodyIn::PrivateMessage(value) => value.into(),
+        MlsMessageBodyIn::PublicMessage(value) => value.into(),
+        other => panic!("actual signed proposal: {other:?}"),
+    };
+    let ProcessedMessageContent::ProposalMessage(queued) = source
+        .process_message(&provider, protocol)
+        .unwrap()
+        .into_content()
+    else {
+        panic!("actual proposal admission")
+    };
+    assert!(matches!(queued.proposal(), Proposal::Update(_)));
+    let reference = queued.proposal_reference_ref().clone();
+    source
+        .store_pending_proposal(provider.storage(), *queued)
+        .unwrap();
+    drop(source);
+    let fresh = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fresh
+            .pending_proposals()
+            .map(|p| p.proposal_reference_ref().clone())
+            .collect::<Vec<_>>(),
+        vec![reference.clone()]
+    );
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("pure own update")
+    };
+    let staged = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        staged.pending_commit().unwrap().queued_proposals().count(),
+        0,
+        "pure rotation must not consume unrelated proposals"
+    );
+    assert_eq!(
+        staged
+            .pending_proposals()
+            .map(|p| p.proposal_reference_ref().clone())
+            .collect::<Vec<_>>(),
+        vec![reference],
+        "source proposal is retained before merge"
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let rotated = MlsGroup::load(
+        provider.storage(),
+        &openmls::group::GroupId::from_slice(gid.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(
+        rotated
+            .own_leaf_node()
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap(),
+        before_leaf
+    );
+    bob.ingest(msg).await.unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    assert_eq!(bob.epoch(&gid).unwrap(), alice.epoch(&gid).unwrap());
+    let mut bob_members = bob.members(&gid).unwrap();
+    let mut alice_members = alice.members(&gid).unwrap();
+    bob_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    alice_members.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    assert_eq!(bob_members, alice_members);
 }
 
 #[tokio::test]
 async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
-    let mut alice = build_client(b"alice");
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = build_clock_client(
+        b"alice",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -4620,7 +5192,7 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
     };
     alice.ingest(routed).await.unwrap();
     assert!(alice.drain_auto_publish().is_empty());
-    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
 
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
     assert_eq!(alice.members(&group_id).unwrap().len(), 2);
@@ -4638,7 +5210,7 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
         "failed auto-publish must not emit a departure; got {events:?}"
     );
 
-    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    advance_selfremove_auto_commit(&mut alice, &group_id, &clock).await;
     assert_eq!(
         alice.drain_auto_publish().len(),
         1,
@@ -4659,8 +5231,25 @@ fn no_legacy_leave_group_call_in_engine_source() {
     use std::path::PathBuf;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src = root.join("src");
-    for entry in walk(&src) {
+    let inputs = walk(&src);
+    assert!(!inputs.is_empty(), "source guard must inspect Rust inputs");
+    let mut selfremove_path = false;
+    for entry in inputs {
         let text = fs::read_to_string(&entry).unwrap();
+        let code = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = code
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        selfremove_path |= compact.contains(".leave_group_via_self_remove(");
+        assert!(
+            !compact.contains(".leave_group("),
+            "found legacy leave_group() in {entry:?}"
+        );
         for line in text.lines() {
             // Allow the comment that explicitly names the legacy call.
             if line.trim_start().starts_with("//") {
@@ -4672,12 +5261,16 @@ fn no_legacy_leave_group_call_in_engine_source() {
             );
         }
     }
+    assert!(
+        selfremove_path,
+        "the production SelfRemove path must be present"
+    );
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.expect("read source directory entry").path();
         if path.is_dir() {
             out.extend(walk(&path));
         } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
@@ -5113,20 +5706,24 @@ async fn a_raced_interval_of_commits_and_chat_replays_in_full_after_the_rejoin()
 
     let target = alice.epoch(&group_id).unwrap();
     let mut received = 0usize;
+    let mut received_apps = Vec::new();
     for round in 1..=8u64 {
         bob.converge_stored_openmls_messages_at(&group_id, round * 1_000_000)
             .expect("a replayed ring must not fail a pass");
-        received += bob
-            .drain_events()
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    cgka_traits::engine::GroupEvent::MessageReceived { group_id: id, .. }
-                        if *id == group_id
-                )
-            })
-            .count();
+        for event in bob.drain_events() {
+            if let cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id: id,
+                sender,
+                payload,
+                ..
+            } = event
+            {
+                assert_eq!(id, group_id);
+                assert_eq!(sender, alice.self_id());
+                received_apps.push(MarmotAppEvent::decode(&payload).unwrap());
+                received += 1;
+            }
+        }
         if bob.epoch(&group_id).unwrap() == target && received == RACED_COMMITS {
             break;
         }
@@ -5135,6 +5732,17 @@ async fn a_raced_interval_of_commits_and_chat_replays_in_full_after_the_rejoin()
         bob.epoch(&group_id).unwrap(),
         target,
         "every raced commit in the ring must apply"
+    );
+    let mut expected = (0..RACED_COMMITS)
+        .map(|round| {
+            MarmotAppEvent::decode(&app_payload_for(&alice, format!("raced-{round}"))).unwrap()
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|a, b| a.id.cmp(&b.id));
+    received_apps.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(
+        received_apps, expected,
+        "every caller-authored raced event is delivered exactly once"
     );
     assert_eq!(
         received, RACED_COMMITS,

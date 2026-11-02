@@ -948,37 +948,61 @@ mod tests {
     fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
         let snapshot = conformance_constant_snapshot();
         assert_eq!(snapshot.schema_version, "1");
-        assert_eq!(snapshot.values.len(), 26);
-        for key in [
-            "P1.max_rewind_commits",
-            "P2.app_message_past_epoch_limit",
-            "P3.max_past_epochs",
-            "P4.settlement_quiescence_ms",
-            "P5.max_convergence_pass_ms",
-            "P6.witness_quorum_senders_per_epoch",
-            "P7.witness_quorum_epochs",
-            "P8.max_witness_override_depth",
-            "P9.sender_ratchet_out_of_order_tolerance",
-            "P10.sender_ratchet_maximum_forward_distance",
-            "E1.max_convergence_reprocessing_passes",
-            "E2.max_deferred_peel_attempts",
-            "E3.max_peel_deferred_rows_per_group",
-            "E3.max_peel_deferred_bytes_per_group",
-            "E3.max_peel_deferred_bytes_per_account",
-            "E4.max_deferred_rows_per_sweep",
-            "E5.candidate_replay_budget_slack",
-            "E6.candidate_replay_budget_floor",
-            "E7.self_remove_auto_commit_jitter_min_ms",
-            "E7.self_remove_auto_commit_jitter_max_ms",
-            "E8.max_deferred_peel_residence_ms",
-            "E9.max_queued_outbound_intents_per_group",
-            "E10.max_candidate_branch_peel_contexts",
-            "E11.foreground_deferred_peel_budget_ms",
-            "E12.max_foreground_deferred_rows",
-            "E13.background_convergence_budget_ms",
-        ] {
-            assert!(snapshot.values.contains_key(key), "missing {key}");
-        }
+        // Adopted values in convergence-reliability-plan.md; comparing only
+        // the key inventory would miss a wrongly mapped value.
+        let expected = BTreeMap::from([
+            ("P1.max_rewind_commits".to_owned(), 5_u64),
+            ("P2.app_message_past_epoch_limit".to_owned(), 5_u64),
+            ("P3.max_past_epochs".to_owned(), 5_u64),
+            ("P4.settlement_quiescence_ms".to_owned(), 1_000_u64),
+            ("P5.max_convergence_pass_ms".to_owned(), 5_000_u64),
+            ("P6.witness_quorum_senders_per_epoch".to_owned(), 2_u64),
+            ("P7.witness_quorum_epochs".to_owned(), 1_u64),
+            ("P8.max_witness_override_depth".to_owned(), 1_u64),
+            (
+                "P9.sender_ratchet_out_of_order_tolerance".to_owned(),
+                100_u64,
+            ),
+            (
+                "P10.sender_ratchet_maximum_forward_distance".to_owned(),
+                1_000_u64,
+            ),
+            ("E1.max_convergence_reprocessing_passes".to_owned(), 16_u64),
+            ("E2.max_deferred_peel_attempts".to_owned(), 32_u64),
+            ("E3.max_peel_deferred_rows_per_group".to_owned(), 2_048_u64),
+            (
+                "E3.max_peel_deferred_bytes_per_group".to_owned(),
+                16_777_216_u64,
+            ),
+            (
+                "E3.max_peel_deferred_bytes_per_account".to_owned(),
+                67_108_864_u64,
+            ),
+            ("E4.max_deferred_rows_per_sweep".to_owned(), 64_u64),
+            ("E5.candidate_replay_budget_slack".to_owned(), 4_u64),
+            ("E6.candidate_replay_budget_floor".to_owned(), 32_u64),
+            (
+                "E7.self_remove_auto_commit_jitter_min_ms".to_owned(),
+                10_u64,
+            ),
+            (
+                "E7.self_remove_auto_commit_jitter_max_ms".to_owned(),
+                50_u64,
+            ),
+            (
+                "E8.max_deferred_peel_residence_ms".to_owned(),
+                2_592_000_000_u64,
+            ),
+            (
+                "E9.max_queued_outbound_intents_per_group".to_owned(),
+                256_u64,
+            ),
+            ("E10.max_candidate_branch_peel_contexts".to_owned(), 8_u64),
+            ("E11.foreground_deferred_peel_budget_ms".to_owned(), 250_u64),
+            ("E12.max_foreground_deferred_rows".to_owned(), 4_u64),
+            ("E13.background_convergence_budget_ms".to_owned(), 500_u64),
+        ]);
+        assert_eq!(snapshot.values, expected);
     }
 
     #[test]
@@ -1012,5 +1036,34 @@ mod tests {
             capture_disbanded_group_snapshot(&group_id, &sibling_device),
             "device-local authorship and roster order/duplicates must not split canonical state"
         );
+        let expected = ConformanceDisbandedGroupSnapshot {
+            group_id_hex: "1020".into(),
+            epoch: 7,
+            actor_identity_hex: "a1".into(),
+            origin_commit_id_hex: Some("c3".into()),
+            commit_digest_hex: "d4".repeat(32),
+            former_member_identities_hex: vec!["a1".into(), "b2".into()],
+            protocol_lifecycle: GroupLifecycleV1::Disbanded,
+            convergence_status: GroupLifecycleState::Disbanded,
+        };
+        assert_eq!(capture_disbanded_group_snapshot(&group_id, &base), expected);
+        for field in ["group", "epoch", "actor", "origin", "digest", "roster"] {
+            let mut changed_group = group_id.clone();
+            let mut changed = base.clone();
+            match field {
+                "group" => changed_group = GroupId::new(vec![0x30]),
+                "epoch" => changed.epoch = EpochId(8),
+                "actor" => changed.actor = MemberId::new(vec![0xb2]),
+                "origin" => changed.origin_commit_id = None,
+                "digest" => changed.commit_digest = [0xe5; 32],
+                "roster" => changed.former_members.clear(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                capture_disbanded_group_snapshot(&changed_group, &changed),
+                expected,
+                "canonical projection must retain {field}"
+            );
+        }
     }
 }

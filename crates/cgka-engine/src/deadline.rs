@@ -79,8 +79,18 @@ mod tests {
 
     #[tokio::test]
     async fn cancels_a_pending_future() {
-        let result = timeout(Duration::from_millis(1), std::future::pending::<()>()).await;
+        let operation_dropped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::clone(&operation_dropped);
+        let operation = async move {
+            let _drop_flag = DropFlag(dropped);
+            std::future::pending::<()>().await;
+        };
+        let result = timeout(Duration::from_millis(1), operation).await;
         assert_eq!(result, Err(DeadlineElapsed));
+        assert!(
+            operation_dropped.load(Ordering::SeqCst),
+            "the native timeout must drop its pending operation before returning"
+        );
     }
 
     #[tokio::test]

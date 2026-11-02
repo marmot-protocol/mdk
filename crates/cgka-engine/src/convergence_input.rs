@@ -340,21 +340,26 @@ mod tests {
         // before the full scan runs `can_gate_outbound`; a state that gates in
         // the classifier but is missing from the constant would make the fast
         // path silently unblock sends.
-        for state in [
-            MessageState::Sent,
-            MessageState::Created,
-            MessageState::Processed,
-            MessageState::Failed,
-            MessageState::Retryable,
-            MessageState::EpochInvalidated,
-            MessageState::PeelDeferred,
-            MessageState::ConvergenceDeferred,
+        for (state, gates) in [
+            (MessageState::Sent, false),
+            (MessageState::Created, true),
+            (MessageState::Processed, false),
+            (MessageState::Failed, false),
+            (MessageState::Retryable, true),
+            (MessageState::EpochInvalidated, false),
+            (MessageState::PeelDeferred, false),
+            (MessageState::ConvergenceDeferred, false),
         ] {
             let classified = input(ConvergencePassMemberRole::CommitEdge, 1, state, 1);
             assert_eq!(
                 classified.can_gate_outbound(),
+                gates,
+                "classifier gating for {state:?}"
+            );
+            assert_eq!(
                 OUTBOUND_GATING_STATES.contains(&state),
-                "{state:?} disagrees between can_gate_outbound and OUTBOUND_GATING_STATES"
+                gates,
+                "indexed gating for {state:?}"
             );
         }
     }

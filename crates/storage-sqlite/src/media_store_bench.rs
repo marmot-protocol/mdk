@@ -412,6 +412,7 @@ impl SqlcipherBench {
             })
             .map_err(error)?;
         let selected = AttachmentHistoryEntry {
+            reaction_artwork: false,
             emoji_tags: Vec::new(),
             message_id_hex: message.clone(),
             attachment_index: 0,
