@@ -627,14 +627,15 @@ These are real simulator scenarios that are still tied to Rust harness details.
 
 ### `failed_invite_staging_does_not_poison_fork_detection_via_harness`
 
-- Setup: Alice's invite fails during commit staging (duplicate-member KeyPackage). Alice then advances to epoch 2 by
+- Setup: Alice's duplicate-device invite is refused before commit staging. Alice then advances to epoch 2 by
   settling Bob's commit through convergence, and a partitioned Dave later delivers a sibling commit from the same
   source epoch.
 - Expected: the sibling commit is adjudicated deterministically (stale losing branch or reorg onto the winner) — never
   a fail-closed `ForkedEpoch` — and Alice's group stays usable for a follow-up invite.
 - Reason: regression guard for the historical phantom fork-detection bookkeeping bug (routing no longer consults
   committer-side bookkeeping at all); mirrors the cgka-engine test
-  `failed_invite_staging_does_not_poison_fork_detection` at the multi-client bus level.
+  `rejected_duplicate_invite_does_not_poison_fork_detection` at the multi-client bus level. The harness test keeps
+  its historical name; duplicate-device filtering now refuses this input before staging.
 
 ### `convergence-e2e-group-events/v1`
 
