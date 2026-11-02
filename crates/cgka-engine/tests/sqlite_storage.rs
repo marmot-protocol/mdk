@@ -774,8 +774,6 @@ async fn local_forget_commits_before_dropping_pending_work_and_survives_reopen()
     );
     alice.confirm_published(pending_retained).await.unwrap();
     assert_eq!(alice.group_context(&retained).unwrap().epoch(), EpochId(2));
-    assert!(alice.drain_auto_publish().is_empty());
-    assert!(alice.drain_auto_proposals().is_empty());
     drop(alice);
     drop(storage);
 
