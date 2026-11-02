@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- The shared runtime roster-write path rejects label/settings changes without a fresh `rename_id` and rejects
+  marker-only non-user changes before staging. It preserves caller-supplied ids for write-ahead recovery;
+  custom lower-level settings writers from the earlier draft must update first (mdk#2628 D86).
+
 - Uploaded media references carry local `source_epoch_identity` provenance.
   Preserve it through host storage and reference round trips. Media and custom
   reaction sends require that exact upload branch, including a branch switch at
@@ -103,6 +107,10 @@
   `key_package_client_name` is set.
 
 ### Added
+
+- Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
 
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a

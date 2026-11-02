@@ -432,8 +432,28 @@ included: one roster commit in the device group, through the same roster write p
 only that entry's label and rename id. The label is at most 64 bytes of UTF-8; empty clears it. While the device group
 has an earlier change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")`
 with nothing sent, since a commit then could build on a roster that is about to change; retry later. A rename whose
-commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
+commit loses a fork is made again on a later maintenance pass, unless another user edit of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
+
+`MarmotAppRuntime::update_linked_device_settings(account_ref, slot_id_hex, add_to_all_chats, bring_history, keep_while_inactive)`
+changes any linked device's supplied settings, this device included. Each setting is optional: omitted values come
+from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
+A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
+eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
+does not leave joined chats. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
+is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
+
+On the editing device, new automatic Adds and history transfers wait for a differing local setting intention to
+settle. Existing history debt keeps its original expiry; once ready, a history setting that is off discards that debt.
+This does not recall deliveries already handed off or change what another device sends before it learns the edit.
+
+A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
+tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
+remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
+of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
+`LinkedDevicesChanged`. These commands remain behind the device-group development gate. Custom clients writing post-link settings must adopt
+this user-edit marker rule before using the feature; earlier draft writers must update first.
 
 When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
 nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once, after the account is signed out; from then on

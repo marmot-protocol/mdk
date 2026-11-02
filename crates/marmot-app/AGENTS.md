@@ -96,17 +96,26 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
-- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, settings, announcements).
   It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
-  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) writes a fresh rename
-  id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
-  roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
-  since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
+  replacement never undoes a change that lands in between. A user edit (`client/device_renames.rs`, D37/D86) writes
+  a fresh rename id next to its label/settings snapshot and is kept on disk before its commit is sent. Legacy NULL settings remain
+  label-only. A later human command first invokes the same recovery helper and re-reads the roster; return Busy if
+  the earlier intention remains unsettled. No-op cancellation must cover every pending difference, so a label-only
+  no-op cannot discard lost settings. Non-user updates preserve label, settings and the id. Maintenance reads only
+  the rename id the winning roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
+  since (made again with a fresh id), any other means another user edit stands. Never infer a rename's fate from labels
   or commit ids. Every entry is created with a fresh rename id (`fresh_rename_id`: the creator's founding entry, the
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
   device entries.
+- Before new automatic Adds or history transfers, `device_setting_ready` defers a target only when the relevant
+  local journal flag differs and its intention has not settled or lost to another user edit. Run D37 upkeep before
+  history maintenance. Apply D76's terminal destination checks only after readiness: pending edits keep existing debt,
+  never extend its expiry or recreate forgotten debt. Check inline send, Blossom preparation and completion, direct
+  Adds and gap Adds; founding inclusion ignores the old-chat setting. Incoming history and already handed-off carrier
+  outcomes settle independently. Legacy label-only rows, equal flags and applied retained edits do not hold work.
 - Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
   as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
   A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and
@@ -280,10 +289,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
   after ten minutes, and never authorize an Add; replay cannot extend one. A live own claim delays another local
   attempt after a terminal Add failure until that same expiry; restart can forget it. Only changed/due chats load their
-  MLS trees: compare effective target keys/exclusions and claimant eligibility with the last actually scheduled
-  inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
-  invalidate all chats. Isolate stock read errors per target, report the error and retry the chat while healthy
-  siblings progress. Check chat quiet again before each target claim; keep original-expiry claims when readiness
+  MLS trees: compare effective target keys/exclusions, pending-setting readiness and claimant eligibility with the
+  last actually scheduled inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
+  invalidate all chats. Preserve live claims and stock waiters for roster-eligible targets during a local settings
+  hold; use only ready targets for scheduling fingerprints, new Adds and stock requests. Isolate settings-readiness
+  and stock read errors per target, report the error and retry the chat while healthy siblings progress.
+  Check chat quiet again before each target claim; keep original-expiry claims when readiness
   changes during publication. With no eligible target, clear pending work without enumerating chats. Hydration
   recovery wakes the recovered chat, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
   exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Select compatible

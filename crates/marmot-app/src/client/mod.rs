@@ -1601,10 +1601,10 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
-        self.drive_history_deliveries().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
+        self.drive_history_deliveries().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;

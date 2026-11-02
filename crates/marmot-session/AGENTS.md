@@ -46,7 +46,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     an outcome), and the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
-    `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
+    `SendIntent::ReplaceDeviceEntry` naming the entry it read. Label/settings changes must supply a present fresh
+    rename id (D86); other edits must preserve it. Validate before staging, and never generate an id behind a caller's
+    write-ahead journal. The engine stages it only while the slot still holds
     that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's

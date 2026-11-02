@@ -123,6 +123,11 @@ impl AppClient {
         let chats = self.sibling_commit_chats_in_list_order()?;
         let mut first_error: Option<AppError> = None;
         'devices: for device in new_devices {
+            if !self.device_setting_ready(&exchange, &device.slot, |settings| {
+                settings.add_to_all_chats
+            })? {
+                continue;
+            }
             let mut owed = Vec::new();
             for chat in &chats {
                 match self.chat_owed_to(&exchange.roster, &device, chat) {
