@@ -316,7 +316,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -365,7 +365,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -426,7 +426,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -513,7 +513,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -605,7 +605,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -677,7 +677,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -738,7 +738,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -808,7 +808,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -868,7 +868,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -938,7 +938,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -1004,7 +1004,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -1074,7 +1074,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -1149,7 +1149,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -1260,7 +1260,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn
@@ -1325,7 +1325,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}
+          name: ci-runner-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mdk-ci-reports
           retention-days: 7
           if-no-files-found: warn

@@ -811,6 +811,39 @@ class RunnerEvidenceTests(unittest.TestCase):
                     self.assertEqual(log.stat().st_size, ci_runner.TAIL_BYTES)
                     self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
+    def test_evidence_write_error_preserves_the_command_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp}):
+                with unittest.mock.patch.object(Path, "write_bytes", side_effect=OSError("No space left on device")):
+                    code = ci_runner.run("full-disk", [sys.executable, "-c",
+                                                  "print('command failure evidence'); raise SystemExit(37)"])
+            self.assertEqual(code, 37)
+            outcome = json.loads(next((Path(tmp) / "mdk-ci-reports").glob("full-disk-*.json")).read_text())
+            self.assertEqual(outcome["exit_code"], 37)
+
+    def test_wrapper_cancellation_drains_the_child_and_records_interruption(self):
+        program = """import signal,sys
+signal.signal(signal.SIGTERM, lambda *_: (print('last cancellation evidence', flush=True), sys.exit(0)))
+print('ready for cancellation', flush=True)
+signal.pause()
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with subprocess.Popen(
+                [sys.executable, str(ROOT / "scripts/ci_runner.py"), "run", "cancelled",
+                 "--", sys.executable, "-c", program], cwd=tmp,
+                env={**os.environ, "RUNNER_TEMP": tmp}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True) as process:
+                while "ready for cancellation" not in process.stdout.readline():
+                    self.assertIsNone(process.poll(), "child must be ready before cancellation")
+                process.terminate()
+                output, error = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 143, error)
+                self.assertIn("last cancellation evidence", output)
+            reports = Path(tmp) / "mdk-ci-reports"
+            self.assertIn("last cancellation evidence", next(reports.glob("*.log")).read_text())
+            outcome = json.loads(next(reports.glob("cancelled-*.json")).read_text())
+            self.assertEqual(outcome, {"label": "cancelled", "exit_code": 0, "signal": 15})
+
     def test_sdk_cleanup_refuses_non_hosted_invocation(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/ci_runner.py"), "prepare"],
                                 env={**os.environ, "GITHUB_ACTIONS": "false"}, capture_output=True)

@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -133,21 +135,84 @@ def run(label: str, command: list[str]) -> int:
         command = [*command[:3], "--tool-config-file", f"mdk-ci:{config}", *command[3:]]
     snapshot("before-" + label)
     tail = bytearray()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          bufsize=0) as child:
-        assert child.stdout is not None
-        while chunk := child.stdout.read(64 * 1024):
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-            tail.extend(chunk)
-            del tail[:-TAIL_BYTES]
-            (root / (name + ".log")).write_bytes(tail)
-        code = child.wait()
-    for report in Path("target/nextest").glob(f"*/{name}.xml"):
-        shutil.copyfile(report, root / (name + ".xml"))
-    (root / (name + ".json")).write_text(json.dumps({"label": label, "exit_code": code}) + "\n")
-    snapshot("after-" + label)
-    return code if code >= 0 else 128 - code
+    child = None
+    interrupted = 0
+    evidence_error = False
+
+    def evidence_failed(error):
+        nonlocal evidence_error
+        if not evidence_error:
+            print(f"CI evidence write failed: {error}", file=sys.stderr, flush=True)
+        evidence_error = True
+
+    def persist_tail():
+        if not evidence_error:
+            try:
+                (root / (name + ".log")).write_bytes(tail)
+            except OSError as error:
+                # Keep draining the pipe even if the runner fills up. Raising
+                # inside Popen's context could deadlock while waiting for a
+                # child blocked on that pipe, hiding its original failure.
+                evidence_failed(error)
+
+    def forward(signum, _frame):
+        nonlocal interrupted
+        interrupted = signum
+        if child is not None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        # A separate process group lets the wrapper forward cancellation once
+        # to the command and its descendants, while staying alive to drain it.
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              bufsize=0, start_new_session=True) as child:
+            if interrupted:
+                forward(interrupted, None)
+            assert child.stdout is not None
+            dirty = False
+            last_flush = 0.0
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    if selector.select(timeout=1):
+                        chunk = os.read(child.stdout.fileno(), 64 * 1024)
+                        if not chunk:
+                            break
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                        tail.extend(chunk)
+                        del tail[:-TAIL_BYTES]
+                        dirty = True
+                    now = time.monotonic()
+                    # Persist during quiet periods too, but at most once per
+                    # second instead of rewriting a megabyte for every line.
+                    if dirty and now - last_flush >= 1:
+                        persist_tail()
+                        dirty = False
+                        last_flush = now
+            if dirty:
+                persist_tail()
+            code = child.wait()
+        try:
+            for report in Path("target/nextest").glob(f"*/{name}.xml"):
+                shutil.copyfile(report, root / (name + ".xml"))
+            outcome = {"label": label, "exit_code": code}
+            if interrupted:
+                outcome["signal"] = interrupted
+            (root / (name + ".json")).write_text(json.dumps(outcome) + "\n")
+            snapshot("after-" + label)
+        except OSError as error:
+            evidence_failed(error)
+        if interrupted:
+            return 128 + interrupted
+        return (code if code >= 0 else 128 - code) or int(evidence_error)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def main() -> int:
