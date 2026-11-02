@@ -8,8 +8,8 @@ Group IDs are opaque MLS IDs, including 16-byte IDs, rather than 32-byte route I
 
 ## Paging and categories
 
-1. Start with no cursor and a limit from 1 through 100. The limit counts original
-   slots, including rejected attachments. Each entry includes source/message IDs,
+1. Start with no cursor and a limit from 1 through 100. The limit counts source
+   candidates, including rejected chat attachments. Each entry includes source/message IDs,
    sender, display/received timestamps, optional source epoch, MDK category and the
    shared parser's accepted reference or typed rejection with its original index.
    Discovery honors the runtime's explicit loopback-development flag. The existing
@@ -53,6 +53,11 @@ surrounding colons. Oversized metadata, artwork beyond those indices, or no
 eligible match produces `None`; keep the shortcode fallback. The first
 well-formed definition for the reaction's exact shortcode wins, even if its
 locator matches no image; a later duplicate definition does not override it.
+Only image slots naming that definition enter the reaction candidate index;
+unrelated image, video and file slots produce no discovery or automatic demand.
+The shared strict parser decides which candidate is usable. Rejected named artwork
+is omitted from group and account discovery pages, retaining their continuation,
+and is rejected before acquisition performs network I/O.
 
 Build an `AttachmentLocalTargetFfi` from the returned `messageIdHex`,
 `sourceMessageIdHex` and accepted attachment's original `attachmentIndex`. Use
@@ -85,8 +90,9 @@ earliest-reaction replacement, deletion, permission denial and stale late result
 ## Inline emoji artwork
 
 Each entry carries `role` (`Shared` or `InlineEmoji`) separately from its MIME
-category. Gallery clients exclude `InlineEmoji`; the API still returns every
-original slot and its parser verdict, so an emoji-only page can have no gallery
+category. Gallery clients exclude `InlineEmoji`; chat attachments retain every
+original slot and parser verdict, while reaction discovery returns only validated
+inline artwork. An emoji-only page can have no gallery
 items while `has_more` remains true. Never renumber slots or stop on a filtered page.
 
 The native classifier matches accepted image locators exactly against well-formed

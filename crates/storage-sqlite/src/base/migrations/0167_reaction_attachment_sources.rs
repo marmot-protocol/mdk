@@ -37,10 +37,36 @@ FROM app_events a, json_each(
 WHERE a.kind=7 AND a.invalidated=0
   AND (a.source_message_id_hex IS NOT NULL OR EXISTS(SELECT 1 FROM app_event_imports i
       WHERE i.group_id_hex=a.group_id_hex AND i.message_id_hex=a.message_id_hex))
-  AND EXISTS (SELECT 1 FROM message_modifier_edges e JOIN message_timeline t
-      ON t.group_id_hex=e.group_id_hex AND t.message_id_hex=e.target_message_id_hex
-      WHERE e.group_id_hex=a.group_id_hex AND e.modifier_message_id_hex=a.message_id_hex
-        AND e.kind=7 AND t.deleted=0 AND t.invalidation_status IS NULL)
+  -- This is a candidate index, not a second encrypted-media parser. Only
+  -- image slots naming the shortcode's first well-formed emoji URL qualify;
+  -- the app's strict parser still rejects malformed named artwork before I/O.
+  AND length(CAST(a.tags_json AS BLOB))<=16384 AND length(CAST(a.plaintext AS BLOB))<=64
+  AND CAST(j.key AS INTEGER)<100
+  AND EXISTS (SELECT 1 FROM json_each(j.value) m WHERE m.type='text'
+      AND substr(m.value,1,2)='m '
+      AND lower(trim(substr(m.value,3,instr(substr(m.value,3)||'/','/')-1),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)))='image')
+  AND EXISTS (SELECT 1 FROM json_each(j.value) l WHERE l.type='text'
+      AND substr(l.value,1,8)='locator ' AND instr(substr(l.value,9),' ')>1
+      AND substr(l.value,9+instr(substr(l.value,9),' '))=(
+          SELECT json_extract(e.value,'$[2]') FROM json_each(a.tags_json) e
+          WHERE CASE WHEN e.type='array' THEN
+              json_array_length(e.value) BETWEEN 3 AND 4
+              AND json_extract(e.value,'$[0]')='emoji'
+              AND NOT EXISTS (SELECT 1 FROM json_each(e.value) field WHERE field.type<>'text')
+              AND length(CAST(json_extract(e.value,'$[1]') AS BLOB)) BETWEEN 1 AND 64
+              -- SQLite GLOB stops at NUL; Rust's ASCII-byte check does not.
+              AND instr(json_extract(e.value,'$[1]'),char(0))=0
+              AND json_extract(e.value,'$[1]') NOT GLOB '*[^a-zA-Z0-9_-]*'
+              AND ':'||json_extract(e.value,'$[1]')||':'=a.plaintext
+              -- Rust str::trim's Unicode White_Space set.
+              AND trim(json_extract(e.value,'$[2]'),char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))<>''
+          ELSE 0 END ORDER BY CAST(e.key AS INTEGER) LIMIT 1))
+  AND EXISTS (SELECT 1 FROM message_timeline t
+      WHERE t.group_id_hex=a.group_id_hex AND t.message_id_hex=(
+          SELECT json_extract(e.value,'$[1]') FROM json_each(a.tags_json) e
+          WHERE CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='e' ELSE 0 END
+          ORDER BY CAST(e.key AS INTEGER) LIMIT 1)
+        AND t.deleted=0 AND t.invalidation_status IS NULL)
   AND NOT EXISTS (SELECT 1 FROM message_modifier_edges e JOIN app_events d
       ON d.group_id_hex=e.group_id_hex AND d.message_id_hex=e.modifier_message_id_hex
       WHERE e.group_id_hex=a.group_id_hex AND e.target_message_id_hex=a.message_id_hex
@@ -91,8 +117,8 @@ mod tests {
 INSERT INTO account_groups(group_id_hex,endpoint,updated_at,pending_confirmation) VALUES('aa','',0,0);
 INSERT INTO app_events(group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
 VALUES('aa','root','source-root',1,'received','alice','hello',9,'[]',1,1),
- ('aa','active','source-active',1,'received','alice',':party:',7,'[["e","root"],["imeta","v future"],["emoji","party","https://example.com/a"]]',2,2),
- ('aa','retracted','source-retracted',1,'received','alice',':party:',7,'[["e","root"],["imeta","v future"]]',3,3),
+ ('aa','active','source-active',1,'received','alice',':party:',7,'[["e","root"],["imeta","v encrypted-media-v2","m video/mp4","locator blossom-v1 https://example.com/a"],["imeta","v encrypted-media-v2","m image/png","locator blossom-v1 https://example.com/a","ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111","plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222","nonce 333333333333333333333333","filename party.png"],["emoji","party","https://example.com/a"]]',2,2),
+ ('aa','retracted','source-retracted',1,'received','alice',':party:',7,'[["e","root"],["imeta","v encrypted-media-v2","m image/png","locator blossom-v1 https://example.com/a","ciphertext_sha256 1111111111111111111111111111111111111111111111111111111111111111","plaintext_sha256 2222222222222222222222222222222222222222222222222222222222222222","nonce 333333333333333333333333","filename party.png"],["emoji","party","https://example.com/a"]]',3,3),
  ('aa','delete','source-delete',1,'received','alice','',5,'[["e","retracted"]]',4,4);
 INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json)
 VALUES('aa','root','source-root',1,'received','alice','hello',9,'[]',1,1,'[]');
@@ -110,7 +136,7 @@ INSERT INTO message_modifier_edges VALUES('aa','active','root',7,'alice',2),('aa
         )
         .unwrap();
         let actual: (String,String,i64) = conn.query_row("SELECT message_id_hex,source_message_id_hex,attachment_index FROM attachment_history",[], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert_eq!(actual, ("active".into(), "source-active".into(), 0));
+        assert_eq!(actual, ("active".into(), "source-active".into(), 1));
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM attachment_worker_demand WHERE message_id_hex='active'",

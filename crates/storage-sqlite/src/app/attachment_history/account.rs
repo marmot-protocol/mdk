@@ -172,6 +172,7 @@ fn sql(seek: bool) -> String {
         ""
     };
     format!("SELECT timeline_at,message_id_hex,attachment_order,
+        EXISTS(SELECT 1 FROM app_events a WHERE a.group_id_hex=h.group_id_hex AND a.message_id_hex=h.message_id_hex AND a.kind=7) AS reaction_artwork,
         attachment_index,source_message_id_hex,source_epoch,sender,received_at,
         substr(slot_json,1,32769) AS slot_json,substr((SELECT json_group_array(json(e.value)) FROM (SELECT tags_json FROM message_timeline WHERE group_id_hex=h.group_id_hex AND message_id_hex=h.message_id_hex
                 UNION ALL SELECT tags_json FROM app_events WHERE group_id_hex=h.group_id_hex AND message_id_hex=h.message_id_hex AND kind=7) t,

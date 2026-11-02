@@ -112,6 +112,18 @@ pub(super) fn present(
         attachment,
     })
 }
+/// A reaction has no standalone Shared message. Keep its strict parser verdict
+/// for acquisition, but omit rejected named candidates from discovery pages.
+/// Cursors still advance over the candidate so empty pages remain bounded.
+pub(super) fn present_for_history(
+    entry: storage_sqlite::AttachmentHistoryEntry,
+    allow_loopback: bool,
+) -> Result<Option<AttachmentEntry>, AppError> {
+    let reaction_artwork = entry.reaction_artwork;
+    let entry = present(entry, allow_loopback)?;
+    Ok((!reaction_artwork || entry.role == AttachmentRole::InlineEmoji).then_some(entry))
+}
+
 /// First well-formed definition wins for each case-sensitive shortcode, even if unmatched.
 /// Every accepted image slot using that artwork locator has the inline role; acquisition is unchanged.
 fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) -> AttachmentRole {
@@ -246,7 +258,7 @@ impl MarmotAppRuntime {
                     entries: page
                         .entries
                         .into_iter()
-                        .map(|e| present(e, allow_loopback))
+                        .filter_map(|e| present_for_history(e, allow_loopback).transpose())
                         .collect::<Result<_, _>>()?,
                     version: page.version,
                     next_cursor: page.next_cursor,

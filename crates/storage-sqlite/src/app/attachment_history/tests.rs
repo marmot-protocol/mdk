@@ -779,8 +779,106 @@ fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
             "party".into(),
             "https://example.com/party".into(),
         ],
-        vec!["imeta".into(), "url https://example.com/party".into()],
+        vec![
+            "imeta".into(),
+            "v encrypted-media-v2".into(),
+            "m image/png".into(),
+            "locator blossom-v1 https://example.com/party".into(),
+            format!("ciphertext_sha256 {}", "11".repeat(32)),
+            format!("plaintext_sha256 {}", "22".repeat(32)),
+            format!("nonce {}", "33".repeat(12)),
+            "filename party.png".into(),
+        ],
     ];
+    // A reaction carries artwork, never an otherwise unrepresented shared file.
+    for (i, (content, tags)) in [
+        (
+            "+",
+            vec![vec![
+                "imeta",
+                "m video/mp4",
+                "locator blossom-v1 https://example.com/video",
+            ]],
+        ),
+        (
+            ":party:",
+            vec![
+                vec![
+                    "imeta",
+                    "m image/png",
+                    "locator blossom-v1 https://example.com/unrelated",
+                ],
+                vec!["emoji", "party", "https://example.com/party"],
+            ],
+        ),
+        (
+            ":party:",
+            vec![
+                vec![
+                    "imeta",
+                    "m video/mp4",
+                    "locator blossom-v1 https://example.com/party",
+                ],
+                vec!["emoji", "party", "https://example.com/party"],
+            ],
+        ),
+        (
+            ":party\0!:",
+            vec![
+                vec![
+                    "imeta",
+                    "m image/png",
+                    "locator blossom-v1 https://example.com/party",
+                ],
+                vec!["emoji", "party\0!", "https://example.com/party"],
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut unrelated = event.clone();
+        unrelated.message_id_hex = format!("unrelated-reaction-{i}");
+        unrelated.source_message_id_hex = Some(format!("source-unrelated-reaction-{i}"));
+        unrelated.plaintext = content.into();
+        unrelated.tags = vec![vec!["e".into(), "chat".into()]];
+        unrelated.tags.extend(
+            tags.into_iter()
+                .map(|t| t.into_iter().map(str::to_owned).collect()),
+        );
+        // Keep each negative slot structurally valid: the source-role filter,
+        // rather than a downstream media-parser rejection, must exclude it.
+        for slot in unrelated
+            .tags
+            .iter_mut()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            slot.extend(
+                event.tags[2]
+                    .iter()
+                    .skip(1)
+                    .filter(|field| !field.starts_with("m ") && !field.starts_with("locator "))
+                    .cloned(),
+            );
+        }
+        app.record_app_event(&unrelated).unwrap();
+        assert!(
+            page(&app).entries.is_empty(),
+            "unrelated reaction slot {i} entered discovery"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM attachment_worker_demand", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0,
+            "unrelated reaction slot {i} created automatic demand"
+        );
+    }
     app.record_app_event(&event).unwrap();
     let original = event.clone();
     // The public resolver's database read is a point lookup even in a chat
@@ -798,6 +896,24 @@ fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
         },
     );
     assert_eq!(candidates.len(), 1);
+    // A busy target can have many plain reactions. Adding one more must not
+    // reprocess every sibling's attachment state during catch-up.
+    sql(&store, "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<499)
+        INSERT INTO app_events(group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
+        SELECT 'aa',printf('plain-%04d',i),printf('source-plain-%04d',i),7,'received','bob','+',7,'[[\"e\",\"chat\"]]',10,10 FROM n;
+        INSERT INTO message_modifier_edges(group_id_hex,modifier_message_id_hex,target_message_id_hex,kind,sender,recorded_at)
+        SELECT 'aa',message_id_hex,'chat',7,sender,recorded_at FROM app_events WHERE message_id_hex GLOB 'plain-*'");
+    let mut newest = event.clone();
+    newest.message_id_hex = "newest-plain".into();
+    newest.source_message_id_hex = Some("source-newest-plain".into());
+    newest.plaintext = "+".into();
+    newest.tags = vec![vec!["e".into(), "chat".into()]];
+    crate::base::query_work_test_support::measured(
+        &store,
+        "adding a plain reaction to a busy target",
+        400_000,
+        || app.record_app_event(&newest).unwrap(),
+    );
     let p = page(&app);
     assert_eq!(
         p.entries.len(),
@@ -863,7 +979,12 @@ fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
         page(&app).entries.is_empty(),
         "withdrawn reaction has no live source"
     );
+    let mut other = root.clone();
+    other.message_id_hex = "other-target".into();
+    other.source_message_id_hex = Some("source-other-target".into());
+    app.record_app_event(&other).unwrap();
     let mut retained = original;
+    retained.tags.push(vec!["e".into(), other.message_id_hex]);
     retained.message_id_hex = "second-reaction".into();
     retained.source_message_id_hex = Some("source-second-reaction".into());
     app.record_app_event(&retained).unwrap();
@@ -880,6 +1001,6 @@ fn reaction_attachment_sources_follow_event_lifecycle_without_timeline_rows() {
         .unwrap();
     assert!(
         page(&app).entries.is_empty(),
-        "retention of the target revokes surviving reaction sources"
+        "retention of the first target revokes artwork despite a live second e target"
     );
 }

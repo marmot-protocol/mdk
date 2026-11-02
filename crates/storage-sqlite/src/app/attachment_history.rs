@@ -12,6 +12,8 @@ pub const MAX_ATTACHMENT_HISTORY_PAGE: usize = 100;
 /// No message body or complete album is loaded by this projection.
 #[derive(Clone)]
 pub struct AttachmentHistoryEntry {
+    /// Source context for discovery: rejected reaction artwork has no Shared message.
+    pub reaction_artwork: bool,
     pub message_id_hex: String,
     pub attachment_index: usize,
     pub source_message_id_hex: String,
@@ -124,7 +126,8 @@ fn page_sql(cursor: bool) -> String {
     } else {
         String::new()
     };
-    format!("SELECT {KEY_COLUMNS},attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,slot_json,
+    format!("SELECT {KEY_COLUMNS},
+        EXISTS(SELECT 1 FROM app_events a WHERE a.group_id_hex=attachment_history.group_id_hex AND a.message_id_hex=attachment_history.message_id_hex AND a.kind=7) AS reaction_artwork,attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,slot_json,
         (SELECT json_group_array(json(e.value)) FROM (SELECT tags_json FROM message_timeline WHERE group_id_hex=attachment_history.group_id_hex AND message_id_hex=attachment_history.message_id_hex
               UNION ALL SELECT tags_json FROM app_events WHERE group_id_hex=attachment_history.group_id_hex AND message_id_hex=attachment_history.message_id_hex AND kind=7) t,
             json_each(CASE WHEN json_valid(t.tags_json) THEN
@@ -178,7 +181,7 @@ impl SqliteAppStorage {
         now: u64,
     ) -> Result<Vec<AttachmentHistoryEntry>, StorageError> {
         self.connection.with_deferred_read(|conn| {
-            let mut stmt = conn.prepare_cached("SELECT h.message_id_hex,h.attachment_index,h.source_message_id_hex,
+            let mut stmt = conn.prepare_cached("SELECT 1 AS reaction_artwork,h.message_id_hex,h.attachment_index,h.source_message_id_hex,
                 h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,
                 (SELECT json_group_array(json(e.value) ORDER BY CAST(e.key AS INTEGER)) FROM json_each(a.tags_json) e
                  WHERE CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji'
@@ -328,7 +331,12 @@ pub(crate) fn refresh_reaction_attachment_sources_tx(
         } else {
             "SELECT message_id_hex FROM app_events WHERE group_id_hex=?1 AND kind=7 AND ?2 IS NULL"
         };
-        let mut stmt = conn.prepare_cached(sql).storage()?;
+        // A changed target can have many plain reactions. Only actual artwork
+        // candidates or prior sources need the per-source reconciliation work.
+        let sql = format!("SELECT candidate.message_id_hex FROM ({sql}) candidate
+            WHERE EXISTS(SELECT 1 FROM attachment_history h WHERE h.group_id_hex=?1 AND h.message_id_hex=candidate.message_id_hex)
+               OR EXISTS(SELECT 1 FROM reaction_attachment_history_source s WHERE s.group_id_hex=?1 AND s.message_id_hex=candidate.message_id_hex)");
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
         stmt.query_map(rusqlite::params![group, target], |r| r.get::<_, String>(0))
             .storage()?
             .collect::<Result<Vec<_>, _>>()
@@ -389,6 +397,7 @@ fn entry_with_metadata(
     let attachment_index = r.as_ref().column_index("attachment_index")?;
     let source_epoch_index = r.as_ref().column_index("source_epoch")?;
     Ok(AttachmentHistoryEntry {
+        reaction_artwork: r.get("reaction_artwork")?,
         message_id_hex: r.get("message_id_hex")?,
         attachment_index: usize::try_from(nonnegative(r, attachment_index)?)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(attachment_index, i64::MAX))?,

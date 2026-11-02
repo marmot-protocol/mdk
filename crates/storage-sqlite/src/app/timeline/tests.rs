@@ -2314,9 +2314,19 @@ fn reaction_event_reprojects_target_without_full_timeline_rebuild() {
         .unwrap();
     fail_on_timeline_delete(&store);
 
-    let update = app
-        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
-        .unwrap();
+    let mut event = reaction("reaction-1", "bob", "target", 2, "+");
+    event.tags.push(vec!["e".into(), "unrelated".into()]);
+    let update = app.record_app_event(&event).unwrap();
+    let group = "11".repeat(32);
+    assert!(
+        app.timeline_message(&group, "unrelated")
+            .unwrap()
+            .unwrap()
+            .reactions
+            .user_reactions
+            .is_empty(),
+        "a second e tag cannot count the reaction again"
+    );
 
     assert!(matches!(
         update.changes.as_slice(),
@@ -2325,6 +2335,29 @@ fn reaction_event_reprojects_target_without_full_timeline_rebuild() {
             message,
         }] if message.message_id_hex == "target"
     ));
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER panic_message_timeline_delete")
+        .unwrap();
+    app.rebuild_message_timeline_for_group(&group).unwrap();
+    assert!(
+        app.timeline_message(&group, "unrelated")
+            .unwrap()
+            .unwrap()
+            .reactions
+            .user_reactions
+            .is_empty()
+    );
+    assert_eq!(
+        app.timeline_message(&group, "target")
+            .unwrap()
+            .unwrap()
+            .reactions
+            .user_reactions
+            .len(),
+        1
+    );
 }
 
 #[test]

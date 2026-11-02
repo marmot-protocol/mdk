@@ -431,6 +431,7 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
     ] {
         let raw = tag(mime);
         let entry = storage_sqlite::AttachmentHistoryEntry {
+            reaction_artwork: false,
             message_id_hex: "private-message".into(),
             source_message_id_hex: "private-source".into(),
             attachment_index: 9,
@@ -732,6 +733,10 @@ async fn reaction_artwork_lookup_keeps_source_identity_and_safe_fallbacks() {
     let runtime = app.runtime();
     let url = format!("https://media.example/{}.bin", "11".repeat(32));
     let emoji = |code: &str, url: &str| vec!["emoji".to_owned(), code.to_owned(), url.to_owned()];
+    let mut legacy_image = tag(" \tIMAGE \t/png; legacy");
+    legacy_image[1] = "v encrypted-media-v1".into();
+    let mut rejected_image = tag("image/png");
+    rejected_image.push("nonce duplicate".into());
     for (i, (tags, expected_index)) in [
         (vec![tag("image/png")], None),
         (vec![tag("image/png"), emoji("other", &url)], None),
@@ -752,6 +757,23 @@ async fn reaction_artwork_lookup_keeps_source_identity_and_safe_fallbacks() {
             Some(1),
         ),
         (vec![tag("audio/ogg"), emoji("wave", &url)], None),
+        (vec![legacy_image, emoji("wave", &url)], Some(0)),
+        (
+            vec![
+                tag("image/png"),
+                emoji("wave", "\u{a0}\u{2003}"),
+                emoji("wave", &url),
+            ],
+            Some(0),
+        ),
+        (
+            vec![rejected_image, tag("image/png"), emoji("wave", &url)],
+            Some(1),
+        ),
+        (
+            vec![tag("image/png"), tag("image/png"), emoji("wave", &url)],
+            Some(0),
+        ),
         (
             vec![
                 tag("image/png"),
@@ -791,6 +813,36 @@ async fn reaction_artwork_lookup_keeps_source_identity_and_safe_fallbacks() {
             _ => panic!("wrong artwork fallback for source case {i}"),
         }
     }
+    // Named but rejected artwork remains parser-local, never a Shared orphan
+    // in either discovery surface. Accepted duplicate slots keep their role.
+    let AttachmentPageRead::Page(page) = runtime
+        .attachment_history_page("alice", &group, 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("missing group page")
+    };
+    assert!(!page.entries.is_empty());
+    assert!(
+        page.entries
+            .iter()
+            .all(|entry| entry.role == AttachmentRole::InlineEmoji),
+        "reaction candidates leaked as Shared gallery entries"
+    );
+    let super::super::account_attachment_history::AccountAttachmentPageRead::Page(page) = runtime
+        .account_attachment_history_page("alice", Default::default(), 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("missing account page")
+    };
+    assert!(!page.entries.is_empty());
+    assert!(
+        page.entries
+            .iter()
+            .all(|entry| entry.entry.role == AttachmentRole::InlineEmoji),
+        "reaction candidates leaked as Shared account entries"
+    );
     assert!(runtime.accounts.workers.lock().await.is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
