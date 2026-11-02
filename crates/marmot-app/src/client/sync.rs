@@ -218,7 +218,7 @@ const FULL_HISTORY_ADMISSION_RESERVE_DIVISOR: u32 = 6;
 const RECOVERY_JOB_CANCEL_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) struct FullHistoryRepairControl<'a> {
-    started: Instant,
+    started: tokio::time::Instant,
     timeout: Duration,
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
@@ -241,7 +241,7 @@ impl FullHistoryRepairControl<'_> {
 
     /// When the comparison pass must end, leaving the admission reserve.
     pub(crate) fn network_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started) + self.network_budget()
+        self.started + self.network_budget()
     }
 
     fn network_budget(&self) -> Duration {
@@ -253,7 +253,7 @@ impl FullHistoryRepairControl<'_> {
     /// follows gets a whole one.
     fn for_job(&self) -> Self {
         FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: self.timeout,
             cancelled: self.cancelled,
         }
@@ -5992,7 +5992,7 @@ impl AppClient {
                 .await;
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,
             cancelled,
         })
@@ -6638,28 +6638,68 @@ impl AppClient {
             origin_commit_id: None,
             moderation_grant,
         };
-        let projection_update = self.app.record_account_app_event_at(
-            &self.state.label,
-            &message_projection,
-            message.received_at,
-        )?;
-        if retains_encrypted_media
-            && self
-                .remember_received_encrypted_media_secret(
+        // The engine's retained-anchor read can require a separate database
+        // savepoint. Resolve it before taking the app write transaction, then
+        // commit the available key together with its source slots.
+        let source_media_secret = if retains_encrypted_media {
+            match carried_media_secret {
+                Some(secret) => Some(cgka_traits::SecretBytes::new(secret.as_bytes().to_vec())),
+                None => match self
+                    .exportable_encrypted_media_secret(&message.group_id, message.source_epoch)
+                {
+                    Ok(secret) => secret,
+                    Err(error)
+                        if matches!(&error, AppError::Storage(_))
+                            || matches!(
+                                error.as_engine_error(),
+                                Some(cgka_traits::EngineError::Storage(_))
+                            ) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        // Late/legacy events can outlive their retained source
+                        // exporter. Preserve that content and any existing
+                        // cached material when historic keys are unavailable.
+                        tracing::warn!(
+                            target: "marmot_app::media",
+                            method = "project_received_message",
+                            error_code = "encrypted_media_secret_cache_skipped",
+                            "source media key unavailable for a legacy received message",
+                        );
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        let projection_update = if let Some(secret) = source_media_secret {
+            // An acknowledged source must carry its available media key. A
+            // required-key failure rolls back the source and leaves its durable
+            // engine outbox event available after retry or restart.
+            let storage = self.app.account_storage(&self.state.label)?;
+            cgka_traits::StorageProvider::with_transaction(&storage, |_| {
+                let update = self.app.record_account_app_event_at(
+                    &self.state.label,
+                    &message_projection,
+                    message.received_at,
+                )?;
+                self.remember_received_encrypted_media_secret(
                     &message.group_id,
                     message.source_epoch,
                     &message.tags,
-                    carried_media_secret,
-                )
-                .is_err()
-        {
-            tracing::warn!(
-                target: "marmot_app::media",
-                method = "project_received_message",
-                error_code = "encrypted_media_secret_cache_skipped",
-                "failed to cache encrypted media source epoch secret",
-            );
-        }
+                    secret.as_slice(),
+                )?;
+                Ok::<_, AppError>(update)
+            })?
+        } else {
+            self.app.record_account_app_event_at(
+                &self.state.label,
+                &message_projection,
+                message.received_at,
+            )?
+        };
         summary.projection_updates.push(projection_update);
         self.prune_plaintext_retention_for_group(&message.group_id)?;
         Ok(())

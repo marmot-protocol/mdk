@@ -365,7 +365,7 @@ mod tests {
         let result = validate_app_payload_for_sender(&payload, &MemberId::new(Vec::new()));
         assert!(matches!(
             result,
-            Err(EngineError::InvalidAppMessagePayload(_))
+            Err(EngineError::InvalidAppMessagePayload(reason)) if reason == "application message has no authenticated member sender"
         ));
     }
 
@@ -376,7 +376,7 @@ mod tests {
         let result = validate_app_payload_for_sender(&payload, &sender);
         assert!(matches!(
             result,
-            Err(EngineError::InvalidAppMessagePayload(_))
+            Err(EngineError::InvalidAppMessagePayload(reason)) if reason == "marmot app event pubkey mismatch"
         ));
     }
 

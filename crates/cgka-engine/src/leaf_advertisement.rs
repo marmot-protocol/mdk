@@ -195,3 +195,107 @@ impl<S: StorageProvider> Engine<S> {
         crate::app_components::app_component_support_blockers(&mls_group, component_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account_identity_proof::{
+        AccountIdentityProofMaterial, account_identity_proof_capability,
+    };
+    use crate::engine::DEFAULT_CIPHERSUITE;
+    use openmls::extensions::{AppDataDictionary, ExtensionType, UnknownExtension};
+    use openmls::prelude::{Capabilities, KeyPackage};
+
+    #[test]
+    fn refresh_unions_support_and_preserves_every_other_leaf_byte() {
+        let engine = crate::distributed_convergence::tests::test_engine();
+        let AccountIdentityProofMaterial::LegacyExtension(proof) =
+            &engine.identity.account_identity_proof
+        else {
+            panic!("legacy fixture");
+        };
+        let old = 0x9101;
+        let new = 0x9102;
+        let opaque_id = 0x9201;
+        let opaque = vec![0, 255, 7, 0];
+        let other = Extension::Unknown(0xf123, UnknownExtension(vec![0, 3, 0xff]));
+        let mut dictionary = AppDataDictionary::new();
+        dictionary.insert(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&BTreeSet::from([APP_COMPONENTS_COMPONENT_ID, old])),
+        );
+        dictionary.insert(opaque_id, opaque.clone());
+        let make_leaf = |with_dictionary| {
+            let mut extensions = vec![proof.clone(), other.clone()];
+            if with_dictionary {
+                extensions.push(Extension::AppDataDictionary(
+                    AppDataDictionaryExtension::new(dictionary.clone()),
+                ));
+            }
+            KeyPackage::builder()
+                .leaf_node_capabilities(Capabilities::new(
+                    None,
+                    Some(&[DEFAULT_CIPHERSUITE]),
+                    Some(&[
+                        account_identity_proof_capability(),
+                        ExtensionType::Unknown(0xf123),
+                        ExtensionType::AppDataDictionary,
+                    ]),
+                    None,
+                    None,
+                ))
+                .leaf_node_extensions(Extensions::from_vec(extensions).unwrap())
+                .build(
+                    DEFAULT_CIPHERSUITE,
+                    &openmls_rust_crypto::OpenMlsRustCrypto::default(),
+                    &engine.identity.signer,
+                    engine.identity.credential_with_key.clone(),
+                )
+                .unwrap()
+                .key_package()
+                .leaf_node()
+                .clone()
+        };
+        let leaf = make_leaf(true);
+        crate::account_identity_proof::validate_leaf_account_identity_proof(
+            &leaf,
+            DEFAULT_CIPHERSUITE,
+        )
+        .unwrap();
+        let tag = vec![4, 0, 0xfe];
+        let refreshed =
+            own_leaf_refresh_extensions(&leaf, &AppComponentSet::new([new]), Some(tag.clone()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(refreshed.unknown(0xf123), leaf.extensions().unknown(0xf123));
+        assert_eq!(refreshed.unknown(0xf2f1), leaf.extensions().unknown(0xf2f1));
+        assert_eq!(refreshed.iter().count(), leaf.extensions().iter().count());
+        let result = refreshed.app_data_dictionary().unwrap().dictionary();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.get(&opaque_id), Some(opaque.as_slice()));
+        assert_eq!(result.get(&DEVICE_TAG_COMPONENT_ID), Some(tag.as_slice()));
+        assert_eq!(
+            result.get(&APP_COMPONENTS_COMPONENT_ID),
+            Some(
+                encode_components_list(&BTreeSet::from([
+                    APP_COMPONENTS_COMPONENT_ID,
+                    old,
+                    new,
+                    DEVICE_TAG_COMPONENT_ID
+                ]))
+                .as_slice()
+            )
+        );
+        let no_dictionary = make_leaf(false);
+        crate::account_identity_proof::validate_leaf_account_identity_proof(
+            &no_dictionary,
+            DEFAULT_CIPHERSUITE,
+        )
+        .unwrap();
+        assert!(
+            own_leaf_refresh_extensions(&no_dictionary, &AppComponentSet::new([new]), Some(tag))
+                .unwrap()
+                .is_none()
+        );
+    }
+}

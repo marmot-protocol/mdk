@@ -8,6 +8,17 @@
 
 ### Breaking changes
 
+- Uploaded media references carry local `source_epoch_identity` provenance.
+  Preserve it through host storage and reference round trips. Media and custom
+  reaction sends require that exact upload branch, including a branch switch at
+  the same epoch number, and refuse missing or stale provenance with
+  `MediaReferenceStaleEpoch`. Older and received references remain downloadable;
+  upload their verified bytes again before sending. The `imeta` wire format is
+  unchanged. Attachment-bearing reactions receive the same engine pin and
+  no-retention guarantee as media messages (mdk#2840, mdk#2151). Rust callers
+  constructing `MediaAttachmentOutcome::Accepted` box its `reference`; the
+  Swift, Kotlin, and C outcome shapes are unchanged.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It
@@ -614,6 +625,11 @@
   event keeps its fields, level, message and `method`.
 
 ### Fixed
+
+- Received media sources and available decryption keys commit together, so a
+  failed key write remains retryable after restart instead of acknowledging
+  unusable artwork. Authenticated carried keys and retained canonical source
+  exporters replace stale same-epoch cache entries (mdk#2840).
 
 - A device cleans up after every device its device group's roster stops
   listing, not only one whose `removed` record it still reads (mdk#2761):

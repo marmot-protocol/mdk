@@ -1056,6 +1056,7 @@ mod mention_tests {
                     media_type: "image/jpeg".into(),
                     version: "2".into(),
                     source_epoch: 0,
+                    source_epoch_identity: None,
                     dim: None,
                     thumbhash: None,
                 }],
@@ -1238,6 +1239,7 @@ mod application_tag_tests {
             media_type: "image/png".into(),
             version: "encrypted-media-v2".into(),
             source_epoch: 1,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }

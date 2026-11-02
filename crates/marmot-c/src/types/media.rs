@@ -47,6 +47,8 @@ c_mirror! {
         /// `MarmotEncryptedMediaVersion` discriminant.
         enum_val version: MarmotEncryptedMediaVersion,
         copy source_epoch: u64,
+        /// Nullable local upload branch identity; preserve unchanged when sending.
+        opt_str source_epoch_identity,
         opt_str dim,
         opt_str thumbhash,
     }
@@ -81,6 +83,7 @@ impl MarmotMediaAttachmentReference {
                 }
             },
             source_epoch: self.source_epoch,
+            source_epoch_identity: unsafe { optional_str(self.source_epoch_identity) }?,
             dim: unsafe { optional_str(self.dim) }?,
             thumbhash: unsafe { optional_str(self.thumbhash) }?,
         })

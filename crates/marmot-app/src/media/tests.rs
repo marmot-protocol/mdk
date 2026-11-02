@@ -1613,6 +1613,7 @@ fn loopback_reference() -> MediaAttachmentReference {
         media_type: "image/png".to_owned(),
         version: ENCRYPTED_MEDIA_VERSION.to_owned(),
         source_epoch: 0,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     }
@@ -3281,6 +3282,7 @@ pub(crate) fn attachment_worker_fixture_with_secret(
             media_type: mime.into(),
             version: EncryptedMediaVersion::V2.as_str().into(),
             source_epoch: 3,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         },

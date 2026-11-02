@@ -13,6 +13,7 @@ struct History {
     relay: Arc<ScriptedPushRelayClient>,
     group: GroupId,
     account: String,
+    upload_epoch_identity: String,
 }
 impl History {
     async fn new(count: usize) -> Self {
@@ -64,6 +65,7 @@ impl History {
             .app_storage()
             .refresh_chat_list_row(&account.account_id_hex, &group_hex, &|_, _| false)
             .unwrap();
+        let upload_epoch_identity = hex::encode(client.runtime.epoch_pin(&group).unwrap().identity);
         drop(client);
         Self {
             _dir: dir,
@@ -71,6 +73,7 @@ impl History {
             relay,
             group,
             account: account.account_id_hex,
+            upload_epoch_identity,
         }
     }
 }

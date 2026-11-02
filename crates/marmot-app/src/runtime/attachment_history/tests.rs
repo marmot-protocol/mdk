@@ -456,7 +456,7 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
         // must see that same verbatim MIME value.
         assert_eq!(reference.media_type, mime);
         assert_eq!(
-            *reference,
+            **reference,
             crate::parse_media_attachment(&raw, None, false).unwrap()
         );
         assert!(!format!("{projected:?}").contains("private"));
@@ -657,7 +657,7 @@ fn attachment_roles_validate_definitions_without_changing_parser_outcomes() {
     ] {
         let attachment = MediaAttachmentOutcome::Accepted {
             attachment_index: 4,
-            reference: crate::parse_media_attachment(&tag(mime), Some(1), false).unwrap(),
+            reference: Box::new(crate::parse_media_attachment(&tag(mime), Some(1), false).unwrap()),
         };
         let tags = tags
             .into_iter()

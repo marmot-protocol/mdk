@@ -34,10 +34,6 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
-- **File:** `application_data_wire.rs`
-  - **Owns:** OpenMLS integration-contract tests for the MLS application-data carriers Marmot uses (pins fork codec
-    behavior the engine relies on)
-
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
@@ -47,16 +43,19 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
-  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
+  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip, exact buffered-malformed retirement, and
+    encrypted own-echo persistence. The pure canonical-disposition/public-outcome mapper is pinned in
+    `../src/message_processor/ingest.rs::tests`
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
-    included), KeyPackage-based `constructable_capabilities`, capability matrix
+    included), KeyPackage-based `constructable_capabilities`, capability matrix. Pure OpenMLS carrier codecs live in
+    `../src/wire_format/tests/application_data_wire.rs`
 
-- **File:** `leaf_advertisement.rs`
+- **File:** `capabilities/leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
     would change the leaf
 
@@ -69,7 +68,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
-    `peel_deferred -> peel_deferred` audit row.
+    `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return
+    deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
+    continuation, restore live state between slices and eventually deliver the real rival application exactly once.
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
@@ -323,6 +324,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and
     the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
     Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
+
+`record_write_atomicity/application_receive_retry.rs` also owns committed stored-message audit evidence: real
+receive-output and second sent-row failures leave no state transition in the actual V5 log, retry/reopen retain
+truthful transitions, and a public Welcome-state mutation waits for an external caller's outermost transaction.
+Keep the independent SQLCipher row reads and reopens in the file-backed cases.
 
 ```sh
 cargo test -p cgka-engine

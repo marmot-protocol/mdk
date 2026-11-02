@@ -67,6 +67,10 @@ pub struct MediaAttachmentReferenceFfi {
     pub media_type: String,
     pub version: EncryptedMediaVersionFfi,
     pub source_epoch: u64,
+    /// Local upload branch identity; preserve unchanged when sending returned references.
+    /// Absent for received attachments; never sent in an `imeta` tag.
+    #[uniffi(default = None)]
+    pub source_epoch_identity: Option<String>,
     pub dim: Option<String>,
     pub thumbhash: Option<String>,
 }
@@ -84,6 +88,7 @@ impl TryFrom<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
             media_type: value.media_type,
             version: EncryptedMediaVersion::parse(&value.version)?.into(),
             source_epoch: value.source_epoch,
+            source_epoch_identity: value.source_epoch_identity,
             dim: value.dim,
             thumbhash: value.thumbhash,
         })
@@ -103,6 +108,7 @@ impl From<MediaAttachmentReferenceFfi> for MediaAttachmentReference {
                 .as_str()
                 .to_owned(),
             source_epoch: value.source_epoch,
+            source_epoch_identity: value.source_epoch_identity,
             dim: value.dim,
             thumbhash: value.thumbhash,
         }
@@ -200,7 +206,7 @@ impl From<MediaAttachmentOutcome> for MediaAttachmentOutcomeFfi {
             MediaAttachmentOutcome::Accepted {
                 attachment_index,
                 reference,
-            } => match MediaAttachmentReferenceFfi::try_from(reference) {
+            } => match MediaAttachmentReferenceFfi::try_from(*reference) {
                 Ok(reference) => Self::Accepted {
                     attachment_index,
                     reference,
@@ -878,6 +884,7 @@ mod tests {
             media_type: "application/pdf".to_owned(),
             version: EncryptedMediaVersionFfi::V2,
             source_epoch: 42,
+            source_epoch_identity: Some("ab".repeat(32)),
             dim: None,
             thumbhash: None,
         };
@@ -891,6 +898,10 @@ mod tests {
         assert_eq!(round_trip.file_name, "brief.pdf");
         assert_eq!(round_trip.version, EncryptedMediaVersionFfi::V2);
         assert_eq!(round_trip.source_epoch, 42);
+        assert_eq!(
+            round_trip.source_epoch_identity.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
     }
 
     #[test]
@@ -907,6 +918,7 @@ mod tests {
             media_type: "application/pdf".to_owned(),
             version: EncryptedMediaVersionFfi::V2,
             source_epoch: 42,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }
@@ -918,7 +930,7 @@ mod tests {
         // reason instead of dropping it.
         let outcome = MediaAttachmentOutcomeFfi::from(MediaAttachmentOutcome::Accepted {
             attachment_index: 3,
-            reference: app,
+            reference: Box::new(app),
         });
         let (index, rejection) = rejected(&outcome);
         assert_eq!(index, 3);

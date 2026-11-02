@@ -1219,6 +1219,16 @@ attachment policy's disk reserve fails with `StorageFull` before anything is
 uploaded; ask the user to free space. The counter is monotonic processed bytes
 (copy, digest pass, then transfer), not a percentage.
 
+Uploads return `MediaAttachmentReferenceFfi.sourceEpochIdentity`, a local branch
+identity that must be preserved unchanged when saving a reference or passing it
+to `sendMediaAttachments`, `sendTaggedMedia`, or `reactWithMedia`. A send requires
+both the upload epoch and that exact branch to remain current. A branch change
+can invalidate an upload even when the epoch number stays the same. References
+received from peers or saved before this field existed have no upload identity:
+re-upload their retained bytes before sending them. Downloads of those references
+remain supported. This identity is local metadata and is never included in
+`imeta` or shared with peers.
+
 Cancellation observed before message admission starts prevents publication.
 Admission is not interruptible once started, including while durable acceptance
 is pending. File-backed uploads have no fixed worker-response timeout;
