@@ -617,11 +617,16 @@ impl AppClient {
         }
         self.send_private_key_package_hand_offs(&exchange).await?;
         // Then this device's own.
+        let mut first_error = None;
         for sibling in exchange.siblings() {
-            self.request_private_key_packages_when_needed(&exchange, &sibling, now)
-                .await?;
+            if let Err(error) = self
+                .request_private_key_packages_when_needed(&exchange, &sibling, now)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Send every hand-off not yet queued to a sibling the roster lists, at
@@ -691,6 +696,10 @@ impl AppClient {
         sibling: &DeviceSlotId,
         now: u64,
     ) -> Result<(), AppError> {
+        // Recompute only the chat-derived upper bound. A held/uncertain chat
+        // cannot justify an old burst, while healthy chats and baseline stock
+        // still progress. Never reset the request clock or cancel a carrier.
+        let (cap, chat_error) = self.invitation_chat_stock_cap(exchange, *sibling)?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let issuer_slot_hex = hex::encode(sibling);
         let usable = storage
@@ -699,19 +708,22 @@ impl AppClient {
             .filter(|record| record.issuer_slot_hex == issuer_slot_hex && record.usable_at(now))
             .count();
         let need = storage.private_key_package_need(&issuer_slot_hex)?;
-        let wanted = need.as_ref().map_or(1, |need| need.need);
+        let wanted = need
+            .as_ref()
+            .map_or(1, |need| need.need)
+            .min(cap.unwrap_or(u32::MAX));
         if usable >= wanted as usize {
             if need.is_some() {
                 storage.delete_private_key_package_need(&issuer_slot_hex)?;
             }
-            return Ok(());
+            return chat_error.map_or(Ok(()), Err);
         }
         if need
             .as_ref()
             .and_then(|need| need.requested_at)
             .is_some_and(|requested_at| now < requested_at.saturating_add(REQUEST_INTERVAL_SECS))
         {
-            return Ok(());
+            return chat_error.map_or(Ok(()), Err);
         }
         let want = wanted
             .max(PRIVATE_KEY_PACKAGE_STOCK_TARGET as u32)
@@ -739,7 +751,7 @@ impl AppClient {
                 None => storage.delete_private_key_package_need(&issuer_slot_hex)?,
             }
         }
-        Ok(())
+        chat_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn prepared_private_key_packages<'a>(

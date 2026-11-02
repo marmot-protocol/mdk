@@ -428,18 +428,106 @@ impl AppClient {
         device: &NewDevice,
         chat: &GroupId,
     ) -> Result<bool, AppError> {
-        if !self.invitation_allows_sibling_add(chat)?
-            || self.runtime.chat_sibling_add_refusal(chat)?.is_some()
-        {
+        if !self.invitation_allows_sibling_add(chat)? {
+            return Ok(false);
+        }
+        self.sibling_missing_from_chat(roster, chat, device.slot, Some(&device.tag_signature_key))
+    }
+
+    /// The same current native missing-device predicate serves direct Adds,
+    /// gap Adds and request-time burst bounds. It grants no Add permission.
+    pub(super) fn sibling_missing_from_chat(
+        &self,
+        roster: &DeviceRosterV1,
+        chat: &GroupId,
+        slot: DeviceSlotId,
+        key: Option<&[u8]>,
+    ) -> Result<bool, AppError> {
+        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
             return Ok(false);
         }
         Ok(!self
             .runtime
             .own_account_leaf_claims(chat, roster)?
             .into_iter()
-            .any(|(key, claim)| {
-                claim == DeviceTagClaim::Device(device.slot) || key == device.tag_signature_key
+            .any(|(held, claim)| {
+                claim == DeviceTagClaim::Device(slot) || key == Some(held.as_slice())
             }))
+    }
+
+    /// Only declined or unreadable chat demand narrows an old aggregate burst.
+    /// Non-chat demand is the independent one-package baseline; absent those
+    /// conditions the generic burst owner's existing behavior stays unchanged.
+    pub(super) fn invitation_chat_stock_cap(
+        &self,
+        exchange: &Exchange,
+        slot: DeviceSlotId,
+    ) -> Result<(Option<u32>, Option<AppError>), AppError> {
+        let excluded = self.excluded_sibling_slots(exchange)?;
+        let entry = exchange
+            .roster
+            .devices
+            .get(&slot)
+            .ok_or(AppError::DeviceGroupRefused("device_missing"))?;
+        let eligible = !excluded.contains(&slot)
+            && matches!(
+                entry.status,
+                DeviceStatusV1::Active | DeviceStatusV1::Inactive
+            )
+            && entry.settings.add_to_all_chats
+            && entry.tag_signature_key.is_some();
+        let mut affected = false;
+        let mut count = 0u32;
+        let mut first_error = None;
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        // Include retained, unhydrated chats when classifying a known hold.
+        // They justify no burst until ready; healthy chats still contribute.
+        let chats: Vec<_> = self
+            .state
+            .groups
+            .iter()
+            .filter_map(|group| hex::decode(&group.group_id_hex).ok().map(GroupId::new))
+            .filter(|chat| *chat != exchange.group_id)
+            .collect();
+        for chat in chats {
+            let result = self.is_device_group(&chat).and_then(|device_group| {
+                if device_group {
+                    return Ok(false);
+                }
+                self.invitation_allows_sibling_add(&chat)
+                    .and_then(|allowed| {
+                        if !allowed {
+                            affected = true;
+                            return Ok(false);
+                        }
+                        if unhydrated.contains(&chat) {
+                            affected = true;
+                            return Ok(false);
+                        }
+                        if !eligible
+                            || super::group_is_terminal(&self.runtime, &chat)
+                            || super::group_is_quarantined(&self.runtime, &chat)
+                        {
+                            return Ok(false);
+                        }
+                        self.sibling_missing_from_chat(
+                            &exchange.roster,
+                            &chat,
+                            slot,
+                            entry.tag_signature_key.as_deref(),
+                        )
+                    })
+            });
+            match result {
+                Ok(true) => count = count.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    affected = true;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Ok((affected.then_some(count.max(1)), first_error))
     }
 
     /// [`Self::sibling_commit_chats`], in the order the chat list shows them.

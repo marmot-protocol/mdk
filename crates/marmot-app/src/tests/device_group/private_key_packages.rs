@@ -2163,6 +2163,26 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
     devices.phone.drive_invitation_decisions().await;
     assert!(phone_store.leave_request(&chat).unwrap().is_none());
 
+    // Local deletion hides the projection but retains this installed native
+    // leaf and its original authenticated admission. A later matching decline
+    // must still reach ordinary Leave without restoring the deleted UI row.
+    assert!(devices.phone.delete_group_local(&chat).await.unwrap());
+    assert!(devices.phone.state_group_record(&chat).is_none());
+    assert!(
+        devices
+            .phone_app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        devices
+            .phone
+            .runtime
+            .canonical_group_membership(&chat)
+            .unwrap()
+            .local_leaf_active
+    );
     let winner = storage_sqlite::InvitationDecision {
         version: 3,
         declined: true,
@@ -2182,6 +2202,14 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
     assert!(
         phone_store.leave_request(&chat).unwrap().is_some(),
         "the matching winner enters the real durable Leave owner despite zero acknowledgements"
+    );
+    assert!(devices.phone.state_group_record(&chat).is_none());
+    assert!(
+        devices
+            .phone_app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .is_none()
     );
     devices.relay.allow_publishes();
 
@@ -2215,4 +2243,118 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
         laptop_store.leave_request(&chat).unwrap().is_some(),
         "a newer accepted value and restart never cancel an already requested Leave"
     );
+
+    // Keep this additional admission's large async operation out of the
+    // existing lifecycle/restart owner's inline future frame.
+    Box::pin(async {
+        // A held maximum cannot create a newer local decision. Once local
+        // blocking is lifted, an explicit action may still apply that SAME
+        // winning acceptance without writing or broadcasting another value.
+        let maximum_chat = bob.create_group("maximum invitation", &[]).await.unwrap();
+        let key = published_key_package(&mut devices.phone, &devices.relay).await;
+        let effects = bob
+            .runtime
+            .send(SendIntent::Invite {
+                group_id: maximum_chat.clone(),
+                key_packages: vec![key],
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+        bob.observe_drained_session_events(&effects).await.unwrap();
+        deliver_all(&mut devices.phone, &devices.relay).await;
+        let maximum_hex = hex::encode(maximum_chat.as_slice());
+        let maximum_admission = phone_store
+            .invitation_admission(&maximum_chat)
+            .unwrap()
+            .unwrap();
+        let bob_id = bob_app
+            .account_home()
+            .account("bob")
+            .unwrap()
+            .account_id_hex;
+        devices
+            .phone_app
+            .set_user_blocked("alice", &bob_id, true)
+            .await
+            .unwrap();
+        let maximum = storage_sqlite::InvitationDecision {
+            group_id_hex: maximum_hex.clone(),
+            generation: maximum_admission.generation,
+            version: storage_sqlite::MAX_SMALL_STATE_NUMBER,
+            declined: false,
+        };
+        let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+            std::slice::from_ref(&maximum),
+        ))
+        .unwrap();
+        assert!(
+            laptop
+                .send_device_group_message(&device_group, KIND_SMALL_STATE_UPDATE, content)
+                .await
+                .unwrap()
+        );
+        deliver_all(&mut devices.phone, &devices.relay).await;
+        devices.phone.drive_invitation_decisions().await;
+        assert!(
+            devices
+                .phone
+                .state_group_record(&maximum_chat)
+                .unwrap()
+                .pending_confirmation
+        );
+        assert_eq!(
+            phone_store
+                .app_storage()
+                .invitation_decision(&maximum_hex, &maximum.generation)
+                .unwrap(),
+            Some(maximum.clone())
+        );
+        devices
+            .phone_app
+            .set_user_blocked("alice", &bob_id, false)
+            .await
+            .unwrap();
+        let unsent = phone_store
+            .app_storage()
+            .unsent_invitation_decisions()
+            .unwrap();
+        assert!(
+            devices
+                .phone
+                .decline_group_invite(&maximum_chat)
+                .await
+                .is_err()
+        );
+        assert!(phone_store.leave_request(&maximum_chat).unwrap().is_none());
+        assert!(
+            devices
+                .phone
+                .state_group_record(&maximum_chat)
+                .unwrap()
+                .pending_confirmation
+        );
+        assert!(
+            !devices
+                .phone
+                .accept_group_invite(&maximum_chat)
+                .unwrap()
+                .pending_confirmation
+        );
+        assert_eq!(
+            phone_store
+                .app_storage()
+                .invitation_decision(&maximum_hex, &maximum.generation)
+                .unwrap(),
+            Some(maximum)
+        );
+        assert_eq!(
+            phone_store
+                .app_storage()
+                .unsent_invitation_decisions()
+                .unwrap(),
+            unsent
+        );
+    })
+    .await;
 }

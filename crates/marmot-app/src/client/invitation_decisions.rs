@@ -217,26 +217,47 @@ impl AppClient {
             storage.defer_uninstalled_invitation_decision(decision)?;
             return Ok(());
         }
-        let Some(group) = self.app.group(&self.state.label, &decision.group_id_hex)? else {
-            return Ok(());
-        };
+        let group = self.app.group(&self.state.label, &decision.group_id_hex)?;
         // Winning values durably owe this pass. Reuse its retry ownership to
         // wake an existing gap even if only application state changed, with no
         // chat epoch or device-group eligibility change. A failed read above
         // keeps the work owed; a duplicate/losing value never re-arms it.
         self.invitation_decision_changes_sibling_gaps(&group_id);
-        if let Some(cached) = self
-            .state
-            .groups
-            .iter_mut()
-            .find(|cached| cached.group_id_hex == decision.group_id_hex)
+        if let Some(group) = &group
+            && let Some(cached) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|cached| cached.group_id_hex == decision.group_id_hex)
         {
             *cached = group.clone();
         }
         if work.decline_owed && decision.declined {
-            if group.self_membership == SelfMembership::Member
-                && account.leave_request(&group_id)?.is_none()
-            {
+            let mut leave_requested = account.leave_request(&group_id)?.is_some();
+            let mut native_member = false;
+            if !leave_requested {
+                // Local deletion may hide the app row while retaining a live
+                // native leaf. Read current native authority, never recreate a
+                // projection to make that leaf eligible for ordinary Leave.
+                let authority = self
+                    .runtime
+                    .group_authority_view()
+                    .with_group_authority_snapshot(&group_id, |_, authority| {
+                        Ok::<_, AppError>(authority)
+                    })?;
+                native_member = authority.facts.is_member;
+                if native_member
+                    && (authority.facts.is_admin
+                        || authority.disbanding
+                        || authority.lifecycle != cgka_traits::GroupLifecycleState::Stable
+                        || !self.group_quiet(&group_id)?)
+                {
+                    // Keep the exact work owed before push drain, sync or a
+                    // queued refusal. The native send rechecks after send sync.
+                    return Ok(());
+                }
+            }
+            if native_member && !leave_requested {
                 // Foreground Leave boxes this same large operation. Keep its
                 // future out of every maintenance frame, including idle passes.
                 let result = Box::pin(self.leave_group_with_audit_context(
@@ -245,26 +266,26 @@ impl AppClient {
                     Some(decision),
                 ))
                 .await;
-                if account.leave_request(&group_id)?.is_none() {
+                leave_requested = account.leave_request(&group_id)?.is_some();
+                if !leave_requested {
                     result?;
                 }
             }
-            let current = self.app.group(&self.state.label, &decision.group_id_hex)?;
-            if account.leave_request(&group_id)?.is_some()
-                || current.is_some_and(|current| current.self_membership != SelfMembership::Member)
-            {
+            if leave_requested || !native_member {
                 storage
                     .invitation_decline_handed_off(&decision.group_id_hex, &decision.generation)?;
-                self.set_group_invite_confirmation(&group_id, false, true)?;
+                if group.is_some() {
+                    self.set_group_invite_confirmation(&group_id, false, true)?;
+                }
                 storage.mark_invitation_decision_applied(decision)?;
             }
         } else if work.apply_owed {
             if let Some(projection) = self.accepted_invitation_projection(&group_id)? {
                 self.set_group_invite_confirmation(&group_id, false, projection.archived)?;
                 storage.mark_invitation_decision_applied(decision)?;
-            } else if !group.pending_confirmation
-                || group.self_membership != SelfMembership::Member
-                || account.leave_request(&group_id)?.is_some()
+            } else if group.as_ref().is_none_or(|group| {
+                !group.pending_confirmation || group.self_membership != SelfMembership::Member
+            }) || account.leave_request(&group_id)?.is_some()
             {
                 storage.mark_invitation_decision_applied(decision)?;
             }

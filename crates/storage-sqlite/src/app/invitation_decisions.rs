@@ -59,7 +59,16 @@ impl SqliteAppStorage {
     ) -> StorageResult<InvitationDecision> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let version = held(&conn, chat, &generation)?.map_or(0, |item| item.version);
+            let prior = held(&conn, chat, &generation)?;
+            if let Some(prior) = &prior
+                && prior.version == crate::MAX_SMALL_STATE_NUMBER
+                && prior.declined == declined
+            {
+                // An explicit local action may apply the already winning
+                // value, but cannot create a version or rebroadcast at MAX.
+                return Ok(prior.clone());
+            }
+            let version = prior.map_or(0, |item| item.version);
             let decision = InvitationDecision {
                 group_id_hex: chat.to_owned(),
                 generation,
@@ -282,5 +291,73 @@ mod tests {
         );
         assert!(storage.invitation_decision_work().unwrap()[0].decline_owed);
         assert!(storage.unsent_invitation_decisions().unwrap().is_empty());
+
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_invite_decision")
+            .unwrap();
+        let maximum = InvitationDecision {
+            version: crate::MAX_SMALL_STATE_NUMBER,
+            declined: false,
+            ..decline
+        };
+        storage
+            .merge_invitation_decisions(std::slice::from_ref(&maximum))
+            .unwrap();
+        storage.mark_invitation_decision_applied(&maximum).unwrap();
+        storage.lock().unwrap().execute_batch("CREATE TRIGGER refuse_max_write BEFORE UPDATE ON invitation_decisions BEGIN SELECT RAISE(ABORT, 'maximum must stay unchanged'); END").unwrap();
+        assert_eq!(
+            storage
+                .record_invitation_decision("0102", [1; 32], false)
+                .unwrap(),
+            maximum
+        );
+        assert!(
+            storage
+                .record_invitation_decision("0102", [1; 32], true)
+                .is_err()
+        );
+        assert_eq!(
+            storage.invitation_decision("0102", &[1; 32]).unwrap(),
+            Some(maximum.clone())
+        );
+        assert!(storage.unsent_invitation_decisions().unwrap().is_empty());
+        assert!(storage.invitation_decision_work().unwrap().is_empty());
+        storage
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_max_write")
+            .unwrap();
+        let maximum_decline = InvitationDecision {
+            declined: true,
+            ..maximum
+        };
+        storage
+            .merge_invitation_decisions(std::slice::from_ref(&maximum_decline))
+            .unwrap();
+        storage
+            .invitation_decline_handed_off("0102", &[1; 32])
+            .unwrap();
+        storage
+            .mark_invitation_decision_applied(&maximum_decline)
+            .unwrap();
+        assert!(
+            storage
+                .record_invitation_decision("0102", [1; 32], false)
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .record_invitation_decision("0102", [1; 32], true)
+                .unwrap(),
+            maximum_decline
+        );
+        assert_eq!(
+            storage.invitation_decision("0102", &[1; 32]).unwrap(),
+            Some(maximum_decline)
+        );
+        assert!(storage.unsent_invitation_decisions().unwrap().is_empty());
+        assert!(storage.invitation_decision_work().unwrap().is_empty());
     }
 }

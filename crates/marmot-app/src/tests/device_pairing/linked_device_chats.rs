@@ -203,6 +203,181 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A real Add pass owes three chats; two usable packages arrive afterward.
+/// A later matching decline removes that burst, while another slot's normal
+/// stock request still progresses. Already issued private material stays held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
+    use base64::Engine as _;
+    use marmot_session::{KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, PrivateKeyPackageHandOff};
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let mut choices = DeviceLinkChoices::new("Tablet");
+    choices.add_to_all_chats = false;
+    link_with(&relay, &mut phone, &mut tablet, choices).await;
+    laptop.client.set_device_tag_key().await.unwrap();
+    tablet.client.set_device_tag_key().await.unwrap();
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 4).await;
+    let phone_slot = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
+    let laptop_slot = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let stock = phone.app.account_storage("alice").unwrap().app_storage();
+    assert_eq!(held_from(&phone, &laptop), 0);
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut pending = Vec::new();
+    for index in 0..3 {
+        let chat = bob
+            .create_group(&format!("stock obligation {index}"), &[])
+            .await
+            .unwrap();
+        let key = published_key_package(&mut phone.client, &relay).await;
+        let effects = bob
+            .runtime
+            .send(SendIntent::Invite {
+                group_id: chat.clone(),
+                key_packages: vec![key],
+                initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+            })
+            .await
+            .unwrap();
+        bob.observe_drained_session_events(&effects).await.unwrap();
+        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+        phone.client.sync().await.unwrap();
+        assert!(
+            phone
+                .client
+                .state_group_record(&chat)
+                .unwrap()
+                .pending_confirmation
+        );
+        pending.push(chat);
+    }
+    // No stock has arrived, so the actual automatic Add pass derives the
+    // three-chat burst but cannot admit an Add. Never seed the need directly.
+    assert_eq!(
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut Default::default())
+            .await,
+        0
+    );
+    let need = stock
+        .private_key_package_need(&laptop.slot_hex())
+        .unwrap()
+        .unwrap();
+    assert_eq!(need.need, 3);
+    assert!(need.requested_at.is_none());
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    laptop
+        .client
+        .runtime
+        .issue_private_key_packages(&phone_slot, 2, None, crate::unix_now_seconds())
+        .unwrap();
+    let issued: Vec<_> = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.recipient_slot == phone_slot)
+        .collect();
+    assert_eq!(issued.len(), 2);
+    let hand_off = PrivateKeyPackageHandOff {
+        from: laptop_slot,
+        to: phone_slot,
+        key_packages: issued
+            .iter()
+            .map(|record| cgka_traits::KeyPackage::new(record.key_package.clone()))
+            .collect(),
+    };
+    laptop
+        .client
+        .runtime
+        .set_private_key_package_hand_offs_queued(
+            &issued
+                .iter()
+                .map(|record| record.key_package_ref.clone())
+                .collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap();
+    assert!(
+        laptop
+            .client
+            .send_device_group_message(
+                &group,
+                KIND_PRIVATE_KEY_PACKAGE_HAND_OFF,
+                base64::engine::general_purpose::STANDARD.encode(hand_off.encode().unwrap())
+            )
+            .await
+            .unwrap()
+    );
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 2).await;
+    assert_eq!(held_from(&phone, &laptop), 2);
+
+    for chat in &pending {
+        let error = phone.client.decline_group_invite(chat).await.unwrap_err();
+        assert!(
+            matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+            ),
+            "{error}"
+        );
+    }
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    let laptop_issued = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .iter()
+        .filter(|record| record.recipient_slot == phone_slot)
+        .count();
+    let tablet_issued = tablet
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .iter()
+        .filter(|record| record.recipient_slot == phone_slot)
+        .count();
+    assert_eq!(laptop_issued, 2, "no new request solely for declined chats");
+    assert_eq!(
+        tablet_issued, 10,
+        "the independent healthy slot's baseline request proceeds"
+    );
+    assert!(
+        stock
+            .private_key_package_need(&laptop.slot_hex())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        stock
+            .private_key_package_need(&tablet.slot_hex())
+            .unwrap()
+            .unwrap()
+            .need,
+        1
+    );
+    assert_eq!(held_from(&phone, &laptop), 2);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+}
+
 /// A real pending admin invitation can be declined while ordinary Leave is
 /// refused before a native request exists. Both automatic Add paths must hold
 /// it; a real sibling's later acceptance wakes only that generation's gap.
@@ -363,8 +538,50 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         )
         .await;
     }
-    phone.client.drive_invitation_decisions().await;
+    phone.app.set_native_push_enabled("alice", true).unwrap();
+    phone
+        .app
+        .upsert_push_registration(
+            "alice",
+            crate::PushPlatform::Fcm,
+            "phone-token",
+            &::nostr::prelude::Keys::generate().public_key().to_hex(),
+            Some("wss://relay.example".to_owned()),
+        )
+        .unwrap();
+    phone.client.share_push_registration().await.unwrap();
     let before = relay.published_event_ids().len();
+    for _ in 0..2 {
+        phone.client.drive_invitation_decisions().await;
+        assert_eq!(
+            relay.published_event_ids().len(),
+            before,
+            "an admin's owed decline must not remove and re-share its push token on retry"
+        );
+        for chat in [&direct, &gap] {
+            assert!(store.leave_request(chat).unwrap().is_none());
+            let generation = store
+                .invitation_admission(chat)
+                .unwrap()
+                .unwrap()
+                .generation;
+            assert!(
+                stock
+                    .invitation_decision(&hex::encode(chat.as_slice()), &generation)
+                    .unwrap()
+                    .unwrap()
+                    .declined
+            );
+            assert!(
+                stock
+                    .invitation_decision_work()
+                    .unwrap()
+                    .iter()
+                    .any(|work| { work.decision.generation == generation && work.decline_owed }),
+                "a refused native Leave keeps its exact decline work owed"
+            );
+        }
+    }
     let held = held_from(&phone, &laptop);
     let tablet_taken = taken_from(&phone, &tablet);
     phone
