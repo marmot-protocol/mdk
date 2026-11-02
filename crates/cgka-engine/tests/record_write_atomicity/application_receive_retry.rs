@@ -7,6 +7,83 @@ use rusqlite::{Connection, OptionalExtension, types::Value};
 use sha2::{Digest, Sha256};
 use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 
+fn recording_client(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    path: &std::path::Path,
+) -> cgka_engine::Engine<SqliteAccountStorage> {
+    let recorder = marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+        path,
+        "11".repeat(16),
+        Some("22".repeat(16)),
+        marmot_forensics::v5::Producer {
+            mdk_revision: None,
+            build_profile: marmot_forensics::v5::BuildProfile::Debug,
+            platform: marmot_forensics::v5::Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap()
+}
+
+fn audit_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|row| row["event"].clone())
+        .collect()
+}
+
+fn audit_transitions(path: &std::path::Path, id: &MessageId) -> Vec<serde_json::Value> {
+    let reference = marmot_forensics::v5::EngineMessageRef::from_message_id(id.as_slice()).unwrap();
+    audit_events(path)
+        .into_iter()
+        .filter(|event| {
+            event["type"] == "message_state_changed" && event["message_ref"] == reference.as_str()
+        })
+        .collect()
+}
+
+fn message_rows(connection: &Connection, group: &GroupId) -> Vec<Vec<Value>> {
+    connection
+        .prepare(
+            "SELECT id, group_id, epoch, state, storage_format, record, payload, deferred_peel
+             FROM cgka_messages WHERE group_id = ?1 ORDER BY id",
+        )
+        .unwrap()
+        .query_map([group.as_slice()], |row| {
+            (0..8).map(|index| row.get(index)).collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn assert_received_transitions(path: &std::path::Path, id: &MessageId) {
+    let transitions = audit_transitions(path, id);
+    assert_eq!(
+        transitions.len(),
+        2,
+        "one committed receive: {transitions:?}"
+    );
+    assert!(transitions[0].get("previous_state").is_none());
+    assert_eq!(transitions[0]["new_state"], "created");
+    assert_eq!(transitions[0]["reason"], "persist");
+    assert_eq!(transitions[1]["previous_state"], "created");
+    assert_eq!(transitions[1]["new_state"], "processed");
+    assert_eq!(transitions[1]["reason"], "state_update");
+}
+
 async fn application(
     sender: &mut cgka_engine::Engine<SqliteAccountStorage>,
     group_id: &GroupId,
@@ -173,7 +250,8 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
     let key = SqlCipherKey::raw([0x51; 32]);
     let mut alice = build_selfremove_client(b"alice-receive-output");
     let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let mut bob = build_selfremove_client_on_storage(b"bob-receive-output", storage.clone());
+    let audit_path = dir.path().join("receive-audit.jsonl");
+    let mut bob = recording_client(b"bob-receive-output", storage.clone(), &audit_path);
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, result) = alice
         .create_group(CreateGroupRequest {
@@ -206,6 +284,7 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
     // A real peer application proves the fixture and the pending-output path
     // work before the single targeted write is refused.
     let (healthy, healthy_payload) = application(&mut alice, &group_id, "healthy control").await;
+    let healthy_id = MessageId::new(Sha256::digest(&healthy.payload).to_vec());
     assert!(matches!(
         bob.ingest(healthy).await.unwrap(),
         IngestOutcome::Processed
@@ -229,6 +308,7 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
             .unwrap()
             .is_empty()
     );
+    assert_received_transitions(&audit_path, &healthy_id);
 
     let (original, payload) = application(&mut alice, &group_id, "recover this original").await;
     let content_id = MessageId::new(Sha256::digest(&original.payload).to_vec());
@@ -266,6 +346,15 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
     let alias_after_failure = storage.has_processed_transport_id(&original.id).unwrap();
     let output_after_failure = storage.list_pending_application_events().unwrap();
     let mls_after_failure = mls_rows(&observer, &group_id);
+    assert!(
+        audit_transitions(&audit_path, &content_id).is_empty(),
+        "rolled-back receive must emit no committed message-state transition"
+    );
+    assert!(
+        audit_events(&audit_path)
+            .iter()
+            .any(|event| { event["type"] == "ingest_error" && event["error_kind"] == "storage" })
+    );
     let mut events = Vec::new();
     collect_and_ack(&mut bob, &storage, &mut events);
     observer
@@ -285,6 +374,7 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
         &original,
         &before_mls,
     );
+    assert_received_transitions(&audit_path, &content_id);
 
     // Release every connection and reopen the actual encrypted database, so
     // an in-memory cache cannot supply the apparent recovery.
@@ -293,7 +383,7 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
     storage.close().unwrap();
     drop(storage);
     let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let mut bob = build_selfremove_client_on_storage(b"bob-receive-output", storage.clone());
+    let mut bob = recording_client(b"bob-receive-output", storage.clone(), &audit_path);
     bob.hydrate_all_stored_groups().unwrap();
     collect_and_ack(&mut bob, &storage, &mut events);
     let retry = bob.ingest(original.clone()).await.unwrap();
@@ -357,6 +447,7 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
         invalidated, 0,
         "storage failure cannot invalidate a valid application"
     );
+    assert_received_transitions(&audit_path, &content_id);
     assert!(matches!(content_after_failure, Err(StorageError::NotFound)));
     assert!(
         !alias_after_failure,
@@ -377,4 +468,203 @@ async fn direct_application_recovers_after_pending_output_write_failure() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn sent_message_audit_waits_for_both_durable_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sent-audit.sqlite");
+    let audit_path = dir.path().join("sent-audit.jsonl");
+    let key = SqlCipherKey::raw([0x52; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut alice = recording_client(b"alice-sent-audit", storage.clone(), &audit_path);
+    let (group, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "sent audit atomicity".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = result else {
+        panic!("expected a legacy founding commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let observer = open_observer(&path, &key);
+
+    let (control, _) = application(&mut alice, &group, "healthy sent control").await;
+    let control_content = MessageId::new(Sha256::digest(&control.payload).to_vec());
+    assert_ne!(control.id, control_content, "exercise two distinct rows");
+    for id in [&control.id, &control_content] {
+        let rows = audit_transitions(&audit_path, id);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["new_state"], "sent");
+        assert_eq!(storage.get_message(id).unwrap().state, MessageState::Sent);
+    }
+    let before = message_rows(&observer, &group);
+    let states_before = audit_events(&audit_path)
+        .iter()
+        .filter(|event| event["type"] == "message_state_changed")
+        .count();
+    observer
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_second_sent_row BEFORE INSERT ON cgka_messages
+             WHEN NEW.group_id = X'{group_hex}' AND
+                  (SELECT COUNT(*) FROM cgka_messages WHERE group_id = NEW.group_id) = {second}
+             BEGIN SELECT RAISE(ABORT, 'injected second sent row failure'); END",
+            group_hex = hex::encode(group.as_slice()),
+            second = before.len() + 1,
+        ))
+        .unwrap();
+    let payload = MarmotAppEvent::new(
+        hex::encode(alice.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "retry this sent event",
+    )
+    .encode()
+    .unwrap();
+    let failed = alice
+        .send(SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload,
+            expected_epoch: Some(alice.epoch_pin(&group).unwrap()),
+        })
+        .await;
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail)))
+            if detail.contains("injected second sent row failure")),
+        "must reach the distinct content-marker write: {failed:?}"
+    );
+    assert_eq!(message_rows(&observer, &group), before);
+    let after = audit_events(&audit_path);
+    let states_after = after
+        .iter()
+        .filter(|event| event["type"] == "message_state_changed")
+        .count();
+    assert_eq!(
+        states_after, states_before,
+        "neither rolled-back sent row may claim a committed transition"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|event| { event["type"] == "send_error" && event["error_kind"] == "storage" })
+    );
+    observer
+        .execute_batch("DROP TRIGGER fail_second_sent_row")
+        .unwrap();
+    let (retry, _) = application(&mut alice, &group, "retry this sent event").await;
+    let retry_content = MessageId::new(Sha256::digest(&retry.payload).to_vec());
+    assert_ne!(retry.id, retry_content);
+    for id in [&retry.id, &retry_content] {
+        let rows = audit_transitions(&audit_path, id);
+        assert_eq!(rows.len(), 1, "one committed sent row: {rows:?}");
+        assert!(rows[0].get("previous_state").is_none());
+        assert_eq!(rows[0]["new_state"], "sent");
+        assert_eq!(rows[0]["reason"], "persist");
+        assert_eq!(storage.get_message(id).unwrap().state, MessageState::Sent);
+    }
+    let committed = message_rows(&observer, &group);
+    assert_eq!(committed.len(), before.len() + 2);
+    drop(alice);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let observer = open_observer(&path, &key);
+    assert_eq!(message_rows(&observer, &group), committed);
+    let mut alice = recording_client(b"alice-sent-audit", storage.clone(), &audit_path);
+    alice.hydrate_all_stored_groups().unwrap();
+    let (following, _) = application(&mut alice, &group, "following sent control").await;
+    assert_eq!(
+        storage.get_message(&following.id).unwrap().state,
+        MessageState::Sent
+    );
+    assert_eq!(audit_transitions(&audit_path, &following.id).len(), 1);
+}
+
+#[tokio::test]
+async fn welcome_state_audit_waits_for_the_callers_outermost_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("nested-audit.jsonl");
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = recording_client(b"alice-outer-audit", storage.clone(), &audit_path);
+    let mut bob = build_selfremove_client(b"bob-outer-audit");
+    let (group, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "outer audit unit".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = result else {
+        panic!("expected a legacy founding Welcome");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let id = &welcomes[0].id;
+    let before = audit_transitions(&audit_path, id);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0]["new_state"], "sent");
+
+    // The public engine call succeeds in an inner transaction, but that does
+    // not grant permission to announce the outer transaction's pending write.
+    let failed: Result<(), EngineError> = storage.with_transaction(|outer| {
+        outer.with_transaction(|_| {
+            alice.mark_sent_welcome_delivered(id)?;
+            assert_eq!(
+                audit_transitions(&audit_path, id),
+                before,
+                "a successful nested unit is not an outer commit"
+            );
+            Ok::<_, EngineError>(())
+        })?;
+        Err(StorageError::Backend("abandon outer audit unit".into()).into())
+    });
+    assert!(
+        matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail)))
+        if detail == "abandon outer audit unit")
+    );
+    assert_eq!(storage.get_message(id).unwrap().state, MessageState::Sent);
+    assert_eq!(audit_transitions(&audit_path, id), before);
+
+    storage
+        .with_transaction(|outer| -> Result<(), EngineError> {
+            let failed: Result<(), EngineError> =
+                outer.with_group_savepoint(&group, "unused", |_| {
+                    alice.mark_sent_welcome_delivered(id)?;
+                    Err(StorageError::Backend("abandon savepoint audit unit".into()).into())
+                });
+            assert!(
+                matches!(&failed, Err(EngineError::Storage(StorageError::Backend(detail)))
+                if detail == "abandon savepoint audit unit")
+            );
+            assert_eq!(storage.get_message(id)?.state, MessageState::Sent);
+            assert_eq!(audit_transitions(&audit_path, id), before);
+            outer.with_transaction(|_| alice.mark_sent_welcome_delivered(id))?;
+            assert_eq!(
+                audit_transitions(&audit_path, id),
+                before,
+                "even the surviving nested write still waits for outer COMMIT"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        storage.get_message(id).unwrap().state,
+        MessageState::Processed
+    );
+    let after = audit_transitions(&audit_path, id);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after[1]["previous_state"], "sent");
+    assert_eq!(after[1]["new_state"], "processed");
+    assert_eq!(after[1]["reason"], "state_update");
 }
