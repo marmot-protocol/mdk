@@ -645,7 +645,7 @@ impl AppClient {
                 .leave_in_progress(group_id)
                 .map_err(marmot_session::SessionError::from)?
             || self.runtime.disbanding_in_progress(group_id)?
-            || self.epoch_gap_held_groups()?.contains(group_id)
+            || self.epoch_gap_holds_group(group_id, super::recovery::wall_now_ms()?)?
             || self.runtime.has_pending_convergence_inputs(group_id)?
             || self.runtime.has_queued_outbound_intents(group_id)?
         {

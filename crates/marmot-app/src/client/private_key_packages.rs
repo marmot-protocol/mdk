@@ -290,6 +290,7 @@ impl AppClient {
         if kept > 0 {
             self.received_private_key_package_generation =
                 self.received_private_key_package_generation.wrapping_add(1);
+            self.sibling_gap_stock_arrived(&hand_off.from);
         }
         tracing::debug!(
             target: TRACE_TARGET,
@@ -899,8 +900,9 @@ impl AppClient {
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .await?;
-        let held = self.epoch_gap_held_groups()?;
-        self.send_owed_sibling_welcomes(&held).await;
+        // The shared sender reads its device group's hold itself, and
+        // leaves the durable Welcome owed if that readiness cannot be read.
+        self.send_owed_sibling_welcomes(&[]).await;
         Ok(())
     }
 
@@ -934,7 +936,14 @@ impl AppClient {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        if held.contains(&exchange.group_id) || !exchange.tagged {
+        // Immediate post-create/post-Add callers have no precomputed hold
+        // list. Read this device group directly even then; an error defers
+        // sending through the outer error path, never treating unknown as
+        // an empty hold. Other groups need not be hydrated to deliver a 461.
+        if held.contains(&exchange.group_id)
+            || !exchange.tagged
+            || self.epoch_gap_holds_group(&exchange.group_id, super::recovery::wall_now_ms()?)?
+        {
             return Ok(());
         }
         let mut sent = 0usize;
