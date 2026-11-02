@@ -1086,7 +1086,8 @@ pub const ROSTER_TAG_KEYS_PER_SLOT: usize = 4;
 /// Every tag signature key a device-group roster this device held listed, by
 /// group and slot (mdk#2761). The engine records each roster state it
 /// applies; nothing in the engine reads them back. The app reads them to
-/// clean up after a device whose key the roster no longer lists.
+/// clean up after a device whose key the roster no longer lists, and to add
+/// no device in a slot held as removed to its chats.
 pub trait RosterTagKeyStorage {
     /// Record `keys` as seen in `group_id`'s roster at `seen_at`, in the
     /// order this device applied the roster states that listed them: a key

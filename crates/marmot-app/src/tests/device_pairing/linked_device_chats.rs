@@ -279,6 +279,7 @@ async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat(
     let chat = phone.client.create_group("chat", &[]).await.unwrap();
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, true).await;
+    assert_eq!(held_from(&phone, &laptop), 0);
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
 
     phone.client.add_linked_devices_to_chats(&[]).await;
