@@ -834,48 +834,21 @@ struct EventProjectionProgress {
     terminal_cleanup: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
+/// Which retained sends [`AppClient::wake_retained_sends`] wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSendWake {
+    /// Every retryable target, as for a host connectivity edge.
+    All,
+    /// Only sends still below their required acknowledgements, the ones a
+    /// user sees as unsent, and sends still awaiting MLS confirmation.
+    BelowQuorum,
+}
+
 impl AppClient {
     /// Persist a host connectivity-restored edge into every exact fanout with a
     /// retryable target, then schedule its group for an immediate worker pass.
-    /// Possibly-exposed targets wake too: their retry resends the same signed
-    /// event, which a relay that already holds it acknowledges as a duplicate.
-    /// Leaving them on the ambiguity clock held a reconnecting device's queued
-    /// sends for up to an hour (mdk#2762).
-    ///
-    /// A group the session opened only seeded hides its fanouts until it is
-    /// hydrated, so each group that holds one is hydrated first. Otherwise an
-    /// edge soon after a cold start would skip exactly the sends a previous
-    /// process left behind. A group that fails to hydrate moves to quarantine
-    /// and keeps its fanouts frozen, as at open.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
-        let unhydrated = self.runtime.unhydrated_group_ids();
-        if !unhydrated.is_empty() {
-            for group_id in self.runtime.outbound_fanout_group_ids()? {
-                if unhydrated.contains(&group_id)
-                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
-                {
-                    tracing::warn!(
-                        target: "marmot_app::sync",
-                        method = "note_connectivity_restored",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
-                        "group with retained sends could not hydrate for the connectivity wake",
-                    );
-                }
-            }
-        }
-        let mut woken_targets = 0;
-        for mut fanout in self.runtime.outbound_fanouts()? {
-            let woken = fanout.wake_targets_for_restored_connectivity();
-            if woken == 0 {
-                continue;
-            }
-            let group_id = fanout.group_id().cloned();
-            self.runtime.put_outbound_fanout(&fanout)?;
-            if let Some(group_id) = group_id {
-                self.pending_convergence_groups.insert(group_id);
-            }
-            woken_targets += woken;
-        }
+        let woken_targets = self.wake_retained_sends(RetainedSendWake::All)?;
         self.app.product_analytics.observe(
             crate::ProductFamily::Connectivity,
             "reconnect",
@@ -887,6 +860,66 @@ impl AppClient {
             crate::ProductUnit::Attempt,
             None,
         );
+        Ok(woken_targets)
+    }
+
+    /// Clear the retry clock of every retryable target of a retained send, then
+    /// schedule its group for an immediate worker pass. Attempt counts stay, so
+    /// a retry that fails again resumes its backoff. Possibly-exposed targets
+    /// wake too: their retry resends the same signed event, which a relay that
+    /// already holds it acknowledges as a duplicate. Leaving them on the
+    /// ambiguity clock held a reconnecting device's queued sends for up to an
+    /// hour (mdk#2762).
+    ///
+    /// A group the session opened only seeded hides its fanouts until it is
+    /// hydrated, so each group that holds one is hydrated first. Otherwise a
+    /// wake soon after a cold start would skip exactly the sends a previous
+    /// process left behind. A group that fails to hydrate moves to quarantine
+    /// and keeps its fanouts frozen, as at open.
+    ///
+    /// [`RetainedSendWake::BelowQuorum`] leaves sends that met their required
+    /// acknowledgements, and await no MLS confirmation, to the secondary
+    /// replication schedule.
+    pub(crate) fn wake_retained_sends(
+        &mut self,
+        scope: RetainedSendWake,
+    ) -> Result<usize, AppError> {
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        if !unhydrated.is_empty() {
+            for group_id in self.runtime.outbound_fanout_group_ids()? {
+                if unhydrated.contains(&group_id)
+                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::sync",
+                        method = "wake_retained_sends",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "group with retained sends could not hydrate for the wake",
+                    );
+                }
+            }
+        }
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.outbound_fanouts()? {
+            // A send that met quorum but still awaits MLS confirmation remains
+            // a group barrier, so its clock must not hold the group either.
+            if scope == RetainedSendWake::BelowQuorum
+                && fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1)
+                && !matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            {
+                continue;
+            }
+            let woken = fanout.wake_targets_for_restored_connectivity();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
         Ok(woken_targets)
     }
 

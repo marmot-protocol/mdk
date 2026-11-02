@@ -38,6 +38,7 @@ use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -1830,6 +1831,22 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
+            // A start gets no host connectivity edge, so the retry clocks a
+            // previous process left on unsent retained sends, backed off
+            // towards an hour while offline, would hold them after a start
+            // that is already online (mdk#2762). Wake them once. Starting the
+            // transport does not prove a relay is reachable, so this costs one
+            // retry per woken send; a failed retry resumes its backoff from
+            // its kept attempt count. Sends that met quorum keep their
+            // secondary replication schedule.
+            if let Err(error) = client.wake_retained_sends(RetainedSendWake::BelowQuorum) {
+                tracing::warn!(
+                    target: "marmot_app::account_worker",
+                    method = "startup_retained_send_wake",
+                    error_kind = error.privacy_safe_kind(),
+                    "retained sends could not be woken after the startup sync",
+                );
+            }
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");

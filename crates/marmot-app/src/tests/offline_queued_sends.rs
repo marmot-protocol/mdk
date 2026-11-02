@@ -186,9 +186,10 @@ impl OfflineQueue {
         self.runtime.drain_in_flight_work().await.unwrap();
     }
 
-    /// Restart the process while still offline, after the stored fanouts have failed
-    /// `extra_attempts` more times, as a long offline period leaves them.
-    async fn restart_after_long_offline(&mut self, extra_attempts: u32) {
+    /// Restart the process after the stored fanouts have failed `extra_attempts` more
+    /// times, as a long offline period leaves them. With `relays_back`, the relays accept
+    /// publishes again by the time the new process starts; otherwise it starts offline.
+    async fn restart_after_long_offline(&mut self, extra_attempts: u32, relays_back: bool) {
         self.runtime.shutdown().await;
         {
             let client = self.app.client("sender").await.unwrap();
@@ -217,6 +218,9 @@ impl OfflineQueue {
                     .unwrap();
             }
             drop(client);
+        }
+        if relays_back {
+            self.relay.allow_publishes();
         }
         self.runtime = MarmotAppRuntime::new(self.app.clone());
         self.runtime.reconcile_accounts().await.unwrap();
@@ -334,20 +338,36 @@ async fn mixed_offline_failures_all_publish_after_reconnect() {
 }
 
 /// A long offline period backs the retry clocks off towards an hour, and a cold restart
-/// keeps them. The stuck sends stay pending until the host reports connectivity, then all
-/// publish at once.
+/// keeps them. A restart that is online already gets no connectivity edge from its host,
+/// so the startup sync reaching the relays must release the batch on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_offline_batch_publishes_after_a_restart_that_reaches_the_relays() {
+    let mut queue = OfflineQueue::online().await;
+    queue.send_offline(OfflineFailure::Unavailable).await;
+    queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    queue.restart_after_long_offline(7, true).await;
+    queue
+        .assert_all_published_once_in_order(Duration::from_secs(8), "online restart")
+        .await;
+    queue.runtime.shutdown().await;
+}
+
+/// A restart that is still offline spends its startup wake on one failed retry. The
+/// backed-off sends then wait for the host's connectivity edge, and all publish on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_offline_batch_survives_restart_and_publishes_on_reconnect() {
     let mut queue = OfflineQueue::online().await;
     queue.send_offline(OfflineFailure::Unavailable).await;
     queue.send_offline(OfflineFailure::PossiblyExposed).await;
     queue.send_offline(OfflineFailure::PossiblyExposed).await;
-    queue.restart_after_long_offline(7).await;
+    queue.restart_after_long_offline(7, false).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     queue.relay.allow_publishes();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
         queue.unpublished() > 0,
-        "without a connectivity edge the restarted batch keeps its backed-off clocks"
+        "without a connectivity edge the batch keeps its backed-off clocks"
     );
     queue.reconnect().await;
     queue
