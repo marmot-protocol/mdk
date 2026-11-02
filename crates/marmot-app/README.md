@@ -430,10 +430,15 @@ stands. Show the label the next list returns after `LinkedDevicesChanged`, not t
 `MarmotAppRuntime::update_linked_device_settings(account_ref, slot_id_hex, add_to_all_chats, bring_history, keep_while_inactive)`
 changes any linked device's supplied settings, this device included. Each setting is optional: omitted values come
 from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
-A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits the linked-device Add flow while it is still adding; turning it off
+A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
+eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
 does not leave joined chats. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
+
+On the editing device, new automatic Adds and history transfers wait for a differing local setting intention to
+settle. Existing history debt keeps its original expiry; once ready, a history setting that is off discards that debt.
+This does not recall deliveries already handed off or change what another device sends before it learns the edit.
 
 A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it

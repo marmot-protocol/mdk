@@ -12,7 +12,7 @@
 
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{
-    DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1, DeviceRenameId, DeviceSlotId,
+    DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1, DeviceRenameId, DeviceSettingsV1, DeviceSlotId,
 };
 use marmot_session::{AccountResult, DeviceRosterEdit, DeviceRosterEditBlocked, PendingResolution};
 use rand::RngCore;
@@ -20,6 +20,7 @@ use rand::rngs::OsRng;
 use storage_sqlite::DeviceRenameRecord;
 
 use super::AppClient;
+use super::device_group::Exchange;
 use super::device_group::device_slot;
 use crate::AppError;
 
@@ -152,6 +153,41 @@ fn edit_matches(record: &DeviceRenameRecord, entry: &DeviceEntryV1) -> bool {
 }
 
 impl AppClient {
+    /// Before a new settings-dependent side effect, wait for a differing local
+    /// intention to settle. This reads the existing journal, not another queue.
+    /// Equal flags, legacy labels and applied edits do not hold unrelated work.
+    pub(super) fn device_setting_ready(
+        &mut self,
+        exchange: &Exchange,
+        slot: &DeviceSlotId,
+        flag: fn(DeviceSettingsV1) -> bool,
+    ) -> Result<bool, AppError> {
+        let Some(entry) = exchange.roster.devices.get(slot) else {
+            return Ok(true);
+        };
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(record) = storage.device_rename(&hex::encode(slot))? else {
+            return Ok(true);
+        };
+        let Some(settings) = record.settings else {
+            return Ok(true);
+        };
+        let state = standing(&record, entry.rename_id);
+        if flag(settings) == flag(entry.settings) || state == Standing::Applied {
+            return Ok(true);
+        }
+        // A different id retires this intention only after every own Commit
+        // has reached its outcome, exactly as the D37 recovery owner requires.
+        let held = self.epoch_gap_held_groups()?;
+        if !self
+            .runtime
+            .device_group_takes_commit(&exchange.group_id, &held)?
+        {
+            return Ok(false);
+        }
+        Ok(state == Standing::Replaced)
+    }
+
     /// Rename any linked device; empty clears its label and at most 64 UTF-8
     /// bytes are accepted. Earlier lost edits recover before a later edit.
     pub(crate) async fn rename_linked_device(

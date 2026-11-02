@@ -110,6 +110,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as
   device entries.
+- Before new automatic Adds or history transfers, `device_setting_ready` defers a target only when the relevant
+  local journal flag differs and its intention has not settled or lost to another user edit. Run D37 upkeep before
+  history maintenance. Apply D76's terminal destination checks only after readiness: pending edits keep existing debt,
+  never extend its expiry or recreate forgotten debt. Check inline send, Blossom preparation and completion, direct
+  Adds and gap Adds; founding inclusion ignores the old-chat setting. Incoming history and already handed-off carrier
+  outcomes settle independently. Legacy label-only rows, equal flags and applied retained edits do not hold work.
 - Recovery words for backups (`src/client/backups.rs`, mdk#2628 4.4a) live only in `AppClient::pending_recovery_words`
   as zeroized entropy, until confirmed or cancelled: never write or log the words, their entropy or the private half.
   A device that trusts no device group keeps only the key's public half (`backup_recovery_key`), and

@@ -597,6 +597,90 @@ async fn gap_filling_covers_a_link_older_than_the_approvers_burst() {
     assert_eq!(taken_from(&phone, &laptop), 1);
 }
 
+/// Both automatic Add paths leave private stock untouched while a local
+/// opt-out still needs replay. Once the user enables the settled setting,
+/// either path can proceed; retaining the applied edit never blocks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_adds_wait_for_a_lost_local_old_chat_toggle() {
+    for resume_with_gap in [false, true] {
+        let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+        let chat = chats(&mut phone, 1).await.remove(0);
+        let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+        hold_key_packages(&relay, &mut phone, &mut laptop).await;
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        let slot_hex = laptop.slot_hex();
+        let slot: [u8; 32] = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+        phone
+            .client
+            .update_linked_device_settings(&slot_hex, Some(false), None, None)
+            .await
+            .unwrap();
+        for platform in ["fork-a", "fork-b"] {
+            let edit = laptop
+                .client
+                .runtime
+                .edit_device_roster_entry(&group, &slot, &[], |entry| {
+                    entry.platform = platform.to_owned();
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                edit,
+                marmot_session::DeviceRosterEdit::Committed(_)
+            ));
+        }
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        assert!(
+            phone.roster(&group).devices[&slot]
+                .settings
+                .add_to_all_chats,
+            "the opt-out lost to the longer non-user branch"
+        );
+        assert!(held_from(&phone, &laptop) > 0);
+        assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
+        phone.client.fill_sibling_chat_gaps(&[], 1).await;
+        assert_eq!(
+            taken_from(&phone, &laptop),
+            0,
+            "neither path spends stock for a pending opt-out"
+        );
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+
+        phone.client.try_device_rename_upkeep().await.unwrap();
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        assert!(
+            !phone.roster(&group).devices[&slot]
+                .settings
+                .add_to_all_chats
+        );
+        phone
+            .client
+            .update_linked_device_settings(&slot_hex, Some(true), None, None)
+            .await
+            .unwrap();
+        if resume_with_gap {
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE device_links SET decided_at = decided_at - ?1",
+                    [i64::try_from(LINK_CHAT_ADD_SECS).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
+            phone.client.fill_sibling_chat_gaps(&[], 1).await;
+        } else {
+            assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 1);
+        }
+        assert_eq!(taken_from(&phone, &laptop), 1);
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    }
+}
+
 /// A chat with a commit of the phone's own still staged takes no Add and no
 /// KeyPackage: an Add there could not go through, and one queued behind the
 /// commit could not yet show in the chat, so a later pass would add the

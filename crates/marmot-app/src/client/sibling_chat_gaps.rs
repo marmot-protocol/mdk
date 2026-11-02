@@ -367,6 +367,10 @@ impl AppClient {
             return Ok(());
         }
         for slot in siblings {
+            if !self.device_setting_ready(exchange, slot, |settings| settings.add_to_all_chats)? {
+                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                continue;
+            }
             let gap = (chat.clone(), *slot);
             if !self.gap_is_missing(exchange, chat, *slot)? {
                 self.sibling_chat_gaps.claims.remove(&gap);
@@ -441,6 +445,8 @@ impl AppClient {
                 || !current.tagged
                 || !self.group_quiet(&current.group_id)?
                 || !self.gap_siblings(&current)?.contains(slot)
+                || !self
+                    .device_setting_ready(&current, slot, |settings| settings.add_to_all_chats)?
                 || !self.group_quiet(chat)?
                 || !self.gap_is_missing(&current, chat, *slot)?
             {
