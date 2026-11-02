@@ -252,6 +252,59 @@ mod tests {
             Ok(())
         }
     }
+    // A real upload supplies the local provenance that an outbound reference needs.
+    async fn upload_sink() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let base = url.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let base = base.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    let end = loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    assert!(headers.starts_with("PUT /upload "));
+                    let header = |name: &str| {
+                        headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                            .unwrap()
+                            .1
+                            .trim()
+                            .to_owned()
+                    };
+                    let len: usize = header("content-length").parse().unwrap();
+                    let hash = header("x-sha-256");
+                    while request.len() < end + len {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let body = serde_json::json!({"url": format!("{base}/{hash}"), "sha256": hash,
+                        "size": len, "type": "application/octet-stream", "uploaded": 1})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (url, task)
+    }
     /// C results preserve slot metadata while page and cloned-version ownership remain independent.
     #[test]
     fn attachment_c_handles_preflight_borrowing_and_deep_free() {
@@ -269,7 +322,7 @@ mod tests {
         let kit = Marmot::new_with_options(
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
-            marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
             Some(Arc::new(Store::default())),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
@@ -294,21 +347,40 @@ mod tests {
                 None,
             ))
             .unwrap();
-        let reference = MediaAttachmentReferenceFfi {
-            locators: vec![MediaLocatorFfi {
-                kind: "blossom-v1".into(),
-                value: format!("https://media.example/{}.bin", "11".repeat(32)),
-            }],
-            ciphertext_sha256: "11".repeat(32),
-            plaintext_sha256: "22".repeat(32),
-            nonce_hex: "33".repeat(12),
-            file_name: "image.png".into(),
-            media_type: "image/png".into(),
-            version: EncryptedMediaVersionFfi::V2,
-            source_epoch: 0,
-            dim: None,
-            thumbhash: None,
-        };
+        let (server, upload_task) = client.block_on(upload_sink());
+        let uploaded = client
+            .block_on(client.marmot.upload_media(
+                account.clone(),
+                group.clone(),
+                MediaUploadRequestFfi {
+                    attachments: vec![MediaUploadAttachmentRequestFfi {
+                        file_name: "image.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"C attachment fixture".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    }],
+                    caption: None,
+                    send: false,
+                    blossom_server: Some(server),
+                    message_tags: Vec::new(),
+                },
+            ))
+            .unwrap();
+        let reference = uploaded.attachments.into_iter().next().unwrap().reference;
+        assert!(
+            reference.source_epoch_identity.is_some(),
+            "upload must carry local provenance"
+        );
+        // Exercise the C input conversion and deep free with a populated identity.
+        let mut mirrored =
+            crate::types::media::MarmotMediaAttachmentReference::from(reference.clone());
+        let restored = unsafe { mirrored.to_ffi() }.unwrap();
+        assert_eq!(
+            restored.source_epoch_identity,
+            reference.source_epoch_identity
+        );
+        unsafe { mirrored.free_in_place() };
         client
             .block_on(client.marmot.send_media_attachments(
                 account.clone(),
@@ -555,6 +627,7 @@ mod tests {
             });
             free_boxed(boxed(rejected));
         }
+        upload_task.abort();
         client.block_on(client.marmot.shutdown_and_close()).unwrap();
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

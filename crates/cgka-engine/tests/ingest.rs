@@ -1316,8 +1316,12 @@ async fn post_peel_invalid_mls_inputs_are_terminal_and_restart_deduplicated() {
 
 #[tokio::test]
 async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_rollback() {
-    let mut alice =
-        build_client_with_peeler(b"alice-pending", Box::new(MalformedShortPayloadPeeler));
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = build_client_with_storage_and_peeler(
+        storage.clone(),
+        b"alice-pending",
+        Box::new(MalformedShortPayloadPeeler),
+    );
     let mut bob = build_client(b"bob-pending");
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -1370,21 +1374,29 @@ async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_
         "pre-peel buffering during PendingPublish is the tested entry \
          condition, got {buffered:?}"
     );
+    let mut expected_row = storage.get_message(&garbage.id).unwrap();
+    assert_eq!(expected_row.state, MessageState::Retryable);
+    assert_eq!(
+        cgka_traits::message::StoredMessagePayload::decode(&expected_row.payload)
+            .unwrap()
+            .as_raw_transport(),
+        Some(&garbage)
+    );
 
     // Rollback returns the group to Stable and replays the buffered backlog;
     // the garbage now peels `Malformed` for the first time. The terminal
     // contract: once classification has run, the attacker-keyed row must not
     // stay in a non-terminal state that re-enters replay forever.
     alice.publish_failed(staged).await.unwrap();
+    expected_row.state = MessageState::Failed;
+    assert_eq!(storage.get_message(&garbage.id).unwrap(), expected_row);
     let after_replay = alice.ingest(garbage).await.unwrap();
-    assert!(
-        matches!(
-            after_replay,
-            IngestOutcome::Stale { .. } | IngestOutcome::Ignored { .. }
-        ),
-        "a malformed message must land terminal once classified — a \
-         `Buffered` here means the stored row is still non-terminal and \
-         perpetually reported as pending, got {after_replay:?}"
+    assert_eq!(
+        after_replay,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate,
+        },
+        "the retained malformed row must be terminal and suppress exact redelivery"
     );
 }
 
@@ -1712,7 +1724,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
     // Sent marker and classify as OwnEcho instead of being processed again.
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice.sqlite");
-    let key = SqlCipherKey::new("durable own echo content marker").unwrap();
+    let key = SqlCipherKey::raw([0x71; 32]);
 
     let group_id;
     let app_msg;

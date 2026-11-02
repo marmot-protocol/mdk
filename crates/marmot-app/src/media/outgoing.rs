@@ -561,6 +561,7 @@ pub(crate) async fn upload_staged<C: MediaCatalog + 'static>(
             media_type: source.media_type,
             version: policy.version.as_str().to_owned(),
             source_epoch,
+            source_epoch_identity: None,
             dim: source.dim,
             thumbhash: source.thumbhash,
         };
