@@ -783,7 +783,12 @@ impl AppClient {
     }
 
     fn restore_failure(&self, error: &AppError) {
-        tracing::warn!(target: TARGET,method="backup_restore",error_kind=error.privacy_safe_kind(),"backup restore step failed");
+        tracing::warn!(
+            target: TARGET,
+            method = "backup_restore",
+            error_kind = error.privacy_safe_kind(),
+            "backup restore step failed"
+        );
     }
 }
 

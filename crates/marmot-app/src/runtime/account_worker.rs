@@ -4601,7 +4601,12 @@ fn dispatch_backup_restore(client: &mut AppClient, media_http: &MediaHttpContext
         }
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(target: "marmot_app::runtime",method="dispatch_backup_restore",error_kind=error.privacy_safe_kind(),"backup restore preparation failed")
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "dispatch_backup_restore",
+                error_kind = error.privacy_safe_kind(),
+                "backup restore preparation failed"
+            )
         }
     }
 }
