@@ -13775,6 +13775,51 @@ impl LiveCursorFixture {
         fixture
     }
 
+    /// Replace the fixture's empty account queue with a store that waits before
+    /// writing the real spill rows. Dropping the sender opens the gate, including
+    /// on panic, so a blocked writer cannot strand the runtime's blocking pool.
+    pub(crate) fn hold_spill_writes(
+        &mut self,
+    ) -> (std::sync::mpsc::Sender<()>, Arc<tokio::sync::Notify>) {
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let writing = entered.clone();
+        let storage = self.app.account_storage("alice").unwrap();
+        let store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            writing.notify_one();
+            let _ = held.lock().unwrap().recv();
+            storage
+                .app_storage()
+                .spill_account_deliveries(
+                    deliveries,
+                    crate::client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    crate::unix_now_seconds(),
+                )
+                .map(|dispositions| {
+                    dispositions
+                        .into_iter()
+                        .map(crate::client::delivery_spill::plane_spill_disposition)
+                        .collect()
+                })
+                .map_err(|error| {
+                    if error.is_closed() {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
+        self.client.adapter = self.app.relay_plane.account_adapter_with_recovery_marker(
+            self.account_id.clone(),
+            self.relay.clone(),
+            None,
+            Some(store),
+        );
+        self.client.adapter.open_transport_cursor(self.persisted());
+        (release, entered)
+    }
+
     async fn open_with_cursor(seed_cursor: bool, audited: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
