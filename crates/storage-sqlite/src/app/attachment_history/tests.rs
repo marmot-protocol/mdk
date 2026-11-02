@@ -206,12 +206,13 @@ fn account_group_fences_and_atomic_rollback() {
         &store,
         "CREATE TRIGGER fail_attachment_removal BEFORE DELETE ON attachment_history BEGIN SELECT RAISE(ABORT,'test'); END",
     );
+    let refused = store
+        .lock()
+        .unwrap()
+        .execute("UPDATE message_timeline SET deleted=1", []);
     assert!(
-        store
-            .lock()
-            .unwrap()
-            .execute("UPDATE message_timeline SET deleted=1", [])
-            .is_err()
+        matches!(&refused, Err(rusqlite::Error::SqliteFailure(_, Some(message))) if message == "test"),
+        "{refused:?}"
     );
     assert_eq!(page(&app).version, before.version);
     assert_eq!(
@@ -281,7 +282,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
     use cgka_traits::app_event::AppMessageRetentionDecision;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attachments.sqlite3");
-    let key = crate::SqlCipherKey::new("attachment-test-key").unwrap();
+    let key = crate::SqlCipherKey::raw([0x4a; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let event = crate::StoredAppEvent {
         group_id_hex: "aa".into(),

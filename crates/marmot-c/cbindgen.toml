@@ -52,6 +52,7 @@ include = [
     "MarmotHostPerformanceOutcome",
     "MarmotModerationReportOrigin",
     "MarmotSignInResponse",
+    "MarmotCompromiseWarningReason",
 ]
 
 [enum]

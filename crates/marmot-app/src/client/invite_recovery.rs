@@ -119,7 +119,12 @@ impl AppClient {
         // until both the native replacement and its app projection have settled.
         let policy_lock = self.app.block_update_lock(&self.state.label).await;
         let _policy_guard = policy_lock.lock().await;
-        let group_id = self.runtime.confirm_group_rejoin(welcome_id, token).await?;
+        // A confirmation that fails can still retire offers: one whose
+        // carriers were all withdrawn, or a Welcome it refuses.
+        let offers = self.rejoin_offer_snapshot()?;
+        let confirmed = self.runtime.confirm_group_rejoin(welcome_id, token).await;
+        self.reconcile_rejoin_offer_changes(offers)?;
+        let group_id = confirmed?;
         // GroupJoined is durably journaled by the engine, so a failed app
         // projection refresh is repaired by the ordinary reopen/drain path.
         let summary = self.drain_pending_session_events().await?;
@@ -208,7 +213,12 @@ impl AppClient {
             // seam must hold it through projection without nesting that path.
             let policy_lock = self.app.block_update_lock(&self.state.label).await;
             let _policy_guard = policy_lock.lock().await;
-            if self.runtime.retry_rejoins_after_trusted_removal().await? {
+            // The retry also retires offers it cannot join, which the host
+            // shows until it is told.
+            let offers = self.rejoin_offer_snapshot()?;
+            let joined = self.runtime.retry_rejoins_after_trusted_removal().await;
+            self.reconcile_rejoin_offer_changes(offers)?;
+            if joined? {
                 let summary = self.drain_pending_session_events().await?;
                 self.pending_applied_sync_summary.merge(summary);
             }

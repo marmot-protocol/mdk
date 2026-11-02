@@ -237,3 +237,172 @@ impl PerformanceRecorder {
         self.0.measure_app(operation, work).await
     }
 }
+
+#[cfg(all(test, feature = "product-analytics-export"))]
+mod tests {
+    use super::*;
+    use crate::product_analytics::fixtures::{configured, grant};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn recording_views_preserve_operation_samples_and_share_revocation() {
+        let (collector, clock) = configured();
+        grant(&collector);
+        clock.mono.store(1000, Ordering::Relaxed);
+        let product = ProductRecorder::from(collector.clone());
+        let first = Observer::sharing(&product);
+        let second = Observer::sharing(&product);
+        let permit = first.product().permit().unwrap();
+
+        first.performance().record(
+            AppPerformanceOperation::AppStart,
+            Duration::from_millis(10),
+            true,
+        );
+        assert_eq!(first.performance().snapshot().app_start.attempts, 1);
+        assert_eq!(second.performance().snapshot().app_start.attempts, 0);
+        first.product().observe(
+            ProductFamily::Maintenance,
+            "sweep",
+            "performed",
+            ProductUnit::Transition,
+            None,
+        );
+        let output = second
+            .product()
+            .observed(
+                ProductFamily::Maintenance,
+                "self_update",
+                ProductUnit::Attempt,
+            )
+            .run(|| Ok::<_, ()>(17), success_or_failure);
+        assert_eq!(output, Ok(17));
+
+        let counts = first
+            .product()
+            .operation(
+                ProductFamily::Maintenance,
+                "retention",
+                ProductUnit::Attempt,
+            )
+            .unwrap()
+            .counts_only();
+        counts.count("success", ProductUnit::Action, 2);
+        drop(counts);
+        first
+            .product()
+            .operation(
+                ProductFamily::Maintenance,
+                "key_package",
+                ProductUnit::Attempt,
+            )
+            .unwrap()
+            .discard();
+        first
+            .product()
+            .operation(ProductFamily::Maintenance, "deferred", ProductUnit::Attempt)
+            .unwrap()
+            .finish("success");
+        second
+            .product()
+            .operation(ProductFamily::Maintenance, "capacity", ProductUnit::Attempt)
+            .unwrap()
+            .finish_with_duration("failure", Duration::from_millis(250));
+        let directory = second
+            .product()
+            .operation(ProductFamily::Directory, "key_package", ProductUnit::Action)
+            .unwrap()
+            .counts_only();
+        directory.directory_sample("success", "cache", 3);
+        directory.duration_sample("success", Duration::from_millis(25));
+        drop(directory);
+        first
+            .product()
+            .storage_failure(Some(&permit), StorageFailureKind::Busy);
+        let backlog = second.product().backlog_source();
+        backlog.sample(&permit, ProductFamily::Maintenance, "pending", 8);
+
+        assert_eq!(first.product().status().queued_events, 0);
+        crate::wiring::seal_partial(&collector);
+        assert_eq!(first.product().status().queued_events, 11);
+        let payloads = collector.test_payloads();
+        assert!(payloads.iter().all(|row| row["props"]["partial"] == "true"));
+        let find = |event: &str, operation: &str, unit: &str| {
+            let rows = payloads
+                .iter()
+                .filter(|row| {
+                    row["eventName"] == event
+                        && row["props"]["operation"] == operation
+                        && row["props"]["unit"] == unit
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "{event}/{operation}/{unit}");
+            rows[0]
+        };
+        for (operation, unit, count, outcome) in [
+            ("sweep", "transition", "1", "performed"),
+            ("self_update", "attempt", "1", "success"),
+            ("retention", "action", "2", "success"),
+            ("deferred", "attempt", "1", "success"),
+            ("capacity", "attempt", "1", "failure"),
+        ] {
+            let row = find("mdk_maintenance_summary", operation, unit);
+            assert_eq!(row["props"]["count_bucket"], count);
+            assert_eq!(row["props"]["outcome"], outcome);
+        }
+        let startup = find("mdk_runtime_summary", "startup", "attempt");
+        assert_eq!(startup["props"]["count_bucket"], "1");
+        assert_eq!(startup["props"]["duration_bucket"], "le_10ms");
+        assert_eq!(
+            find("mdk_maintenance_summary", "capacity", "attempt")["props"]["duration_bucket"],
+            "le_250ms"
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|row| row["eventName"] == "mdk_maintenance_summary")
+                .count(),
+            6,
+            "count-only and discarded tickets must not add cancellation samples"
+        );
+        assert!(!payloads.iter().any(|row| {
+            row["eventName"] == "mdk_maintenance_summary"
+                && row["props"]["operation"] == "key_package"
+        }));
+        let directory_rows = payloads
+            .iter()
+            .filter(|row| row["eventName"] == "mdk_directory_summary")
+            .collect::<Vec<_>>();
+        assert_eq!(directory_rows.len(), 2);
+        let source = directory_rows
+            .iter()
+            .find(|row| row["props"]["source"] == "cache")
+            .unwrap();
+        assert_eq!(source["props"]["count_bucket"], "3_5");
+        let duration = directory_rows
+            .iter()
+            .find(|row| row["props"]["duration_bucket"] == "le_25ms")
+            .unwrap();
+        assert_eq!(duration["props"]["count_bucket"], "1");
+        assert_eq!(
+            find("mdk_storage_summary", "busy", "attempt")["props"]["outcome"],
+            "failure"
+        );
+        assert_eq!(
+            find("mdk_maintenance_summary", "pending", "backlog")["props"]["count_bucket"],
+            "6_10"
+        );
+
+        crate::wiring::revoke_memory(&collector);
+        assert!(!permit_valid(&permit));
+        assert!(first.product().permit().is_none());
+        assert!(second.product().permit().is_none());
+        assert!(
+            second
+                .product()
+                .operation(ProductFamily::Maintenance, "sweep", ProductUnit::Attempt)
+                .is_none()
+        );
+        assert!(collector.test_payloads().is_empty());
+    }
+}

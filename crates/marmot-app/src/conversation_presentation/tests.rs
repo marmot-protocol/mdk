@@ -78,6 +78,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        imported_from: None,
     }
 }
 fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {
@@ -172,6 +173,13 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
             false,
             AppGroupLifecycleState::Stable,
             ConversationParticipation::Removed,
+        ),
+        (
+            SelfMembership::DeviceRemoved,
+            false,
+            false,
+            AppGroupLifecycleState::Stable,
+            ConversationParticipation::DeviceRemoved,
         ),
         (
             SelfMembership::Member,

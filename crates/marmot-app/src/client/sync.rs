@@ -477,7 +477,7 @@ pub(crate) struct RecoveryExecutionState {
 
 /// The public outcome of an explicit full-history repair that did not
 /// qualify. Everything the repair admitted stays in the partial summary.
-fn incomplete_full_history_repair(
+pub(crate) fn incomplete_full_history_repair(
     summary: SyncSummary,
     reason: crate::FullHistoryRepairIncompleteReason,
     delivery_loss_pending: bool,
@@ -834,24 +834,21 @@ struct EventProjectionProgress {
     terminal_cleanup: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
+/// Which retained sends [`AppClient::wake_retained_sends`] wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSendWake {
+    /// Every retryable target, as for a host connectivity edge.
+    All,
+    /// Only sends still below their required acknowledgements, the ones a
+    /// user sees as unsent, and sends still awaiting MLS confirmation.
+    BelowQuorum,
+}
+
 impl AppClient {
-    /// Persist a host connectivity-restored edge into every exact fanout whose
-    /// prior attempt was proven unavailable, then schedule its group for an
-    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    /// Persist a host connectivity-restored edge into every exact fanout with a
+    /// retryable target, then schedule its group for an immediate worker pass.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
-        let mut woken_targets = 0;
-        for mut fanout in self.runtime.outbound_fanouts()? {
-            let woken = fanout.wake_retryable_unavailable_targets();
-            if woken == 0 {
-                continue;
-            }
-            let group_id = fanout.group_id().cloned();
-            self.runtime.put_outbound_fanout(&fanout)?;
-            if let Some(group_id) = group_id {
-                self.pending_convergence_groups.insert(group_id);
-            }
-            woken_targets += woken;
-        }
+        let woken_targets = self.wake_retained_sends(RetainedSendWake::All)?;
         self.app.product_analytics.observe(
             crate::ProductFamily::Connectivity,
             "reconnect",
@@ -863,6 +860,66 @@ impl AppClient {
             crate::ProductUnit::Attempt,
             None,
         );
+        Ok(woken_targets)
+    }
+
+    /// Clear the retry clock of every retryable target of a retained send, then
+    /// schedule its group for an immediate worker pass. Attempt counts stay, so
+    /// a retry that fails again resumes its backoff. Possibly-exposed targets
+    /// wake too: their retry resends the same signed event, which a relay that
+    /// already holds it acknowledges as a duplicate. Leaving them on the
+    /// ambiguity clock held a reconnecting device's queued sends for up to an
+    /// hour (mdk#2762).
+    ///
+    /// A group the session opened only seeded hides its fanouts until it is
+    /// hydrated, so each group that holds one is hydrated first. Otherwise a
+    /// wake soon after a cold start would skip exactly the sends a previous
+    /// process left behind. A group that fails to hydrate moves to quarantine
+    /// and keeps its fanouts frozen, as at open.
+    ///
+    /// [`RetainedSendWake::BelowQuorum`] leaves sends that met their required
+    /// acknowledgements, and await no MLS confirmation, to the secondary
+    /// replication schedule.
+    pub(crate) fn wake_retained_sends(
+        &mut self,
+        scope: RetainedSendWake,
+    ) -> Result<usize, AppError> {
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        if !unhydrated.is_empty() {
+            for group_id in self.runtime.outbound_fanout_group_ids()? {
+                if unhydrated.contains(&group_id)
+                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::sync",
+                        method = "wake_retained_sends",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "group with retained sends could not hydrate for the wake",
+                    );
+                }
+            }
+        }
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.outbound_fanouts()? {
+            // A send that met quorum but still awaits MLS confirmation remains
+            // a group barrier, so its clock must not hold the group either.
+            if scope == RetainedSendWake::BelowQuorum
+                && fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1)
+                && !matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            {
+                continue;
+            }
+            let woken = fanout.wake_targets_for_restored_connectivity();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
         Ok(woken_targets)
     }
 
@@ -1048,6 +1105,23 @@ impl AppClient {
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
     ) {
+        // Every engine effect passes here. A group's lifecycle decides what the
+        // recovery runner may serve, so it reads its debt again.
+        if effects.events.iter().any(|event| {
+            use cgka_traits::engine::GroupEvent;
+            matches!(
+                event,
+                GroupEvent::GroupCreated { .. }
+                    | GroupEvent::GroupJoined { .. }
+                    | GroupEvent::LocalGroupCopyTerminated { .. }
+                    | GroupEvent::LocalGroupCopyRestored { .. }
+                    | GroupEvent::GroupUnrecoverable { .. }
+                    | GroupEvent::GroupStateInvalidated { .. }
+                    | GroupEvent::GroupStateRevalidated { .. }
+            )
+        }) {
+            self.wake_recovery_runner();
+        }
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
         }
@@ -1961,7 +2035,31 @@ impl AppClient {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
         }
+        // Behind the internal `runner_owns_debt` gate, a directly owned client
+        // also runs its recovery runner in place for one pass (mdk#2660).
+        if explicit && self.has_in_place_recovery_runner() {
+            summary = self.run_in_place_recovery_pass(summary).await?;
+        }
         self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// The in-place runner's pass after an explicit sync, behind `summary`.
+    /// Boxed like the pass itself, so its awaits add nothing to every sync's
+    /// stack.
+    fn run_in_place_recovery_pass(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> futures::future::BoxFuture<'_, Result<SyncSummary, ClassifiedSyncFailure>> {
+        Box::pin(async move {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            self.run_recovery_runner_pass().await;
+            self.prepend_pending_applied_summary(&mut summary);
+            if self.pending_runtime_group_subscription_refresh {
+                summary = self.refresh_live_group_subscriptions(summary).await?;
+            }
+            Ok(summary)
+        })
     }
 
     /// Bring the live group subscriptions up to the current routes. Nothing
@@ -2467,6 +2565,9 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
+        self.note_device_group_sent_ids(effects);
+        self.note_device_group_removal(effects);
+        self.settle_sibling_welcome_carriers(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
@@ -2562,6 +2663,7 @@ impl AppClient {
             .get(pending.failed_message_cursor)
         {
             if pending.failed_message_update.is_none() {
+                self.history_delivery_failed(&failed.app_event_id)?;
                 pending.failed_message_update = Some(
                     self.app
                         .account_storage(&self.state.label)?
@@ -2980,7 +3082,7 @@ impl AppClient {
                 // The loss is durable and fences the cursor. A directly owned
                 // client has no worker, so its recovery job runs here.
                 transport_nostr::AccountDeliveryReceive::Overflow(_) => {
-                    match self
+                    let recovered = match self
                         .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
                         .await?
                     {
@@ -2989,6 +3091,15 @@ impl AppClient {
                         EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending => {
                             SyncSummary::default()
                         }
+                    };
+                    // Behind the internal `runner_owns_debt` gate, its
+                    // recovery runner runs one pass here too (mdk#2660).
+                    if self.has_in_place_recovery_runner() {
+                        self.pending_applied_sync_summary.merge(recovered);
+                        self.run_recovery_runner_pass().await;
+                        self.take_pending_applied_sync_summary()
+                    } else {
+                        recovered
                     }
                 }
             };
@@ -3433,6 +3544,11 @@ impl AppClient {
                 on_progress.publish(self, committed).await;
             } else {
                 self.pending_native_sync_summary.merge(committed);
+            }
+            // An unlinked account receives nothing more; the drain ends as a
+            // quiet relay ends it (mdk#2628 D67).
+            if self.device_unlinked {
+                break false;
             }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
@@ -4056,6 +4172,20 @@ impl AppClient {
             });
         }
         let effects = ingest?;
+        // A Welcome delivery naming another KeyPackage of this account is a
+        // reason to look for a new sign-in (mdk#2628 3.2): bring the check
+        // forward, as a live KeyPackage of the account does.
+        if matches!(
+            effects.outcome,
+            IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
+            }
+        ) {
+            client
+                .app
+                .sign_in_nudges
+                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+        }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
             &effects.effects,
@@ -5832,13 +5962,22 @@ impl AppClient {
     pub(crate) async fn repair_full_history(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        self.repair_full_history_cancellable(&|| false).await
+        self.repair_full_history_cancellable(&|| false, None).await
     }
 
+    /// Explicit repair. Behind the internal `runner_owns_debt` gate it runs
+    /// through the account's runner, `spawned` for a worker account
+    /// (mdk#2660 phase 4).
     pub(crate) async fn repair_full_history_cancellable(
         &mut self,
         cancelled: &(dyn Fn() -> bool + Sync),
+        spawned: Option<&mut super::recovery_runner::host::SpawnedRunner>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        if self.repairs_through_runner(spawned.as_deref()) {
+            return self
+                .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)
+                .await;
+        }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
             started: Instant::now(),
             timeout: FULL_HISTORY_REPAIR_TIMEOUT,
@@ -6816,6 +6955,8 @@ impl AppClient {
                     .stored_group_self_membership(&self.state.label, &group_id_hex)?;
                 let membership = if *voluntary || existing == Some(SelfMembership::Left) {
                     SelfMembership::Left
+                } else if self.account_keeps_a_leaf(group_id)? {
+                    SelfMembership::DeviceRemoved
                 } else {
                     SelfMembership::Removed
                 };
@@ -6877,6 +7018,16 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
+    /// Whether this device's copy of the group is removed while the account
+    /// still has a leaf in it: a removal of this device alone, which is not a
+    /// removal of the account from the group (mdk#2628 D62). A removed copy
+    /// keeps the members the removal left.
+    pub(crate) fn account_keeps_a_leaf(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        let record = self.runtime.group_record(group_id)?;
+        let self_id = self.runtime.self_id();
+        Ok(record.removed && record.members.iter().any(|member| member.id == self_id))
+    }
+
     /// Restore departed projections from canonical local-device state, without a timeline invitation.
     /// An outstanding local leave remains a departure intent even before its proposal merges.
     pub(crate) fn reconcile_canonical_self_membership(
@@ -6884,11 +7035,11 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        if !matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        ) || self.runtime.group_record(group_id)?.is_terminal()
+        if !self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed)
+            || self.runtime.group_record(group_id)?.is_terminal()
             || self.has_local_group_deletion_frontier(group_id)?
             || self
                 .runtime
@@ -6912,11 +7063,10 @@ impl AppClient {
     /// Canonical restoration repairs membership while preserving local archive intent.
     fn restore_canonical_self_membership(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let departed = matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        );
+        let departed = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed);
         if !departed {
             return Ok(false);
         }
@@ -7552,6 +7702,7 @@ mod live_cursor_checkpoint_tests {
     fn a_fenced_drain_checkpoint_keeps_spilling_what_live_promotion_exposed() {
         run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
             let mut fixture = LiveCursorFixture::open().await;
+            let (spill_gate, writing) = fixture.hold_spill_writes();
             let cursor_before = fixture.cursor_before;
             let promoting = fixture.probe(cursor_before + 4_000, "promoting");
             queue_in_order(&fixture, [promoting.clone()]).await;
@@ -7565,13 +7716,15 @@ mod live_cursor_checkpoint_tests {
             let second = fixture
                 .delivery(fixture.probe(cursor_before + 1_001, "second"))
                 .await;
-            // The spill writer has not run yet, so its hand-off fences the
-            // drain checkpoint that follows, which a later ingest would
-            // otherwise have moved past the live promotion.
+            // Hold the real spill write through the checkpoint. Even a writer
+            // scheduled immediately must leave its hand-off fencing the cursor.
             fixture
                 .app
                 .relay_plane
                 .route_account_delivery_for_test(first);
+            tokio::time::timeout(std::time::Duration::from_secs(5), writing.notified())
+                .await
+                .expect("the spill writer reaches its store gate");
             assert!(fixture.client.adapter.delivery_loss_blocks_cursor());
             fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
             fixture
@@ -7593,6 +7746,7 @@ mod live_cursor_checkpoint_tests {
                     .is_none(),
                 "a delivery only the live promotion exposed is still spilled"
             );
+            drop(spill_gate);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while fixture
                     .app

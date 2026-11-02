@@ -25,9 +25,9 @@ use cgka_traits::app_components::{
     encode_device_tag_content_v1, encode_device_tag_signed_content_v1, encode_device_tag_v1,
 };
 use cgka_traits::error::EngineError;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{RosterTagKey, StorageProvider};
 use cgka_traits::types::GroupId;
-use openmls::group::MlsGroup;
+use openmls::group::{MlsGroup, StagedCommit};
 use openmls::messages::proposals::Proposal;
 use openmls::prelude::LeafNode;
 use openmls_basic_credential::SignatureKeyPair;
@@ -124,6 +124,16 @@ impl OwnDeviceTag {
         let slot = own_slot?;
         let entry_key = roster.devices.get(&slot)?.tag_signature_key.as_deref();
         (entry_key == Some(own_signature_key)).then_some(Self { roster, slot })
+    }
+
+    /// The device group's current roster this entry was read from.
+    pub(crate) fn roster(&self) -> &DeviceRosterV1 {
+        &self.roster
+    }
+
+    /// This device's roster slot.
+    pub(crate) fn slot(&self) -> DeviceSlotId {
+        self.slot
     }
 
     /// Whether `leaf`, one of this device's, carries a tag that reads as this
@@ -268,6 +278,65 @@ impl<S: StorageProvider> Engine<S> {
         };
         own.filter(|own| !own.reads_as_own(leaf))
     }
+
+    /// The roster slots of this account's other devices whose leaves `staged`
+    /// adds to `group_id`, as each leaf's device tag reads against the device
+    /// group's current roster, read through `storage` (mdk#2628 D76). Empty
+    /// in the device group itself, while this device names no device group,
+    /// and while that group is not live or its roster does not read, so a
+    /// confirmation never fails on it.
+    pub(crate) fn sibling_slots_added(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        staged: &StagedCommit,
+    ) -> Vec<DeviceSlotId> {
+        let Some(device_group_id) = self
+            .device_tag_group
+            .as_ref()
+            .filter(|device_group_id| *device_group_id != group_id)
+        else {
+            return Vec::new();
+        };
+        let own_leaves: Vec<LeafNode> = staged
+            .add_proposals()
+            .map(|proposal| proposal.add_proposal().key_package().leaf_node().clone())
+            .filter(|leaf| {
+                crate::identity::validated_member_id_of_leaf(leaf)
+                    .is_ok_and(|member| member == *self.identity.self_id())
+            })
+            .collect();
+        if own_leaves.is_empty() || self.ensure_group_live(device_group_id).is_err() {
+            return Vec::new();
+        }
+        let Some(roster) = MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(device_group_id.as_slice()),
+        )
+        .ok()
+        .flatten()
+        .filter(|device_group| {
+            crate::app_components::group_requires_device_roster(device_group).unwrap_or(false)
+        })
+        .and_then(|device_group| {
+            crate::app_components::app_component_data_of_group(
+                &device_group,
+                DEVICE_ROSTER_COMPONENT_ID,
+            )
+        })
+        .and_then(|roster| decode_device_roster_v1(&roster).ok()) else {
+            return Vec::new();
+        };
+        let mut slots = Vec::new();
+        for leaf in own_leaves {
+            if let DeviceTagClaim::Device(slot) = device_tag_claim(&leaf, &roster)
+                && !slots.contains(&slot)
+            {
+                slots.push(slot);
+            }
+        }
+        slots
+    }
 }
 
 /// This device's roster slot, the slot its KeyPackage lifecycle publishes
@@ -329,6 +398,47 @@ fn read_entry(entry: &[u8], leaf_signature_key: &[u8], roster: &DeviceRosterV1) 
         return DeviceTagClaim::RejectedSlot(content.slot);
     }
     DeviceTagClaim::Unclaimed
+}
+
+/// The slot `leaf`'s device tag reads as under `leaf_tag_key`, when one of
+/// `keys` names that slot and its key verifies the tag. Reads against tag
+/// signature keys this device remembers a roster listing (mdk#2761) rather
+/// than against the current roster, so a device the roster no longer lists
+/// is still recognized. Like [`device_tag_claim`], only for leaves of the
+/// reader's own account.
+pub(crate) fn device_tag_reads_as_one_of(
+    leaf: &LeafNode,
+    leaf_tag_key: &[u8; 32],
+    keys: &[RosterTagKey],
+) -> Option<DeviceSlotId> {
+    let entry = leaf
+        .extensions()
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_TAG_COMPONENT_ID))?;
+    entry_reads_as_one_of(entry, leaf.signature_key().as_slice(), leaf_tag_key, keys)
+}
+
+fn entry_reads_as_one_of(
+    entry: &[u8],
+    leaf_signature_key: &[u8],
+    leaf_tag_key: &[u8; 32],
+    keys: &[RosterTagKey],
+) -> Option<DeviceSlotId> {
+    let content = open_entry(entry, leaf_signature_key, leaf_tag_key)?;
+    let signed = sign_content(&content.slot, leaf_signature_key);
+    keys.iter()
+        .filter(|key| key.slot == content.slot)
+        .any(|key| {
+            VERIFY_CRYPTO
+                .verify_signature(
+                    SignatureScheme::ED25519,
+                    &signed,
+                    &key.tag_signature_key,
+                    &content.signature,
+                )
+                .is_ok()
+        })
+        .then_some(content.slot)
 }
 
 fn open_entry(
@@ -477,6 +587,38 @@ mod tests {
         assert_eq!(
             read_entry(&spec_tag(), &LEAF_SIGNATURE_KEY, &roster),
             DeviceTagClaim::Unclaimed
+        );
+    }
+
+    /// A remembered key reads a leaf as its slot with no roster at all; a
+    /// key remembered for another slot, another key for the slot, or another
+    /// account's `leaf_tag_key` does not.
+    #[test]
+    fn a_remembered_key_reads_a_leaf_as_its_slot() {
+        let remembered = |slot, tag_signature_key| RosterTagKey {
+            slot,
+            tag_signature_key,
+            held_as_removed: false,
+        };
+        let reads = |leaf_tag_key: &[u8; 32], keys: &[RosterTagKey]| {
+            entry_reads_as_one_of(&spec_tag(), &LEAF_SIGNATURE_KEY, leaf_tag_key, keys)
+        };
+        let other_key = remembered(SLOT, vec![0x01; 32]);
+        assert_eq!(
+            reads(
+                &LEAF_TAG_KEY,
+                &[other_key.clone(), remembered(SLOT, tag_public_key())]
+            ),
+            Some(SLOT)
+        );
+        assert_eq!(
+            reads(&LEAF_TAG_KEY, &[remembered([0x12; 32], tag_public_key())]),
+            None
+        );
+        assert_eq!(reads(&LEAF_TAG_KEY, &[other_key]), None);
+        assert_eq!(
+            reads(&[0x34; 32], &[remembered(SLOT, tag_public_key())]),
+            None
         );
     }
 

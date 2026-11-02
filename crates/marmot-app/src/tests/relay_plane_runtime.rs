@@ -756,6 +756,21 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     bob_app.save_state(&state).unwrap();
     let mut bob_client = crate::tests::client_on_app_relay_plane(&bob_app, "bob").await;
     bob_client.prepare_transport().await.unwrap();
+    // His inbox REQs reach back before the rename, since gift wraps are
+    // backdated, and until their replay is admitted every rebuilt REQ keeps
+    // their floor. Let it admit before he reads the Welcome, so the group REQ
+    // his join plans resumes from the cursor (mdk#2783).
+    timeout(Duration::from_secs(20), async {
+        loop {
+            bob_client.synchronize_native_replay().await.unwrap();
+            if bob_client.subscription_rebuild_since().unwrap() == Some(Timestamp(resume_at - 1)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Bob's inbox replay is admitted");
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).is_err() {
             bob_client.next_event().await.unwrap();

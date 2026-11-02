@@ -54,4 +54,20 @@ impl Marmot {
             .map(Into::into)
             .collect())
     }
+
+    /// Start this device without the devices its first check found ("No,
+    /// start fresh"): each sign-in from before this device is answered Not
+    /// now, now and when one is listed later. It rejects nothing and raises
+    /// no warning, so one of those devices can still link this one. Fails
+    /// before the first check and once this device trusts a device group.
+    pub async fn start_fresh(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.start_fresh(&account_ref).await?)
+    }
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the app can say that only chats it is invited to from now on are here.
+    /// Always false in release builds until the roster's spec lands.
+    pub async fn started_fresh(&self, account_ref: String) -> Result<bool, MarmotKitError> {
+        Ok(self.runtime.started_fresh(&account_ref).await?)
+    }
 }

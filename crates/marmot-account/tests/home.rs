@@ -332,6 +332,40 @@ fn account_home_idempotent_import_reactivates_signed_out_identity() {
     assert!(!home.account("agent").unwrap().signed_out);
 }
 
+/// An account whose device was unlinked stays signed out: neither signing in
+/// nor importing its key again reactivates it, and removing it clears the
+/// mark with the rest of the account (mdk#2628 D67).
+#[test]
+fn account_home_unlinked_account_stays_signed_out_until_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    home.import_account_idempotent("agent", nsec).unwrap();
+
+    let unlinked = home.mark_account_unlinked("agent").unwrap();
+    assert!(unlinked.unlinked && unlinked.signed_out);
+    assert_eq!(home.account("agent").unwrap(), unlinked);
+    assert_eq!(home.mark_account_unlinked("agent").unwrap(), unlinked);
+
+    assert!(matches!(
+        home.set_account_signed_out("agent", false),
+        Err(AccountHomeError::AccountUnlinked(label)) if label == "agent"
+    ));
+    assert!(matches!(
+        home.import_account_idempotent("agent", nsec),
+        Err(AccountHomeError::AccountUnlinked(label)) if label == "agent"
+    ));
+    assert_eq!(
+        home.set_account_signed_out("agent", true).unwrap(),
+        unlinked
+    );
+    assert_eq!(home.account("agent").unwrap(), unlinked);
+
+    home.remove_account("agent").unwrap();
+    let again = home.import_account_idempotent("agent", nsec).unwrap();
+    assert!(!again.unlinked && !again.signed_out);
+}
+
 #[test]
 fn account_home_idempotent_import_repairs_interrupted_record_first_import() {
     let dir = tempfile::tempdir().unwrap();
@@ -342,6 +376,7 @@ fn account_home_idempotent_import_repairs_interrupted_record_first_import() {
         local_signing: true,
         external_signing: false,
         signed_out: false,
+        unlinked: false,
     };
     let account_dir = dir.path().join("accounts").join(&account.label);
     std::fs::create_dir_all(&account_dir).unwrap();
@@ -873,6 +908,7 @@ fn account_home_runtime_import_does_not_capture_mismatched_keychain_credential()
         local_signing: true,
         external_signing: false,
         signed_out: false,
+        unlinked: false,
     };
     let store =
         KeychainSecretStore::new(format!("com.marmot.test.runtime-mismatch-{account_id}")).unwrap();
@@ -986,6 +1022,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
         local_signing: true,
         external_signing: false,
         signed_out: false,
+        unlinked: false,
     };
     let twin_dir = dir.path().join("accounts").join(&twin.label);
     std::fs::create_dir_all(&twin_dir).unwrap();

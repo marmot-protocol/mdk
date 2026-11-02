@@ -173,35 +173,40 @@ async fn a_host_cannot_supply_account_devices_data_at_creation() {
 
 /// bob, who is not an admin, adds a device of his account to the group alice
 /// founded, and that device then removes bob's first one. alice accepts both
-/// Commits and the new device joins through bob's Welcome.
+/// Commits and the new device joins through bob's sibling Welcome.
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn a_member_adds_and_removes_its_own_devices_from_the_start() {
-    let mut alice = device(b"alice", true);
-    let mut bob = device(b"bob", true);
-    let bob_kp = bob.engine.fresh_key_package().await.unwrap();
-    let gid = found_group(&mut alice, vec![bob_kp], true, &mut [&mut bob]).await;
+    use super::device_roster::slot;
+    use super::tagged_siblings::{
+        assert_joins_from, chat_device, found_routed_group, handed, owed, tagged_devices,
+    };
+    let (mut bob, mut new, _) = tagged_devices(b"bob", 1).await;
+    let mut alice = chat_device(b"alice");
+    let gid = found_routed_group(&mut alice, &mut [&mut bob]).await;
     assert!(!is_admin(&bob, &gid));
 
-    let mut laptop = device(b"bob", true);
-    let laptop_kp = laptop.engine.fresh_key_package().await.unwrap();
+    let mut laptop = new.remove(0);
+    let sibling = handed(&mut laptop, slot(2), slot(1));
     let SendResult::GroupEvolution {
         msg,
         welcomes,
         pending,
     } = bob
         .engine
-        .send(add_own_devices(&gid, vec![laptop_kp]))
+        .send(add_own_devices(&gid, vec![sibling]))
         .await
         .unwrap()
     else {
         panic!("expected GroupEvolution")
     };
+    assert!(welcomes.is_empty(), "{welcomes:?}");
     bob.engine.confirm_published(pending).await.unwrap();
     assert_accepted(&mut alice, &route_to_group(&msg, &gid), &gid).await;
-    let [welcome] = &welcomes[..] else {
-        panic!("one Welcome per added KeyPackage, got {}", welcomes.len())
+    let [welcome] = &owed(&bob)[..] else {
+        panic!("one sibling Welcome per added KeyPackage")
     };
-    assert_joins(&mut laptop, welcome, &gid, &bob).await;
+    assert_joins_from(&mut laptop, welcome, &gid, &bob).await;
 
     let phone = signature_key(&bob, &gid);
     let remove = send_commit(&mut laptop, remove_own_devices(&gid, vec![phone]), &gid).await;
@@ -246,7 +251,7 @@ async fn a_device_without_account_devices_cannot_be_added_later() {
     let bob_laptop_kp = key_package(b"bob", false).await;
     assert!(
         bob.engine
-            .send(add_own_devices(&gid, vec![bob_laptop_kp]))
+            .send(add_own_devices(&gid, vec![unnamed(bob_laptop_kp)]))
             .await
             .is_err()
     );

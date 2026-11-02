@@ -5,10 +5,13 @@
 
 use std::collections::BTreeSet;
 
-use super::canonical_membership::{deliver_new, published_key_package};
+use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
-use crate::client::sign_ins::{Announcement, SlotOutcome};
-use crate::{ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
+use crate::client::sign_ins::SlotOutcome;
+use crate::{
+    CompromiseWarningReason, ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn,
+    UnrecognizedSignInState,
+};
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
     DeviceRosterUpdateV1, DeviceRosterV1, RejectedSlotReasonV1, RejectedSlotV1,
@@ -36,16 +39,16 @@ fn sign_in_app_at(
 
 /// Alice's account on `N` devices sharing one relay. A device signs in,
 /// and publishes its KeyPackage, only when a test opens it.
-struct Account {
+pub(super) struct Account {
     _dirs: Vec<tempfile::TempDir>,
-    alice_id: String,
+    pub(super) alice_id: String,
     keys: Keys,
-    relay: Arc<ScriptedPushRelayClient>,
-    apps: Vec<MarmotApp>,
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) apps: Vec<MarmotApp>,
 }
 
 impl Account {
-    fn new(devices: usize, device_groups: bool) -> Self {
+    pub(super) fn new(devices: usize, device_groups: bool) -> Self {
         let dirs: Vec<_> = (0..devices).map(|_| tempfile::tempdir().unwrap()).collect();
         let home = AccountHome::open(dirs[0].path());
         let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -70,14 +73,14 @@ impl Account {
     }
 
     /// Sign in on device `index`.
-    async fn open(&self, index: usize) -> AppClient {
+    pub(super) async fn open(&self, index: usize) -> AppClient {
         let app = &self.apps[index];
         remember_test_member_inbox(app, &self.alice_id, "wss://relay.example");
         app.client("alice").await.unwrap()
     }
 }
 
-fn own_slot(client: &AppClient) -> String {
+pub(super) fn own_slot(client: &AppClient) -> String {
     client
         .app
         .account_storage("alice")
@@ -90,7 +93,7 @@ fn own_slot(client: &AppClient) -> String {
 
 /// The link `creator` confirms for `key_package`, naming device group
 /// `group`, whose Welcome comes from `creator`'s leaf.
-fn link_for(
+pub(super) fn link_for(
     key_package: &cgka_traits::KeyPackage,
     group: u8,
     creator: &AppClient,
@@ -111,7 +114,7 @@ fn key_package_ref(key_package: &cgka_traits::KeyPackage) -> String {
         .key_package_ref_hex
 }
 
-fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
+pub(super) fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
     decode_device_roster_v1(
         &client
             .runtime
@@ -124,7 +127,7 @@ fn roster(client: &AppClient, group: &GroupId) -> DeviceRosterV1 {
 
 /// One roster commit by `client` in `group`, standing in for another
 /// device's change of the roster or a link.
-async fn commit_roster(
+pub(super) async fn commit_roster(
     client: &mut AppClient,
     group: &GroupId,
     operations: Vec<DeviceRosterOperationV1>,
@@ -343,7 +346,6 @@ async fn a_copy_of_this_devices_key_package_never_rejects_it() {
     let group = phone.dev_create_device_group(link).await.unwrap();
     let founded = roster(&phone, &group);
     assert!(founded.rejected_slots.is_empty(), "{founded:?}");
-    assert!(founded.rejected_key_packages.is_empty(), "{founded:?}");
     let mut cursor = 0;
     deliver_new(&mut laptop, relay, &mut cursor).await;
     laptop.sync().await.unwrap();
@@ -366,7 +368,6 @@ async fn a_copy_of_this_devices_key_package_never_rejects_it() {
             .collect::<Vec<_>>(),
         [new_slot]
     );
-    assert!(roster.rejected_key_packages.is_empty(), "{roster:?}");
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlot);
 }
@@ -432,7 +433,6 @@ async fn a_copy_of_another_devices_key_package_rejects_only_its_slot() {
             .collect::<Vec<_>>(),
         [copy_slot]
     );
-    assert!(founded.rejected_key_packages.is_empty(), "{founded:?}");
     assert!(
         listed(&mut phone)
             .iter()
@@ -614,8 +614,6 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
         RejectedSlotReasonV1::NotMe
     );
     assert_eq!(roster.rejected_slots.len(), 1);
-    // The slot alone: its KeyPackage could be a copy of a real device's.
-    assert!(roster.rejected_key_packages.is_empty(), "{roster:?}");
     assert_eq!(roster.devices.len(), 2);
 
     let before = relay.published_events.lock().unwrap().len();
@@ -630,12 +628,7 @@ async fn a_rejection_before_any_device_group_founds_the_roster() {
     // The laptop it linked is a roster device now, and leaves the list.
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     let report = phone.check_sign_ins().await.unwrap();
-    assert_eq!(
-        report.slots[&laptop_slot],
-        SlotOutcome::KnownDevice {
-            announced: Announcement::Matches
-        }
-    );
+    assert_eq!(report.slots[&laptop_slot], SlotOutcome::KnownDevice);
 }
 
 /// Rejecting a sign-in in a device group is one roster commit. A sibling
@@ -1138,6 +1131,112 @@ async fn a_live_key_package_brings_the_check_forward() {
     assert_eq!(phone.unrecognized_sign_ins().unwrap().len(), 1);
 }
 
+/// The deliveries published after `cursor`, with the Welcome rumors that name
+/// `own` first or last and the order otherwise kept. Advances `cursor`.
+async fn welcomes_ordered(
+    account: &Account,
+    cursor: &mut usize,
+    own: &MessageId,
+    own_first: bool,
+) -> Vec<NostrTransportEvent> {
+    let events = account.relay.published_events.lock().unwrap()[*cursor..].to_vec();
+    *cursor += events.len();
+    let peeler =
+        transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(account.keys.clone());
+    let (mut named, mut own_rumors, mut other_rumors) = (Vec::new(), 0, 0);
+    for event in events {
+        let names_own = match peeler
+            .peel_welcome_with_provenance(&event.to_transport_message().unwrap())
+            .await
+        {
+            Ok((_, provenance)) => {
+                let names_own = provenance.key_package_event_id.as_slice() == own.as_slice();
+                if names_own {
+                    own_rumors += 1;
+                } else {
+                    other_rumors += 1;
+                }
+                names_own
+            }
+            Err(_) => false,
+        };
+        named.push((names_own != own_first, event));
+    }
+    assert!(own_rumors > 0 && other_rumors > 0, "both devices' rumors");
+    named.sort_by_key(|(later, _)| *later);
+    named.into_iter().map(|(_, event)| event).collect()
+}
+
+/// A Welcome that names another KeyPackage of the account brings the check
+/// forward too (mdk#2628 3.2). Bob invites Alice, so the phone also receives
+/// the delivery made for the laptop's KeyPackage, which is not addressed to
+/// it, and checks within the minute, whichever delivery comes first. Anyone
+/// can send such a Welcome: a burst right after a check waits its minute,
+/// then makes one check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_naming_another_key_package_brings_the_check_forward() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    let phones = published_key_package(&mut phone, relay)
+        .await
+        .source
+        .unwrap()
+        .event_id;
+    phone.drive_sign_ins().await;
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    let a_minute = std::time::Duration::from_secs(61);
+    // Whether a pass a minute on from the last check runs one.
+    let checks_a_minute_on = async |phone: &mut AppClient| {
+        phone.sign_in_schedule.rewind(a_minute);
+        let before = phone.sign_in_schedule.last;
+        phone.drive_sign_ins().await;
+        phone.sign_in_schedule.last != before
+    };
+    assert!(!checks_a_minute_on(&mut phone).await, "nothing nudged it");
+
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = sign_in_app_at(&bob_dir, relay.clone(), false);
+    remember_test_member_inbox(&bob_app, &account.alice_id, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut cursor = relay.published_events.lock().unwrap().len();
+    // The phone's own deliveries first: it joins each group before the
+    // laptop's delivery of the same Welcome arrives.
+    for name in ["one", "two", "three"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, true).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
+    assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert_eq!(
+        listed(&mut phone),
+        [(own_slot(&laptop), false, UnrecognizedSignInState::Prompt)]
+    );
+
+    // A burst right after a check, the laptop's deliveries first, waits its
+    // minute, then makes one check and leaves none pending.
+    for name in ["four", "five", "six"] {
+        bob.create_group(name, &[&account.alice_id]).await.unwrap();
+    }
+    let burst = welcomes_ordered(&account, &mut cursor, &phones, false).await;
+    let delivered = deliver_events(&mut phone, &burst).await;
+    assert_eq!(delivered.joined_groups.len(), 3);
+    let checked = phone.sign_in_schedule.last;
+    phone.drive_sign_ins().await;
+    assert_eq!(
+        phone.sign_in_schedule.last, checked,
+        "not within the minute"
+    );
+    assert!(checks_a_minute_on(&mut phone).await);
+    assert!(!checks_a_minute_on(&mut phone).await, "one check per burst");
+}
+
 /// Sign a publication into `slot` with the account's key at `created_at`,
 /// holding `content`, as if whoever holds the key published it there.
 fn publish_into_slot(account: &Account, slot: &str, content: &str, created_at: u64) -> String {
@@ -1152,7 +1251,7 @@ fn publish_into_slot(account: &Account, slot: &str, content: &str, created_at: u
     id
 }
 
-fn published_at(client: &AppClient) -> u64 {
+pub(super) fn published_at(client: &AppClient) -> u64 {
     client
         .runtime
         .key_package_maintenance_status()
@@ -1181,6 +1280,8 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     assert!(report.foreign.replacing);
     assert!(report.own_slot_complete);
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
+    // It holds no KeyPackage, so it warns of nothing.
+    assert!(phone.compromise_warning().unwrap().is_empty());
     phone.run_due_maintenance().await.unwrap();
     assert!(published_at(&phone) > forged_at);
 
@@ -1209,6 +1310,187 @@ async fn a_check_now_while_paused_leaves_the_own_slot_repair_due() {
     phone.pause_maintenance();
     phone.check_sign_ins_now().await.unwrap();
     phone.resume_maintenance();
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at);
+}
+
+/// The newest KeyPackage publication in `slot`.
+fn newest_in_slot(account: &Account, slot: &str) -> NostrTransportEvent {
+    account
+        .relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == 30443 && event.tag_value("d") == Some(slot))
+        .max_by_key(|event| event.created_at)
+        .unwrap()
+        .clone()
+}
+
+/// Publish `event`'s KeyPackage again in `slot` at `created_at`, as whoever
+/// holds the account key could, after `edit` changes its tags. Returns its
+/// `i` tag: the KeyPackage's ref, unless `edit` changed it.
+fn republish_into_slot(
+    account: &Account,
+    event: &NostrTransportEvent,
+    slot: &str,
+    created_at: u64,
+    edit: impl FnOnce(&mut Vec<Vec<String>>),
+) -> String {
+    let mut tags = event.tags.clone();
+    tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = slot.into();
+    edit(&mut tags);
+    let key_package_ref = tags.iter().find(|tag| tag[0] == "i").unwrap()[1].clone();
+    let copy = NostrTransportEvent::new_unsigned_at(
+        event.pubkey.clone(),
+        event.kind,
+        tags,
+        event.content.clone(),
+        created_at,
+    );
+    account.relay.published_events.lock().unwrap().push(copy);
+    key_package_ref
+}
+
+/// A valid KeyPackage of the account in this device's slot that another
+/// device made raises the compromise warning on this device only, before
+/// the device replaces it (mdk#2628 3.7b). A relay serving it again warns
+/// no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_it_did_not_make_in_its_own_slot_warns_there_only() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    laptop.check_sign_ins().await.unwrap();
+    let (phone_slot, laptop_slot) = (own_slot(&phone), own_slot(&laptop));
+    let laptop_event = newest_in_slot(&account, &laptop_slot);
+    phone.take_compromise_warning_changed();
+    let forged_at = published_at(&phone) + 2;
+    let key_package_ref =
+        republish_into_slot(&account, &laptop_event, &phone_slot, forged_at, |_| {});
+
+    let before = unix_now_seconds();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlotForeign);
+    assert!(report.foreign.replacing);
+    assert!(phone.take_compromise_warning_changed());
+    let warning = phone.compromise_warning().unwrap();
+    let [item] = warning.as_slice() else {
+        panic!("{warning:?}");
+    };
+    assert_eq!(
+        item.reason,
+        CompromiseWarningReason::ForeignOwnSlotKeyPackage
+    );
+    assert_eq!(item.slot_id_hex, phone_slot);
+    assert_eq!(item.key_package_ref_hex.as_ref(), Some(&key_package_ref));
+    assert!(item.occurred_at >= before);
+    laptop.check_sign_ins().await.unwrap();
+    assert!(laptop.compromise_warning().unwrap().is_empty());
+
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at);
+    phone.dismiss_compromise_warning().unwrap();
+    phone.take_compromise_warning_changed();
+    let again = published_at(&phone) + 2;
+    republish_into_slot(&account, &laptop_event, &phone_slot, again, |_| {});
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlotForeign);
+    assert!(!phone.take_compromise_warning_changed());
+    assert!(phone.compromise_warning().unwrap().is_empty());
+}
+
+/// A KeyPackage this device made before its device group, published in its
+/// slot again, is replaced as any foreign publication is, but never warns:
+/// its signature key is this device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_package_it_made_before_its_device_group_does_not_warn() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let phone_slot = own_slot(&phone);
+    let before_group = newest_in_slot(&account, &phone_slot);
+    let mut laptop = account.open(1).await;
+    let laptop_key_package = published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    laptop.check_sign_ins().await.unwrap();
+    let link = link_for(&laptop_key_package, 0x5a, &phone);
+    laptop
+        .dev_record_confirmed_device_link(link.clone())
+        .unwrap();
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    assert_eq!(phone.trusted_device_group().unwrap(), Some(group));
+    phone.take_compromise_warning_changed();
+
+    let forged_at = published_at(&phone) + 2;
+    republish_into_slot(&account, &before_group, &phone_slot, forged_at, |_| {});
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlotForeign);
+    assert!(report.foreign.replacing);
+    assert!(!phone.take_compromise_warning_changed());
+    assert!(phone.compromise_warning().unwrap().is_empty());
+}
+
+/// A device restored from a backup taken before its newest publication does
+/// not know that publication's event, so it replaces it, but never warns of
+/// it: the KeyPackage carries the device's own signature key, which the
+/// backup holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_device_does_not_warn_of_its_own_newer_key_package() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let storage = phone.app.account_storage("alice").unwrap();
+    let backup = storage.key_package_lifecycle().unwrap().unwrap();
+    // A newer KeyPackage of its own, published after the backup.
+    let first = published_at(&phone);
+    publish_into_slot(&account, &slot, "not a key package", first + 2);
+    phone.check_sign_ins().await.unwrap();
+    phone.run_due_maintenance().await.unwrap();
+    let newer = newest_in_slot(&account, &slot);
+    assert!(newer.created_at > first + 2);
+    assert!(newer.content != "not a key package");
+    phone.take_compromise_warning_changed();
+
+    storage.put_key_package_lifecycle(&backup).unwrap();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&slot], SlotOutcome::OwnSlotForeign);
+    assert!(!phone.take_compromise_warning_changed());
+    assert!(phone.compromise_warning().unwrap().is_empty());
+}
+
+/// A publication in this device's slot that holds no valid KeyPackage is
+/// replaced without a warning, even one whose KeyPackage another device
+/// made: an `i` tag that does not match its KeyPackage makes it invalid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_publication_in_its_own_slot_is_replaced_without_a_warning() {
+    let account = Account::new(2, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let mut laptop = account.open(1).await;
+    published_key_package(&mut laptop, relay).await;
+    phone.check_sign_ins().await.unwrap();
+    let phone_slot = own_slot(&phone);
+    let laptop_event = newest_in_slot(&account, &own_slot(&laptop));
+    phone.take_compromise_warning_changed();
+
+    let forged_at = published_at(&phone) + 2;
+    republish_into_slot(&account, &laptop_event, &phone_slot, forged_at, |tags| {
+        tags.iter_mut().find(|tag| tag[0] == "i").unwrap()[1] = "00".repeat(32);
+    });
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.slots[&phone_slot], SlotOutcome::OwnSlotForeign);
+    assert!(report.foreign.replacing);
+    assert!(!phone.take_compromise_warning_changed());
+    assert!(phone.compromise_warning().unwrap().is_empty());
     phone.run_due_maintenance().await.unwrap();
     assert!(published_at(&phone) > forged_at);
 }
@@ -1267,6 +1549,232 @@ async fn a_foreign_publication_dated_far_ahead_is_deleted_by_id() {
         lifecycle.phase,
         cgka_traits::MaintenancePhase::ClockSkewBlocked
     );
+}
+
+/// The relay stops serving anything in `slot`, as one that honored a
+/// deletion there does, whether or not it said so.
+pub(super) fn relay_empties_slot(relay: &ScriptedPushRelayClient, slot: &str) {
+    relay.published_events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.tag_value("d") != Some(slot)
+    });
+}
+
+/// Whether the relay serves a publication in `slot`.
+pub(super) fn relay_serves_slot(relay: &ScriptedPushRelayClient, slot: &str) -> bool {
+    relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == KIND_MARMOT_KEY_PACKAGE && event.tag_value("d") == Some(slot))
+}
+
+/// Record this device's current publication as made two days ago: a slot
+/// emptied of one less than a day old waits. Returns its new time.
+pub(super) fn publish_two_days_ago(client: &AppClient) -> u64 {
+    let storage = client.app.account_storage(&client.state.label).unwrap();
+    let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+    let published = lifecycle.authored_event_created_at.as_mut().unwrap();
+    published.0 -= 2 * 24 * 60 * 60;
+    let aged = published.0;
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    aged
+}
+
+/// A deletion by id that the relay honored but never acknowledged leaves it
+/// serving nothing in this device's slot, though it accepted the device's
+/// KeyPackage. The next check reads the slot empty there and publishes a new
+/// KeyPackage (mdk#2628 3.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unacknowledged_deletion_that_emptied_the_slot_is_refilled() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    publish_into_slot(
+        &account,
+        &slot,
+        "not a key package",
+        unix_now_seconds() + 864_000,
+    );
+
+    account.relay.zero_ack_next_publish();
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!((report.foreign.beyond_skew, report.foreign.deleted), (1, 0));
+    assert!(!report.refilling);
+    assert!(
+        !phone.runtime.key_package_network_maintenance_due().unwrap(),
+        "no relay said it deleted"
+    );
+
+    relay_empties_slot(&account.relay, &slot);
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(report.own_slot_complete);
+    assert_eq!(report.foreign, Default::default());
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// A slot withdrawal no relay acknowledged rolls back, though a relay may
+/// have honored it and emptied the slot. The withdrawing runtime publishes
+/// nothing more; the account's next one reads the slot empty there and
+/// publishes a new KeyPackage, since the withdrawal covers the current one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_that_rolled_back_is_refilled_by_the_next_runtime() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+
+    account.relay.zero_ack_next_publish();
+    phone.withdraw_key_package_slot().await.unwrap_err();
+    relay_empties_slot(&account.relay, &slot);
+    assert!(!phone.check_sign_ins().await.unwrap().refilling);
+    drop(phone);
+
+    let mut phone = account.open(0).await;
+    assert_eq!(
+        published_at(&phone),
+        published,
+        "the withdrawal rolled back"
+    );
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Whoever holds the account key can delete this device's slot by its
+/// address. A relay that honors that serves nothing there and refuses any
+/// publication in the slot dated up to the deletion, the device's current
+/// one included, so the device publishes a new KeyPackage dated after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_deletion_of_its_own_slot_is_refilled() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let deleted_at = publish_two_days_ago(&phone) + 60;
+    let address = format!("{KIND_MARMOT_KEY_PACKAGE}:{}:{slot}", account.alice_id);
+    let deletion = EventBuilder::new(Kind::Custom(5), "")
+        .tags([
+            Tag::parse(["a", address.as_str()]).unwrap(),
+            Tag::parse(["k", "30443"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from_secs(deleted_at))
+        .finalize(&account.keys)
+        .unwrap();
+    account
+        .relay
+        .published_events
+        .lock()
+        .unwrap()
+        .push(NostrTransportEvent::from_nostr_event(&deletion).unwrap());
+    relay_empties_slot(&account.relay, &slot);
+
+    let report = phone.check_sign_ins().await.unwrap();
+    assert_eq!(report.foreign, Default::default());
+    assert!(report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > deleted_at);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Only a relay's finished read shows the slot empty. A read that reached no
+/// relay, or one that stopped short, never refills it: the slot may hold
+/// what the read missed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_read_never_refills_the_slot() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    account.relay.unfinished_directory_reads.store(true, SeqCst);
+
+    phone.check_sign_ins().await.unwrap_err();
+    // Another slot's publication shows the read reached the relay, though it
+    // did not finish.
+    publish_into_slot(
+        &account,
+        &"ab".repeat(32),
+        "not a key package",
+        unix_now_seconds(),
+    );
+    let report = phone.check_sign_ins().await.unwrap();
+    assert!(!report.own_slot_complete);
+    assert!(!report.refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&phone), published);
+    assert!(!relay_serves_slot(&account.relay, &slot));
+
+    account
+        .relay
+        .unfinished_directory_reads
+        .store(false, SeqCst);
+    assert!(phone.check_sign_ins().await.unwrap().refilling);
+}
+
+/// A relay whose own read finished shows the slot empty even while another
+/// relay is down and no relay returned any of the account's publications:
+/// the check cannot count sign-ins then, but it still refills the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_empty_relay_is_refilled_while_another_is_down() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    account
+        .relay
+        .other_directory_relays_down
+        .store(true, SeqCst);
+
+    let result = phone.check_sign_ins().await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::DeviceGroupRefused("key_packages_unreachable"))
+        ),
+        "{result:?}"
+    );
+    assert!(phone.runtime.key_package_network_maintenance_due().unwrap());
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > published);
+    assert!(relay_serves_slot(&account.relay, &slot));
+}
+
+/// Only a publication at least a day old is refilled. A refill is a new
+/// publication, so a relay that accepts this device's KeyPackages and keeps
+/// none costs one a day, not one per check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_that_keeps_nothing_is_refilled_once_a_day() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    let slot = own_slot(&phone);
+    publish_two_days_ago(&phone);
+    relay_empties_slot(&account.relay, &slot);
+    assert!(phone.check_sign_ins().await.unwrap().refilling);
+    phone.run_due_maintenance().await.unwrap();
+    let refilled = published_at(&phone);
+
+    relay_empties_slot(&account.relay, &slot);
+    assert!(!phone.check_sign_ins().await.unwrap().refilling);
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(published_at(&phone), refilled);
+    assert!(!relay_serves_slot(&account.relay, &slot));
 }
 
 /// A device with no slot yet, as a Welcome join records it before the

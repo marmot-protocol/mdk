@@ -650,10 +650,9 @@ publication or downstream app adoption.
 Publishing dispatches still require the workflow and source ancestry on `master`.
 Build-only dispatches from a development branch may build that branch's source.
 Dispatching from `master` still requires source ancestry on `master`, including
-build-only runs, because only those runs may save dependency caches. A build-only
-run on `master` can deliberately warm the per-input caches without publishing.
-Cache keys separate input targets and include the builder scripts/profile/defaults;
-the cache action also keys the Rust toolchain and Cargo dependency inputs.
+build-only runs, so the `master` workflow builds only `master` source. Inputs build
+without a Cargo cache, from a clean target directory; the repository's cache
+budget is described in `.github/workflows/ci.yml`.
 
 Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
 limited. The three-job Apple bound is per workflow, not an organization-wide

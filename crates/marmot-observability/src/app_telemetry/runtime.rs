@@ -457,6 +457,7 @@ mod tests {
     #[test]
     fn concurrent_completed_recording_preserves_all_counts_and_durations() {
         let telemetry = AppPerformanceTelemetry::default();
+        let recorder = crate::PerformanceRecorder::from(&telemetry);
         let operation = RuntimePerformanceOperation::StorageConnectionWait;
         std::thread::scope(|scope| {
             for outcome in [
@@ -466,10 +467,10 @@ mod tests {
                 Outcome::Timeout,
                 Outcome::NotReady,
             ] {
-                let telemetry = &telemetry;
+                let recorder = &recorder;
                 scope.spawn(move || {
                     for _ in 0..1_000 {
-                        telemetry.record_runtime(operation, Duration::from_millis(2), outcome);
+                        recorder.record_runtime(operation, Duration::from_millis(2), outcome);
                     }
                 });
             }
@@ -497,6 +498,24 @@ mod tests {
         assert_eq!(snapshot.duration_ms.buckets[1].count, 5_000);
         assert_eq!(snapshot.duration_ms.sum_ms, 10_000);
         assert_eq!(snapshot.duration_ms.overflow_count, 0);
+
+        // The completed-only path uses a separate histogram implementation;
+        // externally supplied host durations must saturate there as well.
+        recorder.record_runtime(operation, Duration::MAX, Outcome::Success);
+        recorder.record_runtime(operation, Duration::from_millis(2), Outcome::Success);
+        let saturated = telemetry
+            .runtime
+            .snapshot()
+            .into_iter()
+            .find(|snapshot| snapshot.operation == operation)
+            .unwrap();
+        assert_eq!(saturated.duration_ms.sum_ms, u64::MAX);
+        assert_eq!(saturated.duration_ms.overflow_count, 1);
+        assert_eq!(saturated.duration_ms.buckets[1].count, 5_001);
+        assert_eq!(
+            (saturated.started, saturated.completed, saturated.successes),
+            (5_002, 5_002, 1_002)
+        );
     }
 
     fn sample(t: &AppPerformanceTelemetry) -> RuntimePerformanceSnapshot {
@@ -509,7 +528,8 @@ mod tests {
     #[test]
     fn live_cancelled_and_terminal_outcomes_balance() {
         let t = AppPerformanceTelemetry::default();
-        let live = t.observe(RuntimePerformanceOperation::ConversationOpen);
+        let recorder = crate::PerformanceRecorder::from(&t);
+        let live = recorder.observe(RuntimePerformanceOperation::ConversationOpen);
         assert_eq!(sample(&t).in_flight, 1);
         assert_eq!(sample(&t).completed, 0);
         drop(live);
@@ -519,7 +539,8 @@ mod tests {
             Outcome::Timeout,
             Outcome::NotReady,
         ] {
-            t.observe(RuntimePerformanceOperation::ConversationOpen)
+            recorder
+                .observe(RuntimePerformanceOperation::ConversationOpen)
                 .finish(outcome);
         }
         let s = sample(&t);
@@ -540,6 +561,53 @@ mod tests {
             5
         );
     }
+    #[tokio::test]
+    async fn measured_results_are_returned_and_recorded_exactly_once() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Failure(Outcome, &'static str);
+        impl From<&Failure> for Outcome {
+            fn from(error: &Failure) -> Self {
+                error.0
+            }
+        }
+        let telemetry = AppPerformanceTelemetry::default();
+        let recorder = crate::PerformanceRecorder::from(&telemetry);
+        for expected in [
+            Ok("original success"),
+            Err(Failure(Outcome::Failure, "original failure")),
+            Err(Failure(Outcome::Timeout, "original timeout")),
+            Err(Failure(Outcome::NotReady, "original unavailable")),
+        ] {
+            let input = match &expected {
+                Ok(value) => Ok(*value),
+                Err(Failure(outcome, message)) => Err(Failure(*outcome, message)),
+            };
+            let result = recorder
+                .measure_app(
+                    RuntimePerformanceOperation::ConversationOpen,
+                    std::future::ready(input),
+                )
+                .await;
+            assert_eq!(result, expected);
+        }
+        let snapshot = sample(&telemetry);
+        assert_eq!(
+            (snapshot.started, snapshot.completed, snapshot.in_flight),
+            (4, 4, 0)
+        );
+        assert_eq!(
+            (
+                snapshot.successes,
+                snapshot.failures,
+                snapshot.timeouts,
+                snapshot.not_ready,
+                snapshot.cancelled
+            ),
+            (1, 1, 1, 1, 0)
+        );
+        assert_eq!(snapshot.duration_ms.sample_count(), 4);
+    }
+
     #[test]
     fn age_tracking_is_bounded_but_counts_are_not_lost() {
         let t = AppPerformanceTelemetry::default();
@@ -547,7 +615,30 @@ mod tests {
             .map(|_| t.observe(RuntimePerformanceOperation::ConversationOpen))
             .collect::<Vec<_>>();
         assert_eq!(sample(&t).untracked_in_flight, 10);
+
+        // Age calculation gets explicit historical Instant values in its private
+        // state fixture. The actual observe/finish path still owns allocation,
+        // removal and reuse; no elapsed-time sleep controls this assertion.
+        let first_start = live[0].started;
+        let oldest = first_start - Duration::from_secs(20);
+        let next_oldest = first_start - Duration::from_secs(10);
+        {
+            let mut state = t
+                .runtime
+                .operation(RuntimePerformanceOperation::ConversationOpen)
+                .observed
+                .lock()
+                .unwrap();
+            state.starts[live[0].slot.unwrap()] = Some(oldest);
+            state.starts[live[1].slot.unwrap()] = Some(next_oldest);
+        }
+        let before = millis(oldest.elapsed());
+        let age = sample(&t).oldest_tracked_in_flight_ms;
+        assert!(before <= age && age <= millis(oldest.elapsed()));
         live.remove(0).finish(Outcome::Success);
+        let before = millis(next_oldest.elapsed());
+        let age = sample(&t).oldest_tracked_in_flight_ms;
+        assert!(before <= age && age <= millis(next_oldest.elapsed()));
         let reused = t.observe(RuntimePerformanceOperation::ConversationOpen);
         assert_eq!(sample(&t).untracked_in_flight, 10);
         drop(live);

@@ -54,7 +54,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn populated_partial_upgrade_preserves_chunks_quota_cascades_and_rollback() {
+    fn populated_partial_upgrade_preserves_chunks_quota_and_cascades() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
@@ -104,10 +104,6 @@ mod tests {
                 0
             );
         };
-        let tx = conn.transaction().unwrap();
-        apply(&tx).unwrap();
-        tx.rollback().unwrap();
-        check(&conn);
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();

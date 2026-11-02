@@ -43,6 +43,7 @@ use crate::types::chat_list::{
     MarmotExistingDirectConversation,
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
+use crate::types::compromise_warning::MarmotCompromiseWarningItemList;
 use crate::types::device_link::MarmotDeviceLinkSnapshot;
 use crate::types::directory::MarmotCachedIdentityProjectionList;
 use crate::types::directory::MarmotUserDirectorySearchResultList;
@@ -58,7 +59,8 @@ use crate::types::group::{
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
-use crate::types::history_notice::MarmotHistoryNoticeList;
+use crate::types::history_import::MarmotChatHistoryImportList;
+use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
 use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
     MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
@@ -770,6 +772,12 @@ c_cmd! {
     /// `marmot_history_notice_list_free`.
     async fn marmot_history_notices(account_ref: str) -> rec(MarmotHistoryNoticeList) = history_notices;
 
+    /// Read the account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice. Re-read on the
+    /// `RecoveryStatusChanged` event. Free with
+    /// `marmot_account_recovery_status_free`.
+    async fn marmot_account_recovery_status(account_ref: str) -> rec(MarmotAccountRecoveryStatus) = account_recovery_status;
+
     /// Dismiss one notice once the user accepts the history may be incomplete.
     /// Durable; recorded as its own outcome, never as recovered history.
     /// Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
@@ -782,6 +790,16 @@ c_cmd! {
     /// `LinkedDevicesChanged` event. Free with
     /// `marmot_linked_device_list_free`.
     async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
+
+    /// List the held chats whose history from another of this account's
+    /// devices is arriving or has arrived: `Receiving` while a delivery
+    /// waits to be imported, with `retrying` once an attempt to get its
+    /// bundle failed, then `Imported` with the device it came from and when. Empty
+    /// while device groups are off. Re-read on the
+    /// `ChatHistoryImportsChanged` event, which also fires when a source
+    /// device is renamed or removed. Free with
+    /// `marmot_chat_history_import_list_free`.
+    async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
 
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user
@@ -807,11 +825,24 @@ c_cmd! {
     /// device whose link is not made yet. Re-read on the
     /// `LinkedDevicesChanged` event.
     async fn marmot_remove_linked_device(account_ref: str, slot_id_hex: str) -> unit = remove_linked_device;
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero while device groups are off. Not evented:
-    /// read it when showing the device list.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has (removed, or no longer listed by its device group), because
+    /// the chat doesn't take a same-account removal; a chat admin can remove it.
+    /// Zero while device groups are off. Not evented: read it when showing the device list.
     async fn marmot_removed_device_leftover_chats(account_ref: str) -> scalar(u32) = removed_device_leftover_chats;
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves. Once a
+    /// link this device approved is made, the new device is added to this
+    /// device's other chats when its "add to all my chats" setting is on,
+    /// for a week after the link. A chat that can take this account's
+    /// devices but whose requirements the new device's KeyPackages don't
+    /// meet is passed over and not counted, so zero does not mean the new
+    /// device reaches every chat. A chat admin can turn the component on;
+    /// removing a device frees its leaves. Zero while device
+    /// groups are off. Not evented: read it when showing the device list.
+    async fn marmot_chats_closed_to_linked_devices(account_ref: str) -> scalar(u32) = chats_closed_to_linked_devices;
 
     /// List the sign-ins of this account that this device does not
     /// recognize, the earliest to appear first. Always empty in release
@@ -824,6 +855,32 @@ c_cmd! {
     /// the list after the check. A read that reached no relay fails. Free
     /// with `marmot_unrecognized_sign_in_list_free`.
     async fn marmot_check_sign_ins(account_ref: str) -> rec(MarmotUnrecognizedSignInList) = check_sign_ins;
+
+    /// Start this device without the devices its first check found ("No,
+    /// start fresh"): each sign-in from before this device is answered Not
+    /// now, now and when one is listed later. It rejects nothing and raises
+    /// no warning, so one of those devices can still link this one. Fails
+    /// before the first check and once this device trusts a device group.
+    async fn marmot_start_fresh(account_ref: str) -> unit = start_fresh;
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false in release builds until the roster's spec lands.
+    async fn marmot_started_fresh(account_ref: str) -> scalar(bool) = started_fresh;
+
+    /// List the account's open compromise warning on this device: each
+    /// rejection the user has not seen here, the earliest gathered first.
+    /// Empty when no warning is open. The host writes the wording, and never
+    /// says the account's devices stopped whoever holds the key. Always empty
+    /// in release builds until the roster's spec lands. Re-read on the
+    /// `CompromiseWarningChanged` event. Free with
+    /// `marmot_compromise_warning_item_list_free`.
+    async fn marmot_compromise_warning(account_ref: str) -> rec(MarmotCompromiseWarningItemList) = compromise_warning;
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged.
+    async fn marmot_dismiss_compromise_warning(account_ref: str) -> unit = dismiss_compromise_warning;
 
     /// On a new device: ask a device of this account already signed in to
     /// link this one. Refused in release builds until the pairing and

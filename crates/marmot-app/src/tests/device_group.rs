@@ -19,36 +19,59 @@ use cgka_traits::engine::SendIntent;
 use marmot_session::DeviceRosterEdit;
 use storage_sqlite::DeviceGroupTrust;
 
+mod backup_writer;
+mod backups;
 mod chat_kinds;
 mod devices;
+mod heartbeats;
+mod history;
+mod history_delivery;
 mod private_key_packages;
 mod removal;
+mod sign_out;
+
+pub(super) use removal::{commit_removal_decided_elsewhere, converge_device_group};
 
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
+    device_group_app_on(dir, relay, MarmotDeployment::white_noise())
+}
+
+fn device_group_app_on(
+    dir: &tempfile::TempDir,
+    relay: Arc<ScriptedPushRelayClient>,
+    deployment: MarmotDeployment,
+) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
         MarmotAppConfig::white_noise()
+            .with_deployment(deployment)
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_dev_device_groups(true)
+            .with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(relay)
 }
 
 /// Alice's phone and laptop, each with a published KeyPackage, and the link
 /// confirming the laptop's under `device_group_id`.
-struct Devices {
-    _dirs: [tempfile::TempDir; 2],
-    relay: Arc<ScriptedPushRelayClient>,
-    phone_app: MarmotApp,
-    laptop_app: MarmotApp,
-    phone: AppClient,
-    laptop: AppClient,
-    link: ConfirmedDeviceLink,
+pub(super) struct Devices {
+    pub(super) _dirs: [tempfile::TempDir; 2],
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) phone_app: MarmotApp,
+    pub(super) laptop_app: MarmotApp,
+    pub(super) phone: AppClient,
+    pub(super) laptop: AppClient,
+    pub(super) link: ConfirmedDeviceLink,
 }
 
-async fn phone_and_laptop() -> Devices {
+pub(super) async fn phone_and_laptop() -> Devices {
+    phone_and_laptop_on(MarmotDeployment::white_noise()).await
+}
+
+/// [`phone_and_laptop`] under `deployment`.
+pub(super) async fn phone_and_laptop_on(deployment: MarmotDeployment) -> Devices {
     let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let home = AccountHome::open(dirs[0].path());
     let alice_id = home.create_account("alice").unwrap().account_id_hex;
@@ -61,8 +84,8 @@ async fn phone_and_laptop() -> Devices {
         .import_account("alice", &secret)
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let phone_app = device_group_app_at(&dirs[0], relay.clone());
-    let laptop_app = device_group_app_at(&dirs[1], relay.clone());
+    let phone_app = device_group_app_on(&dirs[0], relay.clone(), deployment.clone());
+    let laptop_app = device_group_app_on(&dirs[1], relay.clone(), deployment);
     for app in [&phone_app, &laptop_app] {
         remember_test_member_inbox(app, &alice_id, "wss://relay.example");
     }
@@ -1001,7 +1024,7 @@ async fn the_host_never_learns_of_the_device_group() {
     assert_eq!(quarantined, vec![chat_hex]);
 }
 
-fn stable_slot(app: &MarmotApp) -> String {
+pub(super) fn stable_slot(app: &MarmotApp) -> String {
     app.account_storage("alice")
         .unwrap()
         .key_package_lifecycle()
@@ -1058,6 +1081,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     // The dev hook links the new device with both settings off.
@@ -1153,6 +1178,8 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
         add_to_all_chats: true,
         bring_history: true,
         keep_while_inactive: false,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     };
     let desk = LinkedDevice {
@@ -1491,7 +1518,7 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     (devices, group)
 }
 
-async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
+pub(super) async fn deliver_all(client: &mut AppClient, relay: &ScriptedPushRelayClient) {
     let mut cursor = 0;
     deliver_new(client, relay, &mut cursor).await;
     client.sync().await.unwrap();
@@ -1518,6 +1545,12 @@ async fn linked_devices() -> (Devices, GroupId) {
         trust(&devices.laptop_app, &group),
         Some(DeviceGroupTrust::Linked)
     );
+    // Each device starts small state (mdk#2628 4.3a), sending the broadcast
+    // request it owes at start, so a test's first maintenance pass publishes
+    // only what that test is about.
+    for client in [&mut devices.phone, &mut devices.laptop] {
+        client.drive_small_state().await;
+    }
     (devices, group)
 }
 
@@ -1742,18 +1775,33 @@ async fn an_unreadable_device_group_refuses_publication() {
         mut phone,
         ..
     } = phone_and_laptop().await;
+    let storage = phone_app.account_storage("alice").unwrap().app_storage();
     assert!(
-        phone_app
-            .account_storage("alice")
-            .unwrap()
-            .app_storage()
+        storage
             .insert_device_group(&storage_sqlite::DeviceGroupRecord {
                 group_id_hex: "not a group id".to_owned(),
-                trust: DeviceGroupTrust::Created,
+                trust: DeviceGroupTrust::Creating,
                 key_package_ref_hex: Some("00".repeat(32)),
                 recorded_at: 1,
             })
             .unwrap()
+    );
+    assert!(
+        storage
+            .trust_device_group(
+                "not a group id",
+                DeviceGroupTrust::Creating,
+                DeviceGroupTrust::Created,
+                None,
+                1,
+                &storage_sqlite::FirstTrustedRoster {
+                    own: &[],
+                    roster: &[],
+                    now: 1,
+                },
+            )
+            .unwrap()
+            .is_some()
     );
 
     let before = relay.published_events.lock().unwrap().len();

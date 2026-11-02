@@ -11,7 +11,7 @@ use marmot_app::{
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use super::media::{MediaAttachmentOutcomeFfi, timeline_media_outcomes_ffi};
-use crate::conversions::StickerRefFfi;
+use crate::conversions::{HistoryImportSourceFfi, StickerRefFfi};
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -381,6 +381,10 @@ pub struct TimelineMessageRecordFfi {
     /// instead of disappearing; the value is the engine invalidation reason
     /// (e.g. `LosingBranch`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+    /// The device this row came from in a chat history it sent; `None` for
+    /// a row that arrived live. Draw "Imported from <device>" where rows
+    /// change from imported to live.
+    pub imported_from: Option<HistoryImportSourceFfi>,
 }
 
 impl std::fmt::Debug for TimelineMessageRecordFfi {
@@ -429,6 +433,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             deletion_source: value.deletion_source.into(),
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
             invalidation_status: value.invalidation_status,
+            imported_from: value.imported_from.map(Into::into),
         }
     }
 }
@@ -825,6 +830,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            imported_from: None,
         }
     }
 

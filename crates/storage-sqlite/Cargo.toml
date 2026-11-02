@@ -24,6 +24,8 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# The migrated test template is copied with SQLite's backup API.
+rusqlite = { workspace = true, features = ["backup"] }
 media-store = { workspace = true, features = ["catalog-conformance"] }
 proc-macro2.workspace = true
 quote.workspace = true
@@ -39,16 +41,15 @@ storage-format-benchmarks = []
 # `media_store_bench` example, run on desktop and on devices.
 media-store-benchmarks = ["dep:libc"]
 test-conformance-replay = []
-# Copy in-memory test databases from one migrated template per process.
-test-migrated-template = ["rusqlite/backup"]
 # Test-only hooks for dependents' tests: database page caps, checkpoint byte
-# counts, and stores that skip SQLCipher's memory security and full fsync. The
-# hooks are inert helpers: nothing happens unless a test calls one,
-# and non-test code must never call them. Workspace-wide `--all-targets` dev
-# builds enable this feature through marmot-app's dev-dependency; release and
-# artifact recipes build single packages without dev-dependencies, so it is
-# never compiled into them.
-test-support = []
+# counts, stores that skip SQLCipher's memory security and full fsync, and
+# in-memory stores copied from a migrated template. The hooks are inert
+# helpers: nothing happens unless a test calls one, and non-test code must
+# never call them. Workspace-wide `--all-targets` dev builds enable this
+# feature through marmot-app's dev-dependency, and the conformance simulator
+# enables it; release and artifact recipes build single packages without
+# dev-dependencies, so it is never compiled into them.
+test-support = ["rusqlite/backup"]
 
 [[example]]
 name = "media_store_bench"

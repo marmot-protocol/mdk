@@ -78,8 +78,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chunk_upgrade_preserves_legacy_bytes_and_fences_unfinished_attempts() {
+    fn upgraded() -> rusqlite::Connection {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;
             CREATE TABLE attachment_acquisition(token BLOB PRIMARY KEY,state INTEGER,attempt BLOB);
@@ -89,18 +88,15 @@ mod tests {
             INSERT INTO attachment_retention_usage VALUES(1,4);
             INSERT INTO attachment_acquisition VALUES(x'01',3,NULL);
             INSERT INTO retained_attachment_bytes VALUES(x'01',x'01020304');").unwrap();
-        {
-            let tx = conn.transaction().unwrap();
-            apply(&tx).unwrap();
-            tx.rollback().unwrap();
-        }
-        assert!(
-            conn.prepare("SELECT * FROM retained_attachment_files")
-                .is_err()
-        );
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();
+        conn
+    }
+
+    #[test]
+    fn chunk_upgrade_preserves_legacy_bytes_and_fences_unfinished_attempts() {
+        let conn = upgraded();
         assert_eq!(
             conn.query_row(
                 "SELECT bytes FROM retained_attachment_bytes WHERE token=x'01'",
@@ -144,5 +140,48 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// A file row's identity never changes, and once its file is verified a
+    /// chunk can be neither added, changed nor removed.
+    #[test]
+    fn file_identity_and_verified_chunks_are_immutable() {
+        let conn = upgraded();
+        conn.execute_batch(
+            "INSERT INTO attachment_acquisition VALUES(x'02',3,NULL);
+            INSERT INTO retained_attachment_bytes VALUES(x'02',x'');
+            INSERT INTO outgoing_attachment_uploads VALUES(x'03');
+            INSERT INTO attachment_chunk_bodies VALUES(zeroblob(16));
+            INSERT INTO retained_attachment_files VALUES(x'02',zeroblob(16),zeroblob(16),80,0);
+            INSERT INTO outgoing_attachment_upload_files VALUES(x'03',zeroblob(16),80,0);
+            INSERT INTO retained_attachment_chunks VALUES(zeroblob(16),0,zeroblob(80));
+            UPDATE retained_attachment_files SET completed=1;",
+        )
+        .unwrap();
+        for (sql, refusal) in [
+            (
+                "UPDATE retained_attachment_files SET byte_len=81",
+                "retained file identity is immutable",
+            ),
+            (
+                "UPDATE outgoing_attachment_upload_files SET byte_len=81",
+                "outgoing file identity is immutable",
+            ),
+            (
+                "UPDATE retained_attachment_chunks SET bytes=zeroblob(79)",
+                "verified file chunks are immutable",
+            ),
+            (
+                "INSERT INTO retained_attachment_chunks VALUES(zeroblob(16),80,x'01')",
+                "verified file chunks are immutable",
+            ),
+            (
+                "DELETE FROM retained_attachment_chunks",
+                "verified file chunks are immutable",
+            ),
+        ] {
+            let error = conn.execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains(refusal), "{sql}: {error}");
+        }
     }
 }

@@ -170,32 +170,30 @@ impl<S: StorageProvider> Engine<S> {
             .await
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
+        let welcomes = self
+            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &parsed_kps)
+            .await?;
+        // `members()` shows the linked device while the publish is pending;
+        // `confirm_published` and `publish_failed` re-derive the record from
+        // MLS state.
+        let projected_members =
+            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+
         self.record_sent_openmls_message(
             &commit_msg,
             commit_bytes.as_slice(),
             &group_id,
             pre_commit_epoch,
         )?;
-        let key_packages = vec![key_package];
-        let welcomes = self
-            .wrap_staged_welcomes(
-                &mls_group,
-                &group_id,
-                &commit_msg.id,
-                pre_commit_epoch,
-                &welcome_bytes,
-                &key_packages,
-                &parsed_kps,
-                Some(deliver_until),
-            )
-            .await?;
-
-        // `members()` shows the linked device while the publish is pending;
-        // `confirm_published` and `publish_failed` re-derive the record from
-        // MLS state.
+        let welcomes = self.record_staged_welcomes(
+            welcomes,
+            &group_id,
+            &commit_msg.id,
+            pre_commit_epoch,
+            Some(deliver_until),
+        )?;
         let mut group_record = existing;
-        group_record.members =
-            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        group_record.members = projected_members;
         self.storage.put_group(&group_record)?;
 
         let pending_ref =

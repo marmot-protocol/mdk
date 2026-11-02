@@ -13,9 +13,9 @@ use cgka_traits::capabilities::{
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, EpochPin, GroupEvent,
     GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason, KeyPackage,
-    SendIntent, SendResult,
+    SendIntent, SendResult, SiblingKeyPackage,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{DisbandTombstone, Group, Member, ProtocolProfile};
@@ -551,6 +551,17 @@ fn snapshot_send_intents() {
         }
     );
     insta::assert_json_snapshot!(
+        "intent_app_message_pinned",
+        SendIntent::AppMessage {
+            group_id: gid(),
+            payload: b"hello".to_vec(),
+            expected_epoch: Some(EpochPin {
+                epoch: EpochId(7),
+                identity: [0xAB; 32],
+            }),
+        }
+    );
+    insta::assert_json_snapshot!(
         "intent_invite",
         SendIntent::Invite {
             group_id: gid(),
@@ -569,7 +580,10 @@ fn snapshot_send_intents() {
         "intent_add_own_account_devices",
         SendIntent::AddOwnAccountDevices {
             group_id: gid(),
-            key_packages: vec![KeyPackage::new(vec![0xEF; 4])],
+            siblings: vec![SiblingKeyPackage {
+                slot: [0x5A; 32],
+                key_package: KeyPackage::new(vec![0xEF; 4]),
+            }],
         }
     );
     insta::assert_json_snapshot!(

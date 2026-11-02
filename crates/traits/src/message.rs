@@ -101,6 +101,16 @@ pub struct OwnApplicationConvergenceStamp {
 ///   confirmed, enriched with its [`OwnCommitConvergenceStamp`] so stored
 ///   convergence can treat it as a pre-validated candidate branch after a
 ///   restart.
+/// - `StagedSiblingWelcome`: a Welcome for one of this account's own devices
+///   from a private KeyPackage that device handed over (mdk#2628 D19), staged
+///   with its unconfirmed Commit as a `StagedInviteWelcome` is. It holds the
+///   encoded sibling Welcome that a kind-461 device-group message carries,
+///   never a transport message: no transport publish path reads it.
+///   `deliver_until` is the KeyPackage's lifetime end, after which the device
+///   no longer holds its key.
+/// - `OutboundSiblingWelcome`: such a Welcome once its Commit confirmed, owed
+///   until a 461 carrying it is published. `carrier` is that 461's app event
+///   id, recorded before its send; a failed send clears it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum StoredMessagePayload {
@@ -135,6 +145,19 @@ pub enum StoredMessagePayload {
     OwnCommitWire {
         message: TransportMessage,
         stamp: OwnCommitConvergenceStamp,
+    },
+    StagedSiblingWelcome {
+        welcome: Vec<u8>,
+        origin_commit_id: MessageId,
+        key_package_ref: Vec<u8>,
+        deliver_until: Timestamp,
+    },
+    OutboundSiblingWelcome {
+        welcome: Vec<u8>,
+        key_package_ref: Vec<u8>,
+        deliver_until: Timestamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carrier: Option<Vec<u8>>,
     },
 }
 
@@ -202,6 +225,34 @@ impl StoredMessagePayload {
         Self::OwnCommitWire { message, stamp }
     }
 
+    pub fn staged_sibling_welcome(
+        welcome: Vec<u8>,
+        origin_commit_id: MessageId,
+        key_package_ref: Vec<u8>,
+        deliver_until: Timestamp,
+    ) -> Self {
+        Self::StagedSiblingWelcome {
+            welcome,
+            origin_commit_id,
+            key_package_ref,
+            deliver_until,
+        }
+    }
+
+    pub fn outbound_sibling_welcome(
+        welcome: Vec<u8>,
+        key_package_ref: Vec<u8>,
+        deliver_until: Timestamp,
+        carrier: Option<Vec<u8>>,
+    ) -> Self {
+        Self::OutboundSiblingWelcome {
+            welcome,
+            key_package_ref,
+            deliver_until,
+            carrier,
+        }
+    }
+
     /// Encode the MDK-local storage payload format.
     ///
     /// Version 2 deliberately follows Marmot's binary grammar (fixed-width
@@ -233,7 +284,9 @@ impl StoredMessagePayload {
             | Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -244,7 +297,9 @@ impl StoredMessagePayload {
             | Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -259,7 +314,9 @@ impl StoredMessagePayload {
             | Self::OutboundWelcome { .. }
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -276,7 +333,9 @@ impl StoredMessagePayload {
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -290,7 +349,9 @@ impl StoredMessagePayload {
             Self::RawTransport(_)
             | Self::OpenMlsWire(_)
             | Self::SignedOpenMlsWire { .. }
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -298,7 +359,9 @@ impl StoredMessagePayload {
         match self {
             Self::RawTransport(_)
             | Self::OutboundWelcome { .. }
-            | Self::StagedInviteWelcome { .. } => None,
+            | Self::StagedInviteWelcome { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
             Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
             Self::SignedOpenMlsWire {
                 openmls_message, ..
@@ -313,7 +376,9 @@ impl StoredMessagePayload {
             Self::SignedOpenMlsWire { exact_message, .. } => Some(exact_message),
             Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
@@ -324,7 +389,9 @@ impl StoredMessagePayload {
             Self::RawTransport(_)
             | Self::OutboundWelcome { .. }
             | Self::StagedInviteWelcome { .. }
-            | Self::OpenMlsWire(_) => None,
+            | Self::OpenMlsWire(_)
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
             Self::SignedOpenMlsWire { stamp, .. } => stamp.as_ref(),
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
         }
@@ -341,20 +408,25 @@ impl StoredMessagePayload {
             | Self::OutboundWelcome { .. }
             | Self::StagedInviteWelcome { .. }
             | Self::OpenMlsWire(_)
-            | Self::OwnCommitWire { .. } => None,
+            | Self::OwnCommitWire { .. }
+            | Self::StagedSiblingWelcome { .. }
+            | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 
-    pub fn into_message(self) -> TransportMessage {
+    /// The transport message this payload holds. A sibling Welcome holds
+    /// none.
+    pub fn into_message(self) -> Option<TransportMessage> {
         match self {
             Self::RawTransport(message)
             | Self::OutboundWelcome { message, .. }
             | Self::OpenMlsWire(message)
-            | Self::OwnCommitWire { message, .. } => message,
-            Self::StagedInviteWelcome { message, .. } => message,
+            | Self::OwnCommitWire { message, .. } => Some(message),
+            Self::StagedInviteWelcome { message, .. } => Some(message),
             Self::SignedOpenMlsWire {
                 openmls_message, ..
-            } => openmls_message,
+            } => Some(openmls_message),
+            Self::StagedSiblingWelcome { .. } | Self::OutboundSiblingWelcome { .. } => None,
         }
     }
 }
@@ -455,6 +527,36 @@ fn encode_stored_message_payload_v2(
             encode_transport_message(message, &mut out)?;
             encode_own_commit_stamp(stamp, &mut out)?;
         }
+        StoredMessagePayload::StagedSiblingWelcome {
+            welcome,
+            origin_commit_id,
+            key_package_ref,
+            deliver_until,
+        } => {
+            out.push(10);
+            encode_var_bytes(welcome, &mut out, "sibling Welcome")?;
+            encode_var_bytes(
+                origin_commit_id.as_slice(),
+                &mut out,
+                "staged Welcome origin commit id",
+            )?;
+            encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
+            out.extend_from_slice(&deliver_until.0.to_be_bytes());
+        }
+        StoredMessagePayload::OutboundSiblingWelcome {
+            welcome,
+            key_package_ref,
+            deliver_until,
+            carrier,
+        } => {
+            out.push(11);
+            encode_var_bytes(welcome, &mut out, "sibling Welcome")?;
+            encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
+            out.extend_from_slice(&deliver_until.0.to_be_bytes());
+            encode_option(carrier.as_ref(), &mut out, |carrier, out| {
+                encode_var_bytes(carrier, out, "sibling Welcome carrier")
+            })?;
+        }
     }
     Ok(out)
 }
@@ -519,6 +621,18 @@ fn decode_stored_message_payload_v2(
             key_package_ref: decoder
                 .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
             deliver_until: Some(Timestamp(decoder.u64("Welcome delivery deadline")?)),
+        },
+        10 => StoredMessagePayload::StagedSiblingWelcome {
+            welcome: decoder.var_bytes("sibling Welcome")?,
+            origin_commit_id: MessageId::new(decoder.var_bytes("staged Welcome origin commit id")?),
+            key_package_ref: decoder.var_bytes("Welcome KeyPackageRef")?,
+            deliver_until: Timestamp(decoder.u64("Welcome delivery deadline")?),
+        },
+        11 => StoredMessagePayload::OutboundSiblingWelcome {
+            welcome: decoder.var_bytes("sibling Welcome")?,
+            key_package_ref: decoder.var_bytes("Welcome KeyPackageRef")?,
+            deliver_until: Timestamp(decoder.u64("Welcome delivery deadline")?),
+            carrier: decoder.option(|decoder| decoder.var_bytes("sibling Welcome carrier"))?,
         },
         variant => {
             return Err(invalid(format!(
@@ -1025,12 +1139,34 @@ mod stored_payload_codec_tests {
                 message: group_message,
                 stamp: commit_stamp,
             },
+            StoredMessagePayload::staged_sibling_welcome(
+                vec![0x61; 40],
+                MessageId::new([0x55, 0x56]),
+                vec![0x58; 32],
+                Timestamp(1_700_000_600),
+            ),
+            StoredMessagePayload::outbound_sibling_welcome(
+                vec![0x61; 40],
+                vec![0x58; 32],
+                Timestamp(1_700_000_600),
+                None,
+            ),
+            StoredMessagePayload::outbound_sibling_welcome(
+                vec![0x61; 40],
+                vec![0x58; 32],
+                Timestamp(1_700_000_600),
+                Some(vec![0x62; 32]),
+            ),
         ];
 
         for value in values {
             let encoded = value.encode().unwrap();
             assert!(encoded.starts_with(b"MDKMP\0\x02"));
             assert_eq!(StoredMessagePayload::decode(&encoded).unwrap(), value);
+            assert_eq!(
+                StoredMessagePayload::decode(&serde_json::to_vec(&value).unwrap()).unwrap(),
+                value
+            );
         }
     }
 

@@ -6,7 +6,7 @@ use storage_sqlite::TransportReconciliationItem;
 
 impl Account {
     /// The account holds `events` on `route`: its reconciliation inventory.
-    fn hold(&self, route: &Route, events: &[Event]) {
+    pub(super) fn hold(&self, route: &Route, events: &[Event]) {
         let items = events
             .iter()
             .map(|event| TransportReconciliationItem {
@@ -32,7 +32,7 @@ impl Account {
             .unwrap();
     }
 
-    fn staged_events(&self, route: &Route) -> u64 {
+    pub(super) fn staged_events(&self, route: &Route) -> u64 {
         self.app
             .staged_recovery_usage(std::slice::from_ref(route), None)
             .unwrap()
@@ -41,13 +41,13 @@ impl Account {
 }
 
 /// `count` events spread evenly over `[since, until)`.
-fn spread(group: [u8; 32], since: u64, until: u64, count: u64) -> Vec<Event> {
+pub(super) fn spread(group: [u8; 32], since: u64, until: u64, count: u64) -> Vec<Event> {
     (0..count)
         .map(|index| event(group, since + index * (until - since) / count))
         .collect()
 }
 
-fn ids(events: &[Event]) -> BTreeSet<EventId> {
+pub(super) fn ids(events: &[Event]) -> BTreeSet<EventId> {
     events.iter().map(|event| event.id).collect()
 }
 
@@ -242,6 +242,46 @@ async fn recovery_runner_never_rechecks_a_cap_only_relay() {
     );
 }
 
+/// An explicit repair asks a relay to compare again: one that would not
+/// earlier in this process, on a connection still up, is re-checked once the
+/// repair re-arms it, so the repair can end with its window covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_repair_rechecks_a_relay_that_would_not_compare_before() {
+    use super::super::{PassBound, RepairEnd};
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let events = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &events);
+    let compares = ModelRelay::new(OTHER_RELAY, caps(500, true))
+        .with_events(events)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[OTHER_RELAY])],
+        &[&compares],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, OTHER_RELAY, floor, t0 - 1);
+    host.tails.stand(&route, OTHER_RELAY, t0);
+    account.record_caps(OTHER_RELAY, caps(500, true), t0);
+    let (mut runner, _handle) = runner(&host, test_policy());
+    // As an earlier group comparison it refused leaves it.
+    runner.memory.would_not_compare(OTHER_RELAY);
+
+    let end = runner
+        .repair(&PassBound::within(Duration::from_secs(60)))
+        .await;
+    assert!(
+        matches!(end, RepairEnd::Covered),
+        "the repair re-checked the relay"
+    );
+    assert!(!compares.comparisons().is_empty());
+}
+
 /// A full pass is due again six hours after it finished, and at once after an
 /// epoch gap, from the gap's bound. What it finds inside covered ranges
 /// arrived late: it is staged and counted.
@@ -399,6 +439,82 @@ async fn recovery_runner_resumes_a_failed_recheck_pass_and_uncovers_nothing() {
             .is_some()
     );
     assert!(still_covered(&account));
+}
+
+/// A re-check whose settle commits and whose progress write then fails keeps
+/// its attempt open, and the refund that follows changes nothing: the relay's
+/// answer stands and the account keeps the charge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_a_settled_recheck_whose_progress_write_failed() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - DAY;
+    let held = every([1; 32], floor, t0, HOUR);
+    account.hold(&route, &held);
+    let relay = ModelRelay::new(RELAY, caps(500, true))
+        .with_events(held)
+        .build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY])],
+        &[&relay],
+    );
+    account.goal(&route, floor);
+    account.live_boundary(&route, RELAY, floor, t0 - 1);
+    host.tails.stand(&route, RELAY, t0);
+    account.record_caps(RELAY, caps(500, true), t0);
+    // The relay failed once before, so an answer shows in its streak.
+    account
+        .app
+        .settle_recovery_recheck(&route, RELAY, Outcome::Unreachable, &test_policy().unit, t0)
+        .unwrap();
+    let streak = || {
+        account
+            .app
+            .recovery_relay_health(RELAY)
+            .unwrap()
+            .unwrap()
+            .unreachable_streak
+    };
+    assert_eq!(streak(), 1);
+    let faults = account.fault_connection();
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_recheck_progress BEFORE UPDATE OF recheck_position_seconds
+             ON account_recovery_units BEGIN SELECT RAISE(ABORT, 'recheck progress fault'); END;",
+        )
+        .unwrap();
+    let attempts = || {
+        account
+            .app
+            .recovery_account_usage(clock.now())
+            .unwrap()
+            .attempts
+    };
+    let (mut runner, _handle) = runner(&host, test_policy());
+    let open = runner.open_attempts();
+
+    let failed = ran(runner.step().await);
+    assert_eq!(
+        (failed.recheck, failed.outcome),
+        (true, Outcome::LocalFailure)
+    );
+    let pass = account.unit(&route, RELAY).recheck;
+    assert_eq!(pass.completed_at_seconds, None, "its progress was not kept");
+    assert_eq!(streak(), 0, "its settle committed the relay's answer");
+    assert_eq!(attempts(), 1);
+    assert!(!open.is_empty(), "its attempt stays open");
+
+    faults
+        .execute_batch("DROP TRIGGER fail_recheck_progress;")
+        .unwrap();
+    open.refund(&account.app, &test_policy().unit, clock.now());
+    assert!(open.is_empty());
+    assert_eq!(attempts(), 1, "the refund kept the settled charge");
+    assert_eq!(streak(), 0, "and the relay's answer");
 }
 
 /// A repair that makes a pass due while one of its quanta runs is not
@@ -569,4 +685,36 @@ async fn recovery_runner_holds_a_full_relays_recheck_back_but_not_its_frontier_d
         held_back(host.survey(policy).await),
         (Some(false), Some(true))
     );
+}
+
+/// A re-check of a retained prior route passes over nothing past its goal's
+/// end, though the ledger covers later seconds there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_rechecks_a_retained_route_only_through_its_goal() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let route = group(1);
+    let floor = t0 - HOUR;
+    let ceiling = t0 - HOUR / 2;
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.record_caps(RELAY, caps(500, true), t0);
+    account.live_boundary(&route, RELAY, floor, t0);
+    account.goal(&route, floor);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![RunnerRoute {
+            goal_until: Some(ceiling),
+            ..required(&route, &[RELAY])
+        }],
+        &[&relay],
+    );
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    let summary = ran(runner.step().await);
+    assert!(summary.recheck);
+    let comparisons = relay.comparisons();
+    assert!(!comparisons.is_empty());
+    assert!(comparisons.iter().all(|window| window.until <= ceiling));
 }

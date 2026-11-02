@@ -1187,3 +1187,34 @@ async fn a_cut_request_is_dropped_after_the_grace_or_at_once() {
         );
     }
 }
+
+#[test]
+fn an_inbox_route_asks_for_and_keeps_only_its_recipients_gift_wraps() {
+    let recipient = [9; 32];
+    let inbox = SweepRoute::Inbox { pubkey: recipient };
+    let filter = inbox.slice_filter(T0, T0 + DAY, Some(500));
+    let json = serde_json::to_value(&filter).expect("filter json");
+    assert_eq!(json["kinds"], serde_json::json!([1059]));
+    assert_eq!(json["#p"], serde_json::json!([hex::encode(recipient)]));
+    assert_eq!(json["since"], serde_json::json!(T0));
+    assert_eq!(json["until"], serde_json::json!(T0 + DAY));
+
+    let wrap = |kind: u16, recipient: [u8; 32]| {
+        Event::new(
+            EventId::from_byte_array([kind as u8; 32]),
+            Keys::generate().public_key(),
+            Timestamp::from_secs(T0),
+            NostrKind::from(kind),
+            [Tag::parse(["p", &hex::encode(recipient)]).expect("p tag")],
+            "",
+            Signature::from_byte_array([1; 64]),
+        )
+    };
+    assert!(inbox.matches(&wrap(1059, recipient)));
+    assert!(!inbox.matches(&wrap(1059, [8; 32])), "another recipient");
+    assert!(!inbox.matches(&wrap(445, recipient)), "another kind");
+    assert!(
+        !route().matches(&wrap(1059, GROUP)),
+        "a group route keeps no gift wrap"
+    );
+}

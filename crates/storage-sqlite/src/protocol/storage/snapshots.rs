@@ -111,8 +111,9 @@ mod tests {
     };
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::storage::{
-        GroupStateCheckpointRef, GroupStorage, MemberValidationCacheStorage, MessageStorage,
-        OutboundIntentStorage, StorageError, StorageProvider,
+        ConvergencePolicyStorage, GroupStateCheckpointRef, GroupStorage,
+        MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, StorageError,
+        StorageProvider,
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -265,7 +266,20 @@ mod tests {
     fn snapshot_rollback_restores_group_messages_queue_and_openmls_group_state() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g0 = sample_group(gid(1), 0, 1);
+        let other = sample_group(gid(2), 0, 0);
         store.put_group(&g0).unwrap();
+        store.put_group(&other).unwrap();
+        assert_eq!(store.validated_tree_marker(&g0.id).unwrap(), None);
+        store.put_convergence_policy(&g0.id, b"policy-v1").unwrap();
+        store
+            .put_convergence_policy(&other.id, b"other-policy")
+            .unwrap();
+        store
+            .put_validated_tree_marker(&g0.id, b"marker-v1")
+            .unwrap();
+        store
+            .put_validated_tree_marker(&other.id, b"other-marker")
+            .unwrap();
         store
             .put_message(&sample_message(mid(1), g0.id.clone(), 0))
             .unwrap();
@@ -305,6 +319,10 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"epoch-1".to_vec()))
             .unwrap();
+        store.put_convergence_policy(&g0.id, b"policy-v2").unwrap();
+        store
+            .put_validated_tree_marker(&g0.id, b"marker-v2")
+            .unwrap();
 
         store
             .rollback_group_to_snapshot(&g0.id, "pre-commit")
@@ -325,6 +343,24 @@ mod tests {
         assert_eq!(queued[0].id, mid(10));
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+        // Convergence policy and the validated-tree marker are per group and
+        // ride in the snapshot; the other group's rows are left alone.
+        assert_eq!(
+            store.convergence_policy(&g0.id).unwrap(),
+            Some(b"policy-v1".to_vec())
+        );
+        assert_eq!(
+            store.validated_tree_marker(&g0.id).unwrap(),
+            Some(b"marker-v1".to_vec())
+        );
+        assert_eq!(
+            store.convergence_policy(&other.id).unwrap(),
+            Some(b"other-policy".to_vec())
+        );
+        assert_eq!(
+            store.validated_tree_marker(&other.id).unwrap(),
+            Some(b"other-marker".to_vec())
+        );
     }
 
     #[test]
@@ -842,7 +878,15 @@ mod tests {
                 "injected after partial live restore".into(),
             ))
         });
-        assert!(result.is_err());
+        // Only the injected error proves the rollback ran inside the
+        // transaction: a nested-transaction failure is also `Backend`.
+        assert!(
+            matches!(
+                &result,
+                Err(StorageError::Backend(message)) if message == "injected after partial live restore"
+            ),
+            "{result:?}"
+        );
 
         assert_eq!(store.get_group(&live_group.id).unwrap(), live_group);
         assert_eq!(
@@ -902,57 +946,26 @@ mod tests {
 
     #[test]
     fn snapshot_create_and_rollback_retry_writer_contention() {
-        use crate::{SqlCipherKey, SqliteStorageOptions};
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snapshot-contention.sqlite");
-        let key = SqlCipherKey::new("snapshot contention key").unwrap();
-        let options = SqliteStorageOptions {
-            busy_timeout_ms: 50,
-            ..SqliteStorageOptions::default()
-        };
-        let store = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-            .unwrap();
+        let db = SharedDatabase::new();
+        let store = db.open();
         let original = sample_group(gid(1), 0, 1);
         store.put_group(&original).unwrap();
 
-        let spawn_blocker = || {
-            let blocker_path = path.clone();
-            let blocker_options = options.clone();
-            let blocker_key = SqlCipherKey::new("snapshot contention key").unwrap();
-            let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                    &blocker_path,
-                    &blocker_key,
-                    blocker_options,
-                )
-                .unwrap();
-                let conn = blocker.lock().unwrap();
-                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-                lock_acquired_tx.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                conn.execute_batch("COMMIT").unwrap();
-            });
-            lock_acquired_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap();
-            handle
-        };
-
-        let blocker = spawn_blocker();
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         store
             .create_group_snapshot(&original.id, "contended")
             .expect("snapshot capture retries after transient contention");
-        blocker.join().unwrap();
+        blocker.join();
 
         let changed = sample_group(gid(1), 1, 1);
         store.put_group(&changed).unwrap();
-        let blocker = spawn_blocker();
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         store
             .rollback_group_to_snapshot(&original.id, "contended")
             .expect("snapshot rollback retries after transient contention");
-        blocker.join().unwrap();
+        blocker.join();
         assert_eq!(store.get_group(&original.id).unwrap(), original);
     }
 
@@ -980,6 +993,10 @@ mod tests {
         assert!(matches!(
             store.rollback_group_to_snapshot(&g1.id, "a-before"),
             Err(StorageError::SnapshotMissing(_))
+        ));
+        assert!(matches!(
+            store.release_group_snapshot(&g1.id, "a-before"),
+            Err(StorageError::SnapshotMissing(name)) if name == "a-before"
         ));
     }
 

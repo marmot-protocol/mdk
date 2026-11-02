@@ -1615,10 +1615,12 @@ async fn check_restored_tip(
     }
     let payload = app_payload("after replay");
     if matches!(capacity, OutboundCapacity::Available) {
+        let pin = alice.epoch_pin(&group_id).unwrap();
+        assert_eq!(pin.epoch, EpochId(source_epoch + 1));
         let pinned = alice
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
-                expected_epoch: Some(EpochId(source_epoch + 1)),
+                expected_epoch: Some(pin),
                 payload: payload.clone(),
             })
             .await;
@@ -2364,6 +2366,85 @@ async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
          rivals cannot unseal, so filling the cap with rivals must not \
          evict it"
     );
+}
+
+/// mdk#2861: an evicted candidate offers no exporter context; readable
+/// rivals still do, and neither complete nor sliced enumeration adopts it.
+#[tokio::test]
+async fn an_evicted_candidate_is_silent_and_preserves_readable_rivals() {
+    let (mut alice, alice_storage) = build_client(b"evicted-candidate-alice");
+    let (mut bob, storage) = build_client(b"evicted-candidate-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let readable = rival_commit(&alice_storage, &alice.self_id(), &group_id);
+    let SendResult::GroupEvolution {
+        msg: removal,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected removal commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    // Advance the observer on its own rival so enumeration must restore the
+    // retained anchor as well as each candidate's temporary replay state.
+    confirmed_update(&mut bob, &group_id).await;
+    admit_rival(&storage, &group_id, &readable, source_epoch);
+    admit_rival(&storage, &group_id, &removal, source_epoch);
+    let before = replay_state(&storage, &group_id);
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let expected = peel(&storage, &group_id, V1_MAX_REWIND_COMMITS);
+    assert!(expected.contested, "eviction does not adjudicate the fork");
+    assert_eq!(
+        expected.contexts.len(),
+        2,
+        "both surviving rivals remain readable"
+    );
+    assert!(
+        expected
+            .contexts
+            .iter()
+            .all(|c| c.tip_epoch == source_epoch + 1)
+    );
+    assert!(replay_state(&storage, &group_id) == before);
+
+    let mut slot = None;
+    let mut slices = 0;
+    let actual = loop {
+        let output = super::candidate_peel_slice(
+            &storage,
+            &group_id,
+            0,
+            V1_MAX_REWIND_COMMITS,
+            ReplayProfilePolicy::default(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+            &mut slot,
+            &mut super::ReplaySlice::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                1,
+            ),
+        )
+        .expect("an evicted candidate cannot fail a sliced survey");
+        slices += 1;
+        assert!(slices < 100, "candidate scan must finish across slices");
+        assert!(replay_state(&storage, &group_id) == before);
+        assert!(storage.list_messages(&group_id, EpochId(0)).unwrap() == ledger);
+        if let Some(output) = output {
+            break output;
+        }
+    };
+    assert!(actual.contested);
+    assert_eq!(branch_ids(&actual), branch_ids(&expected));
+    for (actual, expected) in actual.contexts.iter().zip(&expected.contexts) {
+        assert!(actual.context == expected.context);
+    }
+    assert!(slot.is_none());
 }
 
 #[tokio::test]

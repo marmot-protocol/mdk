@@ -212,6 +212,7 @@ mod tests {
             local_signing,
             external_signing: false,
             signed_out,
+            unlinked: false,
         }
     }
 

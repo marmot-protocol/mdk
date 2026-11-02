@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
+  (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
+
+- `self_membership` in `groups show`, `chats list` and their feeds can read `device_removed` (mdk#2628 item 3.6b):
+  this device's leaf was removed while the account stays in the group through another of its devices. It is not a
+  removal of the account from the group.
 - A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
   verification in Marmot encodings, with seven emoji to compare, a commitment to the new device's key, and
   confirmations that cover the new device's exact `KeyPackageRef`, the device group's id, and the MLS signature key of
@@ -29,8 +35,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   (mdk#2628 item 3.1). A group that requires it is a device group. It holds the roster from creation and keeps
   requiring it, and only one account's devices may be members. The roster holds the key that seals the account's
   device tags, which no update changes. A roster update is a list of operations that each set or remove one entry: a
-  device keyed by its KeyPackage slot, with the key it signs its device tags with, a rejected slot (a removed device's
-  keeps that key) or a rejected KeyPackage. Every member applies the operations to the parent's roster. A roster may
+  device keyed by its KeyPackage slot, with the key it signs its device tags with, or a rejected slot (a removed
+  device's keeps that key). Every member applies the operations to the parent's roster. A roster may
   hold at most 20 devices, no two with one tag signature key. The device that creates a device group draws its tag key
   at random. Until the component's spec is adopted, only test-policy builds may advertise it. A release build can't
   create or join a device group, and it treats roster bytes in other groups as unknown data, so nothing ships the
@@ -71,22 +77,32 @@ versioning through the workspace version in the root `Cargo.toml`.
   item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
   event to re-read it. It is false in release builds until the roster's spec lands.
 - A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
-  open, every six hours and soon after one of the account's KeyPackages arrives live, and keeps what an inviter would
-  add: each slot's newest publication, not deleted, valid and fresh, with no cap on how many. A slot that is neither
-  this device's nor in its device group's roster is an unrecognized sign-in. Slots this device's first check returned,
-  fresh or not, are devices that were there before it; other slots are new sign-ins, whatever their publication times
-  say. Malformed input and client tags never raise one. Rejecting a sign-in records its slot as rejected in the device
-  group's roster in one commit, or keeps it on the device until it has a device group; a device that later creates one
-  founds the roster with it. Each device keeps its rejections until the roster holds the slot as a device, a link the
-  user confirmed, and commits one again whenever the roster has no entry for the slot; it never replaces an entry. The
-  runtime writes them (`AccountDeviceRuntime::reject_device_slots`) behind the gate its other roster updates wait
-  behind. A rejection names the slot alone, never its KeyPackage, which may be a copy of a real device's, and a rejected
-  KeyPackage never makes another slot rejected. A sign-in another device answered keeps its prompt, saying so, until
-  dismissed, and is listed again if the roster loses that answer; one whose slot a complete check finds empty stays
-  listed as no longer signed in. A publication that is only stale never signs a slot out, and a check of fallback
-  relays, when the account lists none, is never complete. Hosts list sign-ins with `unrecognized_sign_ins`, answer one
-  with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`, UniFFI and C, and re-read on the
-  `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+  open, every six hours, and soon after one of the account's KeyPackages arrives live or a Welcome names one this device
+  did not publish, and keeps what an inviter would add: each slot's newest publication, not deleted, valid and fresh,
+  with no cap on how many. A slot that is neither this device's nor in its device group's roster is an unrecognized
+  sign-in. Slots this device's first check returned, fresh or not, are devices that were there before it; other slots
+  are new sign-ins, whatever their publication times say. Malformed input and client tags never raise one. Rejecting a
+  sign-in records its slot as rejected in the device group's roster in one commit, or keeps it on the device until it
+  has a device group; a device that later creates one founds the roster with it. Each device keeps its rejections until
+  the roster holds the slot as a device, a link the user confirmed, and commits one again whenever the roster has no
+  entry for the slot; it never replaces an entry. The runtime writes them (`AccountDeviceRuntime::reject_device_slots`)
+  behind the gate its other roster updates wait behind. A rejection names the slot alone, never its KeyPackage, which
+  may be a copy of a real device's. A sign-in another
+  device answered keeps its prompt, saying so, until dismissed, and is listed again if the roster loses that answer; one
+  whose slot a complete check finds empty stays listed as no longer signed in. A publication that is only stale never
+  signs a slot out, and a check of fallback relays, when the account lists none, is never complete. Hosts list sign-ins
+  with `unrecognized_sign_ins`, answer one with `answer_sign_in`, and check now with `check_sign_ins`, in `marmot-app`,
+  UniFFI and C, and re-read on the `UnrecognizedSignInsChanged` event. Only test-policy builds run any of it.
+- Hosts can warn the user that someone holding the account's signing key published where the account's devices did
+  not (mdk#2628 items 3.7a and 3.7b). `compromise_warning`, in `marmot-app`, UniFFI and C, lists each rejected
+  sign-in, from this device or its device group's roster, and each KeyPackage this device found in its own slot that it
+  did not make, that the user has not seen on this device, with a `CompromiseWarningChanged` event to re-read it. A
+  device made a KeyPackage when its LeafNode carries the device's signature key, so only a foreign key warns, and only
+  on the device that found it, before it replaces the publication. Existing development device groups must be
+  recreated: the roster dropped its rejected KeyPackages (mdk#2628 D74), which changed its encoding. `dismiss_compromise_warning` marks them seen on this device only;
+  a rejection branch selection drops and restores stays seen, and rejections already in a device's first roster count
+  as seen. `start_fresh` lets the user start a device without the devices its first check found, answering each Not
+  now without rejecting it, and `started_fresh` says whether it did. Only test-policy builds run any of it.
 - Hosts can link a new device of the account through pairing (mdk#2628 item 3.3b): `start_device_link`,
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
@@ -109,6 +125,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   retired with `QueuedIntentRefused`. A lost edit is re-issued when the winner left that entry alone, even if it
   changed others. The device roster's write path uses it, so an entry read before a sibling's change never
   overwrites it.
+- New `SendIntent::ReplaceAccountEntry` replaces the account entry of a device group's roster (its backup writer and
+  recovery key) while the roster still holds the entry it was computed from (mdk#2628 item 4.4a), compared as
+  `ReplaceDeviceEntry` compares a device entry; otherwise the new `EngineError::AccountEntryChanged` refuses it. It is
+  never queued: while the device group settles, the new `EngineError::AccountEntryUnsettled` refuses it.
+  `Engine::recovery_public_key`, `seal_to_recovery_key` and `open_with_recovery_key` derive the X25519 recovery key
+  pair from the 128 bits of entropy 12 recovery words carry and seal to it under the label "Marmot Backup". Like the
+  roster, reachable only behind `dev_device_groups` until the backup spec is adopted.
+  `Engine::owes_superseded_own_commit_reissue` says whether an own commit a fork dropped is still owed a re-issue that
+  maintenance has not re-derived, as after a lost announcement; the device group's commit gate waits for it.
 - `SendIntent::UnlinkDevice` removes a device whose link failed, with its roster entry, in one admin Commit
   (mdk#2628 item 3.3b): the new device made no commit in the device group by the link's deadline. It takes the
   device's leaf signature key and a roster update that removes exactly one listed slot, adds no member and makes no
@@ -177,8 +202,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- `messages send-event` refuses the device-group kinds 457, 459, 460 and 462 with `reserved_app_event_kind`, and one
-  received in a chat makes no timeline row or message (mdk#2628). They are read only in the account's device group.
+- `messages send-event` refuses the device-group kinds 457, 459, 460, 461, 473, 475 and 476 with
+  `reserved_app_event_kind`, and one received in a chat makes no timeline row or message (mdk#2628). They are read only
+  in the account's device group.
 - Creating a group now refuses an initial entry for `marmot.group.account-devices.v1` (0x800d), or any other protocol
   component that carries no data, with `EngineError::NoDataAppComponent` before anything is created or published
   (mdk#2628). Hosts could pass one among the optional initial components and create a GroupContext entry the spec

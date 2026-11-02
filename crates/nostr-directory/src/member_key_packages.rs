@@ -673,6 +673,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                             DirectoryFetchOutcome {
                                 records,
                                 complete: retry.complete,
+                                complete_endpoints: retry.complete_endpoints,
                             },
                         )
                     }

@@ -2,10 +2,12 @@
 //! of an account's devices holds a leaf (mdk#2628 item 3.1d, D32).
 //!
 //! Read through the engine, a member's leaf belongs to the roster slot its
-//! tag names, against the device group's current tree only. A tag never makes
-//! a Commit invalid. No group may require 0x800f, and a GroupContext entry
-//! under it is unknown data that this engine never writes. The tag crypto and
-//! the spec vector are tested in the engine's `device_tag` module.
+//! tag names, in the current tree only, or, read at an epoch, in the tree of
+//! that epoch: the current one, or a past one from its retained anchor, a
+//! read that writes nothing. A tag never makes a Commit invalid. No group may
+//! require 0x800f, and a GroupContext entry under it is unknown data that
+//! this engine never writes. The tag crypto and the spec vector are tested in
+//! the engine's `device_tag` module.
 //!
 //! A device tags from the roster of the device group its host names, once its
 //! entry there, the one at its KeyPackage publication slot, carries its MLS
@@ -18,6 +20,7 @@ use super::device_roster::{
     entry, found_device_group, phone_and_laptop, roster, roster_device, roster_device_on,
     roster_of, roster_update, slot,
 };
+use super::tagged_siblings::{found_routed_group, handed};
 use super::*;
 use cgka_engine::device_tag::{DeviceTagClaim, device_tag_claim, seal_device_tag};
 use cgka_traits::app_components::{
@@ -103,7 +106,7 @@ fn claim(
 ) -> Option<DeviceTagClaim> {
     reader
         .engine
-        .member_device_tag_claim(gid, epoch, leaf_index, roster)
+        .member_device_tag_claim_at(gid, epoch, leaf_index, roster)
         .unwrap()
 }
 
@@ -135,10 +138,36 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
         Some(DeviceTagClaim::Device(slot(2)))
     );
 
-    // Only the current tree is read: an older epoch, or an index with no
-    // leaf, reads nothing.
-    assert_eq!(claim(&phone, &gid, before, laptop_leaf, &tagged), None);
+    // The current-tree reader reads only the current epoch.
+    let current = |epoch| {
+        phone
+            .engine
+            .member_device_tag_claim(&gid, epoch, laptop_leaf, &tagged)
+            .unwrap()
+    };
+    assert_eq!(current(after), Some(DeviceTagClaim::Device(slot(2))));
+    assert_eq!(current(before), None);
+
+    // Read at an epoch, an older one reads the leaf as it was then, from its
+    // retained anchor, and leaves the group's state and snapshots as they
+    // were; an epoch with no anchor, or an index with no leaf, reads nothing.
+    let state = phone.storage.group_replay_state_fingerprint(&gid).unwrap();
+    let snapshots = phone.storage.list_group_snapshots(&gid).unwrap();
+    assert_eq!(
+        claim(&phone, &gid, before, laptop_leaf, &tagged),
+        Some(DeviceTagClaim::Unclaimed)
+    );
+    assert_eq!(
+        phone.storage.group_replay_state_fingerprint(&gid).unwrap(),
+        state
+    );
+    assert_eq!(phone.storage.list_group_snapshots(&gid).unwrap(), snapshots);
+    assert_eq!(
+        claim(&phone, &gid, EpochId(after.0 + 1), laptop_leaf, &tagged),
+        None
+    );
     assert_eq!(claim(&phone, &gid, after, 9, &tagged), None);
+    assert_eq!(claim(&phone, &gid, before, 9, &tagged), None);
     // Against a roster in which the laptop has not set its key, the same
     // leaf is unclaimed.
     let without_key = DeviceRosterV1 {
@@ -149,6 +178,52 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
         claim(&phone, &gid, after, laptop_leaf, &without_key),
         Some(DeviceTagClaim::Unclaimed)
     );
+
+    // After a later commit, the tagged epoch still reads as the laptop, from
+    // its own anchor, again writing nothing.
+    send_commit(
+        &mut phone,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    let state = phone.storage.group_replay_state_fingerprint(&gid).unwrap();
+    let snapshots = phone.storage.list_group_snapshots(&gid).unwrap();
+    assert_eq!(
+        claim(&phone, &gid, after, laptop_leaf, &tagged),
+        Some(DeviceTagClaim::Device(slot(2)))
+    );
+    assert_eq!(
+        phone.storage.group_replay_state_fingerprint(&gid).unwrap(),
+        state
+    );
+    assert_eq!(phone.storage.list_group_snapshots(&gid).unwrap(), snapshots);
+
+    // Once later commits have pruned an epoch's anchor, it reads nothing,
+    // never the current tree's tag.
+    for _ in 0..5 {
+        send_commit(
+            &mut phone,
+            SendIntent::SelfUpdate {
+                group_id: gid.clone(),
+            },
+            &gid,
+        )
+        .await;
+    }
+    assert_eq!(
+        claim(
+            &phone,
+            &gid,
+            phone.engine.epoch(&gid).unwrap(),
+            laptop_leaf,
+            &tagged
+        ),
+        Some(DeviceTagClaim::Device(slot(2)))
+    );
+    assert_eq!(claim(&phone, &gid, before, laptop_leaf, &tagged), None);
 }
 
 /// Most members cannot open a tag, so a tag that does not decode, open or
@@ -566,9 +641,15 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
     let (mut phone, mut laptop, device_gid) = phone_and_laptop().await;
     let mut bob = roster_device(b"bob");
     let mut groups = Vec::new();
-    for _ in 0..6 {
-        let bob_kp = bob.engine.fresh_key_package().await.unwrap();
-        groups.push(found_group(&mut laptop, vec![bob_kp], true, &mut [&mut bob]).await);
+    for index in 0..6 {
+        // The same-account Add's chat names a relay for its sibling Welcome.
+        let gid = if index == 3 {
+            found_routed_group(&mut laptop, &mut [&mut bob]).await
+        } else {
+            let bob_kp = bob.engine.fresh_key_package().await.unwrap();
+            found_group(&mut laptop, vec![bob_kp], true, &mut [&mut bob]).await
+        };
+        groups.push(gid);
     }
     hold_slot(&laptop, slot(2));
     laptop
@@ -576,10 +657,17 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
         .set_device_tag_group(Some(device_gid.clone()))
         .unwrap();
     set_own_key(&mut laptop, slot(2), &device_gid, &mut [&mut phone]).await;
+    // The phone, tagged too, hands the laptop the KeyPackage it adds.
+    hold_slot(&phone, slot(1));
+    phone
+        .engine
+        .set_device_tag_group(Some(device_gid.clone()))
+        .unwrap();
+    set_own_key(&mut phone, slot(1), &device_gid, &mut [&mut laptop]).await;
     let tagged = roster_of(&laptop, &device_gid);
     let mut carol = roster_device(b"carol");
     let carol_kp = carol.engine.fresh_key_package().await.unwrap();
-    let phone_kp = phone.engine.fresh_key_package().await.unwrap();
+    let phone_kp = handed(&mut phone, slot(1), slot(2));
 
     let intents = [
         SendIntent::SelfUpdate {

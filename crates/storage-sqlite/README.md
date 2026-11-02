@@ -71,11 +71,14 @@ Tests can opt out of two defaults, because memory security turns every SQLite al
 fsync per commit adds disk waits. Together they made up most of the workspace test lane's run time. Both helpers exist
 only in this crate's own tests or with the `test-support` feature, and do nothing until a test calls them:
 
-- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`. This crate's own unit tests get it
-  from `in_memory()`; dependents call it explicitly.
+- `in_memory_for_test()` opens an in-memory store without `cipher_memory_security`, copied from a migrated template
+  kept beside the test binary. The first store a build opens replays the migrations and writes the template; where the
+  binary's directory takes no files, every store replays them. This crate's own unit tests get it from `in_memory()`;
+  dependents call it explicitly.
 - After a test process calls `relax_storage_for_test_process()`, every database it opens skips
-  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests. The
-  tests that pin the production settings never call it.
+  `cipher_memory_security` and uses `synchronous=NORMAL`. `marmot-app`'s constructors call it in its unit tests, and
+  this crate's own unit tests start that way. The tests that pin the production settings never call it, and here they
+  call `use_production_storage_for_test_process()` first.
 
 Long-lived connections are closeable so a host can release file locks before suspending; closing is terminal and
 surviving clones return `StorageError::Closed`.
@@ -166,7 +169,10 @@ the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 **Group savepoints.** Nested `with_transaction` calls join the outermost transaction and roll back only there.
 `StorageProvider::with_group_savepoint` is the nested unit that rolls back on its own: on `Err` or panic a SQLite
 `SAVEPOINT` undoes every write the unit made, drops the after-commit wakeups it registered and moves
-`mls_write_generation`, and the caller's transaction stays open. Canonical convergence apply uses it in place of a full
+`mls_write_generation`, and the caller's transaction stays open. The exception is a transaction SQLite rolls back by
+itself (a full disk, an I/O error or out of memory mid-statement, a trigger's `RAISE(ROLLBACK)`): the unit's error comes
+back, the rest of the caller's transaction fails instead of committing write by write, and the connection stays usable
+for the next one. Canonical convergence apply uses it in place of a full
 group snapshot, so its rollback cost no longer grows with stored history (mdk#2326).
 `StorageProvider::rollback_group_state_keeping_live_records`, the rewind onto a retained anchor that a reorg's apply and
 the convergence probes use, restores canonical state only, even from a legacy full anchor, and leaves message,
@@ -187,6 +193,11 @@ targets always read the tail). `conversation_account_snapshot` captures that win
 inputs, draft descriptors, and persisted controls in one deferred read. `StorageProvider::with_read_snapshot` composes
 public storage calls under one deferred transaction, enforcing and restoring SQLite query-only mode even when nested.
 See the [opening contract](../../docs/marmot-architecture/further-context/conversation-opening.md).
+
+A sibling's read position (small state, mdk#2628 item 4.3) advances the read marker as a local read does, but keeps a
+manual-unread reminder. It may name a message this device does not hold yet: unread counts compare canonical order
+keys, not ids. The position this device sends is the furthest delivered message, other than an edit, at or before its
+read marker, so a marker on a synthesized group system row or an undelivered send still has one.
 
 Selected composer reads and revision-checked mutations share the encrypted draft tables; migration 0073 tracks legacy
 writes too, and queued/fanout acceptance clears only its submitted revision atomically. See the

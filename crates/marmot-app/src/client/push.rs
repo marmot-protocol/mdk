@@ -413,6 +413,11 @@ impl AppClient {
     }
 
     pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
+        // A device signing out announces no push token; its retries stop
+        // until the sign-out ends (mdk#2628 D67).
+        if self.signing_out() {
+            return false;
+        }
         let snapshots_pending = self.send_owed_push_snapshots().await;
         let shares_pending = self.retry_pending_push_registration_shares().await;
         // After the shares: one sent after a join window ends is the announce.
@@ -1011,10 +1016,18 @@ impl AppClient {
         self.publish_notification_trigger_tokens(tokens).await
     }
 
-    async fn publish_notification_trigger_tokens(
+    pub(crate) async fn publish_notification_trigger_tokens(
         &self,
         tokens: Vec<notifications::GroupPushTokenRecord>,
     ) -> Result<(), AppError> {
+        // An unlinked account wakes no one (mdk#2628 D67). Triggers go out
+        // through the adapter's anonymous publisher, which the account's
+        // publish stop does not cover.
+        if self.device_unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(self.state.label.clone()),
+            ));
+        }
         let account = self.app.account_home().account(&self.state.label)?;
         let by_server = notifications::token_records_by_server(tokens, &account.account_id_hex);
         if by_server.is_empty() {
@@ -1063,6 +1076,8 @@ impl AppClient {
                             "trigger",
                             crate::ProductUnit::Attempt,
                         );
+                        // This function refuses an unlinked account above.
+                        #[allow(clippy::disallowed_methods)]
                         let result = self
                             .adapter
                             .publish_signed_event(fallback, endpoints, &event, 1)

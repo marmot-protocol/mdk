@@ -12,6 +12,7 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
+pub use crate::own_account_devices::OwedSiblingWelcome;
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -19,8 +20,8 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
-    GroupStateChange, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, EpochPin, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
@@ -30,7 +31,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
+use cgka_traits::storage::{LeaveRequest, RosterTagKey, StorageError, StorageProvider};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
@@ -986,6 +987,23 @@ impl<S: StorageProvider> Engine<S> {
                 })
             })
             .collect())
+    }
+
+    /// Groups that hold a stored frozen fanout, hydrated or not, once each in
+    /// staging order. Quarantined groups are left out. [`Self::outbound_fanouts`]
+    /// hides unhydrated groups, so a host wake reads this first and hydrates
+    /// just these groups before it wakes their fanouts (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        let mut group_ids: Vec<GroupId> = Vec::new();
+        for fanout in self.storage.list_outbound_fanouts()? {
+            if let Some(group_id) = fanout.group_id()
+                && !self.quarantined_groups.contains_key(group_id)
+                && !group_ids.contains(group_id)
+            {
+                group_ids.push(group_id.clone());
+            }
+        }
+        Ok(group_ids)
     }
 
     /// Read one live group's frozen fanouts in original staging order without
@@ -3377,7 +3395,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::StagedInviteWelcome { .. }
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         }
         .ok_or_else(|| {
             EngineError::Backend(
@@ -3636,7 +3656,9 @@ impl<S: StorageProvider> Engine<S> {
             StoredMessagePayload::RawTransport(_)
             | StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => None,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => None,
         };
         if !message
             .is_some_and(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
@@ -3731,9 +3753,13 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::RawTransport(message) => {
                 matches!(message.envelope, TransportEnvelope::Welcome { .. })
             }
+            // A sibling Welcome is never a transport message, so no
+            // transport publish names its id.
             StoredMessagePayload::OpenMlsWire(_)
             | StoredMessagePayload::SignedOpenMlsWire { .. }
-            | StoredMessagePayload::OwnCommitWire { .. } => false,
+            | StoredMessagePayload::OwnCommitWire { .. }
+            | StoredMessagePayload::StagedSiblingWelcome { .. }
+            | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
         })
     }
 
@@ -3764,24 +3790,94 @@ impl<S: StorageProvider> Engine<S> {
         roster: &DeviceRosterV1,
     ) -> Result<Option<DeviceTagClaim>, EngineError> {
         self.with_live_mls_group(group_id, |mls_group| {
-            if mls_group.epoch().as_u64() != epoch.0 {
-                return Ok(None);
-            }
-            let Some(leaf) = mls_group
-                .public_group()
-                .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))
-            else {
-                return Ok(None);
-            };
-            let own_account = openmls::prelude::BasicCredential::try_from(
-                leaf.credential().clone(),
-            )
-            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
-            Ok(Some(if own_account {
-                crate::device_tag::device_tag_claim(leaf, roster)
+            Ok(if mls_group.epoch().as_u64() == epoch.0 {
+                self.leaf_device_tag_claim(mls_group, leaf_index, roster)
             } else {
-                DeviceTagClaim::Unclaimed
-            }))
+                None
+            })
+        })
+    }
+
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`, as
+    /// [`Self::member_device_tag_claim`] reads it, but a past epoch is read
+    /// from its own retained anchor, never from another epoch's tree, so a
+    /// message read after later commits still names the leaf that sent it, as
+    /// that leaf was then (mdk#2628 3.5). That read writes nothing: it
+    /// rewinds inside a savepoint it always rolls back. `None` when `epoch` is
+    /// neither current nor retained, or no leaf sat at that index.
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Result<Option<DeviceTagClaim>, EngineError> {
+        let claim = |mls_group: &openmls::group::MlsGroup| {
+            self.leaf_device_tag_claim(mls_group, leaf_index, roster)
+        };
+        if let Some(current) = self.with_live_mls_group(group_id, |mls_group| {
+            Ok((mls_group.epoch().as_u64() == epoch.0).then(|| claim(mls_group)))
+        })? {
+            return Ok(current);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-device-tag-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(epoch.0.to_be_bytes());
+        let suffix = hex::encode(&hasher.finalize()[..8]);
+        let site = crate::snapshot_guard::RewindSite::DeviceTagSource;
+        // The read leaves through the savepoint's error path, so every write
+        // the rewind made, its guard included, is rolled back.
+        enum Undone {
+            Read(Result<Option<DeviceTagClaim>, EngineError>),
+            Storage(StorageError),
+        }
+        impl From<StorageError> for Undone {
+            fn from(error: StorageError) -> Self {
+                Self::Storage(error)
+            }
+        }
+        let undone = self.storage.with_group_savepoint(
+            group_id,
+            &site.snapshot_name(&format!("{suffix}-undo")),
+            |storage| {
+                Err::<std::convert::Infallible, _>(Undone::Read(
+                    crate::openmls_projection::with_retained_anchor_group(
+                        storage,
+                        &self.crypto,
+                        group_id,
+                        epoch,
+                        site,
+                        &suffix,
+                        |historical_group, _| Ok(claim(historical_group)),
+                    ),
+                ))
+            },
+        );
+        match undone {
+            Ok(never) => match never {},
+            Err(Undone::Read(read)) => read,
+            Err(Undone::Storage(error)) => Err(error.into()),
+        }
+    }
+
+    /// The slot the leaf at `leaf_index` of `mls_group` reads as, or `None`
+    /// when no leaf sits there.
+    fn leaf_device_tag_claim(
+        &self,
+        mls_group: &openmls::group::MlsGroup,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> Option<DeviceTagClaim> {
+        let leaf = mls_group
+            .public_group()
+            .leaf(openmls::prelude::LeafNodeIndex::new(leaf_index))?;
+        let own_account = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
+            .is_ok_and(|credential| credential.identity() == self.identity.self_id().as_slice());
+        Some(if own_account {
+            crate::device_tag::device_tag_claim(leaf, roster)
+        } else {
+            DeviceTagClaim::Unclaimed
         })
     }
 
@@ -3799,6 +3895,39 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         roster: &DeviceRosterV1,
     ) -> Result<Vec<(Vec<u8>, DeviceTagClaim)>, EngineError> {
+        self.read_other_own_account_leaves(group_id, |leaf| {
+            Some(crate::device_tag::device_tag_claim(leaf, roster))
+        })
+    }
+
+    /// Every other leaf of this device's account in `group_id`'s current
+    /// tree whose device tag reads, under `leaf_tag_key`, as the slot of one
+    /// of `keys` and verifies under that pair's key, as its signature key.
+    /// `keys` are tag signature keys this device remembers a roster listing
+    /// (mdk#2761), so the leaves of a device the roster no longer lists are
+    /// still found. This device's own leaf is left out.
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        Ok(self
+            .read_other_own_account_leaves(group_id, |leaf| {
+                crate::device_tag::device_tag_reads_as_one_of(leaf, leaf_tag_key, keys)
+            })?
+            .into_iter()
+            .map(|(signature_key, _)| signature_key)
+            .collect())
+    }
+
+    /// `read` of each leaf of this device's account in `group_id` other than
+    /// its own, by signature key, where `read` gives a value.
+    fn read_other_own_account_leaves<T>(
+        &self,
+        group_id: &GroupId,
+        read: impl Fn(&openmls::prelude::LeafNode) -> Option<T>,
+    ) -> Result<Vec<(Vec<u8>, T)>, EngineError> {
         self.with_live_mls_group(group_id, |mls_group| {
             let own_leaf = mls_group.own_leaf_index();
             Ok(mls_group
@@ -3812,10 +3941,7 @@ impl<S: StorageProvider> Engine<S> {
                 })
                 .filter_map(|member| {
                     let leaf = mls_group.public_group().leaf(member.index)?;
-                    Some((
-                        member.signature_key,
-                        crate::device_tag::device_tag_claim(leaf, roster),
-                    ))
+                    Some((member.signature_key, read(leaf)?))
                 })
                 .collect())
         })
@@ -4003,7 +4129,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
     ) -> Result<GroupId, EngineError> {
-        self.do_join_welcome(welcome_msg, None).await
+        self.do_join_welcome(
+            welcome_msg,
+            None,
+            crate::group_lifecycle::WelcomeRoute::Delivery,
+        )
+        .await
     }
 
     fn feature_status(
@@ -4208,6 +4339,24 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         self.epoch_manager
             .epoch(group_id)
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+    }
+
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let group = self
+            .take_mls_group(group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        // Project a pending commit as `group_context` does, so the pin names
+        // the epoch whose secrets that view exports. It matches the group
+        // once the commit merges, and never if the commit is rolled back.
+        let pin = match group.pending_commit() {
+            Some(staged) => crate::app_payload::staged_epoch_pin(staged).ok_or_else(|| {
+                EngineError::Backend("staged commit carries no epoch authenticator".into())
+            }),
+            None => Ok(crate::app_payload::epoch_pin(&group)),
+        };
+        self.return_unmodified_mls_group(group_id, group);
+        pin
     }
 
     fn self_id(&self) -> MemberId {

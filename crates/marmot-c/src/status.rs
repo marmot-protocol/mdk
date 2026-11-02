@@ -190,6 +190,9 @@ pub enum MarmotStatus {
     StickerImport = 114,
     /// Signal sticker import is not available for external-signing accounts.
     StickerImportUnsupported = 115,
+    /// This device was unlinked from the account by its other devices. The
+    /// account stays signed out here: wipe it, then link the device again.
+    AccountUnlinked = 116,
 }
 
 thread_local! {
@@ -288,6 +291,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::StickerNetwork { .. } => MarmotStatus::StickerNetwork,
         MarmotKitError::StickerImport { .. } => MarmotStatus::StickerImport,
         MarmotKitError::StickerImportUnsupported => MarmotStatus::StickerImportUnsupported,
+        MarmotKitError::AccountUnlinked { .. } => MarmotStatus::AccountUnlinked,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
@@ -604,6 +608,9 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::StickerImportUnsupported,
+            MarmotKitError::AccountUnlinked {
+                account_ref: "a".into(),
+            },
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -612,7 +619,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            106,
+            107,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -672,6 +679,12 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::StickerImportUnsupported) as i32,
             115
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::AccountUnlinked {
+                account_ref: "a".into()
+            }) as i32,
+            116
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,

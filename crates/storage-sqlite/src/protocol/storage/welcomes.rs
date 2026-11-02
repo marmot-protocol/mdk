@@ -177,23 +177,21 @@ mod tests {
             Err(StorageError::Backend("force rollback".to_owned()))
         });
 
-        assert!(result.is_err());
+        // Only the injected error proves the take ran inside the transaction:
+        // a nested-transaction failure is also `Backend`.
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         assert_eq!(store.take_welcome(&mid(1)).unwrap(), welcome);
     }
 
     #[test]
     fn take_welcome_retries_concurrent_writer_contention() {
-        use crate::{SqlCipherKey, SqliteStorageOptions};
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("welcome-contention.sqlite");
-        let key = SqlCipherKey::new("welcome contention key").unwrap();
-        let options = SqliteStorageOptions {
-            busy_timeout_ms: 50,
-            ..SqliteStorageOptions::default()
-        };
-        let store = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-            .unwrap();
+        let db = SharedDatabase::new();
+        let store = db.open();
         let welcome = PendingWelcome {
             message_id: mid(1),
             group_id: gid(1),
@@ -202,32 +200,13 @@ mod tests {
         };
         store.put_welcome(&welcome).unwrap();
 
-        let blocker_path = path.clone();
-        let blocker_key = SqlCipherKey::new("welcome contention key").unwrap();
-        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
-        let blocker = std::thread::spawn(move || {
-            let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                &blocker_path,
-                &blocker_key,
-                options,
-            )
-            .unwrap();
-            let conn = blocker.lock().unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            lock_acquired_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            conn.execute_batch("COMMIT").unwrap();
-        });
-        lock_acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-
+        let blocker = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         assert_eq!(
             store
                 .take_welcome(&mid(1))
                 .expect("welcome take retries after transient contention"),
             welcome
         );
-        blocker.join().unwrap();
+        blocker.join();
     }
 }

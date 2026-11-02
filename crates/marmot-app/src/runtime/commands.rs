@@ -32,6 +32,17 @@ use marmot_observability::AppPerformanceOperation;
 
 impl AccountManager {
     #[cfg(test)]
+    pub(super) async fn unlink_device_for_test(&self, account_ref: &str) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::UnlinkDeviceForTest { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response.await.map_err(|_| AppError::TransportClosed)?
+    }
+
+    #[cfg(test)]
     pub(super) async fn unhydrated_group_count_for_test(
         &self,
         account_ref: &str,
@@ -1045,6 +1056,19 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn linked_devices(
         &self,
         account_ref: &str,
@@ -1053,6 +1077,19 @@ impl AccountManager {
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::LinkedDevices { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ChatHistoryImports { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         local_account_worker_response(response).await
@@ -1113,6 +1150,49 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn start_fresh(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StartFresh { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::StartedFresh { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn compromise_warning(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CompromiseWarning { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn dismiss_compromise_warning(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DismissCompromiseWarning { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,
@@ -1149,11 +1229,96 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// One step of signing out through siblings (mdk#2628 D67), run in the
+    /// account's worker so deliveries keep settling between steps.
+    pub(crate) async fn sign_out_through_siblings_step(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::client::sign_out::SiblingSignOut, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SignOutThroughSiblingsStep { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::RemovedDeviceLeftoverChats { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ChatsClosedToLinkedDevices { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn begin_recovery_words(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::RecoveryWords, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BeginRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConfirmRecoveryWords { answers, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::CancelRecoveryWords { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        local_account_worker_response(response).await
+    }
+
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::TurnOffBackups { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn backup_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupSettings, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BackupSettings { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         local_account_worker_response(response).await

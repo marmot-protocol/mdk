@@ -326,7 +326,8 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   policy inputs.
 - **Tracing audit is repo-wide.** `tests/tracing_audit.rs` scans production Rust source for `tracing::*` calls. New
   tracing must include explicit `target` and `method` fields and must not include account ids, group ids, message ids,
-  relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material.
+  relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. `just tracing-audit` runs it in seconds
+  without building this crate, which is how the pull-request pre-check runs it.
 - **The harness peeler is real; the relay is not.** `TransportBus` stays in memory, but group messages and Welcomes go
   through `transport-nostr-peeler`.
 - **`HarnessClient` exposes only what tests need.** Needing the inner `Engine<S>` is a smell — extend the harness API

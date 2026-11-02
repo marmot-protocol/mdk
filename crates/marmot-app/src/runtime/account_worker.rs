@@ -34,9 +34,11 @@ use super::{
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::recovery::AttemptGrant;
+use crate::client::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -334,6 +336,9 @@ pub(crate) struct AccountWorkerRuntime {
     pub(crate) events: broadcast::Sender<MarmotAppEvent>,
     pub(crate) lifecycle: RuntimeLifecycle,
     pub(crate) shared: RuntimeSharedServices,
+    /// Fired once when the device group unlinks this device and the worker
+    /// stops, so the runtime deactivates the account (mdk#2628 D67).
+    pub(crate) unlinked: oneshot::Sender<()>,
 }
 
 pub(crate) enum AccountWorkerCommand {
@@ -483,8 +488,14 @@ pub(crate) enum AccountWorkerCommand {
     HistoryNotices {
         respond: oneshot::Sender<Result<Vec<crate::HistoryNotice>, AppError>>,
     },
+    AccountRecoveryStatus {
+        respond: oneshot::Sender<Result<crate::AccountRecoveryStatus, AppError>>,
+    },
     LinkedDevices {
         respond: oneshot::Sender<Result<Vec<crate::LinkedDevice>, AppError>>,
+    },
+    ChatHistoryImports {
+        respond: oneshot::Sender<Result<Vec<crate::ChatHistoryImport>, AppError>>,
     },
     KeyPackageRefreshOverdue {
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -500,6 +511,18 @@ pub(crate) enum AccountWorkerCommand {
     CheckSignIns {
         respond: oneshot::Sender<Result<Vec<crate::UnrecognizedSignIn>, AppError>>,
     },
+    StartFresh {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    StartedFresh {
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    CompromiseWarning {
+        respond: oneshot::Sender<Result<Vec<crate::CompromiseWarningItem>, AppError>>,
+    },
+    DismissCompromiseWarning {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     RenameLinkedDevice {
         slot_id_hex: String,
         label: String,
@@ -511,6 +534,28 @@ pub(crate) enum AccountWorkerCommand {
     },
     RemovedDeviceLeftoverChats {
         respond: oneshot::Sender<Result<u32, AppError>>,
+    },
+    ChatsClosedToLinkedDevices {
+        respond: oneshot::Sender<Result<u32, AppError>>,
+    },
+    SignOutThroughSiblingsStep {
+        respond: oneshot::Sender<Result<crate::client::sign_out::SiblingSignOut, AppError>>,
+    },
+    BeginRecoveryWords {
+        respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
+    },
+    ConfirmRecoveryWords {
+        answers: Vec<String>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    CancelRecoveryWords {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    TurnOffBackups {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    BackupSettings {
+        respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
     },
     DismissHistoryNotice {
         notice_id: String,
@@ -799,6 +844,18 @@ pub(crate) enum AccountWorkerCommand {
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
     },
+    /// Unlink this device as the device group's removal would.
+    #[cfg(test)]
+    UnlinkDeviceForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    /// Whether the worker runs a recovery runner, and if so one explicit pass
+    /// of it, awaited off the worker. `None` without a runner.
+    #[cfg(test)]
+    RecoveryRunnerPassForTest {
+        budget: Duration,
+        respond: oneshot::Sender<Option<crate::client::recovery_runner::PassReport>>,
+    },
 }
 
 impl AccountWorkerCommand {
@@ -822,6 +879,7 @@ impl AccountWorkerCommand {
                 | Self::QuarantinedGroups { .. }
                 | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
+                | Self::AccountRecoveryStatus { .. }
                 | Self::GroupCommitDelivery { .. }
                 | Self::GroupPushDebugInfo { .. }
                 | Self::AccountDevicesActivation { .. }
@@ -1030,6 +1088,21 @@ pub(crate) fn spawn_app_runtime_account_worker(
     ))
 }
 
+/// Stop the worker's recovery runner, if it runs one, while `client` is
+/// still the account's: a quantum in flight settles on it
+/// ([`SpawnedRunner::stop`]). Boxed like a command's future, so each of the
+/// loop's exits adds a pointer to its stack, not the stop.
+fn stop_recovery_runner<'a>(
+    runner: &'a mut Option<SpawnedRunner>,
+    client: &'a mut AppClient,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(runner) = runner.take() {
+            runner.stop(client).await;
+        }
+    })
+}
+
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     command_tx: mpsc::Sender<AccountWorkerCommand>,
@@ -1048,6 +1121,7 @@ async fn run_app_runtime_account_worker(
         events,
         lifecycle,
         shared,
+        unlinked,
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
@@ -1240,6 +1314,14 @@ async fn run_app_runtime_account_worker(
             return;
         }
     }
+    // A removal from the device group applied on an earlier run, which then
+    // ended before it was followed, stops the account before catch-up sends
+    // anything (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
 
     // The snapshot answers read commands while the initial sync holds
     // `&mut client`; its only failure is the shared profile load. Readiness
@@ -1389,8 +1471,10 @@ async fn run_app_runtime_account_worker(
             let summary = client
                 .finish_deferred_comparison_sync(Some(&publish_startup_progress))
                 .await?;
-            app.finish_client_open_network_maintenance(&mut client)
-                .await;
+            if !client.device_unlinked() {
+                app.finish_client_open_network_maintenance(&mut client)
+                    .await;
+            }
             Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
         });
         loop {
@@ -1514,6 +1598,13 @@ async fn run_app_runtime_account_worker(
                                                 publish_client_pending_projection_updates(
                                                     &mut client, &events, &account_id_hex, &account_label,
                                                 );
+                                                if client.device_unlinked() {
+                                                    // Nothing more goes out: the
+                                                    // comparison ends and the worker
+                                                    // stops (D67).
+                                                    network.abort_and_wait().await;
+                                                    return None;
+                                                }
                                                 start_post_join_history_after_visibility(
                                                     &mut client, &summary, &events,
                                                     &account_id_hex, &account_label,
@@ -1585,9 +1676,13 @@ async fn run_app_runtime_account_worker(
                                         if deferred.is_empty() => {
                                         let _ = respond.send(client.history_notices());
                                     }
+                                    AccountWorkerCommand::AccountRecoveryStatus { respond }
+                                        if deferred.is_empty() => {
+                                        let _ = respond.send(client.account_recovery_status());
+                                    }
                                     AccountWorkerCommand::SendMessage {
                                         enqueued_at, queued, group_id, payload, respond,
-                                    } if deferred.is_empty() => {
+                                    } if deferred.is_empty() && !client.device_unlinked() => {
                                         send_message_on_worker(
                                             &mut client, enqueued_at, queued, group_id, payload, respond,
                                             &events, &account_id_hex, &account_label, &shared,
@@ -1617,7 +1712,8 @@ async fn run_app_runtime_account_worker(
                             }
                             () = tokio::task::yield_now(), if native_progress => {}
                             _ = tokio::time::sleep_until(local_submission_retry_at),
-                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
+                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping()
+                                    && !client.device_unlinked() => {
                                 let retry = publish_next_local_submission(
                                     &mut client, &app, &shared, &events,
                                     &account_id_hex, &account_label,
@@ -1656,6 +1752,9 @@ async fn run_app_runtime_account_worker(
                             Err(failure)
                         }
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     // Startup is a sync: whatever the comparison admitted, it
                     // still drains the live replay its activation started.
                     let result = match result {
@@ -1678,6 +1777,9 @@ async fn run_app_runtime_account_worker(
                         }
                         Err(failure) => Err(failure),
                     };
+                    if client.device_unlinked() {
+                        return None;
+                    }
                     app.finish_client_open_network_maintenance(&mut client)
                         .await;
                     result
@@ -1686,13 +1788,21 @@ async fn run_app_runtime_account_worker(
             })
         });
         let Some(result) = continuation.await else {
-            if startup_explicit_shutdown {
+            if client.device_unlinked() {
+                stop_unlinked_worker(&mut client, unlinked).await;
+            } else if startup_explicit_shutdown {
                 client.finish_audit_recording();
             }
             return;
         };
         result
     };
+    // A removal the catch-up applied stops the account before anything
+    // else goes out (mdk#2628 D67).
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
     if let Err(failure) = &mut startup_sync_result {
         client.drain_epoch_stall_escalations(&mut failure.partial_summary);
     }
@@ -1721,6 +1831,9 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
+            // A start gets no host connectivity edge, so wake the sends a
+            // previous process left backed off (mdk#2762).
+            wake_retained_sends_after_transport_start(&mut client, "startup_retained_send_wake");
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
@@ -1796,6 +1909,13 @@ async fn run_app_runtime_account_worker(
             ))
         }
     };
+    // A removal from the device group that the catch-up applied stops the
+    // account before the deferred commands replay (mdk#2628 D67).
+    client.follow_device_group_removal().await;
+    if client.device_unlinked() {
+        stop_unlinked_worker(&mut client, unlinked).await;
+        return;
+    }
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result. Replay uses the live command queue so
@@ -1808,8 +1928,17 @@ async fn run_app_runtime_account_worker(
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+        history_blobs: HistoryBlobFlights::default(),
         worker_lifetime: media_http_worker_lifetime,
     };
+    // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
+    // Spawned before the deferred commands replay, so a repair among them
+    // goes through it; its turns wait until a repair or the loop below
+    // serves them.
+    let mut recovery_runner = client.spawn_recovery_runner().await;
+    // What the runner's survey finds catching up; only a runner changes it.
+    // Each client has its own, so a reconnect subscribes again.
+    let mut recovery_catching_up = client.routing.subscribe_recovery_runner_catching_up();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
@@ -1870,6 +1999,7 @@ async fn run_app_runtime_account_worker(
                         shared: &shared,
                         media_http: &media_http,
                         scheduled_convergence: &mut scheduled_convergence,
+                        recovery_runner: recovery_runner.as_mut(),
                     },
                 )
                 .await;
@@ -1931,6 +2061,15 @@ async fn run_app_runtime_account_worker(
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
     'worker: loop {
+        // An unlinked device stops: no sends, commits, publications or
+        // pairing answers once its device group removed it. The account is
+        // already marked unlinked; the runtime deactivates it once this
+        // worker has exited (mdk#2628 D67).
+        if client.device_unlinked() {
+            stop_recovery_runner(&mut recovery_runner, &mut client).await;
+            stop_unlinked_worker(&mut client, unlinked).await;
+            break 'worker;
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {
@@ -1962,6 +2101,10 @@ async fn run_app_runtime_account_worker(
                 false
             }
         };
+        // Admission can apply this device's removal; the loop top stops.
+        if client.device_unlinked() {
+            continue 'worker;
+        }
         // A pass whose network wait ended admits its owned batch a few events
         // per turn. The select below then serves commands and live input
         // before the next turn.
@@ -1977,6 +2120,11 @@ async fn run_app_runtime_account_worker(
                 }
                 None => Ok(true),
             };
+            // The turn can apply this device's removal: stop before the
+            // pass settles and runs maintenance.
+            if client.device_unlinked() {
+                continue 'worker;
+            }
             if turn.is_ok()
                 && let Some(admission) = job.admission.as_mut()
             {
@@ -2062,6 +2210,7 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                         )
                         .await;
+                        dispatch_history_blobs(&mut client, &media_http);
                     }
                     ComparisonRecoveryOrigin::PostConvergence {
                         audit_tracker_update,
@@ -2095,6 +2244,15 @@ async fn run_app_runtime_account_worker(
                 }
                 continue 'worker;
             }
+        }
+        // One recovery runner turn per pass of the loop, as comparison
+        // admission gets one above, so ready commands and live input never
+        // starve the runner (or a credit its quantum holds). What it admits
+        // publishes below.
+        if !client.has_pending_effect_projections()
+            && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
+        {
+            turn.serve(&mut client).await;
         }
         // Unified admission may have advanced native frames as well as the
         // comparison prefix. Publish their committed effects before live input.
@@ -2184,12 +2342,14 @@ async fn run_app_runtime_account_worker(
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                 client.finish_audit_recording();
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
                     client.finish_audit_recording();
                 }
+                stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             completed = async {
@@ -2274,6 +2434,21 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // A fetched history imports messages; show them, and
+                        // the chat's history state, now, not at the next
+                        // maintenance pass.
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        publish_device_group_changes(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
                         avatar_due = true;
                         attachment_due = true;
                         schedule_pending_convergence_groups(
@@ -2281,7 +2456,10 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                         );
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // Alternate a command and a ready recovery quantum. A permanently
@@ -2315,6 +2493,21 @@ async fn run_app_runtime_account_worker(
                                     recovery.drain_waiters.push(respond);
                                 } else {
                                     let _ = respond.send(());
+                                }
+                                continue;
+                            }
+                            #[cfg(test)]
+                            AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                match &recovery_runner {
+                                    Some(runner) => {
+                                        let handle = runner.handle().clone();
+                                        tokio::spawn(async move {
+                                            let _ = respond.send(handle.run_pass(budget).await);
+                                        });
+                                    }
+                                    None => {
+                                        let _ = respond.send(None);
+                                    }
                                 }
                                 continue;
                             }
@@ -2360,6 +2553,7 @@ async fn run_app_runtime_account_worker(
                                         shared: &shared,
                                         media_http: &media_http,
                                         scheduled_convergence: &mut scheduled_convergence,
+                                        recovery_runner: recovery_runner.as_mut(),
                                     },
                                 )
                                 .await;
@@ -2380,7 +2574,10 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                     }
-                    None => break 'worker,
+                    None => {
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        break 'worker;
+                    }
                 }
             }
             // A completed optional retry owes durable admission one turn once
@@ -2687,6 +2884,10 @@ async fn run_app_runtime_account_worker(
                                 true,
                             );
                         }
+                        if client.device_unlinked() {
+                            // Nothing more goes out; the next turn stops the worker.
+                            continue 'worker;
+                        }
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -2753,6 +2954,9 @@ async fn run_app_runtime_account_worker(
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
                         let transport_account = client.adapter.account_id().clone();
+                        // Its turns need this client; the reopened one gets
+                        // a runner of its own.
+                        stop_recovery_runner(&mut recovery_runner, &mut client).await;
                         drop(client);
                         client = loop {
                             let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
@@ -2941,6 +3145,14 @@ async fn run_app_runtime_account_worker(
                                             );
                                         }
                                     }
+                                    // A reopen while the host's network
+                                    // stayed up gets no connectivity edge to
+                                    // release sends backed off by the outage
+                                    // that closed the old transport (mdk#2762).
+                                    wake_retained_sends_after_transport_start(
+                                        &mut reopened,
+                                        "reopen_retained_send_wake",
+                                    );
                                     let pending = reopened
                                         .retry_pending_push_registration_shares_best_effort()
                                         .await;
@@ -2965,6 +3177,9 @@ async fn run_app_runtime_account_worker(
                             }
                         };
                         replay_changes = client.adapter.replay_changes().await;
+                        recovery_runner = client.spawn_recovery_runner().await;
+                        recovery_catching_up =
+                            client.routing.subscribe_recovery_runner_catching_up();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2972,6 +3187,15 @@ async fn run_app_runtime_account_worker(
                         continue 'worker;
                     }
                 }
+            }
+            // An idle worker waits for the runner's next turn here; the
+            // loop's top serves one per pass while other work is ready.
+            turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                turn.serve(&mut client).await;
+            }
+            Ok(()) = recovery_catching_up.changed() => {
+                client.recovery_status_owed = true;
+                publish_account_level_changes(&mut client, &events, &account_id_hex, &account_label);
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
                 avatar_due = false;
@@ -3065,6 +3289,11 @@ async fn run_app_runtime_account_worker(
                 );
                 // Pairing timers, KeyPackage retries and link settlement.
                 client.drive_device_pairing().await;
+                if client.device_unlinked() {
+                    // Nothing more goes out; the next turn stops the worker.
+                    phase.finish(TelemetryOutcome::Success);
+                    continue 'worker;
+                }
                 attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                 attachments::spawn_legacy_migration(
                     &client,
@@ -3085,6 +3314,12 @@ async fn run_app_runtime_account_worker(
                     };
                     if let Some(observation) = observation {
                         observation.finish(outcome.as_str());
+                    }
+                    if client.device_unlinked() {
+                        // The catch-up applied this device's removal:
+                        // nothing more goes out (D67).
+                        phase.finish(TelemetryOutcome::Success);
+                        continue 'worker;
                     }
                     match catch_up {
                         Ok(Ok(summary)) => {
@@ -3211,11 +3446,16 @@ async fn run_app_runtime_account_worker(
                     &mut scheduled_convergence,
                 )
                 .await;
+                dispatch_history_blobs(&mut client, &media_http);
 
                 phase.finish(TelemetryOutcome::Success);
             }
         }
     }
+    // Each exit that still held the client stopped the runner on it; any
+    // other exit's drop aborts the task and refunds the attempts it left
+    // open. What a quantum staged stays durable.
+    drop(recovery_runner);
     // An admission in progress keeps its durable prefix; its debt waits for
     // the next session.
     if let Some(network) = comparison_recovery.and_then(|job| job.network) {
@@ -4171,6 +4411,10 @@ async fn handle_startup_hydration_command(
             let count = client.runtime.session().unhydrated_group_ids().len();
             let _ = respond.send(count);
         }
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => {
+            let _ = respond.send(client.mark_device_unlinked());
+        }
         AccountWorkerCommand::CatchUp { respond } => {
             deferred.push(DeferredStartupCommand::CatchUp(respond));
         }
@@ -4198,9 +4442,104 @@ struct MediaHttpContext {
     /// more than once. This state is deliberately ephemeral: after a worker
     /// restart, the durable staged/failed record remains retryable.
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
+    /// The history upload and fetch running, at most one of each.
+    history_blobs: HistoryBlobFlights,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
+}
+
+/// Whether a history upload and a history fetch (mdk#2628 4.2c) are running.
+/// Ephemeral, like the uploads above: the history stays owed, or the
+/// delivery parked, until one completes.
+#[derive(Default)]
+struct HistoryBlobFlights {
+    upload: std::sync::atomic::AtomicBool,
+    fetch: std::sync::atomic::AtomicBool,
+    backup: std::sync::atomic::AtomicBool,
+}
+
+/// Starts the next due history upload, history fetch and backup pass on the
+/// media executor, unless one of that kind is running, keeping a slot free
+/// for commands as avatar acquisition does. Each runs off the worker; its
+/// completion sends, imports or publishes here, and a history's then starts
+/// the next.
+fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    let permit = || {
+        (media_http.permits.available_permits() > 1)
+            .then(|| media_http.permits.clone().try_acquire_owned().ok())
+            .flatten()
+    };
+    if !media_http.history_blobs.upload.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_upload() {
+            Ok(Some(upload)) => {
+                media_http
+                    .history_blobs
+                    .upload
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    upload.run(),
+                    MediaHttpCompletion::HistoryUpload,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history upload deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.fetch.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_history_fetch() {
+            Ok(Some(fetch)) => {
+                media_http
+                    .history_blobs
+                    .fetch
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    fetch.run(),
+                    MediaHttpCompletion::HistoryFetch,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "history fetch deferred")
+            }
+        }
+    }
+    if !media_http.history_blobs.backup.load(Ordering::Relaxed)
+        && let Some(permit) = permit()
+    {
+        match client.prepare_backup_pass() {
+            Ok(Some(pass)) => {
+                media_http
+                    .history_blobs
+                    .backup
+                    .store(true, Ordering::Relaxed);
+                spawn_media_http(
+                    media_http,
+                    permit,
+                    pass.run(),
+                    MediaHttpCompletion::BackupPass,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
+                "backup pass deferred")
+            }
+        }
+    }
 }
 
 struct MediaHttpDone {
@@ -4301,6 +4640,9 @@ enum MediaHttpCompletion {
         respond: oneshot::Sender<Result<AppPreparedGroupImageUpload, AppError>>,
         started_at: Instant,
     },
+    HistoryUpload(crate::client::HistoryUploadOutcome),
+    HistoryFetch(crate::client::HistoryFetchOutcome),
+    BackupPass(crate::client::BackupPassOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4484,6 +4826,43 @@ async fn complete_media_http(
         cancellation.discard();
     }
     match completion {
+        MediaHttpCompletion::HistoryUpload(outcome) => {
+            let settled = client.finish_history_upload(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .upload
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
+            return;
+        }
+        MediaHttpCompletion::HistoryFetch(outcome) => {
+            let settled = client.finish_history_fetch(outcome);
+            drop(permit);
+            media_http
+                .history_blobs
+                .fetch
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // A failure waits for the next maintenance pass, so a deferral
+            // that could not be written never turns into a tight retry loop.
+            if settled {
+                dispatch_history_blobs(client, media_http);
+            }
+            return;
+        }
+        MediaHttpCompletion::BackupPass(outcome) => {
+            client.finish_backup_pass(outcome).await;
+            drop(permit);
+            media_http
+                .history_blobs
+                .backup
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         MediaHttpCompletion::Attachment {
             job,
             result,
@@ -4830,6 +5209,9 @@ struct AccountWorkerCommandContext<'a> {
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
     scheduled_convergence: &'a mut ScheduledConvergence,
+    /// The account's recovery runner, behind the internal `runner_owns_debt`
+    /// gate: explicit repair serves its turns while it waits on it.
+    recovery_runner: Option<&'a mut SpawnedRunner>,
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -4894,6 +5276,7 @@ fn account_worker_command_future<'a>(
         shared,
         media_http,
         scheduled_convergence,
+        recovery_runner,
     } = context;
     let storage_permit = shared.observer.product().permit();
     match command {
@@ -4986,6 +5369,17 @@ fn account_worker_command_future<'a>(
             let _ = respond.send(count);
             true
         }),
+        #[cfg(test)]
+        AccountWorkerCommand::UnlinkDeviceForTest { respond } => Box::pin(async move {
+            let _ = respond.send(client.mark_device_unlinked());
+            true
+        }),
+        // The worker loop answers it from its runner before dispatch.
+        #[cfg(test)]
+        AccountWorkerCommand::RecoveryRunnerPassForTest { respond, .. } => Box::pin(async move {
+            let _ = respond.send(None);
+            true
+        }),
         AccountWorkerCommand::CatchUp { respond } => Box::pin(async move {
             let sync_started_at = Instant::now();
             let result = match client
@@ -5065,7 +5459,7 @@ fn account_worker_command_future<'a>(
             let cancelled = || respond.is_closed() || shared.lifecycle().is_stopping();
             let repaired = Box::pin(serve_snapshot_reads_until(
                 read_snapshot,
-                client.repair_full_history_cancellable(&cancelled),
+                client.repair_full_history_cancellable(&cancelled, recovery_runner),
                 commands,
                 pending,
                 app,
@@ -5785,12 +6179,30 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::AccountRecoveryStatus { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.account_recovery_status(),
+            );
+            true
+        }),
         AccountWorkerCommand::LinkedDevices { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
                 storage_permit.as_ref(),
                 respond,
                 client.linked_devices(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ChatHistoryImports { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.chat_history_imports(),
             );
             true
         }),
@@ -5829,6 +6241,34 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::StartFresh { respond } => Box::pin(async move {
+            let result = client.start_fresh();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::StartedFresh { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.started_fresh(),
+            );
+            true
+        }),
+        AccountWorkerCommand::CompromiseWarning { respond } => Box::pin(async move {
+            let result = client.compromise_warning();
+            // A read that gathered announces what it found.
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::DismissCompromiseWarning { respond } => Box::pin(async move {
+            let result = client.dismiss_compromise_warning();
+            publish_account_level_changes(client, events, account_id_hex, account_label);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RenameLinkedDevice {
             slot_id_hex,
             label,
@@ -5846,12 +6286,59 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::SignOutThroughSiblingsStep { respond } => Box::pin(async move {
+            let result = client.sign_out_through_siblings_step().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RemovedDeviceLeftoverChats { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
                 storage_permit.as_ref(),
                 respond,
                 client.removed_device_leftover_chats(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ChatsClosedToLinkedDevices { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.chats_closed_to_linked_devices(),
+            );
+            true
+        }),
+        AccountWorkerCommand::BeginRecoveryWords { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.begin_recovery_words(),
+            );
+            true
+        }),
+        AccountWorkerCommand::ConfirmRecoveryWords { answers, respond } => Box::pin(async move {
+            let result = client.confirm_recovery_words(&answers).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::CancelRecoveryWords { respond } => Box::pin(async move {
+            client.cancel_recovery_words();
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(()));
+            true
+        }),
+        AccountWorkerCommand::TurnOffBackups { respond } => Box::pin(async move {
+            let result = client.turn_off_backups().await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.backup_settings(),
             );
             true
         }),
@@ -6572,6 +7059,9 @@ fn account_worker_command_future<'a>(
                     account_id_hex,
                     account_label,
                 );
+                // A host that drives maintenance itself starts the history
+                // blobs it made due, as the periodic pass does.
+                dispatch_history_blobs(client, media_http);
             }
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -7363,6 +7853,29 @@ impl ScheduledConvergence {
     }
 }
 
+/// Wake unsent retained sends when a transport starts or reopens, which no host
+/// connectivity edge reports.
+///
+/// Their retry clocks may have backed off towards an hour during an outage that has
+/// since ended without an edge, as on a cold start that is already online or a
+/// reopen after the old transport died while the network stayed up. Starting the
+/// transport does not prove a relay is reachable, as activation succeeds with every
+/// relay unreachable, so each start or reopen costs one retry of each woken send. A
+/// failed retry keeps its attempt count and resumes its backoff from it. Sends that
+/// met quorum keep their secondary replication schedule. A start whose sync failed
+/// gets no wake here; its sends wait out their backoff unless a reopen or a
+/// connectivity edge wakes them first.
+fn wake_retained_sends_after_transport_start(client: &mut AppClient, method: &'static str) {
+    if let Err(error) = client.wake_retained_sends(RetainedSendWake::BelowQuorum) {
+        tracing::warn!(
+            target: "marmot_app::account_worker",
+            method = method,
+            error_kind = error.privacy_safe_kind(),
+            "retained sends could not be woken after a transport start",
+        );
+    }
+}
+
 fn schedule_pending_convergence_groups(
     scheduled: &mut ScheduledConvergence,
     client: &mut AppClient,
@@ -7491,6 +8004,17 @@ struct ReceiveTailContext<'a> {
     shared: &'a RuntimeSharedServices,
     scheduled_push_retry: &'a mut ScheduledPushRegistrationRetry,
     command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
+}
+
+/// Forget the device-group copy and ask the runtime to deactivate the
+/// account, which then tells hosts the device group unlinked this device;
+/// the caller ends the worker. Once the account is marked unlinked, a crash
+/// from here on still leaves it signed out; a mark that failed keeps the
+/// copy, so the next start finds the removal and marks it (mdk#2628 D67).
+async fn stop_unlinked_worker(client: &mut AppClient, unlinked: oneshot::Sender<()>) {
+    client.follow_device_group_removal().await;
+    client.finish_audit_recording();
+    let _ = unlinked.send(());
 }
 
 async fn finish_receive_after_recovery(
@@ -7992,7 +8516,9 @@ fn publish_client_pending_applied_summary(
 /// `GroupStateUpdated` for each group whose own notices appeared or
 /// disappeared, so hosts re-read that group's `GroupRecoveryStatus`. Parking,
 /// un-parking by new evidence and dismissal all surface at the next seam that
-/// calls this; each call is one indexed read of the parked set. It also
+/// calls this; each call is one indexed read of the parked set. Behind the
+/// internal `runner_owns_debt` gate a change in what the recovery runner
+/// catches up, or in the notices, is one `RecoveryStatusChanged`. It also
 /// announces device-group and sign-in changes
 /// ([`publish_device_group_changes`], [`publish_sign_in_changes`]).
 fn publish_account_level_changes(
@@ -8005,7 +8531,14 @@ fn publish_account_level_changes(
     client.record_subscription_refusals();
     publish_device_group_changes(client, events, account_id_hex, account_label);
     publish_sign_in_changes(client, events, account_id_hex, account_label);
-    let Some(groups) = client.take_history_notice_changes() else {
+    let notice_changes = client.take_history_notice_changes();
+    if client.take_recovery_status_changed(notice_changes.is_some()) {
+        let _ = events.send(MarmotAppEvent::RecoveryStatusChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    let Some(groups) = notice_changes else {
         return;
     };
     let _ = events.send(MarmotAppEvent::HistoryNoticesChanged {
@@ -8018,12 +8551,14 @@ fn publish_account_level_changes(
 }
 
 /// One `LinkedDevicesChanged` for a hidden device-group event or a change of
-/// device-group trust since the last call, one
-/// `KeyPackageRefreshOverdueChanged` for a maintenance pass that changed the
-/// overdue-refresh answer, and one `DeviceLinkChanged` for a change in
-/// linking a new device. Both the account-level seam and the applied-summary
-/// seam drain them, so startup, reconnect, maintenance and every command and
-/// delivery announce them.
+/// device-group trust since the last call, after giving storage the roster's
+/// device names again; one `KeyPackageRefreshOverdueChanged` for a
+/// maintenance pass that changed the overdue-refresh answer; one
+/// `DeviceLinkChanged` for a change in linking a new device; and one
+/// `ChatHistoryImportsChanged` for a change in chat history from another
+/// device. Both the account-level seam and the applied-summary seam drain
+/// them, so startup, reconnect, maintenance and every command and delivery
+/// announce them.
 fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -8031,6 +8566,7 @@ fn publish_device_group_changes(
     account_label: &str,
 ) {
     if client.take_linked_devices_changed() {
+        client.refresh_device_labels();
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
@@ -8048,10 +8584,17 @@ fn publish_device_group_changes(
             account_label: account_label.to_owned(),
         });
     }
+    if client.take_chat_history_imports_changed() {
+        let _ = events.send(MarmotAppEvent::ChatHistoryImportsChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
 }
 
 /// One `UnrecognizedSignInsChanged` for a check or answer that changed the
-/// unrecognized sign-ins, or a roster change, since the last call. Drained
+/// unrecognized sign-ins, or a roster change, since the last call, and one
+/// `CompromiseWarningChanged` when the compromise warning changed. Drained
 /// at the same seams as [`publish_device_group_changes`].
 fn publish_sign_in_changes(
     client: &mut AppClient,
@@ -8061,6 +8604,12 @@ fn publish_sign_in_changes(
 ) {
     if client.take_unrecognized_sign_ins_changed() {
         let _ = events.send(MarmotAppEvent::UnrecognizedSignInsChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+        });
+    }
+    if client.take_compromise_warning_changed() {
+        let _ = events.send(MarmotAppEvent::CompromiseWarningChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
         });
@@ -8192,6 +8741,7 @@ mod tests {
     mod publication_progress_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
+    mod recovery_runner_host_tests;
     mod refused_subscription_send_tests;
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
@@ -8978,6 +9528,7 @@ mod tests {
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             },
             rx,
@@ -9240,6 +9791,7 @@ mod tests {
                 events,
                 lifecycle: shared.lifecycle(),
                 shared: shared.clone(),
+                unlinked: oneshot::channel().0,
             },
             commands.clone(),
             receiver,
@@ -10217,6 +10769,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -10234,6 +10787,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             )
             .await;
@@ -11263,6 +11817,7 @@ mod tests {
                 tx: media_http_tx,
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+                history_blobs: HistoryBlobFlights::default(),
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);
@@ -11281,6 +11836,7 @@ mod tests {
                     shared: &shared,
                     media_http: &media_http,
                     scheduled_convergence: &mut scheduled_convergence,
+                    recovery_runner: None,
                 },
             );
             let observer = async {

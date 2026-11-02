@@ -48,7 +48,7 @@
 
 mod messages;
 
-pub(crate) use messages::is_device_group_kind;
+pub(crate) use messages::{Exchange, KIND_DEVICE_HEARTBEAT, is_device_group_kind};
 
 use cgka_traits::app_components::{
     AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
@@ -65,9 +65,12 @@ use cgka_traits::{EpochId, Group, GroupId, KeyPackage, Timestamp, TransportGroup
 use marmot_session::DeviceSelfReport;
 use rand::RngCore as _;
 use rand::rngs::OsRng;
-use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
+use std::collections::BTreeMap;
+use storage_sqlite::{DeviceActivityRecord, DeviceGroupRecord, DeviceGroupTrust};
 
+use super::device_heartbeats::sibling_inactive;
 use super::device_pairing::DeviceLinkChoices;
+use super::device_renames::fresh_rename_id;
 use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
 use crate::{AppError, unix_now_seconds};
 
@@ -129,6 +132,16 @@ pub struct LinkedDevice {
     pub bring_history: bool,
     /// Inactivity never removes it.
     pub keep_while_inactive: bool,
+    /// When a heartbeat last showed it running, in Unix seconds: the newest,
+    /// over its heartbeats that counted, of when each was created or, if
+    /// earlier, when this device read it (D35). `None` for this device, and
+    /// for a sibling none of whose heartbeats has counted yet.
+    pub last_active_at: Option<u64>,
+    /// This device judges it inactive: 30 days have passed since its last
+    /// activity or since this device first found it in the roster,
+    /// whichever is later. Never this device. Judged here only; `status`
+    /// [`LinkedDeviceStatus::Inactive`] is the roster's mark.
+    pub inactive: bool,
     /// The user removed it on this device, and the device group has not
     /// taken the removal yet (mdk#2628 item 3.6b).
     pub removal_pending: bool,
@@ -312,20 +325,24 @@ impl AppClient {
         let now = unix_now_seconds();
         let mut roster = DeviceRosterV1::default();
         OsRng.fill_bytes(&mut roster.leaf_tag_key);
-        // The founding roster lists only this device and its rejections; the
-        // founding Add sets the new device's entry, as every later Add does,
-        // so no entry ever names a device without its leaf (D41). Each entry
-        // announces the KeyPackage in that device's slot (3.4), so neither
-        // device owes a roster commit before it publishes. This device's
+        // The founding roster lists only this device, its rejections and its
+        // recovery key; the founding Add sets the new device's entry, as
+        // every later Add does, so no entry ever names a device without its
+        // leaf (D41). Each entry announces the KeyPackage in that device's
+        // slot (3.4), so neither device owes a roster commit before it
+        // publishes. This device's
         // entry also carries its tag signature key, so the engine tags its
         // founding leaf (3.1d), and its history key (4.1), which a later
         // announcement writes if it cannot be read now; the new device sets
         // both of its own once it joins. Nobody chose settings for the
         // founder, so it takes the defaults a new device starts with:
-        // siblings add it to chats it is missing, with their history.
+        // siblings add it to chats it is missing, with their history. Each
+        // entry is created with a fresh rename id (3.6a), so a later rename
+        // of either never reads as one made before it existed.
         roster.devices.insert(
             own_slot,
             DeviceEntryV1 {
+                rename_id: Some(fresh_rename_id()),
                 linked_at: now,
                 settings: DeviceSettingsV1 {
                     add_to_all_chats: true,
@@ -340,6 +357,7 @@ impl AppClient {
         );
         let sibling_entry = DeviceEntryV1 {
             label: choices.label.clone(),
+            rename_id: Some(fresh_rename_id()),
             linked_at: now,
             linked_by: Some(own_slot),
             settings: DeviceSettingsV1 {
@@ -352,6 +370,8 @@ impl AppClient {
         };
         // Rejections this device made before it had a device group (3.2).
         self.founding_sign_in_rejections(&mut roster, &sibling_slot)?;
+        // The recovery key this device kept without one (4.4a).
+        roster.account = self.founding_account_entry(own_slot)?;
         let roster = encode_device_roster_v1(&roster)
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
         let roster_update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
@@ -421,16 +441,13 @@ impl AppClient {
         // error. A restart settles the row and reinstalls the route.
         super::recover_post_canonical_result(
             "record_created_device_group",
-            storage
-                .set_device_group_trust(
-                    &group_id_hex,
-                    DeviceGroupTrust::Creating,
-                    DeviceGroupTrust::Created,
-                    None,
-                    now,
-                )
-                .map(drop)
-                .map_err(AppError::from),
+            self.trust_device_group(
+                &group_id,
+                DeviceGroupTrust::Creating,
+                DeviceGroupTrust::Created,
+                now,
+            )
+            .map(drop),
         );
         let welcome_intents = super::recover_post_canonical_result(
             "prepare_device_group_welcome_delivery_index",
@@ -599,11 +616,10 @@ impl AppClient {
             // device's first commit there as soon as it can (D40).
             storage.record_device_group_join(&group_id_hex, now)?;
         }
-        if storage.set_device_group_trust(
-            &group_id_hex,
+        if self.trust_device_group(
+            group_id,
             DeviceGroupTrust::AwaitingWelcome,
             DeviceGroupTrust::Linked,
-            None,
             now,
         )? {
             self.note_device_roster_changed();
@@ -645,11 +661,10 @@ impl AppClient {
                 requires_roster(&group) && group.local_copy_install_epoch == EpochId(0)
             });
             if created_here {
-                storage.set_device_group_trust(
-                    &record.group_id_hex,
+                self.trust_device_group(
+                    &group_id,
                     DeviceGroupTrust::Creating,
                     DeviceGroupTrust::Created,
-                    None,
                     record.recorded_at,
                 )?;
                 self.note_device_roster_changed();
@@ -960,11 +975,20 @@ impl AppClient {
         let Some((group_id, roster)) = self.trusted_device_roster()? else {
             return Ok(Vec::new());
         };
+        // Imported rows name their source from the roster just read.
+        self.give_device_labels(Some(&roster));
         let storage = self.app.account_storage(&self.state.label)?;
         // A slot that is not 32 bytes names no roster entry.
         let own_slot = storage
             .key_package_lifecycle()?
             .and_then(|lifecycle| device_slot(&lifecycle.stable_slot_id).ok());
+        let activity: BTreeMap<String, DeviceActivityRecord> = storage
+            .app_storage()
+            .device_activity()?
+            .into_iter()
+            .map(|activity| (activity.slot_id_hex.clone(), activity))
+            .collect();
+        let now = unix_now_seconds();
         let group_id_hex = hex::encode(group_id.as_slice());
         let removing: std::collections::BTreeSet<String> = storage
             .app_storage()
@@ -978,6 +1002,15 @@ impl AppClient {
             .into_iter()
             .map(|(slot, entry)| {
                 let mut device = linked_device(slot, entry, own_slot.as_ref());
+                if !device.is_this_device {
+                    // A row kept for an earlier entry of the slot, linked
+                    // again since the last pass, says nothing of this one.
+                    let activity = activity
+                        .get(&device.slot_id_hex)
+                        .filter(|activity| activity.linked_at == device.linked_at);
+                    device.last_active_at = activity.and_then(|activity| activity.last_active_at);
+                    device.inactive = sibling_inactive(activity, now);
+                }
                 device.removal_pending = removing.contains(&device.slot_id_hex);
                 device
             })
@@ -993,12 +1026,49 @@ impl AppClient {
     pub(crate) fn note_device_roster_changed(&mut self) {
         self.linked_devices_changed = true;
         self.unrecognized_sign_ins_changed = true;
+        self.note_compromise_warning_due();
     }
 
     /// Whether the linked devices may have changed since the last call. Set
     /// at open and by every hidden device-group event and change of trust.
     pub(crate) fn take_linked_devices_changed(&mut self) -> bool {
         std::mem::take(&mut self.linked_devices_changed) && self.app.device_groups_enabled()
+    }
+
+    /// Whether the device group removed this device after its link was made,
+    /// so the account must stop here (mdk#2628 D67).
+    pub(crate) fn device_unlinked(&self) -> bool {
+        self.device_unlinked
+    }
+
+    /// Stop the account on this device for good: the device group removed
+    /// it after its link was made (mdk#2628 D67). The client stops first and
+    /// every publisher of the account refuses from then on, so nothing more
+    /// goes out, from this client or any other path, even when the durable
+    /// mark fails; the caller
+    /// then keeps the device-group copy, and the next open finds the removal
+    /// again and retries the mark before it sends anything. Under the runtime,
+    /// the deactivation that follows makes the mark too. Once the mark lands,
+    /// a crash before the worker stops still leaves the account signed out.
+    #[cfg(any(test, feature = "unreleased-device-pairing"))]
+    pub(crate) fn mark_device_unlinked(&mut self) -> Result<(), AppError> {
+        self.device_unlinked = true;
+        self.app
+            .stop_unlinked_account_publishing(&hex::encode(self.adapter.account_id().as_slice()));
+        #[cfg(test)]
+        if self
+            .app
+            .test_fail_unlink_mark
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(AppError::AccountHome(marmot_account::AccountHomeError::Io(
+                std::io::Error::other("injected unlink mark failure"),
+            )));
+        }
+        self.app
+            .account_home()
+            .mark_account_unlinked(&self.state.label)?;
+        Ok(())
     }
 
     /// Whether this device's KeyPackage refresh is overdue because its device
@@ -1055,6 +1125,8 @@ fn linked_device(
         add_to_all_chats: entry.settings.add_to_all_chats,
         bring_history: entry.settings.bring_history,
         keep_while_inactive: entry.settings.keep_while_inactive,
+        last_active_at: None,
+        inactive: false,
         removal_pending: false,
     }
 }

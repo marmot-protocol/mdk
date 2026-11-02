@@ -26,6 +26,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   ask it instead of matching `Engine(..)` or `Session(..)`.
 - `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
 - `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
+- `recovery_key.rs` — `seal_to_recovery_key` without a session (mdk#2628 4.4b): the engine's sealing under the
+  engine's own stateless crypto provider, for a backup written off the account worker.
 - `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
   `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
   - `runtime/slot_announcement.rs` — the slot-announcement gate (mdk#2628 3.4): while the host names a device group,
@@ -34,11 +36,14 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/own_slot.rs` — the own-slot check's runtime half (mdk#2628 3.4): the host hands over publications in this
     device's slot that it did not make. `slot_publication_superseded` is the one test of whether a publication of this
     device's own still stands there; every step that stages, publishes, resends or republishes asks it. One dated past
-    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh.
+    the skew window is deleted by id (D63) and never outranked, so it never holds back a refresh. A relay the host read
+    as serving nothing in the slot, though it accepted the current publication, gets a new KeyPackage
+    (`refill_emptied_slot`) once that publication is a day old, so one that keeps nothing costs one a day.
   - `runtime/device_roster.rs` — this device's reads and writes of its device group's roster: its slot, the merged
     roster, the gate its roster commits wait behind (`device_group_takes_commit`: not stable, held, quarantined,
-    settling, or a change of this device's still queued or unconfirmed; public, so the host judges a lost rename only
-    once its commits there have an outcome), and the sends. The runtime's roster-writing steps use these rather than
+    settling, or a change of this device's still queued, unconfirmed or owed a re-issue that maintenance has not yet
+    re-derived; public, so the host judges a lost rename, and answers a backup change, only once its commits there have
+    an outcome), and the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
     `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
@@ -46,7 +51,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
     history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
-    entry ever gets its history key.
+    entry ever gets its history key. The account entry (backup writer and recovery key, 4.4a) has one write path
+    too, `edit_roster_account_entry`, sent as `SendIntent::ReplaceAccountEntry` naming the entry it read
+    (`AccountEntryChanged` and `AccountEntryUnsettled` map to `Busy`).
     `send_device_roster_update` carries rejected-slot operations only.
   - `runtime/device_tag_key.rs` — this device's tag signature key (mdk#2628 3.1d): the host names the device group to
     tag from (`set_device_tag_group`). Maintenance, and the host before each KeyPackage publication
@@ -58,8 +65,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   - `runtime/removed_slot_expiry.rs` — maintenance drops `removed` slot records 30 days after their `rejected_at`, by
     this device's clock (device-roster-v1.md), in one roster update after the KeyPackage steps. `not_me` records stay.
   - `runtime/sign_in_rejection.rs` — the host's rejected sign-ins (mdk#2628 3.2) as `not_me` rejected slots, in one
-    roster update behind the same gate (`reject_device_slots`). A slot the merged roster already holds, as a device or
-    a rejected slot, is left out: a rejection never replaces an entry.
+    roster update behind the same gate (`reject_device_slots`), which refuses a `removed` record. The lone `removed`
+    record a deciding device makes after a failed link's undo (mdk#2761) goes only through `record_removed_slot`, as
+    `SendIntent::RecordRemovedSlot`, which the engine never queues or re-issues. A slot the merged roster already
+    holds, as a device or a rejected slot, is left out: a rejection never replaces an entry.
   - `runtime/welcome_delivery.rs` — outbound Welcome delivery (mdk#2628 3.5a). The engine's Welcome row is the
     obligation, and every publish reads it first (`welcome_hold`): a withdrawn Welcome never goes out again, a staged
     one waits for its commit, and a device link's Welcome never goes out from its `deliver_until` on, by this
@@ -73,8 +82,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
-  - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b). The request
-    and hand-off checks read device tags through `member_device_tag_claim`.
+  - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
+    chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
+    caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one
+    (3.5b-2), for the app's 461 sender. The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.

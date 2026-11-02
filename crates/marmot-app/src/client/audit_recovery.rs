@@ -385,6 +385,10 @@ impl AppClient {
     /// the goal bound the comparison will use after it.
     pub(crate) fn record_recovery_loss_imports(&self, imports: Vec<RecoveryLossImport>) {
         self.record_coverage_loss(&imports);
+        // Imported loss un-covered its routes: new debt for the runner.
+        if !imports.is_empty() {
+            self.wake_recovery_runner();
+        }
         if imports.is_empty() || !self.audit_v5_enabled() {
             return;
         }

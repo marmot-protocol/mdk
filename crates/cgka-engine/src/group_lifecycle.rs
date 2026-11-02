@@ -21,7 +21,7 @@ use crate::wire_format::{
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
-    DEVICE_ROSTER_COMPONENT_ID, decode_device_roster_v1, default_group_components,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceSlotId, decode_device_roster_v1, default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -162,6 +162,40 @@ pub(crate) fn welcome_key_package_of_this_device(
     }
 }
 
+/// The route a Welcome arrived by, which decides whether it may consume a
+/// private KeyPackage (mdk#2628 3.5).
+#[derive(Clone, Debug)]
+pub(crate) enum WelcomeRoute {
+    /// A transport delivery, a stored rejoin offer or a direct join. It never
+    /// consumes a private KeyPackage.
+    Delivery,
+    /// A sibling Welcome the app admitted from the trusted device group. It
+    /// consumes only the private KeyPackage it names, and only one this
+    /// device issued to `from`'s slot.
+    Sibling {
+        from: DeviceSlotId,
+        key_package_ref: Vec<u8>,
+    },
+}
+
+/// Whether a delivery of a Welcome this device already joined names a
+/// KeyPackage publication this device never held. One Welcome reaches every
+/// device it adds, each in its own delivery of the same content, so once this
+/// device joined through its own, a sibling's lands on the content dedup
+/// marker. It is still not addressed to this device (mdk#2628 3.2). Without
+/// a claim or a lifecycle record, it stays a duplicate.
+pub(crate) fn joined_welcome_names_another_key_package(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+) -> bool {
+    match (lifecycle, claimed) {
+        (Some(lifecycle), Some(claimed)) => !lifecycle
+            .held_publications()
+            .any(|(held, _)| held == claimed),
+        _ => false,
+    }
+}
+
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -178,6 +212,7 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::MissingRequiredCapabilities { .. }
             | EngineError::NotGroupAdmin { .. }
             | EngineError::WelcomeAlreadyProcessed
+            | EngineError::SiblingWelcomePredatesForget
     )
 }
 
@@ -712,10 +747,8 @@ impl<S: StorageProvider> Engine<S> {
             Some(bytes)
         };
 
-        // 4. Persist Marmot-side group record with the PROJECTED
-        //    post-merge member set before recording outbound welcomes.
-        //    SQLite enforces message/group foreign keys, so the group row
-        //    must exist before `record_sent_message` writes welcome records.
+        // 4. Build the Marmot-side group record with the PROJECTED
+        //    post-merge member set.
         //
         //    The MLS group is still at epoch 0 pre-merge, but the `members`
         //    field surfaced via the `CgkaEngine::members` API needs to
@@ -740,28 +773,10 @@ impl<S: StorageProvider> Engine<S> {
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
         };
-        if self.new_protocol_profile == ProtocolProfile::Legacy {
-            self.storage.put_group(&group_record)?;
-            // #740: index this group's transport routing id for O(1) inbound
-            // resolution (see `Engine::transport_group_id_index`). Best-effort:
-            // a routing-read failure only forfeits the fast path.
-            if let Ok(transport_group_id) =
-                crate::app_components::transport_group_id_of_group(&mls_group)
-            {
-                // Inlined `index_transport_group_route` (field-split borrows:
-                // `provider` above still holds `&self`); creation needs no
-                // retention prune yet.
-                self.transport_group_id_index
-                    .insert(transport_group_id.clone(), group_id.clone());
-                let _ = self.storage.put_transport_group_route(
-                    &transport_group_id,
-                    &group_id,
-                    EpochId(mls_group.epoch().as_u64()),
-                );
-            }
-        }
 
-        // 5. Wrap welcomes via the peeler.
+        // 5. Wrap welcomes via the peeler, before the group record or any
+        //    Welcome is written: a Welcome that cannot be wrapped refuses the
+        //    creation.
         //
         // Note: we intentionally do NOT emit the commit. The creator is the
         // only party who'd care about the "commit that creates the group at
@@ -789,10 +804,45 @@ impl<S: StorageProvider> Engine<S> {
                     self.peeler.wrap_welcome(&payload, &recipient).await
                 }
                 .map_err(EngineError::Peeler)?;
-                if self.new_protocol_profile == ProtocolProfile::Legacy {
-                    self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
-                }
                 welcomes.push(wrapped);
+            }
+        }
+
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            // Every check that can refuse the creation runs before its first
+            // write. A current-profile create runs them inside its creation
+            // transaction instead.
+            crate::capability_manager::check_key_packages_carry_profile(
+                group_record.protocol_profile,
+                &parsed_kps,
+            )?;
+            crate::capability_manager::check_own_leaf(
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
+            // SQLite enforces message/group foreign keys, so the group row
+            // must exist before `record_sent_message` writes welcome records.
+            self.storage.put_group(&group_record)?;
+            // #740: index this group's transport routing id for O(1) inbound
+            // resolution (see `Engine::transport_group_id_index`). Best-effort:
+            // a routing-read failure only forfeits the fast path.
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                // Inlined `index_transport_group_route` (field-split borrows:
+                // `provider` above still holds `&self`); creation needs no
+                // retention prune yet.
+                self.transport_group_id_index
+                    .insert(transport_group_id.clone(), group_id.clone());
+                let _ = self.storage.put_transport_group_route(
+                    &transport_group_id,
+                    &group_id,
+                    EpochId(mls_group.epoch().as_u64()),
+                );
+            }
+            for welcome in &welcomes {
+                self.record_sent_message(welcome, &group_id, EpochId(0))?;
             }
         }
 
@@ -852,7 +902,7 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
-                        crate::announced_key_packages::record_roster_announcements(
+                        crate::roster_tag_keys::record_roster_tag_keys(
                             storage,
                             &group_id,
                             &mls_group,
@@ -956,17 +1006,6 @@ impl<S: StorageProvider> Engine<S> {
             }
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
-
-        crate::capability_manager::check_key_package_profiles(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-        )?;
-        crate::capability_manager::check_own_leaf(
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
 
         // 7. Enter PendingPublish — the caller must confirm_published once
         //    the transport hands off every welcome. The visible epoch
@@ -1093,7 +1132,10 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self.do_join_welcome(welcome, None).await {
+            match self
+                .do_join_welcome(welcome, None, WelcomeRoute::Delivery)
+                .await
+            {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -1151,6 +1193,7 @@ impl<S: StorageProvider> Engine<S> {
             peeled,
             content_id,
             Some((&candidate.group_id, local_state_token)),
+            WelcomeRoute::Delivery,
         )
         .await
     }
@@ -1183,6 +1226,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
         prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
@@ -1242,14 +1286,19 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let result = self
-            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone())
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone(), route)
             .await;
         match &result {
             Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
+                // A sibling Welcome refused for its carrier's date refuses
+                // that carrier only; every other refusal is the Welcome's.
+                let content_refused = !matches!(error, EngineError::SiblingWelcomePredatesForget);
                 self.storage.with_transaction(|storage| {
                     storage.put_ingress_dedup_marker(&welcome_id)?;
-                    storage.put_ingress_dedup_marker(&content_id)?;
+                    if content_refused {
+                        storage.put_ingress_dedup_marker(&content_id)?;
+                    }
                     Ok::<_, EngineError>(())
                 })?;
             }
@@ -1263,8 +1312,9 @@ impl<S: StorageProvider> Engine<S> {
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
-        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None)
+        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None, route)
             .await
     }
 
@@ -1275,6 +1325,7 @@ impl<S: StorageProvider> Engine<S> {
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
         consent: Option<(&GroupId, &[u8])>,
+        route: WelcomeRoute,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
         let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
@@ -1393,11 +1444,28 @@ impl<S: StorageProvider> Engine<S> {
                 decided => decided?,
             };
             // A private KeyPackage joins only through a sibling Welcome from
-            // the device group (mdk#2628 3.5). Refusing it as not addressed
-            // here remembers only this wrapper, so that Welcome stays open.
-            if crate::private_key_packages::is_issued(storage, &consumed_key_package_ref)? {
-                return Err(EngineError::WelcomeNotAddressedToThisDevice);
-            }
+            // the device group, and only the one that Welcome names, issued
+            // to the sibling that sent it; a sibling Welcome consumes nothing
+            // else (mdk#2628 3.5). Refusing one as not addressed here
+            // remembers only this wrapper, so its content stays open to the
+            // route it belongs to.
+            let issued =
+                crate::private_key_packages::issued_record(storage, &consumed_key_package_ref)?;
+            let sibling_record = match (&route, issued) {
+                (WelcomeRoute::Delivery, None) => None,
+                (
+                    WelcomeRoute::Sibling {
+                        from,
+                        key_package_ref,
+                    },
+                    Some(record),
+                ) if &record.recipient_slot == from
+                    && key_package_ref == &consumed_key_package_ref =>
+                {
+                    Some(record)
+                }
+                _ => return Err(EngineError::WelcomeNotAddressedToThisDevice),
+            };
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -1441,7 +1509,13 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(cutoff) = dated_reset
                 && welcome_created_at.is_none_or(|created_at| created_at <= cutoff)
             {
-                return Err(EngineError::InvalidWelcome);
+                // A sibling Welcome's date is its carrier's, so the same
+                // Welcome in a later carrier is a fresh one.
+                return Err(if sibling_record.is_some() {
+                    EngineError::SiblingWelcomePredatesForget
+                } else {
+                    EngineError::InvalidWelcome
+                });
             }
 
             let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
@@ -1653,6 +1727,14 @@ impl<S: StorageProvider> Engine<S> {
             }
 
             if let Some(local_state_token) = confirmation_token {
+                // A sibling Welcome into a chat this device still holds, as
+                // one sent after a removal that has not reached it yet, is
+                // no offer: the app keeps it and joins it once the copy reads
+                // removed or unrecoverable. Held, it rolls back like an offer
+                // and marks nothing (mdk#2628 3.5b).
+                if sibling_record.is_some() {
+                    return Err(EngineError::SiblingWelcomeHeld { group_id });
+                }
                 pending_rejoin = Some(PendingWelcome {
                     message_id: welcome_id.clone(),
                     group_id: group_id.clone(),
@@ -1711,7 +1793,7 @@ impl<S: StorageProvider> Engine<S> {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
-            crate::announced_key_packages::record_roster_announcements(
+            crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
             )?;
             if local_state_is_stale {
@@ -1805,6 +1887,10 @@ impl<S: StorageProvider> Engine<S> {
                     .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
                 lifecycle.record_consumed_key_package(&consumed_key_package_ref, joined_at);
                 maintenance.put_key_package_lifecycle(&lifecycle)?;
+            }
+            // The issued record goes with the bundle the join consumed.
+            if let Some(record) = &sibling_record {
+                crate::private_key_packages::delete_issued(storage, record)?;
             }
 
             // A Welcome-installed member must retain the joined epoch
@@ -2452,6 +2538,34 @@ mod tests {
         assert!(matches!(
             decide(None, None),
             Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+    }
+
+    #[test]
+    fn a_joined_welcome_delivered_for_another_key_package_is_not_a_duplicate() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+
+        // A sibling's or unknown delivery names a publication never held.
+        assert!(joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(2))
+        ));
+        // This device's own delivery again is a duplicate.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            Some(&id(1))
+        ));
+        // So is any delivery it cannot tell apart.
+        assert!(!joined_welcome_names_another_key_package(
+            Some(&lifecycle),
+            None
+        ));
+        assert!(!joined_welcome_names_another_key_package(
+            None,
+            Some(&id(2))
         ));
     }
 }

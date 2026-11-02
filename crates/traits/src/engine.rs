@@ -17,7 +17,9 @@
 //! `Box<dyn CgkaEngine + Send + Sync>` today and can be dropped later without
 //! breaking the contract.
 
-use crate::app_components::{AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId};
+use crate::app_components::{
+    AccountEntryV1, AppComponentData, AppComponentId, DeviceEntryV1, DeviceSlotId,
+};
 use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
@@ -71,6 +73,14 @@ pub struct KeyPackage {
     pub protocol_profile: ProtocolProfile,
 }
 
+/// A private KeyPackage a sibling device handed over, with the roster slot of
+/// that sibling ([`SendIntent::AddOwnAccountDevices`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiblingKeyPackage {
+    pub slot: DeviceSlotId,
+    pub key_package: KeyPackage,
+}
+
 impl KeyPackage {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
@@ -116,6 +126,19 @@ impl Hash for KeyPackage {
     }
 }
 
+/// One epoch of a group as this device holds it: its number, and a digest of
+/// its MLS epoch authenticator. Two branches of a fork can reach the same
+/// number; their authenticators differ, so a pin read on one branch never
+/// matches the other. Read it with [`CgkaEngine::epoch_pin`]; pin an
+/// application message to it with
+/// [`SendIntent::AppMessage::expected_epoch`](SendIntent::AppMessage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochPin {
+    pub epoch: EpochId,
+    /// SHA-256 of the epoch's MLS epoch authenticator.
+    pub identity: [u8; 32],
+}
+
 /// Application's intent when calling [`CgkaEngine::send`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendIntent {
@@ -128,18 +151,20 @@ pub enum SendIntent {
         /// An encrypted-media `imeta` reference is the case today: recipients
         /// derive the media key from the epoch of the message that delivers
         /// the tag, so ciphertext produced at epoch N is unreadable when the
-        /// tag ships at N+1.
+        /// tag ships at N+1, or at another N after branch selection.
         ///
         /// `None` (the default, and every ordinary message) lets the engine
-        /// retain the intent while the group's epoch is unsettled and encrypt
-        /// it under whatever epoch the group lands on. A pinned message has
+        /// retain the intent while the group's epoch is unsettled, or behind
+        /// an earlier send still queued for the group, and encrypt it under
+        /// whatever epoch the group lands on. A pinned message has
         /// no such freedom: the engine refuses it with
         /// [`EngineError::AppMessageEpochUnsettled`] instead of retaining it,
         /// and with [`EngineError::AppMessageEpochMismatch`] at encryption
-        /// time if convergence moved the epoch during the send. Nothing is
-        /// persisted or published in either case.
+        /// time if the send's own convergence moved the group off the pinned
+        /// [`EpochPin`]: to another epoch, or to another branch at the same
+        /// number. Nothing is persisted or published in either case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_epoch: Option<EpochId>,
+        expected_epoch: Option<EpochPin>,
     },
     /// Invite new members via their KeyPackages.
     ///
@@ -161,19 +186,23 @@ pub enum SendIntent {
         group_id: GroupId,
         members: Vec<MemberId>,
     },
-    /// Add devices of this device's own account, without admin authority, in
-    /// a group that requires `marmot.group.account-devices.v1`
+    /// Add sibling devices of this device's own account, without admin
+    /// authority, in a group that requires `marmot.group.account-devices.v1`
     /// (account-devices-v1.md, "Same-account operations").
     ///
-    /// The caller supplies every KeyPackage: each must belong to this
-    /// device's account, advertise everything the group requires, and keep
-    /// the account within the leaf limit. The caller must have authenticated
-    /// each one as a device its user approved; the engine never selects an
+    /// The caller supplies every KeyPackage, each a private one a sibling
+    /// handed over, named with that sibling's roster slot (device-group.md,
+    /// "Sibling Welcomes"). Each must belong to this device's account, carry a
+    /// device tag that reads as that slot in the trusted device group's
+    /// roster, name no publication, advertise everything the group requires,
+    /// and keep the account within the leaf limit. The caller must have taken
+    /// each from the KeyPackages handed to it; the engine never selects an
     /// own-account KeyPackage itself ("Sender rules"). Each added device gets
-    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    /// a sibling Welcome, owed once the Commit confirms and sent in the device
+    /// group, never through the transport binding.
     AddOwnAccountDevices {
         group_id: GroupId,
-        key_packages: Vec<KeyPackage>,
+        siblings: Vec<SiblingKeyPackage>,
     },
     /// Remove other devices of this device's own account, without admin
     /// authority, in a group that requires
@@ -226,6 +255,20 @@ pub enum SendIntent {
         leaf_signature_key: Vec<u8>,
         roster_update: Vec<u8>,
     },
+    /// Record a slot of the account's device group as `removed`, alone
+    /// (mdk#2761): the record a device whose user decided a removal makes
+    /// once a failed link's undo took that slot's entry. `roster_update` is a
+    /// `marmot.account.device-roster.v1` update of exactly one
+    /// `SetRejectedSlot`, with reason `removed` and a `tag_signature_key`,
+    /// for a slot the roster lists neither as a device nor as a rejected
+    /// slot. Like a link, it is never queued, and a lost fork never re-issues
+    /// it: once a roster state the device applied held the record, the device
+    /// does not make it again, so only its caller decides whether to send it
+    /// again.
+    RecordRemovedSlot {
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
@@ -260,6 +303,22 @@ pub enum SendIntent {
         slot: DeviceSlotId,
         expected: Box<DeviceEntryV1>,
         entry: Box<DeviceEntryV1>,
+    },
+    /// Replace the account entry in the roster of a device group with
+    /// `entry`, in one `marmot.account.device-roster.v1` `SetAccount`, while
+    /// the roster still holds `expected` there (mdk#2628 4.4a): the backup
+    /// writer and the recovery key's public half.
+    ///
+    /// `SetAccount` replaces the entry whole, so it is compared like
+    /// [`Self::ReplaceDeviceEntry`]: each time the engine prepares the Commit,
+    /// on a direct send or a re-issue after a lost fork. Any other entry
+    /// refuses it with [`EngineError::AccountEntryChanged`] and nothing is
+    /// staged. A send is never queued: while the group would queue it,
+    /// [`EngineError::AccountEntryUnsettled`] refuses it and nothing is kept.
+    ReplaceAccountEntry {
+        group_id: GroupId,
+        expected: Box<AccountEntryV1>,
+        entry: Box<AccountEntryV1>,
     },
     /// Update the group's `marmot.group.profile.v1` app component fields.
     UpdateGroupData {
@@ -388,10 +447,15 @@ pub enum SendResult {
         authority: Option<crate::app_event::AppMessageAuthority>,
     },
     /// The engine accepted the local intent but did not publish anything
-    /// yet because the group has unresolved convergence input. The intent
-    /// will be regenerated from the canonical state when the group becomes
-    /// stable. If that state refuses it, the engine drops it and announces
-    /// [`GroupEvent::QueuedIntentRefused`] with this `intent_id`.
+    /// yet because the group has unresolved convergence input, or an earlier
+    /// send to the group is still queued: a send never goes ahead of one
+    /// queued before it, though one queued admin change may take the drain's
+    /// first attempt after a convergence pass. The intent will be regenerated
+    /// from the canonical state when the group becomes stable, after those
+    /// queued before it. If that state refuses it, the engine drops it and
+    /// announces [`GroupEvent::QueuedIntentRefused`] with this `intent_id`;
+    /// if that state already holds the change, the engine drops it with
+    /// nothing to publish and the drain returns [`SendResult::NoChange`].
     Queued {
         group_id: GroupId,
         intent_id: MessageId,
@@ -1261,6 +1325,12 @@ pub trait CgkaEngine: Send + Sync {
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;
+
+    /// The group's [`EpochPin`]: its epoch and the branch it reached that
+    /// epoch on. While a commit of this device awaits its publication, that
+    /// is the commit's epoch, whose secrets [`Self::group_context`] exports;
+    /// the pin matches the group once the commit merges.
+    fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError>;
 
     /// Stable identity of the local client across every group.
     fn self_id(&self) -> MemberId;

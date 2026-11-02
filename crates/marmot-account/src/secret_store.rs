@@ -417,6 +417,7 @@ mod tests {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
 
         store.write_secret(&account, &keys).unwrap();

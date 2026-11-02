@@ -1144,7 +1144,8 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     let mut historical = storage.get_message(&welcome_id).unwrap();
     let message = StoredMessagePayload::decode(&historical.payload)
         .unwrap()
-        .into_message();
+        .into_message()
+        .unwrap();
     historical.payload = StoredMessagePayload::raw_transport(message)
         .encode()
         .unwrap();
@@ -1634,6 +1635,72 @@ async fn cancelling_founding_retention_before_canonicalization_leaves_no_group()
         reopened.live_group_ids().unwrap().is_empty(),
         "cancellation before the canonical transaction must clean up the provisional MLS group"
     );
+}
+
+/// A legacy-profile create whose Welcome cannot be wrapped is refused before
+/// the group record or any Welcome is written.
+#[tokio::test]
+async fn legacy_create_whose_welcome_cannot_be_wrapped_writes_no_group() {
+    struct RefusingWelcomes(MockPeeler);
+    #[async_trait]
+    impl TransportPeeler for RefusingWelcomes {
+        async fn peel_group_message(
+            &self,
+            msg: &TransportMessage,
+            ctx: &GroupContextSnapshot,
+        ) -> Result<PeeledMessage, PeelerError> {
+            self.0.peel_group_message(msg, ctx).await
+        }
+
+        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+            self.0.peel_welcome(msg).await
+        }
+
+        async fn wrap_group_message(
+            &self,
+            payload: &EncryptedPayload,
+            ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, PeelerError> {
+            self.0.wrap_group_message(payload, ctx).await
+        }
+
+        async fn wrap_welcome(
+            &self,
+            _payload: &EncryptedPayload,
+            _recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            Err(PeelerError::MissingContext {
+                label: "welcome_metadata".into(),
+            })
+        }
+    }
+
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice-unwrappable-welcome"))
+        .account_identity_proof_signer(proof_signer(b"alice-unwrappable-welcome"))
+        .peeler(Box::new(RefusingWelcomes(MockPeeler::default())))
+        .build()
+        .unwrap();
+    let mut bob = build_client(b"bob-unwrappable-welcome", FeatureRegistry::new());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let refused = alice
+        .create_group(CreateGroupRequest {
+            name: "unwrappable welcome".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await;
+    assert!(
+        matches!(refused, Err(EngineError::Peeler(_))),
+        "{refused:?}"
+    );
+    assert!(storage.list_groups().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -27,6 +27,9 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 /// queries is split into several REQs on the same connection (mdk#2269).
 const DIRECTORY_MAX_FILTERS_PER_REQ: usize = 3;
 
+/// The addressable kinds (NIP-01), whose events one `d` value addresses.
+const ADDRESSABLE_KINDS: std::ops::Range<u64> = 30_000..40_000;
+
 /// Stable errors for a bounded, isolated relay inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryInspectionError {
@@ -164,7 +167,12 @@ pub struct DirectorySubscriptionSyncSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirectoryFetchOutcome {
     pub records: Vec<DirectoryRelayEventRecord>,
+    /// Every requested relay reached its end of stored events for every
+    /// query, and no page came back full.
     pub complete: bool,
+    /// The relays whose own read finished that way, whether or not the
+    /// others did: what one of them did not return, it does not serve.
+    pub complete_endpoints: Vec<TransportEndpoint>,
 }
 
 type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
@@ -185,7 +193,7 @@ pub trait DirectoryRelayFetcher: Send + Sync {
             .await
             .map(|records| DirectoryFetchOutcome {
                 records,
-                complete: false,
+                ..DirectoryFetchOutcome::default()
             })
     }
 
@@ -252,11 +260,17 @@ impl DirectoryEventQuery {
     }
 
     /// One author's publications in one KeyPackage slot, the `d` value of
-    /// kind `30443`. Unlike a read of the author's whole account, a busy
-    /// account cannot page the slot out.
+    /// kind `30443`.
     pub fn key_package_slot(author: &str, slot: String, limit: usize) -> Self {
-        let mut query = Self::new(KIND_MARMOT_KEY_PACKAGE, vec![author.to_owned()], limit);
-        query.reference = Some(('d', slot));
+        Self::address(KIND_MARMOT_KEY_PACKAGE, author, slot, limit)
+    }
+
+    /// One author's publications at one address: the `d` value `d` of the
+    /// addressable kind `kind`. Unlike a read of the author's whole account,
+    /// a busy account cannot page the address out.
+    pub fn address(kind: u64, author: &str, d: String, limit: usize) -> Self {
+        let mut query = Self::new(kind, vec![author.to_owned()], limit);
+        query.reference = Some(('d', d));
         query
     }
 
@@ -268,11 +282,11 @@ impl DirectoryEventQuery {
                 Err("invalid directory since constraint".into())
             };
         };
-        if self.kind == KIND_MARMOT_KEY_PACKAGE && *name == 'd' {
+        if ADDRESSABLE_KINDS.contains(&self.kind) && *name == 'd' {
             return if self.authors.len() == 1 && self.since.is_none() && !value.is_empty() {
                 Ok(())
             } else {
-                Err("invalid key package slot query".into())
+                Err("invalid address query".into())
             };
         }
         if self.kind == 5
@@ -1053,14 +1067,17 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         }
 
         let mut outcome = DirectoryFetchOutcome {
-            records: Vec::new(),
             complete: true,
+            ..DirectoryFetchOutcome::default()
         };
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(endpoint) => {
                     outcome.complete &= endpoint.complete;
                     outcome.records.extend(endpoint.records);
+                    outcome
+                        .complete_endpoints
+                        .extend(endpoint.complete_endpoints);
                 }
                 Err(_) => outcome.complete = false,
             }
@@ -1283,7 +1300,11 @@ async fn strict_fetch_endpoint(
         // chunk cannot establish absence.
         complete &= chunk_complete;
     }
-    DirectoryFetchOutcome { records, complete }
+    DirectoryFetchOutcome {
+        records,
+        complete,
+        complete_endpoints: if complete { vec![endpoint] } else { Vec::new() },
+    }
 }
 
 fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
@@ -1656,6 +1677,49 @@ mod tests {
         }
     }
 
+    /// Each relay's read is judged on its own: one that reached its end of
+    /// stored events is named even when another was cut short, so a caller
+    /// can tell what the finished relay does not serve (mdk#2628 3.4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_names_each_relay_that_finished() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let keys = Keys::generate();
+        let events = (0..RELAY_REPLAY_PAGE_LIMIT)
+            .map(|index| {
+                let event = EventBuilder::new(Kind::TextNote, format!("note {index}"))
+                    .finalize(&keys)
+                    .unwrap();
+                serde_json::to_value(&event).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (cut_short, _, cut_short_server) = spawn_filter_limited_relay(3, events.clone()).await;
+        let (finished, _, finished_server) =
+            spawn_filter_limited_relay(3, events[..1].to_vec()).await;
+        let query = DirectoryEventQuery::new(
+            1,
+            vec![keys.public_key().to_hex()],
+            RELAY_REPLAY_PAGE_LIMIT + 100,
+        );
+        let request =
+            DirectoryFetchRequest::new(vec![cut_short, finished.clone()], vec![query]).unwrap();
+        let outcome = timeout(
+            Duration::from_secs(20),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .expect("strict fetch completes")
+        .unwrap();
+        cut_short_server.abort();
+        finished_server.abort();
+        assert!(!outcome.complete);
+        let [named] = outcome.complete_endpoints.as_slice() else {
+            panic!("{:?}", outcome.complete_endpoints);
+        };
+        assert!(crate::same_relay(named.as_str(), finished.as_str()));
+    }
+
     #[test]
     fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {
         use nostr_sdk::prelude::{Event, EventBuilder, FinalizeEvent, Keys};
@@ -1888,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn key_package_slot_query_matches_only_its_author_and_slot() {
+    fn an_address_query_matches_only_its_author_kind_and_address() {
         use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
         let (alice, bob) = (Keys::generate(), Keys::generate());
         let author = alice.public_key().to_hex();
@@ -1909,12 +1973,17 @@ mod tests {
         );
         assert!(validated_directory_event(&publication(&bob, 30443, &slot), &query).is_none());
         assert!(validated_directory_event(&publication(&alice, 1, &slot), &query).is_none());
+        let app_data = DirectoryEventQuery::address(30078, &author, slot.clone(), 4);
+        assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![app_data.clone()]).is_ok());
+        assert!(validated_directory_event(&publication(&alice, 30078, &slot), &app_data).is_some());
+        assert!(validated_directory_event(&publication(&alice, 30443, &slot), &app_data).is_none());
         let mut two_authors = query.clone();
         two_authors.authors.push(bob.public_key().to_hex());
         let mut bounded = query.clone();
         bounded.since = Some(1);
         let empty = DirectoryEventQuery::key_package_slot(&author, String::new(), 4);
-        for invalid in [two_authors, bounded, empty] {
+        let not_addressable = DirectoryEventQuery::address(10002, &author, slot.clone(), 4);
+        for invalid in [two_authors, bounded, empty, not_addressable] {
             assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
         }
     }

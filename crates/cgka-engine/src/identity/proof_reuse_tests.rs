@@ -358,3 +358,21 @@ fn stored_component_verification_binds_suite_scheme_key_and_account() {
         .is_err()
     );
 }
+
+#[test]
+fn legacy_proof_timestamp_does_not_read_the_clock() {
+    assert_eq!(
+        proof_created_at(ProtocolProfile::Legacy, || panic!("legacy read the clock")).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn current_proof_timestamp_rejects_a_clock_before_unix_epoch() {
+    assert!(
+        proof_created_at(ProtocolProfile::Current, || UNIX_EPOCH
+            - std::time::Duration::from_secs(1))
+        .unwrap_err()
+        .contains("system clock precedes Unix epoch")
+    );
+}

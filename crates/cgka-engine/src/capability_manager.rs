@@ -17,6 +17,7 @@ use cgka_traits::capabilities::{
     Capability, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
 };
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::Extension;
@@ -81,7 +82,15 @@ pub(crate) fn check_key_package_profiles<S: StorageProvider>(
     group_id: &GroupId,
     kps: &[KeyPackage],
 ) -> Result<(), EngineError> {
-    let group_profile = storage.get_group(group_id)?.protocol_profile;
+    check_key_packages_carry_profile(storage.get_group(group_id)?.protocol_profile, kps)
+}
+
+/// [`check_key_package_profiles`] against `group_profile`, for a group whose
+/// record is not written yet.
+pub(crate) fn check_key_packages_carry_profile(
+    group_profile: ProtocolProfile,
+    kps: &[KeyPackage],
+) -> Result<(), EngineError> {
     for kp in kps {
         let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             kp.leaf_node(),

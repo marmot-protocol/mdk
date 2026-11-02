@@ -182,7 +182,11 @@ jobs:
           rustc --version
           cargo --version
 
+      # Only the darwin targets keep a Cargo cache: they wait for the shared
+      # macOS runners, and only they fit in the cache budget described in
+      # ci.yml. The Linux targets build cold.
       - name: Cache Cargo artifacts
+        if: runner.os == 'macOS'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}

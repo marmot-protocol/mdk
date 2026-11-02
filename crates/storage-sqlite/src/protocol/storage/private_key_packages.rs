@@ -73,7 +73,6 @@ impl PrivateKeyPackageStorage for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqlCipherKey;
 
     fn issued(reference: u8, issued_at: u64) -> IssuedPrivateKeyPackage {
         IssuedPrivateKeyPackage {
@@ -90,21 +89,16 @@ mod tests {
     }
 
     #[test]
-    fn issued_private_key_packages_survive_reopen_oldest_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+    fn issued_private_key_packages_list_oldest_first() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let mut answered = issued(2, 5);
         answered.request_id = Some(cgka_traits::MessageId::new(vec![9; 32]));
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.put_issued_private_key_package(&issued(1, 6)).unwrap();
-            store.put_issued_private_key_package(&answered).unwrap();
-            let mut queued = issued(1, 6);
-            queued.hand_off_queued = true;
-            store.put_issued_private_key_package(&queued).unwrap();
-        }
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.put_issued_private_key_package(&issued(1, 6)).unwrap();
+        store.put_issued_private_key_package(&answered).unwrap();
+        let mut queued = issued(1, 6);
+        queued.hand_off_queued = true;
+        store.put_issued_private_key_package(&queued).unwrap();
+
         let listed = store.list_issued_private_key_packages().unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0], answered);

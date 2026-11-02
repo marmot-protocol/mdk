@@ -136,6 +136,10 @@ fn every_verified_schema_generation_preserves_live_and_retired_rows() {
         storage
             .set_audit_log_settings(&StoredAuditLogSettings { enabled: false })
             .unwrap();
+        assert_eq!(
+            storage.audit_log_settings().unwrap(),
+            StoredAuditLogSettings { enabled: false }
+        );
         if fixture != PRE_LEDGER {
             let mode: String = storage
                 .lock()

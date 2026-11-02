@@ -21,6 +21,11 @@ c_mirror! {
     /// characters) is the handle actions on the device take. `label`,
     /// `client` and `platform` are empty until set. `linked_at` is in Unix
     /// seconds. `linked_by_slot_id_hex` is NULL for the founder.
+    /// `last_active_at` (Unix seconds, valid when `has_last_active_at`) is
+    /// when a heartbeat last showed the device running; never set for this
+    /// device. `inactive` is this device's own judgement, 30 days after the
+    /// later of that and when it first found the device in the roster; the
+    /// roster's mark is `status` `Inactive`.
     /// `removal_pending` is set while a removal decided on this device waits
     /// for the device group.
     MarmotLinkedDevice from LinkedDeviceFfi,
@@ -36,6 +41,8 @@ c_mirror! {
         copy add_to_all_chats: bool,
         copy bring_history: bool,
         copy keep_while_inactive: bool,
+        opt_copy has_last_active_at/last_active_at: u64,
+        copy inactive: bool,
         copy removal_pending: bool,
     }
 }
@@ -62,6 +69,8 @@ mod tests {
                 add_to_all_chats: false,
                 bring_history: false,
                 keep_while_inactive: false,
+                last_active_at: None,
+                inactive: false,
                 removal_pending: false,
             },
             LinkedDeviceFfi {
@@ -76,6 +85,8 @@ mod tests {
                 add_to_all_chats: true,
                 bring_history: false,
                 keep_while_inactive: true,
+                last_active_at: Some(11),
+                inactive: true,
                 removal_pending: true,
             },
         ]));
@@ -102,6 +113,11 @@ mod tests {
             assert!(second.add_to_all_chats);
             assert!(!second.bring_history);
             assert!(second.keep_while_inactive);
+            assert!(!first.has_last_active_at);
+            assert!(!first.inactive);
+            assert!(second.has_last_active_at);
+            assert_eq!(second.last_active_at, 11);
+            assert!(second.inactive);
             assert!(!first.removal_pending);
             assert!(second.removal_pending);
             marmot_linked_device_list_free(list);

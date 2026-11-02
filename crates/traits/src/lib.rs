@@ -73,7 +73,7 @@ pub use convergence_pass::{
 };
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    EncryptedMediaSecret, GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource,
+    EncryptedMediaSecret, EpochPin, GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource,
     SendAcceptDisposition, SendIntent, SendResult, WelcomeMetadata,
 };
 pub use engine_state::{

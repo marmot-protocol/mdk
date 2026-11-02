@@ -17,6 +17,7 @@ the list only shrinks.
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
 | `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction. `delete_local_group_data`, the app's entry point, lives here on the account handle | `protocol/storage/groups.rs` (`forget_group_local`), `marmot-app` (`delete_local_group_data`) |
 | `views.rs` | App reads of engine tables: the chat list's leave and disband state, branch-withdrawal origins, a conversation's group state, a group's routes, the local-deletion frontier's message order, and the spill's released-receipt check | `app/chat_list.rs`, `app/chat_list/pages.rs`, `app/timeline.rs`, `app/timeline/capture.rs`, `app/account_projection.rs`, `app/transport/delivery_spill.rs` |
+| `migrated_template.rs` | Test support only: an in-memory test database copied from a migrated template, which draws the per-database values a fresh database draws on both sides (the chat presentation store epoch, the migration ledger's times) | `protocol/handle.rs` (`in_memory_for_test`) |
 
 Outside the schema links below, the list holds only the legacy migration 9 reconcile. App code reaches the engine's
 storage only through this folder: the names test flags app code that names `SqliteAccountStorage` or one of the

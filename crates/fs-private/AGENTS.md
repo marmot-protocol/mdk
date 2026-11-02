@@ -30,6 +30,8 @@ list: [`README.md`](README.md). Workspace policy: `docs/marmot-architecture/over
   application is `#[cfg(unix)]`; helpers still create artifacts elsewhere.
 - Keep policy out: this crate knows how to create artifacts privately, not which artifacts an application needs or
   what modes a feature should accept.
+- A test that re-runs its binary as a child (`--exact <name>`) must prove the child ran: a filter that matches
+  nothing exits 0. Check its stdout for `running 1 test`, or depend on a side effect only the child produces.
 
 ## Verification
 

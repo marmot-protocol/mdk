@@ -33,3 +33,32 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     )
     .storage()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::base::migrations::run_through;
+    use rusqlite::Connection;
+
+    /// Existing debt has counted no attempt and no admission.
+    #[test]
+    fn existing_debt_starts_at_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_through(&mut conn, 123).unwrap();
+        conn.execute(
+            "INSERT INTO account_recovery_obligations(demand_key,cause,created_at_ms,updated_at_ms)
+             VALUES ('explicit:existing',3,1000,1000)",
+            [],
+        )
+        .unwrap();
+        run_through(&mut conn, 124).unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT recovery_attempts, recovery_admitted_high FROM account_recovery_obligations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+}

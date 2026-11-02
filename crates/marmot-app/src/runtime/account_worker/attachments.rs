@@ -798,14 +798,18 @@ pub(super) fn schedule(
         // Queued explicit work (Retry, download again) derives a missing
         // source-epoch key from the retained anchor; automatic work reads only
         // what projection and sync cached.
+        let message = Some(source.message_id_hex.as_str());
         let prepared = if explicit {
             client
-                .cache_attachment_source_epoch_secret(&group, &reference)
+                .cache_attachment_source_epoch_secret(&group, &source.message_id_hex, &reference)
                 .and_then(|()| {
-                    client.prepare_background_attachment_download(&group, reference, max)
+                    client.prepare_background_attachment_download_for_message(
+                        &group, message, reference, max,
+                    )
                 })
         } else {
-            client.prepare_background_attachment_download(&group, reference, max)
+            client
+                .prepare_background_attachment_download_for_message(&group, message, reference, max)
         };
         let prepared = match prepared {
             Ok(Some(prepared)) => prepared,

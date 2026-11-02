@@ -4,6 +4,71 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
+  link is made and the roster lists another device that is not leaving. It
+  commits its own roster entry as `leaving` and waits up to about 30
+  seconds, however busy the account is, for that commit to be confirmed,
+  then leaves only the chats no sibling takes
+  it out of, deletes its slot and wipes. `WipeOutcome` adds
+  `groups_left_to_siblings`, the chats it left to them, and
+  `siblings_not_reached`, set when it could not ask them in time and tried
+  to leave every chat itself, reporting any it could not in
+  `group_leave_failures`. A device
+  that finds a sibling `leaving` removes it after a random delay of up to 30
+  seconds, as if its user had. A device removed while it signs out is not
+  unlinked. A chat this device is no longer in, its copy removed or
+  disbanded, is neither left nor reported in `group_leave_failures`. A wipe
+  of an account whose worker cannot run, signed out or with no external
+  signer registered, does not wait on its siblings. Struct literals add the
+  new fields.
+
+- Hosts can show chat history from another of the account's devices
+  (mdk#2628 item 4.2d, D78). `TimelineMessageRecord` adds `imported_from`,
+  the device an imported row came from (`HistoryImportSource`: its slot and
+  its roster name now, empty for an unnamed or removed device), so a host
+  draws "Imported from <device>" where rows change from imported to live.
+  `MarmotAppRuntime::chat_history_imports` lists each held chat whose history
+  is `Receiving` (with `retrying` once an attempt to get its bundle failed)
+  or `Imported`, and `MarmotAppEvent` adds `ChatHistoryImportsChanged {
+  account_id_hex, account_label }`, which fires whenever that list's answer
+  changes. Row names are resolved when rows are read and follow
+  `LinkedDevicesChanged`. Only behind `dev_device_groups`. Exhaustive
+  matches and struct literals add the new arm and field.
+
+- The device roster no longer holds rejected KeyPackages, and kind 462 is no
+  longer reserved for an anomaly alert (mdk#2628 D74). The roster's encoding
+  changed under the same component id, so existing development device groups
+  must be recreated: a roster an earlier build wrote no longer decodes.
+  Nothing has shipped it. `CompromiseWarningReason::RejectedKeyPackage` is
+  now `ForeignOwnSlotKeyPackage` (3.7b): a valid KeyPackage of the account
+  that this device found in its own slot and did not make, because its
+  LeafNode's signature key is not this device's. Only that device warns of
+  it, before it replaces the publication; a copy of a KeyPackage it made, an
+  invalid publication or one from before a restored backup never warns.
+
+- A device that its device group removes after its link was made is unlinked
+  (mdk#2628 item 3.6b): the account stops on that device and stays signed
+  out, and nothing more is published for it from that device.
+  `MarmotAppEvent` adds `DeviceUnlinked { account_id_hex, account_label }`,
+  sent once; `ManagedAccount` and `marmot_account`'s `AccountSummary` add
+  `unlinked`; `AccountHomeError` adds `AccountUnlinked`, which
+  `sign_in_account`, `login`, `login_external_signer`, an import of its key,
+  both onboarding starts, `MarmotApp::client` and an open client's
+  `run_due_maintenance` return for such an account. `sign_out_and_wipe`
+  wipes it without leaving its chats or deleting its slot, since its other
+  devices did both; signing in again is then a new link. Hosts stop showing
+  its local history, which reads still return as for any signed-out
+  account. Exhaustive matches and struct literals add the new arm and field.
+
+- `SelfMembership` adds `DeviceRemoved` and `ConversationParticipation` adds
+  `DeviceRemoved` (mdk#2628 item 3.6b): this device's leaf was removed from a
+  chat the account stays in through another of its devices. It is not a
+  removal of the account from the chat, so hosts show no "removed from group"
+  notice; the chat lists with the departed chats and takes no sends.
+  Exhaustive matches add an arm for each. `AppGroupRoster::roster_revision`
+  now steps by four per epoch, so each membership changes it.
+
 - `GroupEvent` adds `QueuedIntentRefused { group_id, intent_id, intent_kind,
   reason }` (mdk#2694), forwarded to hosts as `MarmotAppEvent::GroupEvent`.
   Exhaustive matches add an arm for it.
@@ -14,6 +79,12 @@
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
 - `MarmotAppEvent` adds `UnrecognizedSignInsChanged { account_id_hex,
   account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `MarmotAppEvent` adds `CompromiseWarningChanged { account_id_hex,
+  account_label }` (mdk#2628). Exhaustive matches add an arm for it.
+- `HistoryNoticeCause` adds `UnprovenHistory`, and `MarmotAppEvent` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660).
+  Exhaustive matches add arms for them. Neither is produced until the recovery
+  runner owns history.
 
 - `MarmotDeployment::key_package_client_preference` and
   `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
@@ -22,6 +93,42 @@
 
 ### Added
 
+- A device adds a sibling to a chat with a private KeyPackage that sibling
+  handed it, and sends the sibling Welcome in the device group as a 461 once
+  the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
+  relay is sent again by the next maintenance pass. Only behind
+  `dev_device_groups`; nothing outside tests adds a sibling yet.
+- The backup writer writes the account's backup once a day (mdk#2628 item
+  4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
+  as blobs on the deployment's Blossom servers under a fresh archive key, and
+  a head that seals that key to the recovery key and indexes the blobs for
+  the key's public half. A kind 30078 backup pointer, addressed and encrypted
+  under the public half, lists the kept backups: the newest two and any older
+  one still the last to hold some of a chat's history, at most 16. A backup
+  counts only once a relay accepts its pointer; one no relay accepts is
+  published again for a day, then abandoned. Blobs of dropped or abandoned
+  backups are deleted (BUD-02) while the pointer fetched in that pass lists
+  no backup they belong to. A device takes over writing when the writer
+  leaves the roster or is leaving, or lists nothing for a week, through the
+  roster's compare-and-set. Runs from maintenance, only behind
+  `dev_device_groups`. Enabling it outside dev needs the White Noise relays
+  to accept kind 30078 (D50); today they refuse it.
+- `MarmotAppRuntime::begin_recovery_words`, `confirm_recovery_words`,
+  `cancel_recovery_words`, `turn_off_backups` and `backup_settings` set up
+  the recovery words an account's backups will be sealed to, and turn backups
+  off (mdk#2628 item 4.4a, D75). MDK makes 12 BIP-39 English words and holds
+  them in memory only; the user types back the two at the positions MDK
+  picks, and only the key's public half is kept: in the device group's
+  roster, committed as a compare-and-set over the entry this device read, or
+  by a device with no device group until the roster it founds carries it.
+  Turning backups on makes the confirming device the backup writer; new words
+  keep the writer; turning them off clears the writer and the key the same
+  way. MDK never sends a backup change again itself: the engine re-issues one
+  a fork dropped while the entry it was made over still stands, and the
+  runtime retries one the relays refused. A change whose re-issue is refused
+  stays lost; `BackupSettings` shows the roster's account entry as it is now,
+  so the user sees that and can make the change again. Only behind
+  `dev_device_groups`. Nothing writes backups yet.
 - Each device keeps an HPKE history key, generated on first use and stored in
   its encrypted account storage, and writes its public half into its own
   device-group roster entry (`history_key`) so siblings can seal chat history
@@ -29,6 +136,73 @@
   new device in the commit that sets its tag signature key, and a device
   whose entry lacks it with its next KeyPackage announcement. Only behind
   `dev_device_groups`. Nothing sends history yet.
+- A chat's history moves between an account's devices as history bundles
+  (mdk#2628 item 4.2a). The sending device fills bundles of at most 8 MiB in
+  chat order, leaving out deleted and removed messages and everything that
+  targets them, and seals each under a fresh one-use key. The receiving device
+  refuses a whole bundle that does not open or decode or names another chat,
+  only adds messages it lacks, marks each with the device that sent it, takes
+  a sent moderation verdict, and never counts them as unread. Neither side
+  handles a device group. Only through the `test-policy-overrides` hooks
+  `dev_export_chat_history` and `dev_import_history_bundle` until the bundle's
+  transport lands.
+- History bundles carry a key for each attachment the sending device can open
+  (mdk#2628 item 4.2a). The key is derived from the attachment's epoch media
+  secret, or is the one the sender imported itself, and the epoch secret never
+  goes in a bundle. The receiving device keeps a key only for a message it
+  adds and only when the key names one of that message's attachments.
+  Downloading an imported attachment uses its key when the epoch's secret is
+  not here, so a device that was never in the attachment's epoch can still
+  open it. A message the device received itself never uses an imported key.
+- `MarmotAppRuntime::account_recovery_status(account_ref)` returns an
+  `AccountRecoveryStatus`: the groups whose history is still being fetched,
+  whether the inbox's is, and every notice as `history_notices` lists them
+  (mdk#2660). Re-read it on `RecoveryStatusChanged`. Until the recovery runner
+  owns history nothing is ever catching up, so it holds only the notices.
+- Audit v5 `recovery_need_changed` rows gain cause `unproven_history`: a
+  coverage-ledger route's notice, shown and dismissed, with the route's
+  one-way tag as `obligation_ref` (mdk#2660). Unproduced until the recovery
+  runner owns history; strict v5 receivers must accept it before then.
+- A chat's history goes to a sibling device through the device group as sealed
+  history deliveries (kind 473, mdk#2628 item 4.2b, D76). Only the device
+  whose own confirmed Commit added the sibling to the chat sends it. Each
+  delivery carries one bundle of at most 23,552 bytes of plaintext inline,
+  with the bundle's key and hash sealed to the receiver's history key for that
+  sender, receiver and chat. The sender owes the history from the add before
+  sending, keeps it owed until every delivery reached a relay, owes it again
+  when branch selection withdraws a delivery or its queued publish later fails
+  for good, and forgets it a week after the add, or at once when the receiver
+  does not ask for history. The receiver reads
+  a delivery only from a sibling whose leaf is tagged, addressed to it, and
+  opening with its own history key; it imports the bundle once it holds the
+  chat and parks it for up to a week until then. A delivery from an epoch
+  older than the device group's retained anchors has no readable sender and is
+  refused, and there are no receipts, so its history is lost. A withdrawn
+  delivery is owed again only
+  when the sender hears of the withdrawal, so one whose record was evicted, or
+  that a crash interrupted, is lost too. A history is still sent when branch
+  selection later withdraws the adding Commit. Only behind
+  `dev_device_groups`.
+- A history too long for eight inline deliveries, or holding an event too
+  large for one, goes through Blossom (mdk#2628 item 4.2c, D77): its newest 16
+  bundles of up to 8 MiB of plaintext each, older ones left out, each uploaded
+  as one blob to the first of the chat's Blossom endpoints that takes it, off
+  the account worker. A delivery then names that server (`blossom`, without
+  the query a v1 endpoint may carry) instead of carrying the bundle, and is
+  sent only once every blob is uploaded. The receiver parks it and fetches
+  the blob off the worker once it holds the chat, through the dial-safe
+  Blossom transport, reading at most the largest bundle ciphertext; one
+  naming the device group is refused unfetched. A failed upload, send or fetch tries again after a wait
+  that doubles up to an hour, until the delivery is a week old, and so does a
+  delivery a relay refuses for good. A chat with no Blossom endpoint, or with
+  no media servers at all, gets no such history, and blobs are never deleted:
+  the server keeps the ciphertext, its size and its timing until it expires
+  them. Imported messages reach subscribers as the fetch completes, and a host
+  that runs maintenance itself (`run_due_maintenance`) starts the uploads and
+  fetches it makes due.
+  A received delivery that fails for any reason but a refusal now fails the
+  projection, so it is read again rather than lost. Only behind
+  `dev_device_groups`.
 - `MarmotAppConfig::device_platform` (`with_device_platform`) names the
   platform this device runs on. Each device writes it and
   `key_package_client_name` into its own roster entry with its next KeyPackage
@@ -41,7 +215,10 @@
   (`device_group_busy`) while an earlier change of this device's in the
   device group is in flight. A rename whose commit loses a fork
   is made again on a later maintenance pass, unless another rename of that
-  device won; that one stands (D37). Refused in release builds until the roster's spec lands.
+  device won; that one stands (D37). Every roster entry this device creates,
+  its own founding entry and every linked device's, carries a fresh rename id, so
+  a device linked again after a failed link never inherits a rename kept for
+  its earlier entry. Refused in release builds until the roster's spec lands.
 - `AppGroupMlsState.convergence_parked` reports a group whose convergence
   pass spent its failure budget (mdk#2684). Show it as stuck syncing until
   new group activity arrives or the user retries;
@@ -55,11 +232,30 @@
   device then replaces its untagged KeyPackage with a tagged one. Maintenance
   drops a removed device's roster record 30 days after it was recorded.
   Release builds hold no device group and tag nothing.
+- While this device trusts a device group, it keeps each chat's read
+  position, pin, mute and archive the same on the account's devices (mdk#2628
+  item 4.3a, `features/account-sync.md`). Each maintenance pass records what
+  the user changed on this device, sends it to the siblings in small-state
+  updates (kind 475, split to fit 32,768 bytes), and applies the values they
+  sent, with the usual chat-list updates. Every device broadcasts every item
+  it holds when it starts, at least daily, whenever the device group's tip
+  passes the app-payload window since its last broadcast, and at most hourly
+  when a sibling asks with a broadcast request (kind 476). An update or
+  request that branch selection withdraws is sent again. Pin order stays per
+  device; an archived chat is never pinned, so a sibling's pin waits until the
+  chat is unarchived here. Drafts are not synced. Release builds hold no device group and
+  sync nothing.
 - `MarmotAppRuntime::linked_devices` lists this account's own devices as
   `LinkedDevice`s, from the roster of the device group this device trusts,
   this device first (mdk#2628 item 3.1). `LinkedDevicesChanged` says to
   re-read it, since the device group's own events never reach hosts. Both are
   empty and silent in release builds until the roster's spec lands.
+- Each device sends a heartbeat (kind 457) in the device group at most once
+  an hour while it runs, never with a push (mdk#2628 item 3.6). `LinkedDevice`
+  gains `last_active_at`, when a sibling's heartbeat last showed it running,
+  and `inactive`, this device's own judgement 30 days after the later of that
+  and when it first found the sibling in the roster. Release builds send and
+  show neither.
 - `MarmotAppRuntime::key_package_refresh_overdue` says when this device's
   device group has held its KeyPackage refresh back for a week (mdk#2628 item
   3.4), so hosts can tell the user before inviters stop treating the device as
@@ -70,10 +266,24 @@
   3.2): a fresh, valid KeyPackage in a slot neither this device nor its device
   group's roster knows. `answer_sign_in` takes a `SignInResponse` (Not now,
   Reject or Dismiss), and `check_sign_ins` checks now instead of at the next
-  scheduled check. A KeyPackage the roster announced for a device's slot in
+  scheduled check. A Welcome delivery naming another KeyPackage of the
+  account brings the next check forward, as a live one of its KeyPackages
+  does, whether it arrives before or after this device's own delivery of
+  that Welcome. A KeyPackage the roster announced for a device's slot in
   the last 30 days counts as that device's, even after a newer announcement
   or a rewind. `UnrecognizedSignInsChanged` says to re-read the list. All
   are empty and silent in release builds until the roster's spec lands.
+- `MarmotAppRuntime::compromise_warning` lists the account's open compromise
+  warning on this device as `CompromiseWarningItem`s (mdk#2628 item 3.7a):
+  each rejected sign-in, from this device or its device group's roster, and
+  each KeyPackage this device found in its own slot that it did not make,
+  that the user has not seen here. A device's first roster
+  counts as seen. `dismiss_compromise_warning` marks everything it gathers as
+  seen, on this device only, and `CompromiseWarningChanged` says to re-read.
+  `start_fresh` answers every sign-in from before this device Not now, now and
+  later, rejecting nothing, and `started_fresh` says whether the device did so
+  and still has no device group. All are empty, false and silent in release
+  builds until the roster's spec lands.
 - Device pairing links a new device of the account through the account runtime (mdk#2628 item 3.3b), behind the
   unreleased `unreleased-device-pairing` feature and `dev_device_groups`. The new device starts a link naming its
   published KeyPackage (`MarmotAppRuntime::start_device_link`), both devices show the same seven emoji with their
@@ -184,6 +394,10 @@
     and draws no reply.
 
 ### Changed
+
+- Sign-in checks no longer load the unused roster announcement history or
+  attach an internal `Announcement` label (mdk#2863, D81). Slot
+  classification and the own-slot compromise warning keep their behavior.
 
 - MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628).
   New KeyPackages list it. A device whose published KeyPackage does not
@@ -341,7 +555,9 @@
   it records no failed join, never becomes a rejoin offer, and leaves the
   device's KeyPackages as they were, and analytics count it as a duplicate.
   Before, a device already in a group recorded the Welcome for a sibling device
-  added later as a failed join. A rejoin offer stored by an earlier release
+  added later as a failed join. A sibling's delivery of a Welcome this device
+  already joined through its own delivery is ignored the same way; only this
+  device's own Welcome, delivered again, is a duplicate. A rejoin offer stored by an earlier release
   is still decided by its MLS Welcome alone, so one stored under a sibling's
   delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
@@ -378,11 +594,69 @@
   fixtures and `_for_test` hooks, including methods on `ProductAnalytics`
   (mdk#2627). Enable it only as a dev-dependency, as before. Builds without
   it are unchanged.
+- Diagnostics log events carry the module that emits them (mdk#2627). The
+  relay-telemetry exporter's events move from the
+  `marmot_app::relay_telemetry_export` target to
+  `marmot_observability::relay_telemetry_export`, and the app-performance
+  recorder's from `marmot_app::app_telemetry` to
+  `marmot_observability::app_telemetry`. The runtime's warning that relay
+  telemetry export was requested in a build without `otlp-export` moves from
+  `marmot_app::relay_telemetry_export` to `marmot_app::runtime`, and
+  `configure_product_analytics_from_environment`'s warning from
+  `marmot_app::product_analytics` to `marmot_app::usage_diagnostics`. A log
+  filter that named an old target must name the new one to keep its events,
+  and one that selected the whole `marmot_app` crate must add
+  `marmot_observability` to keep the exporter's and the recorder's. Every
+  event keeps its fields, level, message and `method`.
 
 ### Fixed
 
+- A device cleans up after every device its device group's roster stops
+  listing, not only one whose `removed` record it still reads (mdk#2761):
+  it removes that device's tagged leaves from chats that take a
+  same-account Remove and discards the private KeyPackages exchanged with
+  its slot. That covers a record dropped before this device acted on it,
+  including while it was away, a link that failed after the new device set
+  its tag signature key, and a made link a later branch dropped. It reads
+  those leaves by every tag signature key a roster it applied listed for
+  the slot in the last 30 days, and only once the device group is settled.
+  Untagged leaves stay, and `removed_device_leftover_chats` counts the chats
+  that take no same-account Remove and keep such a leaf. When a failed
+  link's undo takes the entry of a device the user decided to remove, the deciding device commits its
+  `removed` record alone, so siblings that never saw its key clean up too.
+  It makes that record once: not again after a roster state it applied held
+  it, even across a restart or after branch selection dropped it.
+  Release builds hold no device group.
+- Every text send a device queued while offline now publishes as soon as the
+  host reports restored connectivity (mdk#2762). The wake used to clear only
+  targets whose dial had failed. A send that a stale socket swallowed as the
+  device dropped offline is possibly exposed, so it kept its ambiguity backoff
+  of 30 s doubling to an hour, through a cold restart, and held every later
+  send in its group behind it. The wake now makes possibly-exposed targets
+  eligible too. Their retry resends the same signed event, which a relay that
+  already stored it acknowledges as a duplicate, and their attempt counts are
+  kept, so a retry that fails again resumes the backoff. Two more barriers
+  held later sends behind the first. A send that met quorum but still owed
+  another relay blocked every later retained send in its group, and set the
+  group's wakeup to its own clock. Only a send below its required
+  acknowledgements, or awaiting MLS confirmation, is a barrier now, as it
+  already was for queued sends. And a connectivity edge soon after a cold
+  start skipped groups the session had only seeded; the wake now hydrates the
+  groups that hold retained sends first. A restart that is online already
+  gets no connectivity edge from its host, and neither does a transport that
+  dies and reopens while the network stays up. So the worker also wakes unsent
+  retained sends once its startup sync succeeds and once a reopened transport
+  is ready. A transport starts even with every relay unreachable, so each
+  start or reopen costs one retry of each woken send, which keeps its attempt
+  count. Sends that met quorum keep their secondary replication schedule.
+- An invite, device link or legacy-profile group create whose Welcome cannot
+  be wrapped for the transport, such as an invite of a private KeyPackage, is
+  refused with nothing written. Each used to fail after writing its commit or
+  group record, and the record stayed. Every Add path now wraps each Welcome
+  before its first write.
 - Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, anomaly alert 462) are ignored in any other
+  request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
+  small-state update 475 and broadcast request 476) are ignored in any other
   group (mdk#2628). One received in a chat makes no timeline row, host
   message or notification, and `send_custom_event` refuses each as reserved
   (`is_reserved_app_event_kind`). The device group itself still reads them.

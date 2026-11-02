@@ -95,6 +95,7 @@ mod tests {
     use super::*;
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
+    use cgka_traits::storage::StorageError;
 
     fn evidence(completions: u32) -> StoredEpochStallEvidence {
         StoredEpochStallEvidence {
@@ -144,7 +145,10 @@ mod tests {
         let app = storage.app_storage();
         storage.put_group(&sample_group(gid(1), 1, 2)).unwrap();
         storage.lock().unwrap().execute_batch("CREATE TRIGGER reject_warning BEFORE INSERT ON app_group_recovery_failures BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
-        assert!(app.record_recovery_evidence(&[evidence(3)], 3).is_err());
+        assert!(matches!(
+            app.record_recovery_evidence(&[evidence(3)], 3),
+            Err(StorageError::Backend(message)) if message.contains("injected failure")
+        ));
         assert!(app.epoch_stall_evidence().unwrap().is_empty());
         storage
             .lock()

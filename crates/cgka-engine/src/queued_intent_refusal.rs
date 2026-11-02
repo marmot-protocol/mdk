@@ -96,6 +96,8 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
+        | EngineError::AccountEntryUnsettled { .. }
         | EngineError::InvalidTransition(_)
         | EngineError::Serialize(_)
         // Every OpenMLS error, verdicts included; see the module docs.
@@ -104,6 +106,8 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
+        | EngineError::SiblingWelcomeHeld { .. }
+        | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::Other(_) => false,
     }
@@ -114,10 +118,13 @@ impl<S: StorageProvider> Engine<S> {
     /// Run before it is queued, so the sender is answered at once rather than
     /// by a later [`GroupEvent::QueuedIntentRefused`].
     pub(crate) fn check_queued_key_packages(&self, intent: &SendIntent) -> Result<(), EngineError> {
-        let (SendIntent::Invite { key_packages, .. }
-        | SendIntent::AddOwnAccountDevices { key_packages, .. }) = intent
-        else {
-            return Ok(());
+        let key_packages: Vec<_> = match intent {
+            SendIntent::Invite { key_packages, .. } => key_packages.iter().collect(),
+            SendIntent::AddOwnAccountDevices { siblings, .. } => siblings
+                .iter()
+                .map(|sibling| &sibling.key_package)
+                .collect(),
+            _ => return Ok(()),
         };
         for key_package in key_packages {
             self.parse_key_package(key_package)?;

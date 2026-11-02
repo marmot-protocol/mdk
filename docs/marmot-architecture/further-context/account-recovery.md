@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-30
+updated: 2026-11-02
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -521,6 +521,8 @@ in `marmot-app` fills it from facts the owner already has:
 
 | Fact | Ledger effect |
 | --- | --- |
+| Every account open, with or without a transport cursor | Every current route's goal widens to its standing floor, directly in the ledger. No extra incremental-history obligation is created for the old owner when a cursor exists |
+| A route becomes current, including a group join or route addition | At the runner's routing-change settlement, before its next debt read, current routes' goals widen to their standing floors. Existing wider goals and durable coverage stay intact |
 | A live REQ's endpoint admitted and placed its whole original window, and counted the stored events its relay sent before EOSE | Live boundary on every route the filter carries, from the second after the oldest event counted (never before the REQ's `since`) through the second before the REQ went out (below); a count with no event proves nothing. Written once per generation, while it is healthy (input placed, no loss or spill hand-off pending). A generation that loss may have reached proves nothing. Released seconds stay out (below). The time since the request is a provisional tail, never written (below) |
 | A comparison certified a route at settlement | Comparison covers the frozen window on each relay that certifies the route, less every range un-covered after the grant was selected |
 | A loss import charged a generation, including a notification lag that charges no count, or a legacy clear restored one | In the import's own transaction, a generation whose every charge named its routes un-covers only those routes, each from its own bound, and widens their goals: for queue loss, every dropped delivery the relay plane placed on a route, from the earliest `created_at` dropped there; for a notification lag on the account's own SDK context, every REQ it issued with a floor and known routes, from the lowest `since` among the REQs that select the route. Any other generation un-covers every route the ledger holds from its floor up (all of it when a floor is unknown) and widens their goals to it; the recorder then widens the other current routes' goals. A generation that touches more than 256 routes counts as one that named none. A worker that observes a generation past its durable count passes the relay plane's routes for it, merged as a marker write's are; if the plane holds none, the generation names none. After a restart the relay plane counts new drops under a fresh token, so new loss always raises a count |
@@ -537,6 +539,20 @@ Welcome and sent after it is openable here yet older than the Welcome. The stand
 therefore only starts the goals that want history in general. It never retires, un-covers or
 drops debt: loss and released receipts keep their own floors, explicit repair wants the whole
 window, and goals only widen, so a later Welcome raises nothing.
+The hint is read from durable group metadata even on a deferred runtime open, before MLS
+hydration: an unavailable live accessor must not substitute the retention floor and
+permanently widen a recently joined copy's goal.
+An error reading that metadata is a preparation failure, not an absent hint. All standing
+floors are validated before any goals widen, so a later successful retry can use the actual
+Welcome floor instead of preserving an accidentally broader goal.
+
+**Coverage versus goals.** No debt means no unproven history against the goals the ledger
+holds; it says nothing about a route with no goal. Every current route therefore needs a
+standing goal, including one added after the account's first cold start. Account open seeds
+these even when the transport cursor skips the old owner's incremental-history request.
+Routing replacements wake the runner, whose next routing-change turn seeds newly current
+routes before selecting debt. With the runner gate off these ledger writes do not change
+the old owner's obligations or host-visible recovery status.
 
 **Parked remainders.** Debt the moving retention floor overtakes before anything covers it,
 and loss whose floor is unknown or older than the window, is parked rather than dropped: each
@@ -621,7 +637,8 @@ A restart or relay rebuild drops every tail, and its new REQs start at the trans
 less the rebuild lookback, which a healthy generation keeps raising past its request. The new
 generation proves only from its `since` or past the oldest event it counted, whichever is
 later, so the seconds from a route's last durable proof to that start stay owed, inside the
-retained window startup history already owes, until the runner's sweep proves them. A busy
+retained window the route's standing goal owes, until the runner's sweep proves them. This
+restart-gap debt is background sweep work and never fences live input. A busy
 route's count reaches back near its `since`, so it owes little more than the time between its
 last request and that `since`; a quiet route's count holds nothing, so it owes everything from
 its last proof through the new request. The REQs do not reach back to the last proof instead:
@@ -717,6 +734,11 @@ its next attempt time. Each quantum's outcome is one transaction:
 | Unanswered, local failure | — | — | Refunded |
 
 An attempt is charged when it begins, so a process that dies mid-quantum still counts it.
+A runner stopped mid-quantum while storage is open, by a reconnect or a dropped pass, refunds
+the attempt as unanswered instead, unless the quantum's own settle came in time. A full
+shutdown (`shutdown_and_close`) refunds the same way if storage is still open as the runner
+stops, and otherwise keeps the charge until it leaves the hour. A crash keeps the charge too,
+which caps a reply that crashes the process.
 Newer loss over a parked span earns one probe under the same park. Newer loss inside a
 retired span reopens that part whatever the unit's state: an active unit owes it as ordinary
 debt, a broken one adds it to its park with one probe, and a retired one parks it under a new
@@ -738,12 +760,19 @@ refetches nothing: the events are durable and the ledger-derived cursor is past 
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
 longer decodes, by un-covering its second so it is fetched again.
 
-### 9. The recovery runner (built, not started)
+### 9. The recovery runner (behind its gate)
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
-fetches over the ledger and the retry state above. No production path starts it before the
-switch-over, so the comparison job keeps every behavior until then. A unit is one (route,
-required relay) of a group route; a best-effort relay gets one uncharged attempt per new debt.
+fetches over the ledger and the retry state above. It runs only behind the internal
+`runner_owns_debt` gate, off until the switch-over turns it on, so the comparison job keeps
+every behavior until then. With the gate on (`recovery_runner/host.rs`), the account worker
+spawns the runner with itself, serves its turns between its other work and stops it on every
+exit, a quantum in flight included. A directly owned client runs one pass in place from
+`sync()` and from `next_event()` when it meets delivery loss. Sweeps go over the account's own
+relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
+widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
+wake only makes it read the ledger again. A unit is one (route,
+required relay) of a group route or the inbox; a best-effort relay gets one uncharged attempt per new debt.
 One step picks a unit in a worker turn and waits off the worker for one of the process's two
 recovery credits. It then begins: it reads the relay's NIP-11 caps, records known ones, reads
 the live tails again, plans the unit's owed ranges from its ledger cursor, reads the un-cover
@@ -766,8 +795,30 @@ Units are served by class: held groups, then open conversation windows and the i
 rest, then best-effort relays. Within a class each eligible unit runs once per round, smallest
 route debt first, so a large group is served every round. The runner sleeps until a bump, a
 hint change, a relay reconnect or its earliest retry time. An explicit pass runs each due unit
-once in place within a budget, as a directly owned client's `sync()` will after the switch-over.
+once in place within a budget, as a directly owned client's `sync()` does behind the gate.
 Its starting values are convergence-ledger decision A19.
+
+The runner's inputs come from the account itself. A group with a conversation window open is
+in the window class while the window holds its capture. A reconnect is a relay whose
+connection generation in the account's relay pool moved since the runner last looked: it ends
+that relay's cooldown, its caps are read again, and the survey that follows reads fresh tails.
+The runner's first look only records the generations, so a connection made before it ends
+nothing. A reconnect that a lag of the pool's notifications skipped still moves the
+generation, and a relay that leaves the pool leaves the feed. An Unrecoverable group's routes are suspended: their debt keeps accruing, but their
+units and re-checks are not scheduled, charged, broken or noticed, since a fetch would only
+fill the frozen copy's deferred input. For the same reason admission gives back what the group
+had staged, owed again, so it holds no staging bound, frontier or fence. With the gate on, the comparison owner also leaves their
+epoch-gap obligations out of its grant, so they stay ready and are never fetched. A retained
+route owes nothing past its switch plus the clock-skew allowance: members that had not applied
+the switch by then still send there, and its live subscription carries that. A relay a route
+replacement drops is retired as gone at the runner's next debt turn, once the routes still do
+not carry it and its group is terminal or still has a route: what it owed, parked or retired
+becomes a gone span that loss never reopens. A group left with no route may only be waiting to
+hydrate, so that drop is forgotten. A gone relay that the routes carry again owes its whole
+goal again; nothing else re-arms a unit when a route gains a relay. Pending drops are not kept
+across a restart, which leaves their debt inert. The account breaker reports each pause once:
+a warning, a process count, and a v5 `recovery_runner_paused` audit row with the cap, the
+hour's usage and the process totals of pauses and late findings.
 
 A unit compares instead of sweeping when its relay's recorded caps show NIP-77 and the device
 already holds events in the owed range: its retained inventory and anything staged. With
@@ -820,6 +871,12 @@ ends. A stalled group's fence stays where it is meanwhile, since the capture deb
 drop it is not swept. What a route the runner no longer lists staged is given back, its seconds owed again on
 that route, so it never holds the account's bound.
 
+Before a debt turn reads anything, the host settles pending route changes and their goals.
+A failed preparation write keeps those changes and returns a storage error instead of
+running the read or publishing a successful no-debt survey. The same local-failure backoff
+as admission and survey errors schedules another attempt, without an immediate self-wake
+or a separate retry timer. Existing capture fences stay in force while preparation waits.
+
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
 that its relay's non-empty count left unproven. An empty count's range is cold-start debt,
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
@@ -848,6 +905,34 @@ on. The recorder writes no live boundary on a held route until its frames are re
 tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
 relay plane's cursor seal stops at the oldest one its restart floor does not cover, since no
 queue holds it yet.
+
+The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
+never swept, admission takes its events as a group of their own and never fences them, and
+re-checks visit it as they do a group route. A relay that will not compare the inbox refuses
+its unit, which breaks and parks behind a notice, and keeps comparing groups. Explicit repair,
+behind the gate, is one request the account's runner owns. The runner takes it between its own
+steps, with no quantum in flight, and in one turn widens every current route's goal to the
+retention floor and re-arms every unit. Passes then run within the repair's 60 s while the
+caller serves their turns. Cancelling, or the budget running out, stops the request: a quantum
+in flight is interrupted and settles, so what it read is charged. Its verdicts are today's,
+never success. `BelowRetentionWindow` once every current route, a suspended group's left out,
+has nothing staged and its required relays' units are still active, owe nothing up to their
+live tails (a retained route's goal end, if earlier), and, on each that compares, were
+re-checked since the re-arm wherever the re-check survey owes a pass. As today, something must
+have been judged: a route with no required relay keeps the window unproven, and so does a
+repair whose every route is suspended. The caller decides a cancel first, as today, even over a
+covered window; a covered window wins over the deadline. `Cancelled` or `Deadline` when the
+caller or the budget ends it. Otherwise `CoverageUnproven` after a pass that served nothing. A
+route the ledger parks on a relay it requires is one "history may be incomplete" notice with
+the cause `UnprovenHistory`, whose id is a hash of the route with its park revision; a group
+route's also shows in that group's status. A park on a relay the route now carries only as best
+effort, or no longer, raises none. What a notice shows, its revision (the newest park among
+them) and what dismissing it retires are one set, so such a park moves no revision and is never
+dismissed. A remainder is a notice only once the runner has surveyed and catches up nothing on
+its route. A suspended (Unrecoverable) group's routes give no notice. Each survey
+publishes the required units still catching up; the account's recovery status reads that, and
+a change in it or in the notices is one `RecoveryStatusChanged`. With the gate off none of this
+shows.
 
 ## What gets deleted
 

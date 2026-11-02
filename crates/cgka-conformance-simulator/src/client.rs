@@ -1136,11 +1136,7 @@ impl HarnessStorageBacking {
             // skip SQLCipher's per-allocation mlock and wipe: there is no key
             // material to protect.
             Self::InMemory => {
-                SqliteAccountStorage::in_memory_from_migrated_template(SqliteStorageOptions {
-                    cipher_memory_security: false,
-                    ..SqliteStorageOptions::default()
-                })
-                .map_err(|err| err.to_string())
+                SqliteAccountStorage::in_memory_for_test().map_err(|err| err.to_string())
             }
             Self::FileBacked {
                 path, key, options, ..

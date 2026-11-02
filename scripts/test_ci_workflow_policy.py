@@ -134,12 +134,12 @@ class MergeGatePolicyTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, expected)
 
     def test_full_runs_use_nextest_profiles_without_a_default_filter(self):
-        # The merge queue is the only gate that runs tests, so a profile filter
-        # would silently drop coverage from master.
+        # The merge queue is the only gate that runs every test to the end, so a
+        # profile filter would silently drop coverage from master.
         profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         used = set(re.findall(r"--profile (\S+)", workflow)) - {"minimal"}
-        self.assertEqual(used, {"ci", "default"})
+        self.assertEqual(used, {"ci", "default", "precheck"})
         for profile in used:
             with self.subTest(profile=profile):
                 config = profiles.get(profile, {})
@@ -147,6 +147,26 @@ class MergeGatePolicyTests(unittest.TestCase):
                 # Platform overrides can set their own default-filter.
                 for override in config.get("overrides", []):
                     self.assertNotIn("default-filter", override)
+
+    def test_only_the_pre_check_counts_a_stopped_test_as_passed(self):
+        # A test that passes on timeout never finishes, so only the pull-request
+        # pre-check may select a profile that allows it.
+        profiles = tomllib.loads((ROOT / ".config/nextest.toml").read_text())["profile"]
+        for name, config in profiles.items():
+            timeouts = [config.get("slow-timeout")]
+            timeouts += [override.get("slow-timeout") for override in config.get("overrides", [])]
+            passes = any(isinstance(t, dict) and t.get("on-timeout") == "pass" for t in timeouts)
+            with self.subTest(profile=name):
+                self.assertEqual(passes, name == "precheck")
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        steps = [step for step in workflow.split("\n      - name: ")[1:] if "--profile precheck" in step]
+        self.assertEqual(len(steps), 1)
+        self.assertIn("\n        if: needs.changes.outputs.ci_mode == 'precheck'\n", steps[0])
+        # The job holding that step must still start for a pre-check, or the
+        # pre-check silently loses its tests: it accepts skipped jobs.
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        job = next(block for block in re.split(r"(?m)^  (?=[a-z0-9-]+:$)", jobs) if "--profile precheck" in block)
+        self.assertRegex(job, r"(?m)^    if: needs\.changes\.outputs\.run_full == 'true'$")
 
     def test_required_ci_aggregates_every_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -274,6 +294,37 @@ class MergeGatePolicyTests(unittest.TestCase):
                                                          "REFUSED_CANCELS": str(refused), **env})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((state / "calls").read_text().splitlines(), expected)
+
+
+class CacheBudgetPolicyTests(unittest.TestCase):
+    def test_only_ci_and_the_wn_agent_darwin_builds_save_rust_caches(self):
+        # GitHub evicts the least recently used caches past 10 GB. Another
+        # saving workflow would push out the caches CI restores (ci.yml header).
+        saving = set()
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+            for step in workflow.read_text().split("\n      - ")[1:]:
+                if "uses: Swatinem/rust-cache@" not in step:
+                    continue
+                save_if = re.search(r"(?m)^          save-if: (.+)$", step)
+                # rust-cache saves unless save-if says otherwise.
+                save_if = save_if.group(1) if save_if else "true"
+                with self.subTest(workflow=workflow.name, step=step.splitlines()[0]):
+                    if save_if == "false":
+                        continue
+                    saving.add(workflow.name)
+                    # Pull requests and merge groups only restore.
+                    self.assertEqual(save_if, "${{ github.ref == 'refs/heads/master' }}")
+                    if workflow.name == "wn-agent-binaries.yml":
+                        self.assertRegex(step, r"(?m)^        if: runner\.os == 'macOS'$")
+        self.assertEqual(saving, {"ci.yml", "wn-agent-binaries.yml"})
+
+    def test_binding_packages_build_from_a_clean_target_directory(self):
+        for workflow in ("bindings.yaml", "bindings-profile.yml", "c-bindings.yml"):
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertNotIn("Swatinem/rust-cache", text)
+                self.assertNotIn("actions/cache", text)
+
 
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""

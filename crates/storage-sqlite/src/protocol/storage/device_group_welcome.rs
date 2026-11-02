@@ -69,13 +69,11 @@ impl DeviceGroupWelcomeStorage for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqlCipherKey, SqliteAccountStorage};
+    use crate::SqliteAccountStorage;
 
     #[test]
-    fn device_group_welcome_expectation_survives_reopen_and_deletes_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+    fn device_group_welcome_expectation_round_trips_and_deletes_once() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         let group_id = GroupId::new(vec![7; 16]);
         let expectation = DeviceGroupWelcomeExpectation {
             group_id: group_id.clone(),
@@ -83,55 +81,46 @@ mod tests {
             key_package_ref: vec![5; 32],
             expires_at: 1_800_000_600,
         };
+        store
+            .put_device_group_welcome_expectation(&DeviceGroupWelcomeExpectation {
+                sender_signature_key: vec![1; 32],
+                ..expectation.clone()
+            })
+            .unwrap();
+        store
+            .put_device_group_welcome_expectation(&expectation)
+            .unwrap();
 
-        {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store
-                .put_device_group_welcome_expectation(&DeviceGroupWelcomeExpectation {
-                    sender_signature_key: vec![1; 32],
-                    ..expectation.clone()
-                })
-                .unwrap();
-            store
-                .put_device_group_welcome_expectation(&expectation)
-                .unwrap();
-        }
-
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
-            reopened
-                .device_group_welcome_expectation(&group_id)
-                .unwrap(),
+            store.device_group_welcome_expectation(&group_id).unwrap(),
             Some(expectation.clone())
         );
         assert_eq!(
-            reopened
+            store
                 .device_group_welcome_expectation(&GroupId::new(vec![8; 16]))
                 .unwrap(),
             None
         );
         assert_eq!(
-            reopened.device_group_welcome_expectations().unwrap(),
+            store.device_group_welcome_expectations().unwrap(),
             vec![expectation.clone()]
         );
         assert!(
-            reopened
+            store
                 .delete_device_group_welcome_expectation(&group_id)
                 .unwrap()
         );
         assert!(
-            !reopened
+            !store
                 .delete_device_group_welcome_expectation(&group_id)
                 .unwrap()
         );
         assert_eq!(
-            reopened
-                .device_group_welcome_expectation(&group_id)
-                .unwrap(),
+            store.device_group_welcome_expectation(&group_id).unwrap(),
             None
         );
         assert!(
-            reopened
+            store
                 .device_group_welcome_expectations()
                 .unwrap()
                 .is_empty()

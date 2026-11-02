@@ -7,8 +7,12 @@
 //!   and a `client` tag only labels one. A check that reached no relay proves
 //!   nothing.
 //! - **When.** At open, every six hours, on a live KeyPackage of this account
-//!   from the directory subscription (a nudge only: the check's read is the
-//!   evidence), and when the host asks.
+//!   from the directory subscription or a Welcome delivery naming another
+//!   KeyPackage of this account (nudges only: the check's read is the
+//!   evidence), and when the host asks. A KeyPackage is addressable, so one
+//!   a Welcome names is still served only as its slot's newest publication,
+//!   which the check reads. A nudge before the first check counts for
+//!   nothing: the first check comes anyway and takes the baseline.
 //! - **Before or after this device.** This device's first check takes a
 //!   baseline: every slot its read returns, whether or not the slot counts
 //!   then, is a device that was here first ("do you still have it?"). Every
@@ -28,10 +32,8 @@
 //!   no entry for the slot, and it never replaces an entry.
 //! - **Slots.** A slot is its `d` exactly as published, compared as bytes the
 //!   way relays compare it. A rejection names the slot alone, never its
-//!   KeyPackage, and a rejected KeyPackage never makes another slot rejected:
-//!   whoever holds the account key can copy any KeyPackage, a real device's
-//!   included, into a slot the user rejects. Rejected KeyPackages are Scene
-//!   8's (3.7).
+//!   KeyPackage: whoever holds the account key can copy any KeyPackage, a
+//!   real device's included, into a slot the user rejects.
 //! - **Any one device's answer.** A prompt for a slot another device linked or
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
@@ -47,8 +49,23 @@
 //!   it out. A current publication there that this device never authored,
 //!   compared by event id and whatever it holds, is `OwnSlotForeign`: the
 //!   runtime replaces it with a newer KeyPackage of its own, or deletes it by
-//!   id when it is dated too far ahead to outrank (D63). An incomplete read
-//!   still acts on what it found, and the check runs again within the hour.
+//!   id when it is dated too far ahead to outrank (D63). A relay that
+//!   accepted this device's current publication and, read to its end,
+//!   serves nothing in the slot was emptied by a deletion; the runtime
+//!   publishes a new KeyPackage there too, at most once a day and, with a
+//!   device group, only while its roster lists this device. Only a relay's
+//!   finished read shows it empty, even when no relay returned anything
+//!   else. An incomplete read still acts on what it found, and the check
+//!   runs again within the hour.
+//! - **A KeyPackage this device did not make** (3.7b). Before it replaces a
+//!   foreign publication there, the device raises the compromise warning,
+//!   on this device only, for each valid current-profile KeyPackage of the
+//!   account in one whose LeafNode signature key is not this device's. This
+//!   device's signature key never changes, so a copy of a KeyPackage it made
+//!   (from before a restored backup, or before its device group) never
+//!   warns; nor does an invalid publication. A copy of this device's own
+//!   KeyPackage gains whoever published it nothing: only this device can
+//!   open a Welcome to it.
 //!
 //! Everything here runs only while device groups are on.
 
@@ -58,11 +75,8 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
-use cgka_traits::storage::{
-    ANNOUNCED_KEY_PACKAGE_RETENTION_SECS, AnnouncedKeyPackage, AnnouncedKeyPackageStorage as _,
-    MaintenanceStorage as _,
-};
-use cgka_traits::{GroupId, MessageId, Timestamp};
+use cgka_traits::storage::MaintenanceStorage as _;
+use cgka_traits::{MessageId, Timestamp, TransportEndpoint};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
 use nostr_directory::OwnSlotRead;
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
@@ -143,29 +157,11 @@ pub(crate) enum SlotOutcome {
     OwnSlot,
     /// This device's slot, holding a KeyPackage it did not make.
     OwnSlotForeign,
-    /// A roster device's slot. `announced` compares the KeyPackage with
-    /// every one a roster of the trusted device group announced for that
-    /// slot, now or in any roster state this device applied in the last 30
-    /// days (D31 item 7). A device announces each KeyPackage before
-    /// publishing it (3.4), so a slot still serving an earlier one matches.
-    KnownDevice {
-        announced: Announcement,
-    },
-    /// A slot the roster or this device rejected, or a rejected KeyPackage
-    /// in a roster device's slot.
+    /// A roster device's slot.
+    KnownDevice,
+    /// A slot the roster or this device rejected.
     Rejected,
     Unrecognized,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Announcement {
-    /// A roster announced this KeyPackage for the slot.
-    Matches,
-    /// No roster announced it, and the slot's entry announces another.
-    Differs,
-    /// No roster announced it, and the slot's entry announces none.
-    None,
 }
 
 /// What one check found: each slot's outcome, by slot.
@@ -180,6 +176,9 @@ pub(crate) struct SignInCheckReport {
     /// What the runtime did about publications in this device's slot that
     /// it did not make.
     pub(crate) foreign: ForeignSlotOutcome,
+    /// A relay that accepted this device's current publication serves
+    /// nothing in its slot, so the runtime made a new KeyPackage due.
+    pub(crate) refilling: bool,
 }
 
 /// When an account's devices next check for sign-ins. Ephemeral: a new
@@ -190,14 +189,25 @@ pub(crate) struct SignInSchedule {
     pub(crate) last: Option<Instant>,
 }
 
-/// Live KeyPackages of local accounts, from the directory subscription, that
-/// their clients have not checked yet. Only an account whose client has
-/// checked is tracked, so other accounts' KeyPackages cost nothing.
+#[cfg(all(test, feature = "test-policy-overrides"))]
+impl SignInSchedule {
+    /// Move the schedule back by `by`, as if that much time passed.
+    pub(crate) fn rewind(&mut self, by: Duration) {
+        self.last = self.last.and_then(|last| last.checked_sub(by));
+        self.due = self.due.and_then(|due| due.checked_sub(by));
+    }
+}
+
+/// Live KeyPackages of local accounts, from the directory subscription, and
+/// Welcome deliveries naming another KeyPackage of the account, that their
+/// clients have not checked yet. Only an account whose client has checked is
+/// tracked, so other accounts' KeyPackages cost nothing.
 #[derive(Debug, Default)]
 pub(crate) struct SignInNudges(std::sync::Mutex<BTreeMap<String, bool>>);
 
 impl SignInNudges {
-    /// A KeyPackage `account_id_hex` published arrived live.
+    /// A KeyPackage `account_id_hex` published arrived live, or a Welcome
+    /// named one this device did not publish.
     pub(crate) fn nudge(&self, account_id_hex: &str) {
         if let Ok(mut accounts) = self.0.lock()
             && let Some(nudged) = accounts.get_mut(account_id_hex)
@@ -215,12 +225,13 @@ impl SignInNudges {
     }
 }
 
-/// This device's slot and every publication it made that may still be
-/// served there, by event id.
+/// This device's slot, every publication it made that may still be served
+/// there, by event id, and the relays its current one went to.
 #[derive(Debug, Default)]
 struct OwnKeyPackages {
     slot: Option<String>,
     events: BTreeSet<String>,
+    targets: Vec<TransportEndpoint>,
 }
 
 impl AppClient {
@@ -277,14 +288,14 @@ impl AppClient {
             .app
             .read_account_key_package_slots(&self.state.label, own.slot.as_deref())
             .await?;
+        let trusted = self.trusted_device_roster()?;
         if !read.reached {
+            // A relay whose own read finished still shows the slot empty,
+            // though no relay returned any of the account's publications.
+            let roster = trusted.as_ref().map(|(_, roster)| roster);
+            self.refill_own_slot(&own, read.own_slot.as_ref(), roster)?;
             return Err(AppError::DeviceGroupRefused("key_packages_unreachable"));
         }
-        let trusted = self.trusted_device_roster()?;
-        let announced = match &trusted {
-            Some((group_id, _)) => self.announced_key_packages(group_id)?,
-            None => BTreeSet::new(),
-        };
         let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
@@ -294,6 +305,7 @@ impl AppClient {
             complete: read.complete,
             own_slot_complete: read.own_slot.as_ref().is_none_or(|own| own.complete),
             foreign: ForeignSlotOutcome::default(),
+            refilling: false,
         };
         let mut unrecognized = Vec::new();
         for slot_key_package in read.key_packages {
@@ -302,10 +314,8 @@ impl AppClient {
             let outcome = classify(
                 &slot_hex,
                 &fetched.key_package_event_id,
-                &fetched.key_package_ref_hex,
                 &own,
                 roster.as_ref(),
-                &announced,
                 &rejected_here,
             );
             if outcome == SlotOutcome::Unrecognized {
@@ -341,6 +351,23 @@ impl AppClient {
                 report
                     .slots
                     .insert(slot_hex.to_owned(), SlotOutcome::OwnSlotForeign);
+                // Warn before replacing, so a failed write leaves the
+                // publication for the next check to find.
+                let not_made = key_packages_not_made_here(
+                    slot_hex,
+                    own_read,
+                    &own,
+                    &self.runtime.own_signature_key(),
+                );
+                if !not_made.is_empty()
+                    && storage.record_foreign_own_slot_key_packages(
+                        slot_hex,
+                        &not_made,
+                        unix_now_seconds(),
+                    )?
+                {
+                    self.compromise_warning_changed = true;
+                }
                 report.foreign = self
                     .runtime
                     .replace_foreign_slot_publications(&foreign)
@@ -351,7 +378,45 @@ impl AppClient {
                     .insert(slot_hex.to_owned(), SlotOutcome::OwnSlot);
             }
         }
+        report.refilling = self.refill_own_slot(&own, read.own_slot.as_ref(), roster.as_ref())?;
         Ok(report)
+    }
+
+    /// Publish a new KeyPackage into this device's slot when a relay that
+    /// accepted its current publication, read to its end, serves nothing
+    /// there, while its device group lists it. See the module docs.
+    fn refill_own_slot(
+        &mut self,
+        own: &OwnKeyPackages,
+        own_read: Option<&OwnSlotRead>,
+        roster: Option<&DeviceRosterV1>,
+    ) -> Result<bool, AppError> {
+        let (Some(slot_hex), Some(own_read)) = (own.slot.as_deref(), own_read) else {
+            return Ok(false);
+        };
+        if !self.listed_as_device(slot_hex, roster)? {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime
+            .refill_emptied_slot(&emptied_targets(&own.targets, &own_read.empty))?)
+    }
+
+    /// Whether this device's device group lets it refill its slot: always
+    /// with no trusted device group, and with one only while its trusted
+    /// roster lists this device's slot as a device. A copy that ended, as
+    /// one does when this device's siblings remove it (3.6b), lists nothing.
+    /// Once the device forgets such a copy, nothing here remembers it: what
+    /// a removed device does with its slot is 3.6b's (its own side).
+    fn listed_as_device(
+        &self,
+        slot_hex: &str,
+        roster: Option<&DeviceRosterV1>,
+    ) -> Result<bool, AppError> {
+        if let Some(roster) = roster {
+            return Ok(roster_slot(slot_hex).is_some_and(|slot| roster.devices.contains_key(&slot)));
+        }
+        Ok(self.trusted_device_group()?.is_none())
     }
 
     /// Check now, for the host, and restart the schedule from this check as
@@ -447,6 +512,9 @@ impl AppClient {
             return Err(AppError::DeviceGroupRefused("sign_in_answered"));
         }
         self.unrecognized_sign_ins_changed = true;
+        if to == SignInAnswer::Rejected {
+            self.note_compromise_warning_due();
+        }
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
         {
@@ -458,6 +526,43 @@ impl AppClient {
             );
         }
         Ok(())
+    }
+
+    /// Start this device without the devices its first check found (D54,
+    /// Scene 3): Not now for each of them, now and for one first listed
+    /// later. It rejects nothing and raises no warning, so one of them can
+    /// still link this device. Refused before the first check
+    /// (`sign_ins_unchecked`) and once this device trusts a device group
+    /// (`device_group_exists`).
+    pub(crate) fn start_fresh(&mut self) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Err(AppError::DeviceGroupRefused("roster_unsupported"));
+        }
+        if self.trusted_device_group()?.is_some() {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        match storage.start_fresh(unix_now_seconds())? {
+            None => Err(AppError::DeviceGroupRefused("sign_ins_unchecked")),
+            Some(changed) => {
+                self.unrecognized_sign_ins_changed |= changed;
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this device started fresh and still trusts no device group,
+    /// so the host can say that only chats it is invited to from now on are
+    /// here. False while device groups are off.
+    pub(crate) fn started_fresh(&mut self) -> Result<bool, AppError> {
+        if !self.app.device_groups_enabled() || self.trusted_device_group()?.is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .started_fresh()?)
     }
 
     /// Commit every rejection this device made that the trusted device
@@ -581,22 +686,6 @@ impl AppClient {
         Ok(())
     }
 
-    /// What rosters of the device group `group_id` announced within a
-    /// KeyPackage's lifetime (D31 item 7). The engine records them as it
-    /// applies each roster state.
-    fn announced_key_packages(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<BTreeSet<AnnouncedKeyPackage>, AppError> {
-        let since = unix_now_seconds().saturating_sub(ANNOUNCED_KEY_PACKAGE_RETENTION_SECS);
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .announced_key_packages(group_id, since)?
-            .into_iter()
-            .collect())
-    }
-
     fn own_key_packages(&self) -> Result<OwnKeyPackages, AppError> {
         let Some(lifecycle) = self
             .app
@@ -628,6 +717,11 @@ impl AppClient {
             // its slot empty: there is no slot of its own to read yet.
             slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
+            targets: lifecycle
+                .publication_targets
+                .into_iter()
+                .map(|target| target.endpoint)
+                .collect(),
         })
     }
 }
@@ -651,18 +745,15 @@ fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
         .collect()
 }
 
-/// How a check classifies the publication `event_id_hex`, holding the
-/// KeyPackage `key_package_ref_hex`, in `slot_hex`. In this device's own slot
-/// only the publication counts: one this device did not author is foreign,
-/// whatever KeyPackage it holds, its own earlier ones included. `announced`
-/// is what `roster`'s group announced before.
+/// How a check classifies the publication `event_id_hex` in `slot_hex`.
+/// In this device's own slot only the publication counts: one this device
+/// did not author is foreign,
+/// whatever KeyPackage it holds, its own earlier ones included.
 fn classify(
     slot_hex: &str,
     event_id_hex: &str,
-    key_package_ref_hex: &str,
     own: &OwnKeyPackages,
     roster: Option<&DeviceRosterV1>,
-    announced: &BTreeSet<AnnouncedKeyPackage>,
     rejected_slots: &BTreeSet<String>,
 ) -> SlotOutcome {
     if own.slot.as_deref() == Some(slot_hex) {
@@ -673,43 +764,15 @@ fn classify(
         };
     }
     let slot = roster_slot(slot_hex);
-    let key_package_ref = hex::decode(key_package_ref_hex).ok();
     if roster
         .is_some_and(|roster| slot.is_some_and(|slot| roster.rejected_slots.contains_key(&slot)))
     {
         return SlotOutcome::Rejected;
     }
-    let device = roster.zip(slot).and_then(|(roster, slot)| {
-        roster
-            .devices
-            .get(&slot)
-            .map(|device| (roster, slot, device))
-    });
-    if let Some((roster, slot, device)) = device {
-        // A rejected KeyPackage in a device's slot is rejected, not the device.
-        if key_package_ref.as_ref().is_some_and(|key_package_ref| {
-            roster.rejected_key_packages.contains_key(key_package_ref)
-        }) {
-            return SlotOutcome::Rejected;
-        }
-        let seen = key_package_ref.is_some_and(|key_package_ref| {
-            device.announced_key_package.as_ref() == Some(&key_package_ref)
-                || announced.contains(&AnnouncedKeyPackage {
-                    slot,
-                    key_package_ref,
-                })
-        });
-        return SlotOutcome::KnownDevice {
-            announced: if seen {
-                Announcement::Matches
-            } else if device.announced_key_package.is_some() {
-                Announcement::Differs
-            } else {
-                Announcement::None
-            },
-        };
+    if roster.is_some_and(|roster| slot.is_some_and(|slot| roster.devices.contains_key(&slot))) {
+        return SlotOutcome::KnownDevice;
     }
-    // A rejected KeyPackage elsewhere rejects nothing here: it may be a real
+    // A rejection names the slot alone: its KeyPackage may be a real
     // device's, copied into the slot the user rejected.
     if rejected_slots.contains(slot_hex) {
         SlotOutcome::Rejected
@@ -729,15 +792,8 @@ fn foreign_slot_publications(
     read.current
         .iter()
         .filter(|publication| {
-            classify(
-                slot_hex,
-                &publication.event_id,
-                "",
-                own,
-                None,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-            ) == SlotOutcome::OwnSlotForeign
+            classify(slot_hex, &publication.event_id, own, None, &BTreeSet::new())
+                == SlotOutcome::OwnSlotForeign
         })
         .filter_map(|publication| {
             Some(ForeignSlotPublication {
@@ -745,6 +801,50 @@ fn foreign_slot_publications(
                 created_at: Timestamp(publication.created_at),
             })
         })
+        .collect()
+}
+
+/// The `KeyPackageRef` of each valid KeyPackage of the account in a foreign
+/// publication in this device's slot, `slot_hex`, that this device did not
+/// make: its LeafNode's signature key is not this device's, which never
+/// changes. A copy of a KeyPackage this device made, from before a backup
+/// it was restored from or before its device group, is its own; so is an
+/// invalid publication, which holds no KeyPackage at all.
+fn key_packages_not_made_here(
+    slot_hex: &str,
+    read: &OwnSlotRead,
+    own: &OwnKeyPackages,
+    own_signature_key: &[u8],
+) -> Vec<String> {
+    read.current
+        .iter()
+        .filter(|publication| {
+            classify(slot_hex, &publication.event_id, own, None, &BTreeSet::new())
+                == SlotOutcome::OwnSlotForeign
+        })
+        .filter_map(|publication| publication.key_package.as_ref())
+        .filter(|key_package| key_package.leaf_signature_key != own_signature_key)
+        .map(|key_package| key_package.key_package_ref_hex.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Each of `targets`, the relays this device's current publication went to
+/// as its lifecycle names them, that the read found serving nothing in the
+/// slot (`empty`), however the read spelled it.
+fn emptied_targets(
+    targets: &[TransportEndpoint],
+    empty: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let empty = empty
+        .iter()
+        .map(|relay| transport_nostr::canonical_relay(relay.as_str()))
+        .collect::<BTreeSet<_>>();
+    targets
+        .iter()
+        .filter(|target| empty.contains(&transport_nostr::canonical_relay(target.as_str())))
+        .cloned()
         .collect()
 }
 
@@ -851,7 +951,7 @@ fn rejected_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cgka_traits::app_components::{DeviceEntryV1, RejectedKeyPackageV1};
+    use cgka_traits::app_components::DeviceEntryV1;
 
     fn slot(byte: u8) -> String {
         hex::encode([byte; 32])
@@ -905,13 +1005,6 @@ mod tests {
                 tag_signature_key: None,
             },
         );
-        roster.rejected_key_packages.insert(
-            vec![9; 32],
-            RejectedKeyPackageV1 {
-                slot: [2; 32],
-                rejected_at: 1,
-            },
-        );
         roster
     }
 
@@ -919,101 +1012,55 @@ mod tests {
         hex::encode([byte; 32])
     }
 
+    /// An empty relay is matched to the publication target that names it,
+    /// however either spells it, and a relay this device never published
+    /// to is no target.
     #[test]
-    fn a_slot_is_classified_by_its_slot_and_key_package() {
+    fn an_emptied_relay_is_named_as_its_publication_target() {
+        let endpoint = |url: &str| TransportEndpoint(url.to_owned());
+        let targets = [
+            endpoint("wss://relay.example"),
+            endpoint("wss://kept.example"),
+        ];
+        assert_eq!(
+            emptied_targets(
+                &targets,
+                &[
+                    endpoint("WSS://Relay.Example:443/"),
+                    endpoint("wss://elsewhere.example")
+                ],
+            ),
+            [endpoint("wss://relay.example")]
+        );
+        assert!(emptied_targets(&targets, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_slot_is_classified_by_its_slot_and_publication() {
         let own = OwnKeyPackages {
             slot: Some(slot(1)),
             events: BTreeSet::from([event(1)]),
+            ..Default::default()
         };
         let roster = roster();
-        let none = Default::default();
-        // Earlier roster states announced 6 for slot 2, 8 for slot 4 and 5
-        // for slot 5, which the roster does not list.
-        let announced = BTreeSet::from([
-            AnnouncedKeyPackage {
-                slot: [2; 32],
-                key_package_ref: vec![6; 32],
-            },
-            AnnouncedKeyPackage {
-                slot: [4; 32],
-                key_package_ref: vec![8; 32],
-            },
-            AnnouncedKeyPackage {
-                slot: [5; 32],
-                key_package_ref: vec![5; 32],
-            },
-        ]);
-        let classify = |slot_byte, key_package_byte, roster| {
-            classify(
-                &slot(slot_byte),
-                &event(key_package_byte),
-                &key_package(key_package_byte),
-                &own,
-                roster,
-                &announced,
-                &none,
-            )
+        let none = BTreeSet::new();
+        let classify = |slot_byte, event_byte, roster| {
+            super::classify(&slot(slot_byte), &event(event_byte), &own, roster, &none)
         };
         // In this device's own slot only the publication counts.
         assert_eq!(classify(1, 1, Some(&roster)), SlotOutcome::OwnSlot);
         assert_eq!(classify(1, 7, Some(&roster)), SlotOutcome::OwnSlotForeign);
-        assert_eq!(
-            super::classify(
-                &slot(1),
-                &event(7),
-                &key_package(1),
-                &own,
-                None,
-                &BTreeSet::new(),
-                &none
-            ),
-            SlotOutcome::OwnSlotForeign
-        );
-        assert_eq!(
-            classify(2, 2, Some(&roster)),
-            SlotOutcome::KnownDevice {
-                announced: Announcement::Matches
-            }
-        );
-        assert_eq!(
-            classify(2, 7, Some(&roster)),
-            SlotOutcome::KnownDevice {
-                announced: Announcement::Differs
-            }
-        );
-        assert_eq!(
-            classify(4, 7, Some(&roster)),
-            SlotOutcome::KnownDevice {
-                announced: Announcement::None
-            }
-        );
-        // A KeyPackage an earlier roster announced for the slot matches, even
-        // after the entry moved on or announces none (D31 item 7).
-        for (slot_byte, key_package_byte) in [(2, 6), (4, 8)] {
+        assert_eq!(classify(1, 7, None), SlotOutcome::OwnSlotForeign);
+        // Every listed device is known, whether its entry announces a
+        // KeyPackage or not.
+        for slot_byte in [2, 4] {
             assert_eq!(
-                classify(slot_byte, key_package_byte, Some(&roster)),
-                SlotOutcome::KnownDevice {
-                    announced: Announcement::Matches
-                }
+                classify(slot_byte, 7, Some(&roster)),
+                SlotOutcome::KnownDevice
             );
         }
-        // An announcement counts for its own slot only.
-        assert_eq!(
-            classify(2, 8, Some(&roster)),
-            SlotOutcome::KnownDevice {
-                announced: Announcement::Differs
-            }
-        );
-        // A rejected KeyPackage in a device's slot is rejected, not the
-        // device.
-        assert_eq!(classify(2, 9, Some(&roster)), SlotOutcome::Rejected);
         assert_eq!(classify(3, 3, Some(&roster)), SlotOutcome::Rejected);
-        // An announcement never makes a slot the roster does not list known.
         assert_eq!(classify(5, 5, Some(&roster)), SlotOutcome::Unrecognized);
-        // A rejected KeyPackage in any other slot leaves that slot a sign-in.
-        assert_eq!(classify(5, 9, Some(&roster)), SlotOutcome::Unrecognized);
-        // Without a roster, every other slot is unrecognized unless rejected
-        // here.
         assert_eq!(classify(2, 2, None), SlotOutcome::Unrecognized);
         // A slot is its `d` as published: another spelling of a device's slot
         // is not that device.
@@ -1022,44 +1069,22 @@ mod tests {
             .devices
             .insert([0xab; 32], DeviceEntryV1::default());
         for (spelling, outcome) in [
-            (
-                slot(0xab),
-                SlotOutcome::KnownDevice {
-                    announced: Announcement::None,
-                },
-            ),
+            (slot(0xab), SlotOutcome::KnownDevice),
             (slot(0xab).to_uppercase(), SlotOutcome::Unrecognized),
         ] {
             assert_eq!(
-                super::classify(
-                    &spelling,
-                    &event(7),
-                    &key_package(7),
-                    &own,
-                    Some(&with_letters),
-                    &BTreeSet::new(),
-                    &none
-                ),
+                super::classify(&spelling, &event(7), &own, Some(&with_letters), &none),
                 outcome
             );
         }
-        // A slot rejected here is rejected whatever it holds; its KeyPackage
-        // in another slot leaves that slot a sign-in.
+        // A local rejection names only its slot, never the publication.
         let here = rejected_slots_here(&[record(5, SignInAnswer::Rejected, false)]);
-        for (slot_byte, key_package_byte, outcome) in [
+        for (slot_byte, event_byte, outcome) in [
             (5, 6, SlotOutcome::Rejected),
             (6, 5, SlotOutcome::Unrecognized),
         ] {
             assert_eq!(
-                super::classify(
-                    &slot(slot_byte),
-                    &event(key_package_byte),
-                    &key_package(key_package_byte),
-                    &own,
-                    None,
-                    &BTreeSet::new(),
-                    &here
-                ),
+                super::classify(&slot(slot_byte), &event(event_byte), &own, None, &here),
                 outcome
             );
         }

@@ -12,6 +12,7 @@
 //! follows goes on. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
     RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
@@ -424,11 +425,15 @@ fn observe_live_counts(
     (input_placed, facts, present)
 }
 
-/// A route the account currently subscribes, with the relays that certify it.
+/// A route the account currently subscribes, with the relays that certify it
+/// and its other admitted relays.
 struct CurrentRoute {
     route: TransportReconciliationRoute,
     group_id: Option<Vec<u8>>,
     required: Vec<String>,
+    best_effort: Vec<String>,
+    /// A retained prior route's goal end ([`crate::retained_route_goal_until`]).
+    goal_until: Option<u64>,
 }
 
 /// The ledger keys relays by one spelling: the adapter and the scope plans
@@ -529,31 +534,146 @@ impl AppClient {
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
-        let required = |endpoints: &[cgka_traits::TransportEndpoint]| {
-            let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            relays(&transport_nostr::recovery_required_endpoints(
-                &admitted, operated,
-            ))
-        };
-        let mut routes = vec![CurrentRoute {
-            route: TransportReconciliationRoute::Inbox,
-            group_id: None,
-            required: required(&routing.local_inbox_endpoints),
-        }];
+        let current =
+            |route, group_id, endpoints: &[cgka_traits::TransportEndpoint], goal_until| {
+                let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
+                let required = relays(&transport_nostr::recovery_required_endpoints(
+                    &admitted, operated,
+                ));
+                let best_effort = relays(&admitted)
+                    .into_iter()
+                    .filter(|relay| !required.contains(relay))
+                    .collect();
+                CurrentRoute {
+                    route,
+                    group_id,
+                    required,
+                    best_effort,
+                    goal_until,
+                }
+            };
+        let mut routes = vec![current(
+            TransportReconciliationRoute::Inbox,
+            None,
+            &routing.local_inbox_endpoints,
+            None,
+        )];
         let mut seen = HashSet::new();
         for entry in &routing.group_routes {
             let Ok(id) = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()) else {
                 continue;
             };
             if seen.insert(id) {
-                routes.push(CurrentRoute {
-                    route: TransportReconciliationRoute::Group(id),
-                    group_id: Some(entry.group_id.as_slice().to_vec()),
-                    required: required(&entry.endpoints),
-                });
+                routes.push(current(
+                    TransportReconciliationRoute::Group(id),
+                    Some(entry.group_id.as_slice().to_vec()),
+                    &entry.endpoints,
+                    entry.retained_since.map(crate::retained_route_goal_until),
+                ));
             }
         }
         routes
+    }
+
+    /// The account's current routes as its recovery runner reads them, once
+    /// per debt turn (mdk#2660 phase 4).
+    pub(crate) fn recovery_runner_routes(&self) -> Vec<super::recovery_runner::RunnerRoute> {
+        let windows = self.open_conversation_groups();
+        self.current_coverage_routes()
+            .into_iter()
+            .map(|current| super::recovery_runner::RunnerRoute {
+                unrecoverable: current
+                    .group_id
+                    .as_deref()
+                    .is_some_and(|group_id| self.group_unrecoverable(group_id)),
+                window: current
+                    .group_id
+                    .as_ref()
+                    .is_some_and(|group_id| windows.contains(group_id)),
+                route: current.route,
+                group_id: current.group_id,
+                required: current.required,
+                best_effort: current.best_effort,
+                goal_until: current.goal_until,
+            })
+            .collect()
+    }
+
+    /// Settle what routing replacements changed since the recovery runner's
+    /// last debt turn (mdk#2660 section 3), giving every current route its
+    /// standing goal before the turn reads debt. A (route, relay) a replacement
+    /// dropped is retired as gone once this turn confirms it: the routes still
+    /// do not carry it, and its group is terminal or still has a route
+    /// installed (the inbox: still has a relay). A group left with none may
+    /// only be waiting to hydrate, so its drop is forgotten. A relay the
+    /// routes carry again owes its whole goal. It runs at the start of a debt
+    /// turn, between the owner's commands, so a command that drops a route and
+    /// restores it settles nothing. A failed write keeps the changes for the
+    /// next turn and returns the error to the runner's local-failure backoff;
+    /// no debt read may treat failed preparation as nothing owed.
+    pub(crate) fn settle_recovery_route_changes(
+        &self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
+        let Some(changes) = self.routing.take_route_changes() else {
+            return Ok(());
+        };
+        if changes.dropped.is_empty() && !changes.changed {
+            return Ok(());
+        }
+        let routing = self.routing.snapshot();
+        let carried =
+            crate::ledger_route_pairs(&routing.group_routes, &routing.local_inbox_endpoints);
+        let mut gone: BTreeMap<&TransportReconciliationRoute, Vec<String>> = BTreeMap::new();
+        for (group, route, relay) in &changes.dropped {
+            if carried.contains(&(route.clone(), relay.clone())) {
+                continue;
+            }
+            let confirmed = match group {
+                Some(group) => {
+                    let group = cgka_traits::GroupId::new(group.clone());
+                    super::group_is_terminal(&self.runtime, &group)
+                        || routing
+                            .group_routes
+                            .iter()
+                            .any(|route| route.group_id == group)
+                }
+                None => !routing.local_inbox_endpoints.is_empty(),
+            };
+            if confirmed {
+                gone.entry(route).or_default().push(relay.clone());
+            }
+        }
+        let settled = (|| {
+            let current = self.current_coverage_routes();
+            // This turn reads the new debt immediately. Do not wake its own
+            // runner, especially if a later write keeps the changes pending.
+            for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now)? {
+                app.widen_recovery_coverage_goals(&routes, floor)?;
+            }
+            for (route, relays) in &gone {
+                let ended = !carried.iter().any(|(carried, _)| carried == *route);
+                app.retire_gone_recovery_units(route, (!ended).then_some(relays), now)?;
+            }
+            app.reopen_returned_recovery_units(|route, relay| {
+                carried.contains(&(route.clone(), relay.to_owned()))
+            })?;
+            Ok::<_, cgka_traits::storage::StorageError>(())
+        })();
+        if settled.is_err() {
+            self.routing.restore_route_changes(changes);
+        }
+        settled
+    }
+
+    /// Whether the group's local copy is Unrecoverable, which suspends its
+    /// recovery (mdk#2660 section 6). A group whose record cannot be read is
+    /// not suspended.
+    pub(crate) fn group_unrecoverable(&self, group_id: &[u8]) -> bool {
+        self.runtime
+            .group_record(&cgka_traits::GroupId::new(group_id.to_vec()))
+            .is_ok_and(|group| group.unrecoverable)
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {
@@ -584,12 +704,24 @@ impl AppClient {
             .map(|current| current.route)
             .collect::<Vec<_>>();
         if let Err(error) = self.coverage_storage().and_then(|storage| {
-            Ok(storage
-                .app_storage()
-                .widen_recovery_coverage_goals(&routes, floor)?)
+            Ok(self.widen_coverage_goals(&storage.app_storage(), &routes, floor)?)
         }) {
             log_failure("record_coverage_loss", &error);
         }
+    }
+
+    /// Widen `routes`' goals to `floor` and wake the recovery runner to read
+    /// its ledger again. Only the runner's own routing-change settlement
+    /// widens directly without a wake: that turn immediately reads the debt.
+    fn widen_coverage_goals(
+        &self,
+        app: &SqliteAppStorage,
+        routes: &[TransportReconciliationRoute],
+        floor: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
+        app.widen_recovery_coverage_goals(routes, floor)?;
+        self.wake_recovery_runner();
+        Ok(())
     }
 
     /// Where a current route's standing goal starts: the retention floor,
@@ -601,37 +733,72 @@ impl AppClient {
     /// A Welcome time after `now` (the joining clock ran fast) is ignored, even
     /// one inside the allowance, or the goal would start minutes ago and never
     /// owe the window.
-    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> u64 {
-        let welcome = current.group_id.as_ref().and_then(|group| {
-            self.runtime
-                .group_record(&cgka_traits::GroupId::new(group.clone()))
-                .ok()?
-                .local_copy_welcome_created_at
-        });
-        welcome
+    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> StorageResult<u64> {
+        let welcome = match &current.group_id {
+            Some(group) => match self
+                .engine_storage
+                .get_group(&cgka_traits::GroupId::new(group.clone()))
+            {
+                Ok(group) => group.local_copy_welcome_created_at,
+                Err(StorageError::NotFound) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        Ok(welcome
             .filter(|welcome| welcome.0 <= now)
             .map_or(0, |welcome| crate::history_floor(welcome.0).0)
-            .max(retention_floor(now))
+            .max(retention_floor(now)))
     }
 
-    /// Widen each current route's goal to its standing floor.
+    /// Group standing goals by floor so one write can widen each set.
+    fn standing_goals(
+        &self,
+        routes: &[&CurrentRoute],
+        now: u64,
+    ) -> StorageResult<BTreeMap<u64, Vec<TransportReconciliationRoute>>> {
+        let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for current in routes {
+            by_floor
+                .entry(self.standing_floor(current, now)?)
+                .or_default()
+                .push(current.route.clone());
+        }
+        Ok(by_floor)
+    }
+
+    /// Widen each current route's goal to its standing floor and wake the
+    /// runner. Its own routing-change turn uses the same grouping without a
+    /// wake: that turn already reads what it widened.
     fn widen_standing_goals(
         &self,
         app: &SqliteAppStorage,
         routes: &[&CurrentRoute],
         now: u64,
     ) -> Result<(), AppError> {
-        let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
-        for current in routes {
-            by_floor
-                .entry(self.standing_floor(current, now))
-                .or_default()
-                .push(current.route.clone());
-        }
-        for (floor, routes) in by_floor {
-            app.widen_recovery_coverage_goals(&routes, floor)?;
+        for (floor, routes) in self.standing_goals(routes, now)? {
+            self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
+    }
+
+    /// Every open owes each current route's retained window, even with a
+    /// transport cursor. Durable coverage leaves only its unproven restart
+    /// gap as debt. Widen the ledger directly: an IncrementalHistory request
+    /// would also give the old comparison owner work in the hybrid. The
+    /// runner's first routing-change turn retries a failed best-effort write.
+    pub(crate) fn record_open_coverage_goals(&self) {
+        let current = self.current_coverage_routes();
+        let result = self.coverage_storage().and_then(|storage| {
+            self.widen_standing_goals(
+                &storage.app_storage(),
+                &current.iter().collect::<Vec<_>>(),
+                unix_now_seconds(),
+            )
+        });
+        if let Err(error) = result {
+            log_failure("record_open_coverage_goals", &error);
+        }
     }
 
     /// Startup incremental history wants every current route from its
@@ -651,7 +818,7 @@ impl AppClient {
                         .into_iter()
                         .map(|current| current.route)
                         .collect::<Vec<_>>();
-                    Ok(app.widen_recovery_coverage_goals(&routes, retention_floor(now))?)
+                    Ok(self.widen_coverage_goals(&app, &routes, retention_floor(now))?)
                 }
                 _ => Ok(()),
             }
@@ -896,7 +1063,7 @@ impl AppClient {
             if let Some(owed) = reach.owed_by(demand.cause) {
                 for route in scopes.iter().filter_map(scope_route) {
                     if let Some(floor) = owed.floor(&route) {
-                        app.widen_recovery_coverage_goals(std::slice::from_ref(&route), floor)?;
+                        self.widen_coverage_goals(app, std::slice::from_ref(&route), floor)?;
                     }
                 }
             }

@@ -216,6 +216,7 @@ async fn the_account_slot_read_keeps_every_valid_slot() {
         &account.account_id_hex,
         &records,
         true,
+        &[],
         app.directory().directory_freshness_for_test(),
         None,
     );
@@ -287,6 +288,7 @@ async fn the_own_slot_read_takes_each_relays_current_publication() {
             &account.account_id_hex,
             &records,
             complete,
+            &[],
             app.directory().directory_freshness_for_test(),
             Some(own),
         )
@@ -308,6 +310,68 @@ async fn the_own_slot_read_takes_each_relays_current_publication() {
     expected.sort();
     assert_eq!(current, expected);
     assert!(!read(false).complete);
+}
+
+/// A relay serves nothing in the own slot only when its own read finished
+/// and returned nothing there (mdk#2628 3.4): another slot's publication, or
+/// another account's under the same `d`, leaves the slot empty, and a relay
+/// whose read did not finish proves nothing, whatever the others did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_finished_read_finds_the_own_slot_empty() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let own = "own-slot";
+    let published = |slot: &str| {
+        candidate(
+            account,
+            device_package(&app, account, true),
+            slot,
+            None,
+            now,
+        )
+    };
+    let in_slot = published(own);
+    let other_slot = published("other");
+    let mut someone_else = published(own);
+    someone_else.pubkey = "ff".repeat(32);
+    let relay = |name: &str| TransportEndpoint(name.into());
+    let served = |event: &NostrTransportEvent, name: &str| RelayEventRecord {
+        event: event.clone(),
+        endpoints: vec![relay(name)],
+    };
+    let records = [
+        served(&in_slot, "wss://serving"),
+        served(&other_slot, "wss://other-slot"),
+        served(&someone_else, "wss://other-account"),
+        served(&other_slot, "wss://unfinished"),
+    ];
+    let finished = [
+        relay("wss://serving"),
+        relay("wss://other-slot"),
+        relay("wss://other-account"),
+        relay("wss://nothing"),
+        relay("wss://nothing"),
+    ];
+    let own_slot = nostr_directory::account_key_package_slots_from_records(
+        &account.account_id_hex,
+        &records,
+        false,
+        &finished,
+        app.directory().directory_freshness_for_test(),
+        Some(own),
+    )
+    .own_slot
+    .unwrap();
+    assert!(!own_slot.complete);
+    assert_eq!(
+        own_slot.empty,
+        [
+            relay("wss://other-slot"),
+            relay("wss://other-account"),
+            relay("wss://nothing"),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

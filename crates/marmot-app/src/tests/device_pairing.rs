@@ -20,6 +20,8 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
+mod linked_device_chats;
+
 /// One of Alice's devices, with its own cursor over the shared relay.
 struct Device {
     _dir: tempfile::TempDir,
@@ -152,6 +154,16 @@ async fn link(
     new: &mut Device,
     label: &str,
 ) -> GroupId {
+    link_with(relay, existing, new, DeviceLinkChoices::new(label)).await
+}
+
+/// [`link`], with `choices` for the new device.
+async fn link_with(
+    relay: &ScriptedPushRelayClient,
+    existing: &mut Device,
+    new: &mut Device,
+    choices: DeviceLinkChoices,
+) -> GroupId {
     let started = new.op(DeviceLinkOp::Start).await;
     assert_eq!(
         started.new_device,
@@ -171,12 +183,7 @@ async fn link(
         waiting.new_device,
         Some(NewDeviceLinkState::WaitingForOtherDevice)
     );
-    let linking = existing
-        .op(DeviceLinkOp::Link {
-            prompt_id,
-            choices: DeviceLinkChoices::new(label),
-        })
-        .await;
+    let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
     assert_eq!(
         linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
         DeviceLinkPromptState::Linking
@@ -857,8 +864,139 @@ async fn links_again_after_a_failed_link(restart: bool) {
     assert!(laptop.roster(&group).devices.contains_key(&laptop_slot));
 }
 
+/// A slot linked again after a failed link is a new entry with a fresh
+/// rename id (mdk#2628 3.6a). A rename the phone made of its earlier entry,
+/// still kept because the phone settles renames only in a later pass, reads
+/// that id as another rename's: the phone drops its rename rather than make
+/// it again over the label the second link chose. Only the second link's
+/// commit matters here, so the tablet never joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_linked_again_keeps_its_new_label_over_an_earlier_rename() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let slot = choose_link(&relay, &mut phone, &mut tablet).await;
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // phone's confirm in, tablet's out
+    phone.step(&relay).await; // tablet's confirm in: the link commit
+    let tablet_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    let first = phone.roster(&group).devices[&tablet_slot].rename_id;
+    assert!(
+        first.is_some(),
+        "a linked entry is created with a rename id"
+    );
+
+    let give_up = std::time::Instant::now() + Duration::from_secs(5);
+    while let Err(error) = phone.client.rename_linked_device(&slot, "Kitchen").await {
+        assert!(std::time::Instant::now() < give_up, "{error:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let advanced = phone
+            .client
+            .runtime
+            .advance_convergence(&group)
+            .await
+            .unwrap();
+        phone
+            .client
+            .observe_drained_session_events(&advanced)
+            .await
+            .unwrap();
+    }
+    let renames = |phone: &Device| {
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .device_renames()
+            .unwrap()
+    };
+    assert_eq!(renames(&phone).len(), 1);
+
+    // The tablet never makes its first commit, so the phone removes it.
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await;
+    assert!(!phone.roster(&group).devices.contains_key(&tablet_slot));
+    tablet.step(&relay).await; // the Welcome, then its removal
+    assert_eq!(renames(&phone).len(), 1, "no rename pass ran meanwhile");
+
+    // Linked again, as "Laptop" again, by a KeyPackage it has not joined by:
+    // the phone's commit creates the entry anew.
+    published_key_package(&mut tablet.client, &relay).await;
+    assert_eq!(choose_link(&relay, &mut phone, &mut tablet).await, slot);
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // phone's confirm in, tablet's out
+    phone.step(&relay).await; // tablet's confirm in: the second link commit
+    let again = phone.roster(&group).devices[&tablet_slot].rename_id;
+    assert!(again.is_some() && again != first);
+    phone.client.try_device_rename_upkeep().await.unwrap();
+    assert_eq!(phone.roster(&group).devices[&tablet_slot].label, "Laptop");
+    assert!(renames(&phone).is_empty());
+}
+
 /// Closes `device`'s client and opens it again, as a restart does: pairing
 /// keeps nothing across it.
+/// A new device applies its failed link's removal and closes before it
+/// forgets its copy. The next process finds that removal stored and stops
+/// the account's publishing until a client tells it apart; the client's
+/// open finds a failed link, which stops nothing (D40), and lifts the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_links_removal_found_after_a_restart_stops_nothing() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await; // phone's confirm in, laptop's out
+    phone.step(&relay).await; // laptop's confirm in: the group
+    let group = phone.client.trusted_device_group().unwrap().unwrap();
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await; // the removal
+    // The Welcome, then its removal, with no drive to forget the copy.
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    assert!(laptop.client.runtime.group_record(&group).unwrap().removed);
+    assert!(!laptop.client.device_unlinked());
+    let Device {
+        _dir, app, client, ..
+    } = laptop;
+    drop((client, app));
+
+    let app = MarmotApp::with_relay_and_config(
+        _dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_dev_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let bootstrap = || {
+        AccountRelayListBootstrap::new(
+            vec![TransportEndpoint("wss://relay.example".into())],
+            vec![TransportEndpoint("wss://relay.example".into())],
+        )
+    };
+    let attempted = relay.attempted_events().len();
+    app.publish_user_profile("alice", UserProfileMetadata::default(), bootstrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        relay.attempted_events().len(),
+        attempted,
+        "stopped until a client tells the removal apart"
+    );
+    let client = app.client("alice").await.unwrap();
+    assert!(!client.device_unlinked());
+    assert!(!app.account_home().account("alice").unwrap().unlinked);
+    app.publish_user_profile("alice", UserProfileMetadata::default(), bootstrap())
+        .await
+        .unwrap();
+    drop(client);
+}
+
 async fn reopen(device: Device) -> Device {
     let Device {
         _dir,

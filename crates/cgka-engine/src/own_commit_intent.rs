@@ -44,8 +44,10 @@ impl<S: StorageProvider> Engine<S> {
     /// The kind and authoring baseline to retain for an intent that is about
     /// to stage a group evolution, or `None` for intents that never need
     /// re-issue (application messages, leaves, self-updates, same-account
-    /// Adds and Removes, enabling disbanding or account-devices, linking a
-    /// device, disband).
+    /// Adds and Removes, enabling disbanding or account-devices, linking or
+    /// unlinking a device, a removed slot's lone record, disband). The lone
+    /// record must not come back after a lost fork once a state this device
+    /// applied held it (mdk#2761), so only its caller makes it again.
     pub(crate) fn own_commit_recording(
         &self,
         intent: &SendIntent,
@@ -85,7 +87,7 @@ impl<S: StorageProvider> Engine<S> {
                 ))
             }
             // The intent carries its own baseline: the entry it replaces.
-            SendIntent::ReplaceDeviceEntry { .. } => {
+            SendIntent::ReplaceDeviceEntry { .. } | SendIntent::ReplaceAccountEntry { .. } => {
                 Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
             }
             SendIntent::AppMessage { .. }
@@ -97,6 +99,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::EnableAccountDevices { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
+            | SendIntent::RecordRemovedSlot { .. }
             | SendIntent::Disband { .. } => None,
         })
     }
@@ -162,9 +165,9 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::Invite { .. } => SupersededIntentKind::Invite,
             SendIntent::RemoveMembers { .. } => SupersededIntentKind::RemoveMembers,
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
-            SendIntent::UpdateAppComponents { .. } | SendIntent::ReplaceDeviceEntry { .. } => {
-                SupersededIntentKind::AppComponents
-            }
+            SendIntent::UpdateAppComponents { .. }
+            | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
         let report = |outcome, reason| SupersededIntentReport {
@@ -326,6 +329,24 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 record.intent.clone()
             }
+            // Compared again when the re-issued copy is prepared, as above.
+            SendIntent::ReplaceAccountEntry {
+                group_id, expected, ..
+            } => {
+                let mls_group = self.load_mls_group(group_id)?;
+                if crate::app_components::account_entry_of_group(&mls_group).as_ref()
+                    != Some(&**expected)
+                {
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the account entry; its value stands",
+                        ),
+                        None,
+                    )));
+                }
+                record.intent.clone()
+            }
             _ => return Ok(None),
         };
 
@@ -385,6 +406,34 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(reports)
+    }
+
+    /// Whether an own commit in `group_id` lost a fork and its re-issue is
+    /// still owed: a reconciler missed the announcement and
+    /// [`Self::reissue_superseded_own_commits_from_state`] has not decided it
+    /// since. Such a commit has not reached its outcome.
+    pub fn owes_superseded_own_commit_reissue(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        for record in self.storage.list_own_commit_intents(Some(group_id))? {
+            if record.reinvite.is_some() {
+                continue;
+            }
+            match self.storage.get_message(&record.commit_id) {
+                Ok(message)
+                    if matches!(
+                        message.state,
+                        MessageState::ConvergenceDeferred | MessageState::EpochInvalidated
+                    ) =>
+                {
+                    return Ok(true);
+                }
+                Ok(_) | Err(cgka_traits::storage::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
     }
 
     /// Whether a confirmed commit staged from `record.source_epoch` can no

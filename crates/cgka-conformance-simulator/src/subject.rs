@@ -2550,11 +2550,15 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
+        | EngineError::AccountEntryUnsettled { .. }
         | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::InvalidWelcome
         | EngineError::MissingWelcomeKeyPackage
         | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
+        | EngineError::SiblingWelcomeHeld { .. }
+        | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
         | EngineError::UnknownMember { .. }
@@ -2622,6 +2626,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
         EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
         EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+        EngineError::AccountEntryChanged { .. } => "account_entry_changed",
+        EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",
         EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
         // Every decode failure the engine can reach, not an admin-policy
         // verdict: `audit_helpers::engine_error_kind` names it the same way.
@@ -2630,6 +2636,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
         EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+        EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
+        EngineError::SiblingWelcomePredatesForget => "sibling_welcome_predates_forget",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::GroupUnrecoverableRepairRequired { .. } => {
             "group_unrecoverable_repair_required"

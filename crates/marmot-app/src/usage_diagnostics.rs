@@ -143,7 +143,7 @@ fn configure_product_analytics_from_values(
         .is_err()
     {
         tracing::warn!(
-            target: "marmot_app::product_analytics",
+            target: "marmot_app::usage_diagnostics",
             method = "configure_product_analytics_from_environment",
             error_code = "invalid_product_analytics_configuration",
             "optional product analytics configuration rejected"

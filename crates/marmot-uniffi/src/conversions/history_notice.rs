@@ -1,11 +1,13 @@
-//! "History may be incomplete" notices: parked recovery occurrences.
+//! "History may be incomplete" notices: parked recovery occurrences, and the
+//! account's recovery status.
 
-use marmot_app::{HistoryNotice, HistoryNoticeCause};
+use marmot_app::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 
 /// Why recovery parked; choose the host's wording from it. Current policy
 /// parks only the first five. `KnownEvent` and `MaintenanceBoundary` are
 /// reserved so exhaustive switches stay source-compatible if a later policy
-/// parks them.
+/// parks them, and `UnprovenHistory` is not raised until the recovery runner
+/// owns history (mdk#2660).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HistoryNoticeCauseFfi {
     /// Deliveries were dropped from a full account queue, or spilled rows
@@ -23,6 +25,10 @@ pub enum HistoryNoticeCauseFfi {
     KnownEvent,
     /// A post-join maintenance boundary was never observed.
     MaintenanceBoundary,
+    /// The recovery runner could not prove this history on a route's relays
+    /// and stopped retrying them: a group's (`group_id_hex` names it) or the
+    /// account inbox's.
+    UnprovenHistory,
 }
 
 impl From<HistoryNoticeCause> for HistoryNoticeCauseFfi {
@@ -35,6 +41,7 @@ impl From<HistoryNoticeCause> for HistoryNoticeCauseFfi {
             HistoryNoticeCause::ExplicitRepair => Self::ExplicitRepair,
             HistoryNoticeCause::KnownEvent => Self::KnownEvent,
             HistoryNoticeCause::MaintenanceBoundary => Self::MaintenanceBoundary,
+            HistoryNoticeCause::UnprovenHistory => Self::UnprovenHistory,
         }
     }
 }
@@ -65,6 +72,30 @@ impl From<HistoryNotice> for HistoryNoticeFfi {
             cause: value.cause.into(),
             group_id_hex: value.group_id_hex,
             parked_at_ms: value.parked_at_ms,
+        }
+    }
+}
+
+/// The account's recovery: what is still being fetched, and every "history
+/// may be incomplete" notice. Re-read on `RecoveryStatusChanged`. Until the
+/// recovery runner owns history (mdk#2660), nothing is ever catching up.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AccountRecoveryStatusFfi {
+    /// Groups whose history is still being fetched, as lowercase hex group
+    /// ids, sorted.
+    pub catching_up_group_ids_hex: Vec<String>,
+    /// The account inbox's history (Welcomes) is still being fetched.
+    pub inbox_catching_up: bool,
+    /// Every current notice, as `history_notices` lists them.
+    pub notices: Vec<HistoryNoticeFfi>,
+}
+
+impl From<AccountRecoveryStatus> for AccountRecoveryStatusFfi {
+    fn from(value: AccountRecoveryStatus) -> Self {
+        Self {
+            catching_up_group_ids_hex: value.catching_up_group_ids_hex,
+            inbox_catching_up: value.inbox_catching_up,
+            notices: value.notices.into_iter().map(Into::into).collect(),
         }
     }
 }

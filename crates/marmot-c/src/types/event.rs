@@ -366,12 +366,47 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's compromise warning may have changed; re-read
+    /// `marmot_compromise_warning`. Also fires once each time the account's
+    /// worker opens or reconnects. Carries no slots, and may fire with no
+    /// visible change.
+    CompromiseWarningChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
     /// Linking a new device may have changed as this device shows it;
     /// re-read `marmot_device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
     /// progress. Carries no device, session or group identities, and may
     /// fire with no visible change.
     DeviceLinkChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's recovery status may have changed; re-read
+    /// `marmot_account_recovery_status`. Carries no group identities. Not
+    /// raised until the recovery runner owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// the accounts and show the device-level notice. Fires once; afterwards
+    /// `MarmotAccountSummary.unlinked` says so.
+    DeviceUnlinked {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
+    /// `marmot_chat_history_imports` answers differently; re-read it. Fires
+    /// when a held chat's delivery from another of this account's devices
+    /// arrives, is imported, first fails to fetch, or goes; when imported
+    /// rows go, as retention prunes them or the chat is deleted; when a
+    /// source device is renamed or removed; and when a chat whose delivery
+    /// arrived first is joined. Also fires once each time the account's
+    /// worker opens or reconnects, whatever the answer. Carries no chat or
+    /// device identities.
+    ChatHistoryImportsChanged {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
@@ -503,10 +538,38 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            } => Self::CompromiseWarningChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
             F::DeviceLinkChanged {
                 account_id_hex,
                 account_label,
             } => Self::DeviceLinkChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::ChatHistoryImportsChanged {
+                account_id_hex,
+                account_label,
+            } => Self::ChatHistoryImportsChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RecoveryStatusChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
+            F::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceUnlinked {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
@@ -574,7 +637,23 @@ impl CFree for MarmotEvent {
                     account_id_hex,
                     account_label,
                 }
+                | Self::CompromiseWarningChanged {
+                    account_id_hex,
+                    account_label,
+                }
                 | Self::DeviceLinkChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::ChatHistoryImportsChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::RecoveryStatusChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::DeviceUnlinked {
                     account_id_hex,
                     account_label,
                 } => {
@@ -765,6 +844,37 @@ mod tests {
     }
 
     #[test]
+    fn compromise_warning_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::CompromiseWarningChanged {
+                account_id_hex: "af".repeat(32),
+                account_label: "dana".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dana"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
     fn device_link_change_carries_only_its_account_and_frees_deeply() {
         let _lock = audit::test_lock();
         let before = audit::live_allocations();
@@ -787,6 +897,66 @@ mod tests {
             assert_eq!(
                 std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
                 "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn chat_history_imports_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(
+            MarmotEventFfi::ChatHistoryImportsChanged {
+                account_id_hex: "ae".repeat(32),
+                account_label: "dave".to_owned(),
+            },
+        ));
+        unsafe {
+            let MarmotEvent::ChatHistoryImportsChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ae".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "dave"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
+    #[test]
+    fn recovery_status_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::RecoveryStatusChanged {
+            account_id_hex: "af".repeat(32),
+            account_label: "erin".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "af".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "erin"
             );
             marmot_event_free(event);
         }

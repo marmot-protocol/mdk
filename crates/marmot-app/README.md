@@ -422,6 +422,59 @@ with nothing sent, since a commit then could build on a roster that is about to 
 commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one
 stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
 
+When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
+nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once, after the account is signed out; from then on
+`ManagedAccount::unlinked` and `signed_out` stay set, and signing in, logging in, importing its key or starting
+onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing its local history; reads still return it,
+as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
+which the other devices did; signing in again is then a new link.
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too. It records in the device group that it is leaving, which can take about 30 seconds to settle, then
+leaves only the chats no other device can take it out of, deletes its slot and wipes; the other devices then remove it
+from the device group and from the rest. `WipeOutcome::groups_left_to_siblings` counts the chats it left to them. When
+it can't ask them in time, it tries to leave every chat itself, reporting any it can't in `group_leave_failures`, and
+sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
+the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it.
+A device removed while it signs out finishes signing out and is not unlinked.
+
+### Chat history from another device
+
+A device linked with "Bring chat history" receives each chat's history from the device that added it (mdk#2628 4.2).
+Each imported `TimelineMessageRecord` names its source in `imported_from` (`HistoryImportSource`: the device's slot and
+its roster name now); a row that arrived live has none. Draw "Imported from <device>" where rows change from imported
+to live, and say "another device" for an empty name: a device with no name, one no longer linked, or before this device
+first read the roster. Names are resolved when rows are read, so a rename shows after `LinkedDevicesChanged`.
+
+`MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
+waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
+It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
+after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
+`MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
+is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
+`dev_device_groups` is on.
+
+### Recovery words
+
+An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).
+`MarmotAppRuntime::begin_recovery_words(account_ref)` makes new words as `RecoveryWords`: show the 12 `words` once,
+then ask for the words at `confirm_positions` (1-based) and pass them, in order, to `confirm_recovery_words`. MDK holds
+the words in memory only and forgets them once their change went out or after `cancel_recovery_words`; a restart
+starts over with new words. Confirming keeps only the key's public half: in the device group's roster, or on this
+device while it has no device group, until the device group it founds carries it. A device that joins a device group
+instead leaves the group's backups as they are and forgets the key it kept. The first device to turn backups on writes
+them, and new words from any device keep that writer. A mismatch (`recovery_words_mismatch`), a busy device group
+(`device_group_busy`) or any other error keeps the words for another try; trying again commits nothing if the roster
+already holds their key. `turn_off_backups` turns backups off for every device of the account by clearing the writer
+and the key; backups already written stay until deleted, and turning backups on again takes new words. Both are
+refused as `device_group_busy` while the device group can't take the change, including while a change of this
+device's is still in flight. `backup_settings` says whether backups are on and whether this device writes them, as the
+device group's roster holds them now. Two devices changing backups at once can drop one change: MDK commits it again
+only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
+are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. Nothing writes
+backups yet, and every call is refused as `DeviceGroupRefused("roster_unsupported")` in release builds until the backup
+spec lands.
+
 ### Overdue KeyPackage refresh
 
 While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
@@ -446,6 +499,27 @@ without a prompt, `Reject` records it as rejected in the device group's roster, 
 device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
 and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
 build until the roster's spec lands.
+
+`start_fresh` is the answer when the user no longer has the devices the first check found: every sign-in from before
+this device is answered Not now, now and when one is listed later, and nothing is rejected, so one of them can still
+link this device. It is refused before the first check and once this device trusts a device group. `started_fresh`
+says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
+are here.
+
+## Compromise warning
+
+`MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
+`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item means
+someone holding the account's signing key published where the account's devices did not: a sign-in answered This
+wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage this device found in its own slot that it did
+not make (`ForeignOwnSlotKeyPackage`), which warns on this device only and which it has replaced. The warning gathers
+this device's rejections and those in its device group's roster; rejections
+already in the first roster this device trusts count as seen, and a rejected sign-in leaves once its slot is linked as
+a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
+branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
+host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
+each time the account's worker opens. All of it is empty and silent in every release build until the roster's spec
+lands.
 
 ## Linking a new device
 
@@ -479,6 +553,12 @@ own occurrences also set `GroupRecoveryStatus::history_may_be_incomplete` and li
 account-wide ones (loss, incremental and explicit history) appear only in the list.
 `MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
 `GroupStateUpdated`.
+
+`MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
+the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
+them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`. Until the recovery runner owns history (mdk#2660) nothing
+is ever catching up and neither that event nor `HistoryNoticeCause::UnprovenHistory` (history the runner could not
+prove on a route's relays) is produced.
 
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
 be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired

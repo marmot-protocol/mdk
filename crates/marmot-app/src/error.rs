@@ -307,11 +307,12 @@ pub enum AppError {
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
     /// A media reference was encrypted under `source_epoch`, but the message
-    /// that would carry it is sent at `current_epoch`. The `imeta` tag has no
+    /// that would carry it is sent at `current_epoch`, or at the same number
+    /// on another branch of the group's history. The `imeta` tag has no
     /// epoch field, so recipients would derive the wrong media secret; the
     /// attachment has to be uploaded again.
     #[error(
-        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+        "media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again"
     )]
     MediaReferenceStaleEpoch {
         source_epoch: u64,
@@ -826,6 +827,7 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::AccountExists(_) => "account_home_account_exists",
         AccountHomeError::AccountIdInUse(_) => "account_home_account_id_in_use",
         AccountHomeError::UnknownAccount(_) => "account_home_unknown_account",
+        AccountHomeError::AccountUnlinked(_) => "account_home_account_unlinked",
         AccountHomeError::InvalidSecretKey => "account_home_invalid_secret_key",
         AccountHomeError::InvalidPublicKey => "account_home_invalid_public_key",
         AccountHomeError::InvalidAccountLabel(_) => "account_home_invalid_account_label",

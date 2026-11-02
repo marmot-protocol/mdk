@@ -559,11 +559,11 @@ mod tests {
         let request = audit_upload_request(
             &client,
             "https://example.test/ingest".parse().expect("url"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
+            b"immutable audit body\n".to_vec(),
+            Some("bearer-secret"),
+            Some("device-model"),
+            Some("platform-name"),
+            Some("app-version"),
         )
         .build()
         .expect("audit request");
@@ -571,6 +571,26 @@ mod tests {
         assert_ne!(
             request.timeout(),
             Some(&collector_host_safety::REQUEST_TIMEOUT)
+        );
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        assert_eq!(request.headers()[reqwest::header::CONTENT_LENGTH], "21");
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer bearer-secret"
+        );
+        assert_eq!(
+            request.headers()["X-Goggles-Hardware-Model"],
+            "device-model"
+        );
+        assert_eq!(request.headers()["X-Goggles-Platform"], "platform-name");
+        assert_eq!(request.headers()["X-Goggles-App-Version"], "app-version");
+        assert_eq!(
+            request.body().unwrap().as_bytes(),
+            Some(b"immutable audit body\n".as_slice())
         );
     }
 
@@ -580,22 +600,45 @@ mod tests {
             .into_iter()
             .next()
             .expect("centralized retired host list");
-        for endpoint in [
-            "",
-            "   ",
-            "http://public.example/ingest",
-            "http://10.0.0.1/ingest",
-            "http://dev.localhost/ingest",
-            "ftp://localhost/ingest",
-            "https://user:password@secret.example/path?token=secret-query",
-            "https://secret.example/path?token=secret-query#frag",
-            "https://secret.example:0/ingest",
-            "https:///",
-            &format!("https://{retired}/ingest"),
-            &format!("https://{}/ingest", retired.to_ascii_uppercase()),
-            &format!("https://{retired}./ingest"),
+        let transport_error =
+            "forensic upload endpoint must be https, or loopback http for local testing";
+        for (endpoint, expected) in [
+            ("", "forensic upload endpoint is empty"),
+            ("   ", "forensic upload endpoint is empty"),
+            ("http://public.example/ingest", transport_error),
+            ("http://10.0.0.1/ingest", transport_error),
+            ("http://dev.localhost/ingest", transport_error),
+            ("ftp://localhost/ingest", transport_error),
+            (
+                "https://user:password@secret.example/path?token=secret-query",
+                "forensic upload endpoint is invalid",
+            ),
+            (
+                "https://secret.example/path?token=secret-query#frag",
+                "forensic upload endpoint is invalid",
+            ),
+            (
+                "https://secret.example:0/ingest",
+                "forensic upload endpoint is invalid",
+            ),
+            ("https:///", transport_error),
+            (
+                &format!("https://{retired}/ingest"),
+                "forensic upload endpoint is not allowed",
+            ),
+            (
+                &format!("https://{}/ingest", retired.to_ascii_uppercase()),
+                "forensic upload endpoint is not allowed",
+            ),
+            (
+                &format!("https://{retired}./ingest"),
+                "forensic upload endpoint is not allowed",
+            ),
         ] {
             let err = validate_audit_upload_endpoint(endpoint, Some("bearer-secret")).unwrap_err();
+            assert!(
+                matches!(&err, AuditUploadError::AuditLogUpload(message) if message == expected)
+            );
             assert_privacy_safe(&err);
         }
         let remote = "https://secret.example/path?token=secret-query";
@@ -621,6 +664,110 @@ mod tests {
         assert!(
             validate_audit_upload_endpoint(remote, Some("bearer-secret")).is_ok(),
             "structurally valid public HTTPS with a token is admitted before DNS"
+        );
+        assert_eq!(
+            validate_audit_upload_endpoint(&format!("  {remote}  "), Some("bearer-secret"))
+                .unwrap(),
+            remote
+        );
+        for token in [None, Some(""), Some(" \t ")] {
+            assert!(matches!(
+                validate_audit_upload_endpoint(remote, token),
+                Err(AuditUploadError::AuditLogUpload(message))
+                    if message == "forensic upload endpoint requires an authorization bearer token unless it is loopback"
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoints_read_the_persisted_shape_and_compare_size_and_mtime_independently() {
+        // The omitted mtime is a supported existing sidecar shape, rather than
+        // a value produced by today's derived serializer and read straight back.
+        let mut checkpoint: AuditUploadCheckpoint = serde_json::from_str(
+            r#"{"files":{
+            "old.jsonl":{"size_bytes":7,"outcome":"uploaded"},
+            "large.jsonl":{"size_bytes":9,"modified_at_ms":42,"outcome":"too_large_to_upload"},
+            "schema.jsonl":{"size_bytes":11,"modified_at_ms":43,"outcome":"ineligible_schema"}
+        }}"#,
+        )
+        .unwrap();
+        let old = ListedAuditFile {
+            file_name: "old.jsonl",
+            size_bytes: 7,
+            modified_at_ms: None,
+        };
+        assert_eq!(
+            checkpoint.acknowledged(old),
+            Some(AuditUploadOutcome::Uploaded)
+        );
+        assert_eq!(
+            checkpoint.acknowledged(ListedAuditFile {
+                size_bytes: 8,
+                ..old
+            }),
+            None
+        );
+        assert_eq!(
+            checkpoint.acknowledged(ListedAuditFile {
+                modified_at_ms: Some(1),
+                ..old
+            }),
+            None
+        );
+        for (name, size, mtime, outcome) in [
+            ("large.jsonl", 9, 42, AuditUploadOutcome::TooLargeToUpload),
+            ("schema.jsonl", 11, 43, AuditUploadOutcome::IneligibleSchema),
+        ] {
+            assert_eq!(
+                checkpoint.acknowledged(ListedAuditFile {
+                    file_name: name,
+                    size_bytes: size,
+                    modified_at_ms: Some(mtime),
+                }),
+                Some(outcome)
+            );
+        }
+        checkpoint.acknowledge(
+            ListedAuditFile {
+                file_name: "new.jsonl",
+                ..old
+            },
+            5,
+            AuditUploadOutcome::Uploaded,
+        );
+        assert_eq!(
+            checkpoint.acknowledged(ListedAuditFile {
+                file_name: "new.jsonl",
+                ..old
+            }),
+            None
+        );
+        assert_eq!(
+            checkpoint.acknowledged(ListedAuditFile {
+                file_name: "new.jsonl",
+                size_bytes: 5,
+                ..old
+            }),
+            Some(AuditUploadOutcome::Uploaded)
+        );
+        assert!(checkpoint.retain_present(["old.jsonl", "new.jsonl"]));
+        assert!(!checkpoint.retain_present(["old.jsonl", "new.jsonl"]));
+        assert_eq!(
+            serde_json::to_value(&checkpoint).unwrap(),
+            serde_json::json!({"files":{
+                "old.jsonl":{"size_bytes":7,"modified_at_ms":null,"outcome":"uploaded"},
+                "new.jsonl":{"size_bytes":5,"modified_at_ms":null,"outcome":"uploaded"}
+            }})
+        );
+    }
+
+    #[test]
+    fn file_timestamp_milliseconds_use_the_unix_epoch_and_truncate_submilliseconds() {
+        assert_eq!(system_time_ms(UNIX_EPOCH), Some(0));
+        assert_eq!(system_time_ms(UNIX_EPOCH - Duration::from_nanos(1)), None);
+        assert_eq!(
+            system_time_ms(UNIX_EPOCH + Duration::from_nanos(1_234_567)),
+            Some(1)
         );
     }
 
@@ -788,5 +935,116 @@ mod tests {
         let snapshot = AuditUploadSnapshot::capture(file).await.unwrap();
         assert_eq!(snapshot.body, b"{\"seq\":1}\n");
         assert!(snapshot.complete);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn snapshot_post_defers_incomplete_rows_and_rejects_ineligible_bytes_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        for (bytes, deferred) in [
+            (b"".as_slice(), true),
+            (b"{\"unfinished\":", true),
+            (b" \n\n", false),
+            (b"{invalid private-content}\n", false),
+            (b"{\"schema_version\":\"marmot-forensics-audit/v5\",\"seq\":1,\"wall_time_ms\":0,\"engine_id\":\"test\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"}}\n", false),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let snapshot = AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap()).await.unwrap();
+            let expected_mtime = snapshot.modified_at_ms;
+            // An invalid network endpoint makes accidental attempts fail rather
+            // than dialing; the asserted Deferred/Ineligible outcome is specific.
+            let result = post_audit_upload_snapshot(snapshot, "http://public.example/", None, None, None, None)
+                .await.unwrap();
+            if deferred {
+                assert!(matches!(result, AuditSnapshotPost::Deferred));
+            } else {
+                let AuditSnapshotPost::Ineligible { observed_bytes, modified_at_ms } = result else {
+                    panic!("ineligible capture must not be sent");
+                };
+                assert_eq!(observed_bytes, bytes.len() as u64);
+                assert_eq!(modified_at_ms, expected_mtime);
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes, "validation preserves the source file");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::disallowed_methods)]
+    async fn snapshot_receipts_describe_the_capture_and_keep_rejected_retry_after() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        collector_host_safety::hand_in_direct_http_builder();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut valid = serde_json::to_vec(&serde_json::json!({
+            "schema_version":"marmot-forensics-audit/v4", "seq":1, "wall_time_ms":0,
+            "engine_id":"test-engine", "kind":{"type":"recorder_started","recorder":"test"}
+        }))
+        .unwrap();
+        valid.push(b'\n');
+        for (tail, status, retry_after) in [
+            (b"".as_slice(), 204, None),
+            (b"{\"unfinished\":", 200, None),
+            (b"", 503, Some("120")),
+            (b"", 413, None),
+        ] {
+            let bytes = [valid.as_slice(), tail].concat();
+            fs::write(&path, &bytes).unwrap();
+            let snapshot =
+                AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap())
+                    .await
+                    .unwrap();
+            let expected_mtime = snapshot.modified_at_ms;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
+            let expected_body = valid.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let body_start = loop {
+                    request.push(stream.read_u8().await.unwrap());
+                    if request.ends_with(b"\r\n\r\n") {
+                        break request.len();
+                    }
+                    assert!(request.len() < 8192);
+                };
+                let headers = std::str::from_utf8(&request).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap();
+                request.resize(body_start + length, 0);
+                stream.read_exact(&mut request[body_start..]).await.unwrap();
+                assert_eq!(&request[body_start..], expected_body);
+                let retry_header =
+                    retry_after.map_or(String::new(), |value| format!("Retry-After: {value}\r\n"));
+                stream.write_all(format!("HTTP/1.1 {status} Test\r\n{retry_header}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+                    .await.unwrap();
+            });
+            let result = post_audit_upload_snapshot(snapshot, &endpoint, None, None, None, None)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            if status < 300 {
+                let AuditSnapshotPost::Uploaded(receipt) = result else {
+                    panic!("successful capture must return a receipt");
+                };
+                assert_eq!(receipt.status, status);
+                assert_eq!(receipt.bytes_sent, valid.len() as u64);
+                assert_eq!(receipt.observed_bytes, bytes.len() as u64);
+                assert_eq!(receipt.modified_at_ms, expected_mtime);
+                assert_eq!(receipt.complete, tail.is_empty());
+            } else {
+                assert!(matches!(result, AuditSnapshotPost::Rejected {
+                    status: rejected, retry_after: delay
+                } if rejected == status && delay == retry_after.map(|_| Duration::from_secs(120))));
+            }
+        }
     }
 }

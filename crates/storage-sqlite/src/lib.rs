@@ -12,6 +12,12 @@ mod cross;
 pub mod media_store_bench;
 mod protocol;
 
+pub use app::compromise_warning::{
+    COMPROMISE_WARNING_ITEM_CAP, COMPROMISE_WARNING_KEY_PACKAGE_RETENTION_SECS,
+    CompromiseWarningGather, CompromiseWarningReason, CompromiseWarningRecord, FirstTrustedRoster,
+    ObservedWarningItem,
+};
+pub use app::device_activity::{DeviceActivityRecord, DeviceHeartbeatSent};
 pub use app::device_renames::DeviceRenameRecord;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
@@ -81,13 +87,16 @@ pub use app::avatar_cache::{
     DatabaseAvatarBody, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
     MAX_AVATAR_DIMENSION,
 };
+pub use app::backup_ledger::{BackupRun, BackupRunHead, BackupSchedule, CondemnedBackupBlob};
 pub use app::chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
     ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
     ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
     ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, RetentionExpiryScan, conversation_kind,
+    ExistingDirectConversation, MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition,
+    RetentionExpiryScan, SmallStateBroadcast, SmallStateItem, SmallStateItemName, SmallStateRule,
+    SmallStateSchedule, SmallStateSync, SmallStateValue, SmallStateVersion, conversation_kind,
     select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
@@ -101,6 +110,10 @@ pub use app::chat_presentation::{
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
 pub use app::device_removals::DeviceRemovalRecord;
+pub use app::history_deliveries::{
+    HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryChat,
+    ParkedHistoryDelivery,
+};
 pub use app::message_drafts::{
     ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
@@ -122,22 +135,24 @@ pub use app::recovery_units::{
     RecoveryUnitBreak, RecoveryUnitFence, RecoveryUnitOutcome, RecoveryUnitPark,
     RecoveryUnitPolicy, RecoveryUnitSpan, RecoveryUnitState,
 };
+pub use app::sibling_welcomes::{MAX_STASHED_SIBLING_WELCOMES, StashedSiblingWelcome};
 pub use app::sign_ins::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord};
 pub use app::stickers::{
     StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
     StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
 };
 pub use app::timeline::{
-    BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
+    AppEventImport, BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
-    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    ConversationWindowQuery, DeletionSource, HistoryExportEvent, HistoryExportRow,
+    HistoryImportSource, ImportedAppEvent, ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON,
+    LatestHistoryImport, MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent,
+    TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion, TimelineMessageChange,
+    TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget, TimelinePage,
+    TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
+    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,

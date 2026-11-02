@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     RecoveryUnitOutcome, RecoveryUnitPolicy, RecoveryUnitSpan, SqlCipherKey, SqliteAccountStorage,
 };
+use cgka_traits::storage::StorageError;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{MemberId, MessageId, TransportDeliveryPlane, TransportDeliverySource};
 
@@ -149,20 +150,20 @@ fn a_live_boundary_cannot_stage() {
         (RELAY, RecoveryCoverageProof::LiveBoundary),
         ("", RecoveryCoverageProof::SweepSlice),
     ] {
+        let result = app.stage_recovery_slice(
+            &RecoveryStagedSlice {
+                route: &route,
+                relay,
+                events: &[delivery(1)],
+                fetched_bytes: 0,
+                covered: &[range(0, 100)],
+                proof,
+                mark,
+            },
+            NOW,
+        );
         assert!(
-            app.stage_recovery_slice(
-                &RecoveryStagedSlice {
-                    route: &route,
-                    relay,
-                    events: &[delivery(1)],
-                    fetched_bytes: 0,
-                    covered: &[range(0, 100)],
-                    proof,
-                    mark,
-                },
-                NOW,
-            )
-            .is_err()
+            matches!(result, Err(StorageError::Serialization(ref message)) if message == "invalid recovery coverage")
         );
     }
     assert_eq!(
@@ -403,7 +404,7 @@ fn staging_trims_the_units_parked_spans() {
 #[test]
 fn a_crash_between_staging_and_settling_refetches_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
+    let key = SqlCipherKey::raw([0x5c; 32]);
     let path = dir.path().join("session.sqlite");
     let route = group(1);
     {

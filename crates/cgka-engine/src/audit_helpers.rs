@@ -141,11 +141,13 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
+        SendIntent::ReplaceAccountEntry { .. } => "replace_account_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }
 }
@@ -166,11 +168,13 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::ReplaceDeviceEntry { group_id, .. }
+        | SendIntent::ReplaceAccountEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id.clone(),
     }
 }

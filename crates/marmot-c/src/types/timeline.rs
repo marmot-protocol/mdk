@@ -15,6 +15,7 @@ use marmot_uniffi::conversions::{
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
+use super::history_import::MarmotHistoryImportSource;
 use super::markdown::MarmotMarkdownDocument;
 use super::media::MarmotMediaAttachmentOutcome;
 use crate::MarmotStatus;
@@ -265,6 +266,10 @@ c_mirror! {
         /// for delivered messages.
         opt_str invalidation_status,
         opt_str client_token,
+        /// The device this row came from in a chat history it sent; NULL
+        /// for a row that arrived live. Draw "Imported from <device>"
+        /// where rows change from imported to live.
+        opt_rec imported_from: MarmotHistoryImportSource,
     }
 }
 

@@ -23,11 +23,16 @@
 //! A device keeps its own entry's `client` and `platform` current itself
 //! ([`DeviceSelfReport`]), and its `history_key` (4.1, generated on first
 //! use); each announcement of its KeyPackage writes them.
+//!
+//! The account entry (4.4a: the backup writer and the recovery key's public
+//! half) has its own write path the same way,
+//! [`AccountDeviceRuntime::edit_roster_account_entry`], sent as
+//! [`SendIntent::ReplaceAccountEntry`] naming the entry it read.
 
 use cgka_traits::app_components::{
-    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, decode_device_roster_v1,
-    encode_device_roster_update_v1,
+    AccountEntryV1, AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1,
+    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId,
+    decode_device_roster_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{EngineError, EpochState, FanoutMlsState, GroupId, TransportAdapter};
@@ -40,7 +45,8 @@ use crate::key_package::KeyPackagePublisher;
 use crate::routing::TransportRoutingPolicy;
 use crate::session::SessionError;
 
-/// What [`AccountDeviceRuntime::edit_device_roster_entry`] did.
+/// What [`AccountDeviceRuntime::edit_device_roster_entry`] or
+/// [`AccountDeviceRuntime::edit_roster_account_entry`] did.
 #[derive(Debug)]
 pub enum DeviceRosterEdit {
     /// The roster commit was staged and sent, or queued until the device
@@ -150,6 +156,50 @@ where
         )))
     }
 
+    /// Replace the account entry in the roster of `group_id` with `edit`
+    /// applied to it, in one commit, as [`Self::edit_device_roster_entry`]
+    /// replaces a device entry: only while the roster still holds the entry
+    /// this edit read, and only while the device group takes a commit from
+    /// this device. Every device entry and rejection stays as it is.
+    pub async fn edit_roster_account_entry(
+        &mut self,
+        group_id: &GroupId,
+        held: &[GroupId],
+        edit: impl FnOnce(&mut AccountEntryV1),
+    ) -> AccountResult<DeviceRosterEdit> {
+        let Some(roster) = self.merged_device_roster(group_id) else {
+            return Ok(DeviceRosterEdit::Blocked(
+                DeviceRosterEditBlocked::Unreadable,
+            ));
+        };
+        let current = roster.account;
+        let mut entry = current.clone();
+        edit(&mut entry);
+        if entry == current {
+            return Ok(DeviceRosterEdit::Unchanged);
+        }
+        if !self.device_group_takes_commit(group_id, held)? {
+            return Ok(DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy));
+        }
+        let intent = SendIntent::ReplaceAccountEntry {
+            group_id: group_id.clone(),
+            expected: Box::new(current),
+            entry: Box::new(entry),
+        };
+        let staged = match self.session.send(intent).await {
+            Ok(staged) => staged,
+            Err(SessionError::Engine(
+                EngineError::AccountEntryChanged { .. } | EngineError::AccountEntryUnsettled { .. },
+            )) => {
+                return Ok(DeviceRosterEdit::Blocked(DeviceRosterEditBlocked::Busy));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(DeviceRosterEdit::Committed(Box::new(
+            self.publish_session_effects(staged).await?,
+        )))
+    }
+
     /// The public half of this device's history key, for its own roster
     /// entry, or `None` when it cannot be read or stored now. A history key
     /// never holds back the roster edit it rides on; a later edit of this
@@ -170,8 +220,10 @@ where
 
     /// Whether this device may commit in the device group `group_id` now:
     /// it is stable and not held, quarantined or settling, and nothing of
-    /// this device's is queued or unconfirmed there. Every commit this device
-    /// made there has then reached its outcome.
+    /// this device's is queued, unconfirmed or owed a re-issue there (a
+    /// commit a fork dropped whose announcement was lost waits for
+    /// maintenance to re-derive it). Every commit this device made there has
+    /// then reached its outcome.
     pub fn device_group_takes_commit(
         &mut self,
         group_id: &GroupId,
@@ -188,6 +240,7 @@ where
                 .any(|(quarantined, _)| quarantined == group_id)
             || self.session.has_pending_convergence_inputs(group_id)?
             || self.session.has_queued_outbound_intents(group_id)?
+            || self.session.owes_superseded_own_commit_reissue(group_id)?
             || self
                 .session
                 .outbound_fanouts_for_group(group_id)?

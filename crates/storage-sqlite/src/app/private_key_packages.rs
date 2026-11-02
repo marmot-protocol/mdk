@@ -89,6 +89,18 @@ impl SqliteAppStorage {
         rows.into_iter().map(received_record).collect()
     }
 
+    /// The KeyPackage from `issuer_slot_hex` that
+    /// [`Self::take_received_private_key_package`] would take at `now`, left
+    /// in place.
+    pub fn next_received_private_key_package(
+        &self,
+        issuer_slot_hex: &str,
+        now: u64,
+    ) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
+        let conn = self.lock()?;
+        next_received(&conn, issuer_slot_hex, now)
+    }
+
     /// Take one KeyPackage from `issuer_slot_hex` to use at `now`: the usable
     /// one that expires first, else the unexpired one that expires last.
     /// `None` when it holds none unexpired. Its ref stays, its bytes dropped,
@@ -100,28 +112,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let held = {
-            let mut stmt = tx
-                .prepare_cached(&format!(
-                    "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
-                     WHERE issuer_slot_hex = ?1 AND not_after > ?2 AND taken_at IS NULL
-                     ORDER BY not_after, key_package_ref_hex"
-                ))
-                .storage()?;
-            stmt.query_map(params![issuer_slot_hex, u64_to_i64(now)?], received_row)
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?
-                .into_iter()
-                .map(received_record)
-                .collect::<StorageResult<Vec<_>>>()?
-        };
-        let Some(taken) = held
-            .iter()
-            .find(|record| record.usable_at(now))
-            .or_else(|| held.last())
-            .cloned()
-        else {
+        let Some(taken) = next_received(&tx, issuer_slot_hex, now)? else {
             return Ok(None);
         };
         tx.execute_cached(
@@ -212,6 +203,35 @@ impl SqliteAppStorage {
     }
 }
 
+/// The KeyPackage from `issuer_slot_hex` to use at `now`, as
+/// [`SqliteAppStorage::take_received_private_key_package`] chooses it.
+fn next_received(
+    conn: &rusqlite::Connection,
+    issuer_slot_hex: &str,
+    now: u64,
+) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
+             WHERE issuer_slot_hex = ?1 AND not_after > ?2 AND taken_at IS NULL
+             ORDER BY not_after, key_package_ref_hex"
+        ))
+        .storage()?;
+    let held = stmt
+        .query_map(params![issuer_slot_hex, u64_to_i64(now)?], received_row)
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?
+        .into_iter()
+        .map(received_record)
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(held
+        .iter()
+        .find(|record| record.usable_at(now))
+        .or_else(|| held.last())
+        .cloned())
+}
+
 const RECEIVED_COLUMNS: &str =
     "key_package_ref_hex, issuer_slot_hex, not_before, not_after, key_package, received_at";
 
@@ -277,12 +297,12 @@ mod tests {
     fn handed_over_key_packages_survive_reopen_and_are_kept_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("local identity key").unwrap();
+        let key = SqlCipherKey::raw([7; 32]);
+        let batch = [received("a1", "aa", 0), received("a2", "aa", 10)];
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key)
                 .unwrap()
                 .app_storage();
-            let batch = [received("a1", "aa", 0), received("a2", "aa", 10)];
             assert_eq!(
                 store.insert_received_private_key_packages(&batch).unwrap(),
                 2
@@ -302,7 +322,7 @@ mod tests {
         let store = SqliteAccountStorage::open_encrypted(&path, &key)
             .unwrap()
             .app_storage();
-        assert_eq!(store.received_private_key_packages().unwrap().len(), 2);
+        assert_eq!(store.received_private_key_packages().unwrap(), batch);
         assert_eq!(
             store.private_key_package_need("aa").unwrap(),
             Some(PrivateKeyPackageNeed {
@@ -355,6 +375,18 @@ mod tests {
         store.insert_received_private_key_packages(&batch).unwrap();
         let taken = store.take_received_private_key_package("aa", 10).unwrap();
         assert_eq!(taken.unwrap().key_package_ref_hex, "a1");
+        // The taken private bytes are gone, not only hidden.
+        let kept: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT length(key_package) FROM private_key_packages_received
+                 WHERE key_package_ref_hex = 'a1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 0);
         assert_eq!(
             store.insert_received_private_key_packages(&batch).unwrap(),
             0

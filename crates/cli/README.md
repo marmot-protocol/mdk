@@ -343,7 +343,9 @@ or `post_join_rotation_pending_retryable`); a pending post-join rotation does no
   `disband_request.failed.reason`, then clear it with `groups acknowledge-disband-failure`), the terminal `disbanded`,
   or `unknown` (no positive signal and the MLS state could not be read, as for a quarantined, terminal, or removed copy;
   `not_enabled` is only asserted from a successful MLS read). It also reports `lifecycle_state`, `disbanding` (ordinary
-  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, or `removed`).
+  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, `removed`, or
+  `device_removed`: this device's leaf was removed while the account stays in the group through another of its
+  devices).
 - Ordinary sends into a disbanding group fail with `group_disbanding`. A removed member's copy records its own removal
   (`self_membership: removed`) when the terminal commit lands; read both fields rather than inferring the end from one.
 
@@ -437,7 +439,7 @@ or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content
 pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes, agent activity,
-agent stream anchors, group system rows, push token records, and the device-group kinds 457, 459, 460 and 462) are rejected with `reserved_app_event_kind`. Each `--tag`
+agent stream anchors, group system rows, push token records, and the device-group kinds 457, 459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed
@@ -499,8 +501,8 @@ the wire `imeta` tag carries no epoch, and recipients derive the media key from 
 - A stale reference is refused before publication with `media_reference_stale_epoch` (`source_epoch`,
   `current_epoch`). Upload the file again after the commit and send the new reference. A plaintext hash resolves to the
   newest projected reference carrying it, so after a re-upload the hash form sends the current-epoch copy.
-- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send gives the same
-  error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
+- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send, including a move
+  to another branch at the same epoch number, gives the same error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
   refused with `media_reference_epoch_unsettled` rather than queued. Sync and retry, or upload again if the epoch
   advanced.
 

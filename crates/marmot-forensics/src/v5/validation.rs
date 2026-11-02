@@ -492,6 +492,11 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "native replay admission cannot charge notification or delivery loss",
             )?;
             require(
+                *cause != crate::audit::RecoveryObligationCause::UnprovenHistory
+                    || (charged.is_none() && bound.is_none()),
+                "an unproven-history notice charges no loss and bounds no goal",
+            )?;
+            require(
                 floor_secs.is_some() == (*bound == Some(RecoveryGoalBound::Floor)),
                 "recovery goal floor must accompany a floor bound",
             )
@@ -653,6 +658,9 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 *dropped == 0 || refusals.len() == limit,
                 "refusals are shed only once the bound is full",
             )
+        }
+        AuditEventKind::RecoveryRunnerPaused { pauses, .. } => {
+            require(*pauses > 0, "a pause row counts its own pause")
         }
         _ => Ok(()),
     }

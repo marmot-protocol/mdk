@@ -23,7 +23,7 @@ fn label_of(reader: &mut AppClient, slot: &str) -> String {
         .label
 }
 
-fn published_count(relay: &ScriptedPushRelayClient) -> usize {
+pub(super) fn published_count(relay: &ScriptedPushRelayClient) -> usize {
     relay.published_events.lock().unwrap().len()
 }
 
@@ -42,7 +42,7 @@ fn renames(device: &AppClient) -> Vec<storage_sqlite::DeviceRenameRecord> {
         .unwrap()
 }
 
-fn refusal(error: AppError) -> &'static str {
+pub(super) fn refusal(error: AppError) -> &'static str {
     match error {
         AppError::DeviceGroupRefused(reason) => reason,
         other => panic!("expected a device-group refusal, got {other:?}"),
@@ -73,7 +73,10 @@ async fn any_device_renames_any_device() {
     let mut laptop_cursor = published_count(&relay);
     phone.take_linked_devices_changed();
 
-    assert_eq!(rename_id_of(&mut phone, &laptop_slot), None);
+    // Each founding entry is created with its own fresh rename id.
+    let laptop_founding = rename_id_of(&mut phone, &laptop_slot);
+    assert!(laptop_founding.is_some());
+    assert!(rename_id_of(&mut phone, &phone_slot).is_some_and(|id| Some(id) != laptop_founding));
     phone
         .rename_linked_device(&laptop_slot, "Laptop")
         .await
@@ -82,7 +85,7 @@ async fn any_device_renames_any_device() {
     assert_eq!(label_of(&mut phone, &laptop_slot), "Laptop");
     assert_eq!(announced(&phone, &group, &laptop), laptop_announced);
     let laptop_rename = rename_id_of(&mut phone, &laptop_slot);
-    assert!(laptop_rename.is_some());
+    assert!(laptop_rename.is_some() && laptop_rename != laptop_founding);
     let mut phone_cursor = published_count(&relay);
     deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
     laptop.sync().await.unwrap();
@@ -273,7 +276,7 @@ async fn a_rename_while_a_commit_is_in_flight_is_refused() {
 /// again: each has seen the other's answer to what it got. The device group
 /// is hidden, so convergence runs through the runtime. A pass can take more
 /// than one advance on a loaded machine, so the rounds are not counted.
-async fn exchange(
+pub(super) async fn exchange(
     phone: &mut AppClient,
     laptop: &mut AppClient,
     relay: &ScriptedPushRelayClient,
@@ -355,7 +358,7 @@ async fn another_rename_of_the_same_device_stands() {
 
 /// `device` changes its own roster entry once per platform, each its own
 /// commit, without renaming itself.
-async fn edit_own_entry(device: &mut AppClient, group: &GroupId, platforms: &[&str]) {
+pub(super) async fn edit_own_entry(device: &mut AppClient, group: &GroupId, platforms: &[&str]) {
     let slot: [u8; 32] = hex::decode(own_slot(device)).unwrap().try_into().unwrap();
     for platform in platforms {
         let edit = device
@@ -403,6 +406,7 @@ async fn a_rename_that_loses_a_fork_is_made_again() {
     let laptop_slot = own_slot(&laptop);
     let start = published_count(&relay);
     let mut cursors = (start, start);
+    let founding = rename_id_of(&mut phone, &laptop_slot);
 
     phone
         .rename_linked_device(&laptop_slot, "Laptop")
@@ -422,7 +426,7 @@ async fn a_rename_that_loses_a_fork_is_made_again() {
             "",
             "the phone's rename lost"
         );
-        assert_eq!(rename_id_of(device, &laptop_slot), None);
+        assert_eq!(rename_id_of(device, &laptop_slot), founding);
     }
 
     settle_renames(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;

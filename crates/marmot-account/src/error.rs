@@ -16,6 +16,8 @@ pub enum AccountHomeError {
     AccountIdInUse(String),
     #[error("unknown account: {0}")]
     UnknownAccount(String),
+    #[error("this device was unlinked from the account: {0}")]
+    AccountUnlinked(String),
     #[error("invalid nsec or secret key")]
     InvalidSecretKey,
     #[error("invalid Nostr public key")]

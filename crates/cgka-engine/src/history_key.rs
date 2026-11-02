@@ -56,11 +56,31 @@ pub fn seal_history<C: OpenMlsCrypto>(
     context: &[u8],
     plaintext: &[u8],
 ) -> Option<Vec<u8>> {
+    seal_with_label(
+        crypto,
+        ciphersuite,
+        ENCRYPT_LABEL,
+        recipient_public_key,
+        context,
+        plaintext,
+    )
+}
+
+/// MLS's `EncryptWithLabel` under `label` (already prefixed "MLS 1.0 "),
+/// as [`seal_history`] describes, for any of Marmot's sealing labels.
+pub(crate) fn seal_with_label<C: OpenMlsCrypto>(
+    crypto: &C,
+    ciphersuite: Ciphersuite,
+    label: &[u8],
+    recipient_public_key: &[u8],
+    context: &[u8],
+    plaintext: &[u8],
+) -> Option<Vec<u8>> {
     let sealed = crypto
         .hpke_seal(
             ciphersuite.hpke_config(),
             recipient_public_key,
-            &encrypt_context(context),
+            &encrypt_context(label, context),
             &[],
             plaintext,
         )
@@ -78,6 +98,25 @@ pub fn open_history<C: OpenMlsCrypto>(
     context: &[u8],
     sealed: &[u8],
 ) -> Option<Vec<u8>> {
+    open_with_label(
+        crypto,
+        ciphersuite,
+        ENCRYPT_LABEL,
+        private_key,
+        context,
+        sealed,
+    )
+}
+
+/// MLS's `DecryptWithLabel` under `label`, as [`open_history`] describes.
+pub(crate) fn open_with_label<C: OpenMlsCrypto>(
+    crypto: &C,
+    ciphersuite: Ciphersuite,
+    label: &[u8],
+    private_key: &[u8],
+    context: &[u8],
+    sealed: &[u8],
+) -> Option<Vec<u8>> {
     let mut cursor = sealed;
     let ciphertext = HpkeCiphertext::tls_deserialize(&mut cursor).ok()?;
     if !cursor.is_empty() {
@@ -88,15 +127,15 @@ pub fn open_history<C: OpenMlsCrypto>(
             ciphersuite.hpke_config(),
             &ciphertext,
             private_key,
-            &encrypt_context(context),
+            &encrypt_context(label, context),
             &[],
         )
         .ok()
 }
 
 /// MLS's `EncryptContext`: the label, then the context, each a vector.
-fn encrypt_context(context: &[u8]) -> Vec<u8> {
-    encode_component_vectors(&[ENCRYPT_LABEL, context])
+fn encrypt_context(label: &[u8], context: &[u8]) -> Vec<u8> {
+    encode_component_vectors(&[label, context])
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -256,6 +295,17 @@ mod tests {
         // kem_output<V> (32 bytes) then ciphertext<V> (6 + 16 bytes).
         assert_eq!(sealed.len(), 1 + 32 + 1 + 6 + 16);
         assert_eq!(sealed[0], 32);
+        // A history delivery's key and hash: its ciphertext's length takes
+        // two bytes.
+        let delivery = seal_history(
+            &crypto,
+            DEFAULT_CIPHERSUITE,
+            &pair.public,
+            CONTEXT,
+            &[0; 64],
+        )
+        .unwrap();
+        assert_eq!(delivery.len(), 1 + 32 + 2 + 64 + 16);
 
         let mut trailing = sealed.clone();
         trailing.push(0);

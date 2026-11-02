@@ -30,6 +30,19 @@ pub struct Identity {
     pub(crate) account_identity_proof: crate::account_identity_proof::AccountIdentityProofMaterial,
 }
 
+fn proof_created_at(
+    protocol_profile: ProtocolProfile,
+    now: impl FnOnce() -> SystemTime,
+) -> Result<u64, String> {
+    match protocol_profile {
+        ProtocolProfile::Legacy => Ok(0),
+        ProtocolProfile::Current => now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|error| format!("system clock precedes Unix epoch: {error}")),
+    }
+}
+
 impl Identity {
     /// Load or create an identity with a basic credential whose `identity`
     /// field carries `identity_bytes` (opaque — typically a stable pubkey).
@@ -103,10 +116,7 @@ impl Identity {
                 proof.clone(),
             )
         } else {
-            let created_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-                .as_secs();
+            let created_at = proof_created_at(protocol_profile, SystemTime::now)?;
             let proof = crate::account_identity_proof::account_identity_proof_material(
                 &identity_bytes,
                 &binding.mls_signature_public_key,

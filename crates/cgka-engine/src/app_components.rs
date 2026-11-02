@@ -4,7 +4,7 @@ use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
-    AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
+    AccountEntryV1, AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
     DEVICE_TAG_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -312,6 +312,12 @@ pub(crate) fn device_entry_of_group(
     slot: &DeviceSlotId,
 ) -> Option<DeviceEntryV1> {
     device_roster_of_group(mls_group).and_then(|mut roster| roster.devices.remove(slot))
+}
+
+/// The account entry the device roster `mls_group` holds. `None` when the
+/// roster cannot be read.
+pub(crate) fn account_entry_of_group(mls_group: &MlsGroup) -> Option<AccountEntryV1> {
+    device_roster_of_group(mls_group).map(|roster| roster.account)
 }
 
 pub(crate) fn message_retention_seconds_of_group(

@@ -25,11 +25,15 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `leave_requests.rs`, `disband_requests.rs` | Durable leave and disband requests (plus disband candidates/tombstones). |
 | `maintenance.rs` | `MaintenanceStorage`: maintenance and publication-recovery records. |
 | `private_key_packages.rs` | `PrivateKeyPackageStorage`: one issuer record per private KeyPackage handed to a sibling (mdk#2628 item 3.4b); the key itself stays in the OpenMLS bundle store. |
-| `announced_key_packages.rs` | `AnnouncedKeyPackageStorage`: each KeyPackage a device-group roster this device held announced, by group and slot (mdk#2628 D31 item 7). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
+| `roster_tag_keys.rs` | `RosterTagKeyStorage`: each tag signature key a device-group roster this device held listed, in a device entry or a `removed` record, by group and slot (mdk#2761). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
+| `sibling_adds.rs` | `SiblingAddStorage`: each sibling slot one of this device's own confirmed Commits added to a group, until the app owes it that group's history (mdk#2628 D76). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
 
 ## Rules
 
 - Keep tests beside the module they exercise.
+- Prove that a write joins or owns its transaction by behavior, never by reading source: hold the write lock on a
+  second connection (`write_contention::SharedDatabase` in `mod.rs`) or inject a trigger failure, and match the
+  injected error's text. `StorageError::Backend(_)` alone also matches the error a nested `BEGIN` raises.
 - Message rows follow storage format 2 (`docs/marmot-architecture/storage-format-v2.md`): scalar columns, `payload`,
   and `deferred_peel` are authoritative and `record` is `NULL`; legacy format-1 rows stay readable and promote
   atomically on mutation. Other Marmot records (for example groups) are serialized `record` blobs so trait shapes can

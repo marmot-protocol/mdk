@@ -482,16 +482,43 @@ impl OutboundFanout {
         self.target_last_attempt_at_ms.get(index).copied().flatten()
     }
 
-    /// Make targets whose last attempt was proven not to reach a relay
-    /// immediately eligible after the host observes restored connectivity.
-    /// Possibly-exposed targets deliberately retain their conservative retry
-    /// clock because replaying them early could duplicate an accepted event.
+    /// Make only targets whose last attempt was proven not to reach a relay
+    /// immediately eligible, leaving possibly-exposed targets on their retry
+    /// clock. A restored-connectivity wake uses
+    /// [`Self::wake_targets_for_restored_connectivity`] instead, which also
+    /// wakes possibly-exposed targets: their retry resends the same signed
+    /// event, which a relay that stored it acknowledges as a duplicate.
     pub fn wake_retryable_unavailable_targets(&mut self) -> usize {
         self.ensure_target_metadata_len();
         let mut woken = 0;
         for (index, status) in self.target_statuses.iter().enumerate() {
             if *status == FanoutTargetStatus::RetryableUnavailable
                 && self.target_last_attempt_at_ms[index].take().is_some()
+            {
+                woken += 1;
+            }
+        }
+        woken
+    }
+
+    /// Make every retryable target eligible now after the host observes
+    /// restored connectivity, including possibly-exposed ones (mdk#2762).
+    ///
+    /// A retry resends the exact frozen signed event, so a relay that already
+    /// stored it answers `duplicate:` and the target counts as accepted. No
+    /// second logical message can result. Attempt counts are kept, so a target
+    /// that fails again resumes its backoff from where it was. A send that a
+    /// stale socket swallowed while the device went offline would otherwise
+    /// wait out an ambiguity backoff of up to an hour after reconnecting, and
+    /// hold every later send in its group behind it.
+    pub fn wake_targets_for_restored_connectivity(&mut self) -> usize {
+        self.ensure_target_metadata_len();
+        let mut woken = 0;
+        for (index, status) in self.target_statuses.iter().enumerate() {
+            if matches!(
+                status,
+                FanoutTargetStatus::RetryableUnavailable | FanoutTargetStatus::PossiblyExposed
+            ) && self.target_last_attempt_at_ms[index].take().is_some()
             {
                 woken += 1;
             }
@@ -1379,6 +1406,58 @@ mod tests {
         assert_eq!(
             fanout.target_status(1),
             Some(FanoutTargetStatus::RetryableUnavailable)
+        );
+    }
+
+    #[test]
+    fn restored_connectivity_wakes_every_retryable_target_and_keeps_attempt_counts() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        for (index, kind) in [
+            TransportEndpointFailureKind::PossiblyExposed,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            TransportEndpointFailureKind::TerminalRejected,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fanout.mark_attempt_started_at(index, 100).unwrap();
+            fanout
+                .record_target_failure(
+                    index,
+                    TransportEndpointFailure {
+                        endpoint: fanout.request().target.endpoints()[index].clone(),
+                        reason: "scripted failure".into(),
+                        kind,
+                        rejection_category: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(fanout.wake_targets_for_restored_connectivity(), 2);
+        assert_eq!(fanout.target_last_attempt_at_ms(0), None);
+        assert_eq!(fanout.target_last_attempt_at_ms(1), None);
+        assert_eq!(
+            fanout.target_last_attempt_at_ms(2),
+            Some(100),
+            "a terminal rejection is never retried"
+        );
+        assert_eq!(
+            fanout.target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed),
+            "the wake keeps the exposure record for duplicate accounting"
+        );
+        assert_eq!(fanout.target_attempt_count(0), 1);
+        assert_eq!(
+            fanout.wake_targets_for_restored_connectivity(),
+            0,
+            "a second edge before another attempt has nothing to wake"
         );
     }
 

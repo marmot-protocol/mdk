@@ -3096,6 +3096,111 @@ async fn a_queued_intent_held_by_a_storage_failure_stays_queued() {
     assert_eq!(engine.group_record(&group_id).unwrap().name, "held edit");
 }
 
+/// A queued change the settled state already holds drains to `NoChange` and
+/// is retired then (mdk#2842). A failed retirement leaves it for the next
+/// drain, and the pass still returns the message it prepared before it: had
+/// the drain failed, that message would stay marked in flight, unpublished.
+#[tokio::test]
+async fn a_queued_no_change_whose_retirement_fails_keeps_the_pass() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    use cgka_traits::group::ProtocolProfile;
+
+    let termination_fault = LeaveWriteFault::default();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: termination_fault.clone(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+    })
+    .identity(pad32(b"no-change-retirement"))
+    .account_identity_proof_signer(proof_signer(b"no-change-retirement"))
+    .protocol_profile(ProtocolProfile::Current)
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, _) = engine
+        .create_group(CreateGroupRequest {
+            name: "no change".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let payload = MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "queued first",
+    )
+    .encode()
+    .unwrap();
+    let queued = engine
+        .queue_app_message(group_id.clone(), payload)
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }), "{queued:?}");
+    let enable = engine
+        .send(SendIntent::EnableDisbanding {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(enable, SendResult::Queued { .. }), "{enable:?}");
+
+    termination_fault.arm_on_write(1);
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("a failed retirement does not fail the drain");
+    let [
+        SendResult::ApplicationMessage { msg, .. },
+        SendResult::NoChange { .. },
+    ] = drained.as_slice()
+    else {
+        panic!("the queued message, then the change already made: {drained:?}");
+    };
+    assert_eq!(termination_fault.remaining(), 0);
+    let (_, intent_id) = engine
+        .regenerated_queued_intent_for_message(&msg.id)
+        .unwrap();
+    engine.confirm_queued_outbound_intent(&intent_id).unwrap();
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "the change already made waits for the next drain"
+    );
+
+    let drained = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001)
+        .await
+        .unwrap();
+    assert!(
+        matches!(drained.as_slice(), [SendResult::NoChange { .. }]),
+        "{drained:?}"
+    );
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
     for fail_on_write in 1..=2 {

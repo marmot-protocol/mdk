@@ -30,9 +30,10 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery, transport-cursor and subscription-refusal rows exist only in v5 (see
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only) and
-[`subscription_refused`](#subscription_refused-v5-only)); a v4 recorder drops them.
+Account recovery, transport-cursor, subscription-refusal and recovery-runner pause rows exist only in v5 (see
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only),
+[`subscription_refused`](#subscription_refused-v5-only) and
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -251,8 +252,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
 `sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only), and the v5-only refusal row under
-[`subscription_refused`](#subscription_refused-v5-only).
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
+[`subscription_refused`](#subscription_refused-v5-only), and the runner's pause row under
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -988,14 +990,14 @@ Shared conventions:
 
 #### `recovery_need_changed`
 
-Recovery need changed for one obligation.
+Recovery need changed for one obligation, or for one coverage-ledger route's notice (`unproven_history`).
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660, unproduced until the runner owns history). |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
-| `obligation_ref` | Hashed obligation id. |
-| `obligation_revision` | Revision the change left. |
+| `obligation_ref` | Hashed obligation id; for `unproven_history`, the hashed route tag, never the route. |
+| `obligation_revision` | Revision the change left; for `unproven_history`, the route's park revision. |
 | `bound` | For `recorded` / `joined` / `resumed`: `floor`, `unbounded`, or `retained_window`, the goal's lower bound as the comparison will use it. |
 | `floor_secs` | Present exactly when `bound` is `floor`: the goal's floor after the change, the lowest bound charged by any unresolved generation of the cause. That is the earliest dropped wire `created_at` (queue loss) or the lowest REQ `since` read at a lag (notification loss). |
 | `charged` | Loss causes only: deliveries (queue loss) or lagged notifications (notification loss) newly charged by this change. A notification count is an observation count, not a count of missed events. |
@@ -1010,8 +1012,9 @@ Where it is recorded:
 - Startup incremental history (`retained_window`) and explicit full-history repair (`unbounded`, by design) requests.
 - Native source observation (`subscription_replay`) records original-window input need without a loss charge.
   Limited native admission never reports certified history, `window_certified`, or loss acknowledgment.
-- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, and
-  `closed` for a withdrawn occurrence whose obligation is now satisfied. Parked obligations get no automatic retries,
+- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, a
+  ledger route's included, and `closed` for a withdrawn occurrence whose obligation is now satisfied. A ledger notice
+  records only `notice_shown` and `notice_dismissed`, with no `bound` or `charged`. Parked obligations get no automatic retries,
   so `closed` means an explicit deep repair completed it. The first call after open only takes the baseline.
 - Dismissal (`dismiss_history_notice`): `notice_dismissed`.
 - Explicit full-history repair's own close after a `BelowRetentionWindow` pass: `closed_below_window`, only when
@@ -1226,6 +1229,24 @@ Notes:
   fetch is ignored here; one-shot fetches report their closes through acquisition.
 - An account without a v5 recorder still drains its reports at the seam and discards them.
 
+### `recovery_runner_paused` (v5 only)
+
+The phase 4 recovery runner's account breaker paused this account's history fetches at a rolling-hour cap (mdk#2660).
+The runner records it in a worker turn once per pause. Nothing writes it until the runner owns recovery debt, which
+an internal gate keeps off. Account-scoped, so `group_ref` is `None`.
+
+| Field | Meaning |
+| --- | --- |
+| `cap` | The cap reached: `attempts`, `event_bytes` or `both`. |
+| `attempts` | Attempts the rolling hour holds as it pauses. |
+| `event_bytes` | Event bytes the rolling hour holds as it pauses. |
+| `paused_for_secs` | Seconds until enough of the hour rolls off for the runner to go on. |
+| `pauses` | Pauses since the process started, across its accounts, this one included. |
+| `late_findings` | Events re-checks found inside history already covered, since the process started, across its accounts. |
+
+A pause is a bug signal: the per-unit backoff and per-relay cooldowns should stop a misbehaving relay or route long
+before the account's caps. The pause changes no unit; units stay due and run once the hour rolls.
+
 ### `auto_commit_decision`
 
 Emitted after `LowestIndexAutoCommitter::decide` returns a decision for a queued proposal.
@@ -1369,7 +1390,7 @@ metadata keys for indexing.
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
 | `PeelerOutcomeKind` | `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `other` |
-| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay` |
+| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay`, `unproven_history` |
 | `RecoveryNeedChange` | `recorded`, `joined`, `resumed`, `notice_shown`, `notice_dismissed`, `closed`, `closed_below_window` |
 | `RecoveryGoalBound` | `floor`, `unbounded`, `retained_window` |
 | `RecoveryAttemptScope` | `history`, `exact_event`, `maintenance_boundary`, `mixed` |
@@ -1728,6 +1749,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |
 | Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
+| Did the recovery runner hit the account's hourly cap? | `recovery_runner_paused`: the cap, the hour's usage, how long the pause lasts, and process totals of pauses and late findings. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:

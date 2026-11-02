@@ -1,6 +1,7 @@
 mod attention;
 mod pages;
 mod selection;
+mod small_state;
 mod window;
 use crate::app::account_projection::chat_mute_is_effective;
 use crate::base::connection::CachedSql;
@@ -28,6 +29,11 @@ pub use pages::{
 use rusqlite::{Connection, OptionalExtension, Params, params};
 pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
+pub use small_state::{
+    MAX_SMALL_STATE_NUMBER, MuteSetting, ReadPosition, SmallStateBroadcast, SmallStateItem,
+    SmallStateItemName, SmallStateRule, SmallStateSchedule, SmallStateSync, SmallStateValue,
+    SmallStateVersion,
+};
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};
 
@@ -532,28 +538,6 @@ impl SqliteAppStorage {
     ) -> StorageResult<Vec<ChatListRow>> {
         let conn = self.lock()?;
         direct_conversation_candidate_rows_tx(&conn, peer_account_id_hex)
-    }
-
-    /// `EXPLAIN QUERY PLAN` for the peer-keyed candidate read.
-    ///
-    /// Used by the regression that requires
-    /// `idx_direct_conversation_members_member` as the driving index.
-    pub fn direct_conversation_candidate_query_plan(
-        &self,
-        peer_account_id_hex: &str,
-    ) -> StorageResult<Vec<String>> {
-        let peer_account_id_hex = peer_account_id_hex.trim().to_ascii_lowercase();
-        if peer_account_id_hex.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock()?;
-        let sql = format!("EXPLAIN QUERY PLAN {}", direct_conversation_candidate_sql());
-        let mut statement = conn.prepare_cached(&sql).storage()?;
-        statement
-            .query_map(params![peer_account_id_hex], |row| row.get::<_, String>(3))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()
     }
 
     /// Direct groups that still have no peer-index rows.
@@ -1197,6 +1181,8 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
     // Walk newest insertions first; the first eligible row is the high water.
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
+    // A row imported from a sibling's history is older history, not new
+    // activity, so it never displaces a pending send (mdk#2628 4.2a).
     format!(
         "SELECT accepted_source.insert_order
          FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
@@ -1210,6 +1196,11 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
            AND NOT (
                accepted.direction = 'sent'
                AND accepted.source_message_id_hex IS NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM app_event_imports AS imported
+               WHERE imported.group_id_hex = accepted_source.group_id_hex
+                 AND imported.message_id_hex = accepted_source.message_id_hex
            )
          ORDER BY accepted_source.insert_order DESC
          LIMIT 1"
@@ -1445,6 +1436,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                    OR row.self_membership IS NOT CASE ag.self_membership
                         WHEN 'left' THEN 'left'
                         WHEN 'removed' THEN 'removed'
+                        WHEN 'device_removed' THEN 'device_removed'
                         ELSE 'member'
                       END
                    OR row.conversation_created_at IS NOT ag.conversation_created_at
@@ -1896,6 +1888,10 @@ fn reconcile_unread_messages_tx(
 
 // Edits affect presentation, while mention eligibility stays on the original message.
 const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext)";
+/// A row imported from a sibling's history never counts as unread (mdk#2628
+/// 4.2a). The read marker stays this device's own read, so an import never
+/// moves it.
+const NOT_IMPORTED_SQL: &str = "NOT EXISTS (SELECT 1 FROM app_event_imports AS imported WHERE imported.group_id_hex=message_timeline.group_id_hex AND imported.message_id_hex=message_timeline.message_id_hex)";
 
 /// WHERE clause + parameters selecting rows that sort after a conversation's
 /// read cursor: the single definition of "unread" shared by the projection
@@ -1970,7 +1966,7 @@ fn unread_membership_for_message_tx(
          FROM message_timeline
          WHERE group_id_hex = ?1 AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2 AND message_id_hex = ?3
            AND {activity_filter} AND deleted = 0
-           AND invalidation_status IS NULL AND {where_sql}"
+           AND invalidation_status IS NULL AND {NOT_IMPORTED_SQL} AND {where_sql}"
     );
     let mut query_params = vec![
         rusqlite::types::Value::Text(group_id_hex.to_owned()),
@@ -2038,6 +2034,7 @@ fn rebuild_unread_membership_tx(
            AND deleted = 0
            AND invalidation_status IS NULL
            AND sender NOT IN (SELECT public_key FROM user_blocks) AND sender != ?2
+           AND {NOT_IMPORTED_SQL}
            AND {where_sql}
          ORDER BY {order_sql}"
     );
@@ -2152,6 +2149,7 @@ fn retention_expiry_scan_tx(
                     AND invalidation_status IS NULL
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
+                    AND {NOT_IMPORTED_SQL}
                     AND message_id_hex IN (
                         SELECT message_id_hex FROM app_events
                         WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
@@ -2167,13 +2165,17 @@ fn retention_expiry_scan_tx(
         }
         // No read cursor yet: stay conservative, as the replaced page scan
         // did, and treat every expired received row as unread rather than
-        // guessing what the account has seen.
+        // guessing what the account has seen. An imported row is never
+        // unread, so it expires on time.
         _ => timeline_exists_tx(
             tx,
             "SELECT EXISTS(SELECT 1 FROM app_events
                       WHERE group_id_hex = ?1
                         AND direction = 'received'
-                        AND retention_expires_at <= ?2)",
+                        AND retention_expires_at <= ?2
+                        AND NOT EXISTS (SELECT 1 FROM app_event_imports AS imported
+                            WHERE imported.group_id_hex = app_events.group_id_hex
+                              AND imported.message_id_hex = app_events.message_id_hex))",
             &[group, now],
         )?,
     };

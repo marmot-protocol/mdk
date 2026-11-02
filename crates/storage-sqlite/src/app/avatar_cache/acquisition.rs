@@ -318,32 +318,6 @@ impl SqliteAppStorage {
         ).storage()
     }
 
-    pub fn avatar_acquisition_state(
-        &self,
-        reference: &AvatarAssetRef,
-    ) -> StorageResult<Option<AvatarAcquisitionState>> {
-        let value: Option<i64> = self
-            .lock()?
-            .query_row(
-                "SELECT state FROM avatar_acquisition CROSS JOIN chat_presentation_meta m
-             WHERE token = ?1 AND m.id = 1 AND m.store_epoch = ?2",
-                params![reference.token, reference.store_epoch],
-                |r| r.get(0),
-            )
-            .optional()
-            .storage()?;
-        value
-            .map(|v| match v {
-                0 => Ok(AvatarAcquisitionState::Idle),
-                1 => Ok(AvatarAcquisitionState::Queued),
-                2 => Ok(AvatarAcquisitionState::Fetching),
-                3 => Ok(AvatarAcquisitionState::RetryScheduled),
-                4 => Ok(AvatarAcquisitionState::Blocked),
-                _ => Err(invalid("invalid avatar acquisition state")),
-            })
-            .transpose()
-    }
-
     /// Current binding for a conversation identity, including its previous source.
     pub fn avatar_identity_reference(
         &self,

@@ -4,6 +4,50 @@
 
 ### Breaking changes
 
+- `sign_out_and_wipe` signs out through the account's other devices
+  (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
+  first records in the device group that it is leaving, which can take about
+  30 seconds, and leaves those devices the chats they can take it out of.
+  `WipeOutcomeFfi` adds `groups_left_to_siblings` and `siblings_not_reached`,
+  which says it could not ask them in time and tried to leave every chat
+  itself, reporting any it could not in `group_leave_failures`; tell the
+  user. The call now keeps running when the host cancels it, so a
+  sign-out that has asked its siblings always finishes. Regenerate bindings
+  with the matching native library.
+
+- `TimelineMessageRecordFfi` adds `imported_from: Option<HistoryImportSourceFfi>`,
+  the device an imported row came from, and `MarmotEventFfi` adds
+  `ChatHistoryImportsChanged { account_id_hex, account_label }` (mdk#2628
+  item 4.2d). New `chat_history_imports(account_ref)` lists each held chat's
+  history from another device as `ChatHistoryImportFfi`: `Receiving`, with
+  `retrying` once an attempt to get its bundle failed, or `Imported` with
+  its source and time. An
+  empty `device_label` means "another device". Only behind
+  `dev_device_groups`. Exhaustive matches add the new arm.
+
+- `CompromiseWarningReasonFfi::RejectedKeyPackage` is now
+  `ForeignOwnSlotKeyPackage` (mdk#2628 D74, 3.7b): a KeyPackage this device
+  found in its own slot that it did not make, which only this device warns
+  of. Kind 462 is no longer reserved. The device roster changed its encoding,
+  so existing development device groups must be recreated.
+
+- A device that its device group removes after its link was made is
+  unlinked (mdk#2628 item 3.6b): the account stops on that device and stays
+  signed out. `MarmotEventFfi` adds `DeviceUnlinked { account_id_hex,
+  account_label }`, sent once; `AccountSummaryFfi` adds `unlinked`; and
+  `MarmotKitError` adds `AccountUnlinked { account_ref }`, which signing in,
+  logging in or importing the key of such an account returns. Show that this
+  device was unlinked and offer
+  `sign_out_and_wipe`, which skips leaving chats and deleting the slot;
+  signing in again is then a new link. Update exhaustive Swift/Kotlin
+  handling and regenerate bindings with the matching native library.
+
+- `SelfMembershipFfi` and `ConversationParticipationFfi` add `DeviceRemoved`
+  (mdk#2628 item 3.6b): this device's leaf was removed from a chat the account
+  stays in through another of its devices. Show no "removed from group"
+  notice for it. Update exhaustive Swift/Kotlin handling and regenerate
+  bindings with the matching native library.
+
 - `GroupEventKindFfi` adds `QueuedIntentRefused { intent_id_hex, intent_kind,
   reason }` (mdk#2694): a send that waited for the group to settle was dropped
   because the settled state refused it; tell the user, who may try again.
@@ -24,6 +68,14 @@
 - `MarmotEventFfi` adds `UnrecognizedSignInsChanged { account_id_hex,
   account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
   regenerate bindings with the matching native library.
+
+- `MarmotEventFfi` adds `CompromiseWarningChanged { account_id_hex,
+  account_label }` (mdk#2628). Update exhaustive Swift/Kotlin handling and
+  regenerate bindings with the matching native library.
+- `HistoryNoticeCauseFfi` adds `UnprovenHistory`, and `MarmotEventFfi` adds
+  `RecoveryStatusChanged { account_id_hex, account_label }` (mdk#2660). Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library. Neither is produced until the recovery runner owns history.
 
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
@@ -61,6 +113,13 @@
 
 ### Added
 
+- `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
+  the groups whose history is still being fetched (`catching_up_group_ids_hex`),
+  whether the inbox's is (`inbox_catching_up`), and every notice as
+  `history_notices` lists them (mdk#2660). Re-read it on
+  `RecoveryStatusChanged`. Until the recovery runner owns history nothing is
+  ever catching up.
+
 - `MarmotOptions.devicePlatform` names the platform this device runs on, such
   as `iOS`. With `clientName`, each device writes it into its own roster
   entry, so `linked_devices` shows every device's client and platform
@@ -90,6 +149,11 @@
   trusts, this device first (mdk#2628 item 3.1). Re-read it on
   `LinkedDevicesChanged`. It is empty in release builds until the roster's
   spec lands.
+- `LinkedDeviceFfi` adds `last_active_at`, when a heartbeat last showed a
+  sibling running, and `inactive`, this device's own judgement 30 days after
+  the later of that and when it first found the sibling in the roster
+  (mdk#2628 item 3.6). Each device sends a heartbeat in the device group at
+  most once an hour while it runs. Release builds show neither.
 
 - `key_package_refresh_overdue(account_ref)` says when this device's device
   group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
@@ -104,6 +168,15 @@
   Re-read the list on `UnrecognizedSignInsChanged`. It is empty in release
   builds until the roster's spec lands.
 
+- `compromise_warning(account_ref)` returns the account's open compromise
+  warning on this device as `CompromiseWarningItemFfi` records (mdk#2628 item
+  3.7a), and `dismiss_compromise_warning(account_ref)` closes it on this
+  device. Re-read it on `CompromiseWarningChanged`. `start_fresh(account_ref)`
+  answers every sign-in from before this device Not now without rejecting
+  any, and `started_fresh(account_ref)` says whether the device did so and
+  still has no device group. All are empty or false in release builds until
+  the roster's spec lands.
+
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
   only when the user asks, and the group can never turn it off.
@@ -115,9 +188,19 @@
 
 ### Changed
 
-- `send_custom_event` refuses the device-group kinds 457, 459, 460 and 462
-  as reserved, and one received in a chat makes no timeline row, message or
-  notification (mdk#2628). They are read only in the account's device group.
+- Every text send queued while offline publishes as soon as the host reports
+  restored connectivity, not only the first (mdk#2762). Later sends no longer
+  wait out a retry clock of up to an hour behind it, also after a cold start
+  that is already online or a transport reopen, which get no connectivity
+  report from the host.
+- `removed_device_leftover_chats` also counts chats that keep the leaf of a
+  device the account's device group stopped listing without a removal, such
+  as after a failed link (mdk#2761). Release builds hold no device group, so
+  it stays zero there.
+- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
+  475 and 476 as reserved, and one received in a chat makes no timeline row,
+  message or notification (mdk#2628). They are read only in the account's
+  device group.
 - Creating a group or inviting adds every device of each recipient account
   (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
   last 30 days, at most 20, or the single best one when none is that recent.

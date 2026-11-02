@@ -255,33 +255,48 @@ impl SqliteAppStorage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reservation_is_durable_monotonic_and_fail_closed_when_ambiguous() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
-        let context = [1_u8; 32];
-        let initial = [2_u8; 32];
-        let after = [3_u8; 32];
-        let token = [4_u8; 16];
+    const CONTEXT: [u8; 32] = [1; 32];
+    const INITIAL: [u8; 32] = [2; 32];
 
+    /// A reservation of `record_count` records on top of the transcript the
+    /// publisher last saw (`expected`, `expected_chunk_count`).
+    fn request<'a>(
+        context: &'a [u8; 32],
+        expected: &'a [u8; 32],
+        expected_chunk_count: u64,
+        resulting: &'a [u8; 32],
+        record_count: u64,
+        token: u8,
+    ) -> AgentStreamPublisherReservationRequest<'a> {
+        AgentStreamPublisherReservationRequest {
+            context_id: context,
+            initial_transcript_hash: &INITIAL,
+            expected_transcript_hash: expected,
+            expected_chunk_count,
+            resulting_transcript_hash: resulting,
+            record_count,
+            resulting_chunk_count: expected_chunk_count + record_count,
+            token: [token; 16],
+        }
+    }
+
+    fn refusal<T: std::fmt::Debug>(result: StorageResult<T>) -> String {
+        match result {
+            Err(StorageError::Backend(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reservation_advances_the_sequence_and_an_unconfirmed_one_fails_closed() {
+        let storage = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let after = [3_u8; 32];
         let reserved = storage
-            .app_storage()
-            .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
-                context_id: &context,
-                initial_transcript_hash: &initial,
-                expected_transcript_hash: &initial,
-                expected_chunk_count: 0,
-                resulting_transcript_hash: &after,
-                record_count: 2,
-                resulting_chunk_count: 2,
-                token,
-            })
+            .reserve_agent_stream_publisher_records(request(&CONTEXT, &INITIAL, 0, &after, 2, 4))
             .unwrap();
         assert_eq!(reserved.first_seq, 1);
         assert_eq!(
-            storage
-                .app_storage()
-                .agent_stream_publisher_state(&context)
-                .unwrap(),
+            storage.agent_stream_publisher_state(&CONTEXT).unwrap(),
             Some(AgentStreamPublisherState {
                 next_seq: 3,
                 transcript_hash: after,
@@ -289,105 +304,231 @@ mod tests {
                 ambiguous: true,
             })
         );
-        assert!(
-            storage
-                .app_storage()
-                .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
-                    context_id: &context,
-                    initial_transcript_hash: &initial,
-                    expected_transcript_hash: &after,
-                    expected_chunk_count: 2,
-                    resulting_transcript_hash: &[5; 32],
-                    record_count: 1,
-                    resulting_chunk_count: 3,
-                    token: [6; 16],
-                })
-                .is_err()
+        // The first reservation was never confirmed: its records may have
+        // gone out, so the context is disabled for good.
+        assert_eq!(
+            refusal(storage.reserve_agent_stream_publisher_records(request(
+                &CONTEXT, &after, 2, &[5; 32], 1, 6
+            ))),
+            "agent stream publisher continuity is ambiguous"
         );
-        assert!(
-            storage
-                .app_storage()
-                .confirm_agent_stream_publisher_reservation(&context, &token)
-                .is_err()
+        assert_eq!(
+            refusal(storage.confirm_agent_stream_publisher_reservation(&CONTEXT, &reserved.token)),
+            "agent stream publisher reservation is not current"
         );
     }
 
     #[test]
     fn confirmed_reservation_continues_at_next_sequence() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
-        let context = [1_u8; 32];
-        let initial = [2_u8; 32];
+        let storage = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let after_one = [3_u8; 32];
         let first = storage
-            .app_storage()
-            .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
-                context_id: &context,
-                initial_transcript_hash: &initial,
-                expected_transcript_hash: &initial,
-                expected_chunk_count: 0,
-                resulting_transcript_hash: &after_one,
-                record_count: 1,
-                resulting_chunk_count: 1,
-                token: [4; 16],
-            })
+            .reserve_agent_stream_publisher_records(request(
+                &CONTEXT, &INITIAL, 0, &after_one, 1, 4,
+            ))
             .unwrap();
         storage
-            .app_storage()
-            .confirm_agent_stream_publisher_reservation(&context, &first.token)
+            .confirm_agent_stream_publisher_reservation(&CONTEXT, &first.token)
             .unwrap();
         let second = storage
-            .app_storage()
-            .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
-                context_id: &context,
-                initial_transcript_hash: &initial,
-                expected_transcript_hash: &after_one,
-                expected_chunk_count: 1,
-                resulting_transcript_hash: &[5; 32],
-                record_count: 1,
-                resulting_chunk_count: 2,
-                token: [6; 16],
-            })
+            .reserve_agent_stream_publisher_records(request(
+                &CONTEXT, &after_one, 1, &[5; 32], 1, 6,
+            ))
             .unwrap();
         assert_eq!(second.first_seq, 2);
     }
 
+    /// Each row is corrupt in one way only, so each guard clause is the one
+    /// that refuses it.
     #[test]
     fn corrupt_publisher_state_fails_closed() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
-        let context = [1_u8; 32];
-        let connection = storage.connection.lock().unwrap();
-        connection
-            .execute_batch("PRAGMA ignore_check_constraints = ON;")
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO agent_stream_publisher_sequences (
-                    context_id, next_seq, transcript_hash, chunk_count,
-                    reservation_token, disabled, updated_at_ms
-                 ) VALUES (?1, 0, ?2, 0, NULL, 0, 0)",
-                params![context.as_slice(), [2_u8; 31].as_slice()],
-            )
-            .unwrap();
-        connection
-            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
-            .unwrap();
-        drop(connection);
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let rows: [(u8, i64, &[u8], i64); 3] = [
+            (1, 0, &[3; 32], 0),
+            (2, 1, &[3; 31], 0),
+            (3, 1, &[3; 32], -1),
+        ];
+        let raw_row = |context: &[u8; 32]| {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT next_seq, transcript_hash, chunk_count, reservation_token, disabled
+                     FROM agent_stream_publisher_sequences WHERE context_id = ?1",
+                    params![context.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        for (context, next_seq, hash, chunks) in rows {
+            let context = [context; 32];
+            let connection = store.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO agent_stream_publisher_sequences (
+                        context_id, next_seq, transcript_hash, chunk_count,
+                        reservation_token, disabled, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, 0, 0)",
+                    params![context.as_slice(), next_seq, hash, chunks],
+                )
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+            drop(connection);
+            let before = raw_row(&context);
 
+            // The request matches the stored transcript, so only the
+            // corruption can refuse it; it must never fall back to seq 1.
+            let stored: [u8; 32] = [3; 32];
+            let chunks = chunks.max(0) as u64;
+            assert_eq!(
+                refusal(
+                    store
+                        .app_storage()
+                        .reserve_agent_stream_publisher_records(request(
+                            &context, &stored, chunks, &[4; 32], 1, 5
+                        ))
+                ),
+                "agent stream publisher state is corrupt",
+                "row {before:?}"
+            );
+            assert_eq!(raw_row(&context), before);
+        }
+    }
+
+    /// A publisher holding a stale snapshot would reserve sequence numbers it
+    /// already sent; an empty reservation would leave a token that disables
+    /// the preview. Both are refused and change nothing.
+    #[test]
+    fn stale_or_empty_reservations_are_refused_and_write_nothing() {
+        let storage = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let after = [3_u8; 32];
+        let first = storage
+            .reserve_agent_stream_publisher_records(request(&CONTEXT, &INITIAL, 0, &after, 1, 4))
+            .unwrap();
+        storage
+            .confirm_agent_stream_publisher_reservation(&CONTEXT, &first.token)
+            .unwrap();
+        let state = storage.agent_stream_publisher_state(&CONTEXT).unwrap();
+
+        for (expected, chunks) in [(INITIAL, 0), (after, 0), (INITIAL, 1)] {
+            assert_eq!(
+                refusal(storage.reserve_agent_stream_publisher_records(request(
+                    &CONTEXT, &expected, chunks, &[5; 32], 1, 6
+                ))),
+                "agent stream publisher state changed concurrently",
+                "expected {chunks} chunks"
+            );
+            assert_eq!(
+                storage.agent_stream_publisher_state(&CONTEXT).unwrap(),
+                state
+            );
+        }
+        // An unseen context that does not start from the initial transcript
+        // keeps no row either.
+        let unseen = [8_u8; 32];
+        assert_eq!(
+            refusal(storage.reserve_agent_stream_publisher_records(request(
+                &unseen, &[9; 32], 0, &[5; 32], 1, 6
+            ))),
+            "agent stream publisher state changed concurrently"
+        );
+        assert_eq!(storage.agent_stream_publisher_state(&unseen).unwrap(), None);
+
+        for context in [CONTEXT, unseen] {
+            let expected = if context == CONTEXT { after } else { INITIAL };
+            let chunks = u64::from(context == CONTEXT);
+            assert_eq!(
+                refusal(storage.reserve_agent_stream_publisher_records(request(
+                    &context, &expected, chunks, &[5; 32], 0, 6
+                ))),
+                "agent stream reservation cannot be empty"
+            );
+        }
+        assert_eq!(
+            storage.agent_stream_publisher_state(&CONTEXT).unwrap(),
+            state
+        );
+        assert_eq!(storage.agent_stream_publisher_state(&unseen).unwrap(), None);
+    }
+
+    /// Evicting a context would drop its nonce tombstone and permit sequence
+    /// reuse, so a full table refuses new contexts and keeps the old ones.
+    #[test]
+    fn a_full_context_table_refuses_new_contexts_and_keeps_the_old_ones() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let seeded = |index: u64| {
+            let mut context = [0_u8; 32];
+            context[..8].copy_from_slice(&index.to_be_bytes());
+            context
+        };
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO agent_stream_publisher_sequences (
+                        context_id, next_seq, transcript_hash, chunk_count,
+                        reservation_token, disabled, updated_at_ms
+                     ) VALUES (?1, 1, ?2, 0, NULL, 0, 0)",
+                )
+                .unwrap();
+            for index in 0..MAX_AGENT_STREAM_PUBLISHER_CONTEXTS {
+                insert
+                    .execute(params![seeded(index).as_slice(), INITIAL.as_slice()])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+        let count = || {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM agent_stream_publisher_sequences",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let storage = store.app_storage();
+
+        assert_eq!(
+            refusal(storage.reserve_agent_stream_publisher_records(request(
+                &[0xff; 32],
+                &INITIAL,
+                0,
+                &[5; 32],
+                1,
+                6
+            ))),
+            "agent stream publisher state limit reached"
+        );
+        assert_eq!(count(), 4096);
         assert!(
             storage
-                .app_storage()
-                .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
-                    context_id: &context,
-                    initial_transcript_hash: &[3; 32],
-                    expected_transcript_hash: &[3; 32],
-                    expected_chunk_count: 0,
-                    resulting_transcript_hash: &[4; 32],
-                    record_count: 1,
-                    resulting_chunk_count: 1,
-                    token: [5; 16],
-                })
-                .is_err(),
-            "a corrupt sequence/hash row must never fall back to seq=1"
+                .agent_stream_publisher_state(&seeded(0))
+                .unwrap()
+                .is_some()
         );
+        let oldest = seeded(0);
+        let reserved = storage
+            .reserve_agent_stream_publisher_records(request(&oldest, &INITIAL, 0, &[5; 32], 1, 6))
+            .unwrap();
+        assert_eq!(reserved.first_seq, 1);
+        assert_eq!(count(), 4096);
     }
 }

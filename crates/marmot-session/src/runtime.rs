@@ -30,7 +30,7 @@ use cgka_traits::maintenance::{
     RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition, TransportFanoutAttemptState,
     TransportFanoutTarget,
 };
-use cgka_traits::storage::DeviceGroupWelcomeExpectation;
+use cgka_traits::storage::{DeviceGroupWelcomeExpectation, RosterTagKey};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
@@ -752,6 +752,26 @@ where
         Ok(self.session.account_devices_activation_refusal(group_id)?)
     }
 
+    /// Why a same-account Add of `sibling` to `group_id` would be refused
+    /// now, or `None`, without spending its KeyPackage. The send repeats the
+    /// checks. See [`cgka_engine::engine::Engine::sibling_add_refusal`].
+    pub fn sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+        sibling: &cgka_traits::engine::SiblingKeyPackage,
+    ) -> AccountResult<Option<cgka_traits::error::SiblingAddRefusal>> {
+        Ok(self.session.sibling_add_refusal(group_id, sibling)?)
+    }
+
+    /// Why `group_id` takes no same-account Add of any sibling now, or
+    /// `None`. See [`cgka_engine::engine::Engine::chat_sibling_add_refusal`].
+    pub fn chat_sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::error::SiblingAddRefusal>> {
+        Ok(self.session.chat_sibling_add_refusal(group_id)?)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.acknowledge_disband_failure(group_id)?)
     }
@@ -803,6 +823,23 @@ where
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// Which roster slot the leaf at `leaf_index` belonged to at `epoch`,
+    /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
+    /// its own retained anchor. `None` when `epoch` is neither current nor
+    /// retained, or no leaf sat at that index. See
+    /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .session
+            .member_device_tag_claim_at(group_id, epoch, leaf_index, roster)?)
+    }
+
     /// This account's other leaves in `group_id`, by signature key, with the
     /// roster slot each one's device tag reads as against the device group's
     /// current `roster`. See
@@ -813,6 +850,21 @@ where
         roster: &DeviceRosterV1,
     ) -> AccountResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.session.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// This account's other leaves in `group_id`, by signature key, whose
+    /// device tag reads under `leaf_tag_key` as one of `keys`: tag signature
+    /// keys this device remembers a roster listing. See
+    /// [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> AccountResult<Vec<Vec<u8>>> {
+        Ok(self
+            .session
+            .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)
     }
 
     pub fn app_component(
@@ -847,6 +899,10 @@ where
         length: usize,
     ) -> AccountResult<cgka_traits::SecretBytes> {
         Ok(self.session.exporter_secret(group_id, label, length)?)
+    }
+
+    pub fn epoch_pin(&self, group_id: &GroupId) -> AccountResult<cgka_traits::EpochPin> {
+        Ok(self.session.epoch_pin(group_id)?)
     }
 
     pub fn exporter_secret_with_epoch(
@@ -941,6 +997,40 @@ where
         self.session.open_history(context, sealed)
     }
 
+    /// The public half of the recovery key `entropy` derives (mdk#2628
+    /// 4.4a); nothing is stored. See [`cgka_engine::recovery_key`].
+    pub fn recovery_public_key(
+        &self,
+        entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
+    ) -> SessionResult<Vec<u8>> {
+        self.session.recovery_public_key(entropy)
+    }
+
+    /// `plaintext` sealed to a recovery key's public half, as the roster's
+    /// account entry holds it, for `context`; `None` when that key is not
+    /// one this device can seal to.
+    pub fn seal_to_recovery_key(
+        &self,
+        recovery_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.session
+            .seal_to_recovery_key(recovery_public_key, context, plaintext)
+    }
+
+    /// `sealed` opened with the recovery key `entropy` derives, for
+    /// `context`; `None` when it does not open.
+    pub fn open_with_recovery_key(
+        &self,
+        entropy: &[u8; crate::RECOVERY_ENTROPY_LEN],
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<Vec<u8>>> {
+        self.session
+            .open_with_recovery_key(entropy, context, sealed)
+    }
+
     /// See `CgkaEngine::withdraw_device_group_welcome`.
     pub fn withdraw_device_group_welcome(&mut self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.session.withdraw_device_group_welcome(group_id)?)
@@ -1014,6 +1104,11 @@ where
         group_id: &GroupId,
     ) -> SessionResult<Vec<OutboundFanout>> {
         self.session.outbound_fanouts_for_group(group_id)
+    }
+
+    /// Groups holding a stored frozen fanout, including unhydrated ones (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        self.session.outbound_fanout_group_ids()
     }
 
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
@@ -3851,6 +3946,7 @@ where
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
+        let mut earliest = None;
         for fanout in self.session.outbound_fanouts_for_group(group_id)? {
             let outcome = fanout.outcome();
             if outcome.accepted_targets > 0
@@ -3867,19 +3963,27 @@ where
                 }
                 continue;
             }
-            let mut earliest = None;
             for index in fanout.outstanding_target_indexes() {
                 if let Some(delay_ms) = frozen_fanout_target_retry_delay_ms(&fanout, index, now_ms)
                 {
                     earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
                 }
             }
-            // The first incomplete fanout is the group-scoped ordering
-            // barrier, so later NotAttempted records cannot pull this cutoff
-            // forward and cause a scheduler polling loop.
-            return Ok(earliest);
+            // The first fanout still below its required acknowledgements, or
+            // awaiting MLS confirmation, is the group-scoped ordering barrier,
+            // so later NotAttempted records cannot pull this cutoff forward and
+            // cause a scheduler polling loop. A fanout that met quorum and owes
+            // only secondary replication is not a barrier: the fanouts behind
+            // it are driven in the same pass, so their clocks count too
+            // (mdk#2762).
+            let outcome = fanout.outcome();
+            if matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || outcome.accepted_targets < fanout.request().required_acks.max(1)
+            {
+                return Ok(earliest);
+            }
         }
-        Ok(None)
+        Ok(earliest)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -4163,6 +4267,22 @@ where
         Ok(())
     }
 
+    /// Whether the owner has asked the current pass to yield dispensable
+    /// secondary relay work to a waiting foreground send.
+    fn secondary_retry_yield_requested(&self) -> bool {
+        self.publication_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|progress| {
+                progress
+                    .secondary_retry_yield
+                    .clone()
+                    .now_or_never()
+                    .is_some()
+            })
+    }
+
     async fn resume_outbound_fanouts_for_group(
         &mut self,
         group_id: Option<&GroupId>,
@@ -4190,12 +4310,20 @@ where
                     Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None))
                         .await?;
                 if status.retry_deferred
+                    && (!status.met_required_acks || self.secondary_retry_yield_requested())
                     && let Some(fanout_group) = fanout_group
                 {
                     // Preserve per-group staging order. An older exact event
-                    // that is still in durable backoff is a barrier for newer
-                    // fanouts in this group, but must not block unrelated
-                    // groups during an account-wide drain.
+                    // that is still in durable backoff below its required
+                    // acknowledgements is a barrier for newer fanouts in this
+                    // group, but must not block unrelated groups during an
+                    // account-wide drain. Secondary replication after quorum
+                    // is not a barrier, as for queued intents: a send one relay
+                    // accepted must not hold later sends behind another
+                    // relay's backoff of up to an hour (mdk#2762). Once the
+                    // owner asks secondary work to yield for a foreground
+                    // send, the pass stops here as before, so it does not go
+                    // on to wait on later fanouts' stalled relays instead.
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
@@ -6688,11 +6816,13 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::ReplaceAccountEntry { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::EnableAccountDevices { .. }
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
+            | SendIntent::RecordRemovedSlot { .. }
     )
 }
 

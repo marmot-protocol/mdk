@@ -571,4 +571,62 @@ mod tests {
         let checkpoint = decode_checkpoint(&legacy).unwrap();
         assert_eq!(checkpoint.group, snapshot.group);
     }
+
+    /// A stored snapshot that is cut short, has bytes left over or carries a
+    /// bad option tag must fail to decode rather than restore something else,
+    /// and a rollback snapshot must not pass as a group-state checkpoint.
+    #[test]
+    fn damaged_snapshot_bytes_fail_to_decode() {
+        let mut snapshot = Snapshot {
+            group: sample_group(gid(1), 0, 0),
+            messages: None,
+            queued_outbound: None,
+            convergence_policy: None,
+            validated_tree_marker: None,
+            openmls_values: Vec::new(),
+        };
+        // The group, then six one-byte fields: the message and queued option
+        // tags, the retired list, the policy and marker option tags, the
+        // values list. The offsets below count back from the end.
+        let good = encode(&snapshot).unwrap().as_slice().to_vec();
+        let mut layout = [SNAPSHOT_MAGIC.as_slice(), &SNAPSHOT_VERSION.to_be_bytes()].concat();
+        let group = serialize(&snapshot.group).unwrap();
+        cgka_traits::app_components::encode_quic_varint(group.len() as u64, &mut layout);
+        layout.extend_from_slice(&group);
+        layout.extend_from_slice(&[0; 6]);
+        assert_eq!(good, layout, "tail layout moved");
+        let at = |offset: usize, tag: u8| {
+            let mut bytes = good.clone();
+            let index = bytes.len() - offset;
+            bytes[index] = tag;
+            bytes
+        };
+        let cases = [
+            (
+                [good.as_slice(), &[0]].concat(),
+                "group snapshot has trailing bytes",
+            ),
+            (
+                good[..good.len() - 2].to_vec(),
+                "truncated option discriminant",
+            ),
+            (at(3, 2), "invalid option discriminant 2"),
+            (at(6, 2), "invalid option discriminant 2"),
+        ];
+        for (bytes, expected) in cases {
+            let error = decode(&bytes).err();
+            assert!(
+                matches!(&error, Some(StorageError::Serialization(message)) if message == expected),
+                "{expected}: {error:?}"
+            );
+        }
+
+        snapshot.messages = Some(Vec::new());
+        let error = decode_checkpoint(encode(&snapshot).unwrap().as_slice()).err();
+        assert!(
+            matches!(&error, Some(StorageError::Serialization(message))
+                if message == "group-state checkpoint contains rollback-only fields"),
+            "{error:?}"
+        );
+    }
 }

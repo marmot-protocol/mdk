@@ -319,6 +319,7 @@ mod tests {
     use crate::RecoveryLossCause;
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
+    use cgka_traits::storage::StorageError;
     use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::{MemberId, MessageId, TransportDeliveryPlane, TransportDeliverySource};
 
@@ -568,10 +569,15 @@ mod tests {
             })
         );
 
+        // The loss record references an account this store does not hold.
+        let refused = app.discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000);
         assert!(
-            app.discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000)
-                .is_err(),
-            "the loss record references a missing account"
+            matches!(
+                &refused,
+                Err(StorageError::Backend(message))
+                    if message.contains("FOREIGN KEY constraint failed")
+            ),
+            "{refused:?}"
         );
         assert_eq!(
             due(&app, u64::MAX >> 2).deliveries.len(),

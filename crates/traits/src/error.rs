@@ -144,17 +144,22 @@ pub enum EngineError {
 
     /// An application message pinned to `expected` (see
     /// [`SendIntent::AppMessage::expected_epoch`](crate::engine::SendIntent))
-    /// reached encryption after the group had already advanced to `current`:
-    /// the send folded retained peer commits first. Nothing was prepared or
-    /// published. Routine input for epoch-bound payloads such as
+    /// reached encryption after the group had moved off that pin, to
+    /// `current`: the send folded retained peer commits first. When the two
+    /// numbers are equal, branch selection moved the group to another branch
+    /// at the same epoch, which the pin's identity tells apart. Nothing was
+    /// prepared or published. Routine input for epoch-bound payloads such as
     /// encrypted-media references, not an engine bug: the caller re-derives
     /// the payload for the current epoch (re-uploads the media).
-    #[error("application message pinned to epoch {expected} but the group is at epoch {current}")]
+    #[error(
+        "application message pinned to epoch {expected} but the group has moved off it (now at epoch {current})"
+    )]
     AppMessageEpochMismatch { expected: EpochId, current: EpochId },
 
     /// An application message pinned to `expected` arrived while the group's
     /// epoch is unsettled: a publication this client staged still awaits its
-    /// outcome, or retained convergence input is not yet applied. Ordinary
+    /// outcome, retained convergence input is not yet applied, or an earlier
+    /// send still waits in the outbound queue, which no send overtakes. Ordinary
     /// messages are retained and encrypted at drain time under whatever epoch
     /// the group lands on; a pinned message cannot be, so it is refused
     /// instead of queued. Nothing was persisted. Retry once the group settles
@@ -164,14 +169,17 @@ pub enum EngineError {
     )]
     AppMessageEpochUnsettled { expected: EpochId },
 
-    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice)
-    /// or [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
+    /// A [`SendIntent::LinkDevice`](crate::engine::SendIntent::LinkDevice),
+    /// [`SendIntent::UnlinkDevice`](crate::engine::SendIntent::UnlinkDevice)
+    /// or [`SendIntent::RecordRemovedSlot`](crate::engine::SendIntent::RecordRemovedSlot)
     /// refused instead of queued, because the device group has a Commit in
-    /// flight or convergence input still unsettled. Nothing was persisted.
+    /// flight, convergence input still unsettled or an earlier send still
+    /// queued. Nothing was persisted.
     /// A link never waits in the outbound queue: the new device stops waiting
     /// for its Welcome, and a link sent after that would add a device that
     /// never joins. Retry once the group settles, while the new device still
-    /// waits. An unlink is retried the same way, until it lands.
+    /// waits. An unlink is retried the same way, until it lands, and a
+    /// removed slot's record while its caller still makes it.
     #[error("linking a device refused while the device group is unsettled")]
     LinkDeviceUnsettled { group_id: GroupId },
 
@@ -181,6 +189,23 @@ pub enum EngineError {
     /// Nothing was staged. Read the roster again to retry.
     #[error("a device entry replacement refused: the entry changed since it was read")]
     DeviceEntryChanged { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused because the roster no longer holds the account entry the
+    /// replacement was computed from: a commit applied since changed it.
+    /// Nothing was staged. Read the roster again to retry.
+    #[error("an account entry replacement refused: the entry changed since it was read")]
+    AccountEntryChanged { group_id: GroupId },
+
+    /// A [`SendIntent::ReplaceAccountEntry`](crate::engine::SendIntent::ReplaceAccountEntry)
+    /// refused instead of queued, because the device group has a Commit in
+    /// flight, convergence input still unsettled or other work due first.
+    /// Nothing was persisted. A backup change is answered only once it went
+    /// out or was refused (mdk#2628 D75), and a queued one could still be
+    /// refused at drain after the caller took it as sent. Retry once the
+    /// group settles.
+    #[error("an account entry replacement refused while the device group is unsettled")]
+    AccountEntryUnsettled { group_id: GroupId },
 
     /// A Welcome refused because it is not the device-group Welcome a
     /// confirmed device link expects (mdk#2628 D28, D30, D41): it joins a
@@ -274,6 +299,20 @@ pub enum EngineError {
     #[error("welcome already processed")]
     WelcomeAlreadyProcessed,
 
+    /// A sibling Welcome into a chat this device still holds an active copy
+    /// of, as one sent after a removal that has not reached it yet. Not a
+    /// failed join: nothing was written, and the same Welcome joins once that
+    /// copy reads removed or unrecoverable (mdk#2628 3.5b).
+    #[error("sibling welcome held while the chat's local copy is active")]
+    SiblingWelcomeHeld { group_id: GroupId },
+
+    /// A sibling Welcome whose carrier is dated at or before this device
+    /// forgot the chat. A sibling Welcome is dated by the message that
+    /// carried it, so this refuses that carrier only: the same Welcome in a
+    /// carrier dated after the forget still joins (mdk#2628 3.5b).
+    #[error("sibling welcome carried before the chat was forgotten")]
+    SiblingWelcomePredatesForget,
+
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
     Backend(String),
@@ -331,6 +370,8 @@ impl EngineError {
             EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
             EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
             EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+            EngineError::AccountEntryChanged { .. } => "account_entry_changed",
+            EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",
             EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
@@ -345,6 +386,8 @@ impl EngineError {
             EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
             EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+            EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
+            EngineError::SiblingWelcomePredatesForget => "sibling_welcome_predates_forget",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",
         }
@@ -405,6 +448,28 @@ impl std::fmt::Display for AccountDevicesActivationRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Why a same-account Add of one sibling to a chat would be refused now
+/// (device-group.md, "Sibling Welcomes"). The first three are facts about
+/// the chat, the same for every sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingAddRefusal {
+    /// The chat does not require `marmot.group.account-devices.v1`, so it
+    /// takes no same-account Add.
+    AccountDevicesNotRequired,
+    /// The chat does not name one to 16 relays, none repeated once parsed,
+    /// for a sibling Welcome to carry.
+    ChatRelays,
+    /// The chat already holds `max_leaves_per_account` leaves of this
+    /// account, so an Add of another would make its state invalid.
+    AccountLeaves,
+    /// This device is not tagged in a device group it trusts.
+    NotTagged,
+    /// The KeyPackage cannot add that sibling to this chat: it is published,
+    /// expired, another account's, not tagged as the sibling's slot, or does
+    /// not advertise or prove what the chat requires.
+    KeyPackage,
 }
 
 /// Errors returned by the peeler. The split mirrors the four-method peeler

@@ -959,7 +959,7 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
 
     download_encrypted_media_with_transport(
         upload.attachments[0].reference.clone(),
-        &secret,
+        MediaKey::EpochSecret(&secret),
         &endpoints,
         &allowed,
         &transport,
@@ -983,6 +983,57 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
         assert_eq!(phase.failures, 0);
     }
     assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
+}
+
+/// A device that imported a message holds the file's key, not its epoch's
+/// secret (mdk#2628 4.2a): that key alone opens the download, and a wrong one
+/// fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_file_key_opens_the_download_without_the_epoch_secret() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let reference = upload.attachments[0].reference.clone();
+    let file_key = media_file_key_for_reference(&secret, &reference).unwrap();
+    let transport = BlossomHttpTransport::new(true);
+
+    let downloaded = download_encrypted_media_with_transport(
+        reference.clone(),
+        MediaKey::File(&file_key),
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect("the file key opens the download");
+    assert_eq!(
+        downloaded.plaintext,
+        media_upload_request(None).attachments[0].plaintext
+    );
+
+    let wrong = [0x77; 32];
+    download_encrypted_media_with_transport(
+        reference,
+        MediaKey::File(&wrong),
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect_err("a wrong file key fails the download");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2973,7 +3024,7 @@ async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
 
     let err = download_encrypted_media_with_transport(
         upload.attachments[0].reference.clone(),
-        &wrong_secret,
+        MediaKey::EpochSecret(&wrong_secret),
         &endpoints,
         &allowed,
         &transport,
@@ -3253,7 +3304,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
         }];
         let result = download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true).with_download_limit(cap),
@@ -3275,7 +3326,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
     assert!(matches!(
         download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true).with_download_limit(8),
@@ -3294,7 +3345,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
         }];
         let result = download_encrypted_media_classified(
             reference,
-            &[if wrong_secret { 8 } else { 7 }; 32],
+            MediaKey::EpochSecret(&[if wrong_secret { 8 } else { 7 }; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),
@@ -3344,7 +3395,7 @@ async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_mis
             .collect();
         let result = download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),

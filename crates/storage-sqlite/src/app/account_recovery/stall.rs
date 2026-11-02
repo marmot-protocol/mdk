@@ -162,6 +162,7 @@ impl SqliteAppStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::account_recovery::tests::assert_backend;
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
 
@@ -217,7 +218,10 @@ mod tests {
         let before = app.recovery_revision_fence().unwrap();
         let retry = app.recovery_retry_state().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_terminal_retire BEFORE DELETE ON app_epoch_stall_evidence BEGIN SELECT RAISE(ABORT, 'injected terminal retire failure'); END;").unwrap();
-        assert!(app.retire_terminal_group_recovery(&group).is_err());
+        assert_backend(
+            app.retire_terminal_group_recovery(&group),
+            "injected terminal retire failure",
+        );
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(app.epoch_stall_evidence().unwrap().len(), 1);
         assert_eq!(app.recovery_scope_snapshots(native.id).unwrap().len(), 1);
@@ -486,16 +490,16 @@ mod tests {
         );
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_sample BEFORE INSERT ON app_group_recovery_failures BEGIN SELECT RAISE(FAIL, 'sample failure'); END;").unwrap();
         let revision = app.next_recovery_engine_observation().unwrap();
-        assert!(
+        assert_backend(
             app.sample_qualified_recovery_stall(
                 gid(1).as_slice(),
                 1,
                 revision,
                 7_201_000,
                 3_600_000,
-                3
-            )
-            .is_err()
+                3,
+            ),
+            "sample failure",
         );
         assert_eq!(
             app.epoch_stall_evidence().unwrap()[0].fruitless_completions,
@@ -536,7 +540,7 @@ mod tests {
     fn qualified_stall_certificate_and_interval_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("qualified-stall.sqlite");
-        let key = crate::SqlCipherKey::new("qualified stall reopen test").unwrap();
+        let key = crate::SqlCipherKey::raw([0x52; 32]);
         let observation = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             let app = store.app_storage();

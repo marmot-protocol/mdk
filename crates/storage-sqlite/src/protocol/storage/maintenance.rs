@@ -338,6 +338,84 @@ mod tests {
     use cgka_traits::maintenance::{GroupMaintenanceState, MaintenancePhase, MaintenanceTrigger};
     use cgka_traits::storage::GroupStorage;
 
+    fn obligation(id: MessageId) -> MaintenanceObligation {
+        MaintenanceObligation {
+            id,
+            group_id: gid(1),
+            trigger: MaintenanceTrigger::Manual,
+            phase: MaintenancePhase::Quiet,
+            created_at: Timestamp(10),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash: None,
+            sampled_jitter_ms: 0,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        }
+    }
+
+    /// The KeyPackage lifecycle is one row that a write replaces; a record
+    /// rewritten under its id keeps its place in the listing; a delete removes
+    /// that record alone.
+    #[test]
+    fn maintenance_records_update_in_place_and_delete_one_at_a_time() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
+
+        assert_eq!(store.key_package_lifecycle().unwrap(), None);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        store.put_key_package_lifecycle(&lifecycle).unwrap();
+        lifecycle.upgrade_rotation_recorded = true;
+        store.put_key_package_lifecycle(&lifecycle).unwrap();
+        assert_eq!(store.key_package_lifecycle().unwrap(), Some(lifecycle));
+
+        let mut first = obligation(mid(1));
+        store.put_maintenance_obligation(&first).unwrap();
+        store
+            .put_maintenance_obligation(&obligation(mid(2)))
+            .unwrap();
+        first.attempt_count = 3;
+        store.put_maintenance_obligation(&first).unwrap();
+        assert_eq!(
+            store.maintenance_obligation(&mid(1)).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.list_maintenance_obligations().unwrap(),
+            vec![first, obligation(mid(2))]
+        );
+        store.delete_maintenance_obligation(&mid(1)).unwrap();
+        assert_eq!(store.maintenance_obligation(&mid(1)).unwrap(), None);
+        assert_eq!(
+            store.list_maintenance_obligations().unwrap(),
+            vec![obligation(mid(2))]
+        );
+
+        let enrolled = |group_id| GroupMaintenanceState {
+            group_id,
+            enrolled_at: Some(Timestamp(10)),
+            periodic_enrolled: true,
+            last_own_leaf_rotation_at: None,
+            next_periodic_rotation_at: None,
+            leaf_refresh_due_at: None,
+            post_join_history: None,
+        };
+        store.put_group_maintenance(&enrolled(gid(1))).unwrap();
+        store.put_group_maintenance(&enrolled(gid(2))).unwrap();
+        store.delete_group_maintenance(&gid(1)).unwrap();
+        assert_eq!(store.group_maintenance(&gid(1)).unwrap(), None);
+        assert_eq!(
+            store.group_maintenance(&gid(2)).unwrap(),
+            Some(enrolled(gid(2)))
+        );
+    }
+
     #[test]
     fn maintenance_records_roundtrip_and_group_rows_cascade() {
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -412,24 +490,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .put_maintenance_obligation(&MaintenanceObligation {
-                            id: mid(index.saturating_add(1)),
-                            group_id: gid(1),
-                            trigger: MaintenanceTrigger::Manual,
-                            phase: MaintenancePhase::Quiet,
-                            created_at: Timestamp(u64::from(index)),
-                            operational_target_at: None,
-                            overdue: false,
-                            eose_deadline_at: None,
-                            grace_until: None,
-                            quiet_since: None,
-                            own_leaf_baseline_hash: None,
-                            sampled_jitter_ms: 0,
-                            not_before: None,
-                            attempt_count: 0,
-                            semantic_rearm_count: 0,
-                            last_failure_code: None,
-                        })
+                        .put_maintenance_obligation(&obligation(mid(index.saturating_add(1))))
                         .unwrap();
                 })
             })
@@ -452,19 +513,47 @@ mod tests {
         assert_eq!(distinct_orders, rows);
     }
 
+    /// The policy persists as 0 (disabled) or 1 (enabled for new groups, the
+    /// migration's default), and any other stored value is refused.
     #[test]
     fn periodic_policy_defaults_enabled_for_new_groups_and_roundtrips() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let stored = |value: Option<i64>| {
+            let conn = store.lock().unwrap();
+            if let Some(value) = value {
+                conn.execute(
+                    "UPDATE cgka_maintenance_settings SET periodic_policy = ?1",
+                    [value],
+                )
+                .unwrap();
+            }
+            conn.query_row(
+                "SELECT periodic_policy FROM cgka_maintenance_settings",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
         assert_eq!(
             store.periodic_maintenance_policy().unwrap(),
             PeriodicMaintenancePolicy::EnabledForNewGroups
         );
+        assert_eq!(stored(None), 1);
         store
             .put_periodic_maintenance_policy(PeriodicMaintenancePolicy::Disabled)
             .unwrap();
+        assert_eq!(stored(None), 0);
         assert_eq!(
             store.periodic_maintenance_policy().unwrap(),
             PeriodicMaintenancePolicy::Disabled
+        );
+
+        stored(Some(2));
+        let result = store.periodic_maintenance_policy();
+        assert!(
+            matches!(&result, Err(StorageError::Serialization(message))
+                if message == "invalid persisted periodic maintenance policy"),
+            "{result:?}"
         );
     }
 }

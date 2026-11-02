@@ -34,6 +34,7 @@ impl Marmot {
                 external_signing: m.external_signing,
                 signed_out: m.signed_out,
                 running: m.running,
+                unlinked: m.unlinked,
             })
             .collect())
     }
@@ -70,7 +71,13 @@ impl Marmot {
     /// the secret-store nsec). After this returns the account ref is no longer
     /// valid for any further FFI call. The returned `WipeOutcomeFfi` reports
     /// each stage independently so the app can show progress and a
-    /// partial-failure sheet (mdk#478).
+    /// partial-failure sheet (mdk#478). In a device group, it first asks the
+    /// account's other devices to take it out, which can take about 30
+    /// seconds, and leaves them the chats they can take it out of
+    /// (mdk#2628). It keeps running when the call is cancelled. A sibling
+    /// that sees its `leaving` entry takes it out later, on its own time,
+    /// whatever the host does.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn sign_out_and_wipe(
         &self,
         account_ref: String,
@@ -140,6 +147,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -232,6 +240,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -293,6 +302,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -337,6 +347,7 @@ impl Marmot {
             external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
+            unlinked: result.account.unlinked,
         })
     }
 
@@ -372,6 +383,7 @@ impl Marmot {
             external_signing: account.external_signing,
             signed_out: account.signed_out,
             running: account.running,
+            unlinked: account.unlinked,
         })
     }
 
@@ -778,6 +790,7 @@ impl Marmot {
                 external_signing: result.account.external_signing,
                 signed_out: result.account.signed_out,
                 running: true,
+                unlinked: result.account.unlinked,
             },
             profile: profile.into(),
             readiness: result.readiness.into(),

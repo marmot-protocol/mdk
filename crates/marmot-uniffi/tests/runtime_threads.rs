@@ -385,8 +385,9 @@ fn print_read_latencies(mut latencies: Vec<Duration>) {
 fn uniffi_exports_run_mdk_work_on_marmotkit_runtime_threads() {
     let trace = ThreadTrace::default();
     let filter = tracing_subscriber::EnvFilter::new(
-        "marmot_app=debug,marmot_account=debug,marmot_session::runtime=debug,cgka_engine=debug,\
-         transport_nostr_adapter=debug,nostr_relay_pool=debug,nostr_sdk=debug",
+        "marmot_app=debug,marmot_observability=debug,marmot_account=debug,\
+         marmot_session::runtime=debug,cgka_engine=debug,transport_nostr_adapter=debug,\
+         nostr_relay_pool=debug,nostr_sdk=debug",
     );
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry()

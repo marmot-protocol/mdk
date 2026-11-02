@@ -29,6 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
+use crate::client::sign_out::SiblingSignOut;
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -44,17 +45,17 @@ use crate::{
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    BackupSettings, ChatListRow, ChatNotificationSettings, ChatPinState,
+    ExistingDirectConversation, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS,
+    MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, MessageDraft,
+    MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
+    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
@@ -749,7 +750,7 @@ impl RuntimeSharedServices {
         {
             if config.enabled {
                 tracing::warn!(
-                    target: "marmot_app::relay_telemetry_export",
+                    target: "marmot_app::runtime",
                     method = "configure_relay_telemetry_exporter",
                     "relay telemetry export requested, but marmot-app was built without otlp-export",
                 );
@@ -1038,6 +1039,10 @@ async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
     }
 }
 
+/// How often `sign_out_and_wipe` checks whether its `leaving` commit is
+/// confirmed (mdk#2628 D67).
+const SIGN_OUT_LEAVING_POLL: Duration = Duration::from_millis(250);
+
 fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
     *stopping.borrow()
 }
@@ -1049,6 +1054,11 @@ pub struct ManagedAccount {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+    /// The account's device group removed this device after its link was
+    /// made. The account is signed out here for good: show that this device
+    /// was unlinked from the account, and offer `sign_out_and_wipe`, after
+    /// which signing in again is a new link (mdk#2628 D67).
+    pub unlinked: bool,
 }
 
 /// Structured outcome of [`MarmotAppRuntime::sign_out_and_wipe`].
@@ -1061,7 +1071,9 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Number of active MLS groups this account successfully left.
+    /// Number of active MLS groups this account successfully left. A chat
+    /// this device is no longer in, its copy removed or disbanded, is
+    /// neither left nor reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
@@ -1073,6 +1085,19 @@ pub struct WipeOutcome {
     /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
     /// secret-store nsec, ephemeral relay/subscription state) completed.
     pub local_cleanup: LocalCleanupReport,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings, and each of these chats takes a same-account removal from a
+    /// sibling that is in it (mdk#2628 D67).
+    #[serde(default)]
+    pub groups_left_to_siblings: u32,
+    /// This device could not ask its siblings to take it out within about
+    /// 30 seconds, so it tried to leave every chat itself; one it could not
+    /// leave is in `group_leave_failures`. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
+    #[serde(default)]
+    pub siblings_not_reached: bool,
 }
 
 /// A failed attempt to leave a single MLS group during the wipe.
@@ -1541,6 +1566,15 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's recovery status may have changed: which groups and
+    /// whether the inbox are still catching up, or its notices. Re-read
+    /// `account_recovery_status`. Carries no group identities, and fires at
+    /// most once per publication seam. Not raised until the recovery runner
+    /// owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// The account's linked devices may have changed: re-read
     /// `linked_devices`. The device group's own events never reach hosts, so
     /// this is their only cue. Also fires once each time the account's worker
@@ -1566,12 +1600,41 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's compromise warning may have changed: re-read
+    /// `compromise_warning`. Fires when something new joins it or leaves it
+    /// unseen, after a dismissal, and once each time the account's worker
+    /// opens or reconnects. Carries no slots, and may fire with no visible
+    /// change.
+    CompromiseWarningChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
     /// progress. Carries no device, session or group identities, and may
     /// fire with no visible change.
     DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// `accounts` and show the device-level notice. Fires once, after the
+    /// runtime has signed out the account whose removal the device found;
+    /// `ManagedAccount::unlinked` then says so (mdk#2628 D62, D67).
+    DeviceUnlinked {
         account_id_hex: String,
         account_label: String,
     },
@@ -2476,6 +2539,18 @@ impl MarmotAppRuntime {
         self.accounts.history_notices(account_ref).await
     }
 
+    /// The account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice as
+    /// `history_notices` lists them. Refresh on `RecoveryStatusChanged`.
+    /// Until the recovery runner owns history (mdk#2660), nothing is ever
+    /// catching up.
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        self.accounts.account_recovery_status(account_ref).await
+    }
+
     /// This account's own devices, from the roster of the device group this
     /// device trusts: this device first, then by when each was linked. Empty
     /// until this device trusts a device group, and always empty in release
@@ -2486,6 +2561,21 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<Vec<crate::LinkedDevice>, AppError> {
         self.accounts.linked_devices(account_ref).await
+    }
+
+    /// The held chats whose history from another of this account's devices
+    /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
+    /// delivery waits to be imported, with `retrying` once an attempt to
+    /// get its bundle failed, then `Imported` with the device it came from and when.
+    /// Facts only: an empty history sends nothing, and an expired delivery
+    /// leaves nothing. Empty while device groups are off. Refresh on
+    /// `ChatHistoryImportsChanged`; a device's name follows
+    /// `LinkedDevicesChanged`.
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        self.accounts.chat_history_imports(account_ref).await
     }
 
     /// Whether this device's KeyPackage refresh is overdue because its device
@@ -2543,6 +2633,50 @@ impl MarmotAppRuntime {
         self.accounts.check_sign_ins(account_ref).await
     }
 
+    /// Start this device without the devices its first check found (mdk#2628
+    /// 3.7a, "No, start fresh"): every sign-in from before this device is
+    /// answered Not now, now and when one is listed later. It rejects nothing
+    /// and raises no warning, so one of those devices can still link this
+    /// one. Refusals are `DeviceGroupRefused` with `sign_ins_unchecked`
+    /// (before the first check), `device_group_exists` (this device trusts a
+    /// device group), or `roster_unsupported`.
+    pub async fn start_fresh(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.start_fresh(account_ref).await
+    }
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false in release builds until the roster's spec lands.
+    /// Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.started_fresh(account_ref).await
+    }
+
+    /// The account's open compromise warning on this device (mdk#2628 3.7a):
+    /// each rejection the user has not seen here, the earliest gathered
+    /// first, with its reason and when it was made. Empty when no warning is
+    /// open. A rejection means someone holding the account's signing key, or
+    /// a session with its remote signer, published where the account's
+    /// devices did not; the host writes the wording and never says the
+    /// account's devices stopped them. Rejections already in the first
+    /// roster this device trusts count as seen. Always empty in release
+    /// builds until the roster's spec lands. Refresh on
+    /// `CompromiseWarningChanged`.
+    pub async fn compromise_warning(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
+        self.accounts.compromise_warning(account_ref).await
+    }
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged. Refused with
+    /// `DeviceGroupRefused("roster_unsupported")` while device groups are off.
+    pub async fn dismiss_compromise_warning(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.dismiss_compromise_warning(account_ref).await
+    }
+
     /// Rename one of this account's devices, this one included, by its
     /// `slot_id_hex` from `linked_devices`: one roster commit in the device
     /// group. Any device may rename any device. The label is at most 64
@@ -2586,15 +2720,95 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// How many chats this device is in still hold a device this account
-    /// removed, because the chat doesn't take a same-account removal; a chat
-    /// admin can remove it. Zero until this device trusts a device group, and
-    /// always zero in release builds until the device group's spec lands.
-    /// Read it when showing the device list; it is not evented.
+    /// How many chats this device is in still hold a device this account no
+    /// longer has, because the chat doesn't take a same-account removal; a
+    /// chat admin can remove it. The device is one this account removed, or
+    /// one its device group stopped listing, as after a failed link. Zero
+    /// until this device trusts a device group, and always zero in release
+    /// builds until the device group's spec lands. Read it when showing the
+    /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
             .removed_device_leftover_chats(account_ref)
             .await
+    }
+
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves (mdk#2628
+    /// item 3.5c). Once a link this device approved is made, the new device
+    /// is added to this device's other chats when its "add to all my chats"
+    /// setting is on, for a week after the link. A chat that can take
+    /// this account's devices but whose requirements the new device's
+    /// KeyPackages don't meet is passed over and not counted, so zero
+    /// does not mean the new device reaches every chat. A chat admin can
+    /// turn the component on; removing a device frees its leaves.
+    /// Zero until this device trusts a device group, and always zero in
+    /// release builds until the device group's spec lands. Read it when
+    /// showing the device list; it is not evented.
+    pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
+        self.accounts
+            .chats_closed_to_linked_devices(account_ref)
+            .await
+    }
+
+    /// Make new recovery words for the account's backups (mdk#2628 item
+    /// 4.4a), in place of any not yet confirmed. Show the 12 words once, then
+    /// ask for the words at `confirm_positions` and pass them to
+    /// `confirm_recovery_words`. MDK keeps the words in memory only, so a
+    /// restart starts over with new ones. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (release builds).
+    pub async fn begin_recovery_words(&self, account_ref: &str) -> Result<RecoveryWords, AppError> {
+        self.accounts.begin_recovery_words(account_ref).await
+    }
+
+    /// Confirm the words `begin_recovery_words` made with the words the user
+    /// typed at its confirm positions, in order; case and surrounding spaces
+    /// are ignored. Their key becomes the account's recovery key, in its
+    /// device group's roster, or kept by this device until it has one, and
+    /// the words are forgotten once their commit went out. Refused with
+    /// `DeviceGroupRefused`, keeping the words for another try:
+    /// `roster_unsupported` (release builds), `recovery_words_not_started`,
+    /// `recovery_words_mismatch`, `device_group_busy` (retry later) or
+    /// `roster_unavailable`. Any other error keeps them too; trying again
+    /// with them commits nothing if the roster already holds their key.
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .confirm_recovery_words(account_ref, answers)
+            .await
+    }
+
+    /// Forget recovery words not yet confirmed, if any.
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.cancel_recovery_words(account_ref).await
+    }
+
+    /// Turn the account's backups off (mdk#2628 D75): clear the device
+    /// group roster's account entry, its recovery key and backup writer, or,
+    /// with no device group, forget the key this device keeps. Backups
+    /// already written stay until deleted. Turning them on again takes new
+    /// words through `begin_recovery_words`. Off already is not an error.
+    /// Refused with `DeviceGroupRefused`, changing nothing:
+    /// `roster_unsupported` (release builds), `device_group_busy` (retry
+    /// later) or `roster_unavailable`.
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.turn_off_backups(account_ref).await
+    }
+
+    /// Where the account's backups stand: whether they are on and whether
+    /// this device writes them, as the device group's roster holds them now
+    /// (with no device group, as this device keeps them). A change a fork
+    /// dropped and the engine could not re-issue shows here as not made; the
+    /// user can make it again. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (release builds) or `roster_unavailable`. Read it
+    /// when showing backup settings; it is not evented.
+    pub async fn backup_settings(&self, account_ref: &str) -> Result<BackupSettings, AppError> {
+        self.accounts.backup_settings(account_ref).await
     }
 
     /// Record that the user accepts the risk of changing a group that is still
@@ -4448,6 +4662,15 @@ impl MarmotAppRuntime {
     /// device and from the relays the engine controls publishing to.
     ///
     /// Stages run in the order the spec (mdk#478) mandates:
+    /// 0. Signing out through siblings (mdk#2628 D67), when this device
+    ///    trusts a device group, its link is made and another device that is
+    ///    not leaving is listed: commit its own roster entry as `leaving` and
+    ///    wait about 30 seconds for that commit to be confirmed. Once it is,
+    ///    stage 1 skips each chat a sibling takes this device out of
+    ///    (`groups_left_to_siblings`); if it is not, stage 1 leaves every
+    ///    chat and `siblings_not_reached` is set. From here on a removal
+    ///    from the device group does not unlink this device, and no
+    ///    maintenance pass or pairing drive runs.
     /// 1. Best-effort leave for every active MLS group. Failures are collected
     ///    per group and do not abort the wipe. This MUST happen while MLS state
     ///    still exists — once the session DB is wiped the engine can no longer
@@ -4484,6 +4707,10 @@ impl MarmotAppRuntime {
     /// - Stages 1 and 2 are network-bound; their per-target failures are
     ///   surfaced for the app's partial-failure sheet and never block local
     ///   cleanup.
+    /// - An unlinked account (`ManagedAccount::unlinked`) skips stages 0, 1
+    ///   and 2: its device group already removed this device.
+    /// - This device never leaves its device group: its account is that
+    ///   group's only admin, so a sibling removes it there.
     /// - Every account that can sign — local or external-signer — can be
     ///   wiped. Only tracked-only (npub) accounts are rejected. An external
     ///   signer that is unavailable at wipe time degrades stages 1 and 2 to
@@ -4506,59 +4733,92 @@ impl MarmotAppRuntime {
 
         let mut outcome = WipeOutcome::default();
 
-        // Stage 1: best-effort leave for every active MLS group. We read the
-        // group set directly from the in-memory account state (no relay round
-        // trip). We attempt the leave for *every* group with local MLS
-        // membership, including ones still marked `pending_confirmation`: in
-        // mdk an incoming Welcome auto-joins MLS state while the app
-        // keeps the invite pending until the user accepts, so a
-        // pending-confirmation group is already a committed MLS member this
-        // device can — and must — leave before its state is wiped (mirroring
-        // `decline_group_invite`, which leaves the group before archiving). If
-        // we skipped them, signing out before accepting an invite would wipe
-        // the local MLS state without ever publishing a leave, and the engine
-        // could never sign one afterwards. A failure to enumerate groups is a
-        // recorded failure, not a silent "no groups" — it must not let the wipe
-        // skip remote leaves without surfacing why.
-        let groups = match self.accounts.app.groups(&account.label) {
-            Ok(groups) => groups,
-            Err(err) => {
-                outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex: String::new(),
-                    reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
-                });
-                Vec::new()
-            }
-        };
-        for group in groups {
-            let group_id_hex = group.group_id_hex.clone();
-            let group_id = match hex::decode(&group_id_hex) {
-                Ok(bytes) => GroupId::new(bytes),
-                Err(_) => {
+        // From here until the wipe returns, the device group's removal of
+        // this device does not unlink it: the sign-out finishes what it has
+        // left. The mark drops with this future, finished or cancelled.
+        let _signing_out = (!account.unlinked)
+            .then(|| self.accounts.app.begin_signing_out(&account.account_id_hex));
+
+        // An unlinked device skips stages 0 to 2. Its device group removed
+        // it: its siblings took its leaves out of the chats that allow it and
+        // deleted its slot, and the account stays in every chat through them,
+        // so a leave here would speak for an account that is not leaving
+        // (mdk#2628 D67).
+        if !account.unlinked {
+            // Stage 0: ask the siblings to take this device out of the chats
+            // they can, and of its device group.
+            let left_to_siblings = self
+                .sign_out_through_siblings(account_ref, &mut outcome)
+                .await;
+
+            // Stage 1: best-effort leave for every active MLS group. We read the
+            // group set directly from the in-memory account state (no relay round
+            // trip). We attempt the leave for *every* group with local MLS
+            // membership, including ones still marked `pending_confirmation`: in
+            // mdk an incoming Welcome auto-joins MLS state while the app
+            // keeps the invite pending until the user accepts, so a
+            // pending-confirmation group is already a committed MLS member this
+            // device can — and must — leave before its state is wiped (mirroring
+            // `decline_group_invite`, which leaves the group before archiving). If
+            // we skipped them, signing out before accepting an invite would wipe
+            // the local MLS state without ever publishing a leave, and the engine
+            // could never sign one afterwards. A failure to enumerate groups is a
+            // recorded failure, not a silent "no groups" — it must not let the wipe
+            // skip remote leaves without surfacing why.
+            let groups = match self.accounts.app.groups(&account.label) {
+                Ok(groups) => groups,
+                Err(err) => {
                     outcome.group_leave_failures.push(GroupLeaveFailure {
-                        group_id_hex,
-                        reason: "invalid group id".to_owned(),
+                        group_id_hex: String::new(),
+                        reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
                     });
-                    continue;
+                    Vec::new()
                 }
             };
-            match self.leave_group(account_ref, &group_id).await {
-                Ok(_) => outcome.groups_left += 1,
-                Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex,
-                    reason: wipe_failure_reason(&err),
-                }),
+            let storage = self.accounts.app.account_storage(&account.label).ok();
+            for group in groups {
+                let group_id_hex = group.group_id_hex.clone();
+                if left_to_siblings.contains(&group_id_hex) {
+                    outcome.groups_left_to_siblings += 1;
+                    continue;
+                }
+                let group_id = match hex::decode(&group_id_hex) {
+                    Ok(bytes) => GroupId::new(bytes),
+                    Err(_) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: "invalid group id".to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                // A chat whose copy here is removed or disbanded holds no
+                // leaf of this device to leave: a sibling or an admin
+                // already took it out, maybe while this sign-out waited.
+                if storage.as_ref().is_some_and(|storage| {
+                    cgka_traits::storage::GroupStorage::get_group(storage, &group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                }) {
+                    continue;
+                }
+                match self.leave_group(account_ref, &group_id).await {
+                    Ok(_) => outcome.groups_left += 1,
+                    Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                        group_id_hex,
+                        reason: wipe_failure_reason(&err),
+                    }),
+                }
             }
-        }
 
-        // Stage 2: delete this device's KeyPackage slot while its private
-        // material still exists. A failure must not abort the wipe.
-        self.withdraw_own_key_package_slot(
-            account_ref,
-            &mut outcome.key_packages_deleted,
-            &mut outcome.key_package_failures,
-        )
-        .await;
+            // Stage 2: delete this device's KeyPackage slot while its private
+            // material still exists. A failure must not abort the wipe.
+            self.withdraw_own_key_package_slot(
+                account_ref,
+                &mut outcome.key_packages_deleted,
+                &mut outcome.key_package_failures,
+            )
+            .await;
+        }
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,
@@ -4580,6 +4840,85 @@ impl MarmotAppRuntime {
         }
 
         Ok(outcome)
+    }
+
+    /// Ask this device's siblings to take it out of the account's groups
+    /// (mdk#2628 D67): commit its own roster entry as `leaving`, and wait
+    /// about 30 seconds for that commit to be confirmed. Returns the chats a
+    /// sibling takes it out of, as hex group ids, which stage 1 does not
+    /// leave. Empty when it signs out on its own, and when the commit was not
+    /// confirmed in time, which `siblings_not_reached` reports.
+    ///
+    /// One deadline covers all of it, the worker's start included, and it is
+    /// polled first: once it has passed, no answer is taken, a confirmation
+    /// included, however busy the worker is. Dropping the attempt there is
+    /// safe at each await. A worker start left unsettled is reaped and
+    /// replaced by the next lookup. A step in flight runs to its end on the
+    /// worker, ahead of stage 1's leaves, and stores nothing when it
+    /// confirms; its only network wait is its `leaving` commit's publish,
+    /// which the Nostr relay plane gives up on after 20 seconds.
+    async fn sign_out_through_siblings(
+        &self,
+        account_ref: &str,
+        outcome: &mut WipeOutcome,
+    ) -> HashSet<String> {
+        // Without device groups no sibling can take this device out.
+        if !self.accounts.app.device_groups_enabled() {
+            return HashSet::new();
+        }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            left_to_siblings = self.ask_siblings_to_sign_out(account_ref) => left_to_siblings,
+        }
+    }
+
+    /// Take steps of signing out through siblings until one confirms the
+    /// `leaving` commit or finds this device signs out on its own; the
+    /// caller's deadline ends it otherwise. A step that fails is taken
+    /// again, so a passing error does not cost the sibling path. An account
+    /// whose worker cannot take commands at all, signed out without a wipe
+    /// or with no external signer registered, signs out on its own at once.
+    async fn ask_siblings_to_sign_out(&self, account_ref: &str) -> HashSet<String> {
+        if let Err(err) = self.accounts.worker_commands(account_ref).await {
+            tracing::info!(
+                target: "marmot_app::runtime",
+                method = "ask_siblings_to_sign_out",
+                error_kind = err.privacy_safe_kind(),
+                "no worker to take sign-out steps; signing out on its own"
+            );
+            return HashSet::new();
+        }
+        let mut logged = false;
+        loop {
+            match self
+                .accounts
+                .sign_out_through_siblings_step(account_ref)
+                .await
+            {
+                Ok(SiblingSignOut::Confirmed { left_to_siblings }) => {
+                    return left_to_siblings.into_iter().collect();
+                }
+                Ok(SiblingSignOut::OnItsOwn) => return HashSet::new(),
+                Ok(SiblingSignOut::Pending) => {}
+                Err(err) => {
+                    if !logged {
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "ask_siblings_to_sign_out",
+                            error_kind = err.privacy_safe_kind(),
+                            "could not take a sign-out step; retrying"
+                        );
+                        logged = true;
+                    }
+                }
+            }
+            sleep(SIGN_OUT_LEAVING_POLL).await;
+        }
     }
 
     /// Read the selected account's current published kind-0 profile through the
@@ -6685,6 +7024,7 @@ impl AccountManager {
                 local_signing: account.local_signing,
                 external_signing: account.external_signing,
                 signed_out: account.signed_out,
+                unlinked: account.unlinked,
             })
             .collect())
     }
@@ -6763,6 +7103,10 @@ impl AccountManager {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .cancel_account(&account.account_id_hex);
+                    // Nor does a removed account keep its publish stop, so a
+                    // new link under this id publishes.
+                    self.app
+                        .forget_unlinked_publish_stop(&account.account_id_hex);
                 }
                 removed?;
             }
@@ -6918,6 +7262,16 @@ impl AccountManager {
     }
 
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        self.deactivate_account_marking(account_ref, false).await
+    }
+
+    /// [`Self::deactivate_account`], which also marks the account unlinked,
+    /// in the same write that signs it out, when `unlinked` (D67).
+    async fn deactivate_account_marking(
+        &self,
+        account_ref: &str,
+        unlinked: bool,
+    ) -> Result<(), AppError> {
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
         // before the global lock: the purge may open account storage. A failed
@@ -6941,9 +7295,12 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
-            self.app
-                .account_home()
-                .set_account_signed_out(&account.label, true)?;
+            let home = self.app.account_home();
+            if unlinked {
+                home.mark_account_unlinked(&account.label)?;
+            } else {
+                home.set_account_signed_out(&account.label, true)?;
+            }
             self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
@@ -6954,6 +7311,44 @@ impl AccountManager {
         }
         .await?;
         report_purge
+    }
+
+    /// Deactivate the account once its worker reports that the device group
+    /// unlinked this device, then tell hosts. The worker stopped and tried to
+    /// mark the account unlinked; deactivation reaps it, makes the mark again
+    /// as it signs the account out, so a failed mark never leaves a plain
+    /// sign-out, and drops what the account holds in memory. Hosts hear
+    /// `DeviceUnlinked` only after that, so a host that wipes the account and
+    /// signs in again on hearing it never races this deactivation into the
+    /// new record. A worker that ends any other way drops the sender, and
+    /// this task ends with it.
+    fn deactivate_when_unlinked(
+        &self,
+        account_id_hex: String,
+        account_label: String,
+        unlinked: oneshot::Receiver<()>,
+    ) {
+        let accounts = self.clone();
+        tokio::spawn(async move {
+            if unlinked.await.is_err() {
+                return;
+            }
+            if let Err(error) = accounts
+                .deactivate_account_marking(&account_label, true)
+                .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "deactivate_when_unlinked",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not deactivate an unlinked account; its next start stops it again"
+                );
+            }
+            let _ = accounts.events.send(MarmotAppEvent::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            });
+        });
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
@@ -7003,6 +7398,7 @@ impl AccountManager {
                 external_signing: account.external_signing,
                 signed_out: account.signed_out,
                 running,
+                unlinked: account.unlinked,
             })
         };
         observed
@@ -7222,6 +7618,12 @@ impl AccountManager {
                         AccountStartupProgress::new(self.shared.observer.performance().clone());
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
+                    let (unlinked_tx, unlinked_rx) = oneshot::channel();
+                    self.deactivate_when_unlinked(
+                        account.account_id_hex.clone(),
+                        account.label.clone(),
+                        unlinked_rx,
+                    );
                     let handle = spawn_app_runtime_account_worker(
                         AccountWorkerRuntime {
                             app: self.app.clone(),
@@ -7231,6 +7633,7 @@ impl AccountManager {
                             events: self.events.clone(),
                             lifecycle: self.shared.lifecycle(),
                             shared: self.shared.clone(),
+                            unlinked: unlinked_tx,
                         },
                         command_tx.clone(),
                         command_rx,
@@ -7794,7 +8197,10 @@ impl AccountManager {
                         AccountHome::account_id_for_public_key(identity)?
                     };
                     match self.app.account_home().account(&account_id) {
-                        Ok(account) => self.require_onboarding_complete(&account.label)?,
+                        Ok(account) => {
+                            refuse_unlinked(&account)?;
+                            self.require_onboarding_complete(&account.label)?;
+                        }
                         Err(AccountHomeError::UnknownAccount(_)) => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -8041,6 +8447,7 @@ impl AccountManager {
                 }
                 let existing_account = self.app.account_home().account(&account_id_hex).ok();
                 if let Some(account) = existing_account.as_ref() {
+                    refuse_unlinked(account)?;
                     self.require_onboarding_complete(&account.label)?;
                 }
                 let created_account = existing_account.is_none();
@@ -8987,6 +9394,18 @@ fn validate_account_setup_request(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse to set up, import or log in to an account whose device group
+/// unlinked this device, before anything is read, written or sent for it:
+/// coming back is a wipe and a new link (D67).
+fn refuse_unlinked(account: &AccountSummary) -> Result<(), AppError> {
+    if account.unlinked {
+        return Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(
+            account.label.clone(),
+        )));
+    }
     Ok(())
 }
 

@@ -126,6 +126,18 @@ mod tests {
         pass.phase = ConvergencePassPhase::Completed;
         pass.retry = None;
         store.put_convergence_pass(&pass).unwrap();
+        assert_eq!(
+            store.convergence_pass(&group.id).unwrap(),
+            Some(pass.clone())
+        );
+
+        let other = sample_group(gid(2), 4, 0);
+        store.put_group(&other).unwrap();
+        store
+            .put_convergence_pass(&sample_pass(other.id.clone()))
+            .unwrap();
+        store.delete_convergence_pass(&other.id).unwrap();
+        assert_eq!(store.convergence_pass(&other.id).unwrap(), None);
         assert_eq!(store.convergence_pass(&group.id).unwrap(), Some(pass));
 
         store.delete_group(&group.id).unwrap();

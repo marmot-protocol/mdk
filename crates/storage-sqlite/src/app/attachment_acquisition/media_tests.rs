@@ -2,10 +2,10 @@
 use crate::SqliteAccountStorage;
 use std::io::{Cursor, Read};
 
-use media_store::{MEDIA_DIRECTORY, MediaError, MediaStore, PublishOutcome};
+use media_store::{FileState, MEDIA_DIRECTORY, MediaError, MediaStore, PublishOutcome};
 
 use super::*;
-use crate::{AttachmentHistoryEntry, SqlCipherKey, SqliteMediaCatalog, StoredAppEvent};
+use crate::{AttachmentHistoryEntry, SqliteMediaCatalog, StoredAppEvent};
 
 const GROUP: &str = "abababababababababababababababab";
 const NOW: u64 = 1_000;
@@ -26,11 +26,11 @@ fn digest(body: &[u8]) -> [u8; 32] {
 }
 
 impl Fixture {
+    /// An in-memory account database beside a media store in a temporary
+    /// directory: no test here reopens the database or reads its file.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x6b; 32])).unwrap();
-        let store =
-            SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store
             .lock()
             .unwrap()
@@ -189,6 +189,16 @@ impl Fixture {
 #[test]
 fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
     let fixture = Fixture::new();
+    // An exhausted legacy retained-byte budget does not gate media publication.
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE attachment_retention_usage SET byte_count=?1 WHERE id=1",
+            [i64::MAX / 2],
+        )
+        .unwrap();
     let content = body();
     let message = "1".repeat(64);
     let job = fixture.claimed(&message, &content);
@@ -205,12 +215,14 @@ fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
     assert_eq!(fixture.count("media_file_refs"), 1);
     assert_eq!(fixture.media_files_on_disk(), 1);
     // The database-only read refuses a media body instead of hiding it.
+    let refused = fixture
+        .store
+        .app_storage()
+        .read_retained_attachment(&job.reference, NOW, 0, 16);
     assert!(
-        fixture
-            .store
-            .app_storage()
-            .read_retained_attachment(&job.reference, NOW, 0, 16)
-            .is_err()
+        matches!(&refused, Err(StorageError::Backend(message))
+            if message == "retained attachment is a media file; read it through the media store"),
+        "{refused:?}"
     );
 
     let status = fixture
@@ -246,27 +258,6 @@ fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
 }
 
 #[test]
-fn the_retained_byte_budget_no_longer_gates_media_publication() {
-    let fixture = Fixture::new();
-    fixture
-        .store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE attachment_retention_usage SET byte_count=?1 WHERE id=1",
-            [i64::MAX / 2],
-        )
-        .unwrap();
-    let content = body();
-    let job = fixture.claimed(&"2".repeat(64), &content);
-    assert!(matches!(
-        fixture.publish(&job, &content),
-        PublishOutcome::Published(_)
-    ));
-    assert_eq!(fixture.read(&job).unwrap(), content);
-}
-
-#[test]
 fn a_body_that_fails_its_digest_is_invalid_and_leaves_nothing() {
     let fixture = Fixture::new();
     let content = body();
@@ -274,9 +265,9 @@ fn a_body_that_fails_its_digest_is_invalid_and_leaves_nothing() {
     let mut wrong = content.clone();
     wrong[7] ^= 1;
     let result = fixture.try_publish(&job, &mut Cursor::new(&wrong), wrong.len() as u64);
-    assert!(
-        matches!(result, Err(MediaError::InvalidBody(_))),
-        "{result:?}"
+    assert_eq!(
+        result,
+        Err(MediaError::InvalidBody("media body digest mismatch"))
     );
     assert_eq!(fixture.count("media_files"), 0);
     assert_eq!(fixture.media_files_on_disk(), 0);
@@ -320,74 +311,56 @@ fn removal_during_the_write_supersedes_publication_and_keeps_nothing() {
 #[test]
 fn identical_content_is_attached_without_downloading_and_released_by_the_last_removal() {
     let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
     let content = body();
     let first_message = "5".repeat(64);
     let second_message = "6".repeat(64);
     let first = fixture.claimed(&first_message, &content);
+    let attach_existing = |job: &AttachmentAcquisition| {
+        fixture
+            .media
+            .attach_existing(
+                &app.attachment_publication(job, &|| NOW),
+                Category::Retained,
+                &job.plaintext_digest().unwrap(),
+            )
+            .unwrap()
+    };
+    // No ready file holds the digest yet: the worker downloads as usual.
+    assert_eq!(attach_existing(&first), None);
     let PublishOutcome::Published(id) = fixture.publish(&first, &content) else {
         panic!("first publish wrote nothing");
     };
 
     // The check a worker makes before downloading.
     let second = fixture.claimed(&second_message, &content);
-    assert_eq!(
-        fixture
-            .media
-            .attach_existing(
-                &fixture
-                    .store
-                    .app_storage()
-                    .attachment_publication(&second, &|| NOW),
-                Category::Retained,
-                &second.plaintext_digest().unwrap(),
-            )
-            .unwrap(),
-        Some(PublishOutcome::Existing(id))
-    );
+    assert_eq!(attach_existing(&second), Some(PublishOutcome::Existing(id)));
     assert_eq!(fixture.read(&second).unwrap(), content);
     assert_eq!(fixture.media_files_on_disk(), 1);
 
-    // Removing one slot keeps the shared file; the last removal deletes the
-    // key, and the sweep unlinks the file.
-    assert!(
-        fixture
-            .store
-            .app_storage()
-            .remove_local_attachment(GROUP, &first_message, 0)
-            .unwrap()
+    // Removing one slot keeps the shared file and releases nothing; the last
+    // removal deletes the key and reports the file once, and the sweep
+    // unlinks it.
+    assert_eq!(
+        app.remove_attachment_reference_releasing(&first.reference)
+            .unwrap(),
+        Some(vec![])
     );
     assert_eq!(fixture.read(&second).unwrap(), content);
-    assert!(
-        fixture
-            .store
-            .app_storage()
-            .remove_local_attachment(GROUP, &second_message, 0)
-            .unwrap()
+    assert_eq!(
+        app.remove_attachment_reference_releasing(&second.reference)
+            .unwrap(),
+        Some(vec![id])
+    );
+    assert_eq!(
+        app.remove_attachment_reference_releasing(&second.reference)
+            .unwrap(),
+        None,
+        "nothing left to remove"
     );
     assert_eq!(fixture.count("media_files"), 0);
     fixture.sweep();
     assert_eq!(fixture.media_files_on_disk(), 0);
-}
-
-#[test]
-fn a_digest_without_a_ready_file_downloads_as_usual() {
-    let fixture = Fixture::new();
-    let content = body();
-    let job = fixture.claimed(&"7".repeat(64), &content);
-    assert_eq!(
-        fixture
-            .media
-            .attach_existing(
-                &fixture
-                    .store
-                    .app_storage()
-                    .attachment_publication(&job, &|| NOW),
-                Category::Retained,
-                &job.plaintext_digest().unwrap(),
-            )
-            .unwrap(),
-        None
-    );
 }
 
 #[test]
@@ -412,6 +385,11 @@ fn legacy_database_bodies_stay_readable_beside_media_files() {
     ));
     assert_eq!(fixture.read(&legacy).unwrap(), content);
     assert_eq!(fixture.read(&media).unwrap(), other);
+    // A body smaller than one staging chunk is kept in its row, not chunked.
+    let small = sized(4_000, 4);
+    let in_row = fixture.claimed(&"7".repeat(64), &small);
+    fixture.legacy(&in_row, &small);
+    assert_eq!(fixture.read(&in_row).unwrap(), small);
 }
 
 // Manage storage (mdk#2314 step 5) across both layouts.
@@ -564,11 +542,17 @@ fn storage_usage_and_listings_cover_both_layouts() {
         .unwrap();
     assert_eq!(in_group.len(), 2);
     assert!(in_group.iter().all(|entry| entry.group_id_hex == GROUP));
-    assert!(
+    let page_limit = |result: StorageResult<()>| {
+        matches!(&result, Err(StorageError::Backend(message))
+            if message == "invalid attachment storage page limit")
+    };
+    assert!(page_limit(
         app.largest_retained_attachments(NOW, None, None, 0)
-            .is_err()
-    );
-    assert!(app.attachment_storage_by_chat(NOW, None, 257).is_err());
+            .map(drop)
+    ));
+    assert!(page_limit(
+        app.attachment_storage_by_chat(NOW, None, 257).map(drop)
+    ));
 }
 
 /// Bulk removal is explicit Remove: suppression recorded, bodies of both
@@ -630,7 +614,14 @@ fn bulk_removal_releases_files_and_respects_its_filters() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(suppressed, 3, "removed attachments show as removed by you");
+    assert_eq!(suppressed, 3);
+    for job in [&old_media, &old_own, &old_legacy] {
+        assert_eq!(
+            fixture.reason(GROUP, &job.message_id_hex),
+            Some(0),
+            "removed attachments show as removed by you"
+        );
+    }
     fixture.media.unlink_released(&removal.released_files);
     assert!(
         !fixture.media.path(&own_id).exists(),
@@ -655,29 +646,6 @@ fn bulk_removal_releases_files_and_respects_its_filters() {
         app.remove_retained_attachments(NOW, Some(OTHER_GROUP), None)
             .unwrap(),
         AttachmentRemoval::default()
-    );
-}
-
-/// The single explicit Remove reports the media file it released.
-#[test]
-fn explicit_remove_reports_its_released_file() {
-    let fixture = Fixture::new();
-    let app = fixture.store.app_storage();
-    let content = sized(30_000, 8);
-    let job = fixture.claimed_in(GROUP, &"4".repeat(64), &content, NOW);
-    let PublishOutcome::Published(id) = fixture.publish(&job, &content) else {
-        panic!("published");
-    };
-    assert_eq!(
-        app.remove_attachment_reference_releasing(&job.reference)
-            .unwrap(),
-        Some(vec![id])
-    );
-    assert_eq!(
-        app.remove_attachment_reference_releasing(&job.reference)
-            .unwrap(),
-        None,
-        "nothing left to remove"
     );
 }
 
@@ -853,8 +821,9 @@ fn legacy_bodies_move_into_the_media_store_smallest_first() {
     assert_eq!(fixture.read(&inline).unwrap(), small);
 }
 
-/// A crash after the publish and before the drop leaves both copies. Reads
-/// use the file, and the next batch sees it and only drops the rows.
+/// The drop waits for a ready file. A crash after the publish and before the
+/// drop leaves both copies: reads use the file, and the next batch sees it
+/// and only drops the rows.
 #[test]
 fn an_interrupted_move_reads_the_file_and_then_only_drops_the_rows() {
     let fixture = Fixture::new();
@@ -862,6 +831,13 @@ fn an_interrupted_move_reads_the_file_and_then_only_drops_the_rows() {
     let content = sized(90_000, 3);
     let job = fixture.claimed(&"c".repeat(64), &content);
     fixture.legacy(&job, &content);
+    // The drop is fenced on a ready file: rows whose move never published
+    // stay.
+    assert!(
+        !app.drop_migrated_legacy_body(&fixture.legacy_bodies()[0])
+            .unwrap()
+    );
+    assert_eq!(fixture.read(&job).unwrap(), content);
     let PublishOutcome::Published(id) = fixture.migrate(&fixture.legacy_bodies()[0]).unwrap()
     else {
         panic!("not published");
@@ -879,24 +855,6 @@ fn an_interrupted_move_reads_the_file_and_then_only_drops_the_rows() {
     assert!(app.drop_migrated_legacy_body(&bodies[0]).unwrap());
     assert!(fixture.legacy_bodies().is_empty());
     assert_eq!(fixture.media_files_on_disk(), 1);
-    assert_eq!(fixture.read(&job).unwrap(), content);
-}
-
-/// The drop is fenced on a ready file: rows whose move never published stay.
-#[test]
-fn rows_are_not_dropped_without_a_ready_file() {
-    let fixture = Fixture::new();
-    let content = sized(4_000, 4);
-    let job = fixture.claimed(&"d".repeat(64), &content);
-    fixture.legacy(&job, &content);
-    let body = &fixture.legacy_bodies()[0];
-    assert!(
-        !fixture
-            .store
-            .app_storage()
-            .drop_migrated_legacy_body(body)
-            .unwrap()
-    );
     assert_eq!(fixture.read(&job).unwrap(), content);
 }
 
@@ -1144,14 +1102,27 @@ fn keep_media_defaults_to_forever_and_round_trips() {
         app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
         AttachmentRemoval::default()
     );
-    for keep in [
-        AttachmentKeepMedia::OneYear,
-        AttachmentKeepMedia::SixMonths,
-        AttachmentKeepMedia::ThirtyDays,
-        AttachmentKeepMedia::Forever,
+    // The stored day counts are the schema's, so an upgraded account's
+    // setting decodes to the same window.
+    for (keep, days) in [
+        (AttachmentKeepMedia::OneYear, Some(365)),
+        (AttachmentKeepMedia::SixMonths, Some(183)),
+        (AttachmentKeepMedia::ThirtyDays, Some(30)),
+        (AttachmentKeepMedia::Forever, None),
     ] {
         app.set_attachment_keep_media(keep).unwrap();
         assert_eq!(app.attachment_keep_media().unwrap(), keep);
+        let stored: Option<i64> = fixture
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT keep_days FROM attachment_keep_media WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, days, "{keep:?}");
     }
     assert_eq!(
         app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
@@ -1397,6 +1368,34 @@ fn explicit_remove_relabels_a_cleaned_slot() {
         Some(0),
         "still removed by you"
     );
+
+    // The same through the live Remove: a slot the user removed stays
+    // removed by you when automatic demand later finds it past the window.
+    let content = sized(2_000, 32);
+    let removed = "7".repeat(64);
+    let job = fixture.claimed_in(GROUP, &removed, &content, 0);
+    assert!(matches!(
+        fixture.publish(&job, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert!(
+        app.remove_attachment_reference_releasing(&job.reference)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fixture.reason(GROUP, &removed), Some(0));
+    let (_, mut entry) = Fixture::entry(&removed, &content);
+    entry.received_at = 0;
+    assert_eq!(
+        app.request_automatic_acquisition(GROUP, &entry, digest(&content), 100 * DAY)
+            .unwrap(),
+        AttachmentDemand::Suppressed
+    );
+    assert_eq!(fixture.reason(GROUP, &removed), Some(0));
+    assert_eq!(
+        fixture.status(GROUP, &removed),
+        AttachmentTransferState::Removed
+    );
 }
 
 /// An automatic download queued before the window reached it (the setting
@@ -1444,4 +1443,100 @@ fn the_sweep_cleans_queued_automatic_downloads_but_not_explicit_ones() {
             .is_some(),
         "the explicit request still downloads"
     );
+}
+
+/// A ready download whose media file is lost shows as previously acquired
+/// and unavailable: automatic demand does not queue it again, and an
+/// explicit retry downloads it again.
+#[test]
+fn a_lost_media_file_is_unavailable_until_an_explicit_retry() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = body();
+    let message = "d".repeat(64);
+    let job = fixture.claimed(&message, &content);
+    let PublishOutcome::Published(id) = fixture.publish(&job, &content) else {
+        panic!("published");
+    };
+    std::fs::remove_file(fixture.media.path(&id)).unwrap();
+    assert!(fixture.media.open_reader(&id).unwrap().is_none());
+    assert_eq!(
+        fixture.media.file_state(&id).unwrap(),
+        Some(FileState::Lost)
+    );
+
+    let (_, entry) = Fixture::entry(&message, &content);
+    let policy = AttachmentDownloadPolicy {
+        automatic: true,
+        retained_bytes: 1 << 30,
+        disk_reserve: 0,
+        transfer_limit: 1 << 20,
+    };
+    for _ in 0..3 {
+        let (status, queued) = app
+            .request_automatic_attachment(GROUP, &entry, digest(&content), NOW, (&policy, true))
+            .unwrap();
+        assert!(!queued);
+        assert_eq!(
+            status.unwrap().state,
+            AttachmentTransferState::PreviouslyAcquiredUnavailable
+        );
+    }
+    assert!(
+        app.attachment_transfer_candidates(NOW, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        app.explicitly_retry_attachment(&job.reference, NOW)
+            .unwrap()
+    );
+    let retry = app
+        .claim_attachment_acquisition(&job.reference, NOW, LEASE)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        fixture.publish(&retry, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        fixture.status(GROUP, &message),
+        AttachmentTransferState::Ready
+    );
+    assert_eq!(fixture.read(&retry).unwrap(), content);
+}
+
+/// The attachment types a host may log print lengths and offsets only: no
+/// token, attempt, group, message, file or slot.
+#[test]
+fn attachment_debug_output_names_no_identifier() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = b"abc";
+    let job = fixture.claimed(&"f".repeat(64), content);
+    fixture.legacy(&job, content);
+    let body = fixture.legacy_bodies().remove(0);
+    let entry = app
+        .largest_retained_attachments(NOW, None, None, 1)
+        .unwrap()
+        .remove(0);
+    for (debug, expected) in [
+        (
+            format!("{body:?}"),
+            "LegacyAttachmentBody { byte_len: 3, .. }",
+        ),
+        (
+            format!("{:?}", app.legacy_attachment_reader(&body)),
+            "LegacyBodyReader { byte_len: 3, offset: 0, .. }",
+        ),
+        (
+            format!("{entry:?}"),
+            "RetainedAttachmentEntry { byte_count: 3, .. }",
+        ),
+        (format!("{:?}", job.reference), "AttachmentAssetRef { .. }"),
+        (format!("{job:?}"), "AttachmentAcquisition { .. }"),
+    ] {
+        assert_eq!(debug, expected);
+    }
 }

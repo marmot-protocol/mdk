@@ -145,12 +145,46 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's compromise warning may have changed: re-read
+    /// `compromise_warning`. Also fires once each time the account's worker
+    /// opens or reconnects. Carries no slots, and may fire with no visible
+    /// change.
+    CompromiseWarningChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
     /// account's worker opens or reconnects, which ends any link in
     /// progress. Carries no device, session or group identities, and may
     /// fire with no visible change.
     DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's recovery status may have changed: re-read
+    /// `account_recovery_status`. Carries no group identities. Not raised
+    /// until the recovery runner owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// `list_accounts` and show the device-level notice. Fires once;
+    /// afterwards `AccountSummaryFfi.unlinked` says so.
+    DeviceUnlinked {
         account_id_hex: String,
         account_label: String,
     },
@@ -531,10 +565,38 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 account_id_hex,
                 account_label,
             },
+            MarmotAppEvent::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            } => Self::CompromiseWarningChanged {
+                account_id_hex,
+                account_label,
+            },
             MarmotAppEvent::DeviceLinkChanged {
                 account_id_hex,
                 account_label,
             } => Self::DeviceLinkChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::ChatHistoryImportsChanged {
+                account_id_hex,
+                account_label,
+            } => Self::ChatHistoryImportsChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            } => Self::RecoveryStatusChanged {
+                account_id_hex,
+                account_label,
+            },
+            MarmotAppEvent::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            } => Self::DeviceUnlinked {
                 account_id_hex,
                 account_label,
             },

@@ -16,25 +16,26 @@ pub use cgka_engine::account_identity_proof::{
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
-pub use cgka_engine::engine::{WelcomeDeliveryIndex, WelcomeWithdrawal};
+pub use cgka_engine::engine::{OwedSiblingWelcome, WelcomeDeliveryIndex, WelcomeWithdrawal};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
     KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
 };
 pub use cgka_engine::private_key_packages::{
-    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, MAX_HAND_OFF_KEY_PACKAGES,
-    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
-    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, private_key_package_stock,
-    validate_received_private_key_package,
+    KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
+    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
+    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
+    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
 };
+pub use cgka_engine::recovery_key::RECOVERY_ENTROPY_LEN;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
     AppComponentId, AppComponentSet, DeviceRosterV1, DeviceTagClaim, default_group_components,
 };
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
-    SendIntent, SendResult, SupersededIntentReport,
+    CgkaEngine, CreateGroupRequest, EpochPin, GroupEvent, GroupHydrationQuarantineReason,
+    KeyPackage, SendIntent, SendResult, SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
@@ -46,9 +47,12 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{DeviceGroupWelcomeExpectation, MaintenanceStorage, StorageError};
+use cgka_traits::storage::{
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, RosterTagKey, StorageError,
+};
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
@@ -1035,6 +1039,19 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
+    pub fn member_device_tag_claim_at(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+        leaf_index: u32,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<Option<DeviceTagClaim>> {
+        Ok(self
+            .engine
+            .member_device_tag_claim_at(group_id, epoch, leaf_index, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::own_account_leaf_claims`].
     pub fn own_account_leaf_claims(
         &self,
@@ -1042,6 +1059,18 @@ impl AccountDeviceSession {
         roster: &DeviceRosterV1,
     ) -> SessionResult<Vec<(Vec<u8>, DeviceTagClaim)>> {
         Ok(self.engine.own_account_leaf_claims(group_id, roster)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::own_account_leaves_tagged_by`].
+    pub fn own_account_leaves_tagged_by(
+        &self,
+        group_id: &GroupId,
+        leaf_tag_key: &[u8; 32],
+        keys: &[RosterTagKey],
+    ) -> SessionResult<Vec<Vec<u8>>> {
+        Ok(self
+            .engine
+            .own_account_leaves_tagged_by(group_id, leaf_tag_key, keys)?)
     }
 
     pub fn app_component(
@@ -1079,6 +1108,12 @@ impl AccountDeviceSession {
         context
             .exporter_secret(label, length)
             .ok_or_else(|| EngineError::Other(format!("missing exporter secret for label {label}")))
+    }
+
+    /// The group's epoch and the branch it is on, for pinning an epoch-bound
+    /// application message.
+    pub fn epoch_pin(&self, group_id: &GroupId) -> Result<EpochPin, EngineError> {
+        self.engine.epoch_pin(group_id)
     }
 
     pub fn exporter_secret_with_epoch(
@@ -1345,6 +1380,55 @@ impl AccountDeviceSession {
         })
     }
 
+    /// Join a chat from a sibling Welcome the caller admitted from the
+    /// trusted device group. Its events wait for the next drain, as a
+    /// confirmed rejoin's do. See [`cgka_engine::Engine::join_sibling_welcome`].
+    pub async fn join_sibling_welcome(
+        &mut self,
+        message_id: &MessageId,
+        welcome: &SiblingWelcome,
+        created_at: Option<Timestamp>,
+    ) -> SessionResult<SiblingWelcomeJoin> {
+        let outcome = self
+            .engine
+            .join_sibling_welcome(message_id, welcome, created_at)
+            .await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "join_sibling_welcome",
+            outcome_kind = match &outcome {
+                SiblingWelcomeJoin::Settled(outcome) => ingest_outcome_kind(outcome),
+                SiblingWelcomeJoin::Held { .. } => "held",
+            },
+            "sibling Welcome ingested"
+        );
+        Ok(outcome)
+    }
+
+    /// See [`cgka_engine::Engine::owed_sibling_welcomes`].
+    pub fn owed_sibling_welcomes(&self, now: Timestamp) -> SessionResult<Vec<OwedSiblingWelcome>> {
+        Ok(self.engine.owed_sibling_welcomes(now)?)
+    }
+
+    /// See [`cgka_engine::Engine::carry_sibling_welcome`].
+    pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.carry_sibling_welcome(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_delivered`].
+    pub fn sibling_welcome_delivered(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_delivered(id, carrier)?)
+    }
+
+    /// See [`cgka_engine::Engine::sibling_welcome_send_failed`].
+    pub fn sibling_welcome_send_failed(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+    ) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_send_failed(id, carrier)?)
+    }
+
     pub async fn advance_convergence(
         &mut self,
         group_id: &GroupId,
@@ -1441,6 +1525,11 @@ impl AccountDeviceSession {
         &mut self,
     ) -> SessionResult<Vec<SupersededIntentReport>> {
         Ok(self.engine.reissue_superseded_own_commits_from_state()?)
+    }
+
+    /// See `Engine::owes_superseded_own_commit_reissue`.
+    pub fn owes_superseded_own_commit_reissue(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.owes_superseded_own_commit_reissue(group_id)?)
     }
 
     pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
@@ -1683,6 +1772,23 @@ impl AccountDeviceSession {
         self.engine.account_devices_activation_refusal(group_id)
     }
 
+    /// See [`cgka_engine::engine::Engine::sibling_add_refusal`].
+    pub fn sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+        sibling: &cgka_traits::engine::SiblingKeyPackage,
+    ) -> Result<Option<cgka_traits::error::SiblingAddRefusal>, EngineError> {
+        self.engine.sibling_add_refusal(group_id, sibling)
+    }
+
+    /// See [`cgka_engine::engine::Engine::chat_sibling_add_refusal`].
+    pub fn chat_sibling_add_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<cgka_traits::error::SiblingAddRefusal>, EngineError> {
+        self.engine.chat_sibling_add_refusal(group_id)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.engine.acknowledge_disband_failure(group_id)
     }
@@ -1712,6 +1818,11 @@ impl AccountDeviceSession {
         group_id: &GroupId,
     ) -> SessionResult<Vec<OutboundFanout>> {
         Ok(self.engine.outbound_fanouts_for_group(group_id)?)
+    }
+
+    /// Groups holding a stored frozen fanout, including unhydrated ones (mdk#2762).
+    pub fn outbound_fanout_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        Ok(self.engine.outbound_fanout_group_ids()?)
     }
 
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> SessionResult<()> {
@@ -1767,6 +1878,37 @@ impl AccountDeviceSession {
     /// See [`cgka_engine::engine::Engine::open_history`].
     pub fn open_history(&self, context: &[u8], sealed: &[u8]) -> SessionResult<Option<Vec<u8>>> {
         Ok(self.engine.open_history(context, sealed)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::recovery_public_key`].
+    pub fn recovery_public_key(
+        &self,
+        entropy: &[u8; RECOVERY_ENTROPY_LEN],
+    ) -> SessionResult<Vec<u8>> {
+        Ok(self.engine.recovery_public_key(entropy)?)
+    }
+
+    /// See [`cgka_engine::engine::Engine::seal_to_recovery_key`].
+    pub fn seal_to_recovery_key(
+        &self,
+        recovery_public_key: &[u8],
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.engine
+            .seal_to_recovery_key(recovery_public_key, context, plaintext)
+    }
+
+    /// See [`cgka_engine::engine::Engine::open_with_recovery_key`].
+    pub fn open_with_recovery_key(
+        &self,
+        entropy: &[u8; RECOVERY_ENTROPY_LEN],
+        context: &[u8],
+        sealed: &[u8],
+    ) -> SessionResult<Option<Vec<u8>>> {
+        Ok(self
+            .engine
+            .open_with_recovery_key(entropy, context, sealed)?)
     }
 
     /// See `CgkaEngine::withdraw_device_group_welcome`.
@@ -1909,11 +2051,13 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::ReplaceDeviceEntry { .. } => "replace_device_entry",
+        SendIntent::ReplaceAccountEntry { .. } => "replace_account_entry",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }
 }

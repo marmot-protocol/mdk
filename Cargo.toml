@@ -118,6 +118,9 @@ async-wsocket = "0.17"
 tokio-socks = "0.5.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
+# Recovery words for backups (mdk#2628 4.4): 12 BIP-39 English words. Already
+# in the lockfile through nostr's NIP-06 support.
+bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"

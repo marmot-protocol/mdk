@@ -159,7 +159,9 @@ would encrypt it under the drain-time epoch, and the payload binds key material 
 encrypted-media `imeta` reference, whose media key recipients derive from the delivering message's epoch). The
 engine MUST refuse such a message with `AppMessageEpochUnsettled` instead of retaining it, and MUST compare the loaded
 MLS epoch against the pin immediately before encryption, refusing with `AppMessageEpochMismatch` when convergence
-folded into the send moved the epoch; neither refusal persists or publishes anything. A device link (`LinkDevice`)
+folded into the send moved the epoch. The pin, read with `CgkaEngine::epoch_pin`, names the epoch's number and a
+digest of its epoch authenticator, so a rival branch selected at the same number is refused too; neither refusal
+persists or publishes anything. A device link (`LinkDevice`)
 is the other exception: the engine MUST refuse it with `LinkDeviceUnsettled` whenever it would retain it, and while
 an own Commit is in flight, because the new device stops waiting for its Welcome and a link drained after that would
 add a device that never joins. The caller retries while the new device still waits. Current-fingerprint deferred
@@ -265,11 +267,33 @@ convergence, so the engine MUST NOT report those intents as still pending. The a
 that outcome per message rather than infer it from a message that never arrives; how it is surfaced is an application
 concern, not a protocol one.
 
-Releasing a retained intent is not ordered against a new send: a send accepted once the group is `Stable` publishes
-immediately if its convergence inputs have settled, while a retained intent waits for the next convergence drain, so a
-message accepted later MAY reach the transport first — by up to the settlement quiescence delay. Display order is
-unaffected, because the application timeline stamps a message when it is accepted rather than when it publishes;
-per-sender FIFO publication is not a protocol promise.
+A new send MUST NOT be prepared ahead of an intent retained earlier for the same group. While any retained intent
+still waits for the drain to prepare it, a send the engine would otherwise prepare at once is retained behind it, or
+refused like any intent that never queues (an epoch-pinned message, a device link, an account entry replacement), and
+the drain prepares them in the order they were accepted. An intent the drain already prepared, and whose publication
+the host has not yet resolved, no longer waits: its generation is taken. That holds until the host retries it
+instead: the next drain prepares a retried intent again, at a later generation, after any send made since. The session
+runtime resolves every intent a drain prepared within the advance that prepared it, so none of its sends falls in
+between. The cost is latency: a send accepted while earlier ones wait publishes with them, at the next drain.
+
+Group changes can still go ahead of retained application messages in three ways the queue already allowed. After a
+convergence pass the drain gives its first attempt to one queued admin or same-account change. A requested disband is
+prepared before the queue, and its terminal Commit discards the queue. The engine's own maintenance commits (a replay
+rotation, a due SelfRemove auto-commit) are not sends, and go first. None of them reorders application messages among
+themselves, which is what the ratchet needs. A queued change the settled state already holds (enabling disbanding that
+is already on) is retired when the drain reaches it, with nothing to publish and no event; the drain returns
+`NoChange`.
+
+Display order does not need this, because the application timeline stamps a message when it is accepted. The ratchet
+does (mdk#2842). Each encryption takes the sender's next generation in the epoch, and a receiver keeps only 100 earlier
+generations of a sender (`DEFAULT_OUT_OF_ORDER_TOLERANCE`). A member that reads the group's history in `created_at`
+order, which is acceptance order because the Nostr binding stamps the outer event with the inner app event's
+`created_at`, steps each sender's ratchet in that order. Had later sends gone ahead of retained ones, it would reach
+the retained ones first, at higher generations, and lose every earlier-generation send more than 100 behind. Outside
+those exceptions, ordering by acceptance also keeps a membership change from taking effect before a message
+accepted ahead of it. A drained
+message keeps its original `created_at`: it is part of the inner event's id, and with sends prepared in acceptance
+order it already sorts by generation.
 
 When the group becomes stable, the application calls:
 
@@ -563,9 +587,10 @@ A conforming engine MUST pass scenario tests for:
 - outbound app and commit intents queued while syncing,
 - app message retained across a pending publish and regenerated under the epoch the publish established,
 - epoch-pinned app message refused rather than retained while a publish is pending, and refused at encryption when
-  the send folds a retained commit
+  the send folds a retained commit or selects a rival branch at the same epoch number
   (`epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publish_is_pending`,
-  `epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit`),
+  `epoch_pinned_app_message_is_refused_when_the_send_folds_a_retained_commit`,
+  `epoch_pinned_app_message_is_refused_when_the_send_selects_a_rival_at_the_same_epoch`),
 - queued commit regenerated after settled convergence,
 - restart reproducing the same canonicalization result from persisted storage,
 - peeler-ingest to `GroupEvent` output across multiple in-memory clients.

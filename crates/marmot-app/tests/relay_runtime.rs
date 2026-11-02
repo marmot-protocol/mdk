@@ -4222,7 +4222,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             .await
             .expect("roster reads must not wait for scheduled recovery")
             .unwrap();
-            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
             assert_eq!(roster.self_membership, SelfMembership::Member);
             assert_eq!(roster.members.len(), 2);
         }
@@ -4324,7 +4324,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     .await
     .expect("roster read must not block on the initial catch-up")
     .unwrap();
-    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
     assert_eq!(roster.self_membership, SelfMembership::Member);
     let roster_member_ids = roster
         .members
@@ -5284,14 +5284,24 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
         view.tokens[0].token_fingerprint,
         registration.token_fingerprint
     );
-    assert!(
-        app.push_registration(&bob.account.account_id_hex)
-            .unwrap()
-            .unwrap()
-            .last_shared_at_ms
-            .is_some(),
-        "automatic publication must commit durable share completion"
-    );
+    // Alice can receive the token before Bob's publication completion commits.
+    // Observe that durable completion without initiating another share or retry.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if app
+                .push_registration(&bob.account.account_id_hex)
+                .unwrap()
+                .unwrap()
+                .last_shared_at_ms
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic publication must commit durable share completion");
     runtime.shutdown().await;
 }
 
@@ -12318,6 +12328,9 @@ async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
 
     let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
 
+    // A signed-out account signs out on its own at once: no sibling went
+    // unasked.
+    assert!(!outcome.siblings_not_reached);
     assert_eq!(outcome.key_packages_deleted, 1);
     assert!(outcome.key_package_failures.is_empty());
     assert!(outcome.local_cleanup.completed);

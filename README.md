@@ -175,15 +175,19 @@ just ci                      # full local parity with GitHub CI (slow)
 ```
 
 Pull requests run a pre-check of a few minutes: formatting, the static and
-contract gates, dependency audit, workspace clippy and the WASM build. They run
-no tests. The merge queue runs the full matrix on the exact commit it merges:
-every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
-suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
-Tamarin, Hermes and installer checks. `Required CI` must pass there before a
-change lands. A queue run stops at its first failed job, so the queue ejects a
-failing change within minutes rather than after the whole run. Master pushes run CI only to refresh the Rust dependency caches
-that pull requests and merge groups restore, and only when `Cargo.lock`, a
-`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
+contract gates (the tracing audit among them), dependency audit, workspace
+clippy, the WASM build, and the workspace tests with the `precheck` nextest
+profile. That profile stops each test after half a second and counts it as
+passed, so the pre-check fails on a test that fails quickly and leaves the
+slower ones to the queue. The merge queue runs the full matrix on the exact
+commit it merges: every workspace test with the `ci` nextest profile, the CLI
+and relay end-to-end suites, simulator lanes, C bindings, iOS clippy, Windows
+filesystem contracts, Tamarin, Hermes and installer checks. `Required CI` must
+pass there before a change lands. A queue run stops at its first failed job, so
+the queue ejects a failing change within minutes rather than after the whole
+run. Master pushes run CI only to refresh the Rust dependency caches that pull
+requests and merge groups restore, and only when `Cargo.lock`, a `Cargo.toml`,
+the toolchain pin, Cargo config or `ci.yml` changes.
 
 Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
 along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS

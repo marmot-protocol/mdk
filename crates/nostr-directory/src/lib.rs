@@ -33,7 +33,7 @@ pub use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, Obse
 pub use previews::{MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead};
 pub use published_records::{
     AccountKeyPackageSlots, AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage,
-    MissingRelayListKind, OwnSlotRead, SlotKeyPackage, SlotPublication,
+    MissingRelayListKind, OwnSlotRead, SlotKeyPackage, SlotPublication, SlotPublicationKeyPackage,
     key_package_from_hex_with_optional_source, key_package_from_record, push_unique_strings,
     relay_list_state_from_event, sort_directory_records,
 };

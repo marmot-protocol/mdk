@@ -268,6 +268,11 @@ enum MarmotStatus
    * Signal sticker import is not available for external-signing accounts.
    */
   MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 115,
+  /**
+   * This device was unlinked from the account by its other devices. The
+   * account stays signed out here: wipe it, then link the device again.
+   */
+  MARMOT_STATUS_ACCOUNT_UNLINKED = 116,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -505,12 +510,15 @@ typedef enum MarmotEncryptedMediaVersion {
 
 /**
  * Whether the local account is still a member of this group, and if
- * not, whether it left voluntarily or was removed.
+ * not, whether it left voluntarily or was removed. `DeviceRemoved`: this
+ * device's leaf was removed while the account keeps another device in
+ * the group, which is not a removal from the group.
  */
 typedef enum MarmotSelfMembership {
   MARMOT_SELF_MEMBERSHIP_MEMBER,
   MARMOT_SELF_MEMBERSHIP_LEFT,
   MARMOT_SELF_MEMBERSHIP_REMOVED,
+  MARMOT_SELF_MEMBERSHIP_DEVICE_REMOVED,
 } MarmotSelfMembership;
 
 /**
@@ -555,7 +563,9 @@ typedef enum MarmotSendMaintenanceDisposition {
 
 /**
  * Why recovery parked. Current policy parks only the first five;
- * `KnownEvent` and `MaintenanceBoundary` are reserved.
+ * `KnownEvent` and `MaintenanceBoundary` are reserved, and
+ * `UnprovenHistory` is not raised until the recovery runner owns
+ * history (mdk#2660).
  */
 typedef enum MarmotHistoryNoticeCause {
   /**
@@ -587,6 +597,12 @@ typedef enum MarmotHistoryNoticeCause {
    * A post-join maintenance boundary was never observed.
    */
   MARMOT_HISTORY_NOTICE_CAUSE_MAINTENANCE_BOUNDARY,
+  /**
+   * The recovery runner could not prove this history on a route's
+   * relays and stopped retrying them: a group's (`group_id_hex` names
+   * it) or the account inbox's.
+   */
+  MARMOT_HISTORY_NOTICE_CAUSE_UNPROVEN_HISTORY,
 } MarmotHistoryNoticeCause;
 
 /**
@@ -1197,6 +1213,7 @@ typedef enum MarmotConversationParticipation {
   MARMOT_CONVERSATION_PARTICIPATION_REMOVED,
   MARMOT_CONVERSATION_PARTICIPATION_DISBANDED,
   MARMOT_CONVERSATION_PARTICIPATION_UNAVAILABLE,
+  MARMOT_CONVERSATION_PARTICIPATION_DEVICE_REMOVED,
 } MarmotConversationParticipation;
 
 typedef enum MarmotConversationAnchorKind {
@@ -1459,6 +1476,23 @@ typedef enum MarmotSignInResponse {
    */
   MARMOT_SIGN_IN_RESPONSE_DISMISS,
 } MarmotSignInResponse;
+
+/**
+ * Why something is in the compromise warning. Later releases add
+ * values: show one the host does not know as a generic reason.
+ */
+typedef enum MarmotCompromiseWarningReason {
+  /**
+   * A sign-in the user answered This wasn't me, on this device or
+   * another.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_REJECTED_SIGN_IN,
+  /**
+   * A KeyPackage this device found in its own slot that it did not
+   * make. This device has replaced it.
+   */
+  MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE,
+} MarmotCompromiseWarningReason;
 
 typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
 
@@ -2072,6 +2106,7 @@ typedef struct MarmotAccountSummary {
   bool external_signing;
   bool signed_out;
   bool running;
+  bool unlinked;
 } MarmotAccountSummary;
 
 /**
@@ -2148,7 +2183,9 @@ typedef struct MarmotLocalCleanupReport {
  */
 typedef struct MarmotWipeOutcome {
   /**
-   * Active MLS groups this account successfully left.
+   * Active MLS groups this account successfully left. A chat this
+   * device is no longer in, its copy removed or disbanded, is neither
+   * left nor reported as a failure.
    */
   uint32_t groups_left;
   struct MarmotGroupLeaveFailure *group_leave_failures;
@@ -2161,6 +2198,17 @@ typedef struct MarmotWipeOutcome {
   struct MarmotRelayFailure *key_package_failures;
   uintptr_t key_package_failures_len;
   struct MarmotLocalCleanupReport local_cleanup;
+  /**
+   * Chats this device did not leave itself because another of the
+   * account's devices takes it out of them.
+   */
+  uint32_t groups_left_to_siblings;
+  /**
+   * This device could not ask its siblings within about 30 seconds,
+   * so it tried to leave every chat itself; one it could not leave is
+   * in `group_leave_failures`. Tell the user.
+   */
+  bool siblings_not_reached;
 } MarmotWipeOutcome;
 
 /**
@@ -2786,11 +2834,31 @@ typedef struct MarmotHistoryNoticeList {
 } MarmotHistoryNoticeList;
 
 /**
+ * The account's recovery: `catching_up_group_ids_hex` lists the groups
+ * whose history is still being fetched (lowercase hex, sorted),
+ * `inbox_catching_up` whether the inbox's is, and `notices` every
+ * current notice. Nothing is catching up until the recovery runner owns
+ * history (mdk#2660).
+ */
+typedef struct MarmotAccountRecoveryStatus {
+  char **catching_up_group_ids_hex;
+  uintptr_t catching_up_group_ids_hex_len;
+  bool inbox_catching_up;
+  struct MarmotHistoryNotice *notices;
+  uintptr_t notices_len;
+} MarmotAccountRecoveryStatus;
+
+/**
  * One of this account's own devices, as the roster of the device group
  * this device trusts lists it. `slot_id_hex` (64 lowercase hex
  * characters) is the handle actions on the device take. `label`,
  * `client` and `platform` are empty until set. `linked_at` is in Unix
  * seconds. `linked_by_slot_id_hex` is NULL for the founder.
+ * `last_active_at` (Unix seconds, valid when `has_last_active_at`) is
+ * when a heartbeat last showed the device running; never set for this
+ * device. `inactive` is this device's own judgement, 30 days after the
+ * later of that and when it first found the device in the roster; the
+ * roster's mark is `status` `Inactive`.
  * `removal_pending` is set while a removal decided on this device waits
  * for the device group.
  */
@@ -2806,6 +2874,12 @@ typedef struct MarmotLinkedDevice {
   bool add_to_all_chats;
   bool bring_history;
   bool keep_while_inactive;
+  bool has_last_active_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_active_at;
+  bool inactive;
   bool removal_pending;
 } MarmotLinkedDevice;
 
@@ -2816,6 +2890,70 @@ typedef struct MarmotLinkedDeviceList {
   struct MarmotLinkedDevice *items;
   uintptr_t len;
 } MarmotLinkedDeviceList;
+
+/**
+ * The device a row or a chat's history was imported from.
+ * `device_slot_id_hex` is its roster slot, as `marmot_linked_devices`
+ * names it. `device_label` is its name now: empty when it has none, is
+ * no longer linked, or this device has not read the roster since it
+ * started; show "another device" then. It follows
+ * `LinkedDevicesChanged`.
+ */
+typedef struct MarmotHistoryImportSource {
+  char *device_slot_id_hex;
+  char *device_label;
+} MarmotHistoryImportSource;
+
+/**
+ * Where a chat's history from another device stands.
+ */
+typedef enum MarmotChatHistoryImportState_Tag {
+  /**
+   * A delivery arrived and waits to be imported, as while its bundle is
+   * fetched. `retrying` once an attempt to get one of its bundles failed;
+   * it is tried again later.
+   */
+  MARMOT_CHAT_HISTORY_IMPORT_STATE_RECEIVING,
+  /**
+   * Its latest import: the device it came from, and when, in Unix
+   * seconds.
+   */
+  MARMOT_CHAT_HISTORY_IMPORT_STATE_IMPORTED,
+} MarmotChatHistoryImportState_Tag;
+
+typedef struct MarmotChatHistoryImportState_Receiving_Body {
+  bool retrying;
+} MarmotChatHistoryImportState_Receiving_Body;
+
+typedef struct MarmotChatHistoryImportState_Imported_Body {
+  struct MarmotHistoryImportSource from;
+  uint64_t at;
+} MarmotChatHistoryImportState_Imported_Body;
+
+typedef struct MarmotChatHistoryImportState {
+  MarmotChatHistoryImportState_Tag tag;
+  union {
+    MarmotChatHistoryImportState_Receiving_Body RECEIVING;
+    MarmotChatHistoryImportState_Imported_Body IMPORTED;
+  };
+} MarmotChatHistoryImportState;
+
+/**
+ * A held chat whose history from another device is arriving or has
+ * arrived.
+ */
+typedef struct MarmotChatHistoryImport {
+  char *group_id_hex;
+  struct MarmotChatHistoryImportState state;
+} MarmotChatHistoryImport;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotChatHistoryImportList {
+  struct MarmotChatHistoryImport *items;
+  uintptr_t len;
+} MarmotChatHistoryImportList;
 
 /**
  * A sign-in of this account that this device does not recognize.
@@ -2844,6 +2982,32 @@ typedef struct MarmotUnrecognizedSignInList {
   struct MarmotUnrecognizedSignIn *items;
   uintptr_t len;
 } MarmotUnrecognizedSignInList;
+
+/**
+ * One thing the open compromise warning gathers. `reason` is a
+ * `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`, so
+ * a host can show a value it does not know as a generic reason.
+ * `slot_id_hex` is the KeyPackage slot the item names: the rejected
+ * sign-in's, or this device's own for a KeyPackage found there.
+ * `key_package_ref_hex` is set only for `ForeignOwnSlotKeyPackage`.
+ * `occurred_at` is in Unix seconds: when the rejection was made, as the
+ * device that made it wrote it, or when this device found the
+ * KeyPackage.
+ */
+typedef struct MarmotCompromiseWarningItem {
+  uint32_t reason;
+  char *slot_id_hex;
+  char *key_package_ref_hex;
+  uint64_t occurred_at;
+} MarmotCompromiseWarningItem;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotCompromiseWarningItemList {
+  struct MarmotCompromiseWarningItem *items;
+  uintptr_t len;
+} MarmotCompromiseWarningItemList;
 
 /**
  * One emoji of the code. `description` is its English description, for
@@ -4842,6 +5006,12 @@ typedef struct MarmotTimelineMessageRecord {
    */
   char *invalidation_status;
   char *client_token;
+  /**
+   * The device this row came from in a chat history it sent; NULL
+   * for a row that arrived live. Draw "Imported from <device>"
+   * where rows change from imported to live.
+   */
+  struct MarmotHistoryImportSource *imported_from;
 } MarmotTimelineMessageRecord;
 
 /**
@@ -5788,6 +5958,13 @@ typedef enum MarmotEvent_Tag {
    */
   MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED,
   /**
+   * The account's compromise warning may have changed; re-read
+   * `marmot_compromise_warning`. Also fires once each time the account's
+   * worker opens or reconnects. Carries no slots, and may fire with no
+   * visible change.
+   */
+  MARMOT_EVENT_COMPROMISE_WARNING_CHANGED,
+  /**
    * Linking a new device may have changed as this device shows it;
    * re-read `marmot_device_link_snapshot`. Also fires once each time the
    * account's worker opens or reconnects, which ends any link in
@@ -5795,6 +5972,30 @@ typedef enum MarmotEvent_Tag {
    * fire with no visible change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
+  /**
+   * The account's recovery status may have changed; re-read
+   * `marmot_account_recovery_status`. Carries no group identities. Not
+   * raised until the recovery runner owns history (mdk#2660).
+   */
+  MARMOT_EVENT_RECOVERY_STATUS_CHANGED,
+  /**
+   * The account's device group removed this device after its link was
+   * made, so the account stopped here and is signed out for good: re-read
+   * the accounts and show the device-level notice. Fires once; afterwards
+   * `MarmotAccountSummary.unlinked` says so.
+   */
+  MARMOT_EVENT_DEVICE_UNLINKED,
+  /**
+   * `marmot_chat_history_imports` answers differently; re-read it. Fires
+   * when a held chat's delivery from another of this account's devices
+   * arrives, is imported, first fails to fetch, or goes; when imported
+   * rows go, as retention prunes them or the chat is deleted; when a
+   * source device is renamed or removed; and when a chat whose delivery
+   * arrived first is joined. Also fires once each time the account's
+   * worker opens or reconnects, whatever the answer. Carries no chat or
+   * device identities.
+   */
+  MARMOT_EVENT_CHAT_HISTORY_IMPORTS_CHANGED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -5881,10 +6082,30 @@ typedef struct MarmotEvent_UnrecognizedSignInsChanged_Body {
   char *account_label;
 } MarmotEvent_UnrecognizedSignInsChanged_Body;
 
+typedef struct MarmotEvent_CompromiseWarningChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_CompromiseWarningChanged_Body;
+
 typedef struct MarmotEvent_DeviceLinkChanged_Body {
   char *account_id_hex;
   char *account_label;
 } MarmotEvent_DeviceLinkChanged_Body;
+
+typedef struct MarmotEvent_RecoveryStatusChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_RecoveryStatusChanged_Body;
+
+typedef struct MarmotEvent_DeviceUnlinked_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_DeviceUnlinked_Body;
+
+typedef struct MarmotEvent_ChatHistoryImportsChanged_Body {
+  char *account_id_hex;
+  char *account_label;
+} MarmotEvent_ChatHistoryImportsChanged_Body;
 
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
@@ -5903,7 +6124,11 @@ typedef struct MarmotEvent {
     MarmotEvent_LinkedDevicesChanged_Body LINKED_DEVICES_CHANGED;
     MarmotEvent_KeyPackageRefreshOverdueChanged_Body KEY_PACKAGE_REFRESH_OVERDUE_CHANGED;
     MarmotEvent_UnrecognizedSignInsChanged_Body UNRECOGNIZED_SIGN_INS_CHANGED;
+    MarmotEvent_CompromiseWarningChanged_Body COMPROMISE_WARNING_CHANGED;
     MarmotEvent_DeviceLinkChanged_Body DEVICE_LINK_CHANGED;
+    MarmotEvent_RecoveryStatusChanged_Body RECOVERY_STATUS_CHANGED;
+    MarmotEvent_DeviceUnlinked_Body DEVICE_UNLINKED;
+    MarmotEvent_ChatHistoryImportsChanged_Body CHAT_HISTORY_IMPORTS_CHANGED;
   };
 } MarmotEvent;
 
@@ -7881,6 +8106,22 @@ MarmotStatus marmot_history_notices(const struct MarmotClient *client,
                                     struct MarmotHistoryNoticeList **out);
 
 /**
+ * Read the account's recovery status: the groups whose history is still
+ * being fetched, whether the inbox's is, and every notice. Re-read on the
+ * `RecoveryStatusChanged` event. Free with
+ * `marmot_account_recovery_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_recovery_status(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            struct MarmotAccountRecoveryStatus **out);
+
+/**
  * Dismiss one notice once the user accepts the history may be incomplete.
  * Durable; recorded as its own outcome, never as recovered history.
  * Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
@@ -7913,6 +8154,26 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 MarmotStatus marmot_linked_devices(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotLinkedDeviceList **out);
+
+/**
+ * List the held chats whose history from another of this account's
+ * devices is arriving or has arrived: `Receiving` while a delivery
+ * waits to be imported, with `retrying` once an attempt to get its
+ * bundle failed, then `Imported` with the device it came from and when. Empty
+ * while device groups are off. Re-read on the
+ * `ChatHistoryImportsChanged` event, which also fires when a source
+ * device is renamed or removed. Free with
+ * `marmot_chat_history_import_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chat_history_imports(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         struct MarmotChatHistoryImportList **out);
 
 /**
  * Whether this device's KeyPackage refresh is overdue because its device
@@ -7973,10 +8234,10 @@ MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client,
                                          const char *slot_id_hex);
 
 /**
- * How many chats this device is in still hold a device this account
- * removed, because the chat doesn't take a same-account removal; a chat
- * admin can remove it. Zero while device groups are off. Not evented:
- * read it when showing the device list.
+ * How many chats this device is in still hold a device this account no
+ * longer has (removed, or no longer listed by its device group), because
+ * the chat doesn't take a same-account removal; a chat admin can remove it.
+ * Zero while device groups are off. Not evented: read it when showing the device list.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -7987,6 +8248,30 @@ MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client,
 MarmotStatus marmot_removed_device_leftover_chats(const struct MarmotClient *client,
                                                   const char *account_ref,
                                                   uint32_t *out);
+
+/**
+ * How many chats this device is in can't take any device of this
+ * account, linked or not: they don't require
+ * `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+ * can carry, or already hold this account's limit of 20 leaves. Once a
+ * link this device approved is made, the new device is added to this
+ * device's other chats when its "add to all my chats" setting is on,
+ * for a week after the link. A chat that can take this account's
+ * devices but whose requirements the new device's KeyPackages don't
+ * meet is passed over and not counted, so zero does not mean the new
+ * device reaches every chat. A chat admin can turn the component on;
+ * removing a device frees its leaves. Zero while device
+ * groups are off. Not evented: read it when showing the device list.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   uint32_t *out);
 
 /**
  * List the sign-ins of this account that this device does not
@@ -8019,6 +8304,69 @@ MarmotStatus marmot_unrecognized_sign_ins(const struct MarmotClient *client,
 MarmotStatus marmot_check_sign_ins(const struct MarmotClient *client,
                                    const char *account_ref,
                                    struct MarmotUnrecognizedSignInList **out);
+
+/**
+ * Start this device without the devices its first check found ("No,
+ * start fresh"): each sign-in from before this device is answered Not
+ * now, now and when one is listed later. It rejects nothing and raises
+ * no warning, so one of those devices can still link this one. Fails
+ * before the first check and once this device trusts a device group.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_start_fresh(const struct MarmotClient *client, const char *account_ref);
+
+/**
+ * Whether this device started fresh and still has no device group, so
+ * the host can say that only chats it is invited to from now on are
+ * here. Always false in release builds until the roster's spec lands.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_started_fresh(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  bool *out);
+
+/**
+ * List the account's open compromise warning on this device: each
+ * rejection the user has not seen here, the earliest gathered first.
+ * Empty when no warning is open. The host writes the wording, and never
+ * says the account's devices stopped whoever holds the key. Always empty
+ * in release builds until the roster's spec lands. Re-read on the
+ * `CompromiseWarningChanged` event. Free with
+ * `marmot_compromise_warning_item_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_compromise_warning(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       struct MarmotCompromiseWarningItemList **out);
+
+/**
+ * Dismiss the compromise warning on this device: everything it gathers
+ * now is seen here, and it stays closed until something new arrives.
+ * Other devices' warnings are unchanged.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client,
+                                               const char *account_ref);
 
 /**
  * On a new device: ask a device of this account already signed in to
@@ -13012,6 +13360,15 @@ void marmot_string_list_free(struct MarmotStringList *list);
 void marmot_message_tag_free(struct MarmotMessageTag *ptr);
 
 /**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_compromise_warning_item_list_free(struct MarmotCompromiseWarningItemList *list);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -13317,7 +13674,26 @@ void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
  * `list` must be NULL or an unfreed pointer returned by this
  * library.
  */
+void marmot_chat_history_import_list_free(struct MarmotChatHistoryImportList *list);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
 void marmot_history_notice_list_free(struct MarmotHistoryNoticeList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_account_recovery_status_free(struct MarmotAccountRecoveryStatus *ptr);
 
 /**
  * Free a list returned by this library. NULL is a no-op.

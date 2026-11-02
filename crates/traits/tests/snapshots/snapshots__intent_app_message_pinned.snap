@@ -1,0 +1,58 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::AppMessage\n{\n    group_id: gid(), payload: b\"hello\".to_vec(), expected_epoch:\n    Some(EpochPin { epoch: EpochId(7), identity: [0xAB; 32], }),\n}"
+---
+{
+  "AppMessage": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "payload": [
+      104,
+      101,
+      108,
+      108,
+      111
+    ],
+    "expected_epoch": {
+      "epoch": 7,
+      "identity": [
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171,
+        171
+      ]
+    }
+  }
+}

@@ -1309,8 +1309,10 @@ impl AppClient {
         let mut native_examined = 0;
         let mut blocked = HashSet::new();
         let mut inventory = super::InventoryBatch::default();
+        // An unlinked account admits nothing more (mdk#2628 D67).
         while spent < MAX_COMPARISON_ADMISSION_PER_TURN
             && native_examined < MAX_COMPARISON_ADMISSION_PER_TURN
+            && !self.device_unlinked
         {
             let Some(input) = self.ordered_input(admission, &mut blocked).await else {
                 break;

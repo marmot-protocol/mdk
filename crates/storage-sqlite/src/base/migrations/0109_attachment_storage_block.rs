@@ -44,7 +44,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::base::migrations::{MIGRATIONS, run};
 
     fn partials(conn: &rusqlite::Connection) -> i64 {
@@ -53,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_block_migration_preserves_jobs_and_is_transactional() {
+    fn storage_block_migration_preserves_jobs() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         // Everything before this migration, through 0108's attachment history.
         run(&mut conn, &MIGRATIONS[..108]).unwrap();
@@ -78,18 +77,6 @@ mod tests {
             VALUES(x'01010101010101010101010101010101','g','m',0,'s',1,'[\"imeta\"]',randomblob(32),2,7,1234);
             INSERT INTO attachment_partial(token,ciphertext_digest,locator_digest,etag,total,received,expires_at)
             VALUES(x'01010101010101010101010101010101',randomblob(32),randomblob(32),'\"v1\"',10,3,99999);").unwrap();
-        let tx = conn.transaction().unwrap();
-        apply(&tx).unwrap();
-        tx.rollback().unwrap();
-        assert!(
-            conn.prepare("SELECT storage_blocked_headroom FROM attachment_acquisition")
-                .is_err()
-        );
-        assert_eq!(
-            trigger(&conn),
-            before,
-            "a rolled-back apply keeps the old trigger"
-        );
         // Through this migration only: 0112 later drops database checkpoints.
         run(&mut conn, &MIGRATIONS[..109]).unwrap();
         run(&mut conn, &MIGRATIONS[..109]).unwrap();

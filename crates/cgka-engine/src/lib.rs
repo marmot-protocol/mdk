@@ -34,7 +34,6 @@
 
 mod account_devices_activation;
 pub mod account_identity_proof;
-mod announced_key_packages;
 pub mod app_components;
 
 pub(crate) mod app_payload;
@@ -80,6 +79,8 @@ pub mod private_key_packages;
 pub mod provider;
 pub mod publish;
 mod queued_intent_refusal;
+pub mod recovery_key;
+mod roster_tag_keys;
 pub mod self_update;
 pub mod snapshot_guard;
 pub(crate) mod test_crash_hooks;
@@ -90,7 +91,7 @@ pub mod wire_format;
 pub use convergence_clock::{
     ConvergenceClock, ConvergenceTime, ManualConvergenceClock, SystemConvergenceClock,
 };
-pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder, OwedSiblingWelcome};
 pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,
 };

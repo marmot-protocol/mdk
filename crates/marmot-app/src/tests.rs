@@ -4,6 +4,8 @@ mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
 #[cfg(feature = "test-policy-overrides")]
+mod compromise_warning;
+#[cfg(feature = "test-policy-overrides")]
 mod device_group;
 #[cfg(feature = "test-policy-overrides")]
 mod device_pairing;
@@ -20,6 +22,7 @@ mod message_journeys;
 mod multi_device_members;
 #[cfg(feature = "product-analytics-export")]
 mod observed_operations;
+mod offline_queued_sends;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
@@ -35,6 +38,8 @@ mod replaceable_delivery;
 mod report_backfill;
 #[cfg(feature = "test-policy-overrides")]
 mod sign_ins;
+#[cfg(feature = "test-policy-overrides")]
+mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
@@ -569,10 +574,19 @@ pub(crate) struct ScriptedPushRelayClient {
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
+    /// Fail every publish as a send that may have reached the relay, as a
+    /// stale socket does once the device drops offline (mdk#2762).
+    fail_publish_possibly_exposed: std::sync::atomic::AtomicBool,
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
+    /// Every completion read stops before its end of stored events, as a
+    /// relay that timed out or closed the subscription.
+    pub(crate) unfinished_directory_reads: std::sync::atomic::AtomicBool,
+    /// Only each completion read's first relay finishes; the others are
+    /// down, so the read as a whole is not complete.
+    pub(crate) other_directory_relays_down: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -862,6 +876,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
             complete,
+            complete_endpoints: if complete { endpoints } else { Vec::new() },
         })
     }
 }
@@ -1001,9 +1016,18 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn allow_publishes(&self) {
+    pub(crate) fn allow_publishes(&self) {
         self.fail_publish_unavailable
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.fail_publish_possibly_exposed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail every publish as possibly exposed: the frame left the device but
+    /// no relay acknowledgement arrived (mdk#2762).
+    pub(crate) fn fail_publishes_as_possibly_exposed(&self) {
+        self.fail_publish_possibly_exposed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fail single-endpoint publishes to these relays as unavailable.
@@ -1142,21 +1166,36 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
     }
 
     // The scripted relay holds every event published through it, so a read
-    // finishes unless a query's limit cut it short.
+    // finishes unless a query's limit cut it short or a test cut it off.
     async fn fetch_directory_events_with_completion(
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
         let queries = request.queries.clone();
+        let endpoints = request.endpoints.clone();
         let records = self.fetch_directory_events(request).await?;
-        let complete = queries.iter().all(|query| {
-            records
-                .iter()
-                .filter(|record| query.matches(&record.event))
-                .count()
-                < query.limit
-        });
-        Ok(transport_nostr::DirectoryFetchOutcome { records, complete })
+        let finished = !self
+            .unfinished_directory_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && queries.iter().all(|query| {
+                records
+                    .iter()
+                    .filter(|record| query.matches(&record.event))
+                    .count()
+                    < query.limit
+            });
+        let others_down = self
+            .other_directory_relays_down
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Ok(transport_nostr::DirectoryFetchOutcome {
+            records,
+            complete: finished && !others_down,
+            complete_endpoints: match (finished, others_down) {
+                (false, _) => Vec::new(),
+                (true, false) => endpoints,
+                (true, true) => endpoints.into_iter().take(1).collect(),
+            },
+        })
     }
 }
 
@@ -1426,6 +1465,26 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                             endpoint,
                             reason: "relay unavailable".into(),
                             kind: cgka_traits::TransportEndpointFailureKind::RetryableUnavailable,
+                            rejection_category: None,
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        if self
+            .fail_publish_possibly_exposed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                    "send event timed out",
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            endpoint,
+                            reason: "send event timed out".into(),
+                            kind: cgka_traits::TransportEndpointFailureKind::PossiblyExposed,
                             rejection_category: None,
                         })
                         .collect(),
@@ -4409,6 +4468,127 @@ async fn media_send_epoch_pin_body() {
         .expect("a current-epoch reference sends");
     assert_eq!(summary.published, 1, "{summary:?}");
     assert_eq!(relay.published_event_ids().len(), published_before + 1);
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn media_send_pins_the_engine_to_the_reference_branch() {
+    run_composed_app_runtime_test("media-send-branch-pin", media_send_branch_pin_body);
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn media_send_branch_pin_body() {
+    // A reference names only its epoch number. A rival commit from the same
+    // source epoch can win branch selection inside the send itself and leave
+    // the group at that number on another branch, whose media secret the
+    // recipients would derive instead. The pin carries the branch, so the
+    // engine refuses the send and nothing is published.
+    use canonical_membership::{app_at, deliver_new};
+    use cgka_traits::engine::SendIntent;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("branch pin", &[&bob_account.account_id_hex])
+        .await
+        .unwrap();
+    let mut bob_cursor = 0;
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    bob.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    let source_epoch = bob.runtime.epoch_pin(&group).unwrap().epoch;
+    assert_eq!(alice.runtime.epoch_pin(&group).unwrap().epoch, source_epoch);
+
+    // Two self-updates from one epoch order by committer: the smaller account
+    // id wins, so the other account is the sender and loses.
+    let (mut winner, mut sender) = if alice_account.account_id_hex < bob_account.account_id_hex {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
+    let settling = |ms| marmot_session::CanonicalizationPolicy {
+        settlement_quiescence_ms: ms,
+        ..marmot_session::CanonicalizationPolicy::default()
+    };
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(3_600_000))
+        .unwrap();
+    let self_update = || SendIntent::SelfUpdate {
+        group_id: group.clone(),
+    };
+    sender.runtime.send(self_update()).await.unwrap();
+    let mut sender_cursor = relay.published_events.lock().unwrap().len();
+    winner.runtime.send(self_update()).await.unwrap();
+
+    // The sender pins the epoch its own commit reached, then holds the rival
+    // as retained convergence input.
+    let pin = sender.runtime.epoch_pin(&group).unwrap();
+    assert_eq!(pin.epoch.0, source_epoch.0 + 1);
+    assert_ne!(pin, winner.runtime.epoch_pin(&group).unwrap());
+    deliver_new(&mut sender, &relay, &mut sender_cursor).await;
+    assert_eq!(sender.runtime.epoch_pin(&group).unwrap(), pin);
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(0))
+        .unwrap();
+
+    let published_before = relay.published_event_ids().len();
+    let reference = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x66_u8; 32]),
+        plaintext_sha256: hex::encode([0x14_u8; 32]),
+        nonce_hex: hex::encode([0x25_u8; 12]),
+        file_name: "d.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: pin.epoch.0,
+        dim: None,
+        thumbhash: None,
+    };
+    let error = sender
+        .send_app_event(
+            &group,
+            AppMessageIntent::Media {
+                message_tags: Vec::new(),
+                attachments: vec![reference],
+                caption: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        sender.runtime.epoch_pin(&group).unwrap(),
+        winner.runtime.epoch_pin(&group).unwrap(),
+        "the send must have selected the rival branch before encrypting"
+    );
+    assert!(
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } if source_epoch == pin.epoch.0 && current_epoch == pin.epoch.0
+        ),
+        "a same-number branch change must refuse the media send, got {error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused pinned send must reach the relay with nothing"
+    );
 }
 
 #[test]
@@ -13628,6 +13808,51 @@ impl LiveCursorFixture {
         fixture
     }
 
+    /// Replace the fixture's empty account queue with a store that waits before
+    /// writing the real spill rows. Dropping the sender opens the gate, including
+    /// on panic, so a blocked writer cannot strand the runtime's blocking pool.
+    pub(crate) fn hold_spill_writes(
+        &mut self,
+    ) -> (std::sync::mpsc::Sender<()>, Arc<tokio::sync::Notify>) {
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let writing = entered.clone();
+        let storage = self.app.account_storage("alice").unwrap();
+        let store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            writing.notify_one();
+            let _ = held.lock().unwrap().recv();
+            storage
+                .app_storage()
+                .spill_account_deliveries(
+                    deliveries,
+                    crate::client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    crate::unix_now_seconds(),
+                )
+                .map(|dispositions| {
+                    dispositions
+                        .into_iter()
+                        .map(crate::client::delivery_spill::plane_spill_disposition)
+                        .collect()
+                })
+                .map_err(|error| {
+                    if error.is_closed() {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
+        self.client.adapter = self.app.relay_plane.account_adapter_with_recovery_marker(
+            self.account_id.clone(),
+            self.relay.clone(),
+            None,
+            Some(store),
+        );
+        self.client.adapter.open_transport_cursor(self.persisted());
+        (release, entered)
+    }
+
     async fn open_with_cursor(seed_cursor: bool, audited: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
@@ -14653,7 +14878,7 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
         required_acks: 1,
     });
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = routing.inner.write().unwrap();
+        let _guard = routing.inner.state.write().unwrap();
         panic!("poison app routing lock");
     }));
 
@@ -15276,11 +15501,15 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
         // Device-group kinds: heartbeat, private KeyPackage request and
-        // hand-off, anomaly alert.
+        // hand-off, sibling Welcome, history delivery, small-state update and
+        // broadcast request.
         457,
         459,
         460,
-        462,
+        461,
+        473,
+        475,
+        476,
     ] {
         assert!(crate::is_reserved_app_event_kind(kind));
         let result = build_inner_event(
@@ -17010,10 +17239,13 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("drained replay", &[]).await.unwrap();
-    // The replay fixture represents an already terminal canonical copy.
+    // The replay fixture represents an already terminal canonical copy the
+    // account was removed from, so the account is off its roster.
     let storage = app.account_storage("alice").unwrap();
     let mut terminal = storage.get_group(&group_id).unwrap();
     terminal.removed = true;
+    let self_id = client.runtime.self_id();
+    terminal.members.retain(|member| member.id != self_id);
     storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -25721,4 +25953,16 @@ pub(crate) mod alloc_audit {
     pub(crate) fn peak() -> isize {
         PEAK.load(Ordering::Relaxed)
     }
+}
+
+/// A retained route's recovery goal ends one clock-skew allowance after its
+/// switch, which its subscription floor sits one allowance before.
+#[test]
+fn a_retained_routes_recovery_goal_ends_an_allowance_after_its_switch() {
+    let switch = 1_800_000_000;
+    let allowance = HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs();
+    assert_eq!(
+        crate::retained_route_goal_until(crate::history_floor(switch)),
+        switch + allowance
+    );
 }

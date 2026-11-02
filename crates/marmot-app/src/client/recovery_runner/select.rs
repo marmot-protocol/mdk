@@ -19,13 +19,14 @@ use storage_sqlite::{
     RecoveryCoverageMark, RecoveryRelayCaps, RecoveryUnitState, SqliteAppStorage,
     TransportReconciliationRoute,
 };
-use transport_nostr_adapter::sweep::{RelayCaps, SweepRange};
+use transport_nostr_adapter::sweep::{RelayCaps, SweepRange, SweepRoute};
 
 use super::admission::{Admission, Stalled};
 use super::compare::{self, ComparePlan, PlannedRange};
 use super::quantum::QuantumReport;
 use super::{
-    DebtTurn, PriorityHints, RecoveryRunnerPolicy, RunnerRoute, UnitKey, recheck, recovery_caps,
+    DebtTurn, PriorityHints, RecoveryRunnerPolicy, RunnerRoute, UnitKey, fetch_route, recheck,
+    recovery_caps,
 };
 use storage_sqlite::RecoveryUnitOutcome;
 
@@ -60,6 +61,12 @@ pub(super) struct Survey {
     pub(super) paused_until: Option<u64>,
     /// The routes whose units hold their group's live frames behind a fence.
     pub(super) fenced: BTreeSet<TransportReconciliationRoute>,
+    /// The routes whose group has a conversation window open.
+    pub(super) window: BTreeSet<TransportReconciliationRoute>,
+    /// The required units still catching up: they owe history after their
+    /// live tails and are neither broken nor suspended
+    /// ([`RunnerHost::surveyed`](super::RunnerHost)).
+    pub(super) catching_up: BTreeSet<UnitKey>,
 }
 
 pub(super) enum Pick {
@@ -97,6 +104,16 @@ impl Memory {
     pub(super) fn new_round(&mut self) {
         self.served.clear();
         self.rechecks_served.clear();
+    }
+
+    /// An explicit repair re-armed every unit: what this runner holds back
+    /// on its own is due again too, and a relay that would not compare is
+    /// asked again, as after a reconnect.
+    pub(super) fn rearmed(&mut self) {
+        self.local.clear();
+        self.best_effort.clear();
+        self.uncomparable.clear();
+        self.recheck_holds.clear();
     }
 
     pub(super) fn relay_reconnected(&mut self, relay: &str) {
@@ -201,18 +218,9 @@ impl Memory {
     }
 }
 
-/// The routes a sweep can serve: group routes. The inbox stays on NIP-77
-/// comparison (PR 6).
-pub(super) fn sweepable(routes: &[RunnerRoute]) -> impl Iterator<Item = &RunnerRoute> {
-    routes
-        .iter()
-        .filter(|route| matches!(route.route, TransportReconciliationRoute::Group(_)))
-}
-
-/// Whether the route's group is suspended (Unrecoverable). PR 5 fills this
-/// from the group's lifecycle; until then every group is eligible.
-pub(super) fn suspended(_route: &RunnerRoute) -> bool {
-    false
+/// Whether the route's group is suspended: its copy is Unrecoverable.
+pub(super) fn suspended(route: &RunnerRoute) -> bool {
+    route.unrecoverable
 }
 
 /// When the relay's cooldown ends, if one is running at `now`.
@@ -249,9 +257,10 @@ pub(super) fn survey(
     let mut cooldowns = BTreeMap::new();
     let mut admission = Admission::new(turn);
     let mut candidates = Vec::new();
-    for route in sweepable(turn.routes) {
+    let mut catching_up = BTreeSet::new();
+    for route in turn.routes {
         for (relay, best_effort) in route.relays() {
-            let owed_until = turn.tails.owed_until(&route.route, relay, now);
+            let owed_until = turn.owed_until(route, relay);
             let debt = app.recovery_unit_debt(&route.route, relay, owed_until)?;
             let Some(first) = debt.first() else {
                 continue;
@@ -279,6 +288,9 @@ pub(super) fn survey(
             // leaves the admission frontier.
             let held_back =
                 stalled.holds(route) || admission.backpressured(&key, &policy.staging, true)?;
+            if !best_effort && !broken && !suspended(route) {
+                catching_up.insert(key.clone());
+            }
             candidates.push(Candidate {
                 key,
                 best_effort,
@@ -296,6 +308,13 @@ pub(super) fn survey(
         rechecks: recheck::survey(turn, policy, stalled, &mut admission)?,
         paused_until,
         fenced: admission.fenced_routes()?,
+        window: turn
+            .routes
+            .iter()
+            .filter(|route| route.window)
+            .map(|route| route.route.clone())
+            .collect(),
+        catching_up,
     })
 }
 
@@ -449,7 +468,8 @@ fn pick_recheck(
 /// What one debt quantum will fetch, planned in the begin turn. Not `Debug`.
 pub(super) struct SweepPlan {
     pub(super) key: UnitKey,
-    pub(super) nostr_group_id: [u8; 32],
+    /// What the quantum asks the relay for.
+    pub(super) route: SweepRoute,
     pub(super) best_effort: bool,
     /// The unit's owed ranges, oldest first, each from its ledger cursor to
     /// its end. None reaches past the live tail as this turn read it.
@@ -462,6 +482,7 @@ pub(super) struct SweepPlan {
     pub(super) mark: RecoveryCoverageMark,
     /// The same ranges compared by NIP-77 instead of swept, when the relay
     /// compares and the account holds events there (`compare::plan_debt`).
+    /// Always for the inbox, which is never swept (`compare::plan_inbox`).
     pub(super) compare: Option<ComparePlan>,
 }
 
@@ -469,7 +490,7 @@ pub(super) struct SweepPlan {
 /// longer owes anything or is no longer eligible. `caps` are the relay's
 /// NIP-11 caps as just read; known ones are recorded first, which re-arms
 /// the relay's units that were planned with other caps. `compares` is
-/// whether the relay may compare at all.
+/// whether the relay may compare a group's debt; the inbox's always compares.
 pub(super) fn begin(
     turn: &DebtTurn<'_>,
     key: &UnitKey,
@@ -480,18 +501,15 @@ pub(super) fn begin(
 ) -> StorageResult<Option<SweepPlan>> {
     let app = turn.app;
     let now = turn.now;
-    let TransportReconciliationRoute::Group(nostr_group_id) = key.route else {
-        return Ok(None);
-    };
-    let current = sweepable(turn.routes).any(|route| {
+    let Some(route) = turn.routes.iter().find(|route| {
         route.route == key.route
+            && !suspended(route)
             && route
                 .relays()
                 .any(|(relay, effort)| relay == key.relay && effort == best_effort)
-    });
-    if !current {
+    }) else {
         return Ok(None);
-    }
+    };
     let planned: Option<RecoveryRelayCaps> = caps.map(recovery_caps);
     if planned.is_some() {
         app.record_recovery_relay_caps(&key.relay, planned, now)?;
@@ -516,7 +534,7 @@ pub(super) fn begin(
         return Ok(None);
     }
     let mark = app.recovery_coverage_mark()?;
-    let owed_until = turn.tails.owed_until(&key.route, &key.relay, now);
+    let owed_until = turn.owed_until(route, &key.relay);
     let mut ranges = Vec::new();
     for debt in app.recovery_unit_debt(&key.route, &key.relay, owed_until)? {
         if let Some(cursor) = app.recovery_unit_cursor(
@@ -534,32 +552,36 @@ pub(super) fn begin(
     if ranges.is_empty() {
         return Ok(None);
     }
-    let compare = if compares {
-        compare::plan_debt(app, key, &ranges, now)?.map(|(caps, local)| ComparePlan {
-            key: key.clone(),
-            nostr_group_id,
-            best_effort,
-            caps,
-            ranges: ranges
-                .iter()
-                .map(|&range| PlannedRange {
-                    range,
-                    covered: false,
-                })
-                .collect(),
-            local,
-            mark,
-            recheck: false,
-        })
+    let route = fetch_route(&key.route, turn.inbox);
+    let compared = if key.route == TransportReconciliationRoute::Inbox {
+        Some(compare::plan_inbox(app, key, &ranges, caps, now)?)
+    } else if compares {
+        compare::plan_debt(app, key, &ranges, now)?
     } else {
         None
     };
+    let compare = compared.map(|(caps, local)| ComparePlan {
+        key: key.clone(),
+        route,
+        best_effort,
+        caps,
+        ranges: ranges
+            .iter()
+            .map(|&range| PlannedRange {
+                range,
+                covered: false,
+            })
+            .collect(),
+        local,
+        mark,
+        recheck: false,
+    });
     if !best_effort {
         app.begin_recovery_unit_attempt(&key.route, &key.relay, planned, now)?;
     }
     Ok(Some(SweepPlan {
         key: key.clone(),
-        nostr_group_id,
+        route,
         best_effort,
         ranges,
         delta: unit

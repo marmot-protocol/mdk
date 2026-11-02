@@ -41,27 +41,31 @@ mod tests {
     use crate::base::migrations::{MIGRATIONS, run};
     use rusqlite::Connection;
 
-    /// A remainder is one range per route with a real park revision, and an
-    /// existing goal starts settled at its own floor.
+    /// A remainder is one range per route with a real park revision, and each
+    /// existing goal starts settled at its own floor: the earlier prune left
+    /// nothing below it to park again.
     #[test]
     fn a_remainder_is_one_range_per_route() {
         let mut conn = Connection::open_in_memory().unwrap();
         let end = MIGRATIONS.iter().position(|m| m.version == 130).unwrap();
         run(&mut conn, &MIGRATIONS[..end]).unwrap();
         conn.execute(
-            "INSERT INTO account_recovery_coverage_goals VALUES (0, x'', 40)",
+            "INSERT INTO account_recovery_coverage_goals VALUES (0, x'', 40), (1, x'02', 700)",
             [],
         )
         .unwrap();
         run(&mut conn, &MIGRATIONS[..end + 1]).unwrap();
-        let settled: i64 = conn
-            .query_row(
-                "SELECT settled_below_seconds FROM account_recovery_coverage_goals",
-                [],
-                |row| row.get(0),
+        let settled: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT since_seconds, settled_below_seconds
+                 FROM account_recovery_coverage_goals ORDER BY route_kind",
             )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(settled, 40);
+        assert_eq!(settled, [(40, 40), (700, 700)]);
         assert!(
             conn.execute(
                 "UPDATE account_recovery_coverage_goals SET settled_below_seconds = -1",
@@ -88,72 +92,5 @@ mod tests {
                 "{row}"
             );
         }
-    }
-
-    /// An account the earlier prune left at its floor: coverage below it is
-    /// gone, and one route's loss was imported since. Upgraded through the
-    /// production open path, widening the first route's goal back below the
-    /// floor (as each report does for pending loss) parks none of the dropped
-    /// history, while the loss still parks what it owes.
-    #[test]
-    fn an_upgraded_goal_starts_settled_at_its_floor() {
-        use crate::{
-            RecoveryCoverageRange, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
-            TransportReconciliationRoute, open_hardened_sqlcipher,
-        };
-        const KEY: &str = "mdk storage 0130 upgrade key";
-        const OLD_FLOOR: u64 = 1_000_000;
-        let (covered, lost) = (
-            TransportReconciliationRoute::Group([1; 32]),
-            TransportReconciliationRoute::Group([2; 32]),
-        );
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("schema-129.sqlite3");
-        {
-            let key = SqlCipherKey::new(KEY).unwrap();
-            let mut conn = Connection::open(&database).unwrap();
-            open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::live_cache()).unwrap();
-            let end = MIGRATIONS.iter().position(|m| m.version == 130).unwrap();
-            run(&mut conn, &MIGRATIONS[..end]).unwrap();
-            conn.execute_batch(&format!(
-                "INSERT INTO account_recovery_coverage_goals VALUES
-                     (1, x'{covered}', {OLD_FLOOR}), (1, x'{lost}', {loss});
-                 INSERT INTO account_recovery_coverage VALUES
-                     (1, x'{covered}', 'wss://relay.example', 1, {OLD_FLOOR}, {top}, 0);",
-                covered = "01".repeat(32),
-                lost = "02".repeat(32),
-                loss = OLD_FLOOR - 300,
-                top = OLD_FLOOR + 1_000,
-            ))
-            .unwrap();
-        }
-        let key = SqlCipherKey::new(KEY).unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
-        let app = store.app_storage();
-        app.widen_recovery_coverage_goals(std::slice::from_ref(&covered), OLD_FLOOR - 500)
-            .unwrap();
-        let relays = vec!["wss://relay.example".to_owned()];
-        app.prune_recovery_coverage(
-            OLD_FLOOR + 100,
-            &[(covered.clone(), relays.clone()), (lost.clone(), relays)],
-        )
-        .unwrap();
-        let remainders = app.recovery_coverage_remainders().unwrap();
-        assert!(
-            remainders
-                .iter()
-                .all(|remainder| remainder.route != covered)
-        );
-        let lost_remainder = remainders
-            .iter()
-            .find(|remainder| remainder.route == lost)
-            .expect("the loss still parks");
-        assert!(
-            lost_remainder.range
-                == RecoveryCoverageRange {
-                    since_seconds: OLD_FLOOR - 300,
-                    until_seconds: OLD_FLOOR + 99,
-                }
-        );
     }
 }

@@ -1819,10 +1819,14 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
         | MarmotAppEvent::LinkedDevicesChanged { .. }
         | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
         | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
         | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }

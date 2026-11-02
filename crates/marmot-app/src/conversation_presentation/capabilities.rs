@@ -28,6 +28,9 @@ pub enum ConversationParticipation {
     Removed,
     Disbanded,
     Unavailable,
+    /// This device's leaf was removed while the account keeps another device
+    /// in the conversation. Not a removal from the conversation (mdk#2628 D62).
+    DeviceRemoved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +62,8 @@ impl ConversationAuthority {
             P::Disbanded
         } else if self.self_membership == SelfMembership::Removed {
             P::Removed
+        } else if self.self_membership == SelfMembership::DeviceRemoved {
+            P::DeviceRemoved
         } else if self.leave_request_pending {
             P::Leaving
         } else if self.self_membership == SelfMembership::Left {

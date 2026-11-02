@@ -27,11 +27,13 @@ mod agent_stream;
 mod audit;
 mod chat_list;
 mod common;
+mod compromise_warning;
 mod device_link;
 mod directory_search;
 mod draft;
 mod event;
 mod group;
+mod history_import;
 mod history_notice;
 mod linked_device;
 mod maintenance;
@@ -55,11 +57,13 @@ pub use agent_stream::*;
 pub use audit::*;
 pub use chat_list::*;
 pub use common::*;
+pub use compromise_warning::*;
 pub use device_link::*;
 pub use directory_search::*;
 pub use draft::*;
 pub use event::*;
 pub use group::*;
+pub use history_import::*;
 pub use history_notice::*;
 pub use linked_device::*;
 pub use maintenance::*;
@@ -431,6 +435,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
             invalidation_status: None,
+            imported_from: None,
         };
 
         let page = TimelinePageFfi::from(TimelinePage {
@@ -542,6 +547,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            imported_from: None,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);
@@ -594,6 +600,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            imported_from: None,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);

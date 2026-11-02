@@ -51,9 +51,9 @@ pub use device_roster::{
     AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_RESERVED_KEY_MAX_LEN,
     DEVICE_ROSTER_TAG_SIGNATURE_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
     DeviceRenameId, DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1,
-    DeviceSettingsV1, DeviceSlotId, DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1,
-    RejectedSlotV1, apply_device_roster_update_v1, decode_device_roster_update_v1,
-    decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
+    DeviceSettingsV1, DeviceSlotId, DeviceStatusV1, RejectedSlotReasonV1, RejectedSlotV1,
+    apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1,
 };
 pub use device_tag::{
     DEVICE_TAG_NONCE_LEN, DEVICE_TAG_VECTOR_MAX_LEN, DeviceTagClaim, DeviceTagContentV1,
@@ -79,7 +79,7 @@ pub use profile::{
 };
 pub use routing::{
     NOSTR_RELAY_URL_MAX_LEN, NOSTR_ROUTING_MAX_RELAYS, NostrRoutingV1, decode_nostr_routing_v1,
-    encode_nostr_routing_v1,
+    encode_nostr_routing_v1, valid_sibling_welcome_relays, validate_nostr_relay_url,
 };
 
 /// MLS ComponentID.

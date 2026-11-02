@@ -230,7 +230,10 @@ fn malformed_ledger_and_gapped_test_registry_are_refused() {
             name: "test",
             apply: version_1,
         });
-        assert!(run(&mut conn, &registry).is_err());
+        assert_eq!(
+            run(&mut conn, &registry).unwrap_err().to_string(),
+            "backend failure: invalid shared store migration history"
+        );
         assert!(!table_exists(&conn, "directory_users").unwrap());
     }
 }
@@ -277,7 +280,10 @@ fn ignored_ledger_insert_cannot_commit_body() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(LEDGER_SQL).unwrap();
     conn.execute_batch("CREATE TRIGGER skip BEFORE INSERT ON shared_schema_migrations BEGIN SELECT RAISE(IGNORE); END").unwrap();
-    assert!(run_all(&mut conn).is_err());
+    assert_eq!(
+        run_all(&mut conn).unwrap_err().to_string(),
+        "backend failure: invalid shared store migration history"
+    );
     assert_eq!(count(&conn), 0);
     assert!(!table_exists(&conn, "directory_users").unwrap());
 }
@@ -432,6 +438,19 @@ fn conversion_errors_keep_categories_without_names_values_or_causes() {
             "out of range",
         ),
         (rusqlite::Error::QueryReturnedNoRows, "no rows"),
+        (
+            rusqlite::Error::QueryReturnedMoreThanOneRow,
+            "multiple rows",
+        ),
+        (rusqlite::Error::InvalidColumnIndex(7), "column index 7"),
+        (
+            rusqlite::Error::InvalidColumnName("private-column".into()),
+            "operation failed",
+        ),
+        (
+            rusqlite::Error::InvalidParameterName("private-param".into()),
+            "operation failed",
+        ),
     ] {
         let message = sqlite_error(error).to_string();
         assert!(message.contains(category), "{message}");

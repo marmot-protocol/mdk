@@ -346,8 +346,8 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point; `shutdownAndClose()` keeps
-  running regardless. Generated Swift waits for the call to finish even when its `Task` is
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()` and
+  `signOutAndWipe()` keep running regardless. Generated Swift waits for the call to finish even when its `Task` is
   cancelled.
 - **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
   thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
@@ -854,8 +854,8 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
-`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460 and 462 included. Those are read
-only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
+`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 461, 473, 475 and 476 included. Those
+are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 
 
 ## Device-local membership events
@@ -995,11 +995,24 @@ the device group this device trusts, for a Devices screen:
 - Each device writes its own `client` and `platform`: its `clientName` and `devicePlatform` options (a short name
   such as `iOS`), trimmed, and empty when blank or over 64 bytes. It writes them with its next KeyPackage
   announcement in the device group, so they appear after its next maintenance pass.
+- `last_active_at` is when a heartbeat last showed a sibling running, in Unix seconds. Each running device sends one
+  in the device group at most once an hour; each is dated when it was created or, if earlier, when this device read
+  it. It is `None` for this device and for a sibling none of whose heartbeats has counted yet.
+- `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
+  or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
+  `Inactive` is the roster's own mark.
 - The list is empty until this device trusts a device group (a single-device account has none), and in every release
   build until the roster's spec lands.
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
+
+Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
+`chat_history_imports(account_ref)` lists each held chat's history as `Receiving` (`retrying` once an attempt to get its
+bundle failed) or `Imported`. The list is empty and the event silent in every release build until the roster's spec
+lands. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
+`device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`, which fires whenever its answer
+changes, a source device's rename or removal included; re-read rows on `LinkedDevicesChanged` for their new names.
 
 `rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one included, with
 one roster commit in the device group:
@@ -1011,6 +1024,33 @@ one roster commit in the device group:
   change.
 - A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
   won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+
+### This device unlinked
+
+When another of the account's devices removes this one with `remove_linked_device`, the account stops on this device
+once it reads the removal, and nothing more is sent from it (mdk#2628):
+
+- `MarmotEventFfi::DeviceUnlinked { account_id_hex, account_label }` fires once, after the account is signed out. From
+  then on the account's `AccountSummaryFfi` has `unlinked` and `signed_out` set, and both stay set.
+- Show that this device was unlinked from the account, and stop showing its local history.
+- Signing in to it, logging in to it or importing its key fails with `MarmotKitError::AccountUnlinked`. Offer `sign_out_and_wipe`, which skips leaving the
+  account's chats and deleting its KeyPackage slot, since the other devices did both. Signing in again is then a new
+  sign-in that links this device anew.
+
+### Signing out with linked devices
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too (mdk#2628):
+
+- It first records in the device group that it is leaving and waits for that to settle, which can take about 30
+  seconds; show progress. It then leaves only the chats no other device can take it out of, deletes its KeyPackage
+  slot and wipes. The other devices remove it from the device group and from the rest.
+- `WipeOutcomeFfi.groups_left_to_siblings` counts the chats it left to the other devices; `groups_left` counts those it
+  left itself.
+- When it can't ask them in time, it tries to leave every chat itself, reporting any it can't in
+  `group_leave_failures`, and sets `siblings_not_reached`. Tell the user their other devices couldn't be asked, and
+  that those devices may still list this one until the user removes it from one of them.
+- The other devices list it with `LinkedDeviceStatusFfi::Leaving` until they remove it, then drop it.
 
 ### Overdue KeyPackage refresh
 
@@ -1043,6 +1083,33 @@ It is false in every release build until the roster's spec lands.
   `check_sign_ins(account_ref)` checks now and returns the list after the check.
 - Re-read on `MarmotEventFfi::UnrecognizedSignInsChanged`, which carries no slots. It also fires once each time the
   account's worker opens or reconnects, so it may fire with no visible change.
+- The list is empty in every release build until the roster's spec lands.
+- `start_fresh(account_ref)` is "No, start fresh" when the user no longer has the devices the first check found: every
+  sign-in from before this device is answered `NotNow`, now and when one is listed later. It rejects nothing and
+  raises no compromise warning, so one of those devices can still link this one. It is refused before the first check
+  (`sign_ins_unchecked`) and once this device trusts a device group (`device_group_exists`). `started_fresh` says
+  whether the device did so and still has no device group: say that only chats it is invited to from now on are here.
+  Re-read it after `start_fresh` and on `LinkedDevicesChanged`.
+
+## Compromise warning
+
+`compromise_warning(account_ref)` returns the account's open compromise warning on this device as
+`CompromiseWarningItemFfi` records, the earliest gathered first. An empty list means no warning is open:
+
+- Each item means someone holding the account's signing key, or a session with its remote signer, published where the
+  account's devices did not. `RejectedSignIn` is a sign-in answered This wasn't me, on this device or another;
+  `ForeignOwnSlotKeyPackage` is a KeyPackage this device found in its own slot that it did not make, with its
+  `key_package_ref_hex`. Only the device that found it warns of it, and it has replaced it. `slot_id_hex` and
+  `occurred_at` say where and when.
+- Later releases add reasons. Show one the app does not know as a generic one.
+- The warning gathers this device's rejections and those in its device group's roster, so a rejection made on another
+  device warns here too. Rejections already in the first roster this device trusts count as seen: the user saw them on
+  the devices that were there. A rejected sign-in leaves the warning once its slot is linked as a device.
+- `dismiss_compromise_warning(account_ref)` marks everything the warning gathers as seen, on this device only. It stays
+  closed until a new rejection arrives, and a rejection that branch selection drops and brings back stays seen.
+- The app writes the wording, and never says the account's devices stopped them.
+- Re-read on `MarmotEventFfi::CompromiseWarningChanged`, which carries no slots. It also fires once each time the
+  account's worker opens, so it may fire with no visible change.
 - The list is empty in every release build until the roster's spec lands.
 
 ## Linking a new device
@@ -1094,6 +1161,14 @@ epoch, a later startup's incremental comparison, or a new explicit repair. Expli
 full-history repair remains available and can still complete parked history that its
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
+
+`account_recovery_status(account_ref)` returns `AccountRecoveryStatusFfi`: the groups whose
+history is still being fetched (`catching_up_group_ids_hex`), whether the inbox's is
+(`inbox_catching_up`), and every notice as `history_notices` lists them. Show the first two
+as "catching up" and re-read on `MarmotEventFfi::RecoveryStatusChanged`. Until the recovery
+runner owns history (mdk#2660) nothing is ever catching up, and neither that event nor
+`HistoryNoticeCauseFfi::UnprovenHistory` (the runner could not prove a route's history and
+stopped retrying it) is produced; handle both in exhaustive switches now.
 
 While unresolved epoch-gap recovery covers a group's current local epoch, the group may
 have moved past this device. Group changes (invite, remove, admin changes, profile, image,
@@ -1271,7 +1346,7 @@ builder, toolchain, profile and features. CI transfers inputs only within the sa
 workflow run. Apple assembly checks required files before replacing an existing
 bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
 See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
-for the build-only benchmark workflow and cache-warming procedure.
+for the build-only benchmark workflow.
 
 ## Kotlin / Android
 
@@ -1370,15 +1445,15 @@ Android target compilation, NDK checks and native linking are deferred unless
 explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
-Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it.
+Candidate builds use no Cargo cache, so
+every run compiles from a clean target directory.
 The workflow has no schedule of its own. The
 [nightly release](../../release.md#nightly-builds) builds and validates the
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It does not run `test-native-archive.py` or refresh this
-workflow's cache seeds; matching `master` pushes do both.
+for three hours. It does not run `test-native-archive.py`; matching `master`
+pushes do.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

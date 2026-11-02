@@ -150,13 +150,6 @@ enum Disposition {
 const LIVE_LOSS: &str = "(legacy_retired_count IS NULL OR legacy_retired_count < dropped_count)
     AND (retired_count IS NULL OR retired_count < dropped_count)";
 
-#[cfg(test)]
-thread_local! {
-    /// Test hook: fail this step's transaction after its writes.
-    pub(super) static FAIL_STEP: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// One frozen scope's proof, from its payload.
 enum ScopeProof {
     Certified,
@@ -832,10 +825,6 @@ impl SqliteAppStorage {
                     return Ok(true);
                 };
                 run_step_tx(&conn, step, input, &current)?;
-                #[cfg(test)]
-                if FAIL_STEP.get() == STEPS.iter().position(|candidate| *candidate == step) {
-                    return Err(StorageError::Backend("injected conversion failure".into()));
-                }
                 Ok::<_, StorageError>(false)
             })?;
             if done {
