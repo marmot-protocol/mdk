@@ -210,7 +210,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   it with `device_group_event` and sends it with `send_device_group_event`), one dispatch by kind in `observe_device_group_event`
   (add a feature's kinds there), and one sender read, `ensure_sent_by`, from the sending leaf's device tag (mdk#2628
   D33). A message from an earlier epoch is read from that epoch's retained anchor, so one older than the retained
-  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 459, 460,
+  anchors has no readable sender. List every kind sent only in a device group in `is_device_group_kind` (457, 458, 459, 460,
   461, 473, 475, 476), the one list: `observe_event` drops one received in any other group before the host summary and the
   stored projection, the notification preview refuses it, and the custom path rejects it as reserved. The engine
   withdraws a message by message id alone (an own send's transport id, a received message's content id), so a kind
@@ -263,6 +263,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `next_private_key_package` names before taking it, so a chat that would refuse never spends one;
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
+- Fill missing sibling chat memberships in `client/sibling_chat_gaps.rs` (mdk#2628 3.5e, D82–D84), through
+  kind-458 advisory claims and the existing private Add path. Claims are transient, expire from their original event
+  time after ten minutes, and never authorize an Add; replay cannot extend one. Only changed/due chats load their
+  MLS trees, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
+  exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Missing or unusable
+  selected private stock waits without public fallback; the current stock picker does not search later allocations
+  for chat compatibility. Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling
+  presence at actual direct/queued preparation.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history

@@ -198,6 +198,9 @@ impl AppClient {
             .collect::<Result<Vec<_>, AppError>>()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let kept = storage.insert_received_private_key_packages(&received)?;
+        if kept > 0 {
+            self.sibling_gap_stock_arrived(&hand_off.from);
+        }
         tracing::debug!(
             target: TRACE_TARGET,
             method = "receive_key_package_hand_off",

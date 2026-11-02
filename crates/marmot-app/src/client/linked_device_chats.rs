@@ -74,12 +74,17 @@ struct NewDevice {
 }
 
 impl AppClient {
-    /// One pass; a failure waits for the next one.
-    pub(crate) async fn add_linked_devices_to_chats(&mut self, held: &[GroupId]) {
+    /// One pass; a failure waits for the next one. Return how many Add
+    /// attempts used the per-pass budget, so gap filling shares its remainder.
+    pub(crate) async fn add_linked_devices_to_chats(&mut self, held: &[GroupId]) -> usize {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
-            return;
+            return 0;
         }
-        if let Err(error) = self.try_add_linked_devices_to_chats(held).await {
+        let mut budget = LINK_CHAT_ADDS_PER_PASS;
+        if let Err(error) = self
+            .try_add_linked_devices_to_chats(held, &mut budget)
+            .await
+        {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "add_linked_devices_to_chats",
@@ -87,11 +92,16 @@ impl AppClient {
                 "could not add linked devices to chats"
             );
         }
+        LINK_CHAT_ADDS_PER_PASS - budget
     }
 
     /// Each device and each chat is handled on its own: one that fails never
     /// holds the others back, and the first failure is returned at the end.
-    async fn try_add_linked_devices_to_chats(&mut self, held: &[GroupId]) -> Result<(), AppError> {
+    async fn try_add_linked_devices_to_chats(
+        &mut self,
+        held: &[GroupId],
+        budget: &mut usize,
+    ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
@@ -103,7 +113,6 @@ impl AppClient {
             return Ok(());
         }
         let chats = self.sibling_commit_chats_in_list_order()?;
-        let mut budget = LINK_CHAT_ADDS_PER_PASS;
         let mut first_error: Option<AppError> = None;
         'devices: for device in new_devices {
             let mut owed = Vec::new();
@@ -126,7 +135,7 @@ impl AppClient {
                 first_error.get_or_insert(error);
             }
             for chat in owed {
-                if budget == 0 {
+                if *budget == 0 {
                     break 'devices;
                 }
                 match self.group_quiet(&chat) {
@@ -157,13 +166,59 @@ impl AppClient {
                         continue;
                     }
                 }
-                budget -= 1;
+                *budget -= 1;
                 if let Err(error) = self.add_sibling_to_chat(&chat, &device.slot).await {
                     first_error.get_or_insert(error);
                 }
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Local link outcomes govern only entries this device currently
+    /// approved (the same ownership condition as failed-link undo). Another
+    /// approver's later link is not blocked by this device's old outcome.
+    /// Pending removals and remembered removed keys remain independent.
+    pub(crate) fn excluded_sibling_slots(
+        &self,
+        exchange: &Exchange,
+    ) -> Result<std::collections::HashSet<DeviceSlotId>, AppError> {
+        let group_id_hex = hex::encode(exchange.group_id.as_slice());
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let links = storage
+            .device_links()?
+            .into_iter()
+            .filter(|link| link.group_id_hex == group_id_hex)
+            .filter_map(|link| {
+                device_slot(&link.slot_hex)
+                    .ok()
+                    .map(|slot| (slot, link.outcome))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut removed = storage
+            .device_removals()?
+            .into_iter()
+            .filter(|removal| removal.group_id_hex == group_id_hex)
+            .filter_map(|removal| device_slot(&removal.slot_hex).ok())
+            .collect::<std::collections::HashSet<_>>();
+        removed.extend(
+            self.remembered_tag_keys(&exchange.group_id)?
+                .into_iter()
+                .filter(|key| key.held_as_removed)
+                .map(|key| key.slot),
+        );
+        removed.extend(
+            exchange
+                .roster
+                .devices
+                .iter()
+                .filter(|(slot, entry)| {
+                    entry.linked_by == Some(exchange.own_slot)
+                        && links.get(*slot) != Some(&DeviceLinkOutcome::Linked)
+                })
+                .map(|(slot, _)| *slot),
+        );
+        Ok(removed)
     }
 
     /// The devices whose links this device approved and decided made less

@@ -1,9 +1,9 @@
-//! Adding a newly linked device to chats (mdk#2628 3.5c, D70): once a link
-//! is made, the device that approved it, and only that device, adds the new
-//! device to each of its chats that takes a same-account Add, with one of the
-//! new device's private KeyPackages and a sibling Welcome, when the new
-//! device's "add to all my chats" is on. A chat that takes no same-account
-//! Add is counted and takes no KeyPackage.
+//! Private sibling chat Adds (mdk#2628 3.5c/3.5e, D70, D82–D84). The
+//! approver's initial burst and another holder's claim-based gap filling
+//! compose private stock, a real Add, and sibling Welcome delivery. The
+//! shared cap, old-chat toggle, current removal state, and chat readiness
+//! govern spending; a lower claim holds only its own chat. Engine tests own
+//! the authoritative duplicate-presence check at actual Add preparation.
 
 use super::*;
 use crate::AppCreateGroupOptions;
@@ -103,14 +103,36 @@ async fn hold_key_packages(
     phone: &mut Device,
     laptop: &mut Device,
 ) {
-    for _ in 0..3 {
-        deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-        phone.client.sibling_key_package_upkeep(&[]).await;
-        deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
-        laptop.client.run_due_maintenance().await.unwrap();
-    }
-    deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-    assert!(held_from(phone, laptop) > 0);
+    // Direct clients have no account worker to advance scheduled convergence.
+    // Drive that work too, and await the hand-off rather than assuming a fixed
+    // number of maintenance passes settles every replay slice (mdk#2861).
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            phone.client.sibling_key_package_upkeep(&[]).await;
+            deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
+            laptop.client.run_due_maintenance().await.unwrap();
+            for client in [&mut phone.client, &mut laptop.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            if held_from(phone, laptop) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the phone receives the laptop's private KeyPackage hand-off");
 }
 
 /// A removal of the laptop another device decided reaches the phone, which
@@ -181,12 +203,11 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
-/// Only the device that approved a link adds the new device to chats. The
-/// laptop, linked earlier and in the phone's chats, holds the tablet's
-/// KeyPackages but adds it to none; the phone, which approved the tablet,
-/// adds it.
+/// The direct post-link burst belongs to the approver. A different sibling
+/// can still fill the missing chats through the advisory claim flow while
+/// that approver is offline; the returning approver adds no duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn only_the_device_that_approved_a_link_adds_the_new_device() {
+async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
     let chats = chats(&mut phone, 2).await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
@@ -194,16 +215,109 @@ async fn only_the_device_that_approved_a_link_adds_the_new_device() {
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
 
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    passes(&relay, &mut [&mut laptop, &mut tablet], 4).await;
+    hold_key_packages(&relay, &mut laptop, &mut tablet).await;
+    laptop.client.add_linked_devices_to_chats(&[]).await;
     assert!(held_from(&laptop, &tablet) > 0);
     assert_eq!(taken_from(&laptop, &tablet), 0);
     assert!(!chats.iter().any(|chat| joined(&tablet, chat)));
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !chats.iter().all(|chat| joined(&tablet, chat)) {
+            passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
+            for client in [&mut laptop.client, &mut tablet.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the online sibling fills both missing chats");
+    assert_eq!(taken_from(&laptop, &tablet), chats.len());
 
     passes(&relay, &mut [&mut phone, &mut tablet, &mut laptop], 3).await;
     for chat in &chats {
         assert!(joined(&tablet, chat));
         assert_eq!(leaves_of(&phone, &tablet, chat, &group), 1);
     }
+    assert_eq!(taken_from(&phone, &tablet), 0);
+}
+
+/// A live claim from a lower slot holds just that chat's Add. Another chat
+/// still fills through a real private-package Add and sibling Welcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lower_sibling_claim_holds_only_its_chat() {
+    let (relay, [first, second, mut target]) = alice_devices::<3>().await;
+    let (mut low, mut high) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chats = chats(&mut low, 2).await;
+    let group = link(&relay, &mut low, &mut high, "Other device").await;
+    passes(&relay, &mut [&mut low, &mut high], 4).await;
+    assert!(chats.iter().all(|chat| joined(&high, chat)));
+    link(&relay, &mut low, &mut target, "New device").await;
+    hold_key_packages(&relay, &mut high, &mut target).await;
+    let content = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        low.slot_hex(),
+        target.slot_hex(),
+        hex::encode(chats[0].as_slice())
+    );
+    assert!(
+        low.client
+            .send_device_group_message(&group, 458, content)
+            .await
+            .unwrap()
+    );
+    // The target cannot impersonate that lower claimant to hold another
+    // chat: authenticating `from` uses the MLS sender's actual device tag.
+    let forged = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        low.slot_hex(),
+        target.slot_hex(),
+        hex::encode(chats[1].as_slice())
+    );
+    assert!(
+        target
+            .client
+            .send_device_group_message(&group, 458, forged)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&target, &chats[1]) {
+            passes(&relay, &mut [&mut high, &mut target], 1).await;
+            for client in [&mut high.client, &mut target.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a claim for the first chat never blocks the second chat");
+    assert!(!joined(&target, &chats[0]));
+    assert_eq!(taken_from(&high, &target), 1);
+    assert_eq!(leaves_of(&high, &target, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&high, &target, &chats[1], &group), 1);
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,
@@ -366,7 +480,7 @@ async fn a_chat_that_already_holds_the_new_device_gets_no_add() {
 /// The phone adds the new device to its chats for a week after the link is
 /// made; gap filling covers a link older than that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_made_over_a_week_ago_adds_the_new_device_to_no_chat() {
+async fn gap_filling_covers_a_link_older_than_the_approvers_burst() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let chats = chats(&mut phone, 1).await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
@@ -377,11 +491,15 @@ async fn a_link_made_over_a_week_ago_adds_the_new_device_to_no_chat() {
             [week],
         )
         .unwrap();
-    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
-
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
     assert!(held_from(&phone, &laptop) > 0);
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert!(!joined(&laptop, &chats[0]));
+
+    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
+    assert!(joined(&laptop, &chats[0]));
+    assert_eq!(taken_from(&phone, &laptop), 1);
 }
 
 /// A chat with a commit of the phone's own still staged takes no Add and no

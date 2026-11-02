@@ -101,6 +101,7 @@ pub(crate) mod recovery;
 mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
+pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
 pub(crate) mod sign_out;
 mod small_state;
@@ -859,6 +860,9 @@ pub struct AppClient {
     /// The siblings this client found `leaving`, by slot, and when it
     /// decides to remove each: after its own random delay (mdk#2628 D67).
     pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
+    /// Advisory claims and only the chats whose sibling membership needs a
+    /// check (mdk#2628 3.5e). Transient: a restart checks known chats anew.
+    pub(crate) sibling_chat_gaps: sibling_chat_gaps::SiblingChatGaps,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
@@ -1596,7 +1600,12 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
-        self.add_linked_devices_to_chats(&held).await;
+        let sibling_add_attempts = self.add_linked_devices_to_chats(&held).await;
+        self.fill_sibling_chat_gaps(
+            &held,
+            linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
+        )
+        .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;

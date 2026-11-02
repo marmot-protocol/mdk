@@ -2178,6 +2178,7 @@ impl MarmotApp {
             linked_devices_changed: true,
             inactive_siblings: None,
             leaving_siblings: HashMap::new(),
+            sibling_chat_gaps: Default::default(),
             pending_recovery_words: None,
             key_package_refresh_overdue: None,
             key_package_refresh_overdue_changed: true,

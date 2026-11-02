@@ -193,6 +193,7 @@ impl AppClient {
         event: &cgka_traits::engine::GroupEvent,
         batch_start_frontier: Option<u64>,
     ) -> Result<Option<bool>, AppError> {
+        self.note_sibling_chat_gap_event(event);
         let Some(group_id) = event_group_id(event) else {
             return Ok(None);
         };
