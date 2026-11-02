@@ -1,6 +1,7 @@
 //! Account/group-scoped attachment pages independent of engine readiness.
 use crate::conversions::{
-    AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentPageReadFfi, group_id_from_hex,
+    AttachmentEntryFfi, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentPageReadFfi,
+    group_id_from_hex,
 };
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
@@ -8,6 +9,23 @@ use std::sync::Arc;
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
 impl Marmot {
+    /// Resolve one active custom-emoji reaction's matching encrypted artwork.
+    /// This bounded local read starts no download. Use the returned original
+    /// source slot with attachment acquisition and opaque local reads.
+    pub async fn reaction_attachment(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reaction_message_id_hex: String,
+    ) -> Result<Option<AttachmentEntryFfi>, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .reaction_attachment(&account_ref, &group, &reaction_message_id_hex)
+            .await?
+            .map(Into::into))
+    }
+
     /// Read 1..=100 attachment slots in canonical newest-first order. Rejected slots
     /// consume the limit. Filter categories within returned pages; an empty filtered
     /// page is not exhaustion while has_more is true. No downloads are started.
@@ -54,30 +72,65 @@ mod tests {
     use super::*;
     use crate::conversions::{
         AttachmentCategoryFfi, AttachmentHistoryChangeFfi, AttachmentPageFfi,
-        EncryptedMediaVersionFfi, MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi,
-        MediaLocatorFfi,
+        MediaAttachmentOutcomeFfi, MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi,
     };
     use cgka_traits::TransportEndpoint;
     use marmot_app::{AccountSetupRequest, MarmotApp};
     use nostr_relay_builder::{LocalRelay, RelayBuilder, builder::RateLimit};
     use std::collections::HashSet;
 
-    fn reference(mime: &str) -> MediaAttachmentReferenceFfi {
-        MediaAttachmentReferenceFfi {
-            locators: vec![MediaLocatorFfi {
-                kind: "blossom-v1".into(),
-                value: format!("https://media.example/{}.bin", "11".repeat(32)),
-            }],
-            ciphertext_sha256: "11".repeat(32),
-            plaintext_sha256: "22".repeat(32),
-            nonce_hex: "33".repeat(12),
-            file_name: "attachment.bin".into(),
-            media_type: mime.into(),
-            version: EncryptedMediaVersionFfi::V2,
-            source_epoch: 0,
-            dim: None,
-            thumbhash: None,
-        }
+    // A real upload supplies the local provenance that an outbound reference needs.
+    async fn upload_sink() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let base = url.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let base = base.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    let end = loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    assert!(headers.starts_with("PUT /upload "));
+                    let header = |name: &str| {
+                        headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                            .unwrap()
+                            .1
+                            .trim()
+                            .to_owned()
+                    };
+                    let len: usize = header("content-length").parse().unwrap();
+                    let hash = header("x-sha-256");
+                    while request.len() < end + len {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let body = serde_json::json!({"url": format!("{base}/{hash}"), "sha256": hash,
+                        "size": len, "type": "application/octet-stream", "uploaded": 1})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (url, task)
     }
     fn page(value: AttachmentPageReadFfi) -> AttachmentPageFfi {
         let AttachmentPageReadFfi::Page { page } = value else {
@@ -85,7 +138,7 @@ mod tests {
         };
         page
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attachment_native_pages_traverse_beyond_window_and_refresh_deleted_rows() {
         // Populate 205 messages on one persistent socket without exercising
         // the mock's default 60-event/minute limiter in this pagination test.
@@ -96,7 +149,14 @@ mod tests {
         relay.run().await.unwrap();
         let url = relay.url().await.to_string();
         let root = tempfile::tempdir().unwrap();
-        let app = MarmotApp::with_relays(root.path(), vec![url.clone()]);
+        let app = MarmotApp::with_relays_and_config(
+            root.path(),
+            vec![url.clone()],
+            marmot_app::MarmotAppConfig::white_noise()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_allow_loopback_blob_endpoints(true)
+                .with_open_ranking_provider(None, Vec::new()),
+        );
         let kit = Marmot {
             runtime: app.runtime(),
             app,
@@ -119,13 +179,42 @@ mod tests {
             .create_group(account.clone(), "attachment pages".into(), vec![], None)
             .await
             .unwrap();
+        let (server, upload_task) = upload_sink().await;
+        let uploaded = kit
+            .upload_media(
+                account.clone(),
+                group.clone(),
+                MediaUploadRequestFfi {
+                    attachments: ["image/png", "audio/ogg", "application/pdf"]
+                        .into_iter()
+                        .map(|mime| MediaUploadAttachmentRequestFfi {
+                            file_name: "attachment.bin".into(),
+                            media_type: mime.into(),
+                            plaintext: b"attachment fixture".to_vec(),
+                            dim: None,
+                            thumbhash: None,
+                        })
+                        .collect(),
+                    caption: None,
+                    send: false,
+                    blossom_server: Some(server),
+                    message_tags: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let references: Vec<_> = uploaded
+            .attachments
+            .into_iter()
+            .map(|attachment| attachment.reference)
+            .collect();
         // Unique captions prevent same-second NIP-01 duplicate message IDs.
         for i in 0..205 {
             if i % 7 == 0 {
                 kit.send_media_attachments(
                     account.clone(),
                     group.clone(),
-                    vec![reference("image/png"), reference("audio/ogg")],
+                    vec![references[0].clone(), references[1].clone()],
                     Some(format!("album {i}")),
                 )
                 .await
@@ -230,7 +319,7 @@ mod tests {
         kit.send_media_attachments(
             account.clone(),
             group.clone(),
-            vec![reference("application/pdf")],
+            vec![references[2].clone()],
             Some("new attachment".into()),
         )
         .await
@@ -277,6 +366,7 @@ mod tests {
         );
         assert_eq!(fresh.entries.len(), 59);
         assert!(fresh.entries.iter().all(|e| e.message_id_hex != deleted));
+        upload_task.abort();
         kit.shutdown_and_close().await.unwrap();
         assert!(
             kit.attachment_history_page(account, group, 1, None)

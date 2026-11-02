@@ -72,6 +72,7 @@ impl Fixture {
             moderation_grant: false,
         };
         let entry = AttachmentHistoryEntry {
+            reaction_artwork: false,
             emoji_tags: Vec::new(),
             message_id_hex: message.into(),
             attachment_index: 0,

@@ -90,6 +90,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
 | Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
 | Reaction details | `messageReactions` for complete effective participants | Window references contain bounded previews only. See [complete reaction details](CONVERSATION-WINDOW.md#complete-reaction-details). |
+| Custom reaction artwork | `reactionAttachment` using the reaction's `reactionMessageIdHex`, then ordinary attachment acquisition/local reads | Resolves one reaction's matching encrypted artwork without a group-wide media scan. See [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork). |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
 | Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
@@ -402,11 +403,11 @@ Imported identities can use the durable preflight API instead of `login`:
    and a separate set of trusted `discovery_relays`. These methods return a
    persisted account and snapshot before fetching or publishing Nostr records.
 2. Display the snapshot steps in their returned order (profile, follows, general
-   relays, inbox relays, single-device notice, KeyPackage). Use step identities,
+   relays, inbox relays, sign-in chat/history notice (`SingleDevice`), KeyPackage). Use step identities,
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
    `snapshot`, and drive `next` concurrently with `run_onboarding`.
 3. Localize the typed status, findings, and actions. A healthy account advances
-   automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
+   automatically until the notice acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_relay_repair` previews the smallest safe change to a
    general or inbox relay declaration, preserving the original ordered tags,
@@ -514,16 +515,35 @@ unsupported evidence with this API.
 
 ### Single-device notice
 
-The `SingleDevice` step always pauses before initial KeyPackage publication.
-Display a general notice that White Noise does not yet support synchronized
-multi-device use and recommends one device. The snapshot's `single_device_notice`
-adds evidence with `OtherInstallationPossible`, `NoneFound`, or `Unknown` discovery.
-When another installation is possible, explain that invitations may reach only
-one installation and conversations will not automatically appear on both.
-Reinstallation or cleared local state can produce the same evidence; do not
-claim to have identified a physical device or a particular app.
+The historical `SingleDevice` step still pauses before initial KeyPackage publication.
+It explains what signing in alone restores, rather than declaring all multi-device
+use unsupported. Suggested localized copy:
 
-Offer **Cancel** and **Continue anyway**. For Cancel, invalidate the current UI
+**Chats on this device**
+
+> Signing in alone does not restore your existing chats or messages. If you use another
+> device, keep its app and data until you've checked your chats here.
+
+The snapshot's `single_device_notice` adds advisory evidence. For
+`OtherInstallationPossible`, explain: "Other sign-in records were found. They may
+belong to another installation or an earlier one." For `Unknown`: "Other sign-ins
+could not be checked." `NoneFound` needs no extra warning and does not prove there
+are no other installations. Reinstallation or cleared local state can produce the
+same evidence; do not claim to have identified a physical device or a particular app.
+
+`MultiDeviceUnsupported` remains a legacy issue value for checkpoint and binding
+compatibility; current checks and resumed projections omit it. Render the notice
+from its step, DTO and actions instead of using that historical identifier as a
+capability claim. Existing apps need to adopt the updated localization against a
+published, immutable binding artifact; the MDK update cannot replace installed UI
+strings. Discovery, consent and publication policy stay in MDK.
+
+Device-group linking remains disabled in normal released builds. Do not add a
+working Link action to this notice or promise automatic chat/history restoration.
+Acknowledging it does not approve a sign-in, link devices, or replace sign-in and
+code-comparison prompts.
+
+Offer **Cancel** and **Continue** (the existing `ContinueAnyway` action). For Cancel, invalidate the current UI
 attempt first, then await `cancel_onboarding(account_ref)` before any new
 `begin_*_onboarding`. Cancellation is legal at every interactive step, including
 an approved but unconfirmed repair and a ready checkpoint that the host has not
@@ -545,7 +565,7 @@ restoration are not explicit sign-in. If the call returns
 retry the same cancel; dropping the waiter does not abort cleanup. Do not treat
 `ready` as an Open Chats command — the host still owns that transition.
 
-For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+For Continue, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
 If `snapshot.recovery_epoch` is present, use
 `acknowledge_onboarding_single_device_in_epoch(account_ref, snapshot.revision, epoch)`
 and `approve_onboarding_repair_in_epoch(account_ref, snapshot.revision, epoch)`
@@ -1219,6 +1239,16 @@ attachment policy's disk reserve fails with `StorageFull` before anything is
 uploaded; ask the user to free space. The counter is monotonic processed bytes
 (copy, digest pass, then transfer), not a percentage.
 
+Uploads return `MediaAttachmentReferenceFfi.sourceEpochIdentity`, a local branch
+identity that must be preserved unchanged when saving a reference or passing it
+to `sendMediaAttachments`, `sendTaggedMedia`, or `reactWithMedia`. A send requires
+both the upload epoch and that exact branch to remain current. A branch change
+can invalidate an upload even when the epoch number stays the same. References
+received from peers or saved before this field existed have no upload identity:
+re-upload their retained bytes before sending them. Downloads of those references
+remain supported. This identity is local metadata and is never included in
+`imeta` or shared with peers.
+
 Cancellation observed before message admission starts prevents publication.
 Admission is not interruptible once started, including while durable acceptance
 is pending. File-backed uploads have no fixed worker-response timeout;
@@ -1244,6 +1274,9 @@ See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
 Use the asynchronous attachment history page/version methods for canonical media-library
 discovery. See [the native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
+Custom reaction artwork uses the bounded `reactionAttachment` lookup with the
+reaction event ID, followed by the same acquisition and local-read path as chat
+attachments; see [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork).
 
 ## Local attachment access
 

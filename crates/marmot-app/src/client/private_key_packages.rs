@@ -956,11 +956,11 @@ impl AppClient {
     /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
         if let Err(error) = self.observe_pending_sibling_welcome_activity() {
-            tracing::warn!(target: "marmot_app::client::private_key_packages", method = "try_send_owed_sibling_welcomes",
+            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
                 error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
         }
         if let Err(error) = self.retire_ended_sibling_welcome_resends() {
-            tracing::warn!(target: "marmot_app::client::private_key_packages", method = "try_send_owed_sibling_welcomes",
+            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
                 error_kind = error.privacy_safe_kind(), "could not retire ended sibling Welcome timing");
         }
         let Some(exchange) = self.device_group_exchange()? else {

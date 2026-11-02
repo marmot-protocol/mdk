@@ -621,6 +621,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         media_type: "text/plain".into(),
         version: marmot_uniffi::EncryptedMediaVersionFfi::V1,
         source_epoch: 0,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     };

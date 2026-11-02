@@ -4330,30 +4330,43 @@ async fn media_send_refuses_stale_epoch_body() {
         media_type: "image/png".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: current_epoch + 1,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
-    let error = client
-        .send_media_attachments(&group_id, vec![stale], None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            AppError::MediaReferenceStaleEpoch {
-                source_epoch,
-                current_epoch,
-            } if source_epoch == current_epoch + 1 && current_epoch == client
-                .group_mls_state(&group_id)
-                .unwrap()
-                .epoch
-        ),
-        "{error:?}"
-    );
-    assert!(
-        app.messages("alice").unwrap().is_empty(),
-        "a refused stale reference must publish nothing"
-    );
+    // Older/received references have no local upload provenance. Refusing
+    // those is independent of the numeric-epoch mismatch above.
+    let missing = MediaAttachmentReference {
+        source_epoch: current_epoch,
+        source_epoch_identity: None,
+        ..stale.clone()
+    };
+    for reference in [stale, missing] {
+        let expected_source = reference.source_epoch;
+        let error = client
+            .send_media_attachments(&group_id, vec![reference], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::MediaReferenceStaleEpoch {
+                    source_epoch,
+                    current_epoch,
+                } if source_epoch == expected_source && current_epoch == client
+                    .group_mls_state(&group_id)
+                    .unwrap()
+                    .epoch
+            ),
+            "{error:?}"
+        );
+        assert!(
+            app.messages("alice").unwrap().is_empty(),
+            "a refused stale reference must publish nothing"
+        );
+    }
 }
 
 #[test]
@@ -4393,6 +4406,9 @@ async fn media_send_epoch_pin_body() {
         media_type: "image/png".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: current_epoch + 1,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
@@ -4439,6 +4455,9 @@ async fn media_send_epoch_pin_body() {
     // proving the pin is the reference's epoch and not a blanket refusal.
     let current = MediaAttachmentReference {
         source_epoch: current_epoch,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         ..MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: "blossom-v1".to_owned(),
@@ -4451,6 +4470,7 @@ async fn media_send_epoch_pin_body() {
             media_type: "image/png".to_owned(),
             version: "encrypted-media-v2".to_owned(),
             source_epoch: 0,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }
@@ -4473,24 +4493,58 @@ async fn media_send_epoch_pin_body() {
 #[test]
 #[cfg(feature = "test-policy-overrides")]
 fn media_send_pins_the_engine_to_the_reference_branch() {
-    run_composed_app_runtime_test("media-send-branch-pin", media_send_branch_pin_body);
+    run_composed_app_runtime_test("media-send-branch-pin", || {
+        media_send_branch_pin_body(false, false, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn media_send_refuses_a_reference_after_a_same_epoch_branch_change() {
+    run_composed_app_runtime_test("media-upload-branch-pin", || {
+        media_send_branch_pin_body(true, false, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn upload_and_send_refuses_a_same_epoch_branch_change_before_admission() {
+    run_composed_app_runtime_test("upload-and-send-branch-pin", || {
+        media_send_branch_pin_body(true, true, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn reaction_send_pins_the_engine_to_the_upload_branch() {
+    run_composed_app_runtime_test("reaction-send-branch-pin", || {
+        media_send_branch_pin_body(false, false, true)
+    });
 }
 
 #[cfg(feature = "test-policy-overrides")]
-async fn media_send_branch_pin_body() {
+async fn media_send_branch_pin_body(before_send: bool, upload_and_send: bool, reaction: bool) {
     // A reference names only its epoch number. A rival commit from the same
     // source epoch can win branch selection inside the send itself and leave
     // the group at that number on another branch, whose media secret the
     // recipients would derive instead. The pin carries the branch, so the
     // engine refuses the send and nothing is published.
-    use canonical_membership::{app_at, deliver_new};
+    use canonical_membership::deliver_new;
     use cgka_traits::engine::SendIntent;
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice_account = home.create_account("alice").unwrap();
     let bob_account = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = app_at(&dir, relay.clone());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
@@ -4503,6 +4557,12 @@ async fn media_send_branch_pin_body() {
     deliver_new(&mut bob, &relay, &mut bob_cursor).await;
     bob.sync().await.unwrap();
     bob.accept_group_invite(&group).unwrap();
+    let target_message_id = alice
+        .send(&group, b"artwork target")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
     let source_epoch = bob.runtime.epoch_pin(&group).unwrap().epoch;
     assert_eq!(alice.runtime.epoch_pin(&group).unwrap().epoch, source_epoch);
 
@@ -4534,14 +4594,6 @@ async fn media_send_branch_pin_body() {
     let pin = sender.runtime.epoch_pin(&group).unwrap();
     assert_eq!(pin.epoch.0, source_epoch.0 + 1);
     assert_ne!(pin, winner.runtime.epoch_pin(&group).unwrap());
-    deliver_new(&mut sender, &relay, &mut sender_cursor).await;
-    assert_eq!(sender.runtime.epoch_pin(&group).unwrap(), pin);
-    sender
-        .runtime
-        .session_mut()
-        .set_convergence_policy(settling(0))
-        .unwrap();
-
     let published_before = relay.published_event_ids().len();
     let reference = MediaAttachmentReference {
         locators: vec![MediaLocator {
@@ -4555,20 +4607,108 @@ async fn media_send_branch_pin_body() {
         media_type: "image/png".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: pin.epoch.0,
+        source_epoch_identity: Some(hex::encode(pin.identity)),
         dim: None,
         thumbhash: None,
     };
-    let error = sender
-        .send_app_event(
-            &group,
+    // Exercise genuine uploads held by the host and the combined upload/send
+    // path with the same real fork. The HTTP phase owns the original branch
+    // while the account worker remains free to adopt its rival.
+    let mut completion = None;
+    let mut server = None;
+    let reference = if before_send {
+        let (url, _, task) = crate::client::upload_cleanup_tests::upload_endpoint().await;
+        server = Some(task);
+        let (http, finish) = sender
+            .prepare_encrypted_media_upload(
+                &group,
+                MediaUploadRequest {
+                    attachments: vec![MediaUploadAttachmentRequest {
+                        file_name: "d.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"branch-bound artwork".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    }],
+                    caption: None,
+                    send: upload_and_send,
+                    blossom_server: Some(url),
+                    message_tags: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let (result, uploads) = http.run().await.unwrap();
+        let reference = result.attachments[0].reference.clone();
+        assert_eq!(
+            reference.source_epoch_identity,
+            Some(hex::encode(pin.identity))
+        );
+        completion = Some((finish, result, uploads));
+        reference
+    } else {
+        reference
+    };
+    deliver_new(&mut sender, &relay, &mut sender_cursor).await;
+    assert_eq!(sender.runtime.epoch_pin(&group).unwrap(), pin);
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(0))
+        .unwrap();
+
+    // #2840: a host-held reference must retain the upload branch, even if
+    // convergence completed before the send's own preflight begins.
+    if before_send {
+        let effects = sender.runtime.advance_convergence(&group).await.unwrap();
+        sender
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        assert_eq!(
+            sender.runtime.epoch_pin(&group).unwrap(),
+            winner.runtime.epoch_pin(&group).unwrap(),
+        );
+    }
+    let error = if upload_and_send {
+        let (finish, result, uploads) = completion.take().unwrap();
+        sender
+            .finish_encrypted_media_upload(finish, result, uploads)
+            .await
+            .map(|_| ())
+    } else if before_send {
+        sender
+            .send_media_attachments(&group, vec![reference], None)
+            .await
+            .map(|_| ())
+    } else {
+        let intent = if reaction {
+            AppMessageIntent::Reaction {
+                target_message_id,
+                emoji: ":party:".into(),
+                tags: vec![vec![
+                    "emoji".into(),
+                    "party".into(),
+                    reference.locators[0].value.clone(),
+                ]],
+                attachments: vec![reference],
+            }
+        } else {
             AppMessageIntent::Media {
                 message_tags: Vec::new(),
                 attachments: vec![reference],
                 caption: None,
-            },
-        )
-        .await
-        .unwrap_err();
+            }
+        };
+        sender.send_app_event(&group, intent).await.map(|_| ())
+    }
+    .unwrap_err();
+    if let Some((_, _, uploads)) = completion {
+        uploads.release().await;
+    }
+    if let Some(server) = server {
+        server.abort();
+    }
     assert_eq!(
         sender.runtime.epoch_pin(&group).unwrap(),
         winner.runtime.epoch_pin(&group).unwrap(),
@@ -15230,6 +15370,7 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
                 media_type: "image/png".to_owned(),
                 version: ENCRYPTED_MEDIA_VERSION.to_owned(),
                 source_epoch: 7,
+                source_epoch_identity: None,
                 dim: Some("10x20".to_owned()),
                 thumbhash: Some("thumb".to_owned()),
             },
@@ -15245,6 +15386,7 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
                 media_type: "video/mp4".to_owned(),
                 version: ENCRYPTED_MEDIA_VERSION.to_owned(),
                 source_epoch: 7,
+                source_epoch_identity: None,
                 dim: None,
                 thumbhash: None,
             },
@@ -15598,6 +15740,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
             media_type: "image/png".to_owned(),
             version: ENCRYPTED_MEDIA_VERSION.to_owned(),
             source_epoch: 7,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }],
@@ -15634,6 +15777,7 @@ fn malformed_media_message(version: &str) -> Vec<u8> {
             media_type: "image/png".to_owned(),
             version: version.to_owned(),
             source_epoch: 7,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }],
@@ -23245,6 +23389,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         media_type: "application/pdf".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: source_epoch.0,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     };
@@ -23306,6 +23451,17 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         "precondition: the source epoch was never cached while current"
     );
 
+    // #2840: a same-number losing branch's key can already be cached. A
+    // canonical source replaces it from the carried key or, for a late legacy
+    // event without one, the authoritative retained source-epoch exporter.
+    storage
+        .remember_encrypted_media_epoch_secret(
+            &group_id_hex,
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            source_epoch.0,
+            &[0xcc; 32],
+        )
+        .unwrap();
     let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
@@ -23327,7 +23483,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         .unwrap();
     assert_eq!(summary.messages.len(), 1);
 
-    assert_eq!(
+    assert!(
         storage
             .encrypted_media_epoch_secret(
                 &group_id_hex,
@@ -23335,8 +23491,8 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
                 source_epoch.0,
             )
             .unwrap()
-            .as_deref(),
-        Some(source_secret.as_ref()),
+            .as_deref()
+            == Some(source_secret.as_ref()),
         "the cached key must be the source epoch's exporter secret"
     );
     assert!(

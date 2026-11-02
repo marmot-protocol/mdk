@@ -707,6 +707,20 @@ Observe initial transfer state and complete replacements for bounded source slot
 <details>
 <summary>commands/attachment_history.rs</summary>
 
+### `Marmot::reaction_attachment`
+
+**Current.**
+
+```rust
+pub async fn reaction_attachment( &self, account_ref: String, group_id_hex: String, reaction_message_id_hex: String, ) -> Result<Option<AttachmentEntryFfi>, MarmotKitError>
+```
+
+Bounded local lookup for one active custom-emoji reaction, keyed by its `reactionMessageIdHex` within the account and chat. Returns the validated image attachment matching that reaction's shortcode, with its original message/source IDs and attachment index, or `None` when unavailable or unmatched. Starts no download. Use the target with ordinary automatic or explicit attachment acquisition and opaque local reads; re-resolve when the earliest active reaction ID changes. Never fetch an emoji tag URL directly. See [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork).
+
+The reaction ID must contain exactly 64 hexadecimal characters; malformed IDs return `InvalidMediaReference`. The lookup considers original `imeta` indices 0–99 only, source tag JSON and each candidate slot up to 16 KiB, and reaction content up to 64 UTF-8 bytes including colons. Oversized metadata, artwork outside those indices, or no eligible match returns `None`. The first well-formed definition of the exact content shortcode wins; later duplicates cannot replace an unmatched first definition.
+
+[Source](src/commands/attachment_history.rs#L15)
+
 ### `Marmot::attachment_history_page`
 
 **Current.**
@@ -717,7 +731,7 @@ pub async fn attachment_history_page( &self, account_ref: String, group_id_hex: 
 
 Read 1..=100 attachment slots in canonical newest-first order. Rejected slots consume the limit. Filter categories within returned pages; an empty filtered page is not exhaustion while has_more is true. No downloads are started. Keep cursors/versions in memory only and restart after runtime reconstruction.
 
-[Source](src/commands/attachment_history.rs#L15)
+[Source](src/commands/attachment_history.rs#L33)
 
 ### `Marmot::attachment_history_version`
 
@@ -729,7 +743,7 @@ pub async fn attachment_history_version( &self, account_ref: String, group_id_he
 
 Cheap local refresh signal, including for a fully loaded or empty library. Compare against the baseline version captured when the current collection began: replacing that baseline with a newer page can hide a destructive change to earlier rows.
 
-[Source](src/commands/attachment_history.rs#L37)
+[Source](src/commands/attachment_history.rs#L55)
 
 </details>
 
@@ -2524,9 +2538,9 @@ Build one outbound encrypted-media `imeta` tag without publishing it.
 pub async fn send_media_attachments( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Send already-uploaded encrypted media attachments as a kind-9 chat carrying ordered NIP-92 `imeta` tags.
+Send already-uploaded encrypted media attachments as a kind-9 chat carrying ordered NIP-92 `imeta` tags. Preserve each upload's local `source_epoch_identity`; missing provenance or a changed upload branch requires a fresh upload.
 
-[Source](src/commands/media.rs#L60)
+[Source](src/commands/media.rs#L61)
 
 ### `Marmot::send_tagged_media`
 
@@ -2536,9 +2550,9 @@ Send already-uploaded encrypted media attachments as a kind-9 chat carrying orde
 pub async fn send_tagged_media( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, tags: Vec<Vec<String>>, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-`send_media_attachments` plus application tags on the same kind-9. For NIP-30 custom emoji, upload the image with `upload_media(send = false)`, then send its reference with an `["emoji", shortcode, reference.locators[0].value]` tag; receivers match the tag URL to the `imeta` locator and render that attachment inline. Same tag limits as `send_tagged_text`. `upload_media` with `MediaUploadRequestFfi.message_tags` and `send = true` is the one-call equivalent.
+`send_media_attachments` plus application tags on the same kind-9. For NIP-30 custom emoji, upload the image with `upload_media(send = false)`, then send its reference with an `["emoji", shortcode, reference.locators[0].value]` tag; receivers match the tag URL to the `imeta` locator and render that attachment inline. Preserve the returned reference's `source_epoch_identity`: sending requires the upload's exact branch, not only its epoch number. Missing provenance requires a fresh upload. Same tag limits as `send_tagged_text`. `upload_media` with `MediaUploadRequestFfi.message_tags` and `send = true` is the one-call equivalent.
 
-[Source](src/commands/media.rs#L83)
+[Source](src/commands/media.rs#L85)
 
 ### `Marmot::send_media_reference`
 
@@ -2550,7 +2564,7 @@ pub async fn send_media_reference( &self, account_ref: String, group_id_hex: Str
 
 Backward-compatible single-attachment send helper. Prefer `send_media_attachments` for new callers so one chat can carry ordered mixed media attachments.
 
-[Source](src/commands/media.rs#L136)
+[Source](src/commands/media.rs#L139)
 
 ### `Marmot::upload_media`
 
@@ -2560,9 +2574,9 @@ Backward-compatible single-attachment send helper. Prefer `send_media_attachment
 pub async fn upload_media( &self, account_ref: String, group_id_hex: String, request: MediaUploadRequestFfi, ) -> Result<MediaUploadResultFfi, MarmotKitError>
 ```
 
-Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group. Each body is first kept in the account's encrypted media store, so the sender reads its own attachments locally once the message is confirmed; a body the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull` before anything is uploaded.
+Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group. Upload references include local `source_epoch_identity`; preserve it unchanged when saving or sending them. Each body is first kept in the account's encrypted media store, so the sender reads its own attachments locally once the message is confirmed; a body the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull` before anything is uploaded.
 
-[Source](src/commands/media.rs#L152)
+[Source](src/commands/media.rs#L155)
 
 ### `Marmot::upload_media_files`
 
@@ -2576,7 +2590,7 @@ File-backed `upload_media` for large attachments. Each `source_path` (a regular 
 
 File-backed uploads have no fixed worker-response timeout; per-endpoint network deadlines still apply. Cancellation observed before message admission starts prevents publication. Admission is not interruptible once started, including while durable acceptance is pending.
 
-[Source](src/commands/media.rs#L179)
+[Source](src/commands/media.rs#L182)
 
 ### `Marmot::download_media`
 
@@ -2588,7 +2602,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L209)
+[Source](src/commands/media.rs#L212)
 
 ### `Marmot::list_media`
 
@@ -2600,7 +2614,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L230)
+[Source](src/commands/media.rs#L233)
 
 </details>
 
@@ -2675,9 +2689,9 @@ React to `target_message_id` with `emoji` (an "add" reaction).
 pub async fn react_with_media( &self, account_ref: String, group_id_hex: String, target_message_id: String, emoji: String, tags: Vec<Vec<String>>, attachments: Vec<MediaAttachmentReferenceFfi>, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-React with a custom emoji image. `emoji` is the reaction content (e.g. `:shortcode:`), `attachments` are already-uploaded references emitted as `imeta` on the kind-7, and `tags` name them (NIP-30 `["emoji", shortcode, url]`). The reaction retains its media epoch secret like a chat, so the image stays decryptable after the group advances. Same tag limits as `send_tagged_text`; repeating an existing reaction with the same content is a no-op.
+React with a custom emoji image. `emoji` is the reaction content (e.g. `:shortcode:`), `attachments` are already-uploaded references emitted as `imeta` on the kind-7, and `tags` name them (NIP-30 `["emoji", shortcode, url]`). The reaction retains its media epoch secret like a chat, so the image stays decryptable after the group advances. Preserve the returned reference's `source_epoch_identity`; missing provenance or a changed upload branch requires a fresh upload. Same tag limits as `send_tagged_text`; repeating an existing reaction with the same content is a no-op.
 
-[Source](src/commands/media.rs#L108)
+[Source](src/commands/media.rs#L111)
 
 ### `Marmot::unreact_from_message`
 
@@ -4047,7 +4061,7 @@ pub fn new() -> std::sync::Arc<Self>
 
 Create one control per file-backed operation; it is never reused across operations.
 
-[Source](src/conversions/media.rs#L377)
+[Source](src/conversions/media.rs#L383)
 
 ### `MediaFileTransferControlFfi::cancel`
 
@@ -4059,7 +4073,7 @@ pub fn cancel(&self)
 
 Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission starts. Admission is not interruptible once started, even before durable acceptance returns; cancellation cannot retract an admitted message.
 
-[Source](src/conversions/media.rs#L383)
+[Source](src/conversions/media.rs#L389)
 
 ### `MediaFileTransferControlFfi::is_cancelled`
 
@@ -4071,7 +4085,7 @@ pub fn is_cancelled(&self) -> bool
 
 Whether `cancel` was called. It is not an outcome: await the operation's result.
 
-[Source](src/conversions/media.rs#L387)
+[Source](src/conversions/media.rs#L393)
 
 ### `MediaFileTransferControlFfi::processed_bytes`
 
@@ -4083,7 +4097,7 @@ pub fn processed_bytes(&self) -> u64
 
 Monotonic local work counter across the copy into the encrypted media store, the digest pass and the transfer of the current attachment. Not a percentage or a delivery signal.
 
-[Source](src/conversions/media.rs#L391)
+[Source](src/conversions/media.rs#L397)
 
 ### `max_file_media_ciphertext_bytes`
 
@@ -4095,7 +4109,7 @@ pub fn max_file_media_ciphertext_bytes() -> u64
 
 Per-batch ciphertext ceiling for file-backed uploads (an implementation resource bound, not protocol).
 
-[Source](src/conversions/media.rs#L399)
+[Source](src/conversions/media.rs#L405)
 
 </details>
 

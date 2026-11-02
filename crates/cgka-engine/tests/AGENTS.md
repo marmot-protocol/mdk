@@ -34,10 +34,6 @@ carries no epoch hint, so a device that never entered that epoch state reads opa
 (`tests/epoch_sealed_transport.rs` owns the resulting behaviors). Reach for it whenever a scenario turns on branch- or
 epoch-scoped readability; `MockPeeler` stays right for everything else.
 
-- **File:** `application_data_wire.rs`
-  - **Owns:** OpenMLS integration-contract tests for the MLS application-data carriers Marmot uses (pins fork codec
-    behavior the engine relies on)
-
 - **File:** `scaffold.rs`
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
@@ -47,16 +43,19 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
-  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
+  - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip, exact buffered-malformed retirement, and
+    encrypted own-echo persistence. The pure canonical-disposition/public-outcome mapper is pinned in
+    `../src/message_processor/ingest.rs::tests`
 
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
-    included), KeyPackage-based `constructable_capabilities`, capability matrix
+    included), KeyPackage-based `constructable_capabilities`, capability matrix. Pure OpenMLS carrier codecs live in
+    `../src/wire_format/tests/application_data_wire.rs`
 
-- **File:** `leaf_advertisement.rs`
+- **File:** `capabilities/leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
     would change the leaf
 
@@ -69,11 +68,16 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     foreground budgets, and background work/time budgets with restart and eventual-completion checks. Also the
     publish-cycle replay's cost: rows it keeps parked are not lineage-classified, and each retained anchor's context
     is derived once per replay rather than once per row. A retry that re-defers a row at a new epoch records no
-    `peel_deferred -> peel_deferred` audit row.
+    `peel_deferred -> peel_deferred` audit row. Returned peeler infrastructure faults preserve raw bytes, return
+    deferred capacity and retry through confirmation replay. One-probe public advances must retain the engine's peel
+    continuation, restore live state between slices and eventually deliver the real rival application exactly once.
 
 - **File:** `distributed_convergence.rs`
   - **Owns:** Stored-message convergence, stale classification, retained-anchor behavior, and the canonical
     application handoff after catch-up (horizon boundary, restart, bounded turns, and independent send gate).
+    Also frozen admission role/source integrity through public advance, superseded own-removal recovery (remaining
+    targets or already satisfied), and fresh-material reinvite recovery across real forks, paced lookup, admin grants,
+    and genuine replacement-Welcome offers.
 
 - **File:** `distributed_convergence/historical_application_sender.rs`
   - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct
@@ -117,7 +121,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     matrix enables that feature explicitly for settlement/rewind fixtures.
 
 - **File:** `mip03_guards.rs`
-  - **Owns:** Committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
+  - **Owns:** Ordinary commit/proposal admission and admin policy guards, own SelfRemove echo filtering,
+    admin-not-last and admin-self-remove. Direct target-side auto-committer decision proof remains a gap.
 
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
@@ -195,7 +200,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     for every class; and races settled the same way on every client. Also that the builder accepts 0x800d and still
     refuses protocol ids the engine does not implement. Its `found_group(.., false, ..)` founds with a member that
     does not advertise 0x800d and then removes it, because creation requires 0x800d whenever every founder advertises
-    it.
+    it. The stored history-key suite refusal is also here: both public reads reject the actual mismatched stored key
+    without replacing it. Valid encrypted history-key continuity remains in `sqlite_storage.rs`.
 
 - **File:** `account_devices/creation.rs`
   - **Owns:** Creating a group (mdk#2628 item 2.3): the founding state requires 0x800d exactly when the creator's leaf
@@ -259,7 +265,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     founding leaf from the roster it founds, from its own entry only; each kind of own Commit tags a leaf that needs a
     tag, and the members accept it; a leaf whose tag reads as its own keeps it; without a named device group nothing is
     tagged; naming a seeded group hydrates it, and a quarantined one tags nothing while a tagged KeyPackage stays
-    current. The tag crypto and the spec vector are unit-tested in `src/device_tag.rs`.
+    current. The remembered-key query reads the actual current LeafNode, with untagged, wrong-slot and wrong-key
+    controls. The tag crypto and the spec vector are unit-tested in `src/device_tag.rs`.
 
 - **File:** `account_devices/private_key_packages.rs`
   - **Owns:** Private KeyPackages (mdk#2628 item 3.4b) through the engine: issued ones keep their keys in the same
@@ -271,6 +278,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
     local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite with a
     private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
+    Failed private issuance is checked with a real second-insertion SQLCipher fault after earlier stock and bundle
+    writes, complete independent rows, two physical encrypted reopens and a healed retry. Keep those boundaries.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
@@ -293,7 +302,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
     by then. A sibling that lands through another adder while its Add waits is refused at drain, before a direct
     retry, and by the advisory check; distinct MLS signers exercise authenticated slot presence in both signer orientations
-    (mdk#2628 3.5e). These tagged fixtures do not independently isolate the pre-link signature-key fallback. The read-only pre-check a host runs before it takes a KeyPackage
+    (mdk#2628 3.5e). The separate pre-link case creates its chat before device-group tagging, then removes and re-adds
+    the actual untagged sibling. Keep both tagged orientations and the untagged fallback. The queue-presence case
+    uses one production-read convergence clock across buffering, ordinary send and its later explicit advances
+    (mdk#2892). The read-only pre-check a host runs before it takes a KeyPackage
     (`sibling_add_refusal`, `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
     included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
@@ -303,6 +315,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   invalidation stays retired after reopen, and legacy development rows with no provable origin are not handed off
   after reopen. Exact delivered carrier outcomes settle even while held. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
   compatibility live in `cgka-traits` `message::stored_payload_codec_tests`.
+  The engine cases also pin the carried list's exact row/carrier and Ready/Held/Withdrawn visibility across
+  reconstruction. App effects dispatch remains in the app's held-carrier journey.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
   - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
@@ -410,3 +424,7 @@ source recovery past a genuinely admitted unavailable-history prefix, preserving
 `account_devices/sibling_welcomes.rs::sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire` owns
 terminal expiry before metadata retirement, exact late-outcome handling and clock-rollback re-registration rejection.
 The existing participation owner also proves rearm audit events follow outer commit/savepoint rollback discipline.
+
+History and backup label interoperability stays in the source-local crypto tests. Open and seal through raw HPKE
+with literal encoded label/context bytes in both directions; an oracle built from the production label or context
+helper cannot detect a consistently wrong encoding. Preserve the fixed derivation and device-tag vectors.

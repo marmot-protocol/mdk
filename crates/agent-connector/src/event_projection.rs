@@ -261,6 +261,7 @@ pub(crate) fn media_refs_from_tags(
             nonce_hex: reference.nonce_hex,
             version: reference.version,
             source_epoch: reference.source_epoch,
+            source_epoch_identity: reference.source_epoch_identity,
             locators: reference
                 .locators
                 .into_iter()

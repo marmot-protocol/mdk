@@ -17,8 +17,8 @@
 //! a leaf whose tag does not read as its own, whichever own Commit makes it.
 
 use super::device_roster::{
-    entry, found_device_group, phone_and_laptop, roster, roster_device, roster_device_on,
-    roster_of, roster_update, slot,
+    clocked_roster_device, entry, found_device_group, phone_and_laptop, roster, roster_device,
+    roster_device_on, roster_of, roster_update, slot,
 };
 use super::tagged_siblings::{found_routed_group, handed};
 use super::*;
@@ -28,7 +28,7 @@ use cgka_traits::app_components::{
     decode_components_list,
 };
 use cgka_traits::maintenance::KeyPackageLifecycleState;
-use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _};
+use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _, RosterTagKey};
 use cgka_traits::types::EpochId;
 use openmls_traits::types::SignatureScheme;
 
@@ -115,12 +115,28 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
     let (mut phone, laptop, gid) = phone_and_laptop().await;
     let (signer, public_key) = tag_key_pair();
     let tagged = roster_with_laptop_key(public_key);
+    let remembered = RosterTagKey {
+        slot: slot(2),
+        tag_signature_key: tagged.devices[&slot(2)].tag_signature_key.clone().unwrap(),
+        held_as_removed: true,
+    };
     let laptop_leaf = leaf_index(&laptop, &gid);
     let before = phone.engine.epoch(&gid).unwrap();
     assert_eq!(
         claim(&phone, &gid, before, laptop_leaf, &tagged),
         Some(DeviceTagClaim::Unclaimed),
         "a leaf from before the link carries no tag"
+    );
+    assert!(
+        phone
+            .engine
+            .own_account_leaves_tagged_by(
+                &gid,
+                &tagged.leaf_tag_key,
+                std::slice::from_ref(&remembered),
+            )
+            .unwrap()
+            .is_empty()
     );
 
     let entry = tag_for(&laptop, &tagged, &slot(2), &signer);
@@ -147,6 +163,35 @@ async fn a_member_leaf_reads_as_the_device_its_tag_names() {
     };
     assert_eq!(current(after), Some(DeviceTagClaim::Device(slot(2))));
     assert_eq!(current(before), None);
+    let reads = |leaf_tag_key: &[u8; 32], keys: &[RosterTagKey]| {
+        phone
+            .engine
+            .own_account_leaves_tagged_by(&gid, leaf_tag_key, keys)
+            .unwrap()
+    };
+    let wrong_key = RosterTagKey {
+        tag_signature_key: vec![0x01; 32],
+        ..remembered.clone()
+    };
+    assert_eq!(
+        reads(
+            &tagged.leaf_tag_key,
+            &[wrong_key.clone(), remembered.clone()]
+        ),
+        vec![signature_key(&laptop, &gid)],
+        "remembered keys read the actual current leaf even without a current roster entry",
+    );
+    for keys in [
+        vec![wrong_key],
+        vec![RosterTagKey {
+            slot: slot(3),
+            ..remembered.clone()
+        }],
+        vec![],
+    ] {
+        assert!(reads(&tagged.leaf_tag_key, &keys).is_empty());
+    }
+    assert!(reads(&[0x34; 32], std::slice::from_ref(&remembered)).is_empty());
 
     // Read at an epoch, an older one reads the leaf as it was then, from its
     // retained anchor, and leaves the group's state and snapshots as they
@@ -638,7 +683,15 @@ async fn a_founder_tags_its_founding_leaf_from_the_roster_it_founds() {
 /// tags it, and the other members accept that Commit.
 #[tokio::test]
 async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
-    let (mut phone, mut laptop, device_gid) = phone_and_laptop().await;
+    let clock = manual_convergence_clock();
+    let mut phone = roster_device(b"alice");
+    let mut laptop = clocked_roster_device(b"alice", &clock);
+    let device_gid = found_device_group(
+        &mut phone,
+        &roster(&[(1, "Phone"), (2, "Laptop")]),
+        &mut [&mut laptop],
+    )
+    .await;
     let mut bob = roster_device(b"bob");
     let mut groups = Vec::new();
     for index in 0..6 {
@@ -720,7 +773,7 @@ async fn every_kind_of_own_commit_tags_a_leaf_that_needs_a_tag() {
         .ingest(route_to_group(&msg, gid))
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(75);
     laptop.engine.advance_convergence(gid).await.unwrap();
     let mut publications = laptop.engine.drain_auto_publish();
     assert_eq!(publications.len(), 1);
@@ -806,20 +859,21 @@ async fn only_a_live_device_group_tags() {
     assert!(key_package_tag(&seeded.engine.fresh_key_package().await.unwrap()).1);
 
     // A named group with no MLS state behind it can't say either.
+    let missing = GroupId::new(vec![0xab; 16]);
     seeded
         .engine
-        .set_device_tag_group(Some(GroupId::new(vec![0xab; 16])))
+        .set_device_tag_group(Some(missing.clone()))
         .unwrap();
     assert_eq!(
         key_package_tag(&seeded.engine.fresh_key_package().await.unwrap()),
         (None, false)
     );
-    assert!(
+    assert!(matches!(
         seeded
             .engine
-            .key_package_advertises_current_capabilities(&tagged)
-            .is_err()
-    );
+            .key_package_advertises_current_capabilities(&tagged),
+        Err(EngineError::UnknownGroup(group_id)) if group_id == missing
+    ));
     drop(seeded);
 
     // A stored profile that disagrees with the group's quarantines it when
@@ -835,24 +889,24 @@ async fn only_a_live_device_group_tags() {
         .unwrap();
     assert_eq!(quarantined.engine.unhydrated_group_ids(), vec![gid.clone()]);
     for _ in 0..2 {
-        assert!(
+        assert!(matches!(
             quarantined
                 .engine
-                .set_device_tag_group(Some(gid.clone()))
-                .is_err()
-        );
+                .set_device_tag_group(Some(gid.clone())),
+            Err(EngineError::UnknownGroup(group_id)) if group_id == gid
+        ));
     }
     assert_eq!(quarantined.engine.quarantined_groups().len(), 1);
     assert_eq!(
         key_package_tag(&quarantined.engine.fresh_key_package().await.unwrap()),
         (None, false)
     );
-    assert!(
+    assert!(matches!(
         quarantined
             .engine
-            .key_package_advertises_current_capabilities(&tagged)
-            .is_err()
-    );
+            .key_package_advertises_current_capabilities(&tagged),
+        Err(EngineError::UnknownGroup(group_id)) if group_id == gid
+    ));
 }
 
 /// Native DG acceptance owns source facts for application, Commit and standalone

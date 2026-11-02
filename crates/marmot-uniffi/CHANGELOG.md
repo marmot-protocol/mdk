@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
+  Preserve it when saving an upload reference and sending it back, including
+  custom emoji reactions. Outbound sends refuse a missing identity or a changed
+  upload branch with `InvalidMediaReference`; re-upload retained bytes. The
+  field is local metadata, never written to `imeta`. Received and legacy
+  references remain downloadable. Regenerate bindings with the matching library.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
   first records in the device group that it is leaving, which can take about
@@ -112,6 +119,14 @@
   `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
 
 ### Added
+
+- `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
+  resolves one active custom-emoji reaction's matching encrypted image to its
+  original attachment source slot (mdk#2151). Use ordinary host-managed
+  acquisition and opaque local reads; no group-wide `list_media` scan or
+  `download_media` fallback is required. The additive source migration backfills
+  retained eligible reactions. See `ATTACHMENT-HISTORY.md` for adoption and
+  reaction replacement/removal behavior.
 
 - `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
   the groups whose history is still being fetched (`catching_up_group_ids_hex`),

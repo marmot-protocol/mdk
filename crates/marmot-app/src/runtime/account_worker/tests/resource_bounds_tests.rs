@@ -347,6 +347,12 @@ async fn oversized_event_exhausts_byte_budget_without_retention() {
         assert_eq!(endpoint.stats.serialized_event_bytes, event_bytes);
         assert_eq!(endpoint.stats.retained_high_water_items, 0);
     }
+    // The SDK can receive the frame before its writer records the send.
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(left.wait_for_sent_events(1), right.wait_for_sent_events(1));
+    })
+    .await
+    .expect("both relay writers record their oversized EVENT frames");
     assert_eq!(
         left.snapshot().sent_event_json + right.snapshot().sent_event_json,
         2 * event_bytes

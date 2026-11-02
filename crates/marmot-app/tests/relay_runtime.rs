@@ -24,11 +24,10 @@ use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditLogSettings, ChatListRow, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
-    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    MissingRelayListKind, NotificationTrigger, NotificationWakeSource, PushPlatform,
-    RetentionSweepStatus, RuntimeMessageUpdate, RuntimeNotificationsSubscription, SelfMembership,
-    SignOutOptions, TimelineMessageQuery, TimelinePagination, UserDirectorySearch,
-    UserProfileMetadata, tag_value,
+    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
+    NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
+    RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
+    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
@@ -9047,47 +9046,46 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
-    // A reference is only sendable in the epoch that encrypted it; the
-    // synthetic references below claim the group's live epoch.
-    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
-    bob.send_media_attachments(
-        &group_id,
-        vec![
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: hex::encode([0x42_u8; 32]),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: Some("800x600".to_owned()),
-                thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
+    // Use real upload provenance: the projection must preserve the uploaded
+    // descriptors without putting their device-local identity on the wire.
+    let blossom = mock_blossom().await;
+    let uploaded = bob
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![
+                    MediaUploadAttachmentRequest {
+                        file_name: "diagram.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"diagram fixture".to_vec(),
+                        dim: Some("800x600".into()),
+                        thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".into()),
+                    },
+                    MediaUploadAttachmentRequest {
+                        file_name: "audio.ogg".into(),
+                        media_type: "audio/ogg".into(),
+                        plaintext: b"audio fixture".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                ],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
             },
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x12_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x12_u8; 32]),
-                plaintext_sha256: hex::encode([0x43_u8; 32]),
-                nonce_hex: hex::encode([0x25_u8; 12]),
-                file_name: "audio.ogg".to_owned(),
-                media_type: "audio/ogg".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: None,
-                thumbhash: None,
-            },
-        ],
-        Some("launch diagram".to_owned()),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
+    let references: Vec<_> = uploaded
+        .attachments
+        .into_iter()
+        .map(|attachment| attachment.reference)
+        .collect();
+    let diagram = references[0].clone();
+    bob.send_media_attachments(&group_id, references, Some("launch diagram".into()))
+        .await
+        .unwrap();
     let media = alice.sync().await.unwrap();
     // Media is a kind-9 chat: content is the caption, attachment is an `imeta`.
     assert_eq!(media.messages[0].plaintext, "launch diagram");
@@ -9099,17 +9097,23 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .collect();
     assert_eq!(imeta_tags.len(), 2);
     let imeta = imeta_tags[0];
-    assert!(imeta.iter().any(|field| field
-        == &format!(
-            "locator blossom-v1 https://media.example/{}.bin",
-            hex::encode([0x11_u8; 32])
-        )));
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == &format!("locator blossom-v1 {}", diagram.locators[0].value))
+    );
     assert!(imeta.iter().any(|field| field == "m image/png"));
     assert!(imeta.iter().any(|field| field == "filename diagram.png"));
     assert!(
         imeta
             .iter()
-            .any(|field| field == "nonce 242424242424242424242424")
+            .any(|field| field == &format!("nonce {}", diagram.nonce_hex))
+    );
+    assert!(imeta.iter().any(|field| field == "dim 800x600"));
+    assert!(
+        imeta
+            .iter()
+            .all(|field| !field.starts_with("source_epoch_identity "))
     );
     assert!(imeta.iter().any(|field| field == "v encrypted-media-v2"));
     assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
@@ -9120,26 +9124,10 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             .any(|field| field == "filename audio.ogg")
     );
 
+    let mut malformed = diagram;
+    malformed.plaintext_sha256 = "not-hex".into();
     let bad_media = bob
-        .send_media_attachments(
-            &group_id,
-            vec![MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: "not-hex".to_owned(),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
-                dim: None,
-                thumbhash: None,
-            }],
-            None,
-        )
+        .send_media_attachments(&group_id, vec![malformed], None)
         .await
         .unwrap_err();
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
@@ -10750,8 +10738,108 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
 // NIP-30: upload unsent, then name the attachment by its locator url.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip30_emoji_media_and_reaction_reach_peer() {
+    use marmot_app::{
+        AttachmentAcquisitionMode, AttachmentAutomaticPermission, AttachmentLocalTarget,
+        AttachmentTransferState, MediaAttachmentOutcome,
+    };
+
+    async fn acquire(
+        runtime: &MarmotAppRuntime,
+        account: &str,
+        group: &GroupId,
+        target: AttachmentLocalTarget,
+        expected: &[u8],
+    ) -> marmot_app::AttachmentAssetRef {
+        let transfers = runtime
+            .subscribe_attachment_transfers(account, group, vec![target.clone()])
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .request_automatic_attachment(account, group, target.clone())
+                .await
+                .unwrap()
+                .status
+                .is_some()
+        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let rows = transfers
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("live attachment transfer subscription");
+                let row = rows[0]
+                    .as_ref()
+                    .expect("source remains available while acquiring");
+                if row.state == AttachmentTransferState::Ready {
+                    break;
+                }
+                assert!(
+                    !matches!(
+                        row.state,
+                        AttachmentTransferState::Failed | AttachmentTransferState::RetryExhausted
+                    ),
+                    "artwork transfer failed: {:?}",
+                    row.state
+                );
+            }
+        })
+        .await
+        .expect("reaction artwork acquired through HostManaged policy");
+        transfers.close();
+        let asset = runtime
+            .attachment_local_assets(account, group, vec![target])
+            .await
+            .unwrap()
+            .remove(0)
+            .expect("verified local artwork");
+        let bytes = runtime
+            .read_attachment_asset(account, asset.reference.clone(), 0, 1024)
+            .await
+            .unwrap()
+            .expect("opaque local artwork read");
+        assert_eq!(bytes.as_slice(), expected);
+        asset.reference
+    }
+
+    async fn advance_epoch(
+        runtime: &MarmotAppRuntime,
+        sender: &str,
+        peer: &str,
+        group: &GroupId,
+        events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+        name: &str,
+    ) {
+        let before = runtime.group_mls_state(sender, group).await.unwrap().epoch;
+        runtime
+            .update_group_profile(sender, group, Some(name.into()), None)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if runtime.group_mls_state(sender, group).await.unwrap().epoch > before
+                    && runtime.group_mls_state(peer, group).await.unwrap().epoch > before
+                {
+                    break;
+                }
+                events.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("both peers advance before the artwork step");
+    }
+
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::white_noise()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true)
+            .with_attachment_acquisition_mode(AttachmentAcquisitionMode::HostManaged),
+    );
     let blossom = mock_blossom().await;
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -10766,6 +10854,25 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
     let bob = create_network_ready_identity(&runtime, setup).await.account;
     let a = &alice.account_id_hex;
     let b = &bob.account_id_hex;
+    for account in [a, b] {
+        let generation = runtime
+            .begin_attachment_permission_update(account)
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .set_attachment_automatic_permission(
+                    account,
+                    generation,
+                    AttachmentAutomaticPermission {
+                        images: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+        );
+    }
     let mut events = runtime.subscribe();
     let group = runtime
         .create_group(a, "emoji", std::slice::from_ref(b), None)
@@ -10826,9 +10933,26 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
             .iter()
             .any(|tag| tag[0] == "imeta" && tag.contains(&locator))
     );
-    let downloaded = runtime.download_media(b, &group, reference).await.unwrap();
-    assert_eq!(downloaded.plaintext, emoji_png);
+    acquire(
+        &runtime,
+        b,
+        &group,
+        AttachmentLocalTarget {
+            message_id_hex: id.clone(),
+            source_message_id_hex: app
+                .timeline_message(&bob.label, &hex::encode(group.as_slice()), id)
+                .unwrap()
+                .unwrap()
+                .source_message_id_hex
+                .unwrap(),
+            attachment_index: 0,
+        },
+        &emoji_png,
+    )
+    .await;
 
+    // Reaction-only media uses a fresh epoch, independently of the earlier chat's key.
+    advance_epoch(&runtime, a, b, &group, &mut events, "before reaction").await;
     // The same shape on a kind-7: the reaction carries its own imeta.
     let reaction = runtime
         .upload_media(
@@ -10851,6 +10975,7 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
         .await
         .unwrap();
     let cat = reaction.attachments[0].reference.clone();
+    assert!(cat.source_epoch > reference.source_epoch);
     let cat_tag: Vec<String> = vec!["emoji".into(), "cat".into(), cat.locators[0].value.clone()];
     let reacted = runtime
         .react_with_media(
@@ -10872,9 +10997,212 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
     assert_eq!(received.plaintext, ":cat:");
     assert!(received.tags.contains(&cat_tag));
     assert!(received.tags.iter().any(|tag| tag[0] == "imeta"));
-    let downloaded = runtime.download_media(a, &group, cat).await.unwrap();
-    assert_eq!(downloaded.plaintext, b"cat payload");
-    runtime.shutdown().await;
+    // Acquisition must still decrypt the reaction after its source epoch passes.
+    advance_epoch(&runtime, a, b, &group, &mut events, "after reaction").await;
+    assert!(runtime.group_mls_state(a, &group).await.unwrap().epoch > cat.source_epoch);
+    let artwork = runtime
+        .reaction_attachment(a, &group, reaction_id)
+        .await
+        .unwrap()
+        .expect("bounded reaction artwork lookup");
+    let MediaAttachmentOutcome::Accepted {
+        attachment_index,
+        reference: resolved,
+    } = artwork.attachment
+    else {
+        panic!("validated artwork")
+    };
+    assert_eq!(resolved.ciphertext_sha256, cat.ciphertext_sha256);
+    let target = AttachmentLocalTarget {
+        message_id_hex: artwork.message_id_hex,
+        source_message_id_hex: artwork.source_message_id_hex,
+        attachment_index,
+    };
+    let old_asset = acquire(&runtime, a, &group, target.clone(), b"cat payload").await;
+
+    // Another author uses the same shortcode on the same target with different artwork.
+    // Choose the actual canonical earliest source below, including timestamp ties.
+    let uploaded = runtime
+        .upload_media(
+            a,
+            &group,
+            MediaUploadRequest {
+                message_tags: Vec::new(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "another-cat.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: b"other cat".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let other_cat = uploaded.attachments[0].reference.clone();
+    let other_reaction = runtime
+        .react_with_media(
+            a,
+            &group,
+            id,
+            ":cat:",
+            vec![vec![
+                "emoji".into(),
+                "cat".into(),
+                other_cat.locators[0].value.clone(),
+            ]],
+            vec![other_cat.clone()],
+        )
+        .await
+        .unwrap();
+    let other_reaction_id = &other_reaction.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == other_reaction_id)).await;
+    let other_artwork = runtime
+        .reaction_attachment(a, &group, other_reaction_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let MediaAttachmentOutcome::Accepted {
+        attachment_index,
+        reference: resolved,
+    } = other_artwork.attachment
+    else {
+        panic!("other validated artwork")
+    };
+    assert_eq!(resolved.ciphertext_sha256, other_cat.ciphertext_sha256);
+    assert_ne!(resolved.ciphertext_sha256, cat.ciphertext_sha256);
+    let other_target = AttachmentLocalTarget {
+        message_id_hex: other_artwork.message_id_hex,
+        source_message_id_hex: other_artwork.source_message_id_hex,
+        attachment_index,
+    };
+    let other_asset = acquire(&runtime, a, &group, other_target.clone(), b"other cat").await;
+    let mut window = runtime
+        .open_conversation_window(
+            a,
+            &group,
+            marmot_app::ConversationOpenQuery {
+                target: marmot_app::ConversationOpenTarget::Message(id.clone()),
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let tally = window
+        .snapshot
+        .presentation
+        .messages
+        .iter()
+        .find(|row| &row.message_id_hex == id)
+        .unwrap()
+        .reactions
+        .items
+        .iter()
+        .find(|reaction| reaction.emoji == ":cat:")
+        .unwrap();
+    assert_eq!(tally.count, 2);
+    let earliest = tally.reaction_message_id_hex.clone().unwrap();
+    let (removed_id, successor_id, owner, receiver, removed_target, removed_asset, expected_hash) =
+        if earliest == *reaction_id {
+            (
+                reaction_id,
+                other_reaction_id,
+                b,
+                a,
+                target,
+                old_asset,
+                &other_cat.ciphertext_sha256,
+            )
+        } else {
+            assert_eq!(&earliest, other_reaction_id);
+            (
+                other_reaction_id,
+                reaction_id,
+                a,
+                b,
+                other_target,
+                other_asset,
+                &cat.ciphertext_sha256,
+            )
+        };
+    let removal = runtime
+        .unreact_from_message(owner, &group, id)
+        .await
+        .unwrap();
+    let removal_id = &removal.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == receiver && &m.message.message_id_hex == removal_id)).await;
+    assert!(
+        runtime
+            .reaction_attachment(a, &group, removed_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .attachment_local_assets(a, &group, vec![removed_target.clone()])
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    assert!(
+        runtime
+            .read_attachment_asset(a, removed_asset, 0, 1024)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .request_automatic_attachment(a, &group, removed_target)
+            .await
+            .unwrap()
+            .status
+            .is_none()
+    );
+    let successor = runtime
+        .reaction_attachment(a, &group, successor_id)
+        .await
+        .unwrap()
+        .expect("successor source stays acquirable");
+    let MediaAttachmentOutcome::Accepted { reference, .. } = successor.attachment else {
+        panic!("successor artwork")
+    };
+    assert_eq!(&reference.ciphertext_sha256, expected_hash);
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = window
+                .recv()
+                .await
+                .unwrap()
+                .expect("live conversation window");
+            let Some(tally) = snapshot
+                .presentation
+                .messages
+                .iter()
+                .find(|row| &row.message_id_hex == id)
+                .and_then(|row| {
+                    row.reactions
+                        .items
+                        .iter()
+                        .find(|reaction| reaction.emoji == ":cat:")
+                })
+            else {
+                continue;
+            };
+            if tally.reaction_message_id_hex.as_ref() == Some(successor_id) {
+                assert_eq!(tally.count, 1);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("removal selects the next active reaction artwork source");
+    drop(window);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15579,7 +15907,35 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         notice.single_device_notice.as_ref().unwrap().discovery,
         OnboardingDeviceDiscovery::NoneFound
     );
-    assert!(acknowledge_single_device_notice(&first, notice).await.ready);
+    // Model an older retained discovery result without sleeping or changing
+    // any approval identity, prior prerequisite or publication evidence.
+    let home = AccountHome::open(first_directory.path());
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&home.account_onboarding(&id).unwrap().unwrap()).unwrap();
+    let discovered_at = notice.steps[4].checked_at.unwrap() - 60;
+    checkpoint["snapshot"]["steps"][4]["checked_at"] = serde_json::json!(discovered_at);
+    home.set_account_onboarding(&id, &serde_json::to_vec(&checkpoint).unwrap())
+        .unwrap();
+    let retained = first.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(retained.revision, notice.revision);
+    assert_eq!(retained.recovery_epoch, notice.recovery_epoch);
+    assert_eq!(retained.steps[4].checked_at, Some(discovered_at));
+    let completed = acknowledge_single_device_notice(&first, retained).await;
+    assert!(completed.ready);
+    assert!(
+        completed
+            .single_device_notice
+            .as_ref()
+            .unwrap()
+            .acknowledged_at
+            .unwrap()
+            > discovered_at
+    );
+    assert_eq!(
+        completed.steps[4].checked_at,
+        Some(discovered_at),
+        "Continue must not refresh the discovery observation time"
+    );
 
     // An older publication under another slot still carries usable material.
     // Its timestamp is not grounds for asserting that installation is inactive.

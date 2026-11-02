@@ -127,6 +127,8 @@ pub fn application_message_len(group_id_len: usize, payload_len: usize) -> usize
 
 #[cfg(test)]
 mod tests {
+    mod application_data_wire;
+
     use super::*;
     use crate::engine::DEFAULT_CIPHERSUITE;
     use openmls::group::{GroupId, MlsGroup, MlsGroupCreateConfig};

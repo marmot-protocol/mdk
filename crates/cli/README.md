@@ -474,7 +474,6 @@ wn --account <npub-or-hex> media upload <group-hex> <file-path> --send --message
 wn --account <npub-or-hex> media upload <group-hex> <first.jpg> <second.jpg> --send --message <caption>
 wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.divine.video
 wn --account <npub-or-hex> media send <group-hex> '<media-json>' ['<media-json>' ...] --message <caption>
-wn --account <npub-or-hex> media send <group-hex> <plaintext-sha256>
 wn --account <npub-or-hex> media set-endpoints <group-hex> https://blossom.example [https://mirror.example]
 wn --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
@@ -493,14 +492,18 @@ defaults for new groups only. An active group admin runs `media set-endpoints <g
 Non-admins get `not_group_admin`; the response carries the refreshed `encrypted_media` component.
 
 **Re-sending.** `media send` publishes already-uploaded references as one ordered message without re-uploading. Each
-attachment is either the `media` JSON object from `media upload` / `media list` output, or the plaintext SHA-256 of an
-attachment already projected in the group. The runtime re-validates every reference against the group's media profile,
-locator policy, and version. A reference can only be re-sent while the group is still in the epoch that encrypted it:
-the wire `imeta` tag carries no epoch, and recipients derive the media key from the delivering message's epoch.
+attachment uses the complete `media upload` JSON object, including its local `source_epoch_identity`. Preserve that
+object to send it later. The compatibility plaintext-hash input resolves projected metadata but cannot restore its
+local upload identity.
+References reconstructed from `media list` or a plaintext-hash lookup have no upload provenance and require a fresh
+upload before sending. They remain valid download inputs. The runtime re-validates every reference against the
+group's media profile, locator policy, version, and exact upload branch. The epoch number alone is insufficient:
+branch selection can change the media key while keeping that number. The wire `imeta` tag carries neither epoch nor
+local identity; recipients derive the media key from the delivering message's epoch.
 
 - A stale reference is refused before publication with `media_reference_stale_epoch` (`source_epoch`,
-  `current_epoch`). Upload the file again after the commit and send the new reference. A plaintext hash resolves to the
-  newest projected reference carrying it, so after a re-upload the hash form sends the current-epoch copy.
+  `current_epoch`). Upload the file again and send the returned JSON reference. Missing upload identity requires a
+  fresh upload even when both epoch numbers match.
 - The send is pinned to the reference's epoch inside the engine too: an epoch change during the send, including a move
   to another branch at the same epoch number, gives the same error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
   refused with `media_reference_epoch_unsettled` rather than queued. Sync and retry, or upload again if the epoch

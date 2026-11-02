@@ -56,7 +56,8 @@ impl Marmot {
     }
 
     /// Send already-uploaded encrypted media attachments as a kind-9 chat
-    /// carrying ordered NIP-92 `imeta` tags.
+    /// carrying ordered NIP-92 `imeta` tags. Preserve each upload's local
+    /// `source_epoch_identity`; references without provenance need a fresh upload.
     pub async fn send_media_attachments(
         &self,
         account_ref: String,
@@ -80,6 +81,7 @@ impl Marmot {
 
     /// `send_media_attachments` plus application tags on the same kind-9
     /// event, e.g. NIP-30 `emoji` tags pointing at these attachments.
+    /// Preserve each upload's local `source_epoch_identity`.
     pub async fn send_tagged_media(
         &self,
         account_ref: String,
@@ -104,7 +106,8 @@ impl Marmot {
     }
 
     /// React with a custom emoji image: `attachments` become `imeta` tags on
-    /// the kind-7 and `tags` name them (NIP-30 `emoji`).
+    /// the kind-7 and `tags` name them (NIP-30 `emoji`). Preserve each upload's
+    /// local `source_epoch_identity`; a changed branch requires a fresh upload.
     pub async fn react_with_media(
         &self,
         account_ref: String,

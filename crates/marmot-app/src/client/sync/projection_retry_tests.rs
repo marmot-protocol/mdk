@@ -2052,3 +2052,264 @@ async fn failed_drained_checkpoint_counts_toward_stall_warning() {
     assert!(!client.has_pending_effect_projections());
     assert_eq!(client.retained_projection_failures, 0);
 }
+
+/// A source is usable only once its authenticated media key is durable too.
+/// A failed key write must leave the engine's outbox available across restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_media_key_failure_rolls_back_source_and_replays_after_restart() {
+    use cgka_traits::app_components::{
+        GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    };
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("media key retry", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let (epoch, source_secret) = client
+        .runtime
+        .exporter_secret_with_epoch(&group, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+        .unwrap();
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture_with_secret(
+        b"atomic media source",
+        source_secret.as_ref(),
+    );
+    reference.source_epoch = epoch.0;
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://media.example/{}", reference.ciphertext_sha256),
+    });
+    let event = cgka_traits::app_event::MarmotAppEvent::new(
+        &account.account_id_hex,
+        unix_now_seconds(),
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![reference.imeta_tag()],
+        "atomic media source",
+    );
+    let app_message_id = event.id.clone();
+    let payload = event.encode().unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let source_id = sent.reports[0].message_id.clone();
+    let received = GroupEvent::MessageReceived {
+        authority: None,
+        group_id: group.clone(),
+        message_id: source_id.clone(),
+        sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        sender_leaf_index: None,
+        epoch,
+        payload,
+        retention: None,
+        encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(
+            source_secret.clone(),
+        )),
+    };
+    let storage = app.account_storage("alice").unwrap();
+    // The runtime owns a durable delivery before app projection, as on ingest.
+    storage.put_pending_application_event(&received).unwrap();
+    storage
+        .app_storage()
+        .remember_encrypted_media_epoch_secret(
+            &group_hex,
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            epoch.0,
+            &[0xcc; 32],
+        )
+        .unwrap();
+    let connection =
+        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+    connection.execute_batch("CREATE TRIGGER fail_media_secret BEFORE UPDATE OF secret ON encrypted_media_epoch_secrets BEGIN SELECT RAISE(FAIL, 'injected media secret cache'); END;").unwrap();
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![received],
+        ..Default::default()
+    };
+    let mut summary = SyncSummary::default();
+    let failed = client
+        .observe_account_device_effects(&effects, &mut summary, "media source", unix_now_seconds())
+        .await;
+    assert!(
+        matches!(failed,
+        Err(AppError::Storage(cgka_traits::StorageError::Backend(ref details)))
+            if details.contains("injected media secret cache")),
+        "the required media-key write failure must remain retryable"
+    );
+    assert!(summary.messages.is_empty());
+    assert!(summary.projection_updates.is_empty());
+    assert!(
+        storage
+            .app_storage()
+            .timeline_message(&group_hex, &app_message_id)
+            .unwrap()
+            .is_none(),
+        "a source without its correct key must not become live"
+    );
+    assert!(
+        storage
+            .app_storage()
+            .attachment_history_page(&group_hex, 1, None)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert!(!client.pending_application_event_acks.contains(&source_id));
+    assert!(storage.list_pending_application_events().unwrap().iter().any(|event|
+        matches!(event, GroupEvent::MessageReceived { message_id, .. } if message_id == &source_id)));
+    drop(client);
+
+    let mut reopened = app.client("alice").await.unwrap();
+    connection
+        .execute_batch("DROP TRIGGER fail_media_secret")
+        .unwrap();
+    let repaired = reopened.drain_pending_session_events().await.unwrap();
+    assert_eq!(repaired.messages.len(), 1);
+    assert_eq!(repaired.messages[0].message_id_hex, app_message_id);
+    let source = storage
+        .app_storage()
+        .timeline_message(&group_hex, &app_message_id)
+        .unwrap()
+        .unwrap();
+    assert!(!source.deleted && source.invalidation_status.is_none());
+    assert_eq!(
+        storage
+            .app_storage()
+            .attachment_history_page(&group_hex, 1, None)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    let secret = storage
+        .app_storage()
+        .encrypted_media_epoch_secret(&group_hex, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, epoch.0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        secret.as_slice() == source_secret.as_slice(),
+        "the authenticated source key must replace the stale cached key"
+    );
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A legacy event may outlive its retained source exporter. Missing historic
+/// material must not block valid message content from inbox projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_metadata_without_a_source_exporter_still_projects() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_deployment(crate::MarmotDeployment::neutral()),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("metadata only", &[]).await.unwrap();
+    assert!(!client.state.groups[0].encrypted_media.required);
+    let epoch = client.runtime.group_record(&group).unwrap().epoch;
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"metadata only");
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://media.example/{}", reference.ciphertext_sha256),
+    });
+    let app_event = cgka_traits::app_event::MarmotAppEvent::new(
+        &account.account_id_hex,
+        unix_now_seconds(),
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![reference.imeta_tag()],
+        "keep media metadata",
+    );
+    let app_message_id = app_event.id.clone();
+    let payload = app_event.encode().unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    // A legacy durable event may already be authenticated while projection
+    // waits long enough for its source anchor to leave the retained horizon.
+    for _ in 0..6 {
+        client
+            .runtime
+            .send(cgka_traits::SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(
+        client
+            .runtime
+            .retained_encrypted_media_exporter_secret(&group, epoch)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .encrypted_media_epoch_secret(
+                &hex::encode(group.as_slice()),
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                epoch.0,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group.clone(),
+            message_id: sent.reports[0].message_id.clone(),
+            sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            sender_leaf_index: None,
+            epoch,
+            payload,
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    let mut summary = SyncSummary::default();
+    client
+        .observe_account_device_effects(
+            &effects,
+            &mut summary,
+            "metadata source",
+            unix_now_seconds(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.messages.len(), 1);
+    assert_eq!(summary.messages[0].plaintext, "keep media metadata");
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let row = storage
+        .timeline_message(&hex::encode(group.as_slice()), &app_message_id)
+        .unwrap()
+        .unwrap();
+    assert!(!row.deleted && row.invalidation_status.is_none());
+    assert_eq!(row.tags, vec![reference.imeta_tag()]);
+}

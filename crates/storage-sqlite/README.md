@@ -409,3 +409,15 @@ best-effort activity evidence: queued traffic is not proof of live post-publicat
 
 Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
 arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.
+
+## Reaction artwork sources
+
+Active kind-7 reactions retain their encrypted `imeta` slots in the attachment
+index even though reactions are modifiers and have no standalone timeline row.
+Migration 0167 backfills these sources from retained events. Normal event
+projection maintains them in the same transaction as reaction tallies; unchanged
+slots survive timeline rebuilds. Author retractions, convergence withdrawals,
+retention and group deletion revoke their sources through the ordinary
+acquisition lifecycle. Host applications resolve artwork through
+[`reaction_attachment`](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork)
+and use the returned source slot with existing acquisition and local-read APIs.

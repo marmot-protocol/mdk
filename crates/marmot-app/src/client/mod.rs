@@ -107,7 +107,7 @@ pub(crate) mod sign_out;
 mod small_state;
 mod sync;
 #[cfg(test)]
-mod upload_cleanup_tests;
+pub(crate) mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
 pub(crate) use push::PushFetchClock;
@@ -238,6 +238,7 @@ impl PendingWelcomeDeliveryRecovery {
 pub(crate) struct EncryptedMediaUploadHttp {
     request: crate::media::file_transfer::MediaUploadPayload,
     source_epoch: u64,
+    source_epoch_identity: String,
     media_secret: SecretBytes,
     nostr_signer: Arc<dyn MarmotNostrSigner>,
     version: EncryptedMediaVersion,
@@ -306,7 +307,7 @@ impl EncryptedMediaUploadHttp {
             allowed_locator_kinds: &self.allowed_locator_kinds,
             allow_loopback_http: self.allow_loopback_http,
         };
-        let result = match self.request {
+        let mut result = match self.request {
             crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
                 request.validate()?;
                 let servers = crate::media::upload_servers(request.blossom_server.clone(), policy)?;
@@ -390,6 +391,11 @@ impl EncryptedMediaUploadHttp {
                 .await?
             }
         };
+        // Capture happened on the account worker with the exporter secret,
+        // before HTTP. Never substitute the branch current at completion.
+        for attachment in &mut result.attachments {
+            attachment.reference.source_epoch_identity = Some(self.source_epoch_identity.clone());
+        }
         // Binding is mandatory: an unbound upload would sit staged until it
         // expired. The message itself has not been sent yet.
         let tokens = uploads.tokens().to_vec();
@@ -4860,32 +4866,14 @@ impl AppClient {
                 }
                 other => other,
             };
-            // An encrypted-media reference is bound to the epoch that produced its
-            // ciphertext: the wire `imeta` tag carries no epoch, so every recipient
-            // derives the media key from the epoch of the message that delivers
-            // the tag. Pin the send to that epoch. The engine then refuses to
-            // retain the message while the group's epoch is unsettled and refuses
-            // to encrypt it if convergence moves the epoch during the send, instead
-            // of publishing an attachment nobody can decrypt. Callers have already
-            // checked that every attachment shares one epoch and that it is the
-            // epoch whose media secret this device holds now.
-            //
-            // The reference names only the number, and the sync below or the
-            // engine's own preflight can select a rival branch at that number.
-            // So the pin also carries the identity of the branch this device
-            // holds now, read before either can run. It is read the way the
-            // media secret is, a pending commit's epoch included, and a
-            // reference to any other epoch never matches it. A branch change
-            // before this point, such as during a caller's earlier sync, is
-            // not caught: the reference carries no identity from its upload.
+            // Media and custom-reaction artwork must use the exact branch
+            // that encrypted the upload. The engine enforces this through its
+            // own convergence/preflight, and refuses to retain pinned work.
             let expected_epoch = match &intent {
-                AppMessageIntent::Media { attachments, .. } => match attachments.first() {
-                    Some(attachment) => Some(cgka_traits::EpochPin {
-                        epoch: cgka_traits::types::EpochId(attachment.source_epoch),
-                        ..self.runtime.epoch_pin(group_id)?
-                    }),
-                    None => None,
-                },
+                AppMessageIntent::Media { attachments, .. }
+                | AppMessageIntent::Reaction { attachments, .. } => {
+                    self.media_send_epoch_pin(group_id, attachments)?
+                }
                 _ => None,
             };
             let (event, payload) = if let Some((event, payload)) = prepared {
@@ -5582,9 +5570,10 @@ impl AppClient {
         // into the send, and which keeps the message out of the retention
         // queue while the epoch is unsettled.
         let (sending_epoch, _) = self.encrypted_media_secret(group_id)?;
+        let current = self.runtime.epoch_pin(group_id)?;
         if let Some(stale) = attachments
             .iter()
-            .find(|attachment| attachment.source_epoch != sending_epoch)
+            .find(|attachment| attachment.upload_epoch_pin() != Some(current))
         {
             return Err(AppError::MediaReferenceStaleEpoch {
                 source_epoch: stale.source_epoch,
@@ -5592,6 +5581,31 @@ impl AppClient {
             });
         }
         Ok(())
+    }
+
+    /// Read the upload's pin, never manufacture provenance from the branch
+    /// this device happens to hold at send time. Legacy/received descriptors
+    /// are downloadable but must be uploaded again before an outbound send.
+    fn media_send_epoch_pin(
+        &self,
+        group_id: &GroupId,
+        attachments: &[MediaAttachmentReference],
+    ) -> Result<Option<cgka_traits::EpochPin>, AppError> {
+        let Some(first) = attachments.first() else {
+            return Ok(None);
+        };
+        let pin = first.upload_epoch_pin();
+        if pin.is_none()
+            || attachments
+                .iter()
+                .any(|attachment| attachment.upload_epoch_pin() != pin)
+        {
+            return Err(AppError::MediaReferenceStaleEpoch {
+                source_epoch: first.source_epoch,
+                current_epoch: self.runtime.epoch_pin(group_id)?.epoch.0,
+            });
+        }
+        Ok(pin)
     }
 
     pub async fn send_media_attachments(
@@ -5738,6 +5752,9 @@ impl AppClient {
             endpoints
         };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
+        // No await or engine mutation separates these reads on the worker.
+        // Both methods include a pending commit's epoch, if one exists.
+        let source_pin = self.runtime.epoch_pin(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
         crate::messages::validate_message_tags(request.tags())?;
@@ -5755,6 +5772,7 @@ impl AppClient {
             EncryptedMediaUploadHttp {
                 request,
                 source_epoch,
+                source_epoch_identity: hex::encode(source_pin.identity),
                 media_secret: media_secret.clone(),
                 nostr_signer: signer.as_nostr_signer(),
                 version: policy.version,
@@ -6867,22 +6885,16 @@ impl AppClient {
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
     }
 
-    /// Cache the exporter secret a received media message's attachments are
-    /// keyed to. The message names its source epoch, which the group may have
-    /// left before the message is projected: a convergence pass merges the
-    /// commits it adopts before its replayed applications are drained, and a
-    /// delayed message is read from retained past-epoch secrets. Caching the
-    /// then-current epoch instead leaves every such attachment unreadable.
-    /// The engine captures the secret while it authenticates the message at
-    /// its source epoch (`carried_secret`), because a pass advancing past the
-    /// anchor horizon prunes that epoch's anchor before this runs; deriving it
-    /// here is only the fallback for events that carry none.
+    /// Persist an already-resolved received source key. Resolve any live or
+    /// retained exporter before opening the app projection transaction: the
+    /// engine's retained-anchor rail can need its own database savepoint.
+    /// The caller commits this write together with the source attachment slots.
     fn remember_received_encrypted_media_secret(
         &self,
         group_id: &GroupId,
         source_epoch: u64,
         tags: &[Vec<String>],
-        carried_secret: Option<&cgka_traits::EncryptedMediaSecret>,
+        secret: &[u8],
     ) -> Result<(), AppError> {
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
         let mut component_ids = Vec::new();
@@ -6901,31 +6913,13 @@ impl AppClient {
                 continue;
             };
             let component_id = version.component_id();
-            if !component_ids.contains(&component_id)
-                && self
-                    .cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
-                    .is_none()
-            {
+            if !component_ids.contains(&component_id) {
                 component_ids.push(component_id);
             }
         }
         if component_ids.is_empty() {
             return Ok(());
         }
-        let derived;
-        let secret: &[u8] = match carried_secret {
-            Some(secret) => secret.as_bytes(),
-            None => {
-                derived = self
-                    .exportable_encrypted_media_secret(group_id, source_epoch)?
-                    .ok_or_else(|| {
-                        AppError::InvalidEncryptedMedia(format!(
-                            "encrypted media secret unavailable for epoch {source_epoch}"
-                        ))
-                    })?;
-                derived.as_slice()
-            }
-        };
         for component_id in component_ids {
             self.remember_encrypted_media_epoch_secret_for_component(
                 group_id,
