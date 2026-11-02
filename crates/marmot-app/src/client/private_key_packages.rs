@@ -712,13 +712,14 @@ impl AppClient {
             .take_received_private_key_package_exact(candidate, unix_now_seconds())?)
     }
 
-    /// Add the sibling in `sibling` to `chat` with a KeyPackage it handed
-    /// this device, then send the sibling Welcome the Add leaves owed once
+    /// Add the sibling in `sibling` to `chat` with the exact received
+    /// `candidate` the caller admitted, then send the sibling Welcome owed once
     /// its Commit is published. The engine refuses the Add, writing nothing,
     /// unless both devices are tagged in the trusted device group and the
     /// chat names its relays; it checks a queued Add again at drain, and a
     /// refusal there retires the queued Add with its KeyPackage. The
-    /// KeyPackage is spent either way and never handed back: an error after
+    /// candidate must still be held and unexpired when claimed. Once claimed,
+    /// the KeyPackage is spent either way and never handed back: an error after
     /// the engine took the Add reads the same as a refusal, and a KeyPackage
     /// returned then could reach two Welcomes. Upkeep asks the sibling for
     /// more.
