@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AppClient;
 use super::device_group::Exchange;
+use super::private_key_packages::PrivateKeyPackageSelection;
 use crate::{AppError, unix_now_seconds};
 
 const TARGET: &str = "marmot_app::client::sibling_chat_gaps";
@@ -292,12 +293,20 @@ impl AppClient {
         Ok(())
     }
 
-    pub(crate) async fn fill_sibling_chat_gaps(&mut self, held: &[GroupId], budget: usize) {
+    pub(crate) async fn fill_sibling_chat_gaps(
+        &mut self,
+        held: &[GroupId],
+        budget: usize,
+        selection: &mut PrivateKeyPackageSelection,
+    ) {
         if budget == 0 || !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused()
         {
             return;
         }
-        if let Err(error) = self.try_fill_sibling_chat_gaps(held, budget).await {
+        if let Err(error) = self
+            .try_fill_sibling_chat_gaps(held, budget, selection)
+            .await
+        {
             tracing::warn!(target: TARGET, method = "fill_sibling_chat_gaps", error_kind = error.privacy_safe_kind(), "could not fill sibling chat gaps");
         }
     }
@@ -306,6 +315,7 @@ impl AppClient {
         &mut self,
         held: &[GroupId],
         mut budget: usize,
+        selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             // A later readable/tagged exchange must wake old chats even if
@@ -397,7 +407,7 @@ impl AppClient {
         for chat in due {
             self.sibling_chat_gaps.due.remove(&chat);
             let result = self
-                .fill_one_chat_gap(&exchange, &chat, &siblings, &mut budget)
+                .fill_one_chat_gap(&exchange, &chat, &siblings, &mut budget, selection)
                 .await;
             if let Err(error) = result {
                 self.sibling_chat_gaps.schedule(chat, 0);
@@ -423,6 +433,7 @@ impl AppClient {
         chat: &GroupId,
         siblings: &[DeviceSlotId],
         budget: &mut usize,
+        selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
         if !self.group_quiet(chat)? {
             self.sibling_chat_gaps.schedule(chat.clone(), 0);
@@ -448,7 +459,7 @@ impl AppClient {
                 continue;
             }
             if self
-                .next_private_key_package_for_chat(chat, slot)?
+                .next_private_key_package_for_chat(chat, slot, selection)?
                 .is_none()
             {
                 self.sibling_chat_gaps.waiting_for_stock.insert(gap);
@@ -502,11 +513,13 @@ impl AppClient {
             // Sending the claim may have advanced local effects. Select
             // compatible stock again and pass that exact record to the Add;
             // a clock/preference change cannot consume another allocation.
-            let Some(candidate) = self.next_private_key_package_for_chat(chat, slot)? else {
+            let Some(candidate) = self.next_private_key_package_for_chat(chat, slot, selection)?
+            else {
                 self.sibling_chat_gaps.waiting_for_stock.insert(gap);
                 continue;
             };
             *budget -= 1;
+            selection.record_attempt(slot, &candidate.key_package_ref_hex);
             self.add_sibling_to_chat(chat, slot, candidate).await?;
             self.sibling_chat_gaps
                 .waiting_for_stock

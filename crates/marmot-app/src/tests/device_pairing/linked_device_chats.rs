@@ -216,7 +216,10 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
 
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
     hold_key_packages(&relay, &mut laptop, &mut tablet).await;
-    laptop.client.add_linked_devices_to_chats(&[]).await;
+    laptop
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
     assert!(held_from(&laptop, &tablet) > 0);
     assert_eq!(taken_from(&laptop, &tablet), 0);
     assert!(!chats.iter().any(|chat| joined(&tablet, chat)));
@@ -363,7 +366,9 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     let before = relay.published_events.lock().unwrap().len();
     let stock = held_from(&low, &target);
     assert!(stock > 0);
-    low.client.fill_sibling_chat_gaps(&[], 1).await;
+    low.client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
     assert_eq!(relay.published_events.lock().unwrap().len(), before);
     assert_eq!(held_from(&low, &target), stock);
 
@@ -374,7 +379,7 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
             // driver: the assertion must hold while the claimant is Leaving,
             // before its ordinary removal could also invalidate the claim.
             high.client
-                .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS)
+                .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS, &mut Default::default())
                 .await;
             deliver_new(&mut target.client, &relay, &mut target.cursor).await;
             target.client.join_stashed_sibling_welcomes().await;
@@ -426,13 +431,17 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
         .load(std::sync::atomic::Ordering::SeqCst);
     relay.block_next_publishes(2);
     tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(phone.client.fill_sibling_chat_gaps(&[], 2), async {
-            relay.wait_for_blocked_publishes(blocked + 1).await;
-            relay.release_publish();
-            relay.wait_for_blocked_publishes(blocked + 2).await;
-            relay.reject_next_publish();
-            relay.release_publish();
-        });
+        let mut selection = Default::default();
+        tokio::join!(
+            phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
+            async {
+                relay.wait_for_blocked_publishes(blocked + 1).await;
+                relay.release_publish();
+                relay.wait_for_blocked_publishes(blocked + 2).await;
+                relay.reject_next_publish();
+                relay.release_publish();
+            }
+        );
     })
     .await
     .expect("the claim and terminally rejected Commit complete");
@@ -441,7 +450,10 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
     assert_eq!(leaves_of(&phone, &laptop, &chats[1], &group), 1);
     assert_eq!(taken_from(&phone, &laptop), 2);
     let published = relay.published_event_ids();
-    phone.client.fill_sibling_chat_gaps(&[], 2).await;
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+        .await;
     assert_eq!(
         relay.published_event_ids(),
         published,
@@ -473,7 +485,10 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
     assert_eq!(phone.client.quarantined_groups().len(), 1);
     assert_eq!(taken_from(&phone, &laptop), 0);
     let pin = phone.client.runtime.epoch_pin(&group).unwrap();
-    phone.client.fill_sibling_chat_gaps(&[], 1).await;
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
     assert_eq!(taken_from(&phone, &laptop), 0);
 
     storage.put_group(&original).unwrap();
@@ -481,7 +496,10 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
     phone.client.drain_pending_session_events().await.unwrap();
     assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
-    phone.client.fill_sibling_chat_gaps(&[], 1).await;
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
 }
@@ -531,7 +549,10 @@ async fn a_device_being_removed_is_added_to_no_chat() {
         .await
         .unwrap();
     assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
-    phone.client.add_linked_devices_to_chats(&[]).await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
 }
@@ -556,7 +577,10 @@ async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
         .await
         .unwrap();
     assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
-    phone.client.add_linked_devices_to_chats(&[]).await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
 }
@@ -574,7 +598,10 @@ async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat(
     assert_eq!(held_from(&phone, &laptop), 0);
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
 
-    phone.client.add_linked_devices_to_chats(&[]).await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
 }
@@ -670,7 +697,13 @@ async fn gap_filling_covers_a_link_older_than_the_approvers_burst() {
         )
         .unwrap();
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
-    assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
+    assert_eq!(
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut Default::default())
+            .await,
+        0
+    );
     assert!(held_from(&phone, &laptop) > 0);
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert!(!joined(&laptop, &chats[0]));
@@ -1087,11 +1120,13 @@ async fn a_later_link_by_another_approver_outlives_a_local_failed_link() {
 /// Older clients can participate in the device group without supporting a
 /// chat's optional retention component. Mint that client's authentic private
 /// package with its persisted signer and private bundle, never altered bytes.
-fn older_private_package_without_retention(
+fn private_package_with_lifetime(
     issuer: &Device,
     receiver: &Device,
     group: &GroupId,
     template: &cgka_traits::storage::IssuedPrivateKeyPackage,
+    retention: bool,
+    lifetime: (u64, u64),
 ) -> KeyPackage {
     use cgka_engine::device_tag::seal_device_tag;
     use cgka_engine::provider::EngineOpenMlsProvider;
@@ -1137,7 +1172,9 @@ fn older_private_package_without_retention(
         .clone();
     let mut supported =
         decode_components_list(dictionary.get(&APP_COMPONENTS_COMPONENT_ID).unwrap()).unwrap();
-    supported.remove(&GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    if !retention {
+        supported.remove(&GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    }
     dictionary.insert(
         APP_COMPONENTS_COMPONENT_ID,
         encode_components_list(&supported),
@@ -1164,7 +1201,7 @@ fn older_private_package_without_retention(
     let bundle = MlsKeyPackage::builder()
         .leaf_node_capabilities(leaf.capabilities().clone())
         .leaf_node_extensions(extensions)
-        .key_package_lifetime(Lifetime::init(now - 3600, now + 29 * 24 * 3600))
+        .key_package_lifetime(Lifetime::init(lifetime.0, lifetime.1))
         .build(
             suite,
             &EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
@@ -1201,6 +1238,23 @@ fn older_private_package_without_retention(
         })
         .unwrap();
     package
+}
+
+fn older_private_package_without_retention(
+    issuer: &Device,
+    receiver: &Device,
+    group: &GroupId,
+    template: &cgka_traits::storage::IssuedPrivateKeyPackage,
+) -> KeyPackage {
+    let now = crate::unix_now_seconds();
+    private_package_with_lifetime(
+        issuer,
+        receiver,
+        group,
+        template,
+        false,
+        (now - 3600, now + 29 * 24 * 3600),
+    )
 }
 
 async fn hand_over_stock(
@@ -1246,6 +1300,30 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
                 .unwrap(),
         )
     };
+    let plain = if let Some(retention) = &existing {
+        let plain = phone.client.create_group("plain", &[]).await.unwrap();
+        phone
+            .app
+            .set_chat_pinned("alice", &hex::encode(retention.as_slice()), true)
+            .unwrap();
+        let order = phone
+            .app
+            .chat_list("alice", true)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.group_id_hex)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                hex::encode(retention.as_slice()),
+                hex::encode(plain.as_slice())
+            ]
+        );
+        Some(plain)
+    } else {
+        None
+    };
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let issuer = laptop.slot_hex();
@@ -1260,6 +1338,17 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
         .unwrap();
     let older = older_private_package_without_retention(&laptop, &phone, &group, &newer);
     let older_metadata = marmot_session::key_package_metadata(&older).unwrap();
+    let mut older_refs = vec![older_metadata.key_package_ref_hex.clone()];
+    let mut older_stock = vec![older];
+    if plain.is_some() {
+        let second = older_private_package_without_retention(&laptop, &phone, &group, &newer);
+        older_refs.push(
+            marmot_session::key_package_metadata(&second)
+                .unwrap()
+                .key_package_ref_hex,
+        );
+        older_stock.push(second);
+    }
     let newer_package = KeyPackage::new(newer.key_package)
         .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current);
     let newer_metadata = marmot_session::key_package_metadata(&newer_package).unwrap();
@@ -1278,11 +1367,11 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
     storage
         .delete_received_private_key_packages_from(&issuer)
         .unwrap();
-    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![older]).await;
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, older_stock).await;
     assert_eq!(
         held_from(&phone, &laptop),
-        1,
-        "the real trusted hand-off admits A"
+        older_refs.len(),
+        "the real trusted hand-off admits the older stock"
     );
     let no_compatible = if founding {
         phone
@@ -1291,11 +1380,22 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
             .await
             .unwrap()
     } else {
-        phone.client.add_linked_devices_to_chats(&[]).await;
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut Default::default())
+            .await;
         existing.clone().unwrap()
     };
     assert_eq!(leaves_of(&phone, &laptop, &no_compatible, &group), 0);
-    assert_eq!(taken_from(&phone, &laptop), 0);
+    let prior_adds = usize::from(plain.is_some());
+    if let Some(plain) = &plain {
+        assert_eq!(
+            leaves_of(&phone, &laptop, plain, &group),
+            1,
+            "the retention chat is first but must not hide the later plain chat"
+        );
+    }
+    assert_eq!(taken_from(&phone, &laptop), prior_adds);
     assert!(storage.private_key_package_need(&issuer).unwrap().is_some());
     hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![newer_package]).await;
     assert_eq!(held_from(&phone, &laptop), 2);
@@ -1306,7 +1406,10 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
             .await
             .unwrap()
     } else {
-        phone.client.add_linked_devices_to_chats(&[]).await;
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut Default::default())
+            .await;
         existing.unwrap()
     };
     assert_eq!(
@@ -1314,16 +1417,18 @@ async fn compatible_private_stock_reaches_the_chat(founding: bool) {
         1,
         "newer compatible B must be reached behind older incompatible A (#2869)"
     );
-    let remaining = storage.received_private_key_packages().unwrap();
-    assert_eq!(
-        remaining
-            .iter()
-            .filter(|row| row.issuer_slot_hex == issuer)
-            .map(|row| &row.key_package_ref_hex)
-            .collect::<Vec<_>>(),
-        vec![&older_metadata.key_package_ref_hex]
+    let remaining = storage
+        .received_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.issuer_slot_hex == issuer)
+        .collect::<Vec<_>>();
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        older_refs.contains(&remaining[0].key_package_ref_hex),
+        "B is spent while the remaining incompatible allocation is retained"
     );
-    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(taken_from(&phone, &laptop), prior_adds + 1);
     assert!(
         phone
             .client
@@ -1349,4 +1454,181 @@ async fn post_link_add_reaches_compatible_private_stock_behind_older_stock() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn founding_add_reaches_compatible_private_stock_behind_older_stock() {
     compatible_private_stock_reaches_the_chat(true).await;
+}
+
+/// The shared app preference runs after compatibility filtering. Repeated
+/// advisory peeks reuse one batch; only actual claims retire its allocations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compatible_private_stock_keeps_usable_order_and_longest_fallback() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone
+        .client
+        .create_group_with_options(
+            "retention",
+            &[],
+            AppCreateGroupOptions {
+                disappearing_message_secs: 60,
+                ..AppCreateGroupOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let issuer = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let template = laptop
+        .client
+        .runtime
+        .issued_private_key_packages()
+        .unwrap()
+        .into_iter()
+        .find(|row| hex::encode(row.recipient_slot) == phone.slot_hex())
+        .unwrap();
+    let now = crate::unix_now_seconds();
+    let day = 24 * 3600;
+    let definitions = [
+        (false, now - 3600, now + 7 * day),
+        (true, now - 3600, now + 8 * day),
+        (true, now - 3600, now + 8 * day),
+        (true, now - 3600, now + 10 * day),
+        (true, now - 40 * day, now + 9 * day),
+        (true, now - 40 * day, now + 11 * day),
+    ];
+    let packages = definitions
+        .into_iter()
+        .map(|(retention, before, after)| {
+            private_package_with_lifetime(
+                &laptop,
+                &phone,
+                &group,
+                &template,
+                retention,
+                (before, after),
+            )
+        })
+        .collect::<Vec<_>>();
+    let references = packages
+        .iter()
+        .map(|package| {
+            marmot_session::key_package_metadata(package)
+                .unwrap()
+                .key_package_ref_hex
+        })
+        .collect::<Vec<_>>();
+    let mut tied = [references[1].clone(), references[2].clone()];
+    tied.sort();
+    let expected = [
+        tied[0].clone(),
+        tied[1].clone(),
+        references[3].clone(),
+        references[5].clone(),
+        references[4].clone(),
+    ];
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    storage
+        .delete_received_private_key_packages_from(&laptop.slot_hex())
+        .unwrap();
+    let mut empty = Default::default();
+    assert!(
+        phone
+            .client
+            .next_private_key_package_for_chat(&chat, &issuer, &mut empty)
+            .unwrap()
+            .is_none()
+    );
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, packages).await;
+    let mut selection = Default::default();
+    for (index, expected) in expected.iter().enumerate() {
+        let candidate = phone
+            .client
+            .next_private_key_package_for_chat(&chat, &issuer, &mut selection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&candidate.key_package_ref_hex, expected);
+        if index == 0 {
+            // An advisory second peek (E's post-claim-effect check) must not
+            // reread received stock or silently discard its first candidate.
+            let database = account_database(&phone.app);
+            database
+                .execute_batch("ALTER TABLE private_key_packages_received RENAME TO held_aside")
+                .unwrap();
+            let again =
+                phone
+                    .client
+                    .next_private_key_package_for_chat(&chat, &issuer, &mut selection);
+            database
+                .execute_batch("ALTER TABLE held_aside RENAME TO private_key_packages_received")
+                .unwrap();
+            assert_eq!(
+                again.unwrap().unwrap().key_package_ref_hex,
+                candidate.key_package_ref_hex
+            );
+        }
+        selection.record_attempt(&issuer, &candidate.key_package_ref_hex);
+        assert!(
+            phone
+                .client
+                .take_private_key_package_exact(&issuer, &candidate)
+                .unwrap()
+        );
+    }
+    assert!(
+        phone
+            .client
+            .next_private_key_package_for_chat(&chat, &issuer, &mut selection)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .received_private_key_packages_from(&hex::encode(issuer), now)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.key_package_ref_hex)
+            .collect::<Vec<_>>(),
+        vec![references[0].clone()]
+    );
+    // Native projection can finish a previously failed hand-off while a
+    // maintenance pass holds either empty or all-incompatible cached stock.
+    // A new arrival must invalidate both, before E registers another waiter.
+    let fresh = KeyPackage::new(template.key_package.clone())
+        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current);
+    let fresh_ref = marmot_session::key_package_metadata(&fresh)
+        .unwrap()
+        .key_package_ref_hex;
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![fresh.clone()]).await;
+    let empty_after = phone
+        .client
+        .next_private_key_package_for_chat(&chat, &issuer, &mut empty)
+        .unwrap()
+        .map(|candidate| candidate.key_package_ref_hex);
+    let incompatible_after = phone
+        .client
+        .next_private_key_package_for_chat(&chat, &issuer, &mut selection)
+        .unwrap()
+        .map(|candidate| candidate.key_package_ref_hex);
+    assert_eq!(
+        [empty_after, incompatible_after],
+        [Some(fresh_ref.clone()), Some(fresh_ref.clone())]
+    );
+    let before_duplicate = storage
+        .received_private_key_packages_from(&hex::encode(issuer), now)
+        .unwrap();
+    hand_over_stock(&relay, &mut phone, &mut laptop, &group, vec![fresh]).await;
+    assert_eq!(
+        storage
+            .received_private_key_packages_from(&hex::encode(issuer), now)
+            .unwrap(),
+        before_duplicate
+    );
+    assert_eq!(
+        phone
+            .client
+            .next_private_key_package_for_chat(&chat, &issuer, &mut selection)
+            .unwrap()
+            .unwrap()
+            .key_package_ref_hex,
+        fresh_ref,
+        "duplicate reception preserves the selected allocation"
+    );
 }

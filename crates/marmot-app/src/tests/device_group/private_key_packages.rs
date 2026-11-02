@@ -44,8 +44,8 @@ fn received_from(client: &AppClient, issuer: &DeviceSlotId) -> Vec<ReceivedPriva
 /// Direct Add tests deliberately skip preflight to exercise engine refusal
 /// after an allocation is spent. Normal app callers select compatible stock.
 fn private_candidate(client: &AppClient, issuer: &DeviceSlotId) -> ReceivedPrivateKeyPackage {
-    client
-        .private_key_package_candidates(issuer, crate::unix_now_seconds())
+    devices_storage(client)
+        .received_private_key_packages_from(&hex::encode(issuer), crate::unix_now_seconds())
         .unwrap()
         .into_iter()
         .next()
@@ -206,10 +206,74 @@ async fn a_device_takes_only_its_siblings_own_key_packages() {
     assert!(received_from(&devices.phone, &phone_slot).is_empty());
     assert_eq!(issued(&devices.phone).len(), phone_issued);
 
-    // The same leaf's hand-off of its own KeyPackages is kept.
+    // The insertion can fail after its first write too. Such a hand-off
+    // certifies no new stock; the issuer can hand the same unspent keys over
+    // again once the write works, without changing the allocation protocol.
+    let chat = devices
+        .phone
+        .create_group("receive stock", &[])
+        .await
+        .unwrap();
+    let mut selection = Default::default();
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none()
+    );
+    let database = phone_database(&devices);
+    database
+        .execute_batch(
+            "CREATE TRIGGER refuse_private_stock AFTER INSERT ON private_key_packages_received
+         BEGIN SELECT RAISE(ABORT, 'private hand-off write refused'); END;",
+        )
+        .unwrap();
     devices.laptop.run_due_maintenance().await.unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
+    assert!(received_from(&devices.phone, &laptop_slot).is_empty());
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none(),
+        "a failed insert supplies no candidate to the retained context"
+    );
+    database
+        .execute_batch("DROP TRIGGER refuse_private_stock")
+        .unwrap();
+    let retry = PrivateKeyPackageHandOff {
+        from: laptop_slot,
+        to: phone_slot,
+        key_packages: issued(&devices.laptop)
+            .into_iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .map(|record| KeyPackage::new(record.key_package))
+            .collect(),
+    };
+    assert_eq!(retry.key_packages.len(), 10);
+    devices
+        .laptop
+        .send_device_group_message(
+            &group,
+            KIND_PRIVATE_KEY_PACKAGE_HAND_OFF,
+            base64::engine::general_purpose::STANDARD.encode(retry.encode().unwrap()),
+        )
+        .await
+        .unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(received_from(&devices.phone, &laptop_slot).len(), 10);
+    let selected = devices
+        .phone
+        .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+        .unwrap()
+        .expect("the same retained context sees an authentic resend once insertion commits");
+    assert!(
+        issued(&devices.laptop)
+            .iter()
+            .any(|record| hex::encode(&record.key_package_ref) == selected.key_package_ref_hex)
+    );
 }
 
 /// A sibling takes one KeyPackage to add the issuer to a chat, asks for a
