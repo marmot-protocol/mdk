@@ -922,6 +922,28 @@ impl AppClient {
         }
     }
 
+    fn retire_ended_sibling_welcome_resends(&mut self) -> Result<(), AppError> {
+        // Retirement prepares/sends nothing and remains possible while DG
+        // readiness holds new carriers. The engine durably terminalizes expiry
+        // before we forget timing/high-water state.
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let batch = storage
+            .sibling_welcome_resend_batch(self.sibling_welcome_retirement_cursor.as_deref(), 32)?;
+        if batch.is_empty() {
+            self.sibling_welcome_retirement_cursor = None;
+        }
+        for id in batch {
+            self.sibling_welcome_retirement_cursor = Some(id.clone());
+            if self.runtime.sibling_welcome_resend_has_ended(
+                &MessageId::new(id.clone()),
+                Timestamp(unix_now_seconds()),
+            )? {
+                storage.delete_sibling_welcome_resend(&id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Nothing goes out until this device's own leaf is tagged, since its
     /// sibling would refuse it. Each 461 is pinned to the epoch whose tag was
     /// read: the engine encrypts it under that epoch or refuses it before
@@ -933,6 +955,14 @@ impl AppClient {
     /// never have left. One from a slot other than this device's, or to a
     /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
+        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
+            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
+        }
+        if let Err(error) = self.retire_ended_sibling_welcome_resends() {
+            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
+                error_kind = error.privacy_safe_kind(), "could not retire ended sibling Welcome timing");
+        }
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
@@ -946,6 +976,24 @@ impl AppClient {
         {
             return Ok(());
         }
+        let account_storage = self.app.account_storage(&self.state.label)?;
+        let storage = account_storage.app_storage();
+        let now_ms = super::recovery::wall_now_ms()?;
+        for (id, carrier) in storage.due_sibling_welcome_resends(now_ms)? {
+            match self.runtime.rearm_sibling_welcome(
+                &MessageId::new(id.clone()),
+                &carrier,
+                Timestamp(now_ms / 1_000),
+                &exchange.roster,
+            )? {
+                marmot_session::SiblingWelcomeResendOutcome::Complete => {
+                    storage.delete_sibling_welcome_resend(&id)?;
+                }
+                marmot_session::SiblingWelcomeResendOutcome::Held
+                | marmot_session::SiblingWelcomeResendOutcome::Rearmed => {}
+            }
+        }
+        let excluded = self.excluded_sibling_slots(&exchange)?;
         let mut sent = 0usize;
         for owed in self
             .runtime
@@ -962,15 +1010,56 @@ impl AppClient {
             let Ok(welcome) = SiblingWelcome::decode(&owed.content) else {
                 continue;
             };
-            if welcome.from != exchange.own_slot || !exchange.is_sibling(&welcome.to) {
+            if welcome.from != exchange.own_slot
+                || !exchange.is_sibling(&welcome.to)
+                || excluded.contains(&welcome.to)
+                || !exchange
+                    .roster
+                    .devices
+                    .get(&welcome.to)
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.status,
+                            cgka_traits::app_components::DeviceStatusV1::Active
+                                | cgka_traits::app_components::DeviceStatusV1::Inactive
+                        ) && entry.tag_signature_key.is_some()
+                    })
+            {
                 continue;
             }
-            let event = self.device_group_event(
+            let mut event = self.device_group_event(
                 KIND_SIBLING_WELCOME,
                 base64::engine::general_purpose::STANDARD.encode(&owed.content),
             )?;
+            if let Some((reserved, created_at)) =
+                storage.sibling_welcome_carrier_reservation(owed.id.as_slice())?
+            {
+                event = cgka_traits::MarmotAppEvent::new(
+                    event.pubkey,
+                    created_at,
+                    event.kind,
+                    event.tags,
+                    event.content,
+                );
+                if hex::decode(&event.id)?.as_slice() != reserved.as_slice() {
+                    return Err(StorageError::Backend(
+                        "reserved sibling Welcome carrier differs".into(),
+                    )
+                    .into());
+                }
+            }
             let carrier = hex::decode(&event.id)?;
-            if !self.runtime.carry_sibling_welcome(&owed.id, &carrier)? {
+            // Reserve the actual rumor's time and attach its exact carrier
+            // together, before any external effect. A backward clock holds a
+            // new generation; an unexposed retry may reuse its reservation.
+            let carried = self.runtime.reserve_sibling_welcome_carrier(
+                &owed.id,
+                &exchange.group_id,
+                &welcome.to,
+                &carrier,
+                event.created_at,
+            )?;
+            if !carried {
                 continue;
             }
             self.sibling_welcome_carriers.insert(carrier.clone());
@@ -1022,9 +1111,9 @@ impl AppClient {
     pub(crate) fn settle_sibling_welcome_carriers(
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
-    ) {
+    ) -> Result<(), AppError> {
         let Some(device_group) = self.runtime.device_tag_group() else {
-            return;
+            return Ok(());
         };
         let carrier = |group_id: &GroupId, app_event_id: &str| {
             (group_id == device_group)
@@ -1042,33 +1131,41 @@ impl AppClient {
             .filter_map(|message| carrier(&message.group_id, &message.app_event_id))
             .collect();
         if published.is_empty() && failed.is_empty() {
-            return;
+            return Ok(());
         }
         for carrier in published.iter().chain(&failed) {
             self.sibling_welcome_carriers.remove(carrier);
         }
-        let result = self
-            .runtime
+        self.runtime
             .carried_sibling_welcomes()
             .map_err(AppError::from)
             .and_then(|carried| {
                 for (id, carrier) in carried {
                     if published.contains(&carrier) {
+                        if let Some(observation) = effects
+                            .published_app_messages
+                            .iter()
+                            .find(|message| {
+                                hex::decode(&message.app_event_id).ok().as_deref() == Some(&carrier)
+                            })
+                            .and_then(|message| message.publication_observation)
+                        {
+                            self.app
+                                .account_storage(&self.state.label)?
+                                .app_storage()
+                                .record_sibling_welcome_publication(
+                                    id.as_slice(),
+                                    &carrier,
+                                    observation,
+                                )?;
+                        }
                         self.runtime.sibling_welcome_delivered(&id, &carrier)?;
                     } else if failed.contains(&carrier) {
                         self.runtime.sibling_welcome_send_failed(&id, &carrier)?;
                     }
                 }
                 Ok(())
-            });
-        if let Err(error) = result {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "settle_sibling_welcome_carriers",
-                error_kind = error.privacy_safe_kind(),
-                "could not settle sibling Welcome carriers"
-            );
-        }
+            })
     }
 
     /// Need `want` usable KeyPackages from `issuer`, a burst for adding it to

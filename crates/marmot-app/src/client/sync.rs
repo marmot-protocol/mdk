@@ -2562,12 +2562,15 @@ impl AppClient {
         received_at: u64,
         drained: bool,
     ) {
+        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
+            tracing::warn!(target: "marmot_app::client::sync", method = "retain_effect_projection",
+                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
+        }
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
         self.note_device_group_sent_ids(effects);
         self.note_device_group_removal(effects);
-        self.settle_sibling_welcome_carriers(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
@@ -2637,6 +2640,7 @@ impl AppClient {
         pending: &mut PendingAppliedEffects,
     ) -> Result<(), AppError> {
         if !pending.bookkeeping_started {
+            self.settle_sibling_welcome_carriers(&pending.effects)?;
             self.transport_receipts()?;
             self.observe_recovery_health(&pending.effects)?;
             // This helper transfers unfinished source finalization back to its
@@ -8264,6 +8268,7 @@ mod runtime_group_subscription_refresh_tests {
                 let effects = marmot_session::AccountDeviceEffects {
                     events: vec![event.clone()],
                     published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                        publication_observation: None,
                         group_id: group.clone(),
                         app_event_id: "published-before-tail".into(),
                         message_id: cgka_traits::MessageId::new(vec![0x77; 32]),

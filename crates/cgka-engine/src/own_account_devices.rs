@@ -30,7 +30,7 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
+    DeviceRosterV1, DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
 };
 use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
@@ -83,6 +83,14 @@ pub struct OwedSiblingWelcome {
     /// The app event id of the 461 sent to carry it, while that send is not
     /// resolved.
     pub carrier: Option<Vec<u8>>,
+}
+
+/// Result of a due delivered-Welcome repair check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiblingWelcomeResendOutcome {
+    Rearmed,
+    Held,
+    Complete,
 }
 
 /// Whether a retained sibling Welcome can begin a new carrier delivery.
@@ -602,6 +610,128 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
+    /// Re-owe an already published sibling Welcome after the host's durable
+    /// post-publication activity wait. This reuses the exact Welcome and
+    /// private KeyPackage; the host must first settle outstanding transport
+    /// targets of its previous carrier. Current selected device tags identify
+    /// the target, while only an Update/Commit leaf proves participation.
+    /// Unknown, unreadable or settling state never authorizes a new delivery.
+    pub fn rearm_sibling_welcome(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+        now: Timestamp,
+        roster: &DeviceRosterV1,
+    ) -> Result<SiblingWelcomeResendOutcome, EngineError> {
+        let mut record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(SiblingWelcomeResendOutcome::Complete),
+            Err(error) => return Err(error.into()),
+        };
+        if self.sibling_welcome_resend_has_ended(id, now)? {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        }
+        let StoredMessagePayload::OutboundSiblingWelcome {
+            welcome,
+            key_package_ref,
+            deliver_until,
+            origin,
+            carrier: current_carrier,
+        } = StoredMessagePayload::decode(&record.payload)
+            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?
+        else {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        };
+        if !matches!(record.state, MessageState::Processed | MessageState::Sent)
+            || self.check_sibling_welcome_origin(&record, &origin)?
+                != SiblingWelcomeOriginState::Ready
+        {
+            return Ok(SiblingWelcomeResendOutcome::Held);
+        }
+        let target = SiblingWelcome::decode(&welcome)
+            .map_err(|error| {
+                EngineError::Other(format!("invalid retained sibling Welcome: {error:?}"))
+            })?
+            .to;
+        let Some(entry) = roster.devices.get(&target) else {
+            self.update_stored_message_state(id, MessageState::Failed)?;
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        };
+        if entry.status == cgka_traits::app_components::DeviceStatusV1::Leaving
+            || entry.tag_signature_key.is_none()
+        {
+            return Ok(SiblingWelcomeResendOutcome::Held);
+        }
+        let participated = self.has_own_device_participation(&record.group_id, roster, &target)?;
+        if participated {
+            // A due repair may already be rearmed while new preparation is
+            // held. Complete that debt durably before retiring its high-water;
+            // the preceding successful publication remains the delivery proof.
+            if record.state == MessageState::Sent {
+                self.update_stored_message_state(id, MessageState::Processed)?;
+            }
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        }
+        if record.state != MessageState::Processed || current_carrier.as_deref() != Some(carrier) {
+            return Ok(SiblingWelcomeResendOutcome::Held);
+        }
+        record.state = MessageState::Sent;
+        record.payload = StoredMessagePayload::outbound_sibling_welcome(
+            welcome,
+            key_package_ref,
+            deliver_until,
+            None,
+            origin,
+        )
+        .encode()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        self.storage.put_message(&record)?;
+        self.audit_group(
+            &record.group_id,
+            crate::audit_helpers::message_state_transition_event(
+                hex::encode(id.as_slice()),
+                Some(MessageState::Processed),
+                MessageState::Sent,
+                Some(record.epoch),
+                "state_update",
+            ),
+        );
+        Ok(SiblingWelcomeResendOutcome::Rearmed)
+    }
+
+    /// Whether retained repair metadata has ended, even before activity arms
+    /// its deadline. Expiry becomes terminal in the engine row before callers
+    /// drop the carrier high-water, so clock rollback cannot make it owed again.
+    /// This does not cancel already-handed-off transport fanout settlement.
+    pub fn sibling_welcome_resend_has_ended(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> Result<bool, EngineError> {
+        let record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(StoredMessagePayload::OutboundSiblingWelcome {
+            deliver_until,
+            origin,
+            ..
+        }) = StoredMessagePayload::decode(&record.payload)
+        else {
+            return Ok(true);
+        };
+        if record.state == MessageState::Failed {
+            return Ok(true);
+        }
+        if now >= deliver_until {
+            self.update_stored_message_state(id, MessageState::Failed)?;
+            return Ok(true);
+        }
+        Ok(self.check_sibling_welcome_origin(&record, &origin)?
+            == SiblingWelcomeOriginState::Withdrawn)
+    }
+
     /// Existing sibling-Welcome carriers whose transport outcomes still need
     /// settling. Unlike new-send eligibility, settlement remains possible
     /// while the originating chat or Add is temporarily held.
@@ -697,8 +827,9 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Mark the sibling Welcome `id` delivered once the 461 `carrier` was
-    /// published, so no 461 carries it again: when to resend one is not
-    /// specified yet. Exact carrier outcomes settle even while new delivery
+    /// published. A repair requires a fresh post-publication authenticated
+    /// target observation and its fixed 600-second wait. Exact carrier
+    /// outcomes settle even while new delivery
     /// is held. `false` when the carrier differs or the row is retired or
     /// already settled.
     pub fn sibling_welcome_delivered(
@@ -761,6 +892,9 @@ impl<S: StorageProvider> Engine<S> {
         else {
             return Ok(false);
         };
+        if new_handoff && self.wall_clock.now() >= deliver_until {
+            return Ok(false);
+        }
         match self.check_sibling_welcome_origin(&record, &origin)? {
             SiblingWelcomeOriginState::Withdrawn => return Ok(false),
             SiblingWelcomeOriginState::Held if new_handoff => return Ok(false),

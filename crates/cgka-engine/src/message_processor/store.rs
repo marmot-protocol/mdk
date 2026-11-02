@@ -885,7 +885,7 @@ impl<S: StorageProvider> Engine<S> {
         }) {
             if let Some(transport_id) = processed_transport_id {
                 self.storage
-                    .put_processed_transport_id(group_id, transport_id)?;
+                    .put_processed_transport_content(group_id, transport_id, &id)?;
             }
             return Ok(());
         }
@@ -900,7 +900,7 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(transport_id) = processed_transport_id {
             self.storage.with_transaction(|storage| {
                 storage.put_message(&record)?;
-                storage.put_processed_transport_id(group_id, transport_id)?;
+                storage.put_processed_transport_content(group_id, transport_id, &record.id)?;
                 Ok::<(), EngineError>(())
             })?;
         } else {

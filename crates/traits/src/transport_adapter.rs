@@ -241,6 +241,15 @@ pub enum FanoutPendingKind {
     Disband,
 }
 
+/// A locally ordered, durable observation. Order is scoped to one account-device
+/// store; wall time measures the wait, while order distinguishes replay and
+/// observations made in the same millisecond or across clock adjustments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationObservation {
+    pub order: u64,
+    pub at_ms: u64,
+}
+
 /// One durable transport fanout frozen before its first external side effect.
 ///
 /// The request owns the exact serialized transport message and original target
@@ -263,6 +272,8 @@ pub struct OutboundFanout {
     pending_kind: Option<FanoutPendingKind>,
     #[serde(default)]
     published_message_id: Option<MessageId>,
+    #[serde(default)]
+    first_acceptance_observation: Option<PublicationObservation>,
     target_statuses: Vec<FanoutTargetStatus>,
     #[serde(default)]
     target_failures: Vec<Option<TransportEndpointFailure>>,
@@ -381,6 +392,7 @@ impl OutboundFanout {
             pending_origin_message_id,
             pending_kind,
             published_message_id: None,
+            first_acceptance_observation: None,
             target_statuses: vec![FanoutTargetStatus::NotAttempted; target_count],
             target_failures: vec![None; target_count],
             target_attempt_counts: vec![0; target_count],
@@ -456,6 +468,34 @@ impl OutboundFanout {
             matches!(self.mls_state, FanoutMlsState::Pending(_))
                 .then_some(FanoutPendingKind::GroupEvolution)
         })
+    }
+
+    /// First durable local observation of accepted publication. Legacy accepted
+    /// fanouts have no recoverable boundary and remain `None`.
+    pub fn first_acceptance_observation(&self) -> Option<PublicationObservation> {
+        self.first_acceptance_observation
+    }
+
+    /// Called by the durable store in the transaction that first records an
+    /// accepted target, before exposing a replayable publication effect.
+    pub fn observe_first_acceptance(
+        &mut self,
+        observation: PublicationObservation,
+    ) -> Result<(), TransportAdapterError> {
+        if self.outcome().accepted_targets == 0 || observation.order == 0 {
+            return Err(TransportAdapterError::Other(
+                "invalid publication observation".into(),
+            ));
+        }
+        match self.first_acceptance_observation {
+            Some(previous) if previous != observation => Err(TransportAdapterError::Other(
+                "publication observation changed".into(),
+            )),
+            _ => {
+                self.first_acceptance_observation = Some(observation);
+                Ok(())
+            }
+        }
     }
 
     pub fn created_at_ms(&self) -> u64 {
@@ -765,7 +805,19 @@ impl OutboundFanout {
                 (Some(previous), Some(next)) => previous == next,
                 (Some(_), None) => false,
             };
+        let observation_advances = match (
+            previous.first_acceptance_observation,
+            self.first_acceptance_observation,
+        ) {
+            (Some(prior), Some(next)) => prior == next,
+            (None, Some(_)) => {
+                previous.outcome().accepted_targets == 0 && self.outcome().accepted_targets > 0
+            }
+            (None, None) => true,
+            (Some(_), None) => false,
+        };
         let targets_advance = immutable_matches
+            && observation_advances
             && published_id_advances
             && self
                 .target_statuses

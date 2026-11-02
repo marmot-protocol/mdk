@@ -408,6 +408,23 @@ Engine-behavior assertions need an `Engine<S>` and a storage backend, so they li
 transitions, diff helpers, policy ordering, codecs, caches) uses in-crate `#[cfg(test)]` modules; `src/` has many, and
 `src/openmls_projection/tests/` and `src/message_processor/tests/` hold `--lib` replay and measurement tests.
 
+`account_devices/device_tag.rs::accepted_device_group_application_commit_and_proposal_retain_their_exact_source`
+owns native accepted source proof for direct application/standalone Proposal and selected Commit replay. It proves
+buffering/probes do not observe, source epoch/leaf/current-roster attribution, and rewrapped duplicate immutability.
+The scalar order, delayed partial-proof attribution, deadline and file restart/snapshot contracts belong to SQLite's
+`cross::sibling_welcome_resends` temporal owner; app orchestration remains in its existing lost-Welcome owner.
+
+`account_devices/device_tag.rs::device_group_proposal_profile_read_failure_keeps_native_receive_retryable`
+owns rollback on a real proposal-admission profile read failure: file-backed SQL trigger, independent group/MLS reads,
+wrapper/source absence and exact retry. Propagate storage errors inside native acceptance; only actual policy
+`InvalidTransition` remains the outer terminal rejection path.
+
+`account_devices/device_tag.rs::partial_device_group_source_recovery_pages_past_unavailable_history` owns fair bounded
+source recovery past a genuinely admitted unavailable-history prefix, preserving pending facts and selected state.
+`account_devices/sibling_welcomes.rs::sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire` owns
+terminal expiry before metadata retirement, exact late-outcome handling and clock-rollback re-registration rejection.
+The existing participation owner also proves rearm audit events follow outer commit/savepoint rollback discipline.
+
 History and backup label interoperability stays in the source-local crypto tests. Open and seal through raw HPKE
 with literal encoded label/context bytes in both directions; an oracle built from the production label or context
 helper cannot detect a consistently wrong encoding. Preserve the fixed derivation and device-tag vectors.

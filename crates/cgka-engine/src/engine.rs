@@ -12,7 +12,7 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::convergence_clock::{ConvergenceClock, ConvergenceTime, SystemConvergenceClock};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
-pub use crate::own_account_devices::OwedSiblingWelcome;
+pub use crate::own_account_devices::{OwedSiblingWelcome, SiblingWelcomeResendOutcome};
 use async_trait::async_trait;
 use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{
@@ -154,7 +154,7 @@ impl<S: StorageProvider> Drop for OperationAuditScope<'_, S> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SystemWallClock;
+pub(crate) struct SystemWallClock;
 
 impl WallClock for SystemWallClock {
     fn now(&self) -> cgka_traits::Timestamp {
@@ -246,6 +246,8 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) authority_recovery_cursor: Option<MessageId>,
+    pub(crate) device_group_source_recovery:
+        std::sync::Mutex<crate::device_tag::SourceRecoveryProgress>,
     pub(crate) authority_recovery_attempts: HashMap<MessageId, [u8; 32]>,
     pub(crate) authority_recovery_seen: HashSet<MessageId>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
@@ -717,6 +719,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             authority_recovery_cursor: None,
+            device_group_source_recovery: std::sync::Mutex::default(),
             authority_recovery_attempts: HashMap::new(),
             authority_recovery_seen: HashSet::new(),
             auto_publish_buf: VecDeque::new(),
@@ -3928,6 +3931,51 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<(Vec<u8>, DeviceTagClaim)>, EngineError> {
         self.read_other_own_account_leaves(group_id, |leaf| {
             Some(crate::device_tag::device_tag_claim(leaf, roster))
+        })
+    }
+
+    /// Only a current target-device tag on a selected Update/Commit leaf
+    /// proves participation; an Add's KeyPackage leaf is inconclusive.
+    pub(crate) fn has_own_device_participation(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        target: &cgka_traits::app_components::DeviceSlotId,
+    ) -> Result<bool, EngineError> {
+        self.with_live_mls_group(group_id, |group| {
+            for member in group.members() {
+                if member.index == group.own_leaf_index()
+                    || !openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                        .is_ok_and(|credential| {
+                            credential.identity() == self.identity.self_id().as_slice()
+                        })
+                {
+                    continue;
+                }
+                let leaf = group
+                    .public_group()
+                    .leaf(member.index)
+                    .ok_or_else(|| EngineError::Other("selected member leaf unavailable".into()))?;
+                if crate::device_tag::device_tag_claim(leaf, roster)
+                    != DeviceTagClaim::Device(*target)
+                {
+                    continue;
+                }
+                // RFC 9420 section 7.2: source discriminants are KeyPackage=1,
+                // Update=2, Commit=3. This fork exposes the source accessor but
+                // not its enum path. Serialize that source only, using its
+                // typed TLS discriminator rather than inspecting Debug text.
+                let source = leaf
+                    .leaf_node_source()
+                    .tls_serialize_detached()
+                    .map_err(|_| EngineError::Other("selected leaf source unavailable".into()))?;
+                match source.first() {
+                    Some(1) => {}
+                    Some(2 | 3) => return Ok(true),
+                    _ => return Err(EngineError::Other("unknown selected leaf source".into())),
+                }
+            }
+            Ok(false)
         })
     }
 

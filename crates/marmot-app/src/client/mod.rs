@@ -1084,6 +1084,7 @@ pub struct AppClient {
     /// settles. A carrier the engine holds that is not here was in flight
     /// when the app last stopped, so its Welcome is owed again.
     pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
+    pub(crate) sibling_welcome_retirement_cursor: Option<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
