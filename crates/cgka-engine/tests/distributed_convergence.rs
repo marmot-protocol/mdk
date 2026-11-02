@@ -4623,23 +4623,13 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
     assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
 
-/// U6 resolution (option-c plan): the historical-rewind route and the
-/// no-rewind route agree — a within-horizon losing commit is deferred as
-/// `ConvergenceDeferred` / `NonSelectedEligibleBranch` on BOTH, so a later
-/// pass can reconsider it. There is no third terminality asymmetry.
+/// A within-horizon losing commit stays `ConvergenceDeferred` with
+/// `NonSelectedEligibleBranch` on both historical-rewind and no-rewind routes,
+/// allowing reconsideration in a later pass.
 ///
-/// The three rewind tests above
-/// (`engine_replays_late_same_epoch_commit_from_retained_anchor`,
-/// `engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon`,
-/// `rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor`)
-/// *appear* to pin `EpochInvalidated` for the same shape, but their
-/// `bob_wins == false` arms are dead: `committer_wins(&bob, &alice)` is
-/// deterministically true for the label-derived identities, so the late
-/// commit always WINS there and the terminal expectation never executes
-/// (verified empirically by tracing every `EpochInvalidated` write site —
-/// none fires during those tests). This test exercises the mirrored,
-/// previously uncovered arm: the deterministic tiebreak WINNER is applied
-/// first, and the LOSER arrives late within the rewind horizon.
+/// The four fixed-identity rewind fixtures above exercise Bob's late winning
+/// commit. This test owns the mirrored direction on both routes: apply the
+/// winner first, then admit the loser within the rewind horizon.
 #[tokio::test]
 async fn rewind_and_no_rewind_routes_agree_on_losing_commit_disposition() {
     let (mut alice, _alice_storage) = build_client(b"alice");
