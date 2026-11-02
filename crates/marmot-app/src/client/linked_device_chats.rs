@@ -21,6 +21,11 @@
 //!   stated limit.
 //! - A device this device's user decided to remove gets no Add while that
 //!   removal waits to commit, or after branch selection drops it.
+//! - Nor does a device in a slot a roster state this device applied held as
+//!   `removed`, whichever device decided that removal, while this device
+//!   keeps the key that record carried (`held_as_removed`): after branch
+//!   selection drops the record, and for a later link of the slot
+//!   (device-group.md, "Adding the new device to chats").
 //! - A chat with this device's commit queued, in flight or settling waits for
 //!   a later pass, so an Add is never doubled.
 //! - Before a chat takes a KeyPackage, the engine checks the Add against the
@@ -166,7 +171,8 @@ impl AppClient {
     /// lists as active and linked by this device, with "add to all my chats"
     /// on and their tag signature key set. A device this device's user
     /// decided to remove is none of them, while its removal waits to commit
-    /// or is made again.
+    /// or is made again; nor is one in a slot a roster state this device
+    /// applied held as `removed`, while this device keeps that record's key.
     fn devices_to_add_to_chats(
         &self,
         exchange: &Exchange,
@@ -179,6 +185,12 @@ impl AppClient {
             .into_iter()
             .filter(|removal| removal.group_id_hex == group_id_hex)
             .map(|removal| removal.slot_hex)
+            .collect::<std::collections::HashSet<_>>();
+        let held_as_removed = self
+            .remembered_tag_keys(&exchange.group_id)?
+            .into_iter()
+            .filter(|key| key.held_as_removed)
+            .map(|key| key.slot)
             .collect::<std::collections::HashSet<_>>();
         Ok(storage
             .device_links()?
@@ -193,6 +205,9 @@ impl AppClient {
             })
             .filter_map(|link| {
                 let slot = device_slot(&link.slot_hex).ok()?;
+                if held_as_removed.contains(&slot) {
+                    return None;
+                }
                 let entry = exchange.roster.devices.get(&slot)?;
                 (entry.linked_by == Some(exchange.own_slot)
                     && entry.status == DeviceStatusV1::Active

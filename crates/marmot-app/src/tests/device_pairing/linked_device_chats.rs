@@ -8,6 +8,7 @@
 use super::*;
 use crate::AppCreateGroupOptions;
 use crate::client::linked_device_chats::{LINK_CHAT_ADD_SECS, LINK_CHAT_ADDS_PER_PASS};
+use crate::tests::device_group::{commit_removal_decided_elsewhere, converge_device_group};
 
 /// `count` chats `device` makes on its own.
 async fn chats(device: &mut Device, count: usize) -> Vec<GroupId> {
@@ -95,6 +96,64 @@ fn held_from(device: &Device, issuer: &Device) -> usize {
         .count()
 }
 
+/// The phone asks for the laptop's KeyPackages, and holds them, before any
+/// add pass of its own runs.
+async fn hold_key_packages(
+    relay: &ScriptedPushRelayClient,
+    phone: &mut Device,
+    laptop: &mut Device,
+) {
+    for _ in 0..3 {
+        deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+        phone.client.sibling_key_package_upkeep(&[]).await;
+        deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
+        laptop.client.run_due_maintenance().await.unwrap();
+    }
+    deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+    assert!(held_from(phone, laptop) > 0);
+}
+
+/// A removal of the laptop another device decided reaches the phone, which
+/// applies it with no decision of its own recorded, and, after a maintenance
+/// pass when `pass_between`, is dropped: the laptop, which never receives
+/// that branch, renames itself from the epoch before it until its branch is
+/// the deeper, and the phone adopts that branch, whose roster lists the
+/// laptop again.
+async fn drop_a_removal_decided_elsewhere(
+    relay: &ScriptedPushRelayClient,
+    phone: &mut Device,
+    laptop: &mut Device,
+    group: &GroupId,
+    pass_between: bool,
+) {
+    let slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    commit_removal_decided_elsewhere(&mut phone.client, group, slot).await;
+    assert!(phone.roster(group).rejected_slots.contains_key(&slot));
+    if pass_between {
+        phone.client.run_due_maintenance().await.unwrap();
+    }
+    laptop.cursor = relay.published_events.lock().unwrap().len();
+    let epoch = |device: &Device| device.client.runtime.group_record(group).unwrap().epoch;
+    let phone_epoch = epoch(phone);
+    let mut renames = 0;
+    while epoch(laptop) <= phone_epoch {
+        renames += 1;
+        let slot_hex = laptop.slot_hex();
+        laptop
+            .client
+            .rename_linked_device(&slot_hex, &format!("Laptop {renames}"))
+            .await
+            .unwrap();
+    }
+    converge_device_group(&mut phone.client, relay, &mut phone.cursor, group, 8).await;
+    let roster = phone.roster(group);
+    assert!(
+        !roster.rejected_slots.contains_key(&slot),
+        "branch selection dropped the removal"
+    );
+    assert!(roster.devices.contains_key(&slot));
+}
+
 /// The phone links the laptop, and the laptop joins each of the chats the
 /// phone was in, each from a sibling Welcome the phone sent with one of the
 /// laptop's private KeyPackages. A restart partway changes nothing, and
@@ -173,16 +232,7 @@ async fn a_device_being_removed_is_added_to_no_chat() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let chat = phone.client.create_group("chat", &[]).await.unwrap();
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    // The phone asks for the laptop's KeyPackages, and holds them, before
-    // any add pass of its own runs.
-    for _ in 0..3 {
-        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-        phone.client.sibling_key_package_upkeep(&[]).await;
-        deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
-        laptop.client.run_due_maintenance().await.unwrap();
-    }
-    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-    assert!(held_from(&phone, &laptop) > 0);
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
     phone
         .app
         .account_storage("alice")
@@ -194,6 +244,42 @@ async fn a_device_being_removed_is_added_to_no_chat() {
             crate::unix_now_seconds(),
         )
         .unwrap();
+
+    phone.client.add_linked_devices_to_chats(&[]).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+}
+
+/// A removal another device decided, which the phone applied and saw branch
+/// selection drop with no maintenance pass between, stops the phone adding
+/// the device, and still does after a restart: a roster state the phone
+/// applied held the laptop's slot as `removed`. The roster lists the laptop
+/// again, its link is made and the phone holds its KeyPackages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, false).await;
+    let mut phone = reopen(phone).await;
+
+    phone.client.add_linked_devices_to_chats(&[]).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+}
+
+/// The phone runs a maintenance pass after applying a removal another device
+/// decided, which branch selection then drops. Asked for KeyPackages only
+/// after the drop, the again-listed laptop hands the phone some, and the
+/// phone still adds it to no chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_that_answers_after_its_removal_is_dropped_is_added_to_no_chat() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = phone.client.create_group("chat", &[]).await.unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, true).await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
 
     phone.client.add_linked_devices_to_chats(&[]).await;
     assert_eq!(taken_from(&phone, &laptop), 0);

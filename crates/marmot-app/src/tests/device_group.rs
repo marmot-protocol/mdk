@@ -30,6 +30,8 @@ mod private_key_packages;
 mod removal;
 mod sign_out;
 
+pub(super) use removal::{commit_removal_decided_elsewhere, converge_device_group};
+
 fn device_group_app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     device_group_app_on(dir, relay, MarmotDeployment::white_noise())
 }
