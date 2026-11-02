@@ -642,10 +642,12 @@ async fn inbound_self_update_rejects_account_identity_spoofing() {
 
 #[tokio::test]
 async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
-    // Lock the `staged.update_proposals()` arm independently from the direct
-    // update-path test above: Bob first queues a spoofed Update proposal, then
-    // Alice commits it by reference. Recipients must validate Bob's proposed new
-    // leaf against Bob's pre-merge account identity before applying the commit.
+    // Preserve standalone proof rejection and the later by-reference refusal.
+    // Because the rejected proposal is never re-admitted, the later commit
+    // does not independently isolate the staged Update proof validator.
+    // Keep the real inputs rather than constructing an accepted spoof.
+    // Bob's standalone spoof fails first; Alice's later real by-reference
+    // commit must stay refused across the recipient's durable reconstruction.
     let (mut alice, alice_storage) = build_with_storage(b"alice");
     let (mut bob, bob_storage) = build_with_storage(b"bob");
     let (mut carol, carol_storage) = build_with_storage(b"carol");
@@ -828,6 +830,8 @@ async fn current_by_reference_non_admin_update_is_rejected_at_commit() {
         result.dropped_messages.iter().any(|dropped| {
             dropped.message_id == commit_id
                 && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.rejection_category
+                    == Some(ProposalRejectionCategory::AuthorizationFailed)
         }),
         "commit-time revalidation must reject a non-admin by-reference Update, got {result:?}"
     );
@@ -1057,7 +1061,17 @@ async fn external_join_proposal_is_rejected_before_pending_state() {
 
 #[tokio::test]
 async fn stale_standalone_proposal_never_schedules_or_reenters_pending_state() {
-    let (mut alice, _alice_storage) = build_current_with_storage(b"alice-stale-proposal");
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = EngineBuilder::new(alice_storage.clone())
+        .identity(pad32(b"alice-stale-proposal"))
+        .account_identity_proof_signer(proof_signer(b"alice-stale-proposal"))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .unwrap();
     let (mut bob, bob_storage) = build_current_with_storage(b"bob-stale-proposal");
     let group_id = establish_current_group(&mut alice, &mut bob, false, "stale-proposal").await;
     let crypto = RustCrypto::default();
@@ -1092,6 +1106,43 @@ async fn stale_standalone_proposal_never_schedules_or_reenters_pending_state() {
         "wrong-epoch proposal should retain the stale distinction, got {outcome:?}"
     );
     assert!(alice.drain_auto_publish().is_empty());
+    // OpenMLS owns WrongEpoch admission. Observe its real store and the actual
+    // SelfRemove timer, without forbidding harmless convergence wakeups.
+    let fresh = MlsGroup::load(
+        alice_storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(fresh.pending_proposals().next().is_none());
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None
+    );
+    clock.advance_ms(1_000);
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(alice.drain_auto_publish().is_empty());
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None
+    );
+    let fresh = MlsGroup::load(
+        alice_storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(fresh.pending_proposals().next().is_none());
 }
 
 /// Carol has settled alice's epoch-1 branch and retained its anchor; bob's
@@ -1247,6 +1298,18 @@ async fn parent_dependent_proposal_waits_for_retained_fork_parent() {
             .state,
         MessageState::Failed
     );
+    // The alternate parent does not make this proposal canonical. Its positive
+    // outcome is retained ownership while awaiting a canonical commit, not
+    // acceptance into the live group's pending proposal store.
+    assert!(result.deferred_messages.iter().any(|deferred| deferred.message_id == proposal_id && deferred.reason == cgka_engine::canonicalization::DeferredMessageReason::AwaitingCanonicalCommit));
+    assert_eq!(
+        carol_storage
+            .get_message(&proposal_message_id)
+            .unwrap()
+            .state,
+        MessageState::ConvergenceDeferred,
+        "parent-dependent proposal remains explicitly owned for convergence"
+    );
 }
 
 /// The same seam, reached through the retry lifecycle. It reports `Buffered`,
@@ -1310,10 +1373,9 @@ async fn a_retained_wrapper_is_retired_when_its_proposal_waits_for_its_fork_pare
 }
 
 #[tokio::test]
-async fn non_admin_commit_allowlist_accepts_only_self_update_and_self_remove() {
-    // spec/protocol-core/group-messaging.md:46-53 — a non-admin may commit
-    // ONLY a pure self-update or a SelfRemove-only commit. Every other shape
-    // (PSK, GCE, Add, Remove, AppDataUpdate, combinations) requires admin.
+async fn ordinary_commit_allowlist_accepts_self_update_and_requires_admin_for_psk() {
+    // This classifier boundary covers pure SelfUpdate and repeated PSK
+    // preparation. The real SelfRemove-only shape has its own test below.
     let (mut alice, alice_storage) = build_with_storage(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
@@ -1370,7 +1432,8 @@ async fn non_admin_commit_allowlist_accepts_only_self_update_and_self_remove() {
         "a PreSharedKey commit must require admin"
     );
 
-    // Combination: self-update path + a PSK proposal. REJECTED.
+    // Repeat PSK preparation after the previous helper cleared its staged commit.
+    // This checks retrying the same shape, not a second proposal combination.
     assert!(
         requires_admin_for_proposals(
             &alice_storage,
@@ -1391,7 +1454,17 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
     // non-admin, self-removes; a remaining member stages a SelfRemove-only
     // commit) and assert the allowlist classifies that staged commit as
     // not-admin-required.
-    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .unwrap();
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -1436,7 +1509,12 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
     // Alice ingests bob's SelfRemove and schedules the deferred auto-commit.
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap()
+            .unwrap(),
+    );
     let advanced = alice.advance_convergence(&group_id).await.unwrap();
     assert!(advanced.is_empty());
 
@@ -1468,7 +1546,7 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
 }
 
 #[tokio::test]
-async fn committer_must_not_be_leaver_holds_for_self_proposal() {
+async fn own_selfremove_echo_is_ignored_without_auto_commit() {
     // RFC 9420 §12.2 — when bob (non-admin) produces his own SelfRemove
     // proposal, his engine should NOT auto-commit it (he's the target).
     // The auto_committer policy returns Observe in this case; this test
