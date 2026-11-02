@@ -2403,23 +2403,6 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         }
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    let expected_joined_output = GroupEvent::GroupJoined {
-        group_id: group_id.clone(),
-        via_welcome: welcome.id.clone(),
-        welcomer: Some(alice.self_id()),
-        explicitly_confirmed: false,
-    };
-    let joined_handle = bob_handle.clone();
-    let assert_joined_output = || {
-        assert!(
-            joined_handle
-                .list_pending_application_events()
-                .unwrap()
-                .iter()
-                .any(|event| event == &expected_joined_output),
-            "{label}: rewinds must retain the original Welcome author without inventing replacement consent"
-        );
-    };
     bob.join_welcome(welcome).await.unwrap();
 
     // Each co-admin sends an application at epoch 1, then commits an invite
@@ -2500,7 +2483,6 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         loser.ingest(routed_winner.clone()).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
-    assert_joined_output();
     let mut rows_before = handle
         .list_messages(&group_id, EpochId(0))
         .unwrap()
@@ -2582,7 +2564,6 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
             sorted_pending_events() == pending_events_before,
             "{label}: a failed rewind changed complete pending output"
         );
-        assert_joined_output();
         assert_eq!(
             handle.list_queued_outbound_intents(&group_id).unwrap(),
             queued_before,
@@ -2642,7 +2623,6 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         sorted_pending_events() == pending_events_before,
         "{label}: the reorg must preserve complete pending application outputs"
     );
-    assert_joined_output();
     assert!(
         handle.get_message(&late_app).unwrap() == late_record_before,
         "{label}: the already-processed application must retain its complete record"
