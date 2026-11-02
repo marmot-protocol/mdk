@@ -117,7 +117,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     matrix enables that feature explicitly for settlement/rewind fixtures.
 
 - **File:** `mip03_guards.rs`
-  - **Owns:** Committer-MUST-NOT-be-leaver, admin-not-last, admin-self-remove
+  - **Owns:** Ordinary commit/proposal admission and admin policy guards, own SelfRemove echo filtering,
+    admin-not-last and admin-self-remove. Direct target-side auto-committer decision proof remains a gap.
 
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution

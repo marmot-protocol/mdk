@@ -1,7 +1,7 @@
 //! MIP-03 policy guards.
 //!
-//! Engine-layer guards the engine can enforce directly:
-//! - Committer-MUST-NOT-be-leaver (RFC 9420 §12.2)
+//! Engine policy guards and proposal admission, including own SelfRemove echo
+//! filtering. Direct target-side auto-committer decision proof remains a gap.
 //!
 //! Admin-related guards are enforced through Marmot group data and capability
 //! tracking rather than by OpenMLS alone.
@@ -1442,7 +1442,7 @@ async fn ordinary_commit_allowlist_accepts_self_update_and_requires_admin_for_ps
             &signer,
             vec![psk_proposal],
         ),
-        "a commit combining a path with a non-allowed proposal must require admin"
+        "repeated PSK preparation must still require admin"
     );
 }
 
@@ -1547,11 +1547,9 @@ async fn non_admin_commit_allowlist_accepts_self_remove_only_commit() {
 
 #[tokio::test]
 async fn own_selfremove_echo_is_ignored_without_auto_commit() {
-    // RFC 9420 §12.2 — when bob (non-admin) produces his own SelfRemove
-    // proposal, his engine should NOT auto-commit it (he's the target).
-    // The auto_committer policy returns Observe in this case; this test
-    // exercises the boundary by ingesting bob's own proposal back at bob
-    // and verifying he does NOT auto-commit.
+    // A locally sent SelfRemove returning as a transport echo is classified
+    // OwnEcho before MLS/proposal policy. This checks that echo filter and no
+    // auto-published commit, not auto_committer's we_are_target decision.
     let mut alice = build(b"alice");
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");

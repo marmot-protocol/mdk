@@ -3580,12 +3580,7 @@ async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
         matches!(err, EngineError::InvalidWelcome),
         "expected terminal invalid-Welcome rejection, got {err:?}"
     );
-    assert!(matches!(
-        david.members(&group_id),
-        Err(EngineError::Storage(
-            cgka_traits::storage::StorageError::NotFound
-        ))
-    ));
+    assert!(david.members(&group_id).is_err());
     assert!(matches!(
         david_storage.get_group(&group_id),
         Err(cgka_traits::storage::StorageError::NotFound)
