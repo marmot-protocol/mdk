@@ -74,7 +74,7 @@ atomic require-and-populate API.
 ## Background recovery
 
 **Experimental sibling Welcome delivery.** A retained sibling Welcome records the exact confirmed Add that produced
-it. The origin format also reserves canonical founding for the forthcoming founding-sibling path (mdk#2628 3.5d).
+it, or canonical creation for a founding sibling (mdk#2628 3.5d).
 Before a new carrier is created, owed-work and carrier transitions check
 that origin from stored state. A deferred Add holds delivery because its branch may be selected again; terminal
 invalidation or a terminal chat retires the old Welcome. The association and terminal condition survive restart.

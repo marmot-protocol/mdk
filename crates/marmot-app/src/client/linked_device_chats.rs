@@ -179,6 +179,66 @@ impl AppClient {
         optional_components: &[cgka_traits::app_components::AppComponentData],
         constructable: &cgka_traits::capabilities::GroupCapabilities,
         relays: &[String],
+    ) -> Vec<SiblingKeyPackage> {
+        // Finish optional reads before spending stock. Device-group hydration,
+        // quarantine or stock failures must not prevent an unrelated chat.
+        let selected = match self.select_founding_sibling_key_packages(
+            request,
+            optional_components,
+            constructable,
+            relays,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client::linked_device_chats",
+                    method = "founding_sibling_key_packages",
+                    error_kind = error.privacy_safe_kind(),
+                    "new chat omits siblings whose eligibility could not be read"
+                );
+                return Vec::new();
+            }
+        };
+        let mut taken_siblings = Vec::with_capacity(selected.len());
+        for sibling in selected {
+            match self.take_private_key_package(&sibling.slot) {
+                Ok(Some(taken)) if taken == sibling.key_package => taken_siblings.push(sibling),
+                // Expiry or a failed read/write while taking one candidate
+                // omits it. Never retry creation or return a possibly spent
+                // package to stock; other admitted candidates remain usable.
+                result => {
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: "marmot_app::client::linked_device_chats",
+                            method = "founding_sibling_key_packages",
+                            error_kind = error.privacy_safe_kind(),
+                            "new chat omits a sibling whose private stock could not be taken"
+                        );
+                    }
+                    self.want_founding_private_key_package(&sibling.slot);
+                }
+            }
+        }
+        taken_siblings
+    }
+
+    fn want_founding_private_key_package(&mut self, slot: &DeviceSlotId) {
+        if let Err(error) = self.want_private_key_packages(slot, 1) {
+            tracing::warn!(
+                target: "marmot_app::client::linked_device_chats",
+                method = "founding_sibling_key_packages",
+                error_kind = error.privacy_safe_kind(),
+                "could not request replacement private stock for a new chat"
+            );
+        }
+    }
+
+    fn select_founding_sibling_key_packages(
+        &mut self,
+        request: &cgka_traits::engine::CreateGroupRequest,
+        optional_components: &[cgka_traits::app_components::AppComponentData],
+        constructable: &cgka_traits::capabilities::GroupCapabilities,
+        relays: &[String],
     ) -> Result<Vec<SiblingKeyPackage>, AppError> {
         use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, default_group_components};
         if !self.app.device_groups_enabled()
@@ -190,10 +250,16 @@ impl AppClient {
         {
             return Ok(Vec::new());
         }
+        // A deferred open has not yet named the engine's tag source. Name it
+        // before taking stock, rather than relying only on our roster read.
+        self.sync_device_tag_group()?;
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(Vec::new());
         };
-        if !exchange.tagged || self.epoch_gap_held_groups()?.contains(&exchange.group_id) {
+        if self.runtime.device_tag_group() != Some(&exchange.group_id)
+            || !exchange.tagged
+            || self.epoch_gap_holds_group(&exchange.group_id, super::recovery::wall_now_ms()?)?
+        {
             return Ok(Vec::new());
         }
         let excluded = self.excluded_sibling_slots(&exchange)?;
@@ -232,7 +298,7 @@ impl AppClient {
                 continue;
             }
             let Some(key_package) = self.next_private_key_package(&slot)? else {
-                self.want_private_key_packages(&slot, 1)?;
+                self.want_founding_private_key_package(&slot);
                 continue;
             };
             let valid = marmot_session::validate_received_private_key_package(
@@ -247,26 +313,12 @@ impl AppClient {
                 .is_some_and(|metadata| fixed.iter().all(|id| metadata.app_components.contains(id)))
                 || requirements.validate(&key_package).is_err()
             {
-                self.want_private_key_packages(&slot, 1)?;
+                self.want_founding_private_key_package(&slot);
                 continue;
             }
             selected.push(SiblingKeyPackage { slot, key_package });
         }
-        // Validate every sibling before mutating stock. App storage is
-        // serialized on this account's worker, so the next row is still the
-        // one inspected above. Taking early is safe: failed creates burn at
-        // most one package per sibling and upkeep supplies replacements.
-        let mut taken_siblings = Vec::with_capacity(selected.len());
-        for sibling in selected {
-            match self.take_private_key_package(&sibling.slot)? {
-                Some(taken) if taken == sibling.key_package => taken_siblings.push(sibling),
-                // A lifetime can end between the advisory read and the take.
-                // Skip instead of failing creation or using an unchecked next
-                // package; a taken package is never returned to the stock.
-                _ => self.want_private_key_packages(&sibling.slot, 1)?,
-            }
-        }
-        Ok(taken_siblings)
+        Ok(selected)
     }
 
     /// Local link outcomes govern only entries this device currently

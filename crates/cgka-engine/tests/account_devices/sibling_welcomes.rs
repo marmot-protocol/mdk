@@ -869,13 +869,17 @@ async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
     let mut other = chat_device(b"bob");
     let public = other.engine.fresh_key_package().await.unwrap();
     let private = handed(&mut siblings[0], slot(2), slot(1));
+    let mut unusable = private.clone();
+    unusable.key_package.source = Some(KeyPackageSource {
+        event_id: MessageId::new(vec![7; 32]),
+    });
     let request = founding_request(vec![public]);
     let (gid, result) = creator
         .engine
         .create_group_with_siblings_and_audit_context(
             request,
             Vec::new(),
-            vec![private.clone()],
+            vec![unusable, private.clone()],
             None,
         )
         .await
@@ -928,11 +932,10 @@ async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
     );
 }
 
-/// A refusal for the private route leaves no discoverable new group or
-/// Welcome behind, even when the ordinary invitee was valid. The shared
-/// admission rejects published source metadata before canonical creation.
+/// A published KeyPackage never qualifies for the optional private route.
+/// Its omission preserves the ordinary founder and its transport Welcome.
 #[tokio::test]
-async fn a_founding_sibling_refused_for_its_welcome_leaves_no_group() {
+async fn an_inadmissible_founding_sibling_does_not_block_other_accounts() {
     let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
     let mut other = chat_device(b"bob");
     let public = other.engine.fresh_key_package().await.unwrap();
@@ -940,8 +943,7 @@ async fn a_founding_sibling_refused_for_its_welcome_leaves_no_group() {
     private.key_package.source = Some(KeyPackageSource {
         event_id: MessageId::new(vec![7; 32]),
     });
-    let before = creator.storage.list_groups().unwrap();
-    let error = creator
+    let (gid, result) = creator
         .engine
         .create_group_with_siblings_and_audit_context(
             founding_request(vec![public]),
@@ -950,11 +952,21 @@ async fn a_founding_sibling_refused_for_its_welcome_leaves_no_group() {
             None,
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(error, EngineError::Other(ref reason) if reason.contains("a published KeyPackage never adds a sibling"))
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("canonical ordinary creation despite optional sibling refusal")
+    };
+    assert_eq!(welcomes.len(), 1);
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
     );
-    assert_eq!(creator.storage.list_groups().unwrap(), before);
+    assert!(sibling_rows(&creator, &gid).is_empty());
     assert!(owed(&creator).is_empty());
 }
 
@@ -992,24 +1004,87 @@ async fn founding_siblings_cannot_bypass_the_other_founders_capabilities() {
     );
     let public = other.engine.fresh_key_package().await.unwrap();
     let private = handed(&mut siblings[0], slot(2), slot(1));
-    let before = creator.storage.list_groups().unwrap();
     let request = founding_request(vec![public]);
-    let error = creator
+    let (gid, _) = creator
+        .engine
+        .create_group_with_siblings_and_audit_context(request, Vec::new(), vec![private], None)
+        .await
+        .unwrap();
+    assert!(!requires_account_devices(&creator.engine, &gid));
+    assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
+    assert!(owed(&creator).is_empty());
+}
+
+/// Eligibility can end after a caller selected private stock. The engine's
+/// authoritative clock omits that sibling before staging; the ordinary
+/// founder still receives and joins its canonical Welcome.
+#[tokio::test]
+async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
+    struct AtTime(u64);
+    impl cgka_traits::maintenance::WallClock for AtTime {
+        fn now(&self) -> Timestamp {
+            Timestamp(self.0)
+        }
+        fn now_ms(&self) -> u64 {
+            self.0 * 1_000
+        }
+    }
+    impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
+        fn next_u64(&self) -> u64 {
+            0
+        }
+    }
+    let (creator, mut siblings, device_group) = tagged_devices(b"alice", 1).await;
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let not_after = cgka_engine::key_package::key_package_metadata(&private.key_package)
+        .unwrap()
+        .not_after;
+    let Device { engine, storage } = creator;
+    drop(engine);
+    let clock = Arc::new(AtTime(not_after));
+    let mut supported: Vec<_> = default_group_components().into_iter().collect();
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
+    ]);
+    let mut engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .supported_app_components(supported)
+        .peeler(Box::<MockPeeler>::default())
+        .maintenance_sources(clock.clone(), clock)
+        .build()
+        .unwrap();
+    engine.hydrate_all_stored_groups().unwrap();
+    engine.set_device_tag_group(Some(device_group)).unwrap();
+    let mut creator = Device { engine, storage };
+    let mut other = chat_device(b"bob");
+    let public = other.engine.fresh_key_package().await.unwrap();
+    let (gid, result) = creator
         .engine
         .create_group_with_siblings_and_audit_context(
-            request.clone(),
+            founding_request(vec![public]),
             Vec::new(),
             vec![private],
             None,
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(error, EngineError::Other(ref reason) if reason.contains("requiring account-devices"))
-    );
-    assert_eq!(creator.storage.list_groups().unwrap(), before);
-    let (gid, _) = creator.engine.create_group(request).await.unwrap();
-    assert!(!requires_account_devices(&creator.engine, &gid));
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = result else {
+        panic!("ordinary founding creation")
+    };
+    assert_eq!(welcomes.len(), 1);
     assert_eq!(creator.engine.members(&gid).unwrap().len(), 2);
-    assert!(owed(&creator).is_empty());
+    assert_eq!(
+        other
+            .engine
+            .join_welcome(welcomes[0].clone())
+            .await
+            .unwrap(),
+        gid
+    );
+    assert!(sibling_rows(&creator, &gid).is_empty());
 }

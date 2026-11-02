@@ -517,6 +517,7 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
     let before = taken_from(&phone, &laptop);
     let chat = phone.client.create_group("new chat", &[]).await.unwrap();
+    assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
     assert_eq!(
         leaves_of(&phone, &laptop, &chat, &group),
         1,
@@ -536,11 +537,45 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
         owed.iter()
             .filter(|welcome| welcome.group_id == chat)
             .count(),
-        1
+        0,
+        "canonical founding drives the initial carrier before returning"
     );
-    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    laptop.client.run_due_maintenance().await.unwrap();
     assert!(joined(&laptop, &chat));
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let before = taken_from(&phone, &laptop);
+    // A deferred open has not yet named the engine's trusted tag source.
+    // Creation must synchronize it before spending durable private stock.
+    let Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    } = phone;
+    drop(client);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    let mut phone = Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    };
+    assert_eq!(phone.client.runtime.device_tag_group(), None);
+    let chat = phone
+        .client
+        .create_group("after deferred open", &[])
+        .await
+        .unwrap();
+    assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), before + 1);
 }
 
 /// Missing private stock never falls back to the sibling's public slot or
@@ -569,6 +604,33 @@ async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
         .unwrap();
     assert_eq!(leaves_of(&phone, &laptop, &missing, &group), 0);
     hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let before = taken_from(&phone, &laptop);
+    let database = account_database(&phone.app);
+    // Optional stock reads and consumption writes can fail independently.
+    // Neither failure prevents an ordinary chat or spends unchecked stock.
+    for (break_stock, restore_stock) in [
+        (
+            "ALTER TABLE private_key_packages_received RENAME TO held_aside",
+            "ALTER TABLE held_aside RENAME TO private_key_packages_received",
+        ),
+        (
+            "CREATE TRIGGER refuse_founding_take BEFORE UPDATE ON private_key_packages_received
+             BEGIN SELECT RAISE(ABORT, 'private stock unavailable'); END;",
+            "DROP TRIGGER refuse_founding_take",
+        ),
+    ] {
+        database.execute_batch(break_stock).unwrap();
+        let result = phone
+            .client
+            .create_group("unavailable private stock", &[])
+            .await;
+        database.execute_batch(restore_stock).unwrap();
+        let chat = result.unwrap();
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+        assert_eq!(phone.client.runtime.members(&chat).unwrap().len(), 1);
+        assert_eq!(taken_from(&phone, &laptop), before);
+    }
+    drop(database);
     // The routing is valid for a chat, but repeats a relay once parsed, so
     // no sibling Welcome can carry it. Creation spends no private package.
     let before = taken_from(&phone, &laptop);

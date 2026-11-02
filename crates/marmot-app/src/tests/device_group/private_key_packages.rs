@@ -1391,11 +1391,10 @@ async fn a_sibling_welcome_in_flight_is_not_sent_again() {
 async fn carried_sibling_welcome_outcomes_settle_while_the_chat_is_held() {
     use cgka_traits::storage::MessageStorage as _;
     use cgka_traits::{MessageState, StoredMessagePayload};
-    let (mut devices, device_group) = tagging_devices().await;
+    let (mut devices, device_group, chats) = tagging_devices_with_chats::<2>().await;
     let mut rows = Vec::new();
     let mut pending = Vec::new();
-    for (name, carrier) in [("published", vec![0xfd; 32]), ("failed", vec![0xfe; 32])] {
-        let chat = devices.laptop.create_group(name, &[]).await.unwrap();
+    for (chat, carrier) in chats.into_iter().zip([vec![0xfd; 32], vec![0xfe; 32]]) {
         add_the_phone_unpublished(&mut devices, &chat).await;
         let welcome = owed(&devices.laptop)
             .into_iter()
@@ -1832,6 +1831,9 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .unwrap()
             .tagged
     );
+    // The host's maintenance pause keeps the initial Welcome unsent while
+    // the creator's device-group tag is lost after canonical creation.
+    devices.laptop.pause_maintenance();
     let chat = devices
         .laptop
         .create_group("sender ready", &[])
@@ -1863,6 +1865,7 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .unwrap()
             .tagged
     );
+    devices.laptop.resume_maintenance();
     let before = devices.relay.published_events.lock().unwrap().len();
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     assert_eq!(devices.relay.published_events.lock().unwrap().len(), before);

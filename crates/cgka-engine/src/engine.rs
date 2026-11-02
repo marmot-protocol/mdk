@@ -1318,6 +1318,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Create a chat with private KeyPackages authenticated by the trusted device group.
     /// Siblings cannot weaken the requirements negotiated for `req.members`; their
     /// Welcomes are retained atomically with creation for delivery inside the device group.
+    /// Siblings are optional: candidates whose eligibility cannot be established are
+    /// omitted before staging, while ordinary-founder and creation failures remain errors.
     pub async fn create_group_with_siblings_and_audit_context(
         &mut self,
         req: CreateGroupRequest,

@@ -474,7 +474,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// [`Self::sibling_welcome_plan`], with a refusal as its kind and reason
     /// rather than an error; the error is a failed read.
-    fn checked_sibling_welcome_plan(
+    pub(crate) fn checked_sibling_welcome_plan(
         &self,
         mls_group: &MlsGroup,
         siblings: &[SiblingKeyPackage],
