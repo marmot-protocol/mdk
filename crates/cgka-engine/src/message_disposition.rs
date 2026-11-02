@@ -73,15 +73,33 @@ mod tests {
     use marmot_forensics::v5::{self, BuildProfile, Platform, Producer};
     use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder};
 
-    const ALL: &[MessageDisposition] = &[
-        MessageDisposition::PreMembershipEvent,
-        MessageDisposition::AppPayloadRetentionExpired,
-        MessageDisposition::PredatesLocalCopy,
-        MessageDisposition::RetryPending,
-        MessageDisposition::RetryBudgetRefused,
-        MessageDisposition::ResidenceBudgetRefused,
-        MessageDisposition::DeferredCapacityRefused,
-        MessageDisposition::Quarantined,
+    const ALL: &[(MessageDisposition, &str)] = &[
+        (
+            MessageDisposition::PreMembershipEvent,
+            "pre_membership_event",
+        ),
+        (
+            MessageDisposition::AppPayloadRetentionExpired,
+            "app_payload_retention_expired",
+        ),
+        (MessageDisposition::PredatesLocalCopy, "predates_local_copy"),
+        (MessageDisposition::RetryPending, "peel_failed_no_snapshot"),
+        (
+            MessageDisposition::RetryBudgetRefused,
+            "resource_refused_retry_budget",
+        ),
+        (
+            MessageDisposition::ResidenceBudgetRefused,
+            "resource_refused_residence_budget",
+        ),
+        (
+            MessageDisposition::DeferredCapacityRefused,
+            "resource_refused_deferred_capacity",
+        ),
+        (
+            MessageDisposition::Quarantined,
+            "quarantined_group_input_deferred",
+        ),
     ];
 
     /// Every tag is a closed category the v5 audit boundary keeps verbatim,
@@ -105,7 +123,7 @@ mod tests {
         )
         .unwrap();
         let msg_id = "ab".repeat(32);
-        for &disposition in ALL {
+        for &(disposition, _) in ALL {
             recorder.record(AuditRecord::new(
                 None,
                 crate::audit_helpers::message_state_changed_event(
@@ -137,7 +155,7 @@ mod tests {
                 _ => {}
             }
         }
-        let expected: Vec<String> = ALL.iter().map(|d| d.tag().to_owned()).collect();
+        let expected: Vec<String> = ALL.iter().map(|(_, tag)| (*tag).to_owned()).collect();
         assert_eq!(state_reasons, expected);
         assert_eq!(rejection_reasons, expected);
     }

@@ -3091,4 +3091,209 @@ mod tests {
             ConvergenceDrain::Now
         ));
     }
+
+    #[test]
+    fn canonical_dispositions_report_typed_ingest_outcomes() {
+        use crate::canonicalization::{
+            AlreadySeen, CanonicalizationResult, ConvergenceStatus, DroppedMessage,
+            DroppedMessageReason, InvalidatedAppMessage, InvalidatedAppMessageReason, MessageKind,
+        };
+        use cgka_traits::ingest::{
+            IngestOutcome, InputRejectionCategory, ProposalRejectionCategory, StaleReason,
+        };
+        use cgka_traits::transport::{
+            Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+        };
+        use cgka_traits::types::{EpochId, GroupId, MessageId};
+        use sha2::{Digest, Sha256};
+
+        let empty = || CanonicalizationResult {
+            previous_tip: 9,
+            selected_tip: Some(9),
+            selected_fork_epoch: Some(8),
+            selected_branch_id: Some("selected".into()),
+            candidate_count: 1,
+            eligible_count: 1,
+            convergence_status: ConvergenceStatus::Settled,
+            accepted_commits: vec![],
+            accepted_proposals: vec![],
+            accepted_app_messages: vec![],
+            deferred_messages: vec![],
+            invalidated_app_messages: vec![],
+            dropped_messages: vec![],
+            already_seen: vec![],
+            queued_outbound_intents: vec![],
+            publishable_outbound_messages: vec![],
+            errors: vec![],
+            #[cfg(feature = "test-conformance-snapshot")]
+            replay_probe_count: 0,
+            selection_trace: None,
+        };
+        // Current callers have rebound the id to the inner protocol bytes,
+        // while the payload may still be the outer sealed carrier.
+        let message = TransportMessage {
+            id: MessageId::new(Sha256::digest(b"canonical inner protocol bytes").to_vec()),
+            payload: b"outer sealed carrier".to_vec(),
+            timestamp: Timestamp(1),
+            causal_deps: vec![],
+            source: TransportSource("test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![0x93; 32],
+            },
+        };
+        assert_ne!(message.id, super::content_dedup_id(&message.payload));
+        let id = hex::encode(message.id.as_slice());
+        let other = hex::encode([0x71; 32]);
+        let group = GroupId::new(vec![0x42; 16]);
+        let buffered = || IngestOutcome::Buffered {
+            group_id: group.clone(),
+            epoch: EpochId(9),
+        };
+        let check = |result: &CanonicalizationResult, expected| {
+            assert_eq!(
+                super::convergence_ingest_outcome(result, &message, group.clone(), EpochId(9)),
+                expected
+            );
+        };
+        check(&empty(), buffered());
+        for kind in [
+            MessageKind::Commit,
+            MessageKind::Proposal,
+            MessageKind::AppMessage,
+        ] {
+            for (classified, expected) in [(&id, IngestOutcome::Processed), (&other, buffered())] {
+                let mut result = empty();
+                match kind {
+                    MessageKind::Commit => &mut result.accepted_commits,
+                    MessageKind::Proposal => &mut result.accepted_proposals,
+                    MessageKind::AppMessage => &mut result.accepted_app_messages,
+                }
+                .push(classified.clone());
+                check(&result, expected);
+                result.convergence_status = ConvergenceStatus::Syncing;
+                check(&result, buffered());
+            }
+        }
+        for (classified, expected) in [
+            (
+                &id,
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::Duplicate,
+                },
+            ),
+            (&other, buffered()),
+        ] {
+            let mut result = empty();
+            result.already_seen.push(AlreadySeen {
+                message_id: classified.clone(),
+                kind: MessageKind::AppMessage,
+            });
+            check(&result, expected);
+        }
+        for (reason, kind, expected) in [
+            (
+                DroppedMessageReason::BeyondRollbackHorizon,
+                MessageKind::Commit,
+                IngestOutcome::Stale {
+                    reason: StaleReason::BeyondRollbackHorizon,
+                },
+            ),
+            (
+                DroppedMessageReason::BeyondAnchor,
+                MessageKind::Commit,
+                IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAnchor,
+                },
+            ),
+            (
+                DroppedMessageReason::BeyondAppRetention,
+                MessageKind::AppMessage,
+                IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAppRetention,
+                },
+            ),
+            (
+                DroppedMessageReason::InvalidAgainstCandidateState,
+                MessageKind::Proposal,
+                IngestOutcome::Stale {
+                    reason: StaleReason::InvalidAgainstCanonicalState,
+                },
+            ),
+            (
+                DroppedMessageReason::UnsupportedPolicy,
+                MessageKind::Commit,
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::UnsupportedRequiredFeature,
+                },
+            ),
+            (
+                DroppedMessageReason::Malformed,
+                MessageKind::Commit,
+                IngestOutcome::Ignored {
+                    category: InputRejectionCategory::InvalidEncoding,
+                },
+            ),
+        ] {
+            for (classified, expected) in [(&id, expected), (&other, buffered())] {
+                let mut result = empty();
+                result.dropped_messages.push(DroppedMessage {
+                    message_id: classified.clone(),
+                    kind,
+                    reason,
+                    rejection_category: None,
+                });
+                check(&result, expected);
+            }
+        }
+        let mut rejected = empty();
+        rejected.dropped_messages.push(DroppedMessage {
+            message_id: id.clone(),
+            kind: MessageKind::Proposal,
+            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            rejection_category: Some(ProposalRejectionCategory::AuthorizationFailed),
+        });
+        check(
+            &rejected,
+            IngestOutcome::Rejected {
+                category: ProposalRejectionCategory::AuthorizationFailed,
+            },
+        );
+        for (reason, expected) in [
+            (
+                InvalidatedAppMessageReason::LosingBranch,
+                IngestOutcome::Stale {
+                    reason: StaleReason::LosingBranch,
+                },
+            ),
+            (
+                InvalidatedAppMessageReason::BeyondAnchor,
+                IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAnchor,
+                },
+            ),
+            (
+                InvalidatedAppMessageReason::BeyondAppRetention,
+                IngestOutcome::Stale {
+                    reason: StaleReason::BeyondAppRetention,
+                },
+            ),
+            // Old results used invalidation for a future application. That
+            // compatibility case still promises retained work, never a verdict.
+            (
+                InvalidatedAppMessageReason::UndecryptableInCanonicalState,
+                buffered(),
+            ),
+        ] {
+            for (classified, expected) in [(&id, expected), (&other, buffered())] {
+                let mut result = empty();
+                result.invalidated_app_messages.push(InvalidatedAppMessage {
+                    message_id: classified.clone(),
+                    epoch: 9,
+                    reason,
+                    decrypted_payload_ref: None,
+                });
+                check(&result, expected);
+            }
+        }
+    }
 }

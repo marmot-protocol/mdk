@@ -202,6 +202,49 @@ impl TransportPeeler for CountingEpochGatePeeler {
     }
 }
 
+/// Supplies only a returned infrastructure fault. Message bytes, epoch
+/// readability, and all application delivery still use the ordinary fixture.
+#[cfg(feature = "test-policy-overrides")]
+#[derive(Clone, Default)]
+struct UnavailableEpochGatePeeler {
+    unavailable: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[async_trait]
+impl TransportPeeler for UnavailableEpochGatePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(PeelerError::Backend("injected peeler unavailable".into()));
+        }
+        epoch_gated_group_message(msg, ctx)
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        passthrough_welcome(msg)
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        wrapped_group_message(payload)
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        wrapped_welcome(payload, recipient)
+    }
+}
+
 /// Epoch-gated peeler whose foreground retry attempt can be held indefinitely.
 /// Initial ingest remains fast; tests arm the gate only after the deferred
 /// backlog is durable.
@@ -813,6 +856,167 @@ where
     );
 
     (incumbent, incumbent_storage, group_id, david)
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn sliced_candidate_peeling_retains_engine_progress_until_delivery() {
+    use cgka_traits::storage::{ConvergencePassStorage, StorageProvider};
+
+    let (mut incumbent, storage, group_id, _same_branch_peer) =
+        contested_rival_app_backlog(1).await;
+    incumbent.set_replay_slice_probe_limit_for_tests(1);
+    incumbent.drain_events();
+    let raw_id = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()[0]
+        .id
+        .clone();
+    let expected_sender = MemberId::new(pad32(b"candidate-cache-rival"));
+    let expected_payload = MarmotAppEvent::new(
+        hex::encode(expected_sender.as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "rival branch witness",
+    )
+    .encode()
+    .unwrap();
+    let mut events = Vec::new();
+    let mut pending_peel_slices = 0;
+    let mut restored_peel_slices = 0;
+    let mut complete = false;
+    for _ in 0..128 {
+        let before_metrics = incumbent.engine_metrics();
+        let canonical_complete = storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .is_some_and(|pass| pass.phase == cgka_traits::ConvergencePassPhase::Completed);
+        let before_group = storage.get_group(&group_id).unwrap();
+        let before_mls = storage.group_replay_state_fingerprint(&group_id).unwrap();
+        assert!(before_mls.is_some());
+        let before_rows = storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap();
+        let settled = incumbent
+            .advance_convergence_inputs(&group_id)
+            .await
+            .unwrap();
+        let after_metrics = incumbent.engine_metrics();
+        // A miss without a completed enumeration identifies the engine's
+        // peel continuation, separately from earlier canonical replay slices.
+        let peel_pending = after_metrics.deferred_peel_candidate_cache_misses
+            > before_metrics.deferred_peel_candidate_cache_misses
+            && after_metrics.deferred_peel_candidate_enumerations
+                == before_metrics.deferred_peel_candidate_enumerations;
+        if peel_pending {
+            pending_peel_slices += 1;
+            assert!(!settled, "a partial context set cannot report completion");
+            assert_eq!(
+                storage
+                    .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+                    .unwrap(),
+                before_rows,
+                "enumeration does not mark an unattempted raw row"
+            );
+            if canonical_complete {
+                // Once canonical selection finished, subsequent pending peel
+                // slices have no legitimate durable canonical mutation.
+                assert_eq!(storage.get_group(&group_id).unwrap(), before_group);
+                assert!(storage.group_replay_state_fingerprint(&group_id).unwrap() == before_mls);
+                assert_eq!(
+                    incumbent.group_context(&group_id).unwrap().epoch(),
+                    before_group.epoch
+                );
+                restored_peel_slices += 1;
+            }
+        }
+        let emitted = incumbent.drain_events();
+        if peel_pending {
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
+                "partial enumeration cannot publish application output"
+            );
+        }
+        events.extend(emitted);
+        if settled
+            && storage
+                .list_deferred_message_metadata(&group_id)
+                .unwrap()
+                .is_empty()
+            && events.iter().any(|event| {
+                matches!(event,
+                    GroupEvent::MessageReceived { sender, payload, .. }
+                        if sender == &expected_sender && payload == &expected_payload
+                )
+            })
+        {
+            complete = true;
+            break;
+        }
+    }
+    assert!(
+        pending_peel_slices > 0,
+        "exercise the engine peel continuation"
+    );
+    assert!(
+        restored_peel_slices > 0,
+        "observe restored state between peel slices"
+    );
+    eprintln!(
+        "engine peel continuation: pending_slices={pending_peel_slices}, restored_slices={restored_peel_slices}"
+    );
+    assert!(
+        complete,
+        "one-probe turns must eventually finish the retained rival application"
+    );
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed
+    );
+    for _ in 0..2 {
+        incumbent
+            .advance_convergence_inputs(&group_id)
+            .await
+            .unwrap();
+        events.extend(incumbent.drain_events());
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                GroupEvent::MessageReceived { group_id: id, sender, payload, .. }
+                    if id == &group_id && sender == &expected_sender && payload == &expected_payload
+            ))
+            .count(),
+        1,
+        "resuming and draining again must not duplicate delivery"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::AppMessageInvalidated { .. }))
+    );
+    assert_eq!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event,
+                GroupEvent::MessageReceived { sender, payload, .. }
+                    if sender == &expected_sender && payload == &expected_payload
+            ))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1428,6 +1632,10 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
         })
         .map(|record| record.id.clone())
         .collect::<Vec<_>>();
+    assert!(
+        !completed_ids.is_empty(),
+        "the cancellation fixture must complete a prefix before testing that restart skips it"
+    );
     let first_uncompleted_id = deferred_after_send
         .get(completed_ids.len())
         .expect("foreground slice leaves an uncompleted row")
@@ -2245,6 +2453,159 @@ async fn replay_still_retires_a_deferred_row_it_resolves() {
         carol.ingest(ahead).await.unwrap(),
         IngestOutcome::TransportDeferred { .. }
     ));
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry() {
+    use cgka_traits::storage::StorageProvider;
+
+    let client = build_gated_client(b"carol", UnavailableEpochGatePeeler::default());
+    let (mut alice, mut carol, storage, peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(client).await;
+    carol.set_deferred_peel_limits_for_tests(1, usize::MAX, usize::MAX);
+    let original_payload = app_payload_for(&alice, "retained through peeler failure");
+    let original = send_app(&mut alice, &group_id, "retained through peeler failure").await;
+    let original_content = content_id(&original);
+    assert!(matches!(
+        carol.ingest(original.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let mut expected = storage.get_message(&original.id).unwrap();
+    assert_eq!(expected.state, MessageState::PeelDeferred);
+    assert!(expected.deferred_peel.is_some());
+    assert_eq!(
+        cgka_traits::message::StoredMessagePayload::decode(&expected.payload)
+            .unwrap()
+            .as_raw_transport(),
+        Some(&original)
+    );
+    let before_group = storage.get_group(&group_id).unwrap();
+    let before_mls = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    assert!(before_mls.is_some(), "observe actual SQLite replay state");
+
+    peeler.unavailable.store(true, Ordering::SeqCst);
+    let failed = carol.retry_deferred_peels(&group_id).await;
+    assert!(matches!(failed,
+        Err(cgka_traits::error::EngineError::Peeler(PeelerError::Backend(detail)))
+            if detail == "injected peeler unavailable"
+    ));
+    expected.state = MessageState::Retryable;
+    expected.deferred_peel = None;
+    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+    assert_eq!(storage.get_group(&group_id).unwrap(), before_group);
+    assert!(storage.group_replay_state_fingerprint(&group_id).unwrap() == before_mls);
+    assert!(!storage.has_processed_transport_id(&original.id).unwrap());
+    assert!(matches!(
+        carol.ingest(original.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    carol.drain_events();
+
+    peeler.unavailable.store(false, Ordering::SeqCst);
+    let fresh = send_app(&mut alice, &group_id, "fresh deferred slot control").await;
+    assert!(
+        matches!(
+            carol.ingest(fresh.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ),
+        "the failed row left the deferred lifecycle and returned its only slot"
+    );
+    let deferred = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].id, fresh.id);
+    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+
+    assert!(matches!(
+        carol.ingest(commit2).await.unwrap(),
+        IngestOutcome::Processed | IngestOutcome::Buffered { .. }
+    ));
+    for _ in 0..8 {
+        carol.advance_convergence(&group_id).await.unwrap();
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    // Deliver the next dependency once its source context is readable. The
+    // single deferred slot intentionally still belongs to the fresh control.
+    assert!(matches!(
+        carol.ingest(commit3).await.unwrap(),
+        IngestOutcome::Processed | IngestOutcome::Buffered { .. }
+    ));
+    for _ in 0..8 {
+        carol.advance_convergence(&group_id).await.unwrap();
+    }
+    assert_eq!(
+        carol.epoch(&group_id).unwrap(),
+        alice.epoch(&group_id).unwrap()
+    );
+    let mut events = carol.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                GroupEvent::MessageReceived { message_id, .. } if message_id == &original_content
+            ))
+            .count(),
+        0,
+        "the retryable raw input is still waiting for publish-cycle replay"
+    );
+
+    let (_, pending) = evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    peeler.unavailable.store(true, Ordering::SeqCst);
+    carol
+        .confirm_published(pending)
+        .await
+        .expect("durable confirmation succeeds while failed replay remains pending");
+    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
+    let confirmed_mls = storage.group_replay_state_fingerprint(&group_id).unwrap();
+    let failed = carol.advance_convergence(&group_id).await;
+    assert!(matches!(failed,
+        Err(cgka_traits::error::EngineError::Peeler(PeelerError::Backend(detail)))
+            if detail == "injected peeler unavailable"
+    ));
+    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+    assert!(storage.group_replay_state_fingerprint(&group_id).unwrap() == confirmed_mls);
+    assert!(carol.drain_pending_convergence_groups().contains(&group_id));
+    events.extend(carol.drain_events());
+
+    peeler.unavailable.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        carol.advance_convergence(&group_id).await.unwrap();
+        events.extend(carol.drain_events());
+    }
+    assert_eq!(events.iter().filter(|event| matches!(event,
+        GroupEvent::MessageReceived { message_id, sender, payload, .. }
+            if message_id == &original_content && sender == &alice.self_id() && payload == &original_payload
+    )).count(), 1, "the original application must recover exactly once");
+    assert!(!events.iter().any(|event| matches!(event,
+        GroupEvent::AppMessageInvalidated { message_id, .. } if message_id == &original_content
+    )));
+    assert_eq!(
+        storage.get_message(&original.id).unwrap().state,
+        MessageState::Processed
+    );
+    assert!(storage.has_processed_transport_id(&original.id).unwrap());
+    assert_eq!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event,
+                GroupEvent::MessageReceived { message_id, payload, .. }
+                    if message_id == &original_content && payload == &original_payload
+            ))
+            .count(),
+        1
+    );
 }
 
 /// Carol follows alice to epoch 3, retaining the anchors of the epochs she

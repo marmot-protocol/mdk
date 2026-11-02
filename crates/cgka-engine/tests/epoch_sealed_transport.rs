@@ -748,12 +748,31 @@ async fn unopenable_traffic_from_an_epoch_this_copy_has_not_reached_still_defers
     bob.drain_events();
 
     bob.retry_deferred_peels(&group_id).await.unwrap();
-    assert!(
-        bob.drain_events().iter().any(|event| matches!(
-            event,
-            cgka_traits::engine::GroupEvent::MessageReceived { group_id: id, .. } if *id == group_id
-        )),
-        "once the commit lands, the deferred message opens"
+    let mut delivered = 0;
+    for event in bob.drain_events() {
+        if let cgka_traits::engine::GroupEvent::MessageReceived {
+            group_id: id,
+            sender,
+            epoch,
+            payload,
+            ..
+        } = event
+        {
+            assert_eq!(id, group_id);
+            assert_eq!(sender, alice.self_id());
+            assert_eq!(epoch, alice.epoch(&group_id).unwrap());
+            assert_eq!(
+                cgka_traits::app_event::MarmotAppEvent::decode(&payload)
+                    .unwrap()
+                    .content,
+                "from the epoch ahead"
+            );
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 1,
+        "the deferred application must deliver exactly once"
     );
     assert_eq!(
         deferred_rows(&bob_storage, &group_id),
