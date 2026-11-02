@@ -237,7 +237,9 @@ async fn a_queued_admin_policy_edit_refused_after_demotion_is_retired() {
 #[tokio::test]
 async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queued() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut carol = build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock);
     let (mut dave, _dave_storage) = build_client(b"dave");
     let group_id = create_reservation_test_group(&mut alice, &mut carol, "bad-key-package").await;
     let rename = alice_rename_commit(&mut alice, &group_id, "unsettled").await;
@@ -246,7 +248,8 @@ async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queu
         IngestOutcome::Buffered { .. }
     ));
 
-    let mut key_package = dave.fresh_key_package().await.unwrap();
+    let valid_key_package = dave.fresh_key_package().await.unwrap();
+    let mut key_package = valid_key_package.clone();
     // The KeyPackage's signature is its last field.
     *key_package.bytes.last_mut().unwrap() ^= 0x01;
     let sent = carol
@@ -257,7 +260,7 @@ async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queu
         })
         .await;
     assert!(
-        matches!(sent, Err(cgka_traits::error::EngineError::Backend(_))),
+        matches!(&sent, Err(cgka_traits::error::EngineError::Backend(reason)) if reason.starts_with("key_package validate:")),
         "{sent:?}"
     );
     assert!(
@@ -266,5 +269,21 @@ async fn an_invite_with_a_bad_key_package_signature_is_refused_before_it_is_queu
             .unwrap()
             .is_empty(),
         "nothing was queued"
+    );
+    let valid = carol
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![valid_key_package],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(valid, SendResult::Queued { .. }), "{valid:?}");
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
     );
 }
