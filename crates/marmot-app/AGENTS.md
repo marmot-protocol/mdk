@@ -251,7 +251,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
-  delivered one again: resending is 3.5e. The Add spends
+  delivered one again in these paths. Post-publication resend remains an unimplemented 3.5e follow-on under D70;
+  the current gap-filling flow does not resend a delivered Welcome. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
