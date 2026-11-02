@@ -53,6 +53,9 @@ impl Claim {
             return Ok(None);
         }
         let wire: ClaimContent = serde_json::from_str(content).map_err(|_| invalid())?;
+        if serde_json::to_string(&wire).map_err(|_| invalid())? != content {
+            return Err(invalid());
+        }
         let slot = |value: &str| {
             if value.len() != 64 || !lower_hex(value) {
                 return Err(invalid());
@@ -95,6 +98,17 @@ fn lower_hex(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A leaving device cannot advance gap filling; its earlier claims no
+/// longer hold another worker back. Active and inactive entries remain linked.
+fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
+    exchange.roster.devices.get(slot).is_some_and(|entry| {
+        matches!(
+            entry.status,
+            DeviceStatusV1::Active | DeviceStatusV1::Inactive
+        )
+    })
 }
 
 /// Only changed or due chats are examined. Application traffic at an
@@ -238,7 +252,7 @@ impl AppClient {
             return Ok(());
         };
         if claim.from == exchange.own_slot
-            || !exchange.roster.devices.contains_key(&claim.from)
+            || !claimant_is_eligible(&exchange, &claim.from)
             || !self.gap_siblings(&exchange)?.contains(&claim.to)
             || !self.sibling_commit_chats().contains(&claim.chat)
         {
@@ -268,6 +282,7 @@ impl AppClient {
             return Ok(());
         };
         if held.contains(&exchange.group_id)
+            || !claimant_is_eligible(&exchange, &exchange.own_slot)
             || !exchange.tagged
             || !self.group_quiet(&exchange.group_id)?
         {
@@ -299,7 +314,7 @@ impl AppClient {
         self.sibling_chat_gaps
             .claims
             .retain(|(chat, target), claims| {
-                claims.retain(|slot, _| exchange.roster.devices.contains_key(slot));
+                claims.retain(|slot, _| claimant_is_eligible(&exchange, slot));
                 known.contains(chat) && siblings.contains(target) && !claims.is_empty()
             });
         self.sibling_chat_gaps
@@ -422,6 +437,7 @@ impl AppClient {
                 continue;
             };
             if current.group_id != exchange.group_id
+                || !claimant_is_eligible(&current, &current.own_slot)
                 || !current.tagged
                 || !self.group_quiet(&current.group_id)?
                 || !self.gap_siblings(&current)?.contains(slot)
@@ -491,8 +507,11 @@ mod tests {
         let other_order = CLAIM
             .replace("{\"v\":1,", "{ ")
             .replace("\"chat\":\"010203\"}", "\"chat\":\"010203\", \"v\":1 }");
-        assert!(Claim::decode(&other_order, 100, 200).unwrap().is_some());
         for malformed in [
+            other_order,
+            format!(" {CLAIM}"),
+            format!("{CLAIM}\n"),
+            CLAIM.replace("010203", r"\u003010203"),
             CLAIM.replace("\"v\":1", "\"v\":1,\"v\":1"),
             CLAIM.replace("\"v\":1", "\"v\":1,\"extra\":false"),
             CLAIM.replace("\"v\":1", "\"v\":2"),

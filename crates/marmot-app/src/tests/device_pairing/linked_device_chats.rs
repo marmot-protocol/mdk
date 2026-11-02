@@ -252,7 +252,8 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
 }
 
 /// A live claim from a lower slot holds just that chat's Add. Another chat
-/// still fills through a real private-package Add and sibling Welcome.
+/// still fills through a real private-package Add and sibling Welcome. A
+/// leaving claimant neither sends a new claim nor holds the first chat back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lower_sibling_claim_holds_only_its_chat() {
     let (relay, [first, second, mut target]) = alice_devices::<3>().await;
@@ -339,6 +340,67 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     assert_eq!(taken_from(&high, &target), 1);
     assert_eq!(leaves_of(&high, &target, &chats[0], &group), 0);
     assert_eq!(leaves_of(&high, &target, &chats[1], &group), 1);
+
+    // A claimant that starts leaving no longer holds this chat back. Give
+    // it usable stock first so its own no-claim assertion is not vacuous.
+    hold_key_packages(&relay, &mut low, &mut target).await;
+    let low_slot: [u8; 32] = hex::decode(low.slot_hex()).unwrap().try_into().unwrap();
+    let marmot_session::DeviceRosterEdit::Committed(effects) = low
+        .client
+        .runtime
+        .edit_device_roster_entry(&group, &low_slot, &[], |entry| {
+            entry.status = cgka_traits::app_components::DeviceStatusV1::Leaving;
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the claimant commits its leaving status")
+    };
+    low.client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    let before = relay.published_events.lock().unwrap().len();
+    let stock = held_from(&low, &target);
+    assert!(stock > 0);
+    low.client.fill_sibling_chat_gaps(&[], 1).await;
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+    assert_eq!(held_from(&low, &target), stock);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&target, &chats[0]) {
+            converge_device_group(&mut high.client, &relay, &mut high.cursor, &group, 1).await;
+            // Run the actual gap/Welcome paths without the separate removal
+            // driver: the assertion must hold while the claimant is Leaving,
+            // before its ordinary removal could also invalidate the claim.
+            high.client
+                .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS)
+                .await;
+            deliver_new(&mut target.client, &relay, &mut target.cursor).await;
+            target.client.join_stashed_sibling_welcomes().await;
+            for client in [&mut high.client, &mut target.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a claimant that is leaving no longer suppresses its chat");
+    assert_eq!(
+        high.roster(&group).devices[&low_slot].status,
+        cgka_traits::app_components::DeviceStatusV1::Leaving
+    );
+    assert_eq!(taken_from(&high, &target), 2);
+    assert_eq!(leaves_of(&high, &target, &chats[0], &group), 1);
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,

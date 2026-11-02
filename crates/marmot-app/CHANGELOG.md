@@ -96,7 +96,9 @@
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
   ten-minute advisory claim to reduce competing Adds; the selected tree is
-  checked again when an Add stages. Gap filling requires the sibling's
+  checked again when an Add stages. Claims use byte-exact canonical content;
+  leaving claimants stop participating and no longer hold other devices back.
+  Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
   duplicate cleanup and delivered-Welcome resend remain deferred. Only
