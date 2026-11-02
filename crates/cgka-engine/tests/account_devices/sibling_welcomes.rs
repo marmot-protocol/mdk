@@ -106,7 +106,7 @@ fn with_another_mls_key(
 /// Re-check the slot before a direct send and at a queued Add's actual drain.
 #[tokio::test]
 async fn a_sibling_added_while_its_add_waits_is_not_added_again_at_drain() {
-    // Exercise both the authenticated-slot check and the pre-link signer fallback.
+    // Exercise authenticated-slot detection with both orientations of distinct MLS signers.
     for existing_uses_distinct_mls_key in [false, true] {
         let (mut phone, mut devices, device_group) = tagged_devices(b"bob", 2).await;
         let mut laptop = devices.remove(0);
