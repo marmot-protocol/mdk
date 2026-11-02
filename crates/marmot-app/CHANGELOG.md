@@ -395,6 +395,10 @@
 
 ### Changed
 
+- Sign-in checks no longer load the unused roster announcement history or
+  attach an internal `Announcement` label (mdk#2863, D81). Slot
+  classification and the own-slot compromise warning keep their behavior.
+
 - MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628).
   New KeyPackages list it. A device whose published KeyPackage does not
   replaces it in the same slot at its next maintenance, holding the old one's
