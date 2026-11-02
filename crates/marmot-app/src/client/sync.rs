@@ -8929,6 +8929,7 @@ mod tests {
             media_type: "image/png".into(),
             version: "encrypted-media-v2".into(),
             source_epoch: source,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         };

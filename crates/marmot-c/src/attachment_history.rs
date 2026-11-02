@@ -410,11 +410,11 @@ mod tests {
             reference.source_epoch_identity
         );
         unsafe { mirrored.free_in_place() };
-        client
+        let sent = client
             .block_on(client.marmot.send_media_attachments(
                 account.clone(),
                 group.clone(),
-                vec![reference.clone(), reference],
+                vec![reference.clone(), reference.clone()],
                 None,
             ))
             .unwrap();
@@ -674,6 +674,49 @@ mod tests {
             ] {
                 marmot_attachment_page_read_free(boxed(MarmotAttachmentPageRead::from(result)));
             }
+            // Exercise a non-NULL standalone result through both binding layers.
+            let reacted = client
+                .block_on(client.marmot.react_with_media(
+                    account.to_str().unwrap().into(),
+                    group.to_str().unwrap().into(),
+                    sent.message_ids[0].clone(),
+                    ":c_art:".into(),
+                    vec![vec![
+                        "emoji".into(),
+                        "c_art".into(),
+                        reference.locators[0].value.clone(),
+                    ]],
+                    vec![reference],
+                ))
+                .unwrap();
+            let reaction = CString::new(reacted.message_ids[0].clone()).unwrap();
+            let mut artwork = ptr::null_mut();
+            assert_eq!(
+                marmot_reaction_attachment(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    reaction.as_ptr(),
+                    &mut artwork,
+                ),
+                MarmotStatus::Ok
+            );
+            assert!(!artwork.is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*artwork).message_id_hex)
+                    .to_str()
+                    .unwrap(),
+                reacted.message_ids[0]
+            );
+            assert_eq!((*artwork).role, MarmotAttachmentRole::InlineEmoji);
+            assert!(matches!(
+                (*artwork).attachment,
+                MarmotMediaAttachmentOutcome::Accepted {
+                    attachment_index: 0,
+                    ..
+                }
+            ));
+            marmot_attachment_entry_free(artwork);
             let rejected = MarmotAttachmentEntry::from(AttachmentEntryFfi {
                 message_id_hex: "m".into(),
                 source_message_id_hex: "s".into(),
