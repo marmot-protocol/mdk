@@ -43,6 +43,12 @@ ordering guarantees.
 
 ## Key contracts
 
+**Committed-state observations.** `StorageProvider::after_commit` lets a backend release best-effort observers only
+after the owning outer transaction commits, discarding them when a transaction or savepoint rolls back. SQLite
+supports it. The default drops observations, so an alternate backend or wrapper that has not implemented the complete
+boundary omits positive stored-message audit rows; other forensic observations remain available. Missing audit rows
+never prove that a mutation did not happen.
+
 **Publish-before-apply.** `AutoPublish` follows the same contract as explicit group evolution: callers publish the
 message, then confirm or fail the attached `PendingStateRef`.
 

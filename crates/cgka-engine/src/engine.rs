@@ -347,7 +347,7 @@ pub struct Engine<S: StorageProvider> {
     /// engine only records: the layer that built it owns the log's file,
     /// rotation and end, through a shared handle it keeps (`marmot-session`
     /// passes a clone of its `marmot_forensics::SharedRecorder`).
-    pub(crate) recorder: Box<dyn ForensicRecorder>,
+    pub(crate) recorder: Arc<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,
     /// Audit context for the in-flight local operation. The send and
     /// create-group `*_with_audit_context` entry points set this through an
@@ -749,7 +749,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_clock: self.convergence_clock,
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
-            recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
+            recorder: Arc::from(self.recorder.unwrap_or_else(|| Box::new(NoopRecorder))),
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
@@ -3091,6 +3091,9 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
         kind: AuditEventKind,
     ) {
+        if !self.recorder.is_enabled() {
+            return;
+        }
         // Fall back to the in-flight operation's context so secondary rows
         // emitted via the context-less `audit`/`audit_group` helpers still
         // carry the operation's `human_action`. An explicit context always wins.
@@ -3100,7 +3103,17 @@ impl<S: StorageProvider> Engine<S> {
             kind,
         );
         record.context = context;
-        self.recorder.record(record);
+        if matches!(&record.kind, AuditEventKind::MessageStateChanged { .. }) {
+            // A helper's successful write may still belong to a caller's outer
+            // transaction or savepoint. Capture provenance now, but let storage
+            // release the observation only after the owning unit commits. The
+            // recorder assigns its envelope/sequence at that later append.
+            let recorder = Arc::clone(&self.recorder);
+            self.storage
+                .after_commit(Box::new(move || recorder.record(record)));
+        } else {
+            self.recorder.record(record);
+        }
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that

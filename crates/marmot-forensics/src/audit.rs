@@ -928,7 +928,10 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
-    /// A stored message transitioned to a new `MessageState`.
+    /// A stored message transitioned to a new `MessageState` in a committed
+    /// storage unit. Engine producers emit only after that unit commits; several
+    /// transitions within one unit may be recorded together. Capture remains
+    /// best effort, so absence does not prove that no transition committed.
     MessageStateChanged {
         msg_id: MessageRefHex,
         #[serde(default, skip_serializing_if = "Option::is_none")]
