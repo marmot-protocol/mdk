@@ -324,6 +324,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
     Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
 
+`record_write_atomicity/application_receive_retry.rs` also owns committed stored-message audit evidence: real
+receive-output and second sent-row failures leave no state transition in the actual V5 log, retry/reopen retain
+truthful transitions, and a public Welcome-state mutation waits for an external caller's outermost transaction.
+Keep the independent SQLCipher row reads and reopens in the file-backed cases.
+
 ```sh
 cargo test -p cgka-engine
 cargo test -p cgka-engine --features test-policy-overrides   # suites that install custom policies
