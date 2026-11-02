@@ -119,7 +119,6 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
 struct GapEligibility {
     group: GroupId,
     own_slot: DeviceSlotId,
-    sender_ready: bool,
     targets: BTreeMap<DeviceSlotId, Vec<u8>>,
     claimants: BTreeSet<DeviceSlotId>,
 }
@@ -135,6 +134,25 @@ pub(crate) struct SiblingChatGaps {
 }
 
 impl SiblingChatGaps {
+    /// Compare against the last inputs for which work was actually scheduled.
+    /// Temporary device-group busy/hold windows do not invalidate all chats,
+    /// and must not consume a genuine change before the sender is ready.
+    fn schedule_eligibility(&mut self, eligibility: GapEligibility, ready: bool) -> bool {
+        if !ready || self.eligibility.as_ref() == Some(&eligibility) {
+            return false;
+        }
+        if self
+            .eligibility
+            .as_ref()
+            .is_some_and(|prior| prior.group != eligibility.group)
+        {
+            self.claims.clear();
+            self.waiting_for_stock.clear();
+        }
+        self.eligibility = Some(eligibility);
+        true
+    }
+
     fn schedule(&mut self, chat: GroupId, at: u64) {
         self.due
             .entry(chat)
@@ -318,11 +336,6 @@ impl AppClient {
         selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
-            // A later readable/tagged exchange must wake old chats even if
-            // it has the same roster as before this loss of readiness.
-            if let Some(prior) = self.sibling_chat_gaps.eligibility.as_mut() {
-                prior.sender_ready = false;
-            }
             return Ok(());
         };
         let siblings = self.gap_siblings(&exchange)?;
@@ -334,7 +347,6 @@ impl AppClient {
         let eligibility = GapEligibility {
             group: exchange.group_id.clone(),
             own_slot: exchange.own_slot,
-            sender_ready,
             targets: siblings
                 .iter()
                 .filter_map(|slot| {
@@ -352,23 +364,16 @@ impl AppClient {
                 .copied()
                 .collect(),
         };
-        let changed = self.sibling_chat_gaps.eligibility.as_ref() != Some(&eligibility);
-        if self
-            .sibling_chat_gaps
-            .eligibility
-            .as_ref()
-            .is_some_and(|prior| prior.group != exchange.group_id)
-        {
-            self.sibling_chat_gaps.claims.clear();
-            self.sibling_chat_gaps.waiting_for_stock.clear();
-        }
-        self.sibling_chat_gaps.eligibility = Some(eligibility);
         if siblings.is_empty() {
+            self.sibling_chat_gaps.eligibility = None;
             self.sibling_chat_gaps.due.clear();
             self.sibling_chat_gaps.claims.clear();
             self.sibling_chat_gaps.waiting_for_stock.clear();
             return Ok(());
         }
+        let changed = self
+            .sibling_chat_gaps
+            .schedule_eligibility(eligibility, sender_ready);
         if !sender_ready {
             return Ok(());
         }
@@ -439,6 +444,7 @@ impl AppClient {
             self.sibling_chat_gaps.schedule(chat.clone(), 0);
             return Ok(());
         }
+        let mut first_error = None;
         for slot in siblings {
             let gap = (chat.clone(), *slot);
             if !self.gap_is_missing(exchange, chat, *slot)? {
@@ -450,6 +456,13 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
             }
+            // An earlier target may have left a retained Commit even though
+            // its send returned successfully. Do not publish another claim
+            // for work this chat already cannot advance.
+            if !self.group_quiet(chat)? {
+                self.sibling_chat_gaps.schedule(chat.clone(), 0);
+                break;
+            }
             if let Some(expiry) = self.sibling_chat_gaps.claim_wait_until(
                 &gap,
                 &exchange.own_slot,
@@ -458,12 +471,16 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), expiry);
                 continue;
             }
-            if self
-                .next_private_key_package_for_chat(chat, slot, selection)?
-                .is_none()
-            {
-                self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                continue;
+            match self.next_private_key_package_for_chat(chat, slot, selection) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    self.sibling_chat_gaps.waiting_for_stock.insert(gap);
+                    continue;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             }
             let Some(content) = Claim::content(exchange.own_slot, *slot, chat) else {
                 continue;
@@ -513,10 +530,16 @@ impl AppClient {
             // Sending the claim may have advanced local effects. Select
             // compatible stock again and pass that exact record to the Add;
             // a clock/preference change cannot consume another allocation.
-            let Some(candidate) = self.next_private_key_package_for_chat(chat, slot, selection)?
-            else {
-                self.sibling_chat_gaps.waiting_for_stock.insert(gap);
-                continue;
+            let candidate = match self.next_private_key_package_for_chat(chat, slot, selection) {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) => {
+                    self.sibling_chat_gaps.waiting_for_stock.insert(gap);
+                    continue;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             };
             *budget -= 1;
             selection.record_attempt(slot, &candidate.key_package_ref_hex);
@@ -525,7 +548,7 @@ impl AppClient {
                 .waiting_for_stock
                 .remove(&(chat.clone(), *slot));
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -540,6 +563,36 @@ mod tests {
         "2222222222222222222222222222222222222222222222222222222222222222",
         "\",\"chat\":\"010203\"}"
     );
+
+    /// Scheduling depends on structural inputs at the last ready pass,
+    /// not on sampling a temporary busy interval. Changes during that
+    /// interval must still schedule the first ready pass.
+    #[test]
+    fn blocked_gap_passes_preserve_the_last_scheduled_eligibility() {
+        let eligibility = |key| GapEligibility {
+            group: GroupId::new(vec![1, 2, 3]),
+            own_slot: [1; 32],
+            targets: BTreeMap::from([([2; 32], vec![key; 32])]),
+            claimants: BTreeSet::from([[1; 32], [2; 32]]),
+        };
+        let mut state = SiblingChatGaps::default();
+        assert!(!state.schedule_eligibility(eligibility(3), false));
+        assert!(
+            state.schedule_eligibility(eligibility(3), true),
+            "first ready pass schedules"
+        );
+        assert!(!state.schedule_eligibility(eligibility(3), false));
+        assert!(
+            !state.schedule_eligibility(eligibility(3), true),
+            "busy/ready alone does not rescan"
+        );
+        assert!(!state.schedule_eligibility(eligibility(4), false));
+        assert!(
+            state.schedule_eligibility(eligibility(4), true),
+            "blocked key change is not consumed"
+        );
+        assert!(!state.schedule_eligibility(eligibility(4), true));
+    }
 
     #[test]
     fn gap_claims_have_canonical_bytes_and_reject_ambiguous_fields() {

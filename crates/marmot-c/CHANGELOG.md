@@ -173,8 +173,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   of a device the account's device group stopped listing without a removal,
   such as after a failed link (mdk#2761). Release builds hold no device
   group, so it stays zero there.
-- `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
-  461, 473, 475 and 476 as reserved, and one received in a chat makes no
+- `marmot_send_custom_event` refuses the device-group kinds 457, 458, 459,
+  460, 461, 473, 475 and 476 as reserved, and one received in a chat makes no
   timeline row, message or notification (mdk#2628). They are read only in
   the account's device group.
 - Creating a group or inviting adds every device of each recipient account

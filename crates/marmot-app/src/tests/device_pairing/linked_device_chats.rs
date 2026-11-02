@@ -466,6 +466,88 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
     );
 }
 
+/// An unreadable issuer row cannot prevent a healthy later sibling from
+/// filling the same chat. SQLite scalar corruption is issuer-local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_private_stock_does_not_starve_another_sibling_in_the_same_chat() {
+    let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+    let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut first, "First").await;
+    hold_key_packages(&relay, &mut phone, &mut first).await;
+    link(&relay, &mut phone, &mut second, "Second").await;
+    hold_key_packages(&relay, &mut phone, &mut second).await;
+    assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
+    assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
+    account_database(&phone.app)
+        .execute(
+            "UPDATE private_key_packages_received
+             SET not_before = 'unreadable', not_after = 'unreadable'
+             WHERE issuer_slot_hex = ?1",
+            [first.slot_hex()],
+        )
+        .unwrap();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &first), 0);
+    assert_eq!(taken_from(&phone, &second), 1);
+    assert_eq!(leaves_of(&phone, &second, &chat, &group), 1);
+}
+
+/// A successful send call may retain an unconfirmed Commit. The next
+/// sibling must not publish a claim for this already-busy chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_gap_add_does_not_claim_the_next_sibling() {
+    let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+    let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut first, "First").await;
+    hold_key_packages(&relay, &mut phone, &mut first).await;
+    link(&relay, &mut phone, &mut second, "Second").await;
+    hold_key_packages(&relay, &mut phone, &mut second).await;
+    assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
+    assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
+    assert!(phone.client.group_quiet(&chat).unwrap());
+    let before = relay.published_event_ids().len();
+    let blocked = relay
+        .blocked_publish_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    relay.block_next_publishes(2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut selection = Default::default();
+        tokio::join!(
+            phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
+            async {
+                relay.wait_for_blocked_publishes(blocked + 1).await;
+                relay.release_publish();
+                relay.wait_for_blocked_publishes(blocked + 2).await;
+                relay.zero_ack_next_publish();
+                relay.release_publish();
+            }
+        );
+    })
+    .await
+    .expect("the claim is accepted but the Commit is unconfirmed");
+    assert!(!phone.client.group_quiet(&chat).unwrap());
+    assert_eq!(taken_from(&phone, &first), 1);
+    assert_eq!(taken_from(&phone, &second), 0);
+    assert_eq!(
+        relay.published_event_ids().len(),
+        before + 1,
+        "only the first sibling's claim was published"
+    );
+}
+
 /// Recovering a quarantined chat wakes its missing-membership work without
 /// a device-group or chat epoch change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
