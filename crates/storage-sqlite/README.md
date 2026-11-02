@@ -399,7 +399,7 @@ ambiguous aliases of that event until exact proof resolves; proof never comes fr
 Attribution records the current roster tag key actually verified with the slot. That signature attests the source leaf
 key, so aliases from different MLS leaf keys coalesce to the earliest native observation only under the same verified
 (DG, tag key, slot) principal. A changed roster tag key is a different incarnation. Earlier delayed proof can tighten a
-deadline, never postpone it. Separate indexed32-row scans for proof-present and unavailable work, with source-roster
+deadline, never postpone it. Separate indexed 32-row scans for proof-present and unavailable work, with source-roster
 slot hints excluding current-key-unready work before the result limit, keep pending sources from starving healthy
 traffic. Hints never grant attribution. Rewrapping,
 message upserts, format promotion, snapshot replay and delayed projection cannot make any old observed content new.

@@ -136,13 +136,18 @@ pub(crate) fn observe_native_source(
             .ok_or_else(|| StorageError::Backend("sibling Welcome deadline overflow".into()))?,
     )?;
     store.with_transaction(|store| {
+        struct SourceOwner {
+            wrapper: Vec<u8>,
+            identity: Option<Vec<u8>>,
+            proof: Option<Vec<u8>>,
+        }
         let conn = store.lock()?;
-        let current: Option<(Vec<u8>, Option<Vec<u8>>)> = conn.query_row_cached(
-            "SELECT id, source_proof FROM cgka_processed_transport_ids WHERE group_id = ?1 AND content_id = ?2
+        let current: Option<SourceOwner> = conn.query_row_cached(
+            "SELECT id, source_identity, source_proof FROM cgka_processed_transport_ids WHERE group_id = ?1 AND content_id = ?2
              ORDER BY source_observed_order IS NULL, source_observed_order, id LIMIT 1",
-            params![group_id.as_slice(), content_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)),
+            params![group_id.as_slice(), content_id.as_slice()], |row| Ok(SourceOwner { wrapper: row.get(0)?, identity: row.get(1)?, proof: row.get(2)? }),
         ).optional().storage()?;
-        let Some((wrapper, prior)) = current else { return Ok(()); };
+        let Some(SourceOwner { wrapper, mut identity, proof: prior }) = current else { return Ok(()); };
         if let Some(prior) = prior {
             let old = decode_source_proof(&prior)?;
             if old.leaf.is_none() && source.leaf.is_some() && old.epoch == source.epoch && old.sender == source.sender
@@ -153,6 +158,7 @@ pub(crate) fn observe_native_source(
                     "UPDATE cgka_processed_transport_ids SET source_identity = ?3 WHERE group_id = ?1 AND source_identity = ?2",
                     params![group_id.as_slice(), old.identity.as_slice(), source.identity.as_slice()],
                 ).storage()?;
+                identity = Some(source.identity.as_slice().to_vec());
                 conn.execute_cached(
                     "UPDATE cgka_processed_transport_ids SET source_proof = ?2, source_has_leaf = 1, source_slot_hint = ?3 WHERE id = ?1",
                     params![wrapper, crate::serialize(&(1u8, source))?, source.leaf.as_ref().and_then(|leaf| leaf.slot_hint.as_ref().map(|slot| slot.as_slice()))],
@@ -166,6 +172,13 @@ pub(crate) fn observe_native_source(
                     params![group_id.as_slice(), source.identity.as_slice()],
                 ).storage()?;
             }
+        }
+        if identity.as_deref().is_some_and(|known| known != source.identity.as_slice()) {
+            // Reauthentication after snapshot restore can lack the source
+            // tree that supplied the original full proof. Keep that immutable
+            // owner; a weaker or incompatible observation cannot replace it
+            // or claim a new stamp. Only the exact upgrade above may rebind.
+            return Ok(());
         }
         conn.execute_cached("UPDATE cgka_processed_transport_ids SET source_identity = ?2, source_application_id = ?3 WHERE id = ?1 AND source_identity IS NULL",
             params![wrapper, source.identity.as_slice(), source.application_id.as_ref().map(|id| id.as_slice())]).storage()?;

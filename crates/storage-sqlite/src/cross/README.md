@@ -51,8 +51,8 @@ and slot. That key attests the source leaf key, so MLS rekey under an unchanged 
 observation; different tag-key incarnations never cross-merge. Unknown old source proof holds only aliases sharing that
 inner event identity. `source_resolved` distinguishes pending(0), completed qualification/ignore(1), and verified alias(2);
 only canonical qualified1 rows arm timing. Key-unready source hints filter pending reads, never grant attribution. Proof-present and missing-proof pending
-scans are independently indexed and bounded at32; healthy facts project before unavailable-proof recovery. The latter
-uses content-id keyset pages plus a group-scoped ephemeral cursor and at most128 anchor-fingerprint retry hints, so
+scans are independently indexed and bounded at 32; healthy facts project before unavailable-proof recovery. The latter
+uses content-id keyset pages plus a group-scoped ephemeral cursor and at most 128 anchor-fingerprint retry hints, so
 unavailable old facts cannot permanently block later recovery. The recovery rewind joins the existing group savepoint,
 so a failed historical restore cannot leave an old selected view before its optional projection error is isolated. A cache hit never resolves a fact or releases an alias. Wrapper
 replay, message upserts, format promotion and MLS snapshots never reset provenance. Native source order and the

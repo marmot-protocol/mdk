@@ -1287,6 +1287,134 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
                 .unwrap()
         );
     }
+    // A full snapshot restores the native message ledger, but not its lifetime
+    // source observation. Reauthentication after an epoch advance has less
+    // source-tree evidence and must not replace or retime the original proof.
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source-replay.sqlite");
+    let key = SqlCipherKey::raw([0x71; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let account = b"source-snapshot-replay";
+    let (mut phone, mut siblings, gid) = super::tagged_siblings::tag_devices(vec![
+        roster_device_on(storage.clone(), account),
+        roster_device(account),
+    ])
+    .await;
+    let mut laptop = siblings.remove(0);
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    storage
+        .create_group_snapshot(&gid, "before-source-app")
+        .unwrap();
+    let payload = cgka_traits::MarmotAppEvent::new(
+        hex::encode(laptop.engine.self_id().as_slice()),
+        1,
+        49_999,
+        vec![],
+        "snapshot replay",
+    )
+    .encode()
+    .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = laptop
+        .engine
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("application");
+    };
+    let mut application = route_to_group(&msg, &gid);
+    application.id = MessageId::new(vec![0x73; 32]);
+    let app_id = hash_id(&application.payload);
+    phone.engine.ingest(application.clone()).await.unwrap();
+    let first = storage
+        .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
+        .unwrap();
+    assert!(
+        first
+            .iter()
+            .any(|(id, source)| *id == app_id && source.leaf.is_some())
+    );
+    let observation = || {
+        observer
+            .query_row(
+                "SELECT source_identity, source_proof, source_observed_order, source_observed_at_ms
+         FROM cgka_processed_transport_ids WHERE group_id=?1 AND content_id=?2
+         AND source_proof IS NOT NULL ORDER BY source_observed_order LIMIT 1",
+                rusqlite::params![gid.as_slice(), app_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let first_observation = observation();
+    storage
+        .rollback_group_to_snapshot(&gid, "before-source-app")
+        .unwrap();
+    assert!(matches!(
+        storage.get_message(&app_id),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+    let Device { engine, .. } = phone;
+    drop(engine);
+    phone = roster_device_on(storage.clone(), account);
+    phone.engine.hydrate_all_stored_groups().unwrap();
+    let update = send_commit(
+        &mut laptop,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut phone, &update, &gid).await;
+    let before_replay = storage
+        .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
+        .unwrap();
+    phone.engine.drain_events();
+    application.id = MessageId::new(vec![0x72; 32]);
+    assert_eq!(
+        phone
+            .engine
+            .ingest(application)
+            .await
+            .expect("a previously observed app may authenticate without its old source tree"),
+        IngestOutcome::Processed,
+        "snapshot replay must reach actual native acceptance"
+    );
+    assert_eq!(
+        observation(),
+        first_observation,
+        "weaker replay preserves the original identity, full proof and first stamp"
+    );
+    assert_eq!(
+        storage
+            .pending_authenticated_device_group_sources(&gid, true, None, None, 32)
+            .unwrap(),
+        before_replay,
+        "replay cannot produce a second fresh source activity"
+    );
+    assert!(
+        phone
+            .engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event,
+                GroupEvent::MessageReceived { message_id, .. } if *message_id == app_id
+            )),
+        "the replay reached native application acceptance"
+    );
 }
 
 /// A real storage read failure during proposal admission must remain inside
