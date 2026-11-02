@@ -153,7 +153,8 @@ switch-over.
   `public_app_runner_stalled_relay_does_not_loop_bob_current` uses the same journey and every assertion, with all
   members at one epoch when bob closes. Neither case changes `settle_maintenance` or production timing. Both must
   recover exactly. `epoch-case.json` and the report name the requested case, epochs before close and at reconnect,
-  and the audited epoch-stall arm count (null if audit collection failed). Bob's last public observation during
+  and the audited epoch-stall arm count (null if audit collection failed). The fixture takes a fresh public snapshot
+  before closing bob, so the cached offline projection carries the current MLS epoch. Bob's last observation during
   close is separate from the first live epoch read after reopening and its elapsed time; the latter may already
   reflect recovery, or be null if unavailable. The report also records bounded by-id group
   requests separately from aggregate runner traces; traces alone do not identify a route. Both loops are selected

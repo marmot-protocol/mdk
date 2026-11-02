@@ -1234,7 +1234,14 @@ async fn prepare_loop_case(
     )
     .await?;
     let before = loop_epochs(subject, group, members).await?;
-    let bob = before["bob"];
+    // Direct probes do not refresh the harness's cached offline projection.
+    // Take the public snapshot that the close will preserve, and use its epoch.
+    let stopping = subject.observations(&["bob".to_owned()]).await?;
+    let bob = stopping
+        .first()
+        .ok_or("no bob observation before close")?
+        .protocol
+        .epoch;
     subject.set_online("bob", false).await?;
     let peers = members
         .iter()
