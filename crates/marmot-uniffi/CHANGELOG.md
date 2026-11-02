@@ -113,6 +113,10 @@
 
 ### Added
 
+- Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
 - `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
   the groups whose history is still being fetched (`catching_up_group_ids_hex`),
   whether the inbox's is (`inbox_catching_up`), and every notice as

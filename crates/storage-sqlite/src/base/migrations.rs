@@ -323,6 +323,8 @@ mod migration_0164_backup_ledger;
 mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
+#[path = "migrations/0167_device_edit_settings.rs"]
+mod migration_0167_device_edit_settings;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1280,6 +1282,12 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0166_blossom_history_deliveries::apply,
     },
+    Migration {
+        version: 167,
+        name: "0167_device_edit_settings",
+        suspend_foreign_keys: &[],
+        apply: migration_0167_device_edit_settings::apply,
+    },
 ];
 
 /// Run migration 0117's push-token share repair on an open database. Test
@@ -1636,6 +1644,27 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../../fixtures/storage-v1-v0.9.12.bin");
+
+    /// Legacy provenance remains label-only; settings were not part of its
+    /// intention and must never be synthesized by upgrading a database.
+    #[test]
+    fn migration_0167_keeps_legacy_renames_label_only() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 166).unwrap();
+        conn.execute(
+            "INSERT INTO device_renames VALUES ('aa', 'Laptop', ?1, ?2)",
+            params![vec![3_u8; 16], vec![0_u8; 17]],
+        )
+        .unwrap();
+        run_through(&mut conn, 167).unwrap();
+        let row: (String, Vec<u8>, Vec<u8>, Option<u8>) = conn.query_row(
+            "SELECT label, written, replaced, settings FROM device_renames WHERE slot_id_hex = 'aa'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(row, ("Laptop".into(), vec![3; 16], vec![0; 17], None));
+        conn.execute("UPDATE device_renames SET settings = 5", [])
+            .unwrap();
+        assert!(conn.execute("UPDATE device_renames SET settings = 8", []).is_err_and(|error| matches!(error, rusqlite::Error::SqliteFailure(ref inner, _) if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK)));
+    }
 
     /// D81 retires the unused announcement history without changing the
     /// device group's authoritative record. Exercise a populated upgrade.

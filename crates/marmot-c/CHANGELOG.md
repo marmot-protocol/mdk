@@ -64,6 +64,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_update_linked_device_settings`, using presence/value `uint8_t` pairs for optional booleans. It blocks on the account worker and returns no allocation (mdk#2628 D86).
+
 - `marmot_account_recovery_status` writes an owned
   `MarmotAccountRecoveryStatus`: the groups whose history is still being
   fetched (`catching_up_group_ids_hex`), whether the inbox's is

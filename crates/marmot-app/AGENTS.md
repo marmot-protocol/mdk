@@ -96,13 +96,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the roster. The client recomputes it after each maintenance pass; a change sets
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
-- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, announcements).
+- Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, settings, announcements).
   It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
-  replacement never undoes a change that lands in between. A rename (`client/device_renames.rs`) writes a fresh rename
-  id next to the label and is kept on disk before its commit is sent. Maintenance reads only the rename id the winning
-  roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
-  since (made again with a fresh id), any other means another rename stands. Never infer a rename's fate from labels
+  replacement never undoes a change that lands in between. A user edit (`client/device_renames.rs`, D37/D86) writes
+  a fresh rename id next to its label/settings snapshot and is kept on disk before its commit is sent. Legacy NULL settings remain
+  label-only. A later human command first invokes the same recovery helper and re-reads the roster; return Busy if
+  the earlier intention remains unsettled. No-op cancellation must cover every pending difference, so a label-only
+  no-op cannot discard lost settings. Non-user updates preserve label, settings and the id. Maintenance reads only
+  the rename id the winning roster holds (D37): one the rename wrote means applied, one its renames replaced means lost with nothing renamed
+  since (made again with a fresh id), any other means another user edit stands. Never infer a rename's fate from labels
   or commit ids. Every entry is created with a fresh rename id (`fresh_rename_id`: the creator's founding entry, the
   founding Add's and every later link's), so a kept id shows up again only when a fork brings back an earlier state.
   Rejected slots (3.2's sign-in rejections, below) are written by the runtime's `reject_device_slots` instead, never as

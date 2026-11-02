@@ -1022,8 +1022,22 @@ one roster commit in the device group:
   device group, for a slot the roster doesn't list, and while the device group has an earlier change of this device's
   in flight (`device_group_busy`). Retry that last one later; a commit then could build on a roster that is about to
   change.
-- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device
+- A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename or settings edit of that device
   won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`, not the one the user typed.
+
+`update_linked_device_settings(account_ref, slot_id_hex, add_to_all_chats, bring_history, keep_while_inactive)`
+changes any linked device's supplied settings, this device included. Each setting is optional: omitted values come
+from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
+A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits the linked-device Add flow while it is still adding; turning it off
+does not leave joined chats. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
+is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
+
+A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
+tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
+remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
+of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
+`LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
 ### This device unlinked
 

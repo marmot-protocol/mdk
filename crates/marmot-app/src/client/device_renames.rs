@@ -1,36 +1,19 @@
-//! Renaming this account's devices (mdk#2628 item 3.6, D35, D37).
+//! Human edits of this account's device labels and settings (D37/D86).
 //!
-//! Any device may rename any device, itself included: one roster commit in the
-//! device group this device trusts, setting one entry's label and a fresh
-//! rename id and keeping every other field as the roster holds it, through
-//! the runtime's one roster write path. While that group cannot take a commit
-//! from this device, a rename is refused and nothing is sent.
-//!
-//! A rename is kept on disk before its commit is sent: the ids it wrote, and
-//! the ids the entry held where this device's renames of that device were
-//! built ([`DeviceRenameRecord`]). It is put back as it was only when nothing
-//! went out: the edit was refused, the commit rolled back, or, after an
-//! error, the roster lacks the rename and nothing of this device's is in
-//! flight. Otherwise the commit may still land from the runtime's retry, so
-//! the record stays and is judged like any other. Its commit can lose a fork.
-//! Each
-//! maintenance pass, while the device group can take a commit from this
-//! device (so each of its commits there has reached its outcome), reads the
-//! rename id the winning roster holds for every device this device renamed:
-//! - one this rename wrote: it applied, by its own commit or the engine's
-//!   re-issue of it, which carries the same bytes;
-//! - one the entry held where this device's renames were built: the rename
-//!   lost and nothing renamed the device since, so it is made again with a
-//!   fresh id;
-//! - any other: another rename won and stands, and the record goes.
-//!
-//! Saving the label the roster already shows sends nothing. It keeps a rename
-//! that applied, so a fork that rewinds it later still has it made again, and
-//! forgets a lost one, which would now undo the user's choice. While a rename
-//! of that device is still in flight, it is refused as busy instead.
+//! Rename and settings commands resolve their supplied fields on the worker,
+//! journal label + all three settings, then use the runtime's roster CAS.
+//! Legacy records with no settings still replay only a label. The existing
+//! maintenance owner recovers a lost edit by provenance: a written id means
+//! applied, a replaced id means replay, any other id means another edit won.
+//! A later human edit first tries that same recovery and re-reads. A no-op
+//! cancels a lost edit only when it explicitly covers every pending difference.
+//! Journal writes precede publication and are restored only when nothing went
+//! out; uncertain publication remains recoverable. There is no new scheduler.
 
 use cgka_traits::GroupId;
-use cgka_traits::app_components::{DEVICE_ROSTER_TEXT_MAX_LEN, DeviceRenameId, DeviceSlotId};
+use cgka_traits::app_components::{
+    DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1, DeviceRenameId, DeviceSlotId,
+};
 use marmot_session::{AccountResult, DeviceRosterEdit, DeviceRosterEditBlocked, PendingResolution};
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -122,15 +105,55 @@ enum RenameCommit {
     Busy,
 }
 
+/// A host request changes only its supplied fields. It is resolved on the worker
+/// after any earlier lost local edit has been recovered, never on a host snapshot.
+#[derive(Default)]
+struct DeviceEdit<'a> {
+    label: Option<&'a str>,
+    add_to_all_chats: Option<bool>,
+    bring_history: Option<bool>,
+    keep_while_inactive: Option<bool>,
+}
+
+impl DeviceEdit<'_> {
+    fn apply(&self, entry: &mut DeviceEntryV1) {
+        if let Some(label) = self.label {
+            entry.label = label.to_owned();
+        }
+        if let Some(value) = self.add_to_all_chats {
+            entry.settings.add_to_all_chats = value;
+        }
+        if let Some(value) = self.bring_history {
+            entry.settings.bring_history = value;
+        }
+        if let Some(value) = self.keep_while_inactive {
+            entry.settings.keep_while_inactive = value;
+        }
+    }
+
+    /// A no-op request may cancel only the pending differences it explicitly
+    /// covers. Choosing the shown label must not drop an unrelated settings edit.
+    fn cancels(&self, record: &DeviceRenameRecord, current: &DeviceEntryV1) -> bool {
+        let mut desired = current.clone();
+        desired.label.clone_from(&record.label);
+        if let Some(settings) = record.settings {
+            desired.settings = settings;
+        }
+        self.apply(&mut desired);
+        desired.label == current.label && desired.settings == current.settings
+    }
+}
+
+fn edit_matches(record: &DeviceRenameRecord, entry: &DeviceEntryV1) -> bool {
+    record.label == entry.label
+        && record
+            .settings
+            .is_none_or(|settings| settings == entry.settings)
+}
+
 impl AppClient {
-    /// Rename one of this account's devices: set the label of `slot_id_hex`'s
-    /// roster entry, with a fresh rename id. The label is at most 64 bytes of
-    /// UTF-8; empty clears it.
-    ///
-    /// Refused with nothing sent when device groups are off, with no trusted
-    /// device group, for a slot the roster doesn't list (`unknown_device`),
-    /// and while the device group cannot take a commit from this device now
-    /// (`device_group_busy`; retry later).
+    /// Rename any linked device; empty clears its label and at most 64 UTF-8
+    /// bytes are accepted. Earlier lost edits recover before a later edit.
     pub(crate) async fn rename_linked_device(
         &mut self,
         slot_id_hex: &str,
@@ -142,62 +165,125 @@ impl AppClient {
         if label.len() > DEVICE_ROSTER_TEXT_MAX_LEN {
             return Err(AppError::DeviceGroupRefused("label_too_long"));
         }
+        self.edit_linked_device(
+            slot_id_hex,
+            DeviceEdit {
+                label: Some(label),
+                ..DeviceEdit::default()
+            },
+        )
+        .await
+    }
+
+    /// Patch the supplied settings of any linked device. Omitted values are
+    /// read from the current roster, after recovering an earlier local edit.
+    pub(crate) async fn update_linked_device_settings(
+        &mut self,
+        slot_id_hex: &str,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+    ) -> Result<(), AppError> {
+        self.edit_linked_device(
+            slot_id_hex,
+            DeviceEdit {
+                label: None,
+                add_to_all_chats,
+                bring_history,
+                keep_while_inactive,
+            },
+        )
+        .await
+    }
+
+    async fn edit_linked_device(
+        &mut self,
+        slot_id_hex: &str,
+        request: DeviceEdit<'_>,
+    ) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Err(AppError::DeviceGroupRefused("roster_unsupported"));
+        }
         let slot =
             device_slot(slot_id_hex).map_err(|_| AppError::DeviceGroupRefused("unknown_device"))?;
-        self.sync_runtime_groups_for_send("rename_linked_device")
+        self.sync_runtime_groups_for_send("edit_linked_device")
             .await?;
-        let Some((group_id, roster)) = self.trusted_device_roster()? else {
-            return Err(AppError::DeviceGroupRefused("no_device_group"));
-        };
-        let Some(entry) = roster.devices.get(&slot) else {
-            return Err(AppError::DeviceGroupRefused("unknown_device"));
-        };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let slot_id_hex = hex::encode(slot);
-        let kept = storage.device_rename(&slot_id_hex)?;
-        let kept_standing = kept.as_ref().map(|kept| standing(kept, entry.rename_id));
-        if entry.label == label {
-            // The user chose the label the roster shows. A lost rename of
-            // this device would undo that choice; one that applied stays.
-            if kept_standing.is_some_and(|kept| kept != Standing::Applied) {
-                // Judge it only once its commit has an outcome: one still in
-                // flight is not on the roster yet, and may land.
-                let held = self.epoch_gap_held_groups()?;
-                if !self.runtime.device_group_takes_commit(&group_id, &held)? {
-                    return Err(AppError::DeviceGroupRefused(
-                        DeviceRosterEditBlocked::Busy.reason(),
-                    ));
-                }
-                storage.drop_device_rename(&slot_id_hex)?;
+        // One attempt uses the existing recovery owner; a replay still in flight
+        // is Busy. There is no new retry loop, scheduler or intention merging.
+        for recover_first in [true, false] {
+            let Some((group_id, roster)) = self.trusted_device_roster()? else {
+                return Err(AppError::DeviceGroupRefused("no_device_group"));
+            };
+            let Some(entry) = roster.devices.get(&slot) else {
+                return Err(AppError::DeviceGroupRefused("unknown_device"));
+            };
+            if request.label.is_none()
+                && request.add_to_all_chats.is_none()
+                && request.bring_history.is_none()
+                && request.keep_while_inactive.is_none()
+            {
+                return Ok(());
             }
-            return Ok(());
+            let kept = storage.device_rename(&slot_id_hex)?;
+            let kept_standing = kept.as_ref().map(|kept| standing(kept, entry.rename_id));
+            let mut desired = entry.clone();
+            request.apply(&mut desired);
+            let unchanged = desired.label == entry.label && desired.settings == entry.settings;
+            if unchanged {
+                match kept_standing {
+                    None | Some(Standing::Applied) => return Ok(()),
+                    Some(Standing::Lost | Standing::Replaced) => {
+                        // A record not visible on the roster can still land while
+                        // its commit is unresolved. Never report a contrary no-op.
+                        let held = self.epoch_gap_held_groups()?;
+                        if !self.runtime.device_group_takes_commit(&group_id, &held)? {
+                            return Err(AppError::DeviceGroupRefused("device_group_busy"));
+                        }
+                        if kept_standing == Some(Standing::Replaced)
+                            || request.cancels(kept.as_ref().expect("kept edit"), entry)
+                        {
+                            storage.drop_device_rename(&slot_id_hex)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if let Some(kept) = kept
+                .as_ref()
+                .filter(|kept| kept_standing == Some(Standing::Lost) && !edit_matches(kept, entry))
+            {
+                if !recover_first {
+                    return Err(AppError::DeviceGroupRefused("device_group_busy"));
+                }
+                self.settle_kept_device_edit(kept.clone()).await?;
+                continue;
+            }
+            let replaced = match kept {
+                Some(kept) if kept_standing != Some(Standing::Replaced) => kept
+                    .replaced
+                    .into_iter()
+                    .chain(kept.written.into_iter().map(Some))
+                    .collect(),
+                _ => vec![entry.rename_id],
+            };
+            let record = DeviceRenameRecord {
+                slot_id_hex: slot_id_hex.clone(),
+                label: desired.label,
+                settings: Some(desired.settings),
+                written: vec![fresh_rename_id()],
+                replaced,
+            };
+            return match self
+                .commit_device_rename(&group_id, slot, entry.rename_id, record)
+                .await?
+            {
+                RenameCommit::Sent => Ok(()),
+                RenameCommit::Busy => Err(AppError::DeviceGroupRefused("device_group_busy")),
+            };
         }
-        // Where this device's earlier renames of the device still stand, a
-        // roster holding any id they wrote or replaced means this one lost.
-        let replaced = match kept {
-            Some(kept) if kept_standing != Some(Standing::Replaced) => kept
-                .replaced
-                .into_iter()
-                .chain(kept.written.into_iter().map(Some))
-                .collect(),
-            _ => vec![entry.rename_id],
-        };
-        let record = DeviceRenameRecord {
-            slot_id_hex,
-            label: label.to_owned(),
-            written: vec![fresh_rename_id()],
-            replaced,
-        };
-        let expected = entry.rename_id;
-        match self
-            .commit_device_rename(&group_id, slot, expected, record)
-            .await?
-        {
-            RenameCommit::Sent => Ok(()),
-            RenameCommit::Busy => Err(AppError::DeviceGroupRefused(
-                DeviceRosterEditBlocked::Busy.reason(),
-            )),
-        }
+        unreachable!("the second pass returns")
     }
 
     /// Make each rename this device keeps that lost a fork again, and forget
@@ -219,38 +305,48 @@ impl AppClient {
             return Ok(());
         }
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        for rename in storage.device_renames()? {
-            let Some((group_id, roster)) = self.trusted_device_roster()? else {
-                return Ok(());
-            };
-            let held = self.epoch_gap_held_groups()?;
-            if !self.runtime.device_group_takes_commit(&group_id, &held)? {
-                return Ok(());
-            }
-            let slot = device_slot(&rename.slot_id_hex)?;
-            let Some(entry) = roster.devices.get(&slot) else {
-                storage.drop_device_rename(&rename.slot_id_hex)?;
-                continue;
-            };
-            match standing(&rename, entry.rename_id) {
-                Standing::Applied => {}
-                Standing::Replaced => storage.drop_device_rename(&rename.slot_id_hex)?,
-                // The roster shows this rename's label already.
-                Standing::Lost if entry.label == rename.label => {}
-                Standing::Lost => {
-                    let expected = entry.rename_id;
-                    let mut again = rename;
-                    again.written.push(fresh_rename_id());
-                    if let RenameCommit::Busy = self
-                        .commit_device_rename(&group_id, slot, expected, again)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
+        for record in storage.device_renames()? {
+            if !self.settle_kept_device_edit(record).await? {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// The same D37 owner serves maintenance and a new human command. True
+    /// permits maintenance to visit the next record; commands re-read afterwards.
+    async fn settle_kept_device_edit(
+        &mut self,
+        mut record: DeviceRenameRecord,
+    ) -> Result<bool, AppError> {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
+            return Ok(false);
+        };
+        let held = self.epoch_gap_held_groups()?;
+        if !self.runtime.device_group_takes_commit(&group_id, &held)? {
+            return Ok(false);
+        }
+        let slot = device_slot(&record.slot_id_hex)?;
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(entry) = roster.devices.get(&slot) else {
+            storage.drop_device_rename(&record.slot_id_hex)?;
+            return Ok(true);
+        };
+        match standing(&record, entry.rename_id) {
+            Standing::Applied => {}
+            Standing::Replaced => storage.drop_device_rename(&record.slot_id_hex)?,
+            Standing::Lost if edit_matches(&record, entry) => {}
+            Standing::Lost => {
+                record.written.push(fresh_rename_id());
+                if let RenameCommit::Busy = self
+                    .commit_device_rename(&group_id, slot, entry.rename_id, record)
+                    .await?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Commit `record`'s rename of `slot` in `group_id`, through the
@@ -271,6 +367,7 @@ impl AppClient {
         storage.put_device_rename(&record)?;
         let rename_id = *record.written.last().expect("a rename writes an id");
         let label = record.label.clone();
+        let settings = record.settings;
         let edit = self
             .runtime
             .edit_device_roster_entry(group_id, &slot, &held, |entry| {
@@ -278,6 +375,9 @@ impl AppClient {
                 // reads as unchanged, and the rename waits.
                 if entry.rename_id == expected {
                     entry.label = label;
+                    if let Some(settings) = settings {
+                        entry.settings = settings;
+                    }
                     entry.rename_id = Some(rename_id);
                 }
             })
@@ -348,6 +448,7 @@ mod tests {
         DeviceRenameRecord {
             slot_id_hex: "aa".into(),
             label: "Laptop".into(),
+            settings: None,
             written: written.iter().map(|id| [*id; 16]).collect(),
             replaced: replaced.iter().map(|id| id.map(|id| [id; 16])).collect(),
         }

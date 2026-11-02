@@ -195,7 +195,13 @@ async fn edit_laptop_entry(
     let edited = devices
         .phone
         .runtime
-        .edit_device_roster_entry(group, &laptop_slot, &[], edit)
+        .edit_device_roster_entry(group, &laptop_slot, &[], |entry| {
+            let before = (entry.label.clone(), entry.settings);
+            edit(entry);
+            if (entry.label.clone(), entry.settings) != before {
+                entry.rename_id = Some(rand::random());
+            }
+        })
         .await
         .unwrap();
     assert!(matches!(edited, DeviceRosterEdit::Committed(_)));
@@ -213,6 +219,7 @@ async fn name_phone(devices: &mut Devices, group: &GroupId, label: &str) {
         .runtime
         .edit_device_roster_entry(group, &phone_slot, &[], |entry| {
             entry.label = label.to_owned();
+            entry.rename_id = Some(rand::random());
         })
         .await
         .unwrap();

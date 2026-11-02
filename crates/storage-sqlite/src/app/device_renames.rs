@@ -1,13 +1,14 @@
 //! Renames this device made in its device group's roster, one row per device
 //! renamed (mdk#2628 item 3.6, D37). See migration 0137.
 //!
-//! Every rename writes a fresh rename id next to the label. The row keeps the
+//! User edits of labels or settings write a fresh rename id. NULL settings
+//! retain label-only recovery for records from before migration 0167. The row keeps the
 //! ids this device's rename wrote and the ids the entry held where its renames
 //! were built, so after a fork this device reads from the winning roster's id
 //! alone whether its rename applied, was lost with nothing renaming the device
 //! since, or lost to another rename that stands.
 
-use cgka_traits::app_components::DeviceRenameId;
+use cgka_traits::app_components::{DeviceRenameId, DeviceSettingsV1};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 
@@ -20,6 +21,8 @@ pub struct DeviceRenameRecord {
     pub slot_id_hex: String,
     /// The label this device's latest rename of the device sets.
     pub label: String,
+    /// Settings captured with the user edit. None for a legacy label-only rename.
+    pub settings: Option<DeviceSettingsV1>,
     /// The rename ids that rename wrote, oldest first: the first commit's,
     /// then one for each time it was made again. Never empty.
     pub written: Vec<DeviceRenameId>,
@@ -35,7 +38,7 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT slot_id_hex, label, written, replaced
+                "SELECT slot_id_hex, label, written, replaced, settings
                  FROM device_renames ORDER BY slot_id_hex ASC",
             )
             .storage()?;
@@ -51,7 +54,7 @@ impl SqliteAppStorage {
     pub fn device_rename(&self, slot_id_hex: &str) -> StorageResult<Option<DeviceRenameRecord>> {
         self.lock()?
             .query_row_cached(
-                "SELECT slot_id_hex, label, written, replaced
+                "SELECT slot_id_hex, label, written, replaced, settings
                  FROM device_renames WHERE slot_id_hex = ?1",
                 params![slot_id_hex],
                 device_rename_row,
@@ -76,15 +79,27 @@ impl SqliteAppStorage {
             replaced.push(u8::from(id.is_some()));
             replaced.extend_from_slice(&id.unwrap_or_default());
         }
+        let settings = record.settings.map(|settings| {
+            u8::from(settings.add_to_all_chats)
+                | (u8::from(settings.bring_history) << 1)
+                | (u8::from(settings.keep_while_inactive) << 2)
+        });
         self.lock()?
             .execute_cached(
-                "INSERT INTO device_renames (slot_id_hex, label, written, replaced)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO device_renames (slot_id_hex, label, written, replaced, settings)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(slot_id_hex) DO UPDATE SET
                     label = excluded.label,
                     written = excluded.written,
-                    replaced = excluded.replaced",
-                params![record.slot_id_hex, record.label, written, replaced],
+                    replaced = excluded.replaced,
+                    settings = excluded.settings",
+                params![
+                    record.slot_id_hex,
+                    record.label,
+                    written,
+                    replaced,
+                    settings
+                ],
             )
             .storage()?;
         Ok(())
@@ -102,14 +117,20 @@ impl SqliteAppStorage {
     }
 }
 
-type DeviceRenameRow = (String, String, Vec<u8>, Vec<u8>);
+type DeviceRenameRow = (String, String, Vec<u8>, Vec<u8>, Option<u8>);
 
 fn device_rename_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRenameRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 fn device_rename_record(
-    (slot_id_hex, label, written, replaced): DeviceRenameRow,
+    (slot_id_hex, label, written, replaced, settings): DeviceRenameRow,
 ) -> StorageResult<DeviceRenameRecord> {
     let corrupt = || StorageError::Backend("device rename ids are malformed".into());
     let (written, []) = written.as_chunks::<16>() else {
@@ -133,6 +154,11 @@ fn device_rename_record(
     Ok(DeviceRenameRecord {
         slot_id_hex,
         label,
+        settings: settings.map(|bits| DeviceSettingsV1 {
+            add_to_all_chats: bits & 1 != 0,
+            bring_history: bits & 2 != 0,
+            keep_while_inactive: bits & 4 != 0,
+        }),
         written: written.to_vec(),
         replaced,
     })
@@ -152,6 +178,7 @@ mod tests {
         DeviceRenameRecord {
             slot_id_hex: slot.into(),
             label: label.into(),
+            settings: None,
             written: written.iter().map(|id| [*id; 16]).collect(),
             replaced: replaced.iter().map(|id| id.map(|id| [id; 16])).collect(),
         }
@@ -170,7 +197,12 @@ mod tests {
         );
         assert_eq!(store.device_rename("aa").unwrap(), Some(phone));
 
-        let renamed_again = rename("bb", "Work", &[5], &[None, Some(1)]);
+        let mut renamed_again = rename("bb", "Work", &[5], &[None, Some(1)]);
+        renamed_again.settings = Some(DeviceSettingsV1 {
+            add_to_all_chats: true,
+            bring_history: false,
+            keep_while_inactive: true,
+        });
         store.put_device_rename(&renamed_again).unwrap();
         assert_eq!(store.device_rename("bb").unwrap(), Some(renamed_again));
 

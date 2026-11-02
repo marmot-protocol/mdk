@@ -114,7 +114,9 @@ where
     /// Replace the entry of `slot` in the roster of `group_id` with `edit`
     /// applied to it, in one commit. Every other field, and every other
     /// entry, stays as the roster holds it. `held` lists groups the host is
-    /// holding back from commits.
+    /// holding back from commits. A label/settings change must supply a
+    /// present fresh rename id; other edits preserve the id. The caller's
+    /// supplied id is preserved for its write-ahead recovery record (D86).
     pub async fn edit_device_roster_entry(
         &mut self,
         group_id: &GroupId,
@@ -132,6 +134,22 @@ where
         };
         let mut entry = current.clone();
         edit(&mut entry);
+        // D86: user edits must carry the fresh id their caller retained before
+        // publication. Never invent one here or let a generic caller bypass it.
+        let user_values_changed =
+            entry.label != current.label || entry.settings != current.settings;
+        if user_values_changed
+            && (entry.rename_id.is_none() || entry.rename_id == current.rename_id)
+        {
+            return Err(AccountError::Engine(EngineError::Serialize(
+                "device label or settings edit needs a fresh rename id".into(),
+            )));
+        }
+        if !user_values_changed && entry.rename_id != current.rename_id {
+            return Err(AccountError::Engine(EngineError::Serialize(
+                "non-user device edit must preserve rename id".into(),
+            )));
+        }
         if entry == current {
             return Ok(DeviceRosterEdit::Unchanged);
         }
