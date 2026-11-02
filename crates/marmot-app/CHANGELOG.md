@@ -108,6 +108,8 @@
   inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline
   wins; no automatic join/rejoin or cancellation of an already-requested Leave. Existing host APIs and release
   feature gates stay unchanged; custom experimental peers must adopt V2 sibling Welcomes together.
+  A known current-generation decline holds new automatic sibling Adds and their sole stock demand; a higher
+  acceptance wakes existing opt-in work without recalling admitted traffic or changing another generation.
 
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a

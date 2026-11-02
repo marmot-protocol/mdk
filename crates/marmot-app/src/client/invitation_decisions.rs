@@ -7,6 +7,23 @@ use cgka_traits::storage::{GroupStorage, LeaveRequestStorage};
 use storage_sqlite::InvitationDecision;
 
 impl AppClient {
+    /// An existing automatic Add obligation never spreads an invitation this
+    /// copy's current authenticated generation already declined. Unknown
+    /// legacy admissions and decisions for another generation stay independent.
+    pub(super) fn invitation_allows_sibling_add(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(true);
+        };
+        Ok(account
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)?
+            .is_none_or(|decision| !decision.declined))
+    }
+
     /// Only an actual pending invitation action is replicated; the existing
     /// decline entry point also supports ordinary departure and stays local then.
     pub(super) fn record_local_invitation_decision(
@@ -203,6 +220,11 @@ impl AppClient {
         let Some(group) = self.app.group(&self.state.label, &decision.group_id_hex)? else {
             return Ok(());
         };
+        // Winning values durably owe this pass. Reuse its retry ownership to
+        // wake an existing gap even if only application state changed, with no
+        // chat epoch or device-group eligibility change. A failed read above
+        // keeps the work owed; a duplicate/losing value never re-arms it.
+        self.invitation_decision_changes_sibling_gaps(&group_id);
         if let Some(cached) = self
             .state
             .groups

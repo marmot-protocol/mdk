@@ -439,7 +439,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   action. Uninstalled decisions retain value but defer work until a matching native join. Decline uses existing
   LeaveRequest and worker maintenance; recheck current generation/winner after send preflight. Higher acceptance
   can replace unrequested intent but cannot cancel native LeaveRequest. Box the rare internal Leave future as the
-  foreground owner does, to keep it out of idle maintenance frames. Kind475 invitation pages flush on repeated
+  foreground owner does, to keep it out of idle maintenance frames. A known current-generation decline holds new
+  direct/gap sibling Adds and solely owed stock requests at candidate and final preparation; keep claims/waiters and
+  exposed work settlement independent. Reuse durable winner work to schedule the affected chat's existing gap work,
+  even without an epoch change; do not put per-chat decisions in the global slot/tag eligibility fingerprint.
+  `a_declined_generation_holds_automatic_adds_until_a_later_accept` owns that app/transport boundary. Kind475 invitation
+  pages flush on repeated
   `(chat,item)` even for different generations and never truncate retained generations; ordinary full-broadcast and
   withdrawal ownership re-owe them. Old V1 Welcome bytes are never upgraded to V2 on retry. The source/codec/atomicity
   owners live in the existing engine private-KeyPackage, app small-state and sibling-Welcome modules; do not replay

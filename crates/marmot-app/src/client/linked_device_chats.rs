@@ -428,7 +428,9 @@ impl AppClient {
         device: &NewDevice,
         chat: &GroupId,
     ) -> Result<bool, AppError> {
-        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
+        if !self.invitation_allows_sibling_add(chat)?
+            || self.runtime.chat_sibling_add_refusal(chat)?.is_some()
+        {
             return Ok(false);
         }
         Ok(!self

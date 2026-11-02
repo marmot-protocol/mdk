@@ -875,6 +875,12 @@ impl AppClient {
         sibling: &DeviceSlotId,
         candidate: ReceivedPrivateKeyPackage,
     ) -> Result<(), AppError> {
+        // Candidate selection and claim publication can precede this final
+        // preparation. Re-read the current generation before spending stock.
+        // Already admitted/signed work has its own settlement owner.
+        if !self.invitation_allows_sibling_add(chat)? {
+            return Ok(());
+        }
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));
         }
