@@ -56,6 +56,7 @@ const REMOVE: &str = "RemoveOwnAccountDevices";
 pub(crate) struct SiblingWelcomePlan {
     from: DeviceSlotId,
     relays: Vec<String>,
+    pub(crate) invitation_generation: Option<[u8; 32]>,
 }
 
 /// A sibling Welcome plan, or why the Add is refused and the reason it gives.
@@ -555,6 +556,10 @@ impl<S: StorageProvider> Engine<S> {
         Ok(Ok(SiblingWelcomePlan {
             from: own.slot(),
             relays,
+            invitation_generation: self
+                .storage
+                .invitation_admission(&GroupId::new(mls_group.group_id().as_slice().to_vec()))?
+                .map(|admission| admission.generation),
         }))
     }
 
@@ -900,6 +905,7 @@ pub(crate) fn build_sibling_welcomes(
             let content = SiblingWelcome {
                 from: plan.from,
                 to: sibling.slot,
+                invitation_generation: plan.invitation_generation,
                 key_package_ref: key_package_ref.clone(),
                 welcome: welcome.to_vec(),
                 relays: plan.relays.clone(),

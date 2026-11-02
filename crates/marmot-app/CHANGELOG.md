@@ -104,6 +104,11 @@
 
 ### Added
 
+- Experimental device groups synchronize invitation decisions for one validated admission generation and its
+  inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline
+  wins; no automatic join/rejoin or cancellation of an already-requested Leave. Existing host APIs and release
+  feature gates stay unchanged; custom experimental peers must adopt V2 sibling Welcomes together.
+
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no

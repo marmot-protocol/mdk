@@ -437,6 +437,9 @@
 
 ### Added
 
+- Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
+  publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
+
 - `dismiss_recovery_route_park_on` dismisses a route's broken units on the
   given relays and its remainder, checking the revision against them only;
   a broken unit on any other relay stays as it is (mdk#2660 phase 4).

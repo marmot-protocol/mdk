@@ -2403,6 +2403,17 @@ impl AppClient {
                     );
                     return Err(error);
                 }
+                match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        ..
+                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
+                        self.note_invitation_admission(group_id, None)?
+                    }
+                    _ => {}
+                }
                 let updated_group =
                     event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
                 if previous_group != updated_group
@@ -7339,6 +7350,17 @@ impl AppClient {
                         group_metadata.as_ref(),
                         &mut event_summary,
                     )?;
+                }
+                match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        ..
+                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
+                        self.note_invitation_admission(group_id, None)?
+                    }
+                    _ => {}
                 }
                 let updated_group =
                     event_group_id(event).and_then(|group_id| self.state_group_record(group_id));

@@ -457,6 +457,15 @@ cargo run --release -p marmot-c --example nip46_smoke
 
 ## Linked devices
 
+Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
+and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
+fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
+local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A zero-publication
+`CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
+membership state; ordinary archive/leave/delete is not an invitation decision. This adds no host API or working
+linking control to released builds, which cannot enable device groups. Custom experimental peers must update together
+before using V2 sibling Welcomes; no capability negotiation or mixed-old-receiver guarantee is added.
+
 `marmot_linked_devices` blocks on the account worker, reads local group state only, and writes an owned
 `MarmotLinkedDeviceList`; free it with `marmot_linked_device_list_free`. Each `MarmotLinkedDevice` has its
 `slot_id_hex` handle, `is_this_device`, `label`, `client` and `platform` (empty until set), `linked_at`, a

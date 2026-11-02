@@ -203,6 +203,9 @@ impl PrivateKeyPackageHandOff {
 pub struct SiblingWelcome {
     pub from: DeviceSlotId,
     pub to: DeviceSlotId,
+    /// Original account invitation inherited by this automatic sibling Add.
+    /// None retains the exact version-1, local-only invitation contract.
+    pub invitation_generation: Option<[u8; 32]>,
     /// The consumed private KeyPackage's `KeyPackageRef`, 1 to 64 bytes.
     pub key_package_ref: Vec<u8>,
     /// One `mls_welcome` MLSMessage, as MLS encodes it.
@@ -215,7 +218,9 @@ impl SiblingWelcome {
     /// The binary `SiblingWelcomeV1 { uint8 version; SlotId from; SlotId to;
     /// KeyPackageRefV1 key_package_ref; MLSMessage welcome;
     /// SiblingWelcomeRelayV1 relays<V> }`, each relay an `opaque url<1..512>`.
-    /// The message content is its standard base64.
+    /// With an original invitation generation, V2 inserts its fixed 32 bytes
+    /// after `to`; otherwise this remains byte-identical V1. The message
+    /// content is its standard base64.
     pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
         let invalid = |reason: &str| EngineError::Serialize(format!("sibling Welcome: {reason}"));
         if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&self.key_package_ref.len()) {
@@ -233,9 +238,16 @@ impl SiblingWelcome {
                 .tls_serialize(&mut relays)
                 .map_err(|error| invalid(&format!("{error:?}")))?;
         }
-        let mut bytes = vec![SIBLING_WELCOME_VERSION];
+        let mut bytes = vec![if self.invitation_generation.is_some() {
+            2
+        } else {
+            SIBLING_WELCOME_VERSION
+        }];
         bytes.extend_from_slice(&self.from);
         bytes.extend_from_slice(&self.to);
+        if let Some(generation) = self.invitation_generation {
+            bytes.extend_from_slice(&generation);
+        }
         VLBytes::new(self.key_package_ref.clone())
             .tls_serialize(&mut bytes)
             .map_err(|error| invalid(&format!("{error:?}")))?;
@@ -247,17 +259,28 @@ impl SiblingWelcome {
     }
 
     /// Decode a sibling Welcome, accepting only the exact encoding: version
-    /// 1, a ref of 1 to 64 bytes, one `mls_welcome` MLSMessage, relay URLs of
+    /// 1 or 2 (with its fixed inherited generation), a ref of 1 to 64 bytes,
+    /// one `mls_welcome` MLSMessage, relay URLs of
     /// 1 to 512 bytes of UTF-8, and nothing left over. The Welcome itself is
     /// not processed here.
     pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
         let invalid = || EngineError::Serialize("invalid sibling Welcome".into());
         let (&version, rest) = bytes.split_first().ok_or_else(invalid)?;
-        if version != SIBLING_WELCOME_VERSION || rest.len() < 64 {
+        if ![SIBLING_WELCOME_VERSION, 2].contains(&version) || rest.len() < 64 {
             return Err(invalid());
         }
         let (from, rest) = rest.split_at(32);
         let (to, mut rest) = rest.split_at(32);
+        let invitation_generation = if version == 2 {
+            if rest.len() < 32 {
+                return Err(invalid());
+            }
+            let (generation, remaining) = rest.split_at(32);
+            rest = remaining;
+            Some(generation.try_into().map_err(|_| invalid())?)
+        } else {
+            None
+        };
         let key_package_ref = VLBytes::tls_deserialize(&mut rest).map_err(|_| invalid())?;
         if !(1..=MAX_KEY_PACKAGE_REF_LEN).contains(&key_package_ref.as_slice().len()) {
             return Err(invalid());
@@ -284,6 +307,7 @@ impl SiblingWelcome {
         Ok(Self {
             from: from.try_into().map_err(|_| invalid())?,
             to: to.try_into().map_err(|_| invalid())?,
+            invitation_generation,
             key_package_ref: key_package_ref.as_slice().to_vec(),
             welcome,
             relays,
@@ -548,6 +572,7 @@ impl<S: StorageProvider> Engine<S> {
                 crate::group_lifecycle::WelcomeRoute::Sibling {
                     from: welcome.from,
                     key_package_ref: welcome.key_package_ref.clone(),
+                    invitation_generation: welcome.invitation_generation,
                 },
             )
             .await;

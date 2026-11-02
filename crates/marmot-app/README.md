@@ -255,6 +255,19 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
+**Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
+one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
+or admission fork can prompt again; older unidentified invites stay local-only. Higher version wins, with decline
+winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
+records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
+Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by
+all devices. Normal leave, archive and deletion are not shared invitation decisions.
+
+This uses kind475 plus versioned sibling Welcomes, with no new host command or capability negotiation. Custom
+experimental senders and receivers must update together before using invitation sync; V1 Welcomes and their retries
+are not retrofitted. Released builds still cannot enable device groups. Hosts continue to render MDK's invitation
+and membership projections and must not infer broader account-wide departure across unrelated generations.
+
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.

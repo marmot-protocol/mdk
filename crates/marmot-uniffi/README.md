@@ -1005,6 +1005,15 @@ reports. The C ABI mirrors these calls. See the
 
 ## Linked devices
 
+Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
+and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
+fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
+local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A zero-publication
+`CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
+membership state; ordinary archive/leave/delete is not an invitation decision. This adds no host API or working
+linking control to released builds, which cannot enable device groups. Custom experimental peers must update together
+before using V2 sibling Welcomes; no capability negotiation or mixed-old-receiver guarantee is added.
+
 `linked_devices(account_ref)` returns this account's own devices as `LinkedDeviceFfi` records, read from the roster of
 the device group this device trusts, for a Devices screen:
 

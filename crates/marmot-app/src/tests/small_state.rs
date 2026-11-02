@@ -8,6 +8,7 @@ use super::*;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
 };
+use cgka_traits::storage::GroupStorage as _;
 use std::collections::BTreeMap;
 use storage_sqlite::{
     MuteSetting, SmallStateBroadcast, SmallStateItem, SmallStateValue, SmallStateVersion,
@@ -472,11 +473,34 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         [
             KIND_SMALL_STATE_UPDATE,
             KIND_SMALL_STATE_UPDATE,
+            KIND_SMALL_STATE_UPDATE,
             KIND_SMALL_STATE_BROADCAST_REQUEST
         ]
     );
 
     deliver_all(&mut devices.laptop, &devices.relay).await;
+    let admission = phone_app
+        .account_storage("alice")
+        .unwrap()
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap();
+    let decision = phone_storage()
+        .invitation_decision(&chat_hex, &admission.generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.version, 1);
+    assert!(!decision.declined);
+    assert_eq!(
+        laptop_storage()
+            .invitation_decision(&chat_hex, &admission.generation)
+            .unwrap(),
+        Some(decision.clone())
+    );
+    assert!(
+        devices.laptop.state_group_record(&chat).is_none(),
+        "a decision before its Welcome must not create membership"
+    );
     let phone_items = phone_storage().small_state_items().unwrap();
     assert_eq!(phone_items.len(), 401);
     assert_eq!(laptop_storage().small_state_items().unwrap(), phone_items);
@@ -545,6 +569,15 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         401
     );
 
+    assert_eq!(
+        phone_storage().unsent_invitation_decisions().unwrap(),
+        [decision.clone()]
+    );
+    assert_eq!(
+        laptop_storage().unsent_invitation_decisions().unwrap(),
+        [decision]
+    );
+
     // A withdrawn request owes a new one, on both.
     devices
         .phone
@@ -570,6 +603,9 @@ async fn siblings_exchange_small_state_through_the_device_group() {
     let settle = || {
         phone
             .mark_small_state_sent(&phone.unsent_small_state_items().unwrap())
+            .unwrap();
+        phone
+            .mark_invitation_decisions_sent(&phone.unsent_invitation_decisions().unwrap())
             .unwrap();
         phone.small_state_broadcast_request_sent().unwrap();
     };

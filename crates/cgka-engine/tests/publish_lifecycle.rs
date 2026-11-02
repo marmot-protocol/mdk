@@ -1107,6 +1107,19 @@ struct FaultStorage {
 }
 
 impl GroupStorage for FaultStorage {
+    fn invitation_admission(
+        &self,
+        id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::group::InvitationAdmission>> {
+        self.inner.invitation_admission(id)
+    }
+    fn put_invitation_admission(
+        &self,
+        id: &GroupId,
+        admission: Option<&cgka_traits::group::InvitationAdmission>,
+    ) -> StorageResult<()> {
+        self.inner.put_invitation_admission(id, admission)
+    }
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.inner.put_group(group)
     }

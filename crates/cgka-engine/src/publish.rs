@@ -242,6 +242,16 @@ impl<S: StorageProvider> Engine<S> {
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
                 storage.put_group(&g)?;
+                if kind == crate::epoch_manager::PendingKind::CreateGroup {
+                    storage.put_invitation_admission(
+                        &group_id,
+                        Some(&cgka_traits::group::InvitationAdmission {
+                            generation: self.local_invitation_generation(&mls_group)?,
+                            created_locally: true,
+                            via_welcome: None,
+                        }),
+                    )?;
+                }
                 crate::capability_manager::check_own_leaf(
                     &mls_group,
                     self.identity.self_id(),

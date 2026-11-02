@@ -128,6 +128,20 @@ pub struct GroupStateCheckpointRef {
 
 /// CRUD for group metadata (no Nostr types; see `group.rs` invariants).
 pub trait GroupStorage {
+    /// Admission identity for the installed local copy, never the latest epoch.
+    fn invitation_admission(
+        &self,
+        id: &GroupId,
+    ) -> StorageResult<Option<crate::group::InvitationAdmission>>;
+
+    /// Replace the local-copy association in the native join/create transaction.
+    /// `None` installs an unidentified legacy sibling admission.
+    fn put_invitation_admission(
+        &self,
+        id: &GroupId,
+        admission: Option<&crate::group::InvitationAdmission>,
+    ) -> StorageResult<()>;
+
     fn put_group(&self, group: &Group) -> StorageResult<()>;
     fn get_group(&self, id: &GroupId) -> StorageResult<Group>;
     fn delete_group(&self, id: &GroupId) -> StorageResult<()>;

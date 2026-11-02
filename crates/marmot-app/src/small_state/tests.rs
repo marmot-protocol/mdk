@@ -256,3 +256,53 @@ fn the_merge_rule_picks_the_same_winner_in_any_order() {
     assert_ne!(rule.new_change_id(), rule.new_change_id());
     assert_eq!(rule.pin_index(&["0b".to_owned()]), 0);
 }
+
+#[test]
+fn invitation_pages_preserve_every_generation_and_skip_invalid_items() {
+    use storage_sqlite::InvitationDecision;
+    let mut decisions: Vec<_> = (0..80u8)
+        .map(|generation| InvitationDecision {
+            group_id_hex: "0102".into(),
+            generation: [generation; 32],
+            version: MAX_SMALL_STATE_NUMBER,
+            declined: true,
+        })
+        .collect();
+    decisions.extend((0..80u8).map(|chat| InvitationDecision {
+        group_id_hex: hex::encode([chat; 256]),
+        generation: [0xff; 32],
+        version: MAX_SMALL_STATE_NUMBER,
+        declined: true,
+    }));
+    let pages = encode_invitation_decision_updates(&decisions);
+    assert!(pages.len() > 80);
+    let mut decoded = Vec::new();
+    for (content, carried) in pages {
+        assert!(content.len() <= MAX_SMALL_STATE_CONTENT_BYTES);
+        assert!(
+            decode_small_state_update(&content).unwrap().is_empty(),
+            "old item decoder skips invite"
+        );
+        let page = decode_invitation_decisions(&content).unwrap();
+        assert_eq!(page, carried);
+        decoded.extend(page);
+    }
+    assert_eq!(decoded, decisions);
+    let valid = "{\"v\":1,\"items\":[{\"chat\":\"0102\",\"item\":\"invite\",\"generation\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"value\":\"accept\",\"version\":1}]}";
+    assert_eq!(
+        encode_invitation_decision_updates(&decode_invitation_decisions(valid).unwrap())[0].0,
+        valid
+    );
+    for invalid in [
+        valid.replace("accept", "accepted"),
+        valid.replace("\"version\":1", "\"version\":0"),
+        valid.replace("\"version\":1", "\"version\":1,\"change\":\"00\""),
+    ] {
+        assert!(decode_invitation_decisions(&invalid).unwrap().is_empty());
+    }
+    let repeated = valid.replace("]}", &format!(",{}]}}", &valid[16..valid.len() - 2]));
+    assert!(matches!(
+        decode_invitation_decisions(&repeated),
+        Err(AppError::DeviceGroupRefused("malformed_small_state"))
+    ));
+}

@@ -125,6 +125,94 @@ pub(crate) fn encode_small_state_update(
         .collect()
 }
 
+/// Invitation generations use the same bounded update envelope, with no
+/// duplicate (chat,item) even when two generations belong to one chat.
+pub(crate) fn encode_invitation_decision_updates(
+    items: &[storage_sqlite::InvitationDecision],
+) -> Vec<(String, Vec<storage_sqlite::InvitationDecision>)> {
+    let room = MAX_SMALL_STATE_CONTENT_BYTES - UPDATE_START.len() - UPDATE_END.len();
+    let mut pages = Vec::new();
+    let mut body = String::new();
+    let mut carried = Vec::new();
+    let mut chats = BTreeSet::new();
+    for item in items.iter().filter(|item| item.is_valid()) {
+        let encoded = encode_invitation_decision(item);
+        if !body.is_empty()
+            && (chats.contains(&item.group_id_hex) || body.len() + 1 + encoded.len() > room)
+        {
+            pages.push((
+                format!("{UPDATE_START}{body}{UPDATE_END}"),
+                std::mem::take(&mut carried),
+            ));
+            body.clear();
+            chats.clear();
+        }
+        if !body.is_empty() {
+            body.push(',');
+        }
+        body.push_str(&encoded);
+        chats.insert(item.group_id_hex.clone());
+        carried.push(item.clone());
+    }
+    if !body.is_empty() {
+        pages.push((format!("{UPDATE_START}{body}{UPDATE_END}"), carried));
+    }
+    pages
+}
+
+fn encode_invitation_decision(item: &storage_sqlite::InvitationDecision) -> String {
+    format!(
+        "{{\"chat\":\"{}\",\"item\":\"invite\",\"generation\":\"{}\",\"value\":\"{}\",\"version\":{}}}",
+        item.group_id_hex,
+        hex::encode(item.generation),
+        if item.declined { "decline" } else { "accept" },
+        item.version
+    )
+}
+
+pub(crate) fn decode_invitation_decisions(
+    content: &str,
+) -> Result<Vec<storage_sqlite::InvitationDecision>, AppError> {
+    let object = small_state_object(content, &["v", "items"])?;
+    let items = decode_items(&object)?;
+    if items.is_empty() {
+        return Err(malformed());
+    }
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let item = item.as_object()?;
+            if item.get("item")?.as_str()? != "invite"
+                || item.len() != 5
+                || !["chat", "item", "generation", "value", "version"]
+                    .iter()
+                    .all(|field| item.contains_key(*field))
+            {
+                return None;
+            }
+            let generation = item.get("generation")?.as_str()?;
+            if generation.len() != 64
+                || !generation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            let decision = storage_sqlite::InvitationDecision {
+                group_id_hex: item.get("chat")?.as_str()?.to_owned(),
+                generation: hex::decode(generation).ok()?.try_into().ok()?,
+                version: number(item.get("version")?)?,
+                declined: match item.get("value")?.as_str()? {
+                    "accept" => false,
+                    "decline" => true,
+                    _ => return None,
+                },
+            };
+            decision.is_valid().then_some(decision)
+        })
+        .collect())
+}
+
 /// Every item in `items` in an update's form, without the update's size
 /// limit: a backup's small-state blob (`backup_archive.rs`). An item that
 /// breaks the item rules is left out.
