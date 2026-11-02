@@ -2742,15 +2742,9 @@ impl AppClient {
         // sibling delivery now, as for a later Add; any optional device-group
         // read or delivery failure leaves it owed for maintenance.
         if has_founding_siblings {
-            match self.epoch_gap_held_groups() {
-                Ok(held) => self.send_owed_sibling_welcomes(&held).await,
-                Err(error) => tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "create_group",
-                    error_kind = error.privacy_safe_kind(),
-                    "initial sibling Welcome waits for device-group state"
-                ),
-            }
+            // The shared sender checks its device group's hold directly;
+            // unrelated chats may still be awaiting deferred hydration.
+            self.send_owed_sibling_welcomes(&[]).await;
         }
         Ok(CanonicalCreatedGroup {
             group_id,

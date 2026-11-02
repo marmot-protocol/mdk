@@ -843,6 +843,42 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
     );
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
     assert_eq!(taken_from(&phone, &laptop), before + 1);
+    assert_eq!(
+        phone
+            .client
+            .runtime
+            .owed_sibling_welcomes(Timestamp(crate::unix_now_seconds()))
+            .unwrap()
+            .iter()
+            .filter(|welcome| welcome.group_id == chat)
+            .count(),
+        1,
+        "the deferred device-group route is not installed yet; the Welcome stays durable"
+    );
+
+    // The foreground creation above hydrated/tagged the device group. Use
+    // its existing route installer, as the post-hydration reconcile does,
+    // while leaving the unrelated old chat unhydrated. Initial delivery for
+    // the next creation must not depend on that old chat's readiness.
+    assert!(phone.client.ensure_device_group_route(&group).unwrap());
+    let ready = phone
+        .client
+        .create_group("ready device group", &[])
+        .await
+        .unwrap();
+    assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
+    assert_eq!(leaves_of(&phone, &laptop, &ready, &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), before + 2);
+    assert!(
+        phone
+            .client
+            .runtime
+            .owed_sibling_welcomes(Timestamp(crate::unix_now_seconds()))
+            .unwrap()
+            .iter()
+            .all(|welcome| welcome.group_id != ready && welcome.group_id != chat),
+        "the ready device group carries both the new and retained initial Welcomes"
+    );
 }
 
 /// Missing private stock never falls back to the sibling's public slot or

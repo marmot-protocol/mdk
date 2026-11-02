@@ -241,7 +241,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   be untagged.
 - Send a sibling Welcome (mdk#2628 3.5b-2, `src/client/private_key_packages.rs`) only once the engine owes it, after its
   Add's Commit confirmed, as a 461 in the trusted device group while this device's leaf there is tagged: right after the
-  Add and in each maintenance pass. Pin each 461 to the device group's epoch and branch (`EpochPin`) whose tag was read
+  Add and in each maintenance pass. The shared sender checks the exact device group's epoch-gap hold directly
+  without scanning unrelated chats; a device-group read error defers it, and missing transport readiness leaves it owed.
+  Pin each 461 to the device group's epoch and branch (`EpochPin`) whose tag was read
   (`send_device_group_event_at`), so the engine sends it there or refuses it (`AppMessageEpochUnsettled`,
   `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
   and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
