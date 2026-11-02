@@ -49,6 +49,14 @@ pub(in crate::client) async fn fixture() -> Fixture {
 /// [`fixture`], with the relay returning one stored event created at
 /// `stored` before each EOSE, or none.
 pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
+    fixture_on(vec![RELAY.into()], false, stored).await
+}
+
+pub(in crate::client) async fn fixture_on(
+    relays: Vec<String>,
+    runner_owns_debt: bool,
+    stored: Option<u64>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -56,10 +64,15 @@ pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = crate::MarmotApp::with_relays_and_config(
         dir.path(),
-        vec![RELAY.into()],
+        relays,
         crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay.clone());
+    let app = if runner_owns_debt {
+        app.with_recovery_runner_owning_debt()
+    } else {
+        app
+    };
     *relay.stored_before_eose.lock().unwrap() = stored;
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();

@@ -152,6 +152,177 @@ async fn a_direct_client_runs_no_runner_with_the_gate_off() {
     assert!(matches!(client.recovery_runner, RunnerSeat::Absent));
 }
 
+/// Read through the real account host's debt turn, then publish the production
+/// survey to the same status watch the runner uses. No relay work is scripted.
+async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Survey {
+    let AccountRunner {
+        runner, mut turns, ..
+    } = client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let surveyed = tokio::spawn(async move {
+        let result = host
+            .debt_turn(|turn| {
+                assert!(
+                    super::super::admission::live_fences(turn).unwrap().is_empty(),
+                    "restart debt and an empty live count never fence"
+                );
+                super::super::select::survey(
+                    turn,
+                    &RecoveryRunnerPolicy::default(),
+                    &super::super::admission::Stalled::default(),
+                )
+                .unwrap()
+            })
+            .await
+            .expect("the debt turn was served");
+        host.surveyed(result.catching_up.clone());
+        result
+    });
+    turns.recv().await.unwrap().serve(client).await;
+    surveyed.await.unwrap()
+}
+
+/// A cursor-present reopen must owe a group added after cold start on each
+/// relay. A quiet replay cannot erase that gap, and only proving both relays
+/// clears the group's catching-up status (mdk#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec!["wss://a.example".into(), "wss://b.example".into()],
+        false,
+        None,
+    )
+    .await;
+    let app = client.app.clone();
+    let ledger = storage.app_storage();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap();
+    assert_eq!(route.required.len(), 2);
+    let now = unix_now_seconds();
+    let last_proof = now - HOUR;
+    for relay in &route.required {
+        ledger
+            .record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route: &route.route,
+                    relay,
+                    since_seconds: now - 30 * DAY,
+                    until_seconds: last_proof,
+                    proof: RecoveryCoverageProof::Comparison,
+                }],
+                now,
+            )
+            .unwrap();
+    }
+    assert_eq!(ledger.recovery_coverage_goal(&route.route).unwrap(), None);
+    assert!(client.state.last_transport_timestamp.is_some());
+    drop(client);
+
+    // Open on the existing plane, without network maintenance: the goal must
+    // exist before transport activation or any epoch-gap demand can supply it.
+    let mut reopened = app
+        .local_client_with_relay_plane("alice", &app.relay_plane, None)
+        .await
+        .unwrap();
+    assert!(
+        ledger.recovery_coverage_goal(&route.route).unwrap().is_some(),
+        "account open must give a cursor-present group's route a goal"
+    );
+    assert!(
+        ledger
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| demand.cause != RecoveryCause::IncrementalHistory),
+        "ledger widening must not start the old owner's history job"
+    );
+    let off = reopened.account_recovery_status().unwrap();
+    assert!(off.catching_up_group_ids_hex.is_empty());
+    assert!(!off.inbox_catching_up);
+    assert!(off.notices.is_empty());
+
+    reopened.app = reopened.app.clone().with_recovery_runner_owning_debt();
+    for (proved, relay) in route.required.iter().enumerate() {
+        let survey = restart_goal_survey(&mut reopened).await;
+        let remaining = survey
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.key.route == route.route)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), route.required.len() - proved);
+        for candidate in remaining {
+            assert_eq!(candidate.position, last_proof + 1);
+            assert!(!candidate.blocked);
+        }
+        assert_eq!(
+            reopened.account_recovery_status().unwrap().catching_up_group_ids_hex,
+            [hex::encode(group.as_slice())]
+        );
+        ledger
+            .record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route: &route.route,
+                    relay,
+                    since_seconds: last_proof + 1,
+                    until_seconds: now + DAY,
+                    proof: RecoveryCoverageProof::Comparison,
+                }],
+                now + DAY,
+            )
+            .unwrap();
+    }
+    let survey = restart_goal_survey(&mut reopened).await;
+    assert!(survey.candidates.iter().all(|candidate| candidate.key.route != route.route));
+    assert!(reopened.account_recovery_status().unwrap().catching_up_group_ids_hex.is_empty());
+}
+
+/// A group becoming current during an open account gets a goal before the
+/// runner selects work, with no restart or epoch-gap demand (mdk#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(vec!["wss://a.example".into()], true, None).await;
+    let ledger = storage.app_storage();
+    let route = group_routes(&client).pop().unwrap();
+    let before = unix_now_seconds();
+    let survey = restart_goal_survey(&mut client).await;
+    let candidate = survey
+        .candidates
+        .iter()
+        .find(|candidate| candidate.key.route == route)
+        .expect("a new group's retained history is runnable without an epoch gap");
+    assert!(candidate.position <= before);
+    let goal = ledger.recovery_coverage_goal(&route).unwrap().unwrap();
+    assert!(goal >= before - 30 * DAY);
+    assert!(goal <= unix_now_seconds() - 30 * DAY);
+    assert_eq!(
+        client.account_recovery_status().unwrap().catching_up_group_ids_hex,
+        [hex::encode(group.as_slice())]
+    );
+    let mut wake = wake(&client);
+    restart_goal_survey(&mut client).await;
+    assert!(!woken(&mut wake), "unchanged routes must not keep waking an idle runner");
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), Some(goal));
+}
+
 /// With the gate on, an explicit sync runs one pass in place, and the pass
 /// serves each unit due then once: two groups that each owe the last hour
 /// are each swept once over the account's own relay pool.
