@@ -178,10 +178,10 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
                     &RecoveryRunnerPolicy::default(),
                     &super::super::admission::Stalled::default(),
                 )
-                .unwrap()
             })
             .await
-            .expect("the debt turn was served");
+            .expect("the debt turn was served")
+            .expect("route preparation and survey succeeded");
         host.surveyed(result.catching_up.clone());
         result
     });
@@ -525,7 +525,10 @@ async fn failed_route_goal_writes(failed_steps: usize) {
         }
     }
     let mut account = client.build_recovery_runner().await;
-    let group = client.create_group("goal write failure", &[]).await.unwrap();
+    let group = client
+        .create_group("goal write failure", &[])
+        .await
+        .unwrap();
     let route = client
         .recovery_runner_routes()
         .into_iter()
@@ -549,17 +552,28 @@ async fn failed_route_goal_writes(failed_steps: usize) {
             Box::pin(account.runner.step()),
         )
         .await;
-        let super::super::Step::Idle { next_due: Some(due) } = step else {
+        let super::super::Step::Idle {
+            next_due: Some(due),
+        } = step
+        else {
             panic!("a failed goal write must schedule a local retry, not report no debt");
         };
         assert!(due > before, "persistent failure must not spin");
-        assert!(due <= unix_now_seconds() + 60, "use the bounded local retry policy");
+        assert!(
+            due <= unix_now_seconds() + 60,
+            "use the bounded local retry policy"
+        );
         assert!(!woken(&mut wake), "failed preparation must not self-wake");
         assert!(client.routing.recovery_runner_catching_up_now() == previous_status);
         assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
     }
-    faults.execute_batch("DROP TRIGGER fail_route_goal").unwrap();
-    assert!(!woken(&mut wake), "removing the fault supplied no unrelated wake");
+    faults
+        .execute_batch("DROP TRIGGER fail_route_goal")
+        .unwrap();
+    assert!(
+        !woken(&mut wake),
+        "removing the fault supplied no unrelated wake"
+    );
     let host = account.runner.host.clone();
     let survey = serve_goal_future(
         &mut client,
@@ -575,10 +589,21 @@ async fn failed_route_goal_writes(failed_steps: usize) {
     .await
     .unwrap()
     .unwrap();
-    assert!(survey.candidates.iter().any(|candidate| candidate.key.route == route));
+    assert!(
+        survey
+            .candidates
+            .iter()
+            .any(|candidate| candidate.key.route == route)
+    );
     assert!(ledger.recovery_coverage_goal(&route).unwrap().is_some());
     host.surveyed(survey.catching_up);
-    assert!(client.account_recovery_status().unwrap().catching_up_group_ids_hex.contains(&hex::encode(group.as_slice())));
+    assert!(
+        client
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex
+            .contains(&hex::encode(group.as_slice()))
+    );
 }
 
 /// With the gate on, a directly owned client's `next_event()` runs one pass
@@ -1071,15 +1096,15 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
             .state
     };
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
 
     // Emptied while it may be waiting to hydrate, then back.
     client.routing.replace_group_routes(&group, Vec::new());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     client
         .routing
         .replace_group_routes(&group, installed.clone());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
 
     // Dropped and restored within one command.
@@ -1089,13 +1114,13 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     client
         .routing
         .replace_group_routes(&group, installed.clone());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
     assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
 
     // Dropped for good: the group's route goes on without the relay.
     client.routing.replace_group_routes(&group, moved);
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert_eq!(state(&storage), RecoveryUnitState::Retired);
     assert!(
         storage
@@ -1114,7 +1139,7 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
 
     // Back on the route: it owes the whole goal again.
     client.routing.replace_group_routes(&group, installed);
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert_eq!(state(&storage), RecoveryUnitState::Active);
     assert!(
         storage

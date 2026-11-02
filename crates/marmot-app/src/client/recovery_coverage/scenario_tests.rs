@@ -1090,7 +1090,13 @@ async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
         .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
         .unwrap()
         .route;
-    assert_eq!(storage.app_storage().recovery_coverage_goal(&route).unwrap(), None);
+    assert_eq!(
+        storage
+            .app_storage()
+            .recovery_coverage_goal(&route)
+            .unwrap(),
+        None
+    );
     let welcome_at = unix_now_seconds() - 60 * 60;
     let mut record = storage.get_group(&group).unwrap();
     record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
@@ -1107,7 +1113,10 @@ async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
         Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
     ));
     assert_eq!(
-        storage.app_storage().recovery_coverage_goal(&route).unwrap(),
+        storage
+            .app_storage()
+            .recovery_coverage_goal(&route)
+            .unwrap(),
         Some(welcome_at - 15 * 60),
         "deferred startup must not pin the group to the 30-day retention floor"
     );

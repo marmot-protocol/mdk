@@ -561,7 +561,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
   every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
-  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
+  MLS hydration, and an overly early goal cannot narrow later. That time is only a hint: never use it to retire,
+  un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
@@ -577,7 +579,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  loss branch. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  changes and returns its storage error without running the debt read. The existing admission/survey local-failure
+  backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
+  The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
   adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
   stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
   through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,

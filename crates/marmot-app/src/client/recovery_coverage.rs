@@ -608,13 +608,18 @@ impl AppClient {
     /// routes carry again owes its whole goal. It runs at the start of a debt
     /// turn, between the owner's commands, so a command that drops a route and
     /// restores it settles nothing. A failed write keeps the changes for the
-    /// next turn.
-    pub(crate) fn settle_recovery_route_changes(&self, app: &SqliteAppStorage, now: u64) {
+    /// next turn and returns the error to the runner's local-failure backoff;
+    /// no debt read may treat failed preparation as nothing owed.
+    pub(crate) fn settle_recovery_route_changes(
+        &self,
+        app: &SqliteAppStorage,
+        now: u64,
+    ) -> cgka_traits::storage::StorageResult<()> {
         let Some(changes) = self.routing.take_route_changes() else {
-            return;
+            return Ok(());
         };
         if changes.dropped.is_empty() && !changes.changed {
-            return;
+            return Ok(());
         }
         let routing = self.routing.snapshot();
         let carried =
@@ -653,12 +658,12 @@ impl AppClient {
             app.reopen_returned_recovery_units(|route, relay| {
                 carried.contains(&(route.clone(), relay.to_owned()))
             })?;
-            Ok::<_, AppError>(())
+            Ok::<_, cgka_traits::storage::StorageError>(())
         })();
-        if let Err(error) = settled {
-            log_failure("settle_recovery_route_changes", &error);
+        if settled.is_err() {
             self.routing.restore_route_changes(changes);
         }
+        settled
     }
 
     /// Whether the group's local copy is Unrecoverable, which suspends its
@@ -729,9 +734,8 @@ impl AppClient {
     /// owe the window.
     fn standing_floor(&self, current: &CurrentRoute, now: u64) -> u64 {
         let welcome = current.group_id.as_ref().and_then(|group| {
-            self.runtime
-                .group_record(&cgka_traits::GroupId::new(group.clone()))
-                .ok()?
+            self.stored_group(&cgka_traits::GroupId::new(group.clone()))
+                .ok()??
                 .local_copy_welcome_created_at
         });
         welcome

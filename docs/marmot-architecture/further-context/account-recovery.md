@@ -539,6 +539,9 @@ Welcome and sent after it is openable here yet older than the Welcome. The stand
 therefore only starts the goals that want history in general. It never retires, un-covers or
 drops debt: loss and released receipts keep their own floors, explicit repair wants the whole
 window, and goals only widen, so a later Welcome raises nothing.
+The hint is read from durable group metadata even on a deferred runtime open, before MLS
+hydration: an unavailable live accessor must not substitute the retention floor and
+permanently widen a recently joined copy's goal.
 
 **Coverage versus goals.** No debt means no unproven history against the goals the ledger
 holds; it says nothing about a route with no goal. Every current route therefore needs a
@@ -864,6 +867,12 @@ drain the group; a stalled group is not swept, and the runner idles until the ho
 ends. A stalled group's fence stays where it is meanwhile, since the capture debt that would
 drop it is not swept. What a route the runner no longer lists staged is given back, its seconds owed again on
 that route, so it never holds the account's bound.
+
+Before a debt turn reads anything, the host settles pending route changes and their goals.
+A failed preparation write keeps those changes and returns a storage error instead of
+running the read or publishing a successful no-debt survey. The same local-failure backoff
+as admission and survey errors schedules another attempt, without an immediate self-wake
+or a separate retry timer. Existing capture fences stay in force while preparation waits.
 
 Only capture debt fences live frames: the part `[since, oldest seen]` of a live REQ's range
 that its relay's non-empty count left unproven. An empty count's range is cold-start debt,

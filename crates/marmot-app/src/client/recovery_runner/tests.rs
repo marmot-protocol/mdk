@@ -1065,8 +1065,9 @@ impl TestHost {
 
     /// Each fenced group's release point, as one debt turn reads it.
     async fn fences(&self) -> Vec<(Vec<Route>, u64)> {
-        self.debt_turn(|turn| live_fences(turn).unwrap())
+        self.debt_turn(live_fences)
             .await
+            .unwrap()
             .unwrap()
             .into_iter()
             .map(
@@ -1079,8 +1080,9 @@ impl TestHost {
     }
 
     async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
-        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()).unwrap())
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()))
             .await
+            .unwrap()
             .unwrap()
     }
 
@@ -1129,9 +1131,9 @@ impl RunnerHost for TestHost {
         }))
     }
 
-    async fn debt_turn<T, F>(&self, turn: F) -> Option<T>
+    async fn debt_turn<T, F>(&self, turn: F) -> Option<StorageResult<T>>
     where
-        F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
+        F: FnOnce(&DebtTurn<'_>) -> StorageResult<T> + Send + 'static,
         T: Send + 'static,
     {
         let now = self.clock.now();
@@ -4167,9 +4169,10 @@ async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
     let policy = test_policy();
     assert!(
         host.debt_turn(move |turn| {
-            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy).unwrap()
+            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy)
         })
         .await
+        .unwrap()
         .unwrap()
         .is_none()
     );
