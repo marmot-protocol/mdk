@@ -318,12 +318,6 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
         .fresh_key_package()
         .await
         .unwrap();
-    let template = m.bob.engine.fresh_key_package().await.unwrap();
-    // bob has two leaves, so 19 more break the limit.
-    let over_limit: Vec<_> = (0..MAX_LEAVES_PER_ACCOUNT - 1)
-        .map(|_| unnamed(sibling_key_package(&template, b"bob")))
-        .collect();
-    let limit_error = format!("an account holds more than {MAX_LEAVES_PER_ACCOUNT} leaves");
     let unknown_key = vec![0x5c; 32];
     for (intent, reason) in [
         (
@@ -340,7 +334,6 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
             ),
             "belongs to another account",
         ),
-        (add_own_devices(&gid, over_limit), limit_error.as_str()),
         (
             remove_own_devices(&gid, vec![signature_key(&m.bob, &gid)]),
             "use SendIntent::Leave",
@@ -662,20 +655,19 @@ async fn without_account_devices_a_same_account_intent_takes_no_fairness_attempt
     );
 }
 
-/// A same-account Add of a device already in the group is refused by OpenMLS
-/// (a repeated signature key), which surfaces as `Backend`. Queued, it is
-/// retired and announced like any other refusal, and the self-update queued
-/// behind it drains (mdk#2694).
+/// A refused queued same-account Add is retired and announced once, and the
+/// self-update behind it drains (mdk#2694). Specific sibling-admission
+/// refusals belong to `sibling_welcomes.rs`; this owns queue progress.
 #[tokio::test]
-async fn a_queued_add_of_a_device_already_in_the_group_is_retired() {
+async fn a_refused_queued_same_account_add_does_not_block_the_next_intent() {
     let mut m = members(true).await;
     let gid = m.gid.clone();
-    let present = m.bob_sibling.engine.fresh_key_package().await.unwrap();
+    let key_package = m.bob_sibling.engine.fresh_key_package().await.unwrap();
     queue(
         &m.bob,
         &gid,
         b"queued-0",
-        add_own_devices(&gid, vec![unnamed(present)]),
+        add_own_devices(&gid, vec![unnamed(key_package)]),
     );
     let self_update = SendIntent::SelfUpdate {
         group_id: gid.clone(),
@@ -702,9 +694,8 @@ async fn a_queued_add_of_a_device_already_in_the_group_is_retired() {
                     GroupEvent::QueuedIntentRefused {
                         intent_id,
                         intent_kind,
-                        reason,
                         ..
-                    } => Some((intent_id, intent_kind, reason)),
+                    } => Some((intent_id, intent_kind)),
                     _ => None,
                 }),
         );
@@ -713,8 +704,7 @@ async fn a_queued_add_of_a_device_already_in_the_group_is_retired() {
         refusals,
         vec![(
             MessageId::new(b"queued-0".to_vec()),
-            "add_own_account_devices".to_string(),
-            "backend".to_string()
+            "add_own_account_devices".to_string()
         )]
     );
     let [SendResult::GroupEvolution { .. }] = &drained[..] else {

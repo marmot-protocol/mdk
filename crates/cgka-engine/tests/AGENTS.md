@@ -278,8 +278,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
     and sibling accepts, an added sibling joins through its sibling Welcome and a removed one sees its removal; restart
     treats them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets,
-    never a self-update or a Leave, and only while the group requires 0x800d. A successful Add needs the device roster,
-    so those tests run in test-policy builds only.
+    never a self-update or a Leave, and only while the group requires 0x800d. A refused queued same-account Add is
+    retired and announced exactly once without blocking the self-update behind it; this queue-progress proof does
+    not pin which validation layer refused it. Same-account leaf-limit refusal with a valid tagged sender and private
+    KeyPackage is owned by `sibling_welcomes.rs`. A successful Add needs the device roster, so those tests run in
+    test-policy builds only.
 
 - **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
   - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
@@ -288,8 +291,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged adder, a chat
     that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
     refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
-    by then. The read-only pre-check a host runs before it takes a KeyPackage (`sibling_add_refusal`,
-    `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
+    by then. A sibling that lands through another adder while its Add waits is refused at drain, before a direct
+    retry, and by the advisory check; distinct MLS signers exercise authenticated slot presence in both signer orientations
+    (mdk#2628 3.5e). These tagged fixtures do not independently isolate the pre-link signature-key fallback. The read-only pre-check a host runs before it takes a KeyPackage
+    (`sibling_add_refusal`, `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
     included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
 
