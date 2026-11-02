@@ -1093,7 +1093,7 @@ impl<S: StorageProvider> Engine<S> {
             // Remember the exact wrapper outside the bounded hostile-input
             // marker pool so a later restart can short-circuit before peel.
             self.storage
-                .put_processed_transport_id(&group_id, &raw_msg_id)?;
+                .put_processed_transport_content(&group_id, &raw_msg_id, &content_id)?;
             // This wrapper is one of the arbitrarily many re-wraps a member can
             // mint for the same MLS bytes, and the content record already
             // stands for them. See AGENTS.md, "a `Buffered` outcome never lets

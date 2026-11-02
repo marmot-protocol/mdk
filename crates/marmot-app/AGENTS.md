@@ -253,8 +253,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
-  delivered one again in these paths. Post-publication resend remains an unimplemented 3.5e follow-on under D70;
-  the current gap-filling flow does not resend a delivered Welcome. The Add spends
+  delivered one again before D70's fixed wait. `sibling_welcome_resends` owns one indexed timing row per original
+  Welcome: the first durable accepted-publication observation, then the first newly qualified target-device DG
+  activity and a fixed 600-second deadline. Any authenticated trusted-DG traffic qualifies through its sending leaf
+  and the current roster keys; the named cross transaction keeps immutable content qualification outside snapshots
+  in the existing processed-wrapper ledger. Replay, rewrap and later traffic never rearm or slide the wait. Each
+  successful new carrier needs fresh later activity. D91 freezes the existing local DG's epoch at upgrade; only
+  later-epoch traffic qualifies, while new local groups qualify immediately and initial delivery is unchanged.
+  Due work reuses the engine-owned Welcome/ref/expiry/origin, consumes no KeyPackage and makes no Add or history offer.
+  A current matching Update/Commit target leaf suppresses repair; the Add's tagged KeyPackage leaf alone does not.
+  Reserve the actual generated carrier timestamp and engine carrier association together before handoff, using the
+  row's prepared-carrier high-water; a backward clock holds new preparation, while an unexposed exact retry remains
+  safe. Settlement runs before accepted-fanout projection ACK, so storage failure stays replayable. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that

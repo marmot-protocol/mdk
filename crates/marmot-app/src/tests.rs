@@ -19899,6 +19899,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_session::AccountDeviceEffects {
         published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+            publication_observation: None,
             authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
@@ -20518,6 +20519,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
         marmot_session::AccountDeviceEffects {
             published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                publication_observation: None,
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),

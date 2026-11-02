@@ -323,6 +323,8 @@ mod migration_0164_backup_ledger;
 mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
+#[path = "migrations/0169_sibling_welcome_resends.rs"]
+mod migration_0169_sibling_welcome_resends;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1280,6 +1282,12 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0166_blossom_history_deliveries::apply,
     },
+    Migration {
+        version: 169,
+        name: "0169_sibling_welcome_resends",
+        suspend_foreign_keys: &[],
+        apply: migration_0169_sibling_welcome_resends::apply,
+    },
 ];
 
 /// Run migration 0117's push-token share repair on an open database. Test
@@ -1636,6 +1644,38 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../../fixtures/storage-v1-v0.9.12.bin");
+
+    /// D91 makes unknown pre-upgrade activity ineligible until a later source
+    /// epoch, while a freshly installed local group qualifies immediately.
+    #[test]
+    fn migration_0169_freezes_existing_group_activity_floor_without_changing_initial_delivery() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 166).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES(x'aa', 7, x'00');
+            INSERT INTO cgka_processed_transport_ids(id, group_id) VALUES(x'bb', x'aa');",
+        )
+        .unwrap();
+        run_through(&mut conn, 169).unwrap();
+        conn.execute_batch(
+            "UPDATE cgka_groups SET epoch = 8 WHERE id = x'aa';
+            INSERT INTO cgka_groups(id, epoch, record) VALUES(x'cc', 0, x'00');",
+        )
+        .unwrap();
+        let floors: Vec<i64> = conn
+            .prepare("SELECT sibling_resend_after_epoch FROM cgka_groups ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(floors, vec![7, -1]);
+        let legacy: (Option<Vec<u8>>, Option<i64>) = conn.query_row(
+            "SELECT content_id, qualified_order FROM cgka_processed_transport_ids WHERE id = x'bb'", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(legacy, (None, None));
+    }
 
     /// D81 retires the unused announcement history without changing the
     /// device group's authoritative record. Exercise a populated upgrade.

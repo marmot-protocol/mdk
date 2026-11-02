@@ -376,3 +376,19 @@ query still enumerates all deferred metadata so an unattempted row beyond a prev
 
 
 Media upgrades 0104 and 0105 preserve existing payload pages during account open. Retained legacy bodies gain a sentinel length column with validation/accounting on mutation; they retain the legacy byte-array bound, while larger files use the chunk tables. Already-upgraded stores keep their compatible physical layout. Partial upgrades replace only parent metadata: the migration runner suspends connection-local foreign-key enforcement before BEGIN, validates the affected parent/child references before commit, and restores the original setting on success, rollback and unwind. Checkpoint chunks are preserved in place; no migration ledger is relabeled. Optional encrypted-open observation reports fixed phases and schema numbers without paths, SQL, keys or user data.
+
+### Delivered sibling-Welcome repair
+
+One indexed scheduling row per original Welcome retains the published carrier generation, first durable publication
+observation and first qualifying target-device activity, then a fixed ten-minute deadline. Exact Welcome bytes,
+private KeyPackage reference, expiry and originating Add remain engine-owned. The next successful carrier requires
+new activity after its own publication boundary. A prepared-carrier timestamp high-water prevents reuse of any earlier
+carrier identity after a wall-clock rollback; failed or unexposed exact retries keep their reservation.
+
+Publication acceptance and current-roster-qualified device-group activity share a durable scalar local observation
+order, so same-millisecond observations and backward clocks do not invent ordering. Qualification is immutable content
+metadata on the existing processed transport-id ledger, outside protocol snapshots and without changing wrapper-id
+deduplication. Rewrapping, snapshot replay and delayed app projection cannot make old qualified content new. Existing
+experimental local groups freeze their current epoch at migration 0169; only later-source-epoch activity qualifies,
+after an ordinary committed update. Newly installed local groups qualify immediately. This is best-effort activity
+evidence: queued traffic is not proof of live post-publication activity or Welcome receipt.

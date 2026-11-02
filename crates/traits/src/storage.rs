@@ -433,6 +433,18 @@ pub trait MessageStorage {
         group_id: &GroupId,
         transport_id: &MessageId,
     ) -> StorageResult<()>;
+    /// Associate the admitted content id with an exact processed wrapper.
+    /// Backends may keep only the wrapper marker; unavailable local observation
+    /// provenance must remain unavailable rather than being reconstructed.
+    fn put_processed_transport_content(
+        &self,
+        group_id: &GroupId,
+        transport_id: &MessageId,
+        _content_id: &MessageId,
+    ) -> StorageResult<()> {
+        self.put_processed_transport_id(group_id, transport_id)
+    }
+
     fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;

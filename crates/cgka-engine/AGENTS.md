@@ -224,7 +224,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   founding siblings (mdk#2628 3.5d). Owed work and new carrier attachment derive new-delivery eligibility from
   stored origin; terminal loss retires the row permanently, but a deferred Add or temporarily unavailable state
   holds it. Already-handed-off carrier fanout follows the existing transport contract, and exact carrier outcomes
-  still settle while Held. Older development rows with no provable origin are never handed off again.
+  still settle while Held. A due delivered-Welcome rearm keeps the original bytes/ref/expiry/origin and
+  checks the selected matching target's current roster tag: only MLS Update/Commit participation suppresses repair,
+  while an Add's tagged KeyPackage leaf is inconclusive. The host owns durable activity timing and previous-carrier
+  settlement; the generic engine rechecks origin/readiness/expiry before re-owing the row. Older development rows with no provable origin are never handed off again.
 
 - **Mirror every ingest invariant on every inbound seam.** An inbound MLS message reaches application-visible state
   through two seams — **direct ingest** (`message_processor/ingest.rs::ingest_group_message`) and

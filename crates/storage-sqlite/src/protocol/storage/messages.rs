@@ -832,6 +832,37 @@ impl MessageStorage for SqliteAccountStorage {
         }
     }
 
+    fn put_processed_transport_content(
+        &self,
+        group_id: &GroupId,
+        transport_id: &MessageId,
+        content_id: &MessageId,
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            put_processed_transport_id_on_connection(&conn, group_id, transport_id)?;
+            conn.execute_cached(
+                "UPDATE cgka_processed_transport_ids SET content_id = ?2
+                 WHERE id = ?1 AND content_id IS NULL",
+                params![transport_id.as_slice(), content_id.as_slice()],
+            )
+            .storage()?;
+            let matches: bool = conn
+                .query_row_cached(
+                    "SELECT content_id = ?2 FROM cgka_processed_transport_ids WHERE id = ?1",
+                    params![transport_id.as_slice(), content_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if !matches {
+                return Err(StorageError::Backend(
+                    "processed wrapper content changed".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(

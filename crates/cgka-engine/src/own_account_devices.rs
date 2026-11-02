@@ -30,7 +30,7 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::private_key_packages::SiblingWelcome;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
+    DeviceRosterV1, DeviceSlotId, MAX_LEAVES_PER_ACCOUNT, valid_sibling_welcome_relays,
 };
 use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
@@ -83,6 +83,14 @@ pub struct OwedSiblingWelcome {
     /// The app event id of the 461 sent to carry it, while that send is not
     /// resolved.
     pub carrier: Option<Vec<u8>>,
+}
+
+/// Result of a due delivered-Welcome repair check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiblingWelcomeResendOutcome {
+    Rearmed,
+    Held,
+    Complete,
 }
 
 /// Whether a retained sibling Welcome can begin a new carrier delivery.
@@ -602,6 +610,76 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
+    /// Re-owe an already published sibling Welcome after the host's durable
+    /// post-publication activity wait. This reuses the exact Welcome and
+    /// private KeyPackage; the host must first settle outstanding transport
+    /// targets of its previous carrier. Current selected device tags identify
+    /// the target, while only an Update/Commit leaf proves participation.
+    /// Unknown, unreadable or settling state never authorizes a new delivery.
+    pub fn rearm_sibling_welcome(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+        now: Timestamp,
+        roster: &DeviceRosterV1,
+    ) -> Result<SiblingWelcomeResendOutcome, EngineError> {
+        let mut record = match self.storage.get_message(id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => return Ok(SiblingWelcomeResendOutcome::Complete),
+            Err(error) => return Err(error.into()),
+        };
+        if record.state != MessageState::Processed {
+            return Ok(SiblingWelcomeResendOutcome::Held);
+        }
+        let Ok(StoredMessagePayload::OutboundSiblingWelcome {
+            welcome,
+            key_package_ref,
+            deliver_until,
+            origin,
+            carrier: current_carrier,
+        }) = StoredMessagePayload::decode(&record.payload)
+        else {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        };
+        if current_carrier.as_deref() != Some(carrier) {
+            return Ok(SiblingWelcomeResendOutcome::Held);
+        }
+        if now >= deliver_until {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        }
+        match self.check_sibling_welcome_origin(&record, &origin)? {
+            SiblingWelcomeOriginState::Ready => {}
+            SiblingWelcomeOriginState::Held => return Ok(SiblingWelcomeResendOutcome::Held),
+            SiblingWelcomeOriginState::Withdrawn => {
+                return Ok(SiblingWelcomeResendOutcome::Complete);
+            }
+        }
+        let target = SiblingWelcome::decode(&welcome)
+            .map_err(|error| {
+                EngineError::Other(format!("invalid retained sibling Welcome: {error:?}"))
+            })?
+            .to;
+        if !roster.devices.contains_key(&target) {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        }
+        let participated = self.has_own_device_participation(&record.group_id, roster, &target)?;
+        if participated {
+            return Ok(SiblingWelcomeResendOutcome::Complete);
+        }
+        record.state = MessageState::Sent;
+        record.payload = StoredMessagePayload::outbound_sibling_welcome(
+            welcome,
+            key_package_ref,
+            deliver_until,
+            None,
+            origin,
+        )
+        .encode()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        self.storage.put_message(&record)?;
+        Ok(SiblingWelcomeResendOutcome::Rearmed)
+    }
+
     /// Existing sibling-Welcome carriers whose transport outcomes still need
     /// settling. Unlike new-send eligibility, settlement remains possible
     /// while the originating chat or Add is temporarily held.
@@ -761,6 +839,9 @@ impl<S: StorageProvider> Engine<S> {
         else {
             return Ok(false);
         };
+        if new_handoff && self.wall_clock.now() >= deliver_until {
+            return Ok(false);
+        }
         match self.check_sibling_welcome_origin(&record, &origin)? {
             SiblingWelcomeOriginState::Withdrawn => return Ok(false),
             SiblingWelcomeOriginState::Held if new_handoff => return Ok(false),

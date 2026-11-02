@@ -62,14 +62,44 @@ where
         Ok(self.session.owed_sibling_welcomes(now)?)
     }
 
+    /// Re-owe an exact delivered carrier after the host's durable activity wait.
+    pub fn rearm_sibling_welcome(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+        now: Timestamp,
+        roster: &cgka_traits::app_components::DeviceRosterV1,
+    ) -> AccountResult<cgka_engine::SiblingWelcomeResendOutcome> {
+        Ok(self
+            .session
+            .rearm_sibling_welcome(id, carrier, now, roster)?)
+    }
+
     /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
     pub fn carried_sibling_welcomes(&self) -> AccountResult<Vec<(MessageId, Vec<u8>)>> {
         Ok(self.session.carried_sibling_welcomes()?)
     }
 
-    /// Record `carrier`, the app event id of the device-group message about
-    /// to carry the owed sibling Welcome `id`. See
-    /// [`cgka_engine::Engine::carry_sibling_welcome`].
+    /// Reserve the actual carrier and its timestamp with the engine association.
+    pub fn reserve_sibling_welcome_carrier(
+        &self,
+        id: &MessageId,
+        device_group: &cgka_traits::GroupId,
+        target: &DeviceSlotId,
+        carrier: &[u8],
+        created_at: u64,
+    ) -> AccountResult<bool> {
+        Ok(self.session.reserve_sibling_welcome_carrier(
+            id,
+            device_group,
+            target,
+            carrier,
+            created_at,
+        )?)
+    }
+
+    /// Record the exact carrier association. New app deliveries use the atomic
+    /// timestamp reservation above. See [`cgka_engine::Engine::carry_sibling_welcome`].
     pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> AccountResult<bool> {
         Ok(self.session.carry_sibling_welcome(id, carrier)?)
     }

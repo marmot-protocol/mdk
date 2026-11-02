@@ -26,6 +26,45 @@ use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
 use std::sync::{Arc, Mutex};
 
+struct AtTime(u64);
+impl cgka_traits::maintenance::WallClock for AtTime {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0)
+    }
+    fn now_ms(&self) -> u64 {
+        self.0 * 1_000
+    }
+}
+impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
+    fn next_u64(&self) -> u64 {
+        0
+    }
+}
+
+fn reopen_at_time(device: Device, account: &[u8], now: u64) -> Device {
+    let Device { engine, storage } = device;
+    drop(engine);
+    let clock = Arc::new(AtTime(now));
+    let mut supported: Vec<_> = default_group_components().into_iter().collect();
+    supported.extend([
+        ACCOUNT_DEVICES_COMPONENT_ID,
+        DEVICE_ROSTER_COMPONENT_ID,
+        cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
+    ]);
+    let mut engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(account))
+        .account_identity_proof_signer(proof_signer(account))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .supported_app_components(supported)
+        .peeler(Box::<MockPeeler>::default())
+        .maintenance_sources(clock.clone(), clock)
+        .build()
+        .unwrap();
+    engine.hydrate_all_stored_groups().unwrap();
+    Device { engine, storage }
+}
+
 /// A valid private KeyPackage whose MLS key differs from the device's tag
 /// key. Another implementation may rotate its MLS signer independently;
 /// device-group.md binds private hand-offs by tag, not by one shared signer.
@@ -398,6 +437,20 @@ async fn a_sibling_welcome_is_owed_until_its_key_package_expires() {
     let owed_at = |now| m.bob.engine.owed_sibling_welcomes(Timestamp(now)).unwrap();
     assert_eq!(owed_at(not_after - 1).len(), 1);
     assert!(owed_at(not_after).is_empty());
+    let selected = owed_at(not_after - 1).remove(0);
+    m.bob = reopen_at_time(m.bob, b"bob", not_after);
+    assert!(
+        !m.bob
+            .engine
+            .carry_sibling_welcome(&selected.id, b"expired-carrier")
+            .unwrap(),
+        "a Welcome selected before expiry cannot acquire a new carrier at expiry"
+    );
+    let record = m.bob.storage.get_message(&selected.id).unwrap();
+    assert!(matches!(
+        cgka_traits::StoredMessagePayload::decode(&record.payload).unwrap(),
+        cgka_traits::StoredMessagePayload::OutboundSiblingWelcome { carrier: None, .. }
+    ));
 }
 
 /// A disbanded chat owes no sibling Welcome: its sibling would join a group
@@ -1175,47 +1228,16 @@ async fn founding_siblings_cannot_bypass_the_other_founders_capabilities() {
 /// founder still receives and joins its canonical Welcome.
 #[tokio::test]
 async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
-    struct AtTime(u64);
-    impl cgka_traits::maintenance::WallClock for AtTime {
-        fn now(&self) -> Timestamp {
-            Timestamp(self.0)
-        }
-        fn now_ms(&self) -> u64 {
-            self.0 * 1_000
-        }
-    }
-    impl cgka_traits::maintenance::MaintenanceRandom for AtTime {
-        fn next_u64(&self) -> u64 {
-            0
-        }
-    }
     let (creator, mut siblings, device_group) = tagged_devices(b"alice", 1).await;
     let private = handed(&mut siblings[0], slot(2), slot(1));
     let not_after = cgka_engine::key_package::key_package_metadata(&private.key_package)
         .unwrap()
         .not_after;
-    let Device { engine, storage } = creator;
-    drop(engine);
-    let clock = Arc::new(AtTime(not_after));
-    let mut supported: Vec<_> = default_group_components().into_iter().collect();
-    supported.extend([
-        ACCOUNT_DEVICES_COMPONENT_ID,
-        DEVICE_ROSTER_COMPONENT_ID,
-        cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
-    ]);
-    let mut engine = EngineBuilder::new(storage.clone())
-        .identity(pad32(b"alice"))
-        .account_identity_proof_signer(proof_signer(b"alice"))
-        .protocol_profile(ProtocolProfile::Current)
-        .feature_registry(registry())
-        .supported_app_components(supported)
-        .peeler(Box::<MockPeeler>::default())
-        .maintenance_sources(clock.clone(), clock)
-        .build()
+    let mut creator = reopen_at_time(creator, b"alice", not_after);
+    creator
+        .engine
+        .set_device_tag_group(Some(device_group))
         .unwrap();
-    engine.hydrate_all_stored_groups().unwrap();
-    engine.set_device_tag_group(Some(device_group)).unwrap();
-    let mut creator = Device { engine, storage };
     let mut other = chat_device(b"bob");
     let public = other.engine.fresh_key_package().await.unwrap();
     let (gid, result) = creator
@@ -1242,4 +1264,133 @@ async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
         gid
     );
     assert!(sibling_rows(&creator, &gid).is_empty());
+}
+
+/// The Add's existing tagged KeyPackage leaf does not prove the lost Welcome
+/// arrived. Rearm preserves its exact bytes/ref/expiry and makes no Add; only
+/// the matching target's real MLS Update or Commit suppresses later repair.
+#[tokio::test]
+async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds_tag() {
+    use cgka_engine::SiblingWelcomeResendOutcome::{Complete, Rearmed};
+    for target_uses_update_proposal in [false, true] {
+        let (mut phone, mut siblings, device_group) = tagged_devices(b"bob", 2).await;
+        let mut laptop = siblings.remove(0);
+        let mut tablet = siblings.remove(0);
+        let gid = found_routed_group(&mut phone, &mut [&mut tablet]).await;
+        let roster = super::device_roster::roster_of(&phone, &device_group);
+        let candidate = handed(&mut laptop, slot(2), slot(1));
+        let add = send_commit(&mut phone, add_own_devices(&gid, vec![candidate]), &gid).await;
+        assert_accepted(&mut tablet, &add, &gid).await;
+        let original = owed(&phone).remove(0);
+        phone
+            .engine
+            .carry_sibling_welcome(&original.id, b"first")
+            .unwrap();
+        phone
+            .engine
+            .sibling_welcome_delivered(&original.id, b"first")
+            .unwrap();
+        // Another tagged device participates. Account-wide or any-device
+        // Update/Commit evidence would incorrectly suppress this repair.
+        let tablet_update = send_commit(
+            &mut tablet,
+            SendIntent::SelfUpdate {
+                group_id: gid.clone(),
+            },
+            &gid,
+        )
+        .await;
+        assert_accepted(&mut phone, &tablet_update, &gid).await;
+        assert!(
+            phone
+                .engine
+                .own_account_leaf_claims(&gid, &roster)
+                .unwrap()
+                .iter()
+                .any(|(_, claim)| *claim
+                    == cgka_traits::app_components::DeviceTagClaim::Device(slot(2)))
+        );
+        let epoch = phone.engine.epoch(&gid).unwrap();
+        assert_eq!(
+            phone
+                .engine
+                .rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &roster)
+                .unwrap(),
+            Rearmed
+        );
+        let repaired = owed(&phone).remove(0);
+        assert_eq!(repaired.content, original.content);
+        assert_eq!(repaired.id, original.id);
+        assert_eq!(
+            phone.engine.epoch(&gid).unwrap(),
+            epoch,
+            "repair must not make another Add"
+        );
+        phone
+            .engine
+            .carry_sibling_welcome(&original.id, b"second")
+            .unwrap();
+        phone
+            .engine
+            .sibling_welcome_delivered(&original.id, b"second")
+            .unwrap();
+        let welcome = SiblingWelcome::decode(&original.content).unwrap();
+        assert_eq!(
+            laptop
+                .engine
+                .join_sibling_welcome(&hash_id(&original.content), &welcome, None)
+                .await
+                .unwrap(),
+            cgka_traits::welcome::SiblingWelcomeJoin::Settled(IngestOutcome::Processed)
+        );
+        // Catch the joiner up with the other device's participation Commit.
+        assert_accepted(&mut laptop, &tablet_update, &gid).await;
+        if target_uses_update_proposal {
+            let crypto = RustCrypto::default();
+            let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+                &crypto,
+                laptop.storage.mls_storage(),
+            );
+            let (proposal, _) = load_group(&laptop, &gid)
+                .propose_self_update(
+                    &provider,
+                    &device_signer(&laptop),
+                    LeafNodeParameters::default(),
+                )
+                .unwrap();
+            let proposal = group_transport(proposal, &gid, "target-self-update");
+            assert_eq!(
+                phone.engine.ingest(proposal.clone()).await.unwrap(),
+                IngestOutcome::Processed
+            );
+            let (_, commit) = craft(
+                &tablet,
+                &gid,
+                Parts {
+                    by_reference: vec![proposal],
+                    ..Parts::default()
+                },
+            );
+            assert_accepted(&mut phone, &commit, &gid).await;
+        } else {
+            let update = send_commit(
+                &mut laptop,
+                SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                },
+                &gid,
+            )
+            .await;
+            assert_accepted(&mut phone, &update, &gid).await;
+        }
+        assert_eq!(
+            phone
+                .engine
+                .rearm_sibling_welcome(&original.id, b"second", Timestamp(NOW), &roster)
+                .unwrap(),
+            Complete,
+            "update_proposal={target_uses_update_proposal}"
+        );
+        assert!(owed(&phone).is_empty());
+    }
 }

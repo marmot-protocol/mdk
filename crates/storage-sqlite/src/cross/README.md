@@ -13,6 +13,7 @@ the list only shrinks.
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
 | `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, un-covering their seconds in the coverage ledger, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
 | `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer; the observer's type, its slot on the account handle and its setter, which `marmot-session` calls on the engine's storage | `protocol/storage/outbound.rs` |
+| `sibling_welcome_resends.rs` | Local accepted-publication ordering and immutable qualified DG content observations on the existing processed-wrapper ledger, plus the first matching activity for one Welcome generation, carrier reservation/attachment, and group-lifetime cleanup | `marmot-session` receipt persistence and `marmot-app` DG/publication projection |
 | `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
 | `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction. `delete_local_group_data`, the app's entry point, lives here on the account handle | `protocol/storage/groups.rs` (`forget_group_local`), `marmot-app` (`delete_local_group_data`) |
@@ -38,3 +39,13 @@ not table references the test can see.
   invalidates the engine's cached MLS groups (`protocol/provider.rs`, `mls_write_generation`).
 
 Step 8 decides per table which store each lands in.
+
+The sibling-Welcome observation crossing (migration 0169) preserves wrapper-id deduplication and adds indexed content
+bindings to that same lifetime-of-group ledger. Qualification is first established under current trusted-roster
+attribution and never reset by wrapper replay, message upserts, format promotion or MLS snapshots. Its order and the
+fanout's first acceptance order share a scalar local clock; the corresponding observation time measures the fixed
+wait. The one per-Welcome app row retains identities and timing only, with a prepared-carrier timestamp high-water
+reserved atomically with the engine carrier association on the session’s own connection before handoff; the app and
+runtime can otherwise hold separate connections to this same file. Existing local group epochs are
+frozen at upgrade as the conservative qualification cutoff; new local groups use -1. No raw-ingress retention changes,
+second seen-message ledger or new scheduler are introduced.
