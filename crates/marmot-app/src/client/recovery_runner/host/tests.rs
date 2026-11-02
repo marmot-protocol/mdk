@@ -606,6 +606,73 @@ async fn failed_route_goal_writes(failed_steps: usize) {
     );
 }
 
+/// An unavailable stored Welcome is a preparation failure, not proof that
+/// the copy has no hint: a broad goal could never narrow after recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_welcome_metadata_never_widens_the_goal() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use cgka_traits::storage::{GroupStorage, StorageError};
+    let Fixture {
+        mut client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    let route = group_routes(&client).pop().unwrap();
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+    let welcome_at = unix_now_seconds() - 60 * 60;
+    let mut record = storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+    let faults = fault_connection(&client);
+    faults
+        .execute(
+            "UPDATE cgka_groups SET record = x'ff' WHERE id = ?1",
+            [group.as_slice()],
+        )
+        .unwrap();
+    let mut account = client.build_recovery_runner().await;
+    let host = account.runner.host.clone();
+    let read_route = route.clone();
+    let result = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(move |turn| turn.app.recovery_coverage_goal(&read_route)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(StorageError::Serialization(_))),
+        "unreadable metadata must fail preparation"
+    );
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+
+    let mut wake = wake(&client);
+    storage.put_group(&record).unwrap();
+    assert!(
+        !woken(&mut wake),
+        "restoring metadata emits no routing wake"
+    );
+    let goal = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(move |turn| turn.app.recovery_coverage_goal(&route)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(goal, Some(welcome_at - 15 * 60));
+}
+
 /// With the gate on, a directly owned client's `next_event()` runs one pass
 /// in place when it meets delivery loss, after the recovery it already runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

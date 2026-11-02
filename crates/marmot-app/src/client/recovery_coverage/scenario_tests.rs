@@ -997,7 +997,10 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         } else {
             super::retention_floor(now)
         };
-        assert_eq!(fixture.client.standing_floor(current, now), expected);
+        assert_eq!(
+            fixture.client.standing_floor(current, now).unwrap(),
+            expected
+        );
     }
     assert_eq!(
         app.recovery_coverage_goal(&group_route).unwrap(),
@@ -1057,7 +1060,7 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         fixture.storage.put_group(&record).unwrap();
         for current in &fixture.client.current_coverage_routes() {
             assert_eq!(
-                fixture.client.standing_floor(current, now),
+                fixture.client.standing_floor(current, now).unwrap(),
                 super::retention_floor(now)
             );
         }

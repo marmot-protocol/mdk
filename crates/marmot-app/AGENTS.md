@@ -562,7 +562,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
   the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
-  MLS hydration, and an overly early goal cannot narrow later. That time is only a hint: never use it to retire,
+  MLS hydration, and an overly early goal cannot narrow later. Propagate metadata read errors instead of treating
+  them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
   un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.

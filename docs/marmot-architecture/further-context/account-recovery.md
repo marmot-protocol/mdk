@@ -542,6 +542,9 @@ window, and goals only widen, so a later Welcome raises nothing.
 The hint is read from durable group metadata even on a deferred runtime open, before MLS
 hydration: an unavailable live accessor must not substitute the retention floor and
 permanently widen a recently joined copy's goal.
+An error reading that metadata is a preparation failure, not an absent hint. All standing
+floors are validated before any goals widen, so a later successful retry can use the actual
+Welcome floor instead of preserving an accidentally broader goal.
 
 **Coverage versus goals.** No debt means no unproven history against the goals the ledger
 holds; it says nothing about a route with no goal. Every current route therefore needs a

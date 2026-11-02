@@ -12,6 +12,7 @@
 //! follows goes on. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
     RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
@@ -648,7 +649,7 @@ impl AppClient {
             let current = self.current_coverage_routes();
             // This turn reads the new debt immediately. Do not wake its own
             // runner, especially if a later write keeps the changes pending.
-            for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now) {
+            for (floor, routes) in self.standing_goals(&current.iter().collect::<Vec<_>>(), now)? {
                 app.widen_recovery_coverage_goals(&routes, floor)?;
             }
             for (route, relays) in &gone {
@@ -732,16 +733,22 @@ impl AppClient {
     /// A Welcome time after `now` (the joining clock ran fast) is ignored, even
     /// one inside the allowance, or the goal would start minutes ago and never
     /// owe the window.
-    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> u64 {
-        let welcome = current.group_id.as_ref().and_then(|group| {
-            self.stored_group(&cgka_traits::GroupId::new(group.clone()))
-                .ok()??
-                .local_copy_welcome_created_at
-        });
-        welcome
+    fn standing_floor(&self, current: &CurrentRoute, now: u64) -> StorageResult<u64> {
+        let welcome = match &current.group_id {
+            Some(group) => match self
+                .engine_storage
+                .get_group(&cgka_traits::GroupId::new(group.clone()))
+            {
+                Ok(group) => group.local_copy_welcome_created_at,
+                Err(StorageError::NotFound) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        Ok(welcome
             .filter(|welcome| welcome.0 <= now)
             .map_or(0, |welcome| crate::history_floor(welcome.0).0)
-            .max(retention_floor(now))
+            .max(retention_floor(now)))
     }
 
     /// Group standing goals by floor so one write can widen each set.
@@ -749,15 +756,15 @@ impl AppClient {
         &self,
         routes: &[&CurrentRoute],
         now: u64,
-    ) -> BTreeMap<u64, Vec<TransportReconciliationRoute>> {
+    ) -> StorageResult<BTreeMap<u64, Vec<TransportReconciliationRoute>>> {
         let mut by_floor = std::collections::BTreeMap::<u64, Vec<_>>::new();
         for current in routes {
             by_floor
-                .entry(self.standing_floor(current, now))
+                .entry(self.standing_floor(current, now)?)
                 .or_default()
                 .push(current.route.clone());
         }
-        by_floor
+        Ok(by_floor)
     }
 
     /// Widen each current route's goal to its standing floor and wake the
@@ -769,7 +776,7 @@ impl AppClient {
         routes: &[&CurrentRoute],
         now: u64,
     ) -> Result<(), AppError> {
-        for (floor, routes) in self.standing_goals(routes, now) {
+        for (floor, routes) in self.standing_goals(routes, now)? {
             self.widen_coverage_goals(app, &routes, floor)?;
         }
         Ok(())
