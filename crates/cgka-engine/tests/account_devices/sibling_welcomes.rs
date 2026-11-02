@@ -352,7 +352,7 @@ async fn a_sibling_add_owes_its_sibling_welcome_once_its_commit_confirms() {
 /// marks it delivered, and a delivered row is owed no more.
 #[tokio::test]
 async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
-    let (mut m, mut new) = siblings(1).await;
+    let (mut m, mut new) = siblings(2).await;
     let gid = m.gid.clone();
     let sibling = handed(&mut new[0], slot(2), slot(1));
     send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
@@ -390,6 +390,53 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
     let [(MessageState::Processed, _)] = &sibling_rows(&m.bob, &gid)[..] else {
         panic!("one delivered sibling Welcome")
     };
+
+    // A second genuine Add has its own obligation, after every original
+    // carrier-outcome assertion above. Its withdrawal is read by the
+    // carried list before any other caller can retire it.
+    let sibling = handed(&mut new[1], slot(3), slot(1));
+    let commit = send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let [next] = &owed(&m.bob)[..] else {
+        panic!("one new sibling Welcome")
+    };
+    let next_id = next.id.clone();
+    assert_ne!(next_id, *id);
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin: cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(origin),
+        ..
+    } = StoredMessagePayload::decode(&m.bob.storage.get_message(&next_id).unwrap().payload)
+        .unwrap()
+    else {
+        panic!("the second Add has its own confirmed origin")
+    };
+    assert_eq!(origin, commit.id);
+    assert!(
+        m.bob
+            .engine
+            .carry_sibling_welcome(&next_id, b"withdrawn")
+            .unwrap()
+    );
+    assert_eq!(
+        m.bob.engine.carried_sibling_welcomes().unwrap(),
+        vec![(next_id.clone(), b"withdrawn".to_vec())]
+    );
+    m.bob
+        .storage
+        .update_message_state(&origin, MessageState::EpochInvalidated)
+        .unwrap();
+    assert_eq!(
+        m.bob.storage.get_message(&next_id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(m.bob.engine.carried_sibling_welcomes().unwrap().is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&next_id).unwrap().state,
+        MessageState::Failed
+    );
+    assert_eq!(
+        m.bob.storage.get_message(id).unwrap().state,
+        MessageState::Processed
+    );
 }
 
 /// A forensic state row: the message id, the state it left, the state it
@@ -720,22 +767,17 @@ async fn sibling_welcome_origin_unknown_and_settling_hold_but_terminal_retires_a
     );
     m.bob.engine.publish_failed(pending).await.unwrap();
     assert_eq!(owed(&m.bob).len(), 1);
-    assert!(
-        m.bob
-            .engine
-            .carry_sibling_welcome(&id, b"before-terminal")
-            .unwrap()
-    );
+    assert!(owed(&m.bob)[0].carrier.is_none());
     m.bob
         .storage
         .update_message_state(&origin, MessageState::EpochInvalidated)
         .unwrap();
-    assert!(m.bob.engine.carried_sibling_welcomes().unwrap().is_empty());
     assert!(owed(&m.bob).is_empty());
     assert_eq!(
         m.bob.storage.get_message(&id).unwrap().state,
         MessageState::Failed
     );
+    assert!(m.bob.engine.carried_sibling_welcomes().unwrap().is_empty());
     let Device { engine, storage } = m.bob;
     drop(engine);
     let mut bob = super::device_roster::roster_device_on(storage, b"bob");
@@ -760,12 +802,15 @@ async fn an_unproven_development_sibling_welcome_is_not_handed_off_after_reopen(
     let sibling = handed(&mut new[0], slot(2), slot(1));
     send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
     let id = owed(&m.bob)[0].id.clone();
-    assert!(m.bob.engine.carry_sibling_welcome(&id, b"legacy").unwrap());
     let mut record = m.bob.storage.get_message(&id).unwrap();
     let mut legacy = StoredMessagePayload::decode(&record.payload).unwrap();
-    let StoredMessagePayload::OutboundSiblingWelcome { origin, .. } = &mut legacy else {
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin, carrier, ..
+    } = &mut legacy
+    else {
         panic!("one outbound sibling Welcome");
     };
+    assert!(carrier.is_none());
     *origin = SiblingWelcomeOrigin::LegacyUnproven;
     record.payload = legacy.encode().unwrap();
     m.bob.storage.put_message(&record).unwrap();
@@ -773,12 +818,12 @@ async fn an_unproven_development_sibling_welcome_is_not_handed_off_after_reopen(
     drop(engine);
     let mut bob = super::device_roster::roster_device_on(storage, b"bob");
     bob.engine.hydrate_all_stored_groups().unwrap();
-    assert!(bob.engine.carried_sibling_welcomes().unwrap().is_empty());
     assert!(owed(&bob).is_empty());
     assert_eq!(
         bob.storage.get_message(&id).unwrap().state,
         MessageState::Failed
     );
+    assert!(bob.engine.carried_sibling_welcomes().unwrap().is_empty());
     assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
 }
 
@@ -1069,7 +1114,10 @@ async fn a_sibling_add_the_chat_requires_more_for_is_named_by_the_pre_check() {
 /// and retires it with its KeyPackage, staging no sibling Welcome.
 #[tokio::test]
 async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
-    let (mut m, mut new) = siblings(1).await;
+    let clock = manual_convergence_clock();
+    let bob = clocked_roster_device(b"bob", &clock);
+    let (bob, mut new, _) = tag_devices(vec![bob, roster_device(b"bob")]).await;
+    let mut m = routed_members(chat_device(b"alice"), bob).await;
     let gid = m.gid.clone();
     let laptop = handed(&mut new[0], slot(2), slot(1));
     let published = SiblingKeyPackage {
@@ -1124,11 +1172,13 @@ async fn a_queued_sibling_add_is_checked_before_the_queue_and_at_drain() {
     assert_eq!(queued(&m.bob).len(), 1);
 
     m.bob.engine.set_device_tag_group(None).unwrap();
+    clock.advance_ms(999_000);
     m.bob
         .engine
         .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .unwrap();
     m.bob.engine.drain_events();
+    clock.advance_ms(100);
     let prepared = m
         .bob
         .engine
