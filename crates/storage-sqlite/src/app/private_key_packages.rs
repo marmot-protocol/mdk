@@ -89,6 +89,18 @@ impl SqliteAppStorage {
         rows.into_iter().map(received_record).collect()
     }
 
+    /// Unused, unexpired received stock from one issuer, in expiry/ref order.
+    /// Capability and admission checks belong to the caller, after this read
+    /// has released the SQLite lock.
+    pub fn received_private_key_packages_from(
+        &self,
+        issuer_slot_hex: &str,
+        now: u64,
+    ) -> StorageResult<Vec<ReceivedPrivateKeyPackage>> {
+        let conn = self.lock()?;
+        received_from(&conn, issuer_slot_hex, now)
+    }
+
     /// The KeyPackage from `issuer_slot_hex` that
     /// [`Self::take_received_private_key_package`] would take at `now`, left
     /// in place.
@@ -241,26 +253,33 @@ fn next_received(
     issuer_slot_hex: &str,
     now: u64,
 ) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
-    let mut stmt = conn
-        .prepare_cached(&format!(
-            "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
-             WHERE issuer_slot_hex = ?1 AND not_after > ?2 AND taken_at IS NULL
-             ORDER BY not_after, key_package_ref_hex"
-        ))
-        .storage()?;
-    let held = stmt
-        .query_map(params![issuer_slot_hex, u64_to_i64(now)?], received_row)
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?
-        .into_iter()
-        .map(received_record)
-        .collect::<StorageResult<Vec<_>>>()?;
+    let held = received_from(conn, issuer_slot_hex, now)?;
     Ok(held
         .iter()
         .find(|record| record.usable_at(now))
         .or_else(|| held.last())
         .cloned())
+}
+
+fn received_from(
+    conn: &rusqlite::Connection,
+    issuer_slot_hex: &str,
+    now: u64,
+) -> StorageResult<Vec<ReceivedPrivateKeyPackage>> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {RECEIVED_COLUMNS} FROM private_key_packages_received
+         WHERE issuer_slot_hex = ?1 AND not_after > ?2 AND taken_at IS NULL
+         ORDER BY not_after, key_package_ref_hex"
+        ))
+        .storage()?;
+    stmt.query_map(params![issuer_slot_hex, u64_to_i64(now)?], received_row)
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?
+        .into_iter()
+        .map(received_record)
+        .collect()
 }
 
 const RECEIVED_COLUMNS: &str =
@@ -506,6 +525,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining_bytes, 0);
+    }
+
+    /// An issuer-local batch excludes expired/used rows and never decodes
+    /// another issuer's record, even if that unrelated row is corrupt.
+    #[test]
+    fn issuer_batch_reads_only_its_own_unexpired_unused_records() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let used = received("used", "aa", 0);
+        let expired = received("expired", "aa", 0);
+        let held = received("held", "aa", 10);
+        store
+            .insert_received_private_key_packages(&[
+                used.clone(),
+                expired,
+                held.clone(),
+                received("other", "bb", 0),
+            ])
+            .unwrap();
+        assert!(
+            store
+                .take_received_private_key_package_exact(&used, 1)
+                .unwrap()
+        );
+        // SQLite's scalar affinity permits this corrupt record; a whole-table
+        // decode would fail before an app could filter by issuer in Rust.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE private_key_packages_received SET not_before = 'unreadable',
+             not_after = 'unreadable' WHERE issuer_slot_hex = 'bb'",
+            )
+            .unwrap();
+        assert_eq!(
+            store.received_private_key_packages_from("aa", 100).unwrap(),
+            vec![held]
+        );
+        assert!(
+            store
+                .received_private_key_packages_from("missing", 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A KeyPackage this device used is not kept again when it is handed over

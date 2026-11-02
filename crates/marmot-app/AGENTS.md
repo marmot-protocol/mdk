@@ -263,7 +263,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   key. Pass over a chat while this device's commit there is queued, in flight or settling (`group_quiet`), so no Add is
   doubled. Check the Add with the engine's read-only `sibling_add_refusal` against the KeyPackage
   `next_private_key_package_for_chat` selects from compatible private stock before taking that exact record,
-  so a chat that would refuse never spends one and a changed stock preference never spends another allocation;
+  so a chat that would refuse never spends one and a changed stock preference never spends another allocation.
+  Each pass shares one issuer-filtered received-stock batch and authenticates its metadata once. Cache only
+  time-independent capability matches by the engine's complete `KeyPackageRequirements` and signed advertisement
+  class; use the current clock for ordering/expiry and full engine admission before exact claim. Refresh a batch
+  when its trusted device-group pin changes or a hand-off commits genuinely new stock, including through a pending
+  native projection retry. Failed/duplicate inserts do not advance the memory-only received-stock generation.
+  Never retain a selection context across maintenance passes.
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
