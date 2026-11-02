@@ -2,8 +2,8 @@
 //!
 //! Typed relay-list status, the directory's freshness and selection primitives,
 //! and stateless KeyPackage handling: parsing and tag validation, cached-entry
-//! checks, client-preference ranking, selection and revocation evidence. They
-//! hold no `MarmotApp` state. The account's own KeyPackage inventory stays in
+//! checks, ranking, selection and revocation evidence. They hold no
+//! `MarmotApp` state. The account's own KeyPackage inventory stays in
 //! `crate::key_package_records`.
 
 use std::collections::BTreeSet;
@@ -11,19 +11,19 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use cgka_engine::key_package::key_package_metadata;
-use cgka_traits::MessageId;
+use cgka_engine::key_package::{KeyPackageMetadata, key_package_metadata};
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::{MessageId, TransportEndpoint};
 use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::parse_nip65_relay_set;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
+    RELAY_REPLAY_PAGE_LIMIT,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
-use super::config::KeyPackageClientPreference;
 use super::unix_now_seconds;
 use crate::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord};
@@ -146,18 +146,30 @@ pub struct FetchedKeyPackage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryFreshness {
+    /// The selection time, in Unix seconds.
+    pub(crate) now: u64,
     pub(crate) max_created_at: u64,
 }
 
 impl DirectoryFreshness {
     pub(crate) fn from_now(max_future_skew: Duration) -> Self {
+        Self::at(unix_now_seconds(), max_future_skew)
+    }
+
+    pub(crate) fn at(now: u64, max_future_skew: Duration) -> Self {
         Self {
-            max_created_at: unix_now_seconds().saturating_add(max_future_skew.as_secs()),
+            now,
+            max_created_at: now.saturating_add(max_future_skew.as_secs()),
         }
     }
 
     pub(crate) fn accepts(self, record: &RelayEventRecord) -> bool {
         record.event.created_at <= self.max_created_at
+    }
+
+    /// Published no more than [`KEY_PACKAGE_FRESHNESS`] before selection.
+    fn is_fresh_key_package(self, created_at: u64) -> bool {
+        created_at.saturating_add(KEY_PACKAGE_FRESHNESS.as_secs()) >= self.now
     }
 }
 
@@ -280,10 +292,21 @@ impl KeyPackageRecoveryEvidence {
             &self.deletions,
         ) && !self.winners.iter().any(|winner| {
             winner.tag_value("d") == Some(target.slot.as_str())
-                && (winner.created_at, winner.id.as_str())
-                    > (target.created_at, target.event_id.as_str())
+                && newest_publication_first(winner, target.created_at, &target.event_id).is_lt()
         })
     }
+}
+
+/// Slot order: the later `created_at` first and, on a tie, the lower event id,
+/// which NIP-01 keeps as the slot's current publication.
+fn newest_publication_first(
+    event: &NostrTransportEvent,
+    created_at: u64,
+    event_id: &str,
+) -> std::cmp::Ordering {
+    created_at
+        .cmp(&event.created_at)
+        .then_with(|| event.id.as_str().cmp(event_id))
 }
 
 /// Collapse fresh slot winners before applying deletions, retaining invalid,
@@ -294,21 +317,8 @@ pub(crate) fn without_revoked_slot_winners(
     deletions: &[RelayEventRecord],
     freshness: DirectoryFreshness,
 ) -> (Vec<RelayEventRecord>, KeyPackageRecoveryEvidence) {
-    records.sort_by(|a, b| {
-        b.event
-            .created_at
-            .cmp(&a.event.created_at)
-            .then_with(|| b.event.id.cmp(&a.event.id))
-    });
-    let deletions = deletions
-        .iter()
-        .filter(|record| {
-            record.event.kind == 5
-                && record.event.pubkey == account
-                && record.event.to_verified_nostr_event().is_ok()
-        })
-        .map(|record| record.event.clone())
-        .collect::<Vec<_>>();
+    records.sort_by(|a, b| newest_publication_first(&a.event, b.event.created_at, &b.event.id));
+    let deletions = verified_deletions(account, deletions);
     let mut slots = BTreeSet::new();
     let mut winners = Vec::new();
     records.retain(|record| {
@@ -340,6 +350,19 @@ pub(crate) fn without_revoked_slot_winners(
             deletions,
         },
     )
+}
+
+/// The account's signed kind 5 requests among `records`.
+fn verified_deletions(account: &str, records: &[RelayEventRecord]) -> Vec<NostrTransportEvent> {
+    records
+        .iter()
+        .filter(|record| {
+            record.event.kind == 5
+                && record.event.pubkey == account
+                && record.event.to_verified_nostr_event().is_ok()
+        })
+        .map(|record| record.event.clone())
+        .collect()
 }
 
 pub(crate) fn package_is_deleted(
@@ -466,125 +489,212 @@ pub fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
         .collect()
 }
 
-/// Temporary interoperability policy. Retire this ranking when device-aware
-/// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
-/// single-package selection. Keep separate from cryptographic admission so
-/// multi-device selection can replace this preference without changing validity.
-/// Labels are self-asserted and do not authenticate an application; they only
-/// rank candidates after admission checks and never relax cryptographic gates.
-/// The ranking is the deployment's [`KeyPackageClientPreference`]; an event
-/// with no single, valued `client` tag ranks as unlabelled.
-pub(crate) fn key_package_client_priority(
-    event: &NostrTransportEvent,
-    preference: &KeyPackageClientPreference,
-) -> u8 {
-    let mut tags = event.tags.iter().filter(|tag| {
-        tag.first()
-            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
-    });
-    let Some(tag) = tags.next() else {
-        return preference.rank(None);
-    };
-    if tags.next().is_some() || tag.len() < 2 {
-        return preference.rank(None);
+/// The most KeyPackages one account contributes to one Commit
+/// (`foundation/key-packages.md`, "Selection and lifecycle").
+pub const MAX_KEY_PACKAGES_PER_ACCOUNT: usize = 20;
+/// A KeyPackage published no longer than this before selection is fresh.
+pub const KEY_PACKAGE_FRESHNESS: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// KeyPackage events, and separately deletion requests, read in one lookup:
+/// one relay page each. Relays keep one event per slot and each slot is one
+/// device, so every slot of a normal account fits, along with its deletion
+/// requests. A page that comes back full fails the lookup instead of ranking
+/// without what lies past it ([`key_package_read_page_full`]). Only the
+/// account's own key can publish into its slots or delete them, so only the
+/// account itself can make itself uninvitable this way.
+pub(crate) const KEY_PACKAGE_READ_PAGE: usize = RELAY_REPLAY_PAGE_LIMIT;
+
+/// The KeyPackage events and the deletion requests read alongside them.
+pub(crate) fn key_package_queries(authors: Vec<String>) -> Vec<DirectoryEventQuery> {
+    vec![
+        DirectoryEventQuery::new(
+            KIND_MARMOT_KEY_PACKAGE,
+            authors.clone(),
+            KEY_PACKAGE_READ_PAGE,
+        ),
+        DirectoryEventQuery::key_package_deletions(authors, KEY_PACKAGE_READ_PAGE),
+    ]
+}
+
+/// Whether some relay returned a full page of `account`'s KeyPackages or of
+/// its deletion requests. Nothing past the page was read: an older slot may
+/// outrank every one read, and an older request may cover a slot that still
+/// selects.
+pub(crate) fn key_package_read_page_full(account: &str, records: &[RelayEventRecord]) -> bool {
+    let mut pages = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+    for record in records.iter().filter(|record| {
+        record.event.pubkey == account
+            && (record.event.kind == KIND_MARMOT_KEY_PACKAGE || record.event.kind == 5)
+    }) {
+        for endpoint in &record.endpoints {
+            pages
+                .entry((endpoint.as_str(), record.event.kind))
+                .or_default()
+                .insert(record.event.id.as_str());
+        }
     }
-    preference.rank(Some(&tag[1]))
+    pages.values().any(|ids| ids.len() >= KEY_PACKAGE_READ_PAGE)
 }
 
-/// Directory reads deliberately share the client ranking and slot-supersession
-/// policy used by invitation discovery, but have no target-group requirements.
-/// A malformed current slot never revives an older publication; if no usable
-/// slot remains, the lookup returns the validation error.
-pub fn latest_fresh_key_package_from_records(
-    account_id_hex: &str,
-    records: Vec<RelayEventRecord>,
-    freshness: DirectoryFreshness,
-    preference: &KeyPackageClientPreference,
-) -> Result<KeyPackageSelection<FetchedKeyPackage>, DirectoryError> {
-    let selection = preferred_fresh_key_package_from_records(
-        account_id_hex,
-        &records,
-        freshness,
-        None,
-        preference,
-    )?;
-    Ok(KeyPackageSelection {
-        value: selection.value.map(|selected| selected.fetched),
-        rejected_future: selection.rejected_future,
-        legacy_slots: selection.legacy_slots,
-    })
-}
-
-pub struct PreferredKeyPackage {
-    pub fetched: FetchedKeyPackage,
-    pub(crate) priority: u8,
-}
-
-/// Newest-slot KeyPackage selection. `legacy_slots` only explains an empty
-/// selection; it never makes a legacy publication a join candidate.
-pub struct KeyPackageSelection<T> {
-    pub value: Option<T>,
+/// One account's selected KeyPackages, best first. `legacy_slots` only
+/// explains an empty selection; it never makes a legacy publication a join
+/// candidate.
+pub struct KeyPackageSelection {
+    pub value: Vec<FetchedKeyPackage>,
     pub(crate) rejected_future: bool,
     pub legacy_slots: bool,
 }
 
-impl<T> KeyPackageSelection<T> {
+impl KeyPackageSelection {
     /// Call only after the lookup that produced these records completed: an
     /// incomplete search can explain neither absence nor obsolescence.
-    pub fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, DirectoryError> {
+    pub fn into_value_or_missing(
+        self,
+        account_id_hex: &str,
+    ) -> Result<Vec<FetchedKeyPackage>, DirectoryError> {
+        if !self.value.is_empty() {
+            return Ok(self.value);
+        }
         // A future-dated slot may be a clock-skewed current publication.
         let reason = if self.legacy_slots && !self.rejected_future {
             MissingKeyPackageReason::ObsoleteOnly
         } else {
             MissingKeyPackageReason::NotFound
         };
-        self.value.ok_or_else(|| DirectoryError::MissingKeyPackage {
+        Err(DirectoryError::MissingKeyPackage {
             account: account_id_hex.to_owned(),
             reason,
         })
     }
 }
 
-pub fn preferred_fresh_key_package_from_records(
+/// A validated candidate and what ranks it.
+struct RankedKeyPackage {
+    fetched: FetchedKeyPackage,
+    last_resort: bool,
+    signature_key: Vec<u8>,
+    key_package_ref: Vec<u8>,
+}
+
+/// Select the account's KeyPackages to add (`foundation/key-packages.md`,
+/// "Selection and lifecycle"; `transports/nostr.md`, "KeyPackage
+/// publication" and "Slot deletion").
+///
+/// - Each `d` slot's current publication is its newest fresh event. It
+///   supersedes the slot even when it is invalid or deleted: falling back
+///   within that slot could invite a package whose private material has
+///   already been retired.
+/// - A candidate a deletion request among `records` covers, by the slot's
+///   address or by the event's id, is skipped.
+/// - Malformed, legacy, expired and, with `requirements`, incompatible
+///   candidates are rejected before ranking.
+/// - Ranking: non-last-resort first, then the most recently published, then
+///   the lower KeyPackageRef. Of candidates sharing a leaf signature key, one
+///   device publishing in several slots, only the highest-ranked stays: a
+///   Commit cannot add two leaves with one key.
+/// - Every fresh candidate is selected, at most
+///   [`MAX_KEY_PACKAGES_PER_ACCOUNT`]; with none fresh, the single
+///   highest-ranked one.
+///
+/// With no candidate left, the newest rejection is the error.
+pub fn select_key_packages_from_records(
     account_id_hex: &str,
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    preference: &KeyPackageClientPreference,
-) -> Result<KeyPackageSelection<PreferredKeyPackage>, DirectoryError> {
-    let mut records = records.iter().collect::<Vec<_>>();
-    records.sort_by(|a, b| {
-        a.event
-            .created_at
-            .cmp(&b.event.created_at)
-            .then_with(|| a.event.id.cmp(&b.event.id))
+) -> Result<KeyPackageSelection, DirectoryError> {
+    let SlotCandidates {
+        mut candidates,
+        newest_error,
+        rejected_future,
+        legacy_slots,
+    } = slot_candidates(account_id_hex, records, freshness, requirements);
+    if candidates.is_empty()
+        && let Some(error) = newest_error
+    {
+        return Err(error);
+    }
+    candidates.sort_by(|a, b| {
+        a.last_resort
+            .cmp(&b.last_resort)
+            .then_with(|| b.fetched.created_at.cmp(&a.fetched.created_at))
+            .then_with(|| a.key_package_ref.cmp(&b.key_package_ref))
     });
+    let has_fresh = candidates
+        .iter()
+        .any(|candidate| freshness.is_fresh_key_package(candidate.fetched.created_at));
+    let mut signature_keys = BTreeSet::new();
+    let value = candidates
+        .into_iter()
+        .filter(|candidate| {
+            !has_fresh || freshness.is_fresh_key_package(candidate.fetched.created_at)
+        })
+        .filter(|candidate| signature_keys.insert(candidate.signature_key.clone()))
+        .take(if has_fresh {
+            MAX_KEY_PACKAGES_PER_ACCOUNT
+        } else {
+            1
+        })
+        .map(|candidate| candidate.fetched)
+        .collect();
+    Ok(KeyPackageSelection {
+        value,
+        rejected_future,
+        legacy_slots,
+    })
+}
+
+/// Every slot's candidate, before ranking: its newest publication that is
+/// not deleted, valid, current profile and, with `requirements`, compatible.
+struct SlotCandidates {
+    candidates: Vec<RankedKeyPackage>,
+    /// The newest publication's rejection, of every slot rejected.
+    newest_error: Option<DirectoryError>,
+    rejected_future: bool,
+    legacy_slots: bool,
+}
+
+fn slot_candidates(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> SlotCandidates {
+    let deletions = verified_deletions(account_id_hex, records);
+    let mut records = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account_id_hex
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|a, b| newest_publication_first(&a.event, b.event.created_at, &b.event.id));
     let mut rejected_future = false;
     let mut newest_error = None;
-    let mut selected = None;
-    let mut selected_priority = 0;
     let mut slots = BTreeSet::new();
     let mut legacy_slots = false;
-    for record in records.into_iter().rev() {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            continue;
-        }
+    let mut candidates = Vec::new();
+    for record in records {
         if !freshness.accepts(record) {
             rejected_future = true;
             continue;
         }
-        // A fresh publication supersedes its slot even when its payload or
-        // metadata is invalid. Falling back within that slot can invite a
-        // package whose private material has already been retired.
-        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
-            && !slots.insert(slot.to_owned())
-        {
+        let slot = record.event.tag_value("d").unwrap_or_default();
+        if !slot.is_empty() && !slots.insert(slot.to_owned()) {
             continue;
         }
-        let priority = key_package_client_priority(&record.event, preference);
-        let fetched = match key_package_from_borrowed_record(record) {
-            Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
-                fetched
+        if package_is_deleted(
+            account_id_hex,
+            &record.event.id,
+            slot,
+            record.event.created_at,
+            &deletions,
+        ) {
+            continue;
+        }
+        let (fetched, metadata) = match key_package_and_metadata_from_borrowed_record(record) {
+            Ok((fetched, metadata))
+                if fetched.key_package.protocol_profile == ProtocolProfile::Current =>
+            {
+                (fetched, metadata)
             }
             Ok(_) => continue,
             // A legacy slot still supersedes its older publications, but is
@@ -605,25 +715,224 @@ pub fn preferred_fresh_key_package_from_records(
             newest_error.get_or_insert(DirectoryError::KeyPackageRequirements(error));
             continue;
         }
-        if selected.is_none() || priority > selected_priority {
-            selected = Some(PreferredKeyPackage { fetched, priority });
-            selected_priority = priority;
-            // Newest-first order already breaks ties; nothing can outrank this.
-            if selected_priority == 2 {
-                break;
+        let Ok(key_package_ref) = hex::decode(&metadata.key_package_ref_hex) else {
+            continue;
+        };
+        candidates.push(RankedKeyPackage {
+            fetched,
+            last_resort: metadata.last_resort,
+            signature_key: metadata.leaf_signature_key,
+            key_package_ref,
+        });
+    }
+    SlotCandidates {
+        candidates,
+        newest_error,
+        rejected_future,
+        legacy_slots,
+    }
+}
+
+/// One read of every KeyPackage slot of one account, for its own devices'
+/// new-sign-in check (mdk#2628 item 3.2).
+#[derive(Clone, Debug)]
+pub struct AccountKeyPackageSlots {
+    /// Each slot's newest publication that is fresh and valid by the
+    /// inviter's rules ([`select_key_packages_from_records`]), with its
+    /// self-reported client name. Unlike an inviter's selection, every such
+    /// slot is here: none is capped, or dropped for sharing a signature key
+    /// with another.
+    pub key_packages: Vec<SlotKeyPackage>,
+    /// Every slot whose newest publication is a valid KeyPackage by the
+    /// inviter's rules, fresh or not: the slots still signed in. Freshness
+    /// is a publication time, so it never signs a slot out.
+    pub current_slots: BTreeSet<String>,
+    /// The `d` of every KeyPackage publication of the account the read
+    /// returned, whether or not it counts: which slots exist, whatever their
+    /// publications' times.
+    pub returned_slots: BTreeSet<String>,
+    /// Every relay reached its end of stored events and no page came back
+    /// full, so a slot missing here is not signed in.
+    pub complete: bool,
+    /// The read is complete or returned some of the account's publications.
+    /// A read that reached no relay proves nothing.
+    pub reached: bool,
+    /// The reading device's own slot, read on its own (mdk#2628 item 3.4),
+    /// when the read was asked for it.
+    pub own_slot: Option<OwnSlotRead>,
+}
+
+/// One device's own KeyPackage slot, read by its `d` alone so that the
+/// account's other slots cannot page it out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnSlotRead {
+    /// What each relay serves as the slot's current publication: its newest
+    /// there, the lowest event id on a tie, as relays keep a replaceable
+    /// event. Each publication once, however many relays serve it. A signed
+    /// publication of the account counts whether or not it holds a valid
+    /// KeyPackage, a future-dated or deleted one included.
+    pub current: Vec<SlotPublication>,
+    /// Every relay reached its end of stored events and no page came back
+    /// full, so no relay serves a current publication the read missed.
+    pub complete: bool,
+    /// Each relay whose own read finished that way and returned no
+    /// publication in the slot: it serves nothing there. A relay whose read
+    /// failed or did not finish is never here.
+    pub empty: Vec<TransportEndpoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotPublication {
+    /// Lowercase hex event id.
+    pub event_id: String,
+    pub created_at: u64,
+    /// The KeyPackage it holds, when it holds a valid one of the account
+    /// with the current profile (mdk#2628 item 3.7b).
+    pub key_package: Option<SlotPublicationKeyPackage>,
+}
+
+/// What a device's own-slot check needs of a valid KeyPackage there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotPublicationKeyPackage {
+    /// Lowercase hex `KeyPackageRef`.
+    pub key_package_ref_hex: String,
+    /// Its LeafNode's signature key.
+    pub leaf_signature_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlotKeyPackage {
+    pub fetched: FetchedKeyPackage,
+    /// The `client` tag, read as every MDK reader reads it.
+    pub client: Option<String>,
+}
+
+/// [`AccountKeyPackageSlots`] from one read of `account`'s KeyPackages and
+/// deletion requests, and of `own_slot` when given. `complete_relays` are
+/// the relays whose own read finished. It drops whatever an inviter would: a
+/// deleted, invalid, legacy or future-dated publication, and every slot whose
+/// newest publication is one of those. Only fresh KeyPackages count. The own
+/// slot is read as relays serve it, none dropped.
+pub fn account_key_package_slots_from_records(
+    account: &str,
+    records: &[RelayEventRecord],
+    complete: bool,
+    complete_relays: &[TransportEndpoint],
+    freshness: DirectoryFreshness,
+    own_slot: Option<&str>,
+) -> AccountKeyPackageSlots {
+    let own_slot = own_slot.map(|slot| OwnSlotRead {
+        current: current_slot_publications(account, slot, records),
+        complete,
+        empty: relays_serving_nothing(account, slot, records, complete_relays),
+    });
+    let complete = complete && !key_package_read_page_full(account, records);
+    let reached = complete || records.iter().any(|record| record.event.pubkey == account);
+    let candidates = slot_candidates(account, records, freshness, None).candidates;
+    let current_slots = candidates
+        .iter()
+        .map(|candidate| candidate.fetched.key_package_id.clone())
+        .filter(|slot| !slot.is_empty())
+        .collect();
+    let key_packages = candidates
+        .into_iter()
+        .map(|candidate| candidate.fetched)
+        .filter(|fetched| freshness.is_fresh_key_package(fetched.created_at))
+        .map(|fetched| {
+            let client = records
+                .iter()
+                .find(|record| record.event.id == fetched.key_package_event_id)
+                .and_then(|record| transport_nostr_adapter::key_package_client_name(&record.event))
+                .map(str::to_owned);
+            SlotKeyPackage { fetched, client }
+        })
+        .collect();
+    let returned_slots = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account
+        })
+        .filter_map(|record| record.event.tag_value("d"))
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_owned)
+        .collect();
+    AccountKeyPackageSlots {
+        key_packages,
+        current_slots,
+        returned_slots,
+        complete,
+        reached,
+        own_slot,
+    }
+}
+
+/// What each relay serves as `slot`'s current publication, each one once.
+fn current_slot_publications(
+    account: &str,
+    slot: &str,
+    records: &[RelayEventRecord],
+) -> Vec<SlotPublication> {
+    let mut newest_by_relay = std::collections::BTreeMap::<&str, &RelayEventRecord>::new();
+    for record in records.iter().filter(|record| {
+        record.event.kind == KIND_MARMOT_KEY_PACKAGE
+            && record.event.pubkey == account
+            && record.event.tag_value("d") == Some(slot)
+    }) {
+        for endpoint in &record.endpoints {
+            let newest = newest_by_relay.entry(endpoint.as_str()).or_insert(record);
+            if newest_publication_first(&record.event, newest.event.created_at, &newest.event.id)
+                .is_lt()
+            {
+                *newest = record;
             }
         }
     }
-    if selected.is_none()
-        && let Some(error) = newest_error
-    {
-        return Err(error);
+    let mut current: Vec<SlotPublication> = Vec::new();
+    for record in newest_by_relay.into_values() {
+        if !current.iter().any(|seen| seen.event_id == record.event.id) {
+            let key_package = key_package_and_metadata_from_borrowed_record(record)
+                .ok()
+                .filter(|(fetched, _)| {
+                    fetched.key_package.protocol_profile == ProtocolProfile::Current
+                })
+                .map(|(_, metadata)| SlotPublicationKeyPackage {
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    leaf_signature_key: metadata.leaf_signature_key,
+                });
+            current.push(SlotPublication {
+                event_id: record.event.id.clone(),
+                created_at: record.event.created_at,
+                key_package,
+            });
+        }
     }
-    Ok(KeyPackageSelection {
-        value: selected,
-        rejected_future,
-        legacy_slots,
-    })
+    current
+}
+
+/// Each of `complete_relays` that returned no publication in `slot`, each
+/// relay once.
+fn relays_serving_nothing(
+    account: &str,
+    slot: &str,
+    records: &[RelayEventRecord],
+    complete_relays: &[TransportEndpoint],
+) -> Vec<TransportEndpoint> {
+    let serving = records
+        .iter()
+        .filter(|record| {
+            record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                && record.event.pubkey == account
+                && record.event.tag_value("d") == Some(slot)
+        })
+        .flat_map(|record| &record.endpoints)
+        .collect::<BTreeSet<_>>();
+    let mut empty = Vec::<TransportEndpoint>::new();
+    for relay in complete_relays {
+        if !serving.contains(relay) && !empty.contains(relay) {
+            empty.push(relay.clone());
+        }
+    }
+    empty
 }
 
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current
@@ -734,12 +1043,14 @@ pub(crate) fn key_package_event_id_from_hex(
     Ok(MessageId::new(bytes))
 }
 
+/// The selection's best KeyPackage or, when only future-dated slots hid it,
+/// the cached one.
 pub fn fresh_or_cached_key_package(
     account_id_hex: &str,
-    selection: KeyPackageSelection<FetchedKeyPackage>,
+    selection: KeyPackageSelection,
     cached_entry: Option<UserDirectoryRecord>,
 ) -> Result<FetchedKeyPackage, DirectoryError> {
-    if selection.value.is_none()
+    if selection.value.is_empty()
         && selection.rejected_future
         && let Some(cached) = cached_entry
             .map(cached_key_package_from_entry)
@@ -748,7 +1059,9 @@ pub fn fresh_or_cached_key_package(
     {
         return Ok(cached);
     }
-    selection.into_value_or_missing(account_id_hex)
+    Ok(selection
+        .into_value_or_missing(account_id_hex)?
+        .swap_remove(0))
 }
 
 pub fn key_package_from_record(
@@ -760,6 +1073,12 @@ pub fn key_package_from_record(
 pub(crate) fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, DirectoryError> {
+    key_package_and_metadata_from_borrowed_record(record).map(|(fetched, _)| fetched)
+}
+
+fn key_package_and_metadata_from_borrowed_record(
+    record: &RelayEventRecord,
+) -> Result<(FetchedKeyPackage, KeyPackageMetadata), DirectoryError> {
     let event = &record.event;
     require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
@@ -836,16 +1155,19 @@ pub(crate) fn key_package_from_borrowed_record(
             .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
-    Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey.clone(),
-        key_package,
-        key_package_id,
-        key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id.clone(),
-        created_at: event.created_at,
-        source_relays,
-        relay_lists: AccountRelayListStatus::empty(),
-    })
+    Ok((
+        FetchedKeyPackage {
+            account_id_hex: event.pubkey.clone(),
+            key_package,
+            key_package_id,
+            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+            key_package_event_id: event.id.clone(),
+            created_at: event.created_at,
+            source_relays,
+            relay_lists: AccountRelayListStatus::empty(),
+        },
+        metadata,
+    ))
 }
 
 /// Per spec/transports/nostr.md, each KeyPackage id-list tag is exactly one

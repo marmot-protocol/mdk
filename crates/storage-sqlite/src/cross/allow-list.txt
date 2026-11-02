@@ -1,7 +1,6 @@
 # Crossings between the protocol and app sides of storage-sqlite that still have to move into cross/.
 # One line per file (or schema object) and target: <channel> <where> <target>. base::boundary_tests
 # fails on a crossing missing from this list and on a listed one that no longer occurs.
-# See docs/marmot-architecture/review/brief-storage-boundaries.md.
 
 # SQL naming the other side's tables. base/migrations.rs: the legacy migration 9 reconcile adds a column to two app tables.
 sql base/migrations.rs app_events

@@ -306,7 +306,7 @@ These are longer working documents. Go here when you need depth, not orientation
     redacted SDK relay health, and optional SDK client; relay auth/policy next
 
 - **Layer:** CGKA Engine
-  - **Today:** `crates/cgka-engine` implements the current OpenMLS-backed engine candidate; `crates/cgka-session` wraps
+  - **Today:** `crates/cgka-engine` implements the current OpenMLS-backed engine candidate; `crates/marmot-session` wraps
     it in an encrypted account-device lifecycle
   - **Target:** Spec-level `CgkaEngine` contract with production persistence, whitenoise-rs integration mapping, chaos
     coverage, and portable vectors

@@ -63,6 +63,8 @@ pub enum SubjectCapability {
     RetainedRelayHistory,
     RetainedRelayControl,
     RetainedRelayConfiguration,
+    /// Per-client `marmot.group.account-devices.v1` support and activation.
+    AccountDevices,
 }
 
 impl SubjectCapability {
@@ -95,6 +97,7 @@ impl SubjectCapability {
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
             Self::RetainedRelayConfiguration => "retained_relay_configuration",
+            Self::AccountDevices => "account_devices",
         }
     }
 
@@ -220,6 +223,25 @@ pub struct SubjectUpdateGroupData<'a> {
     pub pending: &'a str,
 }
 
+/// Stage the Commit that makes the group require
+/// `marmot.group.account-devices.v1`.
+#[derive(Clone, Copy, Debug)]
+pub struct SubjectRequireAccountDevices<'a> {
+    /// Unset for an expected refusal, which produces no protocol input.
+    pub action_id: Option<&'a str>,
+    pub client: &'a str,
+    pub pending: Option<&'a str>,
+}
+
+/// Stage a same-account Commit in which `client` removes the leaves of
+/// `devices`, other devices of its own account, by value.
+pub struct SubjectRemoveOwnAccountDevices<'a> {
+    pub action_id: &'a str,
+    pub client: &'a str,
+    pub devices: &'a [String],
+    pub pending: &'a str,
+}
+
 pub struct SubjectUpdateAdminPolicy<'a> {
     /// Stable input id for operations expected to produce protocol input.
     /// Expected validation failures leave this unset because no input should
@@ -339,6 +361,30 @@ pub trait ConvergenceSubject: Send {
         _action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
+    }
+
+    /// Restart `client` on a build that does or does not advertise
+    /// `marmot.group.account-devices.v1`.
+    fn set_account_devices_support(
+        &mut self,
+        _client: &str,
+        _supported: bool,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
+    }
+
+    async fn require_account_devices(
+        &mut self,
+        _action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
+    }
+
+    async fn remove_own_account_devices(
+        &mut self,
+        _action: SubjectRemoveOwnAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
     }
 
     async fn send_application(
@@ -711,6 +757,21 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             capabilities.push(SubjectCapability::OutboundPublication);
         }
         capabilities
+    } else if matches!(step, ScenarioStep::SetAccountDevicesSupport { .. }) {
+        vec![
+            SubjectCapability::AccountDevices,
+            SubjectCapability::CrashReopen,
+        ]
+    } else if matches!(
+        step,
+        ScenarioStep::RequireAccountDevices { .. }
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. }
+            | ScenarioStep::RemoveOwnAccountDevices { .. }
+    ) {
+        vec![
+            SubjectCapability::AccountDevices,
+            SubjectCapability::GroupMutation,
+        ]
     } else if matches!(step, ScenarioStep::ExpectTickError { .. }) {
         vec![
             SubjectCapability::TransportDelivery,
@@ -772,6 +833,12 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
             ScenarioStep::ExpectTickError { .. } => unreachable!("handled above"),
+            ScenarioStep::SetAccountDevicesSupport { .. }
+            | ScenarioStep::RequireAccountDevices { .. }
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. }
+            | ScenarioStep::RemoveOwnAccountDevices { .. } => {
+                unreachable!("handled above")
+            }
             ScenarioStep::InGroup { .. } => unreachable!("handled above"),
         }]
     }
@@ -1026,6 +1093,7 @@ impl EngineHarnessSubject {
             SubjectCapability::AssertionEvaluation,
             SubjectCapability::ClientStateAssertion,
             SubjectCapability::MultiGroup,
+            SubjectCapability::AccountDevices,
         ]);
         Ok(Self {
             descriptor: SubjectDescriptor {
@@ -1655,6 +1723,56 @@ impl ConvergenceSubject for EngineHarnessSubject {
             self.insert_pending(pending, action.client, pending_ref)?;
         }
         Ok(())
+    }
+
+    fn set_account_devices_support(
+        &mut self,
+        client: &str,
+        supported: bool,
+    ) -> Result<(), SubjectError> {
+        self.client_mut(client)?
+            .set_account_devices_supported(supported);
+        ConvergenceSubject::restart(self, client)
+    }
+
+    async fn require_account_devices(
+        &mut self,
+        action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let client = self.client_mut(action.client)?;
+        if let Some(action_id) = action.action_id {
+            client.name_next_scenario_input(action_id);
+        }
+        let pending_ref = client
+            .try_require_account_devices()
+            .await
+            .map_err(subject_engine_error)?;
+        if let Some(pending) = action.pending {
+            self.insert_pending(pending, action.client, pending_ref)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_own_account_devices(
+        &mut self,
+        action: SubjectRemoveOwnAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let keys = action
+            .devices
+            .iter()
+            .map(|device| {
+                self.client(device)?
+                    .own_leaf_signature_key()
+                    .map_err(subject_engine_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let client = self.client_mut(action.client)?;
+        client.name_next_scenario_input(action.action_id);
+        let pending_ref = client
+            .try_remove_own_account_devices(keys)
+            .await
+            .map_err(subject_engine_error)?;
+        self.insert_pending(action.pending, action.client, pending_ref)
     }
 
     async fn send_application(
@@ -2430,9 +2548,17 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // to caller input (the pinned epoch), not a protocol failure.
         | EngineError::AppMessageEpochMismatch { .. }
         | EngineError::AppMessageEpochUnsettled { .. }
+        | EngineError::LinkDeviceUnsettled { .. }
+        | EngineError::DeviceEntryChanged { .. }
+        | EngineError::AccountEntryChanged { .. }
+        | EngineError::AccountEntryUnsettled { .. }
+        | EngineError::UnexpectedDeviceGroupWelcome
         | EngineError::InvalidWelcome
         | EngineError::MissingWelcomeKeyPackage
+        | EngineError::WelcomeNotAddressedToThisDevice
         | EngineError::WelcomeAlreadyProcessed
+        | EngineError::SiblingWelcomeHeld { .. }
+        | EngineError::SiblingWelcomePredatesForget
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
         | EngineError::UnknownMember { .. }
@@ -2440,10 +2566,12 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::MissingRequiredCapabilities { .. }
         | EngineError::DisbandingUnsupportedMembers { .. }
         | EngineError::DisbandingNotEnabled { .. }
+        | EngineError::AccountDevicesActivationRefused { .. }
         | EngineError::InvalidCredentialIdentity(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
         | EngineError::InvalidKeyPackageCapabilities { .. }
+        | EngineError::NoDataAppComponent { .. }
         | EngineError::UnsupportedCiphersuite { .. }
         | EngineError::InvalidAppMessagePayload(_)
         // A halted group refusing new work is deliberate, not a protocol
@@ -2496,12 +2624,20 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
         EngineError::AppMessageEpochMismatch { .. } => "app_message_epoch_mismatch",
         EngineError::AppMessageEpochUnsettled { .. } => "app_message_epoch_unsettled",
+        EngineError::LinkDeviceUnsettled { .. } => "link_device_unsettled",
+        EngineError::DeviceEntryChanged { .. } => "device_entry_changed",
+        EngineError::AccountEntryChanged { .. } => "account_entry_changed",
+        EngineError::AccountEntryUnsettled { .. } => "account_entry_unsettled",
+        EngineError::UnexpectedDeviceGroupWelcome => "unexpected_device_group_welcome",
         // Every decode failure the engine can reach, not an admin-policy
         // verdict: `audit_helpers::engine_error_kind` names it the same way.
         EngineError::Serialize(_) => "serialize",
         EngineError::InvalidWelcome => "invalid_welcome",
         EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
+        EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+        EngineError::SiblingWelcomeHeld { .. } => "sibling_welcome_held",
+        EngineError::SiblingWelcomePredatesForget => "sibling_welcome_predates_forget",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::GroupUnrecoverableRepairRequired { .. } => {
             "group_unrecoverable_repair_required"
@@ -2518,10 +2654,12 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
         EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+        EngineError::AccountDevicesActivationRefused { .. } => "account_devices_activation_refused",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
+        EngineError::NoDataAppComponent { .. } => "no_data_app_component",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",

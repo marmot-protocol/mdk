@@ -1210,7 +1210,8 @@ async fn reader_loss_refetches_seen() {
             panic!("the native reader must receive the small initial range intact");
         };
         match notification {
-            boundary @ NostrSdkNotification::Replay { .. } => {
+            boundary @ (NostrSdkNotification::Replay { .. }
+            | NostrSdkNotification::Disconnected { .. }) => {
                 assert!(
                     !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
                         .sdk
@@ -2966,23 +2967,40 @@ async fn maintenance_replay_is_ordered() {
     assert_replay_before_live(OrderedReplay::Maintenance).await;
 }
 
-/// Distinct messages delivered until the adapter goes quiet.
-async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) -> usize {
+/// Drain and place replay until admission has no outstanding work. Silence
+/// between pages is not completion, and a saturated range may finish incomplete.
+async fn distinct_deliveries(fx: &Fixture, wait: Duration) -> usize {
     const IDLE: Duration = Duration::from_millis(1_500);
-    let deadline = tokio::time::Instant::now() + wait;
+    let mut changes = fx.adapter.replay_changes(&fx.account).await.unwrap();
     let mut seen = HashSet::new();
-    loop {
-        let next = deadline.min(tokio::time::Instant::now() + IDLE);
-        match tokio::time::timeout_at(next, adapter.receive()).await {
-            Ok(Ok(Some(delivery))) => {
-                adapter
-                    .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
-                    .await;
-                seen.insert(delivery.message.id);
+    tokio::time::timeout(wait, async {
+        loop {
+            changes.borrow_and_update();
+            let pending = fx.adapter.take_replay_status(&fx.account).await.pending;
+            tokio::select! {
+                delivery = fx.adapter.receive() => {
+                    let delivery = delivery.unwrap().expect("the replay receiver stays open");
+                    fx.adapter
+                        .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
+                        .await;
+                    seen.insert(delivery.message.id);
+                }
+                changed = changes.changed() => {
+                    changed.expect("the account remains active while replaying");
+                }
+                // Preserve the observation of late withheld tails, but never
+                // let silence end a replay that still has outstanding work.
+                _ = tokio::time::sleep(IDLE), if !pending => return seen.len(),
             }
-            _ => return seen.len(),
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "replay did not finish after {} distinct deliveries",
+            seen.len()
+        )
+    })
 }
 
 /// Store kind-445 events for group route 0 at the given `created_at` seconds.
@@ -3017,7 +3035,7 @@ async fn a_batch_replay_past_500_events_is_paged_for_every_group() {
         )
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)
@@ -3095,7 +3113,9 @@ async fn batch_replay_over_buffer() {
     activation.since = Some(cgka_traits::Timestamp(SINCE));
     fx.adapter.activate_account(activation).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    // Each group waits for its predecessor to drain before its paging starts.
+    // Bound lack of group progress, rather than charging all groups one window.
+    let mut deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     let mut positions = [0; GROUPS];
     let mut payload_bytes = [0; GROUPS];
     for received in 0..GROUPS * PER_GROUP {
@@ -3129,6 +3149,9 @@ async fn batch_replay_over_buffer() {
         fx.adapter
             .ack_replay_delivery(&fx.account, &delivery.message.id)
             .await;
+        if positions[group] == PER_GROUP {
+            deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        }
     }
     assert!(positions.into_iter().all(|count| count == PER_GROUP));
     assert!(payload_bytes.iter().all(|bytes| *bytes < BUFFER_BYTES));
@@ -3331,7 +3354,7 @@ async fn a_synced_batch_replay_past_500_events_is_paged_for_every_group() {
         .sync_account_groups(group_sync(&fx, groups(GROUP_BATCH_ROUTES, &url)))
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)
@@ -3382,7 +3405,7 @@ async fn a_batch_page_saturated_by_one_second_is_paged_per_route() {
         )
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)
@@ -3439,7 +3462,7 @@ async fn a_route_that_saturates_alone_does_not_stop_the_others_paging() {
         )
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)
@@ -3556,7 +3579,7 @@ async fn replay_one_group_at(
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)
@@ -3651,7 +3674,7 @@ async fn unmappable_event_on_a_backward_page_does_not_wedge_paging() {
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
         .await
         .unwrap();
-    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let delivered = distinct_deliveries(&fx, Duration::from_secs(15)).await;
     let complete = fx
         .adapter
         .account_subscription_eose(&fx.account)

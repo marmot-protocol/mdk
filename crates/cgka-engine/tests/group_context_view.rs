@@ -39,7 +39,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -82,6 +82,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -123,7 +124,7 @@ impl TransportPeeler for MockPeeler {
 }
 
 fn build_client(identity: &[u8]) -> impl CgkaEngine {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))

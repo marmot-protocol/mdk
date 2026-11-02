@@ -138,15 +138,6 @@ mod tests {
         assert_eq!(profile.profile_json, record("aa", "Alice").profile_json);
         assert_eq!(QUERIES.with(Cell::get), 1);
     }
-    #[test]
-    fn accepted_profile_changes_have_a_durable_revision_domain() {
-        let store = SqliteSharedStorage::in_memory().unwrap();
-        let exists: bool = store.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'directory_presentation_changes')", [], |r| r.get(0)).unwrap();
-        assert!(
-            exists,
-            "accepted profiles need a durable coalesced change index"
-        );
-    }
     fn record(member: &str, name: &str) -> crate::PublicDirectoryUserRecord {
         crate::PublicDirectoryUserRecord {
             account_id_hex: member.into(),

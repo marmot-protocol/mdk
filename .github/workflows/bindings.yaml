@@ -244,13 +244,9 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          shared-key: marmotkit-${{ matrix.part }}
-          key: ${{ hashFiles('crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh', 'crates/marmot-uniffi/kotlin-bindings.sh') }}
-          workspaces: packaged-source -> target
+      # No Cargo cache: published inputs build from a clean target directory,
+      # and the repository cache budget belongs to ci.yml (see its header). A
+      # cache saved here was evicted before the next nightly anyway.
 
       - name: Build one Apple input
         env:
@@ -618,13 +614,7 @@ jobs:
           "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
           echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          shared-key: marmotkit-${{ matrix.part }}
-          key: ${{ hashFiles('crates/marmot-uniffi/marmotkit-*.env', 'crates/marmot-uniffi/*framework*.sh', 'crates/marmot-uniffi/kotlin-bindings.sh') }}
-          workspaces: packaged-source -> target
+      # No Cargo cache, for the reasons given in apple-build.
 
       - name: Build one Android input
         env:

@@ -57,7 +57,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -97,6 +97,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -259,7 +260,11 @@ async fn canonical_apply_cost_with_stored_history() {
     let mut alice = build_client(alice_store, b"alice", Some(applied.clone()));
     // Bob is only a message source; keep his store in memory so setup time is
     // spent on Alice's file-backed SQLCipher ledger.
-    let mut bob = build_client(SqliteAccountStorage::in_memory().unwrap(), b"bob", None);
+    let mut bob = build_client(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        b"bob",
+        None,
+    );
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, result) = alice

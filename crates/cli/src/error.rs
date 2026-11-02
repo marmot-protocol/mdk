@@ -612,6 +612,11 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
             "message": err.to_string(),
             "account_ref": account,
         }),
+        AccountHomeError::AccountUnlinked(account) => json!({
+            "code": "account_unlinked",
+            "message": err.to_string(),
+            "account_ref": account,
+        }),
         AccountHomeError::InvalidSecretKey => json!({
             "code": "invalid_secret_key",
             "message": err.to_string(),
@@ -948,7 +953,7 @@ fn engine_error_json(err: &EngineError) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use marmot_account::AccountError;
+    use marmot_app::AccountError;
 
     use super::*;
 
@@ -1113,5 +1118,21 @@ mod tests {
 
         assert_eq!(rendered[0]["code"], "engine_error");
         assert!(rendered.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// The CLI column of `marmot-app`'s lower-stack error table: the code
+    /// follows what the error is, however the lower stack wrapped it.
+    #[test]
+    fn lower_stack_errors_get_a_code_by_kind_not_by_wrapping() {
+        let mismatches: Vec<String> = marmot_app::error_kind_table::lower_stack_rows()
+            .into_iter()
+            .filter_map(|row| {
+                let json = wn_error_json(&WnError::App(row.error));
+                let code = json["code"].as_str().unwrap_or_default().to_owned();
+                (code != row.expected.cli_code)
+                    .then(|| format!("{}: {code}, expected {}", row.name, row.expected.cli_code))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }

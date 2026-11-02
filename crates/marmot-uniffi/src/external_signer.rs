@@ -1,9 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cgka_engine::account_identity_proof::{
-    AccountIdentityProofRequest, AccountIdentityProofSigner,
-};
+use marmot_app::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use nostr::prelude::{Event, PublicKey, UnsignedEvent};
 use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
 

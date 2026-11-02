@@ -37,7 +37,7 @@ ratatui-image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "signal"] }
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 unicode-properties.workspace = true
@@ -46,6 +46,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+marmot-app = { workspace = true, features = ["test-support"] }
 nostr-relay-builder.workspace = true
 nostr-sdk.workspace = true
 tempfile.workspace = true

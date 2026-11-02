@@ -1,7 +1,7 @@
 //! Product analytics for directory operations. `marmot-app` implements
 //! [`DirectoryObserver`] over its usage-diagnostics collector, with the same
-//! family, operation and unit strings the directory reported before (step 3,
-//! decision 4 of `docs/marmot-architecture/review/brief-directory.md`).
+//! family, operation and unit strings the directory reported before it had its
+//! own crate.
 
 /// The analytics family an operation reports under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -11,7 +11,7 @@ use cgka_traits::message::{
     OwnApplicationConvergenceStamp, StoredMessagePayload,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 
 fn fresh_deferred_peel_lifecycle(
@@ -71,7 +71,7 @@ pub(crate) fn fail_deferred_peel_rows_in_terminal_group<S: StorageProvider>(
 }
 
 /// Promote or retire the non-deliverable Welcome artifacts produced beside one
-/// staged invite commit.
+/// staged invite commit, sibling Welcomes among them.
 ///
 /// Normal publish resolution supplies the exact origin commit id, so another
 /// staged or stale Welcome at the same group epoch cannot be promoted with the
@@ -100,6 +100,30 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
             storage.put_message(&record)?;
             continue;
         }
+        if let StoredMessagePayload::StagedSiblingWelcome {
+            welcome,
+            origin_commit_id: staged_origin_commit_id,
+            key_package_ref,
+            deliver_until,
+        } = &payload
+        {
+            record.state =
+                if origin_commit_id.is_some_and(|expected| expected != staged_origin_commit_id) {
+                    MessageState::Failed
+                } else {
+                    record.payload = StoredMessagePayload::outbound_sibling_welcome(
+                        welcome.clone(),
+                        key_package_ref.clone(),
+                        *deliver_until,
+                        None,
+                    )
+                    .encode()
+                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+                    state
+                };
+            storage.put_message(&record)?;
+            continue;
+        }
         let Some((message, staged_origin_commit_id)) = payload.as_staged_invite_welcome() else {
             continue;
         };
@@ -111,9 +135,13 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
             storage.put_message(&record)?;
             continue;
         }
-        record.payload = StoredMessagePayload::outbound_welcome(message.clone())
-            .encode()
-            .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+        record.payload = StoredMessagePayload::outbound_welcome(
+            message.clone(),
+            payload.welcome_key_package_ref().map(<[u8]>::to_vec),
+            payload.welcome_deliver_until(),
+        )
+        .encode()
+        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         record.state = state;
         storage.put_message(&record)?;
     }
@@ -307,6 +335,8 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: &TransportMessage,
         origin_commit_id: &MessageId,
+        key_package_ref: Vec<u8>,
+        deliver_until: Option<Timestamp>,
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
@@ -316,7 +346,36 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             RowEpochs::at(epoch),
             MessageState::Sent,
-            StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
+            StoredMessagePayload::staged_invite_welcome(
+                msg.clone(),
+                origin_commit_id.clone(),
+                Some(key_package_ref),
+                deliver_until,
+            ),
+            None,
+        )
+    }
+
+    /// Record a sibling Welcome as staged delivery work of `origin_commit_id`
+    /// (device-group.md, "Sending a sibling Welcome").
+    pub(crate) fn record_staged_sibling_welcome(
+        &self,
+        welcome: crate::own_account_devices::BuiltSiblingWelcome,
+        origin_commit_id: &MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.persist_stored_message_payload(
+            welcome.id,
+            group_id,
+            RowEpochs::at(epoch),
+            MessageState::Sent,
+            StoredMessagePayload::staged_sibling_welcome(
+                welcome.content,
+                origin_commit_id.clone(),
+                welcome.key_package_ref,
+                welcome.deliver_until,
+            ),
             None,
         )
     }
@@ -1256,7 +1315,7 @@ mod tests {
             hasher.update(b"cgka-engine-store-test-identity-v1");
             hasher.update(counter.to_be_bytes());
             material.copy_from_slice(&hasher.finalize());
-            if let Ok(sk) = SigningKey::from_bytes(&material) {
+            if let Ok(sk) = SigningKey::from_slice(&material) {
                 return sk;
             }
             counter += 1;
@@ -1281,7 +1340,7 @@ mod tests {
         crate::engine::Engine<SqliteAccountStorage>,
         GroupId,
     ) {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let signing_key = test_signing_key();
         let identity = signing_key.verifying_key().to_bytes().to_vec();
         let engine = EngineBuilder::new(storage.clone())
@@ -1394,6 +1453,8 @@ mod tests {
                 StoredMessagePayload::staged_invite_welcome(
                     staged_welcome.clone(),
                     origin_commit_id.clone(),
+                    None,
+                    None,
                 ),
                 None,
             )

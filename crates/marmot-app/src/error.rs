@@ -1,8 +1,10 @@
 use cgka_traits::{TransportAdapterError, storage::StorageError};
-use marmot_account::{AccountError, AccountHomeError};
+use marmot_account::AccountHomeError;
+use marmot_session::AccountError;
 
 use crate::MissingRelayListKind;
-use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
+use marmot_observability::AuditUploadError;
+use marmot_observability::{SyncErrorClass, SyncFailureClassification};
 pub use nostr_directory::error::MissingKeyPackageReason;
 use nostr_directory::error::{
     DirectoryError, ResourceError, sqlite_error_kind, storage_error_kind,
@@ -102,11 +104,11 @@ pub enum AppError {
     #[error(transparent)]
     ProductAnalytics(#[from] crate::ProductAnalyticsError),
     #[error(transparent)]
-    Account(#[from] marmot_account::AccountError),
+    Account(marmot_session::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
-    Session(#[from] cgka_session::SessionError),
+    Session(marmot_session::SessionError),
     #[error(transparent)]
     Storage(#[from] cgka_traits::storage::StorageError),
     #[error(transparent)]
@@ -137,6 +139,17 @@ pub enum AppError {
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
+    /// An invite named the inviter's own account. A device never adds its own
+    /// account's other devices from published KeyPackages (mdk#2628 D14).
+    #[error("invited members must not include the inviter")]
+    GroupInviteIncludesInviter,
+    /// A device-group action was refused (mdk#2628 item 3.1): this device
+    /// does not advertise the roster, the confirmed KeyPackage is not this
+    /// account's published one, the account already has a device group, or
+    /// the trusted device group's roster cannot be read
+    /// (`roster_unavailable`). The reason is a fixed, identity-free code.
+    #[error("device group refused: {0}")]
+    DeviceGroupRefused(&'static str),
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -294,11 +307,12 @@ pub enum AppError {
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
     /// A media reference was encrypted under `source_epoch`, but the message
-    /// that would carry it is sent at `current_epoch`. The `imeta` tag has no
+    /// that would carry it is sent at `current_epoch`, or at the same number
+    /// on another branch of the group's history. The `imeta` tag has no
     /// epoch field, so recipients would derive the wrong media secret; the
     /// attachment has to be uploaded again.
     #[error(
-        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+        "media reference was encrypted at epoch {source_epoch} but the group has moved off it (now at epoch {current_epoch}); upload it again"
     )]
     MediaReferenceStaleEpoch {
         source_epoch: u64,
@@ -343,6 +357,16 @@ pub enum AppError {
     /// Pre-dial rejection for untrusted profile/media fetch URLs (SSRF boundary).
     #[error("unsafe media fetch: {0}")]
     UnsafeMediaFetch(String),
+    #[error("invalid sticker data: {0}")]
+    InvalidSticker(String),
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker relay operation failed: {0}")]
+    StickerRelay(String),
+    #[error("sticker import failed: {0}")]
+    StickerImport(String),
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerExternalSignerImportUnsupported,
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
     #[error("invalid push token")]
@@ -454,7 +478,7 @@ impl From<DirectoryError> for AppError {
                 Self::MissingKeyPackage { account, reason }
             }
             DirectoryError::KeyPackageRequirements(error) => {
-                Self::from(cgka_session::SessionError::from(error))
+                Self::from(marmot_session::SessionError::from(error))
             }
             DirectoryError::Resource(error) => *error
                 .into_inner()
@@ -473,12 +497,52 @@ impl From<AppError> for DirectoryError {
     }
 }
 
+/// The audit upload's errors convert back to the `AppError` they replaced: the
+/// same variant, message and `privacy_safe_kind` as before the upload had its
+/// own type.
+impl From<AuditUploadError> for AppError {
+    fn from(error: AuditUploadError) -> Self {
+        match error {
+            AuditUploadError::InvalidAuditLogFile(value) => Self::InvalidAuditLogFile(value),
+            AuditUploadError::AuditLogUpload(value) => Self::AuditLogUpload(value),
+            AuditUploadError::Io(value) => Self::Io(value),
+        }
+    }
+}
+
+/// An external signer reports a rejection as text, which every layer passes
+/// through unchanged. So each lower-stack conversion recognises it by that
+/// text, wherever the rejection happened and however it was wrapped.
+fn is_external_signer_rejection(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED)
+}
+
 impl From<TransportAdapterError> for AppError {
     fn from(error: TransportAdapterError) -> Self {
-        if error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED) {
+        if is_external_signer_rejection(&error) {
             Self::ExternalSignerRejected
         } else {
             Self::Transport(error)
+        }
+    }
+}
+
+impl From<AccountError> for AppError {
+    fn from(error: AccountError) -> Self {
+        if is_external_signer_rejection(&error) {
+            Self::ExternalSignerRejected
+        } else {
+            Self::Account(error)
+        }
+    }
+}
+
+impl From<marmot_session::SessionError> for AppError {
+    fn from(error: marmot_session::SessionError) -> Self {
+        if is_external_signer_rejection(&error) {
+            Self::ExternalSignerRejected
+        } else {
+            Self::Session(error)
         }
     }
 }
@@ -514,7 +578,7 @@ impl AppError {
             Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
-            Self::Session(error) => session_error_kind(error),
+            Self::Session(error) => engine_error_kind(error.as_engine_error()),
             Self::Storage(error) => storage_error_kind(error),
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
@@ -525,6 +589,8 @@ impl AppError {
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
+            Self::GroupInviteIncludesInviter => "group_invite_includes_inviter",
+            Self::DeviceGroupRefused(_) => "device_group_refused",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
@@ -587,6 +653,13 @@ impl AppError {
             Self::BlobStore(_) => "blob_store",
             Self::MediaUploadTimedOut => "media_upload_timed_out",
             Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",
+            Self::InvalidSticker(_) => "invalid_sticker",
+            Self::StickerNotFound => "sticker_not_found",
+            Self::StickerRelay(_) => "sticker_relay",
+            Self::StickerImport(_) => "sticker_import",
+            Self::StickerExternalSignerImportUnsupported => {
+                "sticker_external_signer_import_unsupported"
+            }
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",
             Self::InvalidPushServer(_) => "invalid_push_server",
@@ -641,7 +714,7 @@ impl AppError {
                 _ => SyncErrorClass::Storage,
             },
             Self::Io(_) => SyncErrorClass::Storage,
-            Self::Session(error) => session_error_class(error),
+            Self::Session(error) => engine_error_class(error.as_engine_error()),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
             Self::RelayDirectory(_) | Self::DirectoryLookupIncomplete(_) => {
@@ -668,13 +741,13 @@ impl AppError {
         }
     }
 
+    /// The engine error inside a session or account error, however the lower
+    /// stack wrapped it. Code above the engine asks this rather than matching
+    /// wrapper paths, so moving a call between layers cannot change the answer.
     pub fn as_engine_error(&self) -> Option<&cgka_traits::error::EngineError> {
         match self {
-            Self::Account(marmot_account::AccountError::Engine(err))
-            | Self::Account(marmot_account::AccountError::Session(
-                cgka_session::SessionError::Engine(err),
-            ))
-            | Self::Session(cgka_session::SessionError::Engine(err)) => Some(err),
+            Self::Account(error) => error.as_engine_error(),
+            Self::Session(error) => Some(error.as_engine_error()),
             _ => None,
         }
     }
@@ -691,21 +764,15 @@ fn transport_error_class(error: &TransportAdapterError) -> SyncErrorClass {
 }
 
 fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
+    if let Some(error) = error.as_engine_error() {
+        return engine_error_class(error);
+    }
     match error {
-        AccountError::Session(error) => session_error_class(error),
-        AccountError::Engine(error) => engine_error_class(error),
         AccountError::Transport(error) => transport_error_class(error),
         AccountError::TransportRouting(_) | AccountError::WrongAccountDelivery => {
             SyncErrorClass::Protocol
         }
         _ => SyncErrorClass::Unknown,
-    }
-}
-
-fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
-    match error {
-        cgka_session::SessionError::Storage(error) => storage_error_class(error),
-        cgka_session::SessionError::Engine(error) => engine_error_class(error),
     }
 }
 
@@ -735,20 +802,18 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
 }
 
 fn account_error_kind(error: &AccountError) -> &'static str {
+    // The wrapping depth is not the diagnosis: an engine failure has the
+    // engine's kind whichever layer carried it, so an operator greps one name.
+    if let Some(error) = error.as_engine_error() {
+        return engine_error_kind(error);
+    }
     match error {
-        // The wrapping depth is not the diagnosis. `as_engine_error` already
-        // treats these three shapes as one engine failure; the kind follows,
-        // so an operator greps one name instead of three.
-        AccountError::Session(error) => session_error_kind(error),
-        AccountError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
-            storage_error_kind(error)
-        }
-        AccountError::Engine(error) => error.privacy_safe_kind(),
         AccountError::Transport(_) => "account_transport",
         AccountError::TransportRouting(_) => "account_transport_routing",
         AccountError::KeyPackage(_) => "account_key_package",
         AccountError::ClockSkewBlocked => "account_clock_skew_blocked",
         AccountError::KeyPackageRotationInProgress => "account_key_package_rotation_in_progress",
+        AccountError::KeyPackageAnnouncementPending => "account_key_package_announcement_pending",
         AccountError::WrongAccountDelivery => "account_wrong_delivery",
         _ => "account_unknown",
     }
@@ -762,6 +827,7 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::AccountExists(_) => "account_home_account_exists",
         AccountHomeError::AccountIdInUse(_) => "account_home_account_id_in_use",
         AccountHomeError::UnknownAccount(_) => "account_home_unknown_account",
+        AccountHomeError::AccountUnlinked(_) => "account_home_account_unlinked",
         AccountHomeError::InvalidSecretKey => "account_home_invalid_secret_key",
         AccountHomeError::InvalidPublicKey => "account_home_invalid_public_key",
         AccountHomeError::InvalidAccountLabel(_) => "account_home_invalid_account_label",
@@ -780,26 +846,21 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
     }
 }
 
-/// Privacy-safe kind for a session failure.
+/// Privacy-safe kind for an engine failure, however the session and account
+/// layers wrapped it.
 ///
-/// `SessionError` is a two-variant passthrough, so the diagnostically useful
-/// name always lives one layer down. Collapsing it to a single `"session"`
-/// kind is what made the D5 field investigations blind.
-fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
+/// Collapsing session failures to a single `"session"` kind is what made the
+/// D5 field investigations blind, so the name always comes from the engine.
+fn engine_error_kind(error: &cgka_traits::error::EngineError) -> &'static str {
     match error {
-        // A storage failure is the same failure whichever layer wrapped it, so
-        // reuse the nine storage kinds at both depths. That keeps the one
-        // transient kind (`storage_busy`, the sole case
-        // `SessionError::is_transient` reports) distinguishable from the eight
-        // durable ones without a second transient/permanent axis to keep in
-        // sync.
-        cgka_session::SessionError::Storage(error)
-        | cgka_session::SessionError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
-            storage_error_kind(error)
-        }
+        // Reuse the nine storage kinds. That keeps the one transient kind
+        // (`storage_busy`, the sole case `SessionError::is_transient` reports)
+        // distinguishable from the eight durable ones without a second
+        // transient/permanent axis to keep in sync.
+        cgka_traits::error::EngineError::Storage(error) => storage_error_kind(error),
         // Engine names come from the engine so an app tracing field and an
         // engine forensic audit row say the same word for the same failure.
-        cgka_session::SessionError::Engine(error) => error.privacy_safe_kind(),
+        error => error.privacy_safe_kind(),
     }
 }
 
@@ -834,7 +895,7 @@ mod tests {
     #[test]
     fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {
         let member = cgka_traits::MemberId::new(vec![0xBB; 32]);
-        let error = AppError::Session(cgka_session::SessionError::Engine(
+        let error = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::InvalidKeyPackageCapabilities {
                 member: member.clone(),
             },
@@ -902,7 +963,7 @@ mod tests {
                         reason,
                         delivery_loss_pending: loss,
                     },
-                    crate::app_telemetry::SyncFailureStage::Unknown,
+                    marmot_observability::SyncFailureStage::Unknown,
                 );
                 let wrapped = AppError::AccountCatchUp(AccountCatchUpFailure::from_sync_failure(
                     "display only".into(),
@@ -917,7 +978,7 @@ mod tests {
         }
         let text_only = AppError::AccountCatchUp(AccountCatchUpFailure::new(
             "full_history_coverage_unproven".into(),
-            crate::app_telemetry::SyncFailureClassification::UNKNOWN,
+            marmot_observability::SyncFailureClassification::UNKNOWN,
         ));
         assert_eq!(text_only.full_history_repair_incomplete(), None);
     }
@@ -944,7 +1005,7 @@ mod tests {
     // this case, so the kind has to carry the same split.
     #[test]
     fn transient_session_storage_failure_reports_the_busy_storage_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Storage(StorageError::Busy(
+        let err = AppError::from(marmot_session::SessionError::from(StorageError::Busy(
             "locked".into(),
         )));
         assert_eq!(err.privacy_safe_kind(), "storage_busy");
@@ -956,7 +1017,7 @@ mod tests {
     // tracing field to an engine audit row.
     #[test]
     fn session_engine_failure_reports_the_engine_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Engine(
+        let err = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::ForkedEpoch {
                 group_id: GroupId::new(vec![1u8; 16]),
                 last_stable: EpochId(7),
@@ -972,7 +1033,7 @@ mod tests {
     // is visible at the other.
     #[test]
     fn transient_storage_failure_wrapped_by_the_engine_reports_the_same_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Engine(EngineError::Storage(
+        let err = AppError::Session(marmot_session::SessionError::Engine(EngineError::Storage(
             StorageError::Busy("locked".into()),
         )));
         assert_eq!(err.privacy_safe_kind(), "storage_busy");
@@ -984,11 +1045,11 @@ mod tests {
     // names depending on how deep it was wrapped.
     #[test]
     fn account_wrapped_session_failures_report_the_same_kind_as_unwrapped_ones() {
-        let direct = AppError::Session(cgka_session::SessionError::Engine(
+        let direct = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::InvalidWelcome,
         ));
         let via_account_session = AppError::Account(AccountError::Session(
-            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+            marmot_session::SessionError::Engine(EngineError::InvalidWelcome),
         ));
         let via_account_engine =
             AppError::Account(AccountError::Engine(EngineError::InvalidWelcome));
@@ -1004,12 +1065,12 @@ mod tests {
     #[test]
     fn session_kind_agrees_with_is_transient() {
         for error in [
-            cgka_session::SessionError::Storage(StorageError::Busy("locked".into())),
-            cgka_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
+            marmot_session::SessionError::from(StorageError::Busy("locked".into())),
+            marmot_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
                 "locked".into(),
             ))),
-            cgka_session::SessionError::Storage(StorageError::Closed("shut".into())),
-            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+            marmot_session::SessionError::from(StorageError::Closed("shut".into())),
+            marmot_session::SessionError::Engine(EngineError::InvalidWelcome),
         ] {
             let transient = error.is_transient();
             let kind = AppError::Session(error).privacy_safe_kind();
@@ -1021,8 +1082,7 @@ mod tests {
 #[cfg(test)]
 mod directory_error_tests {
     //! `DirectoryError` converts back to the `AppError` the directory used
-    //! before it had its own type (step 3 of
-    //! `docs/marmot-architecture/review/brief-directory.md`).
+    //! before it had its own type.
 
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
@@ -1118,7 +1178,7 @@ mod directory_error_tests {
             // A KeyPackage requirements failure: the app's session-error step.
             (
                 DirectoryError::KeyPackageRequirements(EngineError::UnknownPending),
-                AppError::from(cgka_session::SessionError::from(
+                AppError::from(marmot_session::SessionError::from(
                     EngineError::UnknownPending,
                 )),
             ),
@@ -1126,7 +1186,7 @@ mod directory_error_tests {
                 DirectoryError::KeyPackageRequirements(EngineError::Storage(StorageError::Busy(
                     "engine".into(),
                 ))),
-                AppError::from(cgka_session::SessionError::from(EngineError::Storage(
+                AppError::from(marmot_session::SessionError::from(EngineError::Storage(
                     StorageError::Busy("engine".into()),
                 ))),
             ),
@@ -1228,5 +1288,126 @@ mod directory_error_tests {
             AppError::from(carried),
             AppError::AccountHome(AccountHomeError::UnknownAccount(label)) if label == "alice"
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit_upload_error_tests {
+    //! `AuditUploadError` converts back to the `AppError` the audit upload
+    //! built before it had its own type.
+
+    use super::AppError;
+    use marmot_observability::{
+        AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadError, AuditUploadSnapshot, invalid_audit_upload,
+        validate_audit_upload_endpoint,
+    };
+
+    /// Every failure the upload half builds, each with the `AppError` the
+    /// upload built for it before. Steps a test can reach run for real; the
+    /// request and response failures need a network, so they are written out.
+    async fn cases() -> Vec<(AuditUploadError, AppError)> {
+        let endpoint = |endpoint: &str, token: Option<&str>| {
+            validate_audit_upload_endpoint(endpoint, token).unwrap_err()
+        };
+        let retired = transport_nostr::retired_relay_hosts()
+            .into_iter()
+            .next()
+            .expect("centralized retired host list");
+        let oversized = tempfile::tempfile().unwrap();
+        oversized.set_len(AUDIT_LOG_UPLOAD_MAX_BYTES + 1).unwrap();
+        let oversized = AuditUploadSnapshot::capture(tokio::fs::File::from_std(oversized))
+            .await
+            .err()
+            .expect("over the upload ceiling");
+        let io = || std::io::Error::other("disk");
+        let upload = |message: &str| {
+            (
+                AuditUploadError::AuditLogUpload(message.to_owned()),
+                AppError::AuditLogUpload(message.to_owned()),
+            )
+        };
+        vec![
+            // Endpoint validation.
+            (
+                endpoint("   ", Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is empty".to_owned()),
+            ),
+            (
+                endpoint("https://collector.example:0/ingest", Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is invalid".to_owned()),
+            ),
+            (
+                endpoint("http://collector.example/ingest", Some("token")),
+                AppError::AuditLogUpload(
+                    "forensic upload endpoint must be https, or loopback http for local testing"
+                        .to_owned(),
+                ),
+            ),
+            (
+                endpoint(&format!("https://{retired}/ingest"), Some("token")),
+                AppError::AuditLogUpload("forensic upload endpoint is not allowed".to_owned()),
+            ),
+            (
+                endpoint("https://collector.example/ingest", None),
+                AppError::AuditLogUpload(
+                    "forensic upload endpoint requires an authorization bearer token unless it is loopback"
+                        .to_owned(),
+                ),
+            ),
+            // Snapshot capture and v4 eligibility.
+            (
+                oversized,
+                AppError::AuditLogUpload(format!(
+                    "audit log exceeds {} byte upload limit",
+                    AUDIT_LOG_UPLOAD_MAX_BYTES
+                )),
+            ),
+            (AuditUploadError::Io(io()), AppError::Io(io())),
+            (
+                invalid_audit_upload(),
+                AppError::InvalidAuditLogFile(
+                    "only valid v4 forensic audit records may be uploaded".into(),
+                ),
+            ),
+            // The validation worker, the network deadline, resolution and
+            // pinning, and the request.
+            upload("audit validation worker failed"),
+            upload("request timed out"),
+            upload("request failed"),
+            upload("HTTP 503"),
+            upload("connection failed"),
+            upload("invalid response body"),
+        ]
+    }
+
+    /// Fails to compile when a variant is added without a case above.
+    fn covered(error: &AuditUploadError) {
+        match error {
+            AuditUploadError::InvalidAuditLogFile(_)
+            | AuditUploadError::AuditLogUpload(_)
+            | AuditUploadError::Io(_) => {}
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_audit_upload_error_converts_to_the_app_error_it_replaced() {
+        for (upload_error, expected) in cases().await {
+            covered(&upload_error);
+            let message = upload_error.to_string();
+            let converted = AppError::from(upload_error);
+            assert_eq!(
+                std::mem::discriminant(&converted),
+                std::mem::discriminant(&expected),
+                "{converted:?} is not the variant of {expected:?}"
+            );
+            assert_eq!(converted.to_string(), expected.to_string());
+            assert_eq!(
+                message,
+                expected.to_string(),
+                "upload message for {expected:?}"
+            );
+            assert_eq!(converted.privacy_safe_kind(), expected.privacy_safe_kind());
+            assert_eq!(format!("{converted:?}"), format!("{expected:?}"));
+        }
     }
 }

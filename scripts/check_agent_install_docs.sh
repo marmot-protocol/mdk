@@ -18,6 +18,7 @@ active_paths=(
     scripts/install-hermes-marmot.sh
     scripts/install-openclaw-marmot.sh
     scripts/install-terminal-harness-marmot.sh
+    scripts/install-wn-agent.sh
     .github/workflows/wn-agent-binaries.yml
 )
 
@@ -54,9 +55,17 @@ for label, text in (("integrations/README.md", quickstart), ("release.md", relea
             file=sys.stderr,
         )
         raise SystemExit(1)
-quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "claude": 1, "codex": 2, "opencode": 1, "pi": 1, "goose": 1}
-for connector, quickstart_expected in quickstart_expected_calls.items():
-    installer = f"install-{connector}-marmot.sh"
+quickstart_expected_calls = {
+    "install-hermes-marmot.sh": 2,
+    "install-openclaw-marmot.sh": 1,
+    "install-claude-marmot.sh": 1,
+    "install-codex-marmot.sh": 2,
+    "install-opencode-marmot.sh": 1,
+    "install-pi-marmot.sh": 1,
+    "install-goose-marmot.sh": 1,
+    "install-wn-agent.sh": 1,
+}
+for installer, quickstart_expected in quickstart_expected_calls.items():
     call = f'install_verified "$base_url/{installer}"'
     checksum = f'"$base_url/{installer}.sha256"'
     for label, text, expected in (
@@ -65,7 +74,7 @@ for connector, quickstart_expected in quickstart_expected_calls.items():
     ):
         if text.count(call) != expected or text.count(checksum) != expected:
             print(
-                f"error: {label} must contain exactly {expected} current {connector} installer call(s) "
+                f"error: {label} must contain exactly {expected} current {installer} call(s) "
                 "paired with companion checksums",
                 file=sys.stderr,
             )
@@ -81,7 +90,8 @@ for path in tracked(sys.argv[2:]):
     if "releases/download/wn-agent-latest/install-" in text:
         raise SystemExit(f"error: {path}: active install guidance uses a mutable release alias")
     for match in re.finditer(
-        r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:hermes|openclaw|claude|codex|opencode|pi|goose)-marmot\.sh", text
+        r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:(?:hermes|openclaw|claude|codex|opencode|pi|goose)-marmot|wn-agent)\.sh",
+        text,
     ):
         if not match.group().startswith(f"wn-agent-v{version}/"):
             raise SystemExit(f"error: {path}: agent install guidance does not match documented release {version}")

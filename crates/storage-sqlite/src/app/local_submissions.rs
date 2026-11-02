@@ -120,3 +120,91 @@ impl SqliteAppStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SqliteAccountStorage;
+
+    fn submission(token: &str, payload_len: usize) -> LocalSubmission {
+        LocalSubmission {
+            group_id_hex: "aa".to_owned(),
+            client_token: token.to_owned(),
+            message_id_hex: format!("message-{token}"),
+            request_hash: vec![1; 32],
+            payload_hash: vec![2; 32],
+            payload: Some(vec![3; payload_len]),
+            request_json: Some("{}".to_owned()),
+            state: 0,
+            outcome_json: Some("private outcome".to_owned()),
+        }
+    }
+
+    fn store() -> SqliteAccountStorage {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES ('aa', '', 0)",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    fn refusal(result: StorageResult<()>) -> String {
+        match result {
+            Err(StorageError::Backend(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Private source data: Debug shows only the state.
+    #[test]
+    fn debug_shows_only_the_state() {
+        assert_eq!(
+            format!("{:?}", submission("private-token", 4)),
+            "LocalSubmission { state: 0, .. }"
+        );
+    }
+
+    /// The app-owned queue holds at most 256 pending sends and 16 MiB of
+    /// payload plus request JSON; sends the engine accepted do not count.
+    #[test]
+    fn the_pending_queue_is_bounded_by_count_and_bytes() {
+        let store = store();
+        let app = store.app_storage();
+        for index in 0..256 {
+            app.insert_local_submission(&submission(&index.to_string(), 1))
+                .unwrap();
+        }
+        assert_eq!(
+            refusal(app.insert_local_submission(&submission("next", 1))),
+            "local submission queue is full"
+        );
+        assert!(app.local_submission("aa", "next").unwrap().is_none());
+        SqliteAppStorage::accept_local_submission_tx(
+            &store.lock().unwrap(),
+            "aa",
+            "app_event_id",
+            &rusqlite::types::Value::Text("message-0".to_owned()),
+        )
+        .unwrap();
+        app.insert_local_submission(&submission("next", 1)).unwrap();
+
+        // Each send carries a 2-byte request JSON beside its payload.
+        let half = 8 * 1024 * 1024;
+        let store = self::store();
+        let app = store.app_storage();
+        app.insert_local_submission(&submission("first", half))
+            .unwrap();
+        assert_eq!(
+            refusal(app.insert_local_submission(&submission("over", half - 3))),
+            "local submission queue is full"
+        );
+        assert!(app.local_submission("aa", "over").unwrap().is_none());
+        app.insert_local_submission(&submission("exact", half - 4))
+            .unwrap();
+    }
+}

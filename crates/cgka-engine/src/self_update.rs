@@ -8,7 +8,9 @@
 //! supports, the replacement leaf also re-advertises the supported set
 //! (`leaf_advertisement::own_leaf_refresh_extensions`). Without that, a leaf
 //! keeps whatever its KeyPackage advertised for the life of the group, and an
-//! existing group could never become eligible for a new component.
+//! existing group could never become eligible for a new component. Once this
+//! device can tag, a leaf whose tag does not read as its own gets a fresh one
+//! the same way (device-tag-v1.md, "Producing tags").
 
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -149,16 +151,8 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        let leaf_node_parameters = mls_group
-            .own_leaf_node()
-            .map(|leaf| {
-                crate::leaf_advertisement::own_leaf_refresh_extensions(
-                    leaf,
-                    &self.supported_app_components,
-                )
-            })
-            .transpose()?
-            .flatten()
+        let leaf_node_parameters = self
+            .own_leaf_replacement(&mls_group)?
             .map(|extensions| {
                 openmls::prelude::LeafNodeParameters::builder()
                     .with_extensions(extensions)
@@ -185,6 +179,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("self update produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
             staged_commit,
             &mls_group,

@@ -1,5 +1,6 @@
 //! C mirrors of the materialized timeline conversions.
 
+use super::sticker::MarmotStickerRef;
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
@@ -14,6 +15,7 @@ use marmot_uniffi::conversions::{
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
+use super::history_import::MarmotHistoryImportSource;
 use super::markdown::MarmotMarkdownDocument;
 use super::media::MarmotMediaAttachmentOutcome;
 use crate::MarmotStatus;
@@ -138,6 +140,7 @@ c_mirror! {
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
+        opt_rec sticker: MarmotStickerRef,
         opt_str media_json,
         /// Ordered per-attachment outcomes for the previewed message:
         /// accepted references plus typed rejections at their positions.
@@ -235,6 +238,7 @@ c_mirror! {
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,
+        opt_rec sticker: MarmotStickerRef,
         vec tags/tags_len: MarmotMessageTag,
         /// Authenticated inner app-event time, or observation time for
         /// synthesized rows.
@@ -262,6 +266,10 @@ c_mirror! {
         /// for delivered messages.
         opt_str invalidation_status,
         opt_str client_token,
+        /// The device this row came from in a chat history it sent; NULL
+        /// for a row that arrived live. Draw "Imported from <device>"
+        /// where rows change from imported to live.
+        opt_rec imported_from: MarmotHistoryImportSource,
     }
 }
 

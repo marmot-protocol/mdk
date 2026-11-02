@@ -1,0 +1,12 @@
+# Every relay and HTTP client must follow the process SOCKS5 policy.
+# Reach relays through `transport-nostr` and wrap HTTP clients with
+# `DirectoryConfig::http_builder` instead.
+disallowed-methods = [
+    { path = "nostr_sdk::client::Client::builder", reason = "reach relays through transport-nostr" },
+    { path = "nostr_sdk::client::Client::new", reason = "reach relays through transport-nostr" },
+    { path = "nostr_sdk::client::ClientBuilder::new", reason = "reach relays through transport-nostr" },
+    { path = "reqwest::Client::builder", reason = "wrap with DirectoryConfig::http_builder" },
+    { path = "reqwest::Client::new", reason = "wrap with DirectoryConfig::http_builder" },
+    { path = "reqwest::ClientBuilder::new", reason = "wrap with DirectoryConfig::http_builder" },
+    { path = "reqwest::get", reason = "wrap with DirectoryConfig::http_builder" },
+]

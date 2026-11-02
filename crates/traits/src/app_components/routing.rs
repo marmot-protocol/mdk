@@ -120,7 +120,9 @@ fn validate_nostr_relay_count(count: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
+/// Check one relay URL against the Nostr relay URL profile
+/// (`transports/nostr.md`, "Relay URL profile").
+pub fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
     if relay.is_empty() {
         return Err("Nostr relay URL must not be empty".into());
     }
@@ -143,4 +145,20 @@ fn validate_nostr_relay_url(relay: &str) -> Result<(), String> {
         return Err("Nostr relay URL must not include a fragment".into());
     }
     Ok(())
+}
+
+/// Whether `relays` is a sibling Welcome's valid relay list
+/// (`device-group.md`, "Sending a sibling Welcome"): one to
+/// [`NOSTR_ROUTING_MAX_RELAYS`] Nostr relay URLs, none repeated once parsed.
+/// Parsing folds host case, a default port and an empty path, so two
+/// spellings of one relay count as a repeat. The sender checks it before an
+/// Add and the receiver before it stashes the Welcome, so a Welcome one
+/// accepts the other never refuses for its relays.
+pub fn valid_sibling_welcome_relays(relays: &[String]) -> bool {
+    let mut parsed = std::collections::BTreeSet::new();
+    (1..=NOSTR_ROUTING_MAX_RELAYS).contains(&relays.len())
+        && relays.iter().all(|relay| {
+            validate_nostr_relay_url(relay).is_ok()
+                && Url::parse(relay).is_ok_and(|url| parsed.insert(url))
+        })
 }

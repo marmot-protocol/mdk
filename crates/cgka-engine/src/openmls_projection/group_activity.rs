@@ -235,7 +235,7 @@ mod tests {
             .with_leaf_node_extensions(
                 engine
                     .identity
-                    .leaf_extensions(&engine.supported_app_components)
+                    .leaf_extensions(&engine.supported_app_components, None)
                     .unwrap(),
             )
             .unwrap()

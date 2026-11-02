@@ -131,31 +131,46 @@ fn promotion_rejects_terminal_and_suppressed_sources() {
 /// Source validity and account-store incarnation are checked inside promotion.
 #[test]
 fn promotion_rejects_expired_hidden_pending_and_foreign_sources() {
-    for mutation in [
-        "UPDATE attachment_acquisition SET expires_at=20",
-        "UPDATE attachment_history SET visible=0",
-        "UPDATE account_groups SET pending_confirmation=1",
-        "UPDATE attachment_history SET source_epoch=4",
+    for (mutation, promoted) in [
+        // The unchanged source promotes: the fixture is sound.
+        ("SELECT 1", true),
+        ("UPDATE attachment_acquisition SET expires_at=20", false),
+        ("UPDATE attachment_history SET visible=0", false),
+        ("UPDATE account_groups SET pending_confirmation=1", false),
+        ("UPDATE attachment_history SET source_epoch=4", false),
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         seed(&store, "stale");
         let asset = request(&store.app_storage(), "stale");
         sql(&store, mutation);
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .app_storage()
                 .promote_attachment_demand(&asset, 20)
-                .unwrap()
+                .unwrap(),
+            promoted,
+            "{mutation}"
         );
     }
+    // A reference from another store incarnation names this store's token
+    // and is still refused.
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "foreign");
     let asset = request(&store.app_storage(), "foreign");
+    let foreign = AttachmentAssetRef {
+        store_epoch: vec![0; 16],
+        token: asset.token.clone(),
+    };
     assert!(
-        !SqliteAccountStorage::in_memory()
-            .unwrap()
+        !store
             .app_storage()
-            .promote_attachment_demand(&asset, 20)
+            .promote_attachment_demand(&foreign, 20)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .app_storage()
+            .attachment_request_is_explicit(&asset)
             .unwrap()
     );
 }
@@ -206,7 +221,7 @@ fn seventh_backlog_promotion_preserves_single_owner_and_retry_positive_control()
 fn promotion_survives_encrypted_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("promotion.sqlite");
-    let key = SqlCipherKey::new("promotion-key").unwrap();
+    let key = SqlCipherKey::raw([0x3c; 32]);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "restart");
     let asset = request(&store.app_storage(), "restart");
@@ -266,11 +281,11 @@ fn initial_explicit_demand_rolls_back_on_promotion_failure() {
         &store,
         "CREATE TRIGGER fail_promotion BEFORE UPDATE OF explicit_request ON attachment_acquisition BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;",
     );
-    assert!(
+    assert_failed_with(
         store
             .app_storage()
-            .request_explicit_attachment(GROUP, &selected("fresh"), digest(), 20)
-            .is_err()
+            .request_explicit_attachment(GROUP, &selected("fresh"), digest(), 20),
+        "injected promotion failure",
     );
     let count: i64 = store
         .lock()

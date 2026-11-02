@@ -17,6 +17,7 @@ INSTALLERS = (
     "install-opencode-marmot.sh",
     "install-pi-marmot.sh",
     "install-goose-marmot.sh",
+    "install-wn-agent.sh",
 )
 SCAN_SUFFIXES = {".md", ".sh", ".yaml", ".yml"}
 SCAN_EXCLUDES = {
@@ -38,6 +39,7 @@ DOCUMENTED_INSTALL_CALLS = {
         "install-opencode-marmot.sh": 1,
         "install-pi-marmot.sh": 1,
         "install-goose-marmot.sh": 1,
+        "install-wn-agent.sh": 1,
     },
     # The repository-level quickstart owns release commands. The crate-level
     # connector guide intentionally links there rather than duplicating them.

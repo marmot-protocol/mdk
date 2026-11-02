@@ -2,8 +2,7 @@ use cgka_traits::MemberId;
 
 use crate::AppError;
 
-// The Nostr account-id helpers moved to the directory (step 3 of
-// docs/marmot-architecture/review/brief-directory.md). These wrappers keep
+// The Nostr account-id helpers live in the directory. These wrappers keep
 // their paths and convert the directory's errors back to `AppError`.
 /// Convert a hex Nostr public key (account id) into its `npub...` bech32 form.
 /// Public so embedders (FFI/UI) can render npubs instead of raw hex.

@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
-    read_json, validate_account_label, write_json, write_private_bytes, write_private_json,
+    read_json, read_private_json, validate_account_label, write_private_bytes, write_private_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -87,6 +87,11 @@ pub struct AccountSummary {
     /// clears this flag.
     #[serde(default)]
     pub signed_out: bool,
+    /// The account's device group removed this device after its link was
+    /// made. An unlinked account is also signed out, and stays so: it can
+    /// only be wiped, and coming back is a new link (mdk#2628 D67).
+    #[serde(default)]
+    pub unlinked: bool,
 }
 
 /// Whether a missing external device key may be created before any database exists.
@@ -198,6 +203,7 @@ fn external_database_credential(account: &AccountSummary) -> AccountSummary {
         local_signing: false,
         external_signing: false,
         signed_out: false,
+        unlinked: false,
     }
 }
 
@@ -259,6 +265,7 @@ impl AccountHome {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
         let _guard = self
             .mutation_lock
@@ -315,6 +322,7 @@ impl AccountHome {
                 local_signing: true,
                 external_signing: false,
                 signed_out: false,
+                unlinked: false,
             };
             if account.label != account.account_id_hex {
                 return Err(AccountHomeError::AccountIdMismatch);
@@ -391,6 +399,7 @@ impl AccountHome {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
 
         // Recover a credential left behind by the old secret-first import
@@ -480,6 +489,7 @@ impl AccountHome {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
         if let Some(setup) = self.raw_account_setup_state(&account.label)? {
             if setup.account_id_hex != account.account_id_hex || setup.kind != kind {
@@ -834,6 +844,7 @@ impl AccountHome {
             local_signing: false,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
         self.write_account_record(&account)?;
         Ok(account)
@@ -865,6 +876,7 @@ impl AccountHome {
             local_signing: false,
             external_signing: true,
             signed_out: false,
+            unlinked: false,
         };
         self.write_account_record(&account)?;
         Ok(account)
@@ -904,7 +916,7 @@ impl AccountHome {
         if validate_account_label(account_ref).is_ok() {
             let path = self.account_record_path(account_ref);
             if path.exists() {
-                return read_json(path);
+                return read_private_json(path);
             }
         }
 
@@ -914,7 +926,7 @@ impl AccountHome {
         if !path.exists() {
             return Err(AccountHomeError::UnknownAccount(account_ref.to_owned()));
         }
-        read_json(path)
+        read_private_json(path)
     }
 
     pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
@@ -1030,7 +1042,7 @@ impl AccountHome {
                 path.exists()
             };
             if exists {
-                match read_json(path) {
+                match read_private_json(path) {
                     Ok(account) => accounts.push(account),
                     Err(error) if strict => return Err(error),
                     Err(_) => skipped_unreadable_records += 1,
@@ -1066,10 +1078,32 @@ impl AccountHome {
         if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
         }
+        if !signed_out && account.unlinked {
+            return Err(AccountHomeError::AccountUnlinked(account.label));
+        }
         if account.signed_out == signed_out {
             return Ok(account);
         }
         account.signed_out = signed_out;
+        self.write_account_record(&account)?;
+        Ok(account)
+    }
+
+    /// Record that this device was unlinked from the account: signed out for
+    /// good, in one record write. Signing in, or importing the account's key
+    /// over this record, is refused from then on; only removing the account
+    /// clears it.
+    pub fn mark_account_unlinked(&self, account_ref: &str) -> AccountHomeResult<AccountSummary> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self.account(account_ref)?;
+        if account.unlinked && account.signed_out {
+            return Ok(account);
+        }
+        account.unlinked = true;
+        account.signed_out = true;
         self.write_account_record(&account)?;
         Ok(account)
     }
@@ -1299,7 +1333,7 @@ impl AccountHome {
         let path = self
             .account_dir(&account.label)
             .join(ACCOUNT_KEY_SECURITY_FILE);
-        match read_json::<StoredKeySecurity>(&path) {
+        match read_private_json::<StoredKeySecurity>(&path) {
             Ok(stored) => Ok(stored.key_security_byte),
             Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 Ok(0x02)
@@ -1315,7 +1349,7 @@ impl AccountHome {
         let path = self
             .account_dir(&account.label)
             .join(ACCOUNT_KEY_SECURITY_FILE);
-        write_json(
+        write_private_json(
             &path,
             &StoredKeySecurity {
                 key_security_byte: 0x00,
@@ -1404,6 +1438,7 @@ impl AccountHome {
             local_signing: true,
             external_signing: false,
             signed_out: false,
+            unlinked: false,
         };
         self.write_new_signing_account(&account, keys)
     }
@@ -1413,6 +1448,9 @@ impl AccountHome {
         mut account: AccountSummary,
         keys: &nostr::prelude::Keys,
     ) -> AccountHomeResult<AccountSummary> {
+        if account.unlinked {
+            return Err(AccountHomeError::AccountUnlinked(account.label));
+        }
         match self.secret_store.load_secret(&account) {
             Ok(stored_keys) => {
                 if stored_keys.public_key() != keys.public_key() {
@@ -1453,7 +1491,7 @@ impl AccountHome {
 
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
         validate_account_label(&account.label)?;
-        write_json(self.account_record_path(&account.label), account)
+        write_private_json(self.account_record_path(&account.label), account)
     }
 
     fn accounts_dir(&self) -> PathBuf {

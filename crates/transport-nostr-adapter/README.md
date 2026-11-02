@@ -21,6 +21,8 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
 - Publishes already-wrapped `TransportMessage`s to target endpoints and returns endpoint-level publish reports.
 - Builds and publishes Marmot kind `30443` KeyPackage events through the same relay-client boundary when supplied with
   the MIP-00 metadata.
+- With the `unreleased-device-pairing` feature, gift-wraps device-pairing messages from `marmot-pairing` to the
+  account's own key and reads them back (`pairing`). No release enables it until the pairing spec merges.
 - Builds NIP-65 kind `10002` and Marmot inbox kind `10050` account relay-list events. KeyPackages are published to the
   NIP-65 relays; there is no dedicated KeyPackage relay list.
 - Exposes adapter-local lifecycle metrics for diagnostics.
@@ -375,6 +377,35 @@ duplicate and event filtering. A short validated event list does not establish a
 Epoch-gap paging uses the raw evidence to descend, and a completed oldest page for admission;
 neither the evidence nor end of stored events certifies durable history coverage.
 The byte allowance counts validated serialized event JSON, not rejected wire bytes or process memory.
+
+## Time-sliced sweep
+
+`sweep::run_sweep` walks one group route on one relay forward through a `created_at` range, one slice REQ at a time
+(`since = cursor`, `until = cursor + Δ`, one filter, closed at EOSE). A reply proven complete is handed to the
+caller's sink oldest first and the cursor advances through the caller's store, so a cancelled or cut call resumes
+where it stopped and never fetches a covered slice again. A full reply halves Δ, a nearly empty one doubles it, and
+a full one-second slice is fetched through NIP-77. Completeness comes from counting: a reply below the
+relay's NIP-11 `max_limit` (strfry 500, wok's marmot preset 5,000), or, with no published cap, a reply below the
+largest full reply the relay sent. That count is proof only for kinds everyone may read, as kind 445 is: strfry spends its cap on events it withholds. `rate-limited:` refusals are waited out; unreachable relays and refusals are
+reported apart from "answered, nothing new". Each call reports its covered slices (with their proof) and one
+outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
+`NostrSdkRelayClient`'s pool. nostr-sdk drops NIP-67 hints, so a client built with `from_builder` reads `more` off
+the wire for the sweep's own REQs, and `more` splits a slice. No hint proves one: `finish` is ignored, since a misread
+`finish` would skip history. A call cut by its deadline or cancellation interrupts the request in flight rather than
+dropping it: `SdkSweepRelay` cancels it and still reports the event bytes it read, so a caller's byte budget sees the
+cut reply too. A request that has not ended within a second (`INTERRUPT_GRACE`) is dropped. Nothing schedules the
+sweep yet; the recovery runner will (#2660).
+
+## NIP-77 comparison
+
+`compare::run_comparison` compares one route's range on one relay with the ids the caller already holds there, a
+window at a time from the oldest end, and fetches each window's difference by id (at most 500 ids per REQ, fewer
+under the relay's cap). A window whose relay set reaches the 16,384-item limit may hide more, so it halves. A window
+is certified once every id the relay named is fetched; a call cut by its deadline, its event or byte budget, a
+withheld id or a refusal hands over what it fetched uncertified, so its caller holds those events and the next call
+resumes without fetching them again. A cut fetch is interrupted as a sweep's request is, so what it read is reported.
+`SdkSweepRelay` implements the relay side. The recovery runner (#2660) uses it
+for owed ranges where the account already holds events, and for its periodic re-checks of covered history.
 
 ## Run tests
 

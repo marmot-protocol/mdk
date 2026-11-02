@@ -19,14 +19,16 @@ before adding behavior or bindings.
 | Task | Start here |
 | --- | --- |
 | Engine behavior | `crates/cgka-engine/AGENTS.md` (`src/`, `tests/` have their own) |
-| Account-device session lifecycle | `crates/cgka-session/AGENTS.md` (`tests/` has its own) |
-| Account orchestration / app-core shell | `crates/marmot-account/AGENTS.md` |
+| Account-device runtime and session lifecycle | `crates/marmot-session/AGENTS.md` (`tests/` has its own) |
+| Account homes, signing keys, secret storage | `crates/marmot-account/AGENTS.md` |
+| Device pairing (the code exchange that links a new device) | `crates/marmot-pairing/AGENTS.md` |
 | App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
 | Encrypted per-file media store (format, file lifecycle) | `crates/media-store/AGENTS.md` |
 | User directory (lookups, search, KeyPackage resolution, directory cache schema) | `crates/nostr-directory/AGENTS.md` |
+| Diagnostics exporters (relay-telemetry OTLP, product analytics and consent state, performance recorder, audit delivery HTTP, collector dial safety) | `crates/marmot-observability/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/base/migrations/`, `src/protocol/openmls_storage/`, `src/protocol/storage/`, `src/protocol/storage/snapshots/` have their own) |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr relay plane (relay sessions, delivery, publish accounting, directory fetches) | `crates/transport-nostr/AGENTS.md` |
@@ -52,6 +54,7 @@ before adding behavior or bindings.
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 | Releases | `release.md` |
+| Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
 | Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
 
 ## Landing changes
@@ -122,9 +125,11 @@ the pre-check passes, and own the queue result until the change merges.
 
 GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
 build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
-default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates, `cargo audit`, clippy (default and
-`--all-features`) and the WASM build. It runs no tests, so unless the PR carries `ci:full`, your local tests are the
-only test signal before the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
+default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates (including the tracing audit),
+`cargo audit`, clippy (default and `--all-features`), the WASM build, and the workspace tests with the `precheck`
+nextest profile. That profile stops each test after half a second and counts it as passed, so it catches only a test
+that fails quickly; unless the PR carries `ci:full`, your local tests are the only signal from the slower tests before
+the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
 and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`
 adds only the iOS lane. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input
 changes.

@@ -1,7 +1,7 @@
 # nostr-directory
 
 The directory of other people's public Nostr data for a Marmot app: who an account is, which relays reach them,
-which KeyPackage to invite them with, and who matches a search.
+which KeyPackages to invite them with, and who matches a search.
 
 It owns the logic and the cache schema. The host app owns the resources: it opens and keys each account's encrypted
 cache, resolves account labels, keeps block lists, and hands the directory open handles through three traits. In
@@ -14,7 +14,8 @@ MDK that host is [`marmot-app`](../marmot-app), which re-exports the directory's
   their relays and kept in a per-account cache, merged with the shared public tier the app's `storage-sqlite`
   database keeps.
 - **Member KeyPackage resolution.** Resolving a whole roster before a group create or invite: canonical ids, relay
-  discovery, fresh KeyPackages, and bounded recovery when the first relays don't answer.
+  discovery, and every valid, fresh KeyPackage of each account (one per device, at most 20), skipping those the
+  account asked to delete, with bounded recovery when the first relays don't answer.
 - **Search.** Streaming web-of-trust search with optional Open Ranking discovery, and network-free search over cached
   data.
 - **Public event previews.** Verified previews of `nostr:` references in messages, stored in the directory cache.
@@ -30,6 +31,3 @@ service out as `MarmotApp::directory()`.
 
 The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
 the hooks `marmot-app`'s directory tests use; production builds never enable it.
-
-See the [directory brief](../../docs/marmot-architecture/review/brief-directory.md) for why the boundary sits where it
-does.

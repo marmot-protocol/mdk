@@ -1087,6 +1087,7 @@ impl TuiApp {
             &admins,
             &relays,
             &account,
+            parse_self_is_member(show_result),
         );
         view.selected = previous.min(view.members.len().saturating_sub(1));
         self.group_detail = Some(view);

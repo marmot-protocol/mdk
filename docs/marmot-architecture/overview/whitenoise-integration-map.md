@@ -51,7 +51,7 @@ whitenoise-rs should keep owning:
 | Get local member id | `self_id()` |
 | Convergence policy | Pinned v1 baseline only (`CanonicalizationPolicy::default()`). Hosts MUST NOT tune it; dedicated harness builds may enable `test-policy-overrides`. |
 
-`marmot-account` adds a first coordinator shell:
+`marmot-session`'s runtime adds a first coordinator shell:
 
 | Need | Current method |
 | --- | --- |
@@ -159,4 +159,4 @@ This map points to three engine-adjacent tasks:
 
 1. Expose enough group/app-component snapshot state for Nostr routing without leaking OpenMLS internals.
 2. Extend portable scenario traces to include selected stale outcomes.
-3. Keep `marmot-account` as the small coordinator shell while resisting a full app-core rebuild inside this repository.
+3. Keep `marmot-session`'s runtime as the small coordinator shell while resisting a full app-core rebuild inside this repository.

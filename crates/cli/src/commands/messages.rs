@@ -1079,6 +1079,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            imported_from: None,
         };
         let mut display_name_for_account = |account_id: &str| {
             if account_id == actor {

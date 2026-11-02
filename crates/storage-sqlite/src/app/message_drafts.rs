@@ -726,28 +726,123 @@ mod tests {
         );
     }
 
-    #[test]
-    fn message_draft_reads_use_one_snapshot_for_rows_and_attachments() {
-        let source = include_str!("message_drafts.rs");
-        let list_body = source
-            .split("pub fn message_drafts(")
-            .nth(1)
-            .unwrap()
-            .split("pub fn message_draft(")
-            .next()
-            .unwrap();
-        let single_body = source
-            .split("pub fn message_draft(")
-            .nth(1)
-            .unwrap()
-            .split("pub fn save_message_draft(")
-            .next()
-            .unwrap();
+    thread_local! {
+        static AFTER_DRAFT_ROWS_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-        for body in [list_body, single_body] {
-            assert!(body.contains("transaction()"));
-            assert!(body.contains("tx.commit()"));
-        }
+    /// Runs `read` on `reader`; once its `message_drafts` statement finishes and
+    /// before it reads attachments, `write` commits on another connection.
+    fn read_with_concurrent_writer<T>(
+        reader: &SqliteAccountStorage,
+        write: impl FnOnce() + 'static,
+        read: impl FnOnce() -> T,
+    ) -> T {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        AFTER_DRAFT_ROWS_READ.set(Some(Box::new(write)));
+        reader.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                if let TraceEvent::Profile(statement, _) = event
+                    && statement.sql().contains("FROM message_drafts")
+                    && let Some(write) = AFTER_DRAFT_ROWS_READ.take()
+                {
+                    write();
+                }
+            }),
+        );
+        let value = read();
+        reader
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+        assert!(
+            AFTER_DRAFT_ROWS_READ.with_borrow(Option::is_none),
+            "the concurrent writer never ran"
+        );
+        value
+    }
+
+    #[test]
+    fn message_draft_reads_take_rows_and_attachments_from_one_snapshot() {
+        use crate::SqlCipherKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drafts.sqlite");
+        let key = SqlCipherKey::raw([0x5d; 32]);
+        let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = reader.app_storage();
+        let group_id_hex = "66".repeat(16);
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![group(&group_id_hex)],
+            },
+            100,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+        let recording = |file_name: &str, plaintext: Vec<u8>| StoredMessageDraftAttachment {
+            id: "voice".to_owned(),
+            file_name: file_name.to_owned(),
+            media_type: "audio/mp4".to_owned(),
+            plaintext,
+            dim: None,
+            thumbhash: None,
+            duration_seconds: Some(1.0),
+            waveform_samples: vec![0.5],
+        };
+        let rerecord = |attachment: StoredMessageDraftAttachment| {
+            let writer = writer.app_storage();
+            let group_id_hex = group_id_hex.clone();
+            move || {
+                writer
+                    .save_message_draft(&group_id_hex, "draft", None, &[attachment])
+                    .unwrap();
+            }
+        };
+
+        let saved = app
+            .save_message_draft(
+                &group_id_hex,
+                "draft",
+                None,
+                &[recording("first.m4a", vec![1])],
+            )
+            .unwrap();
+        let second = recording("second.m4a", vec![2, 2]);
+        let during = read_with_concurrent_writer(&reader, rerecord(second.clone()), || {
+            app.message_draft(&group_id_hex).unwrap().unwrap()
+        });
+        assert_eq!(
+            during, saved,
+            "the row and its attachments share one snapshot"
+        );
+        assert_eq!(
+            app.message_draft(&group_id_hex)
+                .unwrap()
+                .unwrap()
+                .media_attachments,
+            vec![second]
+        );
+
+        let listed = app.message_drafts().unwrap();
+        let during = read_with_concurrent_writer(
+            &reader,
+            rerecord(recording("third.m4a", vec![3, 3, 3])),
+            || app.message_drafts().unwrap(),
+        );
+        assert_eq!(
+            during, listed,
+            "listed rows and summaries share one snapshot"
+        );
+        assert_eq!(
+            app.message_drafts().unwrap()[0].media_attachments[0].file_name,
+            "third.m4a"
+        );
     }
 
     #[test]
@@ -817,8 +912,42 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .media_attachments,
-            vec![second, first]
+            vec![second.clone(), first.clone()]
         );
+
+        // A new recording under a kept id replaces the stored bytes and
+        // metadata, in place and when the list is also reordered.
+        let rerecorded_second = StoredMessageDraftAttachment {
+            file_name: "second-take.m4a".to_owned(),
+            plaintext: vec![2, 2],
+            duration_seconds: Some(2.0),
+            waveform_samples: vec![0.5],
+            ..second
+        };
+        let rerecorded_first = StoredMessageDraftAttachment {
+            plaintext: vec![3, 3, 3],
+            waveform_samples: vec![0.25, 0.75],
+            ..first.clone()
+        };
+        for attachments in [
+            vec![rerecorded_second.clone(), first.clone()],
+            vec![rerecorded_first, rerecorded_second],
+        ] {
+            let revision = app.selected_message_draft(&group_id_hex).unwrap().revision;
+            app.save_message_draft(&group_id_hex, "draft", None, &attachments)
+                .unwrap();
+            assert_eq!(
+                app.message_draft(&group_id_hex)
+                    .unwrap()
+                    .unwrap()
+                    .media_attachments,
+                attachments
+            );
+            assert_ne!(
+                app.selected_message_draft(&group_id_hex).unwrap().revision,
+                revision
+            );
+        }
     }
 
     #[test]
@@ -834,19 +963,10 @@ mod tests {
 
     #[test]
     fn saving_draft_retries_concurrent_writer_contention() {
-        use crate::{SqlCipherKey, SqliteStorageOptions};
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("draft-contention.sqlite");
-        let key = SqlCipherKey::new("draft contention key").unwrap();
-        let options = SqliteStorageOptions {
-            busy_timeout_ms: 50,
-            ..SqliteStorageOptions::default()
-        };
-        let storage =
-            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-                .unwrap()
-                .app_storage();
+        let db = SharedDatabase::new();
+        let storage = db.open().app_storage();
         let group_id_hex = "55".repeat(16);
         storage
             .save_account_projection_state(
@@ -861,31 +981,20 @@ mod tests {
             )
             .unwrap();
 
-        let blocker_path = path.clone();
-        let blocker_key = SqlCipherKey::new("draft contention key").unwrap();
-        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
-        let blocker = std::thread::spawn(move || {
-            let blocker = SqliteAccountStorage::open_encrypted_with_options(
-                &blocker_path,
-                &blocker_key,
-                options,
-            )
-            .unwrap();
-            let conn = blocker.lock().unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            lock_acquired_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            conn.execute_batch("COMMIT").unwrap();
-        });
-        lock_acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-
+        let held = db.hold_write_lock(Release::AfterAFailedAttempt, |_| {});
         let saved = storage
             .save_message_draft(&group_id_hex, "survives contention", None, &[])
             .expect("draft save retries after transient contention");
-        blocker.join().unwrap();
+        held.join();
         assert_eq!(saved.content, "survives contention");
+        assert_eq!(
+            storage
+                .message_draft(&group_id_hex)
+                .unwrap()
+                .unwrap()
+                .content,
+            "survives contention"
+        );
     }
 
     #[test]
@@ -919,7 +1028,11 @@ mod tests {
             .save_message_draft(&group_id_hex, "draft", None, &[attachment])
             .unwrap_err();
 
-        assert!(matches!(error, StorageError::Serialization(_)));
+        assert!(
+            matches!(&error, StorageError::Serialization(message)
+                if message == "message draft waveform samples must be finite"),
+            "{error:?}"
+        );
         assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
     }
 }

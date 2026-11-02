@@ -48,10 +48,6 @@ impl AvatarFileImage {
             height,
         })
     }
-
-    pub fn byte_len(&self) -> u64 {
-        self.byte_len
-    }
 }
 
 /// Publishes one image for one source generation, fenced by the content
@@ -332,12 +328,6 @@ impl std::fmt::Debug for DatabaseAvatar {
         f.debug_struct("DatabaseAvatar")
             .field("byte_len", &self.byte_len)
             .finish_non_exhaustive()
-    }
-}
-
-impl DatabaseAvatar {
-    pub fn byte_len(&self) -> u64 {
-        self.byte_len
     }
 }
 

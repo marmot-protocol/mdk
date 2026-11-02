@@ -3,27 +3,30 @@
 use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
-    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
-    AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS,
-    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
+    ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
+    AccountEntryV1, AppComponentData, AppComponentId, AppComponentSet, DEVICE_ROSTER_COMPONENT_ID,
+    DEVICE_TAG_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
+    GroupProfileV1, MAX_LEAVES_PER_ACCOUNT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, apply_device_roster_update_v1,
+    decode_components_list, decode_device_roster_v1, decode_encrypted_media_policy_v1,
     decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
     decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
     decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
-use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::ProposalRejectionCategory;
 use cgka_traits::types::{GroupId, MemberId};
+use openmls::component::ComponentData;
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::{
-    GroupContext, MlsGroup, ProcessMessageError, StageCommitError, StagedCommit, ValidationError,
+    AppDataDictionaryUpdater, GroupContext, MlsGroup, ProcessMessageError, StageCommitError,
+    StagedCommit, ValidationError,
 };
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
@@ -49,12 +52,65 @@ pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponent
 pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
     [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
 
-/// Protocol components that never carry persistent dictionary state at all.
-/// The multi-device join authorization rides one `AppEphemeral` proposal and
-/// the registry makes it invalid as GroupContext data, so it has no
-/// GroupContext format to validate.
-const CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
-    [MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID];
+/// Protocol components with no data at any location
+/// (app-components/README.md, "Placement"). A group that requires one carries
+/// no GroupContext state for it; the component's own rules say what an entry
+/// under its id means.
+const NO_DATA_APP_COMPONENTS: [AppComponentId; 1] = [ACCOUNT_DEVICES_COMPONENT_ID];
+
+/// Protocol components whose data lives only in LeafNodes and that no group
+/// may require (device-tag-v1.md, "Registry"). Unlike the account proof, a
+/// GroupContext entry under one of these ids is unknown data, not an error.
+/// Requiring one fails as an unsupported requirement, which is also how a
+/// client that does not know the id rejects it, so both kinds of client agree.
+const NEVER_REQUIRED_APP_COMPONENTS: [AppComponentId; 1] = [DEVICE_TAG_COMPONENT_ID];
+
+/// Protocol-owned component ids this engine implements and may advertise in
+/// its KeyPackages and leaves. A protocol id outside this list is refused by
+/// [`validate_supported_app_components`]: advertising a component tells other
+/// clients this one enforces its rules, and a group may then require it.
+const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
+    APP_COMPONENTS_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_LIFECYCLE_COMPONENT_ID,
+    ACCOUNT_DEVICES_COMPONENT_ID,
+];
+
+/// Whether this build may advertise `marmot.account.device-roster.v1`. Its
+/// wire format is unreleased until its spec lands (mdk#2628 3.1), so only
+/// test-policy builds, which production never enables, implement it. A build
+/// that cannot advertise it can never create or join a device group, and
+/// treats roster bytes in other groups as unknown data.
+const DEVICE_ROSTER_ADVERTISABLE: bool = cfg!(feature = "test-policy-overrides");
+
+/// Refuse to advertise a protocol-owned component this engine does not
+/// implement. Application-owned ids (at or above
+/// `APP_OWNED_APP_COMPONENT_ID_START`) and ids the protocol has not assigned
+/// stay the host's business.
+pub(crate) fn validate_supported_app_components(
+    supported: &AppComponentSet,
+) -> Result<(), EngineError> {
+    for component_id in &supported.ids {
+        let advertisable = ADVERTISABLE_PROTOCOL_APP_COMPONENTS.contains(component_id)
+            || (*component_id == DEVICE_ROSTER_COMPONENT_ID && DEVICE_ROSTER_ADVERTISABLE);
+        if PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(component_id) && !advertisable {
+            return Err(EngineError::Other(format!(
+                "engine cannot advertise protocol app component {component_id:#06x}: \
+                 it does not implement it"
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -65,15 +121,22 @@ pub(crate) struct InitialComponentState {
     pub(crate) optional_app_components: Vec<AppComponentData>,
 }
 
+/// The `app_data_dictionary` of a new own LeafNode. A leaf that carries
+/// `device_tag` also advertises `0x800f` (device-tag-v1.md, "Producing
+/// tags"); the host never lists it among its supported components.
 pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
     account_identity_proof: Option<&[u8]>,
+    device_tag: Option<Vec<u8>>,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
     let mut advertised = supported.ids.clone();
     advertised.insert(APP_COMPONENTS_COMPONENT_ID);
     if account_identity_proof.is_some() {
         advertised.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    }
+    if device_tag.is_some() {
+        advertised.insert(DEVICE_TAG_COMPONENT_ID);
     }
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
@@ -86,13 +149,23 @@ pub(crate) fn leaf_app_components_extension(
     if let Some(proof) = account_identity_proof {
         dict.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof.to_vec());
     }
+    if let Some(tag) = device_tag {
+        dict.insert(DEVICE_TAG_COMPONENT_ID, tag);
+    }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
     ))
 }
 
 pub(crate) fn app_components_of_leaf(leaf: &LeafNode) -> Result<AppComponentSet, EngineError> {
-    let Some(ext) = leaf.extensions().app_data_dictionary() else {
+    app_components_of_leaf_extensions(leaf.extensions())
+}
+
+/// The app component ids a LeafNode with `extensions` advertises.
+pub(crate) fn app_components_of_leaf_extensions(
+    extensions: &Extensions<LeafNode>,
+) -> Result<AppComponentSet, EngineError> {
+    let Some(ext) = extensions.app_data_dictionary() else {
         return Ok(AppComponentSet::default());
     };
     let Some(bytes) = ext.dictionary().get(&APP_COMPONENTS_COMPONENT_ID) else {
@@ -159,6 +232,13 @@ pub(crate) fn app_data_dictionary_extension_for_group(
                 "group creation request contains duplicate app components".into(),
             ));
         }
+        // A roster entry in a group that does not require it would carry a
+        // device-group marker's data without its rules.
+        if component.component_id == DEVICE_ROSTER_COMPONENT_ID {
+            return Err(EngineError::Other(
+                "group creation request cannot carry an optional device roster".into(),
+            ));
+        }
         validate_initial_app_component(component)?;
         dict.insert(component.component_id, component.data.clone());
     }
@@ -218,6 +298,28 @@ pub(crate) fn app_component_data_of_group(
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
 }
 
+/// The device roster `mls_group` holds. `None` when it holds none or it
+/// cannot be read.
+pub(crate) fn device_roster_of_group(mls_group: &MlsGroup) -> Option<DeviceRosterV1> {
+    app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID)
+        .and_then(|bytes| decode_device_roster_v1(bytes).ok())
+}
+
+/// The entry of `slot` in the device roster `mls_group` holds. `None` when
+/// the roster lists no device there or cannot be read.
+pub(crate) fn device_entry_of_group(
+    mls_group: &MlsGroup,
+    slot: &DeviceSlotId,
+) -> Option<DeviceEntryV1> {
+    device_roster_of_group(mls_group).and_then(|mut roster| roster.devices.remove(slot))
+}
+
+/// The account entry the device roster `mls_group` holds. `None` when the
+/// roster cannot be read.
+pub(crate) fn account_entry_of_group(mls_group: &MlsGroup) -> Option<AccountEntryV1> {
+    device_roster_of_group(mls_group).map(|roster| roster.account)
+}
+
 pub(crate) fn message_retention_seconds_of_group(
     mls_group: &MlsGroup,
 ) -> Result<Option<u64>, EngineError> {
@@ -265,14 +367,18 @@ pub(crate) fn require_admin(
     })
 }
 
+/// Require an active admin committer for an admin-required Commit. `class` is
+/// the Commit's [`crate::commit_class::CommitClass`] in `mls_group`, its
+/// candidate parent state.
 pub(crate) fn require_admin_for_staged_commit(
     mls_group: &MlsGroup,
     group_id: &GroupId,
     sender: Option<&MemberId>,
     staged: &StagedCommit,
+    class: crate::commit_class::CommitClass,
 ) -> Result<(), EngineError> {
     reject_admin_self_remove_proposals(mls_group, group_id, staged)?;
-    if !staged_commit_requires_admin(staged) {
+    if !class.requires_admin() {
         return Ok(());
     }
     let Some(sender) = sender else {
@@ -281,6 +387,23 @@ pub(crate) fn require_admin_for_staged_commit(
         });
     };
     require_admin(mls_group, group_id, sender)
+}
+
+/// Receiving-flow step 8 (`protocol-core/joining.md`): the Welcome's `author`
+/// may add in the `joined` state. An active admin may, and so may a device of
+/// the `joiner`'s own account once that state requires
+/// `marmot.group.account-devices.v1` ("Welcome acceptance"). Any other author
+/// is [`EngineError::NotGroupAdmin`], an authorization failure.
+pub(crate) fn require_welcome_author_authority(
+    joined: &MlsGroup,
+    group_id: &GroupId,
+    author: &MemberId,
+    joiner: &MemberId,
+) -> Result<(), EngineError> {
+    if author == joiner && group_requires_account_devices(joined)? {
+        return Ok(());
+    }
+    require_admin(joined, group_id, author)
 }
 
 pub(crate) const fn proposal_rejection_category_tag(
@@ -418,14 +541,20 @@ pub(crate) fn authorize_standalone_proposal(
     mls_group: &MlsGroup,
     proposal: &QueuedProposal,
 ) -> Result<(), StandaloneProposalRejection> {
-    authorize_proposal(mls_group, proposal, true)
+    authorize_proposal(mls_group, proposal, None)
 }
 
+/// `commit` is `None` when admitting a proposal on its own, and the class of
+/// the Commit when re-authorizing the proposals that Commit carries. A
+/// Commit's AppDataUpdate batch and its resulting state are validated as a
+/// whole elsewhere, so the checks that need only the proposal and its source
+/// state run here for standalone proposals alone.
 fn authorize_proposal(
     mls_group: &MlsGroup,
     proposal: &QueuedProposal,
-    validate_app_data_payload: bool,
+    commit: Option<crate::commit_class::CommitClass>,
 ) -> Result<(), StandaloneProposalRejection> {
+    let standalone = commit.is_none();
     let Sender::Member(sender_index) = proposal.sender() else {
         return Err(StandaloneProposalRejection::authorization(
             "proposal_sender_not_member",
@@ -467,10 +596,84 @@ fn authorize_proposal(
                     "group_lifecycle_update_must_be_inline",
                 ));
             }
-            if validate_app_data_payload {
+            if standalone {
                 validate_standalone_app_data_update(update).map_err(|_| {
                     StandaloneProposalRejection::invalid("app_data_update_payload_invalid")
                 })?;
+                // The required list this update proposes, when it sets one.
+                let proposed_required = match update.operation() {
+                    AppDataUpdateOperation::Update(data)
+                        if update.component_id() == APP_COMPONENTS_COMPONENT_ID =>
+                    {
+                        Some(AppComponentSet::from(
+                            decode_components_list(data.as_slice()).map_err(|_| {
+                                StandaloneProposalRejection::invalid(
+                                    "app_data_update_payload_invalid",
+                                )
+                            })?,
+                        ))
+                    }
+                    _ => None,
+                };
+                // device-tag-v1.md, "Registry": no group requires a
+                // never-required LeafNode component, and neither does a
+                // proposal.
+                if proposed_required.as_ref().is_some_and(|ids| {
+                    NEVER_REQUIRED_APP_COMPONENTS
+                        .iter()
+                        .any(|component_id| ids.contains(*component_id))
+                }) {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_require_never_required_component",
+                    ));
+                }
+                // account-devices-v1.md, "Data": no AppDataUpdate targets the
+                // component once its source state requires it. "Removal": no
+                // proposal drops it from the required list either.
+                let unrequires = proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(ACCOUNT_DEVICES_COMPONENT_ID));
+                if (update.component_id() == ACCOUNT_DEVICES_COMPONENT_ID || unrequires)
+                    && group_requires_account_devices(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?
+                {
+                    return Err(StandaloneProposalRejection::invalid(if unrequires {
+                        "app_components_unrequire_account_devices"
+                    } else {
+                        "account_devices_app_data_update"
+                    }));
+                }
+                // device-roster: a group requires the roster from creation or
+                // never, and a roster update applies to the source state.
+                let roster_required = group_requires_device_roster(mls_group).map_err(|_| {
+                    StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                })?;
+                if proposed_required
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(DEVICE_ROSTER_COMPONENT_ID) != roster_required)
+                {
+                    return Err(StandaloneProposalRejection::invalid(
+                        "app_components_change_device_roster_requirement",
+                    ));
+                }
+                if update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+                    // device-roster-v1.md, "Removal": a device group keeps
+                    // its roster, so no Commit can carry this removal.
+                    if roster_required
+                        && matches!(update.operation(), AppDataUpdateOperation::Remove)
+                    {
+                        return Err(StandaloneProposalRejection::invalid("device_roster_remove"));
+                    }
+                    resolved_app_data_update(
+                        roster_required,
+                        app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID),
+                        update,
+                    )
+                    .map_err(|_| {
+                        StandaloneProposalRejection::invalid("device_roster_update_invalid")
+                    })?;
+                }
             }
         }
         Proposal::GroupContextExtensions(update) => {
@@ -479,10 +682,38 @@ fn authorize_proposal(
                     "group_context_extensions_sender_not_admin",
                 ));
             }
-            validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+            let proposed_required =
+                validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+            if standalone
+                && profile == ProtocolProfile::Current
+                && proposed_required.contains(DEVICE_ROSTER_COMPONENT_ID)
+                    != group_requires_device_roster(mls_group).map_err(|_| {
+                        StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                    })?
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_context_extensions_change_device_roster_requirement",
+                ));
+            }
+            // account-devices-v1.md, "Removal": a group that requires the
+            // component keeps requiring it.
+            if standalone
+                && !proposed_required.contains(ACCOUNT_DEVICES_COMPONENT_ID)
+                && group_requires_account_devices(mls_group).map_err(|_| {
+                    StandaloneProposalRejection::invalid("proposal_group_state_invalid")
+                })?
+            {
+                return Err(StandaloneProposalRejection::invalid(
+                    "group_context_extensions_unrequire_account_devices",
+                ));
+            }
         }
         Proposal::Add(_) | Proposal::Remove(_) => {
-            if !sender_is_admin {
+            // account-devices-v1.md, "Authorization": in a same-account
+            // Commit every proposal is the committer's own by-value Add or
+            // Remove of its account's leaves, which needs no admin. Such
+            // operations have no standalone authority.
+            if !sender_is_admin && commit != Some(crate::commit_class::CommitClass::SameAccount) {
                 return Err(StandaloneProposalRejection::authorization(
                     "membership_proposal_sender_not_admin",
                 ));
@@ -515,14 +746,16 @@ fn authorize_proposal(
 }
 
 /// Re-run proposal-sender authorization for every proposal carried by a
-/// staged Commit. By-reference proposals keep their original authenticated
-/// sender; by-value proposals are attributed to the committer by MLS.
+/// staged Commit of class `class`. By-reference proposals keep their original
+/// authenticated sender; by-value proposals are attributed to the committer by
+/// MLS.
 pub(crate) fn authorize_staged_commit_proposals(
     mls_group: &MlsGroup,
     staged: &StagedCommit,
+    class: crate::commit_class::CommitClass,
 ) -> Result<(), StandaloneProposalRejection> {
     for proposal in staged.queued_proposals() {
-        authorize_proposal(mls_group, proposal, false)?;
+        authorize_proposal(mls_group, proposal, Some(class))?;
     }
     validate_app_data_update_batch(
         mls_group,
@@ -557,11 +790,14 @@ fn validate_membership_proposal(
     .map_err(|_| StandaloneProposalRejection::invalid("proposal_account_proof_invalid"))
 }
 
+/// Validate a GroupContextExtensions proposal's state against the current
+/// leaves and return the component ids it requires (none on the legacy
+/// profile, which has no required-component list to check).
 fn validate_group_context_extension_proposal(
     mls_group: &MlsGroup,
     profile: ProtocolProfile,
     extensions: &Extensions<GroupContext>,
-) -> Result<(), StandaloneProposalRejection> {
+) -> Result<AppComponentSet, StandaloneProposalRejection> {
     let required_components = if profile == ProtocolProfile::Current {
         validate_current_profile_group_context(extensions, "proposed group state").map_err(
             |_| {
@@ -582,10 +818,16 @@ fn validate_group_context_extension_proposal(
                 "group_context_extensions_not_supported_by_all_members",
             )
         },
-    )
+    )?;
+    // A roster the proposed state requires must be valid now, as every other
+    // known component's bytes must; unknown data elsewhere stays opaque.
+    validate_device_roster_state(extensions, &required_components, leaves.iter()).map_err(
+        |_| StandaloneProposalRejection::invalid("group_context_extensions_device_roster_invalid"),
+    )?;
+    Ok(required_components)
 }
 
-fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
+pub(crate) fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
     let basic = BasicCredential::try_from(cred).ok()?;
     <[u8; 32]>::try_from(basic.identity()).ok()
 }
@@ -626,8 +868,10 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     // ANOTHER member's leaf requires an authenticated admin sender
     // (`require_admin_for_staged_commit`, enforced before this check on the
     // send, ingest, and convergence-replay paths), which fail-closes when the
-    // admin set is empty; the only leaf-removing shape a non-admin may commit
-    // is SelfRemove-only, which cannot de-leaf a member of an empty admin set.
+    // admin set is empty; the leaf-removing shapes a non-admin may commit are
+    // SelfRemove-only and same-account (`crate::commit_class`), which remove
+    // only the committer's own account's leaves, so neither can de-leaf
+    // another member.
     if resulting_admins.is_empty() {
         return Ok(());
     }
@@ -747,8 +991,12 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     }
     for component_id in &protected {
         // The account proof is required by the GroupContext but its data is
-        // LeafNode-only. It must never appear as GroupContext state.
-        if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID {
+        // LeafNode-only, and on the current profile a no-data component has
+        // none at all. Neither has GroupContext state to keep. Legacy groups
+        // keep every other required entry, as they always have.
+        if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
+            || (is_current && NO_DATA_APP_COMPONENTS.contains(component_id))
+        {
             continue;
         }
         let still_present = resulting.is_some_and(|dict| dict.contains(component_id));
@@ -761,14 +1009,14 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     }
 
     // This commit's AppDataUpdate operations by component id: the exact set of
-    // resulting values a changed entry is allowed to take. `None` is a Remove.
-    let mut update_ops: BTreeMap<AppComponentId, Vec<Option<&[u8]>>> = BTreeMap::new();
+    // resulting values a changed entry is allowed to take, resolved against
+    // the parent as every path resolves them. `None` is a Remove.
+    let roster_required = group_requires_device_roster(mls_group)?;
+    let mut update_ops: BTreeMap<AppComponentId, Vec<Option<Vec<u8>>>> = BTreeMap::new();
     for queued in staged.queued_proposals() {
         if let Proposal::AppDataUpdate(update) = queued.proposal() {
-            let op = match update.operation() {
-                AppDataUpdateOperation::Update(data) => Some(data.as_slice()),
-                AppDataUpdateOperation::Remove => None,
-            };
+            let parent_bytes = current.and_then(|dict| dict.get(&update.component_id()));
+            let op = resolved_app_data_update(roster_required, parent_bytes, update)?;
             update_ops
                 .entry(update.component_id())
                 .or_default()
@@ -788,7 +1036,7 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
         }
         let update_backed = update_ops
             .get(&component_id)
-            .is_some_and(|ops| ops.contains(&after));
+            .is_some_and(|ops| ops.iter().any(|op| op.as_deref() == after));
         if !update_backed {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext changes app component \
@@ -814,7 +1062,29 @@ pub(crate) fn validate_current_profile_group_invariants(
     let required_components =
         validate_current_profile_group_context(group.extensions(), "group state")?;
     let leaves = ratchet_tree_leaves(group.export_ratchet_tree())?;
-    validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)
+    validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)?;
+    validate_account_devices_state(group.extensions(), &required_components, &leaves)?;
+    validate_device_roster_state(group.extensions(), &required_components, &leaves)
+}
+
+/// Receiving-flow step 7 (`protocol-core/joining.md`) for the state a Welcome
+/// joins: [`validate_current_profile_group_invariants`], and the GroupInfo
+/// rule of `marmot.group.account-devices.v1` ("Data"): when the joined state
+/// requires the component, the GroupInfo carries no entry under its id.
+/// `group_info_app_data` is the GroupInfo's `app_data_dictionary`, which the
+/// caller reads before OpenMLS stages the Welcome and drops the GroupInfo.
+pub(crate) fn validate_joined_group_invariants(
+    joined: &MlsGroup,
+    group_info_app_data: Option<&AppDataDictionaryExtension>,
+) -> Result<(), EngineError> {
+    validate_current_profile_group_invariants(joined)?;
+    if carries_account_devices_data(group_info_app_data) && group_requires_account_devices(joined)?
+    {
+        return Err(EngineError::Other(
+            "invalid account-devices state: the GroupInfo carries account-devices data".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate current-profile invariants against the complete state a staged
@@ -833,7 +1103,256 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
         validate_current_profile_group_context(extensions, "resulting group state")?;
     let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
     validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
+    validate_account_devices_transition(group, staged, &required_components)?;
+    validate_account_devices_state(extensions, &required_components, &leaves)?;
+    validate_device_roster_transition(group, &required_components)?;
+    validate_device_roster_state(extensions, &required_components, &leaves)?;
     validate_group_lifecycle_transition(group, staged, committer_index)
+}
+
+/// Whether `group` requires `marmot.group.account-devices.v1`. A group on
+/// the legacy profile never does: its rules predate the component, so the id
+/// in a legacy required list changes nothing, as for clients that predate it.
+pub(crate) fn group_requires_account_devices(group: &MlsGroup) -> Result<bool, EngineError> {
+    if crate::account_identity_proof::protocol_profile_of_group(group)? == ProtocolProfile::Legacy {
+        return Ok(false);
+    }
+    Ok(required_app_components_of_group(group)?.contains(ACCOUNT_DEVICES_COMPONENT_ID))
+}
+
+/// Whether an `app_data_dictionary`, at any location, carries an entry under
+/// `marmot.group.account-devices.v1`, which defines none.
+pub(crate) fn carries_account_devices_data(
+    dictionary: Option<&AppDataDictionaryExtension>,
+) -> bool {
+    dictionary.is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
+}
+
+/// Whether `group` requires `marmot.account.device-roster.v1`, which marks
+/// it as a device group. A group on the legacy profile never does, as for
+/// account-devices.
+pub(crate) fn group_requires_device_roster(group: &MlsGroup) -> Result<bool, EngineError> {
+    if crate::account_identity_proof::protocol_profile_of_group(group)? == ProtocolProfile::Legacy {
+        return Ok(false);
+    }
+    Ok(required_app_components_of_group(group)?.contains(DEVICE_ROSTER_COMPONENT_ID))
+}
+
+/// The resulting GroupContext bytes of one AppDataUpdate operation, given the
+/// parent's bytes for its component. `None` removes the entry.
+///
+/// Every other v1 component's update replaces its state whole. While the
+/// parent requires the device roster, a roster update is a diff applied to the
+/// parent's roster instead. Before a group requires the roster, its bytes are
+/// unknown data and replace whole like any other's. Every send, inbound and
+/// replay path resolves updates here, so all of them compute the same state.
+pub(crate) fn resolved_app_data_update(
+    roster_required: bool,
+    parent_bytes: Option<&[u8]>,
+    update: &AppDataUpdateProposal,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let AppDataUpdateOperation::Update(data) = update.operation() else {
+        return Ok(None);
+    };
+    if roster_required && update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+        let prior = parent_bytes.ok_or_else(|| {
+            EngineError::Other(
+                "invalid device roster state: the required roster has no GroupContext state".into(),
+            )
+        })?;
+        return apply_device_roster_update_v1(prior, data.as_slice())
+            .map(Some)
+            .map_err(|error| {
+                EngineError::Serialize(format!("invalid device roster update: {error}"))
+            });
+    }
+    Ok(Some(data.as_slice().to_vec()))
+}
+
+/// Mirror `updates` into `updater` as resulting GroupContext bytes, each
+/// resolved by [`resolved_app_data_update`] against the parent bytes the
+/// updater holds. `roster_required` is whether the parent requires the
+/// device roster ([`group_requires_device_roster`]).
+pub(crate) fn apply_app_data_updates<'a>(
+    roster_required: bool,
+    updater: &mut AppDataDictionaryUpdater<'_>,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    for update in updates {
+        let component_id = update.component_id();
+        match resolved_app_data_update(roster_required, updater.old_value(component_id), update)? {
+            Some(data) => updater.set(ComponentData::from_parts(component_id, data.into())),
+            None => updater.remove(&component_id),
+        }
+    }
+    Ok(())
+}
+
+/// The state rules of `marmot.account.device-roster.v1`, for a state whose
+/// required list is `required`. They apply only while that list contains the
+/// component; before that, roster bytes are unknown data.
+///
+/// - The roster decodes canonically and keeps its own invariants (at most
+///   [`MAX_LEAVES_PER_ACCOUNT`] devices, no slot both a device and rejected).
+///   That its entry is present is the generic required-state check.
+/// - Every leaf is the same account: a device group holds only the devices of
+///   one account.
+fn validate_device_roster_state<'a>(
+    extensions: &Extensions<GroupContext>,
+    required: &AppComponentSet,
+    leaves: impl IntoIterator<Item = &'a LeafNode>,
+) -> Result<(), EngineError> {
+    if !required.contains(DEVICE_ROSTER_COMPONENT_ID) {
+        return Ok(());
+    }
+    let bytes = extensions
+        .app_data_dictionary()
+        .and_then(|dictionary| dictionary.dictionary().get(&DEVICE_ROSTER_COMPONENT_ID))
+        .ok_or_else(|| {
+            EngineError::Other(
+                "invalid device roster state: the required roster has no GroupContext state".into(),
+            )
+        })?;
+    decode_device_roster_v1(bytes)
+        .map_err(|error| EngineError::Serialize(format!("invalid device roster state: {error}")))?;
+    let mut account: Option<Vec<u8>> = None;
+    for leaf in leaves {
+        let identity = BasicCredential::try_from(leaf.credential().clone())
+            .map_err(|_| {
+                EngineError::Other(
+                    "invalid device roster state: a leaf has no basic credential".into(),
+                )
+            })?
+            .identity()
+            .to_vec();
+        match &account {
+            None => account = Some(identity),
+            Some(account) if *account != identity => {
+                return Err(EngineError::Other(
+                    "invalid device roster state: a device group holds another account's leaf"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The Commit rule of `marmot.account.device-roster.v1`: a group requires the
+/// roster from its creation or never. A Commit may neither start nor stop
+/// requiring it, whoever commits it.
+fn validate_device_roster_transition(
+    parent: &MlsGroup,
+    resulting_required: &AppComponentSet,
+) -> Result<(), EngineError> {
+    if group_requires_device_roster(parent)?
+        != resulting_required.contains(DEVICE_ROSTER_COMPONENT_ID)
+    {
+        return Err(EngineError::Other(
+            "commit is invalid: a group requires the device roster from creation or never".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The state rules of `marmot.group.account-devices.v1`, for a state whose
+/// required list is `required`. They apply only while that list contains the
+/// component; before that, an entry under its id is unknown data.
+///
+/// - "Data": no entry under the id in the GroupContext or in any leaf.
+/// - "Leaf limit": at most [`MAX_LEAVES_PER_ACCOUNT`] leaves per credential
+///   identity.
+///
+/// The support invariant is the generic required-component check
+/// ([`validate_resulting_leaf_capabilities`]), which the caller runs first.
+fn validate_account_devices_state<'a>(
+    extensions: &Extensions<GroupContext>,
+    required: &AppComponentSet,
+    leaves: impl IntoIterator<Item = &'a LeafNode>,
+) -> Result<(), EngineError> {
+    if !required.contains(ACCOUNT_DEVICES_COMPONENT_ID) {
+        return Ok(());
+    }
+    if carries_account_devices_data(extensions.app_data_dictionary()) {
+        return Err(EngineError::Other(
+            "invalid account-devices state: GroupContext carries account-devices data".into(),
+        ));
+    }
+    let mut leaves_per_account: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    for leaf in leaves {
+        if carries_account_devices_data(leaf.extensions().app_data_dictionary()) {
+            return Err(EngineError::Other(
+                "invalid account-devices state: a leaf carries account-devices data".into(),
+            ));
+        }
+        let identity = BasicCredential::try_from(leaf.credential().clone())
+            .map_err(|_| {
+                EngineError::Other(
+                    "invalid account-devices state: a leaf has no basic credential".into(),
+                )
+            })?
+            .identity()
+            .to_vec();
+        let count = leaves_per_account.entry(identity).or_default();
+        *count += 1;
+        if *count > MAX_LEAVES_PER_ACCOUNT {
+            return Err(EngineError::Other(format!(
+                "invalid account-devices state: an account holds more than \
+                 {MAX_LEAVES_PER_ACCOUNT} leaves"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The Commit rules of `marmot.group.account-devices.v1`, which read the
+/// candidate parent or what the Commit adds:
+///
+/// - "Removal": a Commit whose parent requires the component keeps requiring
+///   it.
+/// - "Data": such a Commit carries no AppDataUpdate for the component, and a
+///   Commit whose resulting state requires it adds no KeyPackage with a
+///   KeyPackage-level entry under its id. An entry in the KeyPackage's leaf is
+///   a leaf entry, which [`validate_account_devices_state`] covers.
+fn validate_account_devices_transition(
+    parent: &MlsGroup,
+    staged: &StagedCommit,
+    resulting_required: &AppComponentSet,
+) -> Result<(), EngineError> {
+    if group_requires_account_devices(parent)? {
+        if !resulting_required.contains(ACCOUNT_DEVICES_COMPONENT_ID) {
+            return Err(EngineError::Other(
+                "commit is invalid: account-devices cannot be un-required".into(),
+            ));
+        }
+        if staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::AppDataUpdate(update)
+                    if update.component_id() == ACCOUNT_DEVICES_COMPONENT_ID
+            )
+        }) {
+            return Err(EngineError::Other(
+                "commit is invalid: AppDataUpdate targets account-devices".into(),
+            ));
+        }
+    }
+    if resulting_required.contains(ACCOUNT_DEVICES_COMPONENT_ID)
+        && staged.add_proposals().any(|add| {
+            carries_account_devices_data(
+                add.add_proposal()
+                    .key_package()
+                    .extensions()
+                    .app_data_dictionary(),
+            )
+        })
+    {
+        return Err(EngineError::Other(
+            "commit is invalid: an added KeyPackage carries account-devices data".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn lifecycle_from_extensions(
@@ -1104,7 +1623,9 @@ fn validate_current_profile_group_context(
         validate_app_component_bytes(entry.id(), entry.data())?;
     }
     for component_id in &required_components.ids {
-        if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id) {
+        if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id)
+            || NO_DATA_APP_COMPONENTS.contains(component_id)
+        {
             continue;
         }
         if !is_known_group_component(*component_id) {
@@ -1146,12 +1667,14 @@ fn required_app_components_of_extensions(
 
 fn is_known_group_component(component_id: AppComponentId) -> bool {
     // Protocol-owned minus the ids that carry no GroupContext state at all:
-    // the leaf-only account proof and the ephemeral-only join authorization.
-    // Reading the canonical list keeps a newly assigned component id
-    // format-validated without editing this function.
+    // the leaf-only account proof, the no-data components and the
+    // never-required LeafNode components. Reading the canonical list keeps a
+    // newly assigned component id format-validated without editing this
+    // function.
     PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
         && !CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(&component_id)
-        && !CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS.contains(&component_id)
+        && !NO_DATA_APP_COMPONENTS.contains(&component_id)
+        && !NEVER_REQUIRED_APP_COMPONENTS.contains(&component_id)
 }
 
 pub(crate) fn ratchet_tree_nodes(
@@ -1166,7 +1689,9 @@ pub(crate) fn ratchet_tree_nodes(
         .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))
 }
 
-fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+pub(crate) fn ratchet_tree_leaves(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<Vec<LeafNode>, EngineError> {
     Ok(ratchet_tree_nodes(tree)?
         .into_iter()
         .filter_map(|node| match node {
@@ -1184,8 +1709,8 @@ pub(crate) fn lifecycle_support_blockers(group: &MlsGroup) -> Result<Vec<MemberI
 
 /// Deduplicated account identifiers for current leaves that do not advertise
 /// `component_id`. An empty result means the group is eligible to require it.
-/// The tree walk is leaf-precise, so sibling devices cannot be hidden by the
-/// account-keyed capability cache.
+/// The tree walk is leaf-precise, so one device's support never stands in for
+/// a sibling's.
 pub(crate) fn app_component_support_blockers(
     group: &MlsGroup,
     component_id: AppComponentId,
@@ -1411,77 +1936,6 @@ fn reject_admin_self_remove_proposals(
     Ok(())
 }
 
-/// Does this staged commit require the sender to be a group admin?
-///
-/// `spec/protocol-core/group-messaging.md:46-53` defines an *allowlist* of the
-/// only two commit shapes a non-admin may produce:
-///
-/// - **(a) self-update**: a Commit that updates only the sender's own LeafNode,
-///   i.e. an inline update path with no by-reference proposals; and
-/// - **(b) SelfRemove-only**: a Commit whose by-reference proposals are all
-///   `SelfRemove` (at least one), and nothing else.
-///
-/// The two shapes must not be combined with each other or with any other
-/// proposal type. Every other commit shape — including `PreSharedKey`,
-/// `ReInit`, `ExternalInit`, `GroupContextExtensions`, `AppDataUpdate`,
-/// `AppEphemeral`, `Custom`, by-reference `Add`/`Remove`/`Update`, illegal
-/// combinations, and the empty/no-op commit — requires admin.
-///
-/// This is the inverse of the allowlist: it returns `true` (admin required)
-/// unless the commit is exactly one of the two allowed non-admin shapes.
-///
-/// `pub` so engine integration tests can classify real OpenMLS staged commits
-/// directly; there is no production caller outside this crate.
-pub fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
-    !is_allowed_non_admin_commit(staged)
-}
-
-/// Authorization-aware branch ordering class for same-epoch fork recovery.
-pub(crate) fn commit_ordering_priority_for_staged(staged: &StagedCommit) -> CommitOrderingPriority {
-    if staged_commit_requires_admin(staged) {
-        CommitOrderingPriority::Privileged
-    } else {
-        CommitOrderingPriority::Ordinary
-    }
-}
-
-/// Returns `true` iff `staged` is exactly one of the two commit shapes a
-/// non-admin member is permitted to commit. Fail-closed: any unrecognized or
-/// combined shape returns `false`.
-///
-/// Both allowed shapes carry the committer's own update-path leaf node — MLS
-/// requires a fresh path on a Remove/SelfRemove commit, and a self-update *is*
-/// a path. So the update path is never a disqualifier; classification is driven
-/// entirely by the set of by-reference proposals.
-fn is_allowed_non_admin_commit(staged: &StagedCommit) -> bool {
-    let mut proposal_count = 0usize;
-    let mut self_remove_count = 0usize;
-    for queued in staged.queued_proposals() {
-        proposal_count += 1;
-        match queued.proposal() {
-            Proposal::SelfRemove => self_remove_count += 1,
-            // Any non-SelfRemove by-reference proposal (Add, Remove, Update,
-            // PreSharedKey, ReInit, ExternalInit, GroupContextExtensions,
-            // AppDataUpdate, AppEphemeral, Custom) disqualifies both allowed
-            // shapes.
-            _ => return false,
-        }
-    }
-
-    // Shape (a): self-update only — the committer's update path with no
-    // by-reference proposals (updates only the sender's own LeafNode).
-    let is_self_update_only = proposal_count == 0 && staged.update_path_leaf_node().is_some();
-
-    // Shape (b): SelfRemove-only — at least one SelfRemove proposal and every
-    // by-reference proposal is a SelfRemove. The committer's update path is
-    // expected and allowed; it re-keys the committer's own leaf for PCS.
-    let is_self_remove_only = self_remove_count > 0 && self_remove_count == proposal_count;
-
-    // The two shapes are mutually exclusive by proposal count; `^` also rejects
-    // the empty/no-op commit (neither shape).
-    is_self_update_only ^ is_self_remove_only
-}
-
 pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], EngineError> {
     let bytes = id.as_slice();
     if bytes.len() != 32 {
@@ -1586,12 +2040,36 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
         .get(&component_id)
 }
 
+/// Refuse a GroupContext entry this client must never create: a
+/// never-required LeafNode component's data belongs in leaves only
+/// (device-tag-v1.md, "Registry"). An entry another client created stays
+/// unknown data, so only local writes are refused.
+pub(crate) fn refuse_local_group_context_entry(
+    component_id: AppComponentId,
+) -> Result<(), EngineError> {
+    if NEVER_REQUIRED_APP_COMPONENTS.contains(&component_id) {
+        return Err(EngineError::Other(format!(
+            "app component {component_id:#06x} lives only in LeafNodes and cannot be set in \
+             GroupContext"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
+    refuse_local_group_context_entry(component.component_id)?;
+    // A no-data component has no entry for a client to create
+    // (app-components/README.md, "Placement"); the engine decides whether a
+    // group requires it.
+    if NO_DATA_APP_COMPONENTS.contains(&component.component_id) {
+        return Err(EngineError::NoDataAppComponent {
+            component_id: component.component_id,
+        });
+    }
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
         | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
-        | MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -1609,6 +2087,9 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
             validate_encrypted_media_policy_v2(&component.data)
         }
+        DEVICE_ROSTER_COMPONENT_ID => decode_device_roster_v1(&component.data)
+            .map(|_| ())
+            .map_err(|e| EngineError::Serialize(format!("invalid device roster state: {e}"))),
         _ => Ok(()),
     }
 }
@@ -1645,9 +2126,6 @@ fn validate_app_component_bytes(
         ACCOUNT_IDENTITY_PROOF_COMPONENT_ID => Err(EngineError::Other(
             "account identity proof is LeafNode-only and cannot be updated in GroupContext".into(),
         )),
-        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID => Err(EngineError::Other(
-            "multi-device join authorization is ephemeral-only and cannot be stored in GroupContext".into(),
-        )),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(data).map(|_| ()),
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(data)
@@ -1680,7 +2158,24 @@ pub(crate) fn validate_app_data_update_batch<'a>(
     mls_group: &MlsGroup,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
 ) -> Result<(), EngineError> {
-    validate_app_data_update_batch_against(required_app_components_of_group(mls_group)?, updates)
+    let updates = updates.into_iter().collect::<Vec<_>>();
+    validate_app_data_update_batch_against(
+        required_app_components_of_group(mls_group)?,
+        crate::account_identity_proof::protocol_profile_of_group(mls_group)?,
+        updates.iter().copied(),
+    )?;
+    // A roster diff is valid only against the parent it applies to.
+    let roster_required = group_requires_device_roster(mls_group)?;
+    for update in updates {
+        if update.component_id() == DEVICE_ROSTER_COMPONENT_ID {
+            resolved_app_data_update(
+                roster_required,
+                app_component_bytes(mls_group, DEVICE_ROSTER_COMPONENT_ID),
+                update,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Validate the parts of an AppDataUpdate operation that are decidable before
@@ -1705,6 +2200,7 @@ fn validate_standalone_app_data_update(update: &AppDataUpdateProposal) -> Result
 
 fn validate_app_data_update_batch_against<'a>(
     mut resulting_required: AppComponentSet,
+    profile: ProtocolProfile,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
 ) -> Result<(), EngineError> {
     let updates = updates.into_iter().collect::<Vec<_>>();
@@ -1737,6 +2233,15 @@ fn validate_app_data_update_batch_against<'a>(
         }
     }
 
+    // On the current profile a required no-data component has no state to
+    // keep, so the Commit that activates account-devices may remove an entry
+    // left under its id (account-devices-v1.md, "Data"). Legacy groups keep
+    // the rule for every required id.
+    if profile == ProtocolProfile::Current {
+        for component_id in NO_DATA_APP_COMPONENTS {
+            resulting_required.ids.remove(&component_id);
+        }
+    }
     for update in updates {
         match update.operation() {
             AppDataUpdateOperation::Update(data) => {
@@ -1921,6 +2426,16 @@ mod tests {
     }
 
     #[test]
+    fn the_device_roster_is_advertisable_only_in_test_policy_builds() {
+        // Its wire format is unreleased until its spec lands (mdk#2628 3.1).
+        let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
+        assert_eq!(
+            validate_supported_app_components(&supported).is_ok(),
+            cfg!(feature = "test-policy-overrides")
+        );
+    }
+
+    #[test]
     fn group_creation_blossom_image_state_self_validates() {
         let mut ids = BTreeSet::new();
         ids.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
@@ -1944,7 +2459,7 @@ mod tests {
         let mut supported = AppComponentSet::from(default_group_components());
         supported.insert(NOSTR_ROUTING_COMPONENT_ID);
 
-        let ext = leaf_app_components_extension(&supported, None).unwrap();
+        let ext = leaf_app_components_extension(&supported, None, None).unwrap();
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };
@@ -2008,44 +2523,127 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_state_is_rejected() {
-        let component = AppComponentData {
-            component_id: MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-            data: vec![0; 104],
-        };
-        assert!(validate_initial_app_component(&component).is_err());
-        assert!(validate_app_component_update(&component).is_err());
-        assert!(
+    fn withdrawn_join_authorization_id_validates_like_an_unassigned_id() {
+        // The registry withdrew 0x800a (marmot#427). Every validator that once
+        // refused it now answers exactly as for an id the registry never
+        // assigned: opaque optional data passes, and requiring it fails closed.
+        const WITHDRAWN_JOIN_AUTHORIZATION_ID: AppComponentId = 0x800a;
+        const UNASSIGNED_PROTOCOL_ID: AppComponentId = 0xefff;
+        for component_id in [WITHDRAWN_JOIN_AUTHORIZATION_ID, UNASSIGNED_PROTOCOL_ID] {
+            let component = AppComponentData {
+                component_id,
+                data: vec![0; 104],
+            };
+            validate_initial_app_component(&component).expect("opaque initial data");
+            validate_app_component_update(&component).expect("opaque update");
             validate_standalone_app_data_update(&AppDataUpdateProposal::update(
-                component.component_id,
+                component_id,
                 component.data.clone(),
             ))
-            .is_err()
-        );
+            .expect("opaque standalone update");
 
-        let extensions = current_profile_extensions(
-            [
+            let mandatory = [
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
                 ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
-            ],
-            true,
-            false,
-            &[ExtensionType::AppDataDictionary],
-            &[ProposalType::AppDataUpdate],
-        );
-        let mut dictionary = extensions
-            .app_data_dictionary()
+            ];
+            let with_data = |required: &[AppComponentId]| {
+                let extensions = current_profile_extensions(
+                    required.iter().copied(),
+                    true,
+                    false,
+                    &[ExtensionType::AppDataDictionary],
+                    &[ProposalType::AppDataUpdate],
+                );
+                let mut dictionary = extensions
+                    .app_data_dictionary()
+                    .unwrap()
+                    .dictionary()
+                    .clone();
+                dictionary.insert(component_id, component.data.clone());
+                Extensions::from_vec(vec![
+                    Extension::RequiredCapabilities(
+                        extensions.required_capabilities().unwrap().clone(),
+                    ),
+                    Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+                ])
+                .unwrap()
+            };
+            validate_current_profile_group_context(&with_data(&mandatory), "optional")
+                .expect("unknown optional state is preserved");
+            let error = validate_current_profile_group_context(
+                &with_data(&[mandatory[0], mandatory[1], component_id]),
+                "required",
+            )
+            .expect_err("unknown required component fails closed");
+            assert!(
+                error.to_string().contains(&format!(
+                    "unsupported required component {component_id:#06x}"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_tag_is_never_required_and_unknown_data_in_group_context() {
+        // device-tag-v1.md, "Registry": an entry another client put in the
+        // GroupContext is unknown data, a group that requires the id is
+        // invalid, and this client never creates such an entry.
+        let component = AppComponentData {
+            component_id: DEVICE_TAG_COMPONENT_ID,
+            data: vec![0x77; 128],
+        };
+        validate_app_component_update(&component).expect("received entry is unknown data");
+        validate_standalone_app_data_update(&AppDataUpdateProposal::update(
+            DEVICE_TAG_COMPONENT_ID,
+            component.data.clone(),
+        ))
+        .expect("received standalone update is unknown data");
+
+        let mandatory = [
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ];
+        let with_entry = |required: &[AppComponentId]| {
+            let extensions = current_profile_extensions(
+                required.iter().copied(),
+                true,
+                false,
+                &[ExtensionType::AppDataDictionary],
+                &[ProposalType::AppDataUpdate],
+            );
+            let mut dictionary = extensions
+                .app_data_dictionary()
+                .unwrap()
+                .dictionary()
+                .clone();
+            dictionary.insert(DEVICE_TAG_COMPONENT_ID, component.data.clone());
+            Extensions::from_vec(vec![
+                Extension::RequiredCapabilities(
+                    extensions.required_capabilities().unwrap().clone(),
+                ),
+                Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+            ])
             .unwrap()
-            .dictionary()
-            .clone();
-        dictionary.insert(component.component_id, component.data);
-        let extensions = Extensions::from_vec(vec![
-            Extension::RequiredCapabilities(extensions.required_capabilities().unwrap().clone()),
-            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
-        ])
-        .unwrap();
-        let error = validate_current_profile_group_context(&extensions, "test").unwrap_err();
-        assert!(error.to_string().contains("ephemeral-only"));
+        };
+        validate_current_profile_group_context(&with_entry(&mandatory), "optional")
+            .expect("an unrequired GroupContext entry is unknown data");
+        let error = validate_current_profile_group_context(
+            &with_entry(&[mandatory[0], mandatory[1], DEVICE_TAG_COMPONENT_ID]),
+            "required",
+        )
+        .expect_err("no group may require the device tag");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported required component 0x800f"),
+            "{error}"
+        );
+
+        assert!(validate_initial_app_component(&component).is_err());
+        assert!(refuse_local_group_context_entry(DEVICE_TAG_COMPONENT_ID).is_err());
+        refuse_local_group_context_entry(DEVICE_ROSTER_COMPONENT_ID)
+            .expect("only never-required LeafNode ids are refused");
     }
 
     #[test]
@@ -2123,9 +2721,12 @@ mod tests {
             AppDataUpdateProposal::remove(GROUP_PROFILE_COMPONENT_ID),
         ];
 
-        let error =
-            validate_app_data_update_batch_against(AppComponentSet::default(), updates.iter())
-                .expect_err("one operation per component id");
+        let error = validate_app_data_update_batch_against(
+            AppComponentSet::default(),
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect_err("one operation per component id");
 
         assert!(error.to_string().contains("multiple AppDataUpdate"));
     }
@@ -2148,7 +2749,7 @@ mod tests {
             AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
         ];
 
-        validate_app_data_update_batch_against(initial, updates.iter())
+        validate_app_data_update_batch_against(initial, ProtocolProfile::Current, updates.iter())
             .expect("the component is optional in the resulting epoch");
     }
 
@@ -2174,10 +2775,34 @@ mod tests {
             GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
         )];
 
-        let error = validate_app_data_update_batch_against(initial, updates.iter())
-            .expect_err("required state must remain present");
+        let error = validate_app_data_update_batch_against(
+            initial,
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect_err("required state must remain present");
 
         assert!(error.to_string().contains("required Marmot app components"));
+    }
+
+    #[test]
+    fn required_account_devices_entry_is_removable_only_on_the_current_profile() {
+        let required = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_DEVICES_COMPONENT_ID,
+        ]);
+        let updates = [AppDataUpdateProposal::remove(ACCOUNT_DEVICES_COMPONENT_ID)];
+
+        validate_app_data_update_batch_against(
+            required.clone(),
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect("a no-data component has no state to keep");
+        // On a legacy group 0x800d is an opaque id, whose required data stays.
+        validate_app_data_update_batch_against(required, ProtocolProfile::Legacy, updates.iter())
+            .expect_err("legacy validity is unchanged");
     }
 
     #[test]

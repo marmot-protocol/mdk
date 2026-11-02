@@ -385,7 +385,8 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
 }
 
 /// Open with an optional public client name for newly prepared KeyPackages.
-/// NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+/// NULL, whitespace-only or over-long (more than 64 bytes once trimmed)
+/// `client_name` omits the tag; it is never truncated. Signed retries keep
 /// their original tags. NULL `store` selects the platform keychain under the
 /// deployment's keychain service.
 /// Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
@@ -457,9 +458,9 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
 }
 
 /// Borrowed construction options. Zero initialization selects public-only
-/// endpoints, an advancing cursor, no client label, and the platform keychain
-/// (under the deployment's keychain service). The deployment itself is a
-/// separate, required argument.
+/// endpoints, an advancing cursor, no client label or device platform, and the
+/// platform keychain (under the deployment's keychain service). The deployment
+/// itself is a separate, required argument.
 /// Use this struct only with the matching header/library version.
 #[repr(C)]
 pub struct MarmotClientOptions {
@@ -467,12 +468,16 @@ pub struct MarmotClientOptions {
     pub relay_policy: u32,
     /// A MarmotCursorPersistence discriminant.
     pub cursor_persistence: u32,
-    /// Optional UTF-8 label; NULL or blank omits the public tag.
+    /// Optional UTF-8 label; NULL, blank or over 64 bytes omits the public tag.
     pub client_name: *const c_char,
     /// Optional callback store; NULL selects the platform keychain.
     pub store: *const MarmotSecretStore,
     /// 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
     pub attachment_acquisition_mode: u32,
+    /// Optional UTF-8 short name of the platform this device runs on, such as
+    /// "iOS", for this device's entry on the account's Devices screen; NULL,
+    /// blank or over 64 bytes leaves it out.
+    pub device_platform: *const c_char,
 }
 
 /// Create a client with combined relay, cursor, label and secret-storage
@@ -511,6 +516,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             cursor_persistence: 0,
             client_name: std::ptr::null(),
             store: std::ptr::null(),
+            device_platform: std::ptr::null(),
         };
         let options = unsafe { options.as_ref() }.unwrap_or(&defaults);
         let policy = match options.relay_policy {
@@ -537,6 +543,10 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             Ok(name) => name,
             Err(status) => return status,
         };
+        let platform = match unsafe { optional_str(options.device_platform) } {
+            Ok(platform) => platform,
+            Err(status) => return status,
+        };
         let store = if store.is_null() {
             None
         } else {
@@ -559,6 +569,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                             relay_policy: Some(policy),
                             cursor_persistence: Some(cursor.into()),
                             client_name: name,
+                            device_platform: platform,
                             secret_store: store,
                             moderation_report_config: None,
                             deployment,

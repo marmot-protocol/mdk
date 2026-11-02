@@ -26,6 +26,7 @@ holds the implementation, its architecture notes, conformance tests, formal mode
 | I want to… | Start here |
 | --- | --- |
 | Talk to Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, or Goose from White Noise | [White Noise + Agents quickstart](integrations/README.md) |
+| Write your own bot or client against `wn-agent` | [Build your own client](integrations/custom-client.md) |
 | Use White Noise from a terminal (CLI, daemon, TUI) | [`wn` guide](crates/cli/README.md) |
 | Integrate MDK into an iOS, macOS, or Android app | [MarmotKit integration guide](crates/marmot-uniffi/README.md) |
 | Integrate from C or another raw-FFI host | [C ABI guide](crates/marmot-c/README.md) |
@@ -51,6 +52,7 @@ you allowlist can invite or message it.
 | OpenCode | Terminal harness | [integrations/opencode](integrations/opencode/marmot/README.md) |
 | Pi | Terminal harness | [integrations/pi](integrations/pi/marmot/README.md) |
 | Goose | Terminal harness | [integrations/goose](integrations/goose/marmot/README.md) |
+| Your own client | `wn-agent` only | [Build your own client](integrations/custom-client.md) |
 
 The [quickstart](integrations/README.md) installs a checksum-verified release on macOS or Linux and gets you to a first
 encrypted chat. For how connectors share one machine, identities, and allowlists, see
@@ -93,14 +95,14 @@ and reasoned about on its own:
  apps (MarmotKit / C)    wn CLI · wnd · TUI    wn-agent ──► agent runtimes
             └────────────────┬─────┴──────────────┘
                      marmot-app        multi-account runtime, projections
-                     marmot-account    account homes, keys, transport orchestration
-                     cgka-session      one encrypted account-device lifecycle
+                     marmot-session    account-device runtime over one encrypted session
                      cgka-engine       OpenMLS group state machine + commit convergence
                      storage-sqlite    SQLCipher persistence (one DB per account-device)
 
  transport-nostr                     the relay plane: shared relay sessions, delivery, directory fetches
  transport-nostr-peeler / -adapter   Nostr events ⇄ engine messages, relay I/O
  transport-quic-stream / -broker     transient live previews for agent replies
+ marmot-account                      account homes, signing keys, secret storage
 ```
 
 - The engine is generic over a storage trait and knows nothing about Nostr; transport code lives in the peeler and
@@ -133,7 +135,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | --- | --- | --- |
 | Engine | [`cgka-engine`](crates/cgka-engine/README.md) | OpenMLS-backed group state machine and commit convergence |
 | | [`traits`](crates/traits/README.md) (`cgka-traits`) | Shared traits and cross-boundary types |
-| | [`cgka-session`](crates/cgka-session/README.md) | Encrypted account-device session over the engine |
 | Storage | [`storage-sqlite`](crates/storage-sqlite/README.md) | SQLCipher persistence for engine, session, and simulator |
 | | [`fs-private`](crates/fs-private/README.md) | Owner-only file, directory, and socket creation |
 | | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
@@ -142,16 +143,19 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
-| App | [`marmot-account`](crates/marmot-account/README.md) | Account homes, key storage, transport orchestration |
+| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages |
+| | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
+| | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
+| | [`marmot-observability`](crates/marmot-observability/README.md) | Diagnostics exporters: relay telemetry, product analytics and its consent state, audit delivery |
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
 | | [`marmot-forensics`](crates/marmot-forensics/README.md) | Append-only JSONL forensic audit schema |
 | Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings |
 | | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
 | | [`marmot-c`](crates/marmot-c/README.md) | C ABI bindings |
 | Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
-| Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon |
+| Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon and its `doctor` setup check |
 | | [`agent-control`](crates/agent-control/README.md) | Agent control protocol messages and framing |
 | | [`agent-stream-compose`](crates/agent-stream-compose/README.md) | Live-preview stream composition |
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |
@@ -164,10 +168,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); most tasks run through [`just`](Justfile).
 
-`Cargo.toml` patches HPKE 0.7 with the local [`vendor/hpke-rs-libcrux`](vendor/hpke-rs-libcrux/BACKPORT.md)
-provider to use `libcrux-kem 0.0.10`, fixing RUSTSEC-2026-0330 and RUSTSEC-2026-0331.
-Its backport notes record provenance, regression commands and the removal condition.
-
 ```sh
 just fast-ci                 # formatting, static gates, CI's two clippy passes; skips the `just test` matrix
 cargo test -p <crate>        # targeted tests for the crate you changed
@@ -175,15 +175,19 @@ just ci                      # full local parity with GitHub CI (slow)
 ```
 
 Pull requests run a pre-check of a few minutes: formatting, the static and
-contract gates, dependency audit, workspace clippy and the WASM build. They run
-no tests. The merge queue runs the full matrix on the exact commit it merges:
-every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
-suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
-Tamarin, Hermes and installer checks. `Required CI` must pass there before a
-change lands. A queue run stops at its first failed job, so the queue ejects a
-failing change within minutes rather than after the whole run. Master pushes run CI only to refresh the Rust dependency caches
-that pull requests and merge groups restore, and only when `Cargo.lock`, a
-`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
+contract gates (the tracing audit among them), dependency audit, workspace
+clippy, the WASM build, and the workspace tests with the `precheck` nextest
+profile. That profile stops each test after half a second and counts it as
+passed, so the pre-check fails on a test that fails quickly and leaves the
+slower ones to the queue. The merge queue runs the full matrix on the exact
+commit it merges: every workspace test with the `ci` nextest profile, the CLI
+and relay end-to-end suites, simulator lanes, C bindings, iOS clippy, Windows
+filesystem contracts, Tamarin, Hermes and installer checks. `Required CI` must
+pass there before a change lands. A queue run stops at its first failed job, so
+the queue ejects a failing change within minutes rather than after the whole
+run. Master pushes run CI only to refresh the Rust dependency caches that pull
+requests and merge groups restore, and only when `Cargo.lock`, a `Cargo.toml`,
+the toolchain pin, Cargo config or `ci.yml` changes.
 
 Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
 along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS
@@ -191,7 +195,9 @@ clippy lane and Apple packaging, and `ci:android` adds Android packaging; for
 packaging, re-run all candidate-workflow jobs or push a new commit. Ordinary PRs
 skip complete native candidate packaging, including Android target compilation
 and linking; use the opt-in when a change needs that signal before merging.
-Candidate packaging also runs on master when its inputs change, and weekly.
+Candidate packaging also runs on master when its inputs change, and the
+[nightly release](release.md#nightly-builds) builds and validates the same
+packages on nights it does not skip.
 Existing nightly and weekly campaigns retain their wider coverage. Broker image
 publishing stays serialized per ref so an older build cannot overwrite a newer
 `latest` image.

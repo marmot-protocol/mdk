@@ -60,6 +60,9 @@ pub(crate) enum RewindSite {
     EncryptedMediaSource,
     /// Authenticate delayed moderation policy outside any replay guard.
     ModerationSource,
+    /// The app rewinds onto a retained anchor to read the device tag of the
+    /// leaf that sent a device-group message in a past epoch.
+    DeviceTagSource,
     /// Hydration processes a stored proposal to decide whether it is a
     /// deferred SelfRemove.
     HydrateSelfRemove,
@@ -75,11 +78,12 @@ pub(crate) enum RewindSite {
 }
 
 impl RewindSite {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::PastPeelContext,
         Self::RetentionSource,
         Self::EncryptedMediaSource,
         Self::ModerationSource,
+        Self::DeviceTagSource,
         Self::HydrateSelfRemove,
         Self::Replay,
         Self::RetainedAnchorPass,
@@ -94,6 +98,7 @@ impl RewindSite {
             Self::RetentionSource => "retention-restore-",
             Self::EncryptedMediaSource => "encrypted-media-source-restore-",
             Self::ModerationSource => "moderation-source-restore-",
+            Self::DeviceTagSource => "device-tag-source-restore-",
             Self::HydrateSelfRemove => "hydrate-selfremove-probe-",
             Self::Replay => "openmls-probe-",
             Self::RetainedAnchorPass => "openmls-retained-probe-",
@@ -103,6 +108,11 @@ impl RewindSite {
 
     /// The site that wrote `name`, or `None` for a snapshot no guard created
     /// (retained anchors, convergence-apply snapshots, test fixtures).
+    /// The durable name of this site's snapshot for `suffix`.
+    pub(crate) fn snapshot_name(self, suffix: &str) -> String {
+        format!("{}{suffix}", self.prefix())
+    }
+
     pub(crate) fn classify(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -148,7 +158,7 @@ impl<'a, S: StorageProvider> SnapshotRollbackGuard<'a, S> {
         site: RewindSite,
         suffix: &str,
     ) -> StorageResult<Self> {
-        let name = format!("{}{suffix}", site.prefix());
+        let name = site.snapshot_name(suffix);
         storage.create_group_state_snapshot(&group_id, &name)?;
         Ok(Self {
             storage,
@@ -279,7 +289,7 @@ mod tests {
 
     #[test]
     fn every_guard_snapshot_is_classified_by_the_recovery_set() {
-        let storage = SqliteAccountStorage::in_memory().expect("storage");
+        let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
         let group_id = GroupId::new(vec![9; 16]);
         storage
             .put_group(&group(&group_id, 4, "live"))
@@ -324,6 +334,10 @@ mod tests {
                 RewindSite::EncryptedMediaSource,
             ),
             (
+                "device-tag-source-restore-a1b2c3d4e5f60718",
+                RewindSite::DeviceTagSource,
+            ),
+            (
                 "hydrate-selfremove-probe-a1b2c3d4e5f60718",
                 RewindSite::HydrateSelfRemove,
             ),
@@ -345,7 +359,7 @@ mod tests {
 
     #[test]
     fn group_state_guard_does_not_rewrite_live_message_or_queue_rows() {
-        let storage = SqliteAccountStorage::in_memory().expect("storage");
+        let storage = SqliteAccountStorage::in_memory_for_test().expect("storage");
         let group_id = GroupId::new(vec![7; 16]);
         let live_group = group(&group_id, 3, "live");
         let original_message = message(&group_id, 1, 2);

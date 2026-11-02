@@ -4,6 +4,10 @@ use crate::{SqlCipherKey, SqliteAccountStorage};
 const FILLER_ROWS: i64 = 2_000;
 const FILLER_BYTES: i64 = 4_000;
 
+fn key() -> SqlCipherKey {
+    SqlCipherKey::raw([0x5c; 32])
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     store: SqliteAccountStorage,
@@ -12,9 +16,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
-        let store =
-            SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key())
+            .unwrap();
         // The layout accounts created before incremental mode have.
         store.app_storage().make_non_incremental_for_test().unwrap();
         store
@@ -114,7 +117,13 @@ fn compaction_is_refused_inside_a_transaction() {
     let fixture = Fixture::new();
     let app = fixture.store.app_storage();
     let result: StorageResult<bool> = app.connection.with_transaction(|| app.compact_database());
-    assert!(result.is_err());
+    // The guard's own refusal: without it the `VACUUM` fails inside the
+    // transaction anyway, with SQLite's message.
+    assert!(
+        matches!(&result, Err(StorageError::Backend(m))
+            if m == "database compaction cannot run inside a transaction"),
+        "{result:?}"
+    );
     assert!(!fixture.space().incremental);
 }
 
@@ -141,13 +150,17 @@ fn a_close_stops_a_compaction_that_has_not_started_copying() {
     paused_rx.recv().unwrap();
     fixture.store.closer().begin_close();
     let closing = std::time::Instant::now();
-    assert!(compacting.join().unwrap().is_err(), "the copy stopped");
+    // The interrupted `VACUUM`, not the earlier closing check.
+    let stopped = compacting.join().unwrap();
+    assert!(
+        matches!(&stopped, Err(StorageError::Backend(m)) if m.contains("interrupted")),
+        "the copy stopped: {stopped:?}"
+    );
     fixture.store.close().unwrap();
     assert!(closing.elapsed() < std::time::Duration::from_secs(5));
 
-    let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
     let reopened =
-        SqliteAccountStorage::open_encrypted(fixture.dir.path().join("session.sqlite"), &key)
+        SqliteAccountStorage::open_encrypted(fixture.dir.path().join("session.sqlite"), &key())
             .unwrap();
     let app = reopened.app_storage();
     let space = app.database_space().unwrap();
@@ -178,12 +191,8 @@ fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
     let file_before = fixture.file_len();
     let path = fixture.dir.path().join("session.sqlite");
     let reader = rusqlite::Connection::open(&path).unwrap();
-    crate::open_hardened_sqlcipher(
-        &reader,
-        &SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap(),
-        crate::SqlCipherHardening::cipher_only(),
-    )
-    .unwrap();
+    crate::open_hardened_sqlcipher(&reader, &key(), crate::SqlCipherHardening::cipher_only())
+        .unwrap();
     reader.execute_batch("BEGIN").unwrap();
     let _: i64 = reader
         .query_row("SELECT count(*) FROM compaction_marker", [], |r| r.get(0))
@@ -220,7 +229,7 @@ fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
 #[test]
 fn a_new_database_starts_incremental() {
     let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
+    let key = key();
     let path = dir.path().join("session.sqlite");
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert!(store.app_storage().database_space().unwrap().incremental);

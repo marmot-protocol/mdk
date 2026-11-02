@@ -69,11 +69,11 @@ pub use capabilities::{
 };
 pub use convergence_pass::{
     ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole, ConvergencePassPhase,
-    DurableConvergencePass,
+    ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
 };
 pub use engine::{
     AutoPublish, CgkaEngine, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    EncryptedMediaSecret, GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource,
+    EncryptedMediaSecret, EpochPin, GroupEvent, GroupStateChange, KeyPackage, KeyPackageSource,
     SendAcceptDisposition, SendIntent, SendResult, WelcomeMetadata,
 };
 pub use engine_state::{
@@ -88,11 +88,12 @@ pub use ingest::{
     LocalIngestState, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
-    CONSUMED_KEY_PACKAGE_RETENTION_SECS, DurableGroupEvolution, DurableTransportFanout,
-    GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState, GroupMaintenanceStatus,
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
+    GroupMaintenanceState, GroupMaintenanceStatus, KEY_PACKAGE_REPLACEMENT_GRACE_SECS,
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceRandom,
     MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock, PendingKeyPackageReplacement,
-    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
+    PeriodicMaintenancePolicy, PostJoinHistoryFetch, PostJoinHistoryFetchCompletion,
+    PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
     SignedPublicationArtifact, TransportFanoutAttemptState, TransportFanoutTarget, WallClock,
 };
 pub use message::{

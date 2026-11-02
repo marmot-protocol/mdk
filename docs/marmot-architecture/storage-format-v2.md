@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-10-22
+updated: 2026-10-30
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -157,6 +157,10 @@ applications), reading row ids from the covering
 `(group_id, state, openmls_content, openmls_epoch)` index. Classes `-1` and `4`
 are always returned, and the engine re-classifies every returned row from its
 payload, so a derivation gap costs reads, not correctness.
+The `CommitsAndProposalsBetween` filter, which a failed convergence pass reads
+on every load (mdk#2684), seeks classes `1` and `2` by an `openmls_epoch`
+range in the same index, so neither applications nor commits outside the
+range cost reads.
 
 Existing rows take `-1` without a table rewrite. The bounded promotion sweep
 (`promote_legacy_message_rows`) now also derives those rows, writing only the
@@ -211,6 +215,15 @@ Variant values are stable:
 | `2` | one `TransportMessage`, `OpenMlsWire` |
 | `3` | exact `TransportMessage`, OpenMLS `TransportMessage`, optional own-commit stamp, optional own-application stamp |
 | `4` | one `TransportMessage`, required own-commit stamp |
+| `5` | one `TransportMessage`, origin commit id, `StagedInviteWelcome` |
+| `6` | one `TransportMessage`, `KeyPackageRef`, `OutboundWelcome` |
+| `7` | one `TransportMessage`, origin commit id, `KeyPackageRef`, `StagedInviteWelcome` |
+
+A Welcome keeps the `KeyPackageRef` of the KeyPackage it answers, so a
+device can find a Welcome by its KeyPackage after losing the Welcome's id
+(mdk#2628 item 3.3b). A Welcome stored before that has no ref and is written
+as `1` or `5`, byte for byte as before; one with a ref is written as `6` or
+`7`. Ids and refs are length-prefixed opaque values.
 
 A stored `TransportMessage` contains, in order:
 
@@ -247,7 +260,8 @@ so that path justified a binary format.
 
 Snapshot and group-state checkpoint v2 start with `MDKS` and network-order
 `uint16` version `2`. A full rollback snapshot then contains length-delimited
-group JSON, normalized message rows, queued outbound rows, member capabilities,
+group JSON, normalized message rows, queued outbound rows, a retired
+member-capability list (written empty since migration 0121, skipped on read),
 optional convergence-policy and validation bytes, and raw OpenMLS key/value
 rows. A state-scoped snapshot intentionally marks the message and queue fields
 absent, so restoring it leaves the live message ledger, pending application

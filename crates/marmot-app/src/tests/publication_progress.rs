@@ -516,7 +516,7 @@ async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
             "pending route",
             &[],
             Default::default(),
-            &AppPerformanceTelemetry::default(),
+            &marmot_observability::PerformanceRecorder::default(),
         )
         .await
         .unwrap()
@@ -741,6 +741,15 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
         .await
         .unwrap();
     drop(client);
+    // A recent announce keeps the creator's first send from owing a push
+    // announce, so the indexer's next publish is the text's retry.
+    app.record_group_push_gossip_announce(
+        "alice",
+        &hex::encode(group.as_slice()),
+        crate::notifications::unix_now_ms(),
+        None,
+    )
+    .unwrap();
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();

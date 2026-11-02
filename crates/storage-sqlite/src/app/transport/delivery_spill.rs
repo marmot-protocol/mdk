@@ -64,15 +64,15 @@ const SPILL_RETRY_CAP_SECS: u64 = 60 * 60;
 
 /// The payload keeps its own column. JSON would inflate raw ciphertext about
 /// threefold, so only the small remaining metadata is serialized.
-struct EncodedDelivery {
-    event_id: Vec<u8>,
-    payload: Vec<u8>,
-    metadata: Vec<u8>,
-    bytes: u64,
+pub(crate) struct EncodedDelivery {
+    pub(crate) event_id: Vec<u8>,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) metadata: Vec<u8>,
+    pub(crate) bytes: u64,
 }
 
 impl EncodedDelivery {
-    fn encode(delivery: &TransportDelivery) -> StorageResult<Self> {
+    pub(crate) fn encode(delivery: &TransportDelivery) -> StorageResult<Self> {
         let mut metadata = delivery.clone();
         let payload = std::mem::take(&mut metadata.message.payload);
         let metadata = crate::base::codec::serialize(&metadata)?;
@@ -85,7 +85,7 @@ impl EncodedDelivery {
     }
 }
 
-fn already_seen(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
+pub(crate) fn already_seen(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
     // Release journals the ID before the app's seen ring is rewritten, so a
     // journaled receipt still needs redelivery even while `seen_events` lists it.
     conn.query_row_cached(
@@ -319,6 +319,7 @@ mod tests {
     use crate::RecoveryLossCause;
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::GroupStorage;
+    use cgka_traits::storage::StorageError;
     use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::{MemberId, MessageId, TransportDeliveryPlane, TransportDeliverySource};
 
@@ -568,10 +569,15 @@ mod tests {
             })
         );
 
+        // The loss record references an account this store does not hold.
+        let refused = app.discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000);
         assert!(
-            app.discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000)
-                .is_err(),
-            "the loss record references a missing account"
+            matches!(
+                &refused,
+                Err(StorageError::Backend(message))
+                    if message.contains("FOREIGN KEY constraint failed")
+            ),
+            "{refused:?}"
         );
         assert_eq!(
             due(&app, u64::MAX >> 2).deliveries.len(),

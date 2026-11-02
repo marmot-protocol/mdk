@@ -125,9 +125,10 @@ The active workspace proves the shape without the old prototype tree:
 - `crates/traits` defines the cross-boundary types, including the account-aware `TransportAdapter` boundary: activation,
   group sync, publish requests/reports, and delivery metadata.
 - `crates/cgka-engine` implements the OpenMLS-backed engine candidate.
-- `crates/cgka-session` wires the engine to encrypted account-device storage.
-- `crates/marmot-account` owns account/session orchestration: it combines an account-device session, a `TransportAdapter`,
-  transport routing policy, KeyPackage publication, and pending publish confirmation.
+- `crates/marmot-session` wires the engine to encrypted account-device storage, and its runtime owns account/session
+  orchestration: it combines an account-device session, a `TransportAdapter`, transport routing policy, KeyPackage
+  publication, and pending publish confirmation.
+- `crates/marmot-account` owns account identity, files and secrets.
 - `crates/storage-sqlite` provides SQLCipher-backed persistence for Marmot metadata and group-scoped OpenMLS state, plus
   an in-memory SQLite mode for tests and simulator runs.
 - `crates/transport-nostr-adapter` implements the Nostr adapter core: account-scoped activation, group subscription

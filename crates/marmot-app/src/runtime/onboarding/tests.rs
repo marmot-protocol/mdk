@@ -312,6 +312,74 @@ async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// An account its device group unlinked comes back only through a wipe and
+/// a new link (D67). Importing its key, logging in, an external-signer login
+/// and both onboarding starts refuse it as unlinked, before anything else:
+/// before the logins' onboarding check, and before the onboarding starts
+/// reset a finished checkpoint. Nothing is written or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_account_is_refused_every_way_back_in() {
+    fn unlinked<T>(result: Result<T, AppError>) -> bool {
+        matches!(
+            result,
+            Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+        )
+    }
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let home = runtime.accounts().app.account_home();
+    let before = home.mark_account_unlinked(&id).unwrap();
+    let setup = home.account_setup_state(&id).unwrap();
+    let checkpoint = home.account_onboarding(&id).unwrap();
+    let attempts = network.attempts.lock().len();
+    let nsec = || Zeroizing::new(keys.secret_key().to_bech32().unwrap());
+    let signer = || BlockingSigner {
+        keys: keys.clone(),
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+
+    assert!(unlinked(
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(nsec()),
+                ..AccountSetupRequest::default()
+            })
+            .await
+    ));
+    assert!(unlinked(
+        runtime
+            .login(
+                keys.public_key().to_bech32().unwrap(),
+                AccountSetupRequest::default()
+            )
+            .await
+    ));
+    assert!(unlinked(
+        runtime
+            .login_external_signer(id.clone(), signer(), AccountSetupRequest::default())
+            .await
+    ));
+    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+
+    let manager = runtime.accounts();
+    let mut finished = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    finished.snapshot.ready = true;
+    manager.save_onboarding(&mut finished).unwrap();
+    let checkpoint = home.account_onboarding(&id).unwrap();
+    assert!(unlinked(manager.begin_onboarding(nsec(), options()).await));
+    assert!(unlinked(
+        manager
+            .begin_external_signer_onboarding(id.clone(), signer(), options())
+            .await
+    ));
+
+    assert_eq!(home.account(&id).unwrap(), before);
+    assert_eq!(home.account_setup_state(&id).unwrap(), setup);
+    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+    assert_eq!(network.attempts.lock().len(), attempts);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_evidence() {
     let (_directory, runtime, _network, _keys, id) = fixture().await;

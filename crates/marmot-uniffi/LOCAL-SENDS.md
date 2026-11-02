@@ -112,8 +112,10 @@ not resume an upload.
 Uploads are not idempotent blob operations: repeating one may generate new
 encrypted references. After an unknown outcome, query `local_send_status` with the
 original token before uploading again. Media references remain epoch-bound and
-can be rejected if the group changes before engine acceptance. A rejected media
-submission needs freshly prepared references and a new token.
+can be rejected if the group changes before engine acceptance: the send fails
+with `MediaReferenceStaleEpoch` (upload the file again; a rejected submission
+needs freshly prepared references and a new token) or, while the group's epoch
+is unsettled, `MediaReferenceEpochUnsettled` (sync and send again).
 
 ## Captured ordinary-media drafts
 

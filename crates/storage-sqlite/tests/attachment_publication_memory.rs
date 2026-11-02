@@ -152,7 +152,7 @@ fn end_window((sqlite_before, rust_before): (u64, usize)) -> (u64, usize) {
 #[test]
 fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("attachment-memory-test-key").unwrap();
+    let key = SqlCipherKey::raw([7; 32]);
     let store =
         SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite"), &key).unwrap();
     let app = store.app_storage();

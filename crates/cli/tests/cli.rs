@@ -1312,7 +1312,7 @@ fn wait_for_udp_listener(addr: &str, timeout: Duration) {
 
 fn run_json_until_child_exits(
     home: &std::path::Path,
-    mut child: Child,
+    mut child: KillOnDrop,
     timeout: Duration,
     mut run_command: impl FnMut(&std::path::Path) -> Result<Value, String>,
 ) -> (Value, Output) {
@@ -1327,16 +1327,15 @@ fn run_json_until_child_exits(
             }
         }
         if let Some(value) = command_value.take() {
-            if child.try_wait().expect("child status").is_some() {
-                let output = child.wait_with_output().expect("child output");
-                return (value, output);
+            if child.child().try_wait().expect("child status").is_some() {
+                return (value, child.output());
             }
             command_value = Some(value);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("killed child output");
+    let _ = child.child().kill();
+    let output = child.output();
     panic!(
         "child did not finish after retried command\n{}\nlast_command_error={}",
         command_output_summary(&output),
@@ -1347,12 +1346,12 @@ fn run_json_until_child_exits(
 #[test]
 fn run_json_until_child_exits_does_not_repeat_successful_command() {
     let home = tempfile::tempdir().expect("tempdir");
-    let child = Command::new("sh")
-        .args(["-c", "sleep 0.2"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("child should start");
+    let child = KillOnDrop::spawn(
+        Command::new("sh")
+            .args(["-c", "sleep 0.2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let calls = std::cell::Cell::new(0);
 
     let (value, output) =
@@ -1410,7 +1409,7 @@ fn poll_json_without_relay_until(
     );
 }
 
-fn wait_child_output_or_panic(child: Child, timeout: Duration, context: &str) -> Output {
+fn wait_child_output_or_panic(child: KillOnDrop, timeout: Duration, context: &str) -> Output {
     let output = wait_child_output(child, timeout);
     assert!(
         output.status.success(),
@@ -1469,16 +1468,16 @@ fn spawn_quic_broker() -> BrokerHandle {
     }
 }
 
-fn wait_child_output(mut child: Child, timeout: Duration) -> Output {
+fn wait_child_output(mut child: KillOnDrop, timeout: Duration) -> Output {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if child.try_wait().expect("child status").is_some() {
-            return child.wait_with_output().expect("child output");
+        if child.child().try_wait().expect("child status").is_some() {
+            return child.output();
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("killed child output");
+    let _ = child.child().kill();
+    let output = child.output();
     panic!("child timed out\n{}", command_output_summary(&output));
 }
 
@@ -1808,44 +1807,367 @@ fn wait_until_projected_agent_stream_message(
     );
 }
 
-fn wait_for_daemon(socket: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
-            .arg("--socket")
-            .arg(socket)
-            .arg("--json")
-            .args(["daemon", "status"])
-            .output()
-            .expect("wn daemon status should start");
-        if output.status.success() {
-            let value: Value =
-                serde_json::from_slice(&output.stdout).expect("status stdout should be JSON");
-            if value["result"]["running"].as_bool() == Some(true) {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("daemon did not become ready at {}", socket.display());
-}
+/// How long a test daemon may stay up without answering before the test gives
+/// up on it, matching `wn daemon start`. A daemon the test spawned that exits
+/// fails at once; this bounds only one that never answers. The first launch of
+/// a freshly linked `wnd` on a loaded macOS machine can wait several seconds
+/// before it runs (mdk#2696).
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn stop_daemon(socket: &std::path::Path, child: &mut Child) {
-    let _ = Command::new(env!("CARGO_BIN_EXE_wn"))
+fn daemon_answers(socket: &std::path::Path) -> bool {
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(socket)
         .arg("--json")
-        .args(["daemon", "stop"])
-        .output();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
-        }
+        .args(["daemon", "status"])
+        .output()
+        .expect("wn daemon status should start");
+    output.status.success()
+        && serde_json::from_slice::<Value>(&output.stdout)
+            .expect("status stdout should be JSON")["result"]["running"]
+            .as_bool()
+            == Some(true)
+}
+
+fn wait_for_daemon(socket: &std::path::Path) {
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    while !daemon_answers(socket) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not become ready at {}",
+            socket.display()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+/// How long a test daemon gets to exit after `wn daemon stop` before its guard
+/// kills it.
+const DAEMON_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Owns one `wnd` a test started, so the daemon cannot outlive the test.
+///
+/// `std::process::Child` does not kill on drop. A test that panicked before
+/// stopping a bare child left `wnd` running, reparented to init and retrying
+/// the test's dead loopback relay (mdk#2690). Every test daemon goes through
+/// this guard instead. Dropping it, at the end of the test or during a panic's
+/// unwind, asks the daemon to stop over its socket as `wn daemon stop` does,
+/// then kills it once [`DAEMON_STOP_GRACE`] runs out. Drop never panics, so a
+/// failing test cannot turn into an abort.
+struct DaemonGuard {
+    socket: std::path::PathBuf,
+    process: DaemonProcess,
+}
+
+enum DaemonProcess {
+    /// A `wnd` the test spawned itself.
+    Child(Child),
+    /// The detached `wnd` that `wn daemon start` spawns, filled in when the
+    /// guard drops. It is not the test's child, and under load it may not have
+    /// bound its socket or written its pid file yet, so the guard looks it up
+    /// in the process table by the socket it was started for.
+    Detached { pids: Vec<libc::pid_t> },
+}
+
+impl DaemonGuard {
+    /// Spawn `wnd --socket <socket>` with the arguments `configure` adds, and
+    /// wait until it answers on that socket.
+    #[track_caller]
+    fn start(
+        socket: &std::path::Path,
+        configure: impl FnOnce(&mut Command) -> &mut Command,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wnd"));
+        command.arg("--socket").arg(socket);
+        let child = configure(&mut command).spawn().expect("wnd should start");
+        let mut guard = Self {
+            socket: socket.to_owned(),
+            process: DaemonProcess::Child(child),
+        };
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+        while !daemon_answers(socket) {
+            if let DaemonProcess::Child(child) = &mut guard.process
+                && let Ok(Some(exit)) = child.try_wait()
+            {
+                panic!(
+                    "wnd exited before it answered at {} ({exit})",
+                    socket.display()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not become ready at {}",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        guard
+    }
+
+    /// Guard the daemon a `wn daemon start` for `socket` spawns. Take it
+    /// before running the start: the test can fail, or the start can be
+    /// killed, while that daemon is still coming up.
+    fn detached(socket: &std::path::Path) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            process: DaemonProcess::Detached { pids: Vec::new() },
+        }
+    }
+
+    /// Stop the daemon now, before later assertions, instead of at the end of
+    /// the test.
+    fn stop(self) {
+        drop(self);
+    }
+
+    fn running(&mut self) -> bool {
+        match &mut self.process {
+            DaemonProcess::Child(child) => matches!(child.try_wait(), Ok(None)),
+            DaemonProcess::Detached { pids } => pids.iter().any(|pid| process_alive(*pid)),
+        }
+    }
+
+    fn kill(&mut self) {
+        match &mut self.process {
+            DaemonProcess::Child(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            DaemonProcess::Detached { .. } => {
+                // Look the daemon up again instead of reusing the pids found
+                // before the grace period, so only a process that is still
+                // this socket's `wnd` is killed.
+                for pid in wnd_pids_for_socket(&self.socket) {
+                    // SAFETY: `kill` has no memory-safety preconditions, and
+                    // `pid` is a positive pid of a `wnd` the test started.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let DaemonProcess::Detached { pids } = &mut self.process {
+            *pids = wnd_pids_for_socket(&self.socket);
+        }
+        if self.running() {
+            // `wn daemon stop` has no read timeout, so a daemon that is still
+            // starting up could hold it forever; bound it with the daemon.
+            let mut stop = Command::new(env!("CARGO_BIN_EXE_wn"))
+                .arg("--socket")
+                .arg(&self.socket)
+                .arg("--json")
+                .args(["daemon", "stop"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
+            let deadline = Instant::now() + DAEMON_STOP_GRACE;
+            while self.running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Some(stop) = stop.as_mut() {
+                let _ = stop.kill();
+                let _ = stop.wait();
+            }
+        }
+        self.kill();
+    }
+}
+
+/// The pids of running `wnd` processes started with `--socket <socket>`. A
+/// zombie has no arguments left to match, so it is never returned.
+fn wnd_pids_for_socket(socket: &std::path::Path) -> Vec<libc::pid_t> {
+    // `ucomm` is the bare executable name, so the match does not depend on
+    // how the path to `wnd` is spelled.
+    let Ok(ps) = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=", "-o", "ucomm=", "-o", "command="])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    wnd_pids_in_ps_output(&String::from_utf8_lossy(&ps.stdout), socket)
+}
+
+/// Pick the `wnd` processes serving `socket` out of `ps -o pid= -o ucomm=
+/// -o command=` output.
+fn wnd_pids_in_ps_output(ps: &str, socket: &std::path::Path) -> Vec<libc::pid_t> {
+    let socket_arg = format!(" --socket {}", socket.display());
+    ps.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<libc::pid_t>().ok()?;
+            if pid <= 0 || fields.next()? != "wnd" {
+                return None;
+            }
+            line.match_indices(&socket_arg)
+                .any(|(at, arg)| {
+                    let rest = &line[at + arg.len()..];
+                    rest.is_empty() || rest.starts_with(' ')
+                })
+                .then_some(pid)
+        })
+        .collect()
+}
+
+#[test]
+fn wnd_pids_in_ps_output_matches_only_wnd_serving_the_socket() {
+    let socket = std::path::Path::new("/tmp/with space/dev/wnd.sock");
+    let ps = "\
+  101 wnd      /work tree/target/debug/wnd --home /tmp/with space --socket /tmp/with space/dev/wnd.sock --secret-store file
+  102 wnd      /work tree/target/debug/wnd --socket /tmp/with space/dev/wnd.sock
+  103 wn       /work tree/target/debug/wn --socket /tmp/with space/dev/wnd.sock daemon stop
+  104 wnd      /work tree/target/debug/wnd --socket /tmp/with space/dev/wnd.sock.other
+  105 wnd      /work tree/target/debug/wnd --socket /tmp/other/dev/wnd.sock
+  106 wnd      <defunct>
+";
+    assert_eq!(wnd_pids_in_ps_output(ps, socket), vec![101, 102]);
+}
+
+/// Whether `pid` names a live process (a zombie still counts).
+fn process_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that `pid` exists and may be signalled.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A long-lived `wn` child (a stream receiver or watcher, a plain
+/// subscription) that is killed and reaped if the test panics before it
+/// collects the child's output.
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    #[track_caller]
+    fn spawn(command: &mut Command) -> Self {
+        Self(Some(command.spawn().expect("child should start")))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child not yet collected")
+    }
+
+    /// Collect the output of a child that has exited or been killed.
+    fn output(mut self) -> Output {
+        self.0
+            .take()
+            .expect("child not yet collected")
+            .wait_with_output()
+            .expect("child output")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Run a test body that starts a daemon with `start` and then panics with the
+/// daemon still up. Returns the daemon's pid once the panic has unwound.
+fn pid_after_panicking_with(start: impl FnOnce() -> (DaemonGuard, libc::pid_t)) -> libc::pid_t {
+    const FAILURE: &str = "simulated test failure with a live daemon";
+    let pid = std::cell::Cell::new(None);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (_daemon, daemon_pid) = start();
+        assert!(process_alive(daemon_pid), "daemon should be running");
+        pid.set(Some(daemon_pid));
+        std::panic::panic_any(FAILURE);
+    }))
+    .expect_err("the test body should panic");
+    if unwound.downcast_ref::<&str>() != Some(&FAILURE) {
+        std::panic::resume_unwind(unwound);
+    }
+    pid.get().expect("daemon pid")
+}
+
+#[test]
+fn daemon_guard_stops_wnd_when_its_test_panics() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+
+    let pid = pid_after_panicking_with(|| {
+        let daemon = DaemonGuard::start(&socket, |wnd| {
+            wnd.arg("--home")
+                .arg(home.path())
+                .arg("--discovery-relays")
+                .arg(test_relay_url())
+                .arg("--default-account-relays")
+                .arg(test_relay_url())
+                .arg("--secret-store")
+                .arg("file")
+                .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        });
+        let DaemonProcess::Child(child) = &daemon.process else {
+            unreachable!("a started daemon is the test's child");
+        };
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        (daemon, pid)
+    });
+
+    // The guard reaps its child before the unwind leaves the test body.
+    assert!(!process_alive(pid), "wnd outlived the panicking test");
+}
+
+#[test]
+fn daemon_guard_stops_a_detached_wnd_when_its_test_panics() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+
+    let pid = pid_after_panicking_with(|| {
+        let daemon = DaemonGuard::detached(&socket);
+        let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--secret-store")
+            .arg("file")
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            .arg("--json")
+            .args([
+                "daemon",
+                "start",
+                "--discovery-relays",
+                test_relay_url(),
+                "--default-account-relays",
+                test_relay_url(),
+            ])
+            .output()
+            .expect("wn daemon start should run");
+        assert!(
+            start.status.success(),
+            "daemon start failed\n{}",
+            command_output_summary(&start)
+        );
+        let start: Value = serde_json::from_slice(&start.stdout).expect("start stdout JSON");
+        let pid = start["result"]["pid"]
+            .as_i64()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .expect("daemon pid");
+        // Make it look like a daemon still starting up under load: it has no
+        // pid file and does not answer `wn daemon stop`.
+        // SAFETY: `kill` has no memory-safety preconditions.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        std::fs::remove_file(wn_cli::daemon::default_pid_path(home.path()))
+            .expect("remove daemon pid file");
+        (daemon, pid)
+    });
+
+    // `wn daemon start` detaches the daemon, so init reaps it after it exits,
+    // not this test.
+    let deadline = Instant::now() + DAEMON_STOP_GRACE;
+    while process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(pid),
+        "detached wnd outlived the panicking test"
+    );
 }
 
 struct JsonLineSubscription {
@@ -3779,7 +4101,7 @@ fn stream_send_and_receive_show_quic_text_content() {
         .args(["stream", "receive", "--bind", &bind])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let receiver = receiver.spawn().expect("stream receiver should start");
+    let receiver = KillOnDrop::spawn(&mut receiver);
     wait_for_udp_listener(&bind, Duration::from_secs(5));
 
     let sent = run_json_until_success(
@@ -3978,7 +4300,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let watcher = watcher.spawn().expect("stream watcher should start");
+    let watcher = KillOnDrop::spawn(&mut watcher);
     let broker_addr = broker.addr.to_string();
     let (sent, output) =
         run_json_until_child_exits(home.path(), watcher, Duration::from_secs(60), |home| {
@@ -4119,28 +4441,24 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .expect("start message id");
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(
         home.path(),
@@ -4226,7 +4544,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
     assert_eq!(stream_watch["transcript_hash"], sent["transcript_hash"]);
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -4259,28 +4577,24 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
     );
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(
         home.path(),
@@ -4395,7 +4709,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
     );
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -4414,28 +4728,24 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
     let group_id = created_group["group_id"].as_str().expect("group id");
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(
         home.path(),
@@ -4559,7 +4869,7 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
     );
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -4569,28 +4879,24 @@ fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manua
     let socket = home.path().join("dev").join("wnd.sock");
     let broker = spawn_quic_broker();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let alice_created = run_json_without_relay(home.path(), &["create-identity"]);
     let bob_created = run_json_without_relay(home.path(), &["create-identity"]);
@@ -4762,7 +5068,7 @@ fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manua
     );
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -5455,28 +5761,24 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
     let group_id = created_group["group_id"].as_str().expect("group id");
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription =
         spawn_json_subscription(home.path(), &["--account", &bob, "chats", "subscribe"]);
@@ -5540,7 +5842,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
 
     drop(archived_subscription);
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -5562,28 +5864,24 @@ fn notifications_subscribe_streams_runtime_notifications_from_daemon() {
         &["--account", &bob, "groups", "accept", group_id],
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(home.path(), &["notifications", "subscribe"]);
     let ready = subscription.wait_for(Duration::from_secs(20), |line| {
@@ -5620,7 +5918,7 @@ fn notifications_subscribe_streams_runtime_notifications_from_daemon() {
     );
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -5650,24 +5948,20 @@ fn chats_mute_suppresses_and_unmute_restores_notifications() {
     assert_eq!(muted["muted"], true);
     assert!(muted["muted_until_ms"].as_i64().is_some());
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(home.path(), &["notifications", "subscribe"]);
     subscription.wait_for(Duration::from_secs(20), |line| {
@@ -5723,7 +6017,7 @@ fn chats_mute_suppresses_and_unmute_restores_notifications() {
     );
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -5740,28 +6034,24 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // Instant convergence settlement (dev/test) so the daemon surfaces
-        // synced state without waiting on the pinned quiescence window.
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // Instant convergence settlement (dev/test) so the daemon surfaces
+            // synced state without waiting on the pinned quiescence window.
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let subscription = spawn_json_subscription(
         home.path(),
@@ -5798,7 +6088,7 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
     assert_eq!(updated["result"]["mls"]["member_count"], 2);
 
     drop(subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -6314,26 +6604,21 @@ fn chats_list_archived_rows_carry_projection_keys() {
 fn daemon_executes_cli_commands_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        // The forwarded media upload below targets a loopback Blossom server.
-        .env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1")
-        .spawn()
-        .expect("wnd should start");
-
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            // The forwarded media upload below targets a loopback Blossom server.
+            .env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1")
+    });
 
     let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
@@ -6455,7 +6740,7 @@ fn daemon_executes_cli_commands_over_socket() {
         "the daemon must not have looked for note.txt in its own directory"
     );
 
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -6473,23 +6758,19 @@ fn daemon_uses_discovery_relays_independently_from_operational_relays() {
     let alice_home = tempfile::tempdir().expect("alice tempdir");
     let alice = create_account_with_real_relay(alice_home.path(), discovery_relay.url());
     let socket = alice_home.path().join("dev").join("wnd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(alice_home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--relay")
-        .arg(operational_relay.url())
-        .arg("--discovery-relays")
-        .arg(discovery_relay.url())
-        .arg("--default-account-relays")
-        .arg(operational_relay.url())
-        .arg("--secret-store")
-        .arg("file")
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(alice_home.path())
+            .arg("--relay")
+            .arg(operational_relay.url())
+            .arg("--discovery-relays")
+            .arg(discovery_relay.url())
+            .arg("--default-account-relays")
+            .arg(operational_relay.url())
+            .arg("--secret-store")
+            .arg("file")
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+    });
 
     let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
@@ -6501,7 +6782,7 @@ fn daemon_uses_discovery_relays_independently_from_operational_relays() {
         .output()
         .expect("wn keys fetch should run through daemon");
 
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
     assert!(
         output.status.success(),
         "daemon-hosted discovery failed\n{}",
@@ -6521,24 +6802,19 @@ fn daemon_uses_discovery_relays_independently_from_operational_relays() {
 fn daemon_socket_path_is_private() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .spawn()
-        .expect("wnd should start");
-
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+    });
 
     let socket_mode = socket
         .metadata()
@@ -6564,7 +6840,7 @@ fn daemon_socket_path_is_private() {
         .mode()
         & 0o777;
 
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 
     assert_eq!(socket_dir_mode, 0o700);
     assert_eq!(socket_mode, 0o600);
@@ -6575,24 +6851,19 @@ fn daemon_socket_path_is_private() {
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .spawn()
-        .expect("wnd should start");
-
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+    });
 
     let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
@@ -6611,7 +6882,7 @@ fn daemon_refuses_reset_over_socket() {
     assert_eq!(value["error"]["command"], "reset");
     assert!(home.path().exists(), "daemon home should not be deleted");
 
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -6619,24 +6890,19 @@ fn daemon_running_does_not_auto_forward_logout() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
     let account = create_local_account_id(home.path());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        // Daemon tests drive an in-process `MockRelay` at loopback; production
-        // rejects non-public relay hosts unless this dev gate is set.
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .spawn()
-        .expect("wnd should start");
-
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            // Daemon tests drive an in-process `MockRelay` at loopback; production
+            // rejects non-public relay hosts unless this dev gate is set.
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+    });
 
     let mut logout_command = wn_without_relay(home.path());
     logout_command.env_remove("WN_SOCKET");
@@ -6645,7 +6911,7 @@ fn daemon_running_does_not_auto_forward_logout() {
         .output()
         .expect("wn logout should start");
 
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 
     assert!(
         logout.status.success(),
@@ -6665,6 +6931,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
 
+    let _daemon = DaemonGuard::detached(&socket);
     let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
@@ -6799,6 +7066,133 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         "daemon stop failed\n{}",
         command_output_summary(&stop)
     );
+    // `daemon stop` reports success only once the daemon has exited, so a
+    // passing run leaves nothing for the guard to clean up.
+    assert_eq!(wnd_pids_for_socket(&socket), Vec::<libc::pid_t>::new());
+}
+
+/// `wn --json daemon start` for `home` on `socket`, against the test relay.
+fn daemon_start_command(home: &std::path::Path, socket: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+    command
+        .arg("--home")
+        .arg(home)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .arg("--json")
+        .args([
+            "daemon",
+            "start",
+            "--discovery-relays",
+            test_relay_url(),
+            "--default-account-relays",
+            test_relay_url(),
+        ]);
+    command
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn daemon_start_error(start: &Output) -> (String, String) {
+    assert!(
+        !start.status.success(),
+        "daemon start unexpectedly succeeded\n{}",
+        command_output_summary(start)
+    );
+    let value: Value = serde_json::from_slice(&start.stdout).expect("start stdout should be JSON");
+    let field = |name: &str| {
+        value["error"][name]
+            .as_str()
+            .unwrap_or_else(|| panic!("error {name}\n{}", command_output_summary(start)))
+            .to_owned()
+    };
+    (field("code"), field("message"))
+}
+
+#[test]
+fn daemon_start_reports_the_daemon_it_spawned_once_it_answers() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let start = daemon_start_command(home.path(), &socket)
+        .output()
+        .expect("wn daemon start should run");
+
+    assert!(
+        start.status.success(),
+        "daemon start failed\n{}",
+        command_output_summary(&start)
+    );
+    let value: Value = serde_json::from_slice(&start.stdout).expect("start stdout should be JSON");
+    assert_eq!(value["result"]["running"], true);
+    let pid = value["result"]["pid"]
+        .as_i64()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .expect("started daemon pid");
+    assert_eq!(wnd_pids_for_socket(&socket), vec![pid]);
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn daemon_start_fails_at_once_when_the_daemon_it_spawned_exits() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // wnd cannot make its socket under a regular file, so it exits at startup.
+    let not_a_dir = home.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"").expect("write file");
+    let socket = not_a_dir.join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let started = Instant::now();
+    let start = daemon_start_command(home.path(), &socket)
+        // A cap long enough that waiting for it would fail the test.
+        .env("WN_DEV_DAEMON_START_TIMEOUT_MS", "600000")
+        .output()
+        .expect("wn daemon start should run");
+    let elapsed = started.elapsed();
+
+    let (code, message) = daemon_start_error(&start);
+    assert_eq!(code, "daemon_start_failed");
+    assert!(
+        message.contains("exited before it became ready"),
+        "{message}"
+    );
+    assert!(message.contains("Not a directory"), "{message}");
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "an exited daemon must not wait for the cap: {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn daemon_start_stops_the_daemon_it_spawned_at_the_cap() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let _daemon = DaemonGuard::detached(&socket);
+
+    let start = daemon_start_command(home.path(), &socket)
+        // Reach the cap before the spawned daemon can answer.
+        .env("WN_DEV_DAEMON_START_TIMEOUT_MS", "0")
+        .output()
+        .expect("wn daemon start should run");
+
+    let (code, message) = daemon_start_error(&start);
+    assert_eq!(code, "daemon_start_timeout");
+    assert!(message.contains("so it was stopped"), "{message}");
+    assert_eq!(wnd_pids_for_socket(&socket), Vec::<libc::pid_t>::new());
+
+    // Whatever the stopped daemon left behind does not block the next start.
+    let restart = daemon_start_command(home.path(), &socket)
+        .output()
+        .expect("wn daemon start should run");
+    assert!(
+        restart.status.success(),
+        "daemon restart failed\n{}",
+        command_output_summary(&restart)
+    );
 }
 
 #[test]
@@ -6814,6 +7208,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
+    let daemon = DaemonGuard::detached(&socket);
     let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
@@ -6867,12 +7262,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = Command::new(env!("CARGO_BIN_EXE_wn"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--json")
-        .args(["daemon", "stop"])
-        .output();
+    daemon.stop();
 
     assert!(
         saw_group,
@@ -7932,6 +8322,7 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let bob = create_account_with_real_relay(home.path(), relay);
     run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
 
+    let daemon = DaemonGuard::detached(&socket);
     let start = wn_with_relay(home.path(), relay)
         .args(["daemon", "start"])
         .output()
@@ -7974,7 +8365,7 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let messages = wait_until_projected_message(home.path(), relay, &bob, group_id, &body);
     assert_message_plaintexts(&messages, &[&body]);
 
-    let _ = wn(home.path()).args(["daemon", "stop"]).output();
+    daemon.stop();
 }
 
 #[test]
@@ -8192,24 +8583,20 @@ fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_s
     assert_eq!(groups_json["groups"][0]["profile"]["name"], HOSTILE_NAME);
 
     let socket = home.path().join("dev").join("wnd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
-        .arg("--home")
-        .arg(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--discovery-relays")
-        .arg(test_relay_url())
-        .arg("--default-account-relays")
-        .arg(test_relay_url())
-        .arg("--secret-store")
-        .arg("file")
-        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
-        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("wnd should start");
-    wait_for_daemon(&socket);
+    let daemon = DaemonGuard::start(&socket, |wnd| {
+        wnd.arg("--home")
+            .arg(home.path())
+            .arg("--discovery-relays")
+            .arg(test_relay_url())
+            .arg("--default-account-relays")
+            .arg(test_relay_url())
+            .arg("--secret-store")
+            .arg("file")
+            .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+            .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+    });
 
     let daemon_list = {
         let output = wn_plain(home.path())
@@ -8256,23 +8643,27 @@ fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_s
     });
     assert_eq!(json_event["result"]["message"]["plaintext"], HOSTILE_TEXT);
 
-    let mut plain_child = wn_plain(home.path())
-        .arg("--socket")
-        .arg(&socket)
-        .args([
-            "--account",
-            &bob,
-            "messages",
-            "subscribe",
-            group_id,
-            "--limit",
-            "20",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("plain subscription should start");
-    let stdout = plain_child.stdout.take().expect("subscription stdout");
+    let mut plain_child = KillOnDrop::spawn(
+        wn_plain(home.path())
+            .arg("--socket")
+            .arg(&socket)
+            .args([
+                "--account",
+                &bob,
+                "messages",
+                "subscribe",
+                group_id,
+                "--limit",
+                "20",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let stdout = plain_child
+        .child()
+        .stdout
+        .take()
+        .expect("subscription stdout");
     let (tx, rx) = std_mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -8300,8 +8691,7 @@ fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_s
             }
         }
     }
-    let _ = plain_child.kill();
-    let _ = plain_child.wait();
+    drop(plain_child);
     let _ = reader.join();
     assert!(
         saw_sanitized,
@@ -8309,7 +8699,7 @@ fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_s
     );
 
     drop(json_subscription);
-    stop_daemon(&socket, &mut child);
+    daemon.stop();
 }
 
 #[test]
@@ -8318,6 +8708,9 @@ fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
     const HOSTILE_RELAY: &str = "not-a-relay\u{1b}]52;c;YXR0YWNr\u{7}\u{202e}";
     const SANITIZED_WN: &str = "error: invalid relay URL: not-a-relay]52;c;YXR0YWNr\n";
     const SANITIZED_WND: &str = "wnd: invalid relay URL: not-a-relay]52;c;YXR0YWNr\n";
+    // Every start below must fail validation; the guard only matters if one
+    // regresses into spawning a daemon.
+    let _daemon = DaemonGuard::detached(&wn_cli::daemon::default_socket_path(home.path()));
 
     let ordinary = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")

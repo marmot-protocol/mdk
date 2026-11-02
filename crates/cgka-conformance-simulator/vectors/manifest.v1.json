@@ -136,6 +136,86 @@
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
     },
     {
+      "id": "account-devices-founding/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-founding.v1.json",
+      "coverage": [
+        "founding state requires 0x800d when every founder supports it",
+        "invitees join a group that requires 0x800d",
+        "non-admin same-account Remove right after founding",
+        "converged state requires 0x800d and satisfies its rules"
+      ],
+      "next": "Cover a founding Add over the leaf limit if a cheap many-device topology lands."
+    },
+    {
+      "id": "account-devices-activation/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-activation.v1.json",
+      "coverage": [
+        "per-client account-devices (0x800d) support",
+        "a founder without support leaves the founding state without 0x800d",
+        "support gained through a leaf refresh",
+        "activation Commit through publication and apply",
+        "two devices of one account",
+        "account-devices state rules on the exact converged state"
+      ],
+      "next": "Base for account-devices races between devices of one account."
+    },
+    {
+      "id": "account-devices-activation-needs-support/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-activation-needs-support.v1.json",
+      "coverage": [
+        "activation refused while a member lacks support",
+        "support gained through a leaf refresh",
+        "activation after the upgrade"
+      ],
+      "next": "Pin a typed error once the engine reports the support rule with its own error kind."
+    },
+    {
+      "id": "account-devices-activation-loses-to-unsupported-invite/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-activation-loses-to-unsupported-invite.v1.json",
+      "coverage": [
+        "activation racing an invite of an unsupported member",
+        "invite branch selected by committer order",
+        "converged state does not require 0x800d",
+        "activation refused on the converged state"
+      ],
+      "next": "Add the leaf-limit race (an account's 21st leaf) if a cheap many-device topology lands."
+    },
+    {
+      "id": "account-devices-activation-wins-over-unsupported-invite/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-activation-wins-over-unsupported-invite.v1.json",
+      "coverage": [
+        "activation racing an invite of an unsupported member",
+        "activation branch selected by committer order",
+        "converged state requires 0x800d and satisfies its rules",
+        "losing invite leaves no pending work"
+      ],
+      "next": "Assert the losing inviter's superseded-intent event portably."
+    },
+    {
+      "id": "account-devices-own-device-removal-loses-to-admin-remove/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-own-device-removal-loses-to-admin-remove.v1.json",
+      "coverage": [
+        "two devices of one account racing from one parent",
+        "group requiring 0x800d from its founding",
+        "same-account Remove committed without the proposal store",
+        "admin-required Commit beats a same-account Commit by priority class",
+        "converged state requires 0x800d and satisfies its rules"
+      ],
+      "next": "Add the sibling mutual-removal race once vectors can assert a digest-decided winner."
+    },
+    {
       "id": "cross-route-own-commit-recovery/v1",
       "kind": "scenario_vector",
       "status": "portable",
@@ -398,6 +478,18 @@
         "duplicate relay rejection"
       ],
       "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
+    },
+    {
+      "id": "marmot.transport.nostr.welcome/nip44-extended-length/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-welcome-nip44-extended-length.v1.json",
+      "coverage": [
+        "NIP-59 Welcome gift wrap unwrap",
+        "NIP-44 v2 extended length prefix in the seal and the gift wrap",
+        "seal plaintext at the 65,536-byte prefix boundary"
+      ],
+      "next": "Unwrap it with every Marmot implementation's own Welcome path, including its account-signer paths."
     },
     {
       "id": "conversation/v1",

@@ -301,6 +301,10 @@ the events this device sent. They do not prove that any other member has process
 are queryable after the command returns and after a restart: `groups disband-status`, `groups recovery-status`,
 `groups pending-welcomes`, and `groups maintenance-status`.
 
+**Members are accounts.** `groups members`, `groups show` and `groups management` list each member account once, even
+when it has several devices in the group. Each `members` entry carries `device_count`, how many of that account's
+devices are in the group, and member counts, admin counts and the last-admin check count accounts.
+
 **Invites.** `groups invites` lists groups still awaiting local confirmation. `groups accept` clears that pending state;
 `groups decline` leaves and archives the auto-joined pending group.
 
@@ -339,7 +343,9 @@ or `post_join_rotation_pending_retryable`); a pending post-join rotation does no
   `disband_request.failed.reason`, then clear it with `groups acknowledge-disband-failure`), the terminal `disbanded`,
   or `unknown` (no positive signal and the MLS state could not be read, as for a quarantined, terminal, or removed copy;
   `not_enabled` is only asserted from a successful MLS read). It also reports `lifecycle_state`, `disbanding` (ordinary
-  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, or `removed`).
+  outbound work is gated), `disbanded`, `unrecoverable`, and `self_membership` (`member`, `left`, `removed`, or
+  `device_removed`: this device's leaf was removed while the account stays in the group through another of its
+  devices).
 - Ordinary sends into a disbanding group fail with `group_disbanding`. A removed member's copy records its own removal
   (`self_membership: removed`) when the terminal commit lands; read both fields rather than inferring the end from one.
 
@@ -433,7 +439,7 @@ or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content
 pass through verbatim into the encrypted group message. Kinds MDK owns (chat, reactions, edits, deletes, agent activity,
-agent stream anchors, group system rows, push token records) are rejected with `reserved_app_event_kind`. Each `--tag`
+agent stream anchors, group system rows, push token records, and the device-group kinds 457, 459, 460, 461, 473, 475 and 476) are rejected with `reserved_app_event_kind`. Each `--tag`
 takes a JSON array of strings and is repeatable; a malformed tag fails with `invalid_event_tag`. Custom events project as
 standalone rows with their own kind and tags and never fold onto a target message. `messages list` and
 `messages subscribe` accept repeatable `--kind <KIND>` filters and return every kind without one. On the subscribe feed
@@ -495,8 +501,8 @@ the wire `imeta` tag carries no epoch, and recipients derive the media key from 
 - A stale reference is refused before publication with `media_reference_stale_epoch` (`source_epoch`,
   `current_epoch`). Upload the file again after the commit and send the new reference. A plaintext hash resolves to the
   newest projected reference carrying it, so after a re-upload the hash form sends the current-epoch copy.
-- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send gives the same
-  error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
+- The send is pinned to the reference's epoch inside the engine too: an epoch change during the send, including a move
+  to another branch at the same epoch number, gives the same error, and while the epoch is unsettled (your commit still publishing, or peer commits not yet applied) the send is
   refused with `media_reference_epoch_unsettled` rather than queued. Sync and retry, or upload again if the epoch
   advanced.
 
@@ -630,9 +636,22 @@ wn --account <npub-or-hex> chats list
 wn daemon stop
 ```
 
+- `wn daemon start` returns once it knows how the `wnd` it launched turned out. It prints `daemon started` when that
+  daemon reports its accounts open, or `daemon already running` when another daemon answers on the socket first; both
+  exit 0. If the daemon exits first, the command fails at once with JSON error code `daemon_start_failed`, the log
+  path, and the log's last lines. If the daemon is still running but not ready after 60 seconds, the command stops it
+  and fails with `daemon_start_timeout`. Ctrl-C stops it too and fails with `daemon_start_interrupted`. A failed start
+  never leaves a daemon running. The 60 seconds cover the runtime's 45-second budget for opening accounts, and macOS
+  can hold the first launch of a newly installed `wnd` for several seconds before it runs.
+- `wn daemon stop` prints `daemon stopped` only once the daemon process has exited. The daemon answers the request
+  before it shuts down its runtime, which can wait on relays; if it is still running 30 seconds later, the command
+  fails with `daemon_stop_timeout` and names its pid, and leaves it to finish shutting down.
 - When a daemon socket exists for a home, normal `wn --home <path> ...` commands are forwarded to it. `wn daemon status`,
   `wn daemon stop`, and `wn tui` handle daemon access directly. Use `--socket` or `WN_SOCKET` to target a specific
   daemon.
+- `wnd` answers on its socket as soon as it binds it, before it has opened its accounts, which the runtime allows 45
+  seconds. Meanwhile `wn daemon status` prints `daemon starting` (`"starting": true` in `--json`), `wn daemon stop`
+  stops it, and other commands wait until the accounts are open.
 - `wn daemon status --json` includes `last_runtime_activity`, background `stream_watches`, and a redacted `relay_health`
   object with aggregate relay counts and connection-status buckets. It does not include relay URLs, account ids, group
   ids, subscription ids, or message ids.

@@ -400,7 +400,7 @@ mod tests {
         let app = crate::MarmotApp::with_relays(root.path(), Vec::new());
         app.account_storages.lock().unwrap().insert(
             "synthetic-private-label".to_owned(),
-            storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+            storage_sqlite::SqliteAccountStorage::in_memory_for_test().unwrap(),
         );
         app.set_startup_diagnostics_enabled(true);
         let first_open = app

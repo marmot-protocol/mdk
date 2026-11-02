@@ -92,6 +92,7 @@ impl TransportPeeler for MockPeeler {
             content: PeeledContent::Welcome {
                 created_at: None,
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })
@@ -856,8 +857,7 @@ fn build_memory_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAcco
     // The peers are plain fixtures; the file-backed database is what crashes.
     // Copying a migrated template keeps their setup from dominating the time a
     // child needs to reach its pause point.
-    let storage = SqliteAccountStorage::in_memory_from_migrated_template(Default::default())
-        .expect("in-memory storage");
+    let storage = SqliteAccountStorage::in_memory_for_test().expect("in-memory storage");
     let engine = build_client_with_storage(seed, storage.clone());
     (engine, storage)
 }
@@ -920,7 +920,7 @@ fn identity(seed: &[u8]) -> Vec<u8> {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(key) = SigningKey::from_bytes(&material) {
+        if let Ok(key) = SigningKey::from_slice(&material) {
             return key.verifying_key().to_bytes().to_vec();
         }
         counter = counter.checked_add(1).expect("identity search exhausted");

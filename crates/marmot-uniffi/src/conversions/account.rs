@@ -15,6 +15,10 @@ pub struct AccountSummaryFfi {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+    /// The account's device group removed this device after its link was
+    /// made; the account stays signed out here. Show that this device was
+    /// unlinked and offer `sign_out_and_wipe` (mdk#2628 D67).
+    pub unlinked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -311,16 +315,29 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
 /// partial-failure sheet.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct WipeOutcomeFfi {
-    /// Active MLS groups this account successfully left.
+    /// Active MLS groups this account successfully left. A chat this device
+    /// is no longer in, its copy removed or disbanded, is neither left nor
+    /// reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailureFfi>,
-    /// Relay-published KeyPackage events successfully deleted.
+    /// `1` when a relay accepted the deletion of this device's KeyPackage
+    /// slot, otherwise `0`.
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion (or discovery) failures.
+    /// KeyPackage slot deletion failures.
     pub key_package_failures: Vec<RelayFailureFfi>,
     /// Local cleanup (MLS DB, media cache, SQL row, secret-store nsec) result.
     pub local_cleanup: LocalCleanupReportFfi,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings.
+    pub groups_left_to_siblings: u32,
+    /// This device could not ask its siblings to take it out within about 30
+    /// seconds, so it tried to leave every chat itself; one it could not
+    /// leave is in `group_leave_failures`. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
+    pub siblings_not_reached: bool,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -342,15 +359,15 @@ pub struct LocalCleanupReportFfi {
 }
 
 /// Structured result of the non-destructive `signOut`. The account's local
-/// state is kept on device; only the relay-published KeyPackages are cleaned
-/// up (when requested), so the app can render the same per-relay
+/// state is kept on device; only this device's relay-published KeyPackage
+/// slot is deleted (when requested), so the app can render the same
 /// partial-failure sheet as a wipe. Failures are not durably queued for retry.
 #[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct SignOutOutcomeFfi {
-    /// Relay-published KeyPackage events successfully deleted. `0` when
-    /// `deleteKeyPackages` was `false`.
+    /// `1` when a relay accepted the deletion of this device's KeyPackage
+    /// slot, otherwise `0` (always `0` when `deleteKeyPackages` was `false`).
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort.
+    /// KeyPackage slot deletion failures. Best-effort.
     pub key_package_failures: Vec<RelayFailureFfi>,
     /// Local teardown (worker shutdown, subscription deactivation, in-memory
     /// cache eviction) result. Never removes on-disk state.
@@ -373,6 +390,8 @@ impl From<WipeOutcome> for WipeOutcomeFfi {
                 .map(Into::into)
                 .collect(),
             local_cleanup: value.local_cleanup.into(),
+            groups_left_to_siblings: value.groups_left_to_siblings,
+            siblings_not_reached: value.siblings_not_reached,
         }
     }
 }

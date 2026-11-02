@@ -42,7 +42,8 @@ pub unsafe extern "C" fn marmot_subscribe_attachment_transfers(
         }
     })
 }
-/// Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely.
+/// Initial snapshot then replacements. A transfer state change arrives at once; progress-only
+/// replacements arrive at most four per second. Zero timeout waits indefinitely.
 /// Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free.
 /// # Safety
 /// Sub must be live and out writable. Use one receiver per handle.

@@ -30,9 +30,10 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery, transport-cursor and subscription-refusal rows exist only in v5 (see
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only) and
-[`subscription_refused`](#subscription_refused-v5-only)); a v4 recorder drops them.
+Account recovery, transport-cursor, subscription-refusal and recovery-runner pause rows exist only in v5 (see
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only),
+[`subscription_refused`](#subscription_refused-v5-only) and
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -75,10 +76,11 @@ v5 file is rejected. Deploy the compatible receiver before activating v5 deliver
 | Area | Files |
 | --- | --- |
 | Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json) |
-| Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
+| Shared recorder handle | [`crates/marmot-forensics/src/audit/shared.rs`](../../crates/marmot-forensics/src/audit/shared.rs) |
+| Recorder installation point | [`crates/marmot-session/src/session.rs`](../../crates/marmot-session/src/session.rs) wraps the configured recorder in the account-device's `SharedRecorder` and builds the engine ([`engine.rs`](../../crates/cgka-engine/src/engine.rs)) with a clone |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
-| Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
+| Account publish audit call sites | [`crates/marmot-session/src/runtime.rs`](../../crates/marmot-session/src/runtime.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
 | Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
 | UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions/`](../../crates/marmot-uniffi/src/conversions) |
@@ -111,6 +113,13 @@ Important lifecycle behavior:
 - The recorder opens files with append mode and does not truncate existing logs.
 - Each recorder opening emits a `recorder_started` row. Session open also emits `engine_context` and
   `recorder_health` rows once the convergence policy has been installed.
+- One recorder serves the account-device. The engine, the account runtime and the app each hold a clone of one
+  `SharedRecorder`, so their rows share one writer, one recording session and one sequence. App rows go straight to
+  the app's clone, not through the runtime, the session or the engine.
+- The audit switch swaps the recorder for every clone; the swap closes the old file before it returns. An observed
+  graceful shutdown finishes the log: it writes `recording_session_stopped`, then swaps in the no-op recorder, so a
+  clone that outlives shutdown writes nothing and the next open starts a new session. Any other stop writes no stop
+  row, and the file closes when the account's client is dropped.
 
 The UniFFI bridge exposes:
 
@@ -243,8 +252,9 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
 `sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only), and the v5-only refusal row under
-[`subscription_refused`](#subscription_refused-v5-only).
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only), the v5-only refusal row under
+[`subscription_refused`](#subscription_refused-v5-only), and the runner's pause row under
+[`recovery_runner_paused`](#recovery_runner_paused-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -279,7 +289,7 @@ Emitted when group-scoped settings/state should be explicit in the timeline, inc
 
 ### `recorder_health`
 
-Emitted by the session at open and available through `audit_recorder_health()`.
+Emitted by the session at open, through the shared recorder.
 
 | Field | Meaning |
 | --- | --- |
@@ -980,14 +990,14 @@ Shared conventions:
 
 #### `recovery_need_changed`
 
-Recovery need changed for one obligation.
+Recovery need changed for one obligation, or for one coverage-ledger route's notice (`unproven_history`).
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`), or `unproven_history`: a route the recovery runner parked or could not prove, which has no obligation (mdk#2660, unproduced until the runner owns history). |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
-| `obligation_ref` | Hashed obligation id. |
-| `obligation_revision` | Revision the change left. |
+| `obligation_ref` | Hashed obligation id; for `unproven_history`, the hashed route tag, never the route. |
+| `obligation_revision` | Revision the change left; for `unproven_history`, the route's park revision. |
 | `bound` | For `recorded` / `joined` / `resumed`: `floor`, `unbounded`, or `retained_window`, the goal's lower bound as the comparison will use it. |
 | `floor_secs` | Present exactly when `bound` is `floor`: the goal's floor after the change, the lowest bound charged by any unresolved generation of the cause. That is the earliest dropped wire `created_at` (queue loss) or the lowest REQ `since` read at a lag (notification loss). |
 | `charged` | Loss causes only: deliveries (queue loss) or lagged notifications (notification loss) newly charged by this change. A notification count is an observation count, not a count of missed events. |
@@ -1002,8 +1012,9 @@ Where it is recorded:
 - Startup incremental history (`retained_window`) and explicit full-history repair (`unbounded`, by design) requests.
 - Native source observation (`subscription_replay`) records original-window input need without a loss charge.
   Limited native admission never reports certified history, `window_certified`, or loss acknowledgment.
-- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, and
-  `closed` for a withdrawn occurrence whose obligation is now satisfied. Parked obligations get no automatic retries,
+- The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, a
+  ledger route's included, and `closed` for a withdrawn occurrence whose obligation is now satisfied. A ledger notice
+  records only `notice_shown` and `notice_dismissed`, with no `bound` or `charged`. Parked obligations get no automatic retries,
   so `closed` means an explicit deep repair completed it. The first call after open only takes the baseline.
 - Dismissal (`dismiss_history_notice`): `notice_dismissed`.
 - Explicit full-history repair's own close after a `BelowRetentionWindow` pass: `closed_below_window`, only when
@@ -1218,6 +1229,24 @@ Notes:
   fetch is ignored here; one-shot fetches report their closes through acquisition.
 - An account without a v5 recorder still drains its reports at the seam and discards them.
 
+### `recovery_runner_paused` (v5 only)
+
+The phase 4 recovery runner's account breaker paused this account's history fetches at a rolling-hour cap (mdk#2660).
+The runner records it in a worker turn once per pause. Nothing writes it until the runner owns recovery debt, which
+an internal gate keeps off. Account-scoped, so `group_ref` is `None`.
+
+| Field | Meaning |
+| --- | --- |
+| `cap` | The cap reached: `attempts`, `event_bytes` or `both`. |
+| `attempts` | Attempts the rolling hour holds as it pauses. |
+| `event_bytes` | Event bytes the rolling hour holds as it pauses. |
+| `paused_for_secs` | Seconds until enough of the hour rolls off for the runner to go on. |
+| `pauses` | Pauses since the process started, across its accounts, this one included. |
+| `late_findings` | Events re-checks found inside history already covered, since the process started, across its accounts. |
+
+A pause is a bug signal: the per-unit backoff and per-relay cooldowns should stop a misbehaving relay or route long
+before the account's caps. The pause changes no unit; units stay due and run once the hour rolls.
+
 ### `auto_commit_decision`
 
 Emitted after `LowestIndexAutoCommitter::decide` returns a decision for a queued proposal.
@@ -1361,7 +1390,7 @@ metadata keys for indexing.
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
 | `PeelerOutcomeKind` | `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `other` |
-| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay` |
+| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay`, `unproven_history` |
 | `RecoveryNeedChange` | `recorded`, `joined`, `resumed`, `notice_shown`, `notice_dismissed`, `closed`, `closed_below_window` |
 | `RecoveryGoalBound` | `floor`, `unbounded`, `retained_window` |
 | `RecoveryAttemptScope` | `history`, `exact_event`, `maintenance_boundary`, `mixed` |
@@ -1406,7 +1435,7 @@ Files are sorted by app account label, then file name.
 ### Segment rotation
 
 The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
-prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
+prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB), or a day elapses before the next row, and
 continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
@@ -1425,7 +1454,46 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
   attempting rolls for a 30-second backoff before retrying, so transient `ENOSPC`/`EMFILE` errors cost a delayed roll,
   not a session with rotation disabled.
-- Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
+- Segment rotation itself retains all bytes; the local retention sweep below expires old records.
+
+### Local retention
+
+MDK expires closed forensic files 30 days after their last filesystem write, without a user setting. Recorders seal
+at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
+session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
+one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
+short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next actual row.
+A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+Legacy files are not split or rewritten; they age out 30 days after their last write.
+
+Exclusive-root startup sweeps account directories and failed-wipe remnants. Scanning uses filenames and metadata;
+expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when a cursor exists.
+An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
+independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
+path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
+without waiting for payload copying or holding account commands behind a full sweep.
+
+Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed;
+custom names, databases and the always-on key-reveal security log are excluded. Empty or malformed reserved files
+expire by the same metadata policy. Failures are isolated per file/account, nonfatal and retried on the next sweep
+or open. Already-known sealed files unlink without staging space. An old active filename needs a durable cursor
+retirement first; a metadata-write failure leaves its bytes intact while other sealed files continue expiring.
+
+A weak recorder registry serializes writer creation and expiry. The live recorder rechecks each candidate under
+its writer lock. Expired idle data is sealed into a closed inode after a fresh empty writer is ready; this emits no
+rows or record failures, and source context is deferred to the next actual event. Uncertain writers stay protected,
+including the actual segment path after failed roll compensation.
+Expiry serializes local cursor work for the source directory and cancels only an attempt owning the expiring inode.
+Other uploads remain valid, including another file in the same account; their local completion waits for retirement.
+No account-file lookup or installation-wide cancellation is needed for orphan directories or failed wipes.
+
+Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
+alias and exact final byte length. It preserves ACKs and prepared ranges. A crash leaves a discoverable sealed inode
+or a durably retired alias; publication/unlink errors compensate both cursor and filename, retaining source bytes if
+compensation cannot complete. Acknowledged sources disappear without false gaps; unobserved or prepared unsent tails
+retain genuine missing-source evidence. Generic missing-active detection stays conservative. Delivery drops retired,
+gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
+reached a receiver.
 
 ### Explicit upload
 
@@ -1520,7 +1588,7 @@ Nested directories are not traversed, and files outside the leased root are not 
 a scan/deletion failure does not prevent startup or processing
 other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Remaining
 legacy files still fail the v4 upload gate. Cleanup does not rewrite the upload-checkpoint sidecar; the tracker
-retains its existing pruning behavior. This retirement does not introduce ongoing v4 retention limits.
+retains its existing pruning behavior. Ongoing v4/v5 expiry is owned by the separate local retention sweep.
 There is no date-based sunset: direct upgrades from old builds, restored backups, and previous deletion failures
 can reintroduce legacy files later. Removing the scan requires an explicit change to those upgrade/restore guarantees.
 
@@ -1614,13 +1682,11 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
   it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for local handling. Goggles must reject legacy schemas even through other upload paths. Deleting it is
-  mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
-  upgrade-path condition only.
+  for local handling until its records expire through local retention. Goggles must reject legacy schemas even through
+  other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
 - The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
-  are pruned each run. Because sealed segments are never deleted (mdk#1014), that bound still grows with cumulative
-  audit volume â€” each tracker run stats every enumerated file and rewrites the whole sidecar. Both costs are linear in
-  file count and small next to the HTTP request each run already makes.
+  are pruned each run. Local retention removes expired segments; each tracker run stats every enumerated file and
+  rewrites the whole sidecar. Both costs are linear in file count and small next to the HTTP request each run makes.
 
 The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
 collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after
@@ -1683,6 +1749,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |
 | Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
+| Did the recovery runner hit the account's hourly cap? | `recovery_runner_paused`: the cap, the hour's usage, how long the pause lasts, and process totals of pauses and late findings. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:

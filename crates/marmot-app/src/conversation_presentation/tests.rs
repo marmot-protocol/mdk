@@ -78,6 +78,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        imported_from: None,
     }
 }
 fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {
@@ -174,6 +175,13 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
             ConversationParticipation::Removed,
         ),
         (
+            SelfMembership::DeviceRemoved,
+            false,
+            false,
+            AppGroupLifecycleState::Stable,
+            ConversationParticipation::DeviceRemoved,
+        ),
+        (
             SelfMembership::Member,
             false,
             false,
@@ -214,6 +222,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
         message_id_hex: "03".repeat(32),
         sender: reply.clone(),
         plaintext: "earlier".into(),
+        tags: Vec::new(),
         kind: 9,
         source_epoch: Some(0),
         media: None,
@@ -579,6 +588,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
             .map(|id| format!("@{}", npub_for_account_id(id).unwrap()))
             .collect::<Vec<_>>()
             .join(" "),
+        tags: Vec::new(),
         kind: 9,
         source_epoch: Some(0),
         media: None,

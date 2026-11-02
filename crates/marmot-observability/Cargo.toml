@@ -1,0 +1,48 @@
+[package]
+name = "marmot-observability"
+# Product payloads report `sdkVersion` from this crate's CARGO_PKG_VERSION, so it
+# must stay the workspace version marmot-app reports.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Marmot diagnostics exporters: relay-telemetry OTLP export, product analytics and its consent state, the app-performance recorder, audit delivery's HTTP halves and the collector dial-safety helper."
+
+[features]
+default = []
+product-analytics-export = []
+# Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
+# privacy-critical mapping and opt-in gate stay in the default build; this
+# feature only adds the OTLP protobuf dependencies and the push transport.
+otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+# The diagnostics test fixtures and hooks marmot-app's tests use. Enable only
+# as a dev-dependency.
+test-support = []
+
+[dependencies]
+cgka-traits.workspace = true
+chrono.workspace = true
+hex.workspace = true
+httpdate.workspace = true
+jsonschema.workspace = true
+marmot-forensics.workspace = true
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "net", "io-util"] }
+tokio-util.workspace = true
+tracing.workspace = true
+transport-nostr.workspace = true
+transport-nostr-adapter.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+transport-nostr = { workspace = true, features = ["test-support"] }

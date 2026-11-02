@@ -26,6 +26,7 @@ Supported integrations, all speaking the same [`agent-control`](../agent-control
 - [What this crate owns](#what-this-crate-owns)
 - [First installation from a White Noise prompt](#first-installation-from-a-white-noise-prompt)
 - [Run locally](#run-locally)
+- [Check the setup](#check-the-setup)
 - [Invite policy](#invite-policy)
 - [Outbound media paths](#outbound-media-paths)
 - [Group profile updates](#group-profile-updates)
@@ -151,16 +152,28 @@ a path the connector can read.
 
 ## Run locally
 
-Start the connector with the same public relay set the phone app uses (`--home` is required):
+To run a released `wn-agent` for your own client without building from source, follow
+[Build your own client](../../integrations/custom-client.md).
+
+Start the connector (`--home` is required):
 
 ```sh
 install -d -m 0700 ~/.marmot-agent/dev/outbound-media
 cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
-  --media-allowed-root ~/.marmot-agent/dev/outbound-media \
-  --relay wss://relay.eu.whitenoise.chat \
-  --relay wss://relay.us.whitenoise.chat
+  --media-allowed-root ~/.marmot-agent/dev/outbound-media
 ```
+
+The daemon and `bootstrap` choose relays the same way: `--relay` values (repeated or comma-separated), then
+`MARMOT_RELAYS` (comma-separated), then the relays the phone app uses, `wss://relay.eu.whitenoise.chat` and
+`wss://relay.us.whitenoise.chat`. Each relay must be a `wss://` URL. For offline and test runs,
+`--no-default-relays` drops the last fallback; an account with no relay lists then cannot start.
+
+On the first start of an account with no cached relay lists, such as an identity brought in with `import-identity`,
+the daemon reads the account's published relay lists (kinds 10002 and 10050) from its relays and adopts them. It
+publishes its own relays as a list only when every relay answered and none holds that list. If a relay does not
+answer, it publishes nothing and stops. If the identity's lists are only on other relays, name one of them with
+`--relay` for that first start; otherwise the daemon publishes new lists that name its own relays.
 
 By default the control socket is `<home>/dev/wn-agent.sock`, here:
 
@@ -174,6 +187,30 @@ the final socket address alone. A custom `--socket` does not move the local
 usage-diagnostics socket: use a shorter home if those controls are unavailable.
 Regular control continues when the optional diagnostics socket cannot bind.
 Keep the existing directory and socket permissions.
+
+### Startup failures
+
+A failed start prints one line, `wn-agent: startup failed code=<code> detail=<message>`, sometimes followed by
+`io_kind=` or `reason=`. The line never contains paths, account ids or relay URLs.
+
+| Code and detail | Cause | Fix |
+| --- | --- | --- |
+| `missing_relay_lists` | The account has no usable relay lists and the daemon cannot publish them: it has no relays (`--no-default-relays` with no `--relay` or `MARMOT_RELAYS`), or the account published an empty list or a kind 10002 with no write relay, which the daemon will not replace. | Pass `--relay` or set `MARMOT_RELAYS`, or publish complete lists from another client. |
+| `relay_list_inconclusive` | An account with no cached relay lists started, and a relay did not answer the read, so the daemon could not tell whether the lists exist. Nothing was published. | Start again when the relays are reachable, or remove the relay that does not answer. |
+| `invalid_relay_url reason=<reason>` | A `--relay` or `MARMOT_RELAYS` value is not usable, for example `reason=unsupported_scheme` for a `ws://` URL. | Fix the value. Loopback `ws://` relays need `--allow-loopback-relays` (development only). |
+| `io_error detail=the control socket directory must not be world-accessible…` `io_kind=PermissionDenied` | `--socket` puts the socket in a directory other users can enter, such as a `0755` home. The daemon creates and restricts only `<home>/dev`, and keeps the mode of any other directory. | Omit `--socket` to use `<home>/dev/wn-agent.sock`, or `chmod 0700` the socket's directory. |
+| `io_error detail=the control socket directory is group-writable…` | The socket's directory is group-writable and `--socket-dir-mode` is not. | `chmod 0700` or `0750` the directory, or pass `--socket-dir-mode 0770` with `--auth-token-file`. |
+| `io_error detail=the control socket directory must be owned by the service user or root` | Another user owns the socket's directory. | Run the daemon as that directory's owner, or choose another `--socket`. |
+| `io_error detail=the control socket path exists and is not a Unix socket…` | A file or directory is where the socket belongs. The daemon leaves it in place. | Move it, or choose another `--socket`. |
+| `io_error detail=the control socket is already in use…` | Another `wn-agent` is serving that socket. | Stop that daemon, or choose another `--home` or `--socket`. |
+| `unsafe_control_plane_config reason=non-default socket modes require an auth token` | `--socket-dir-mode` or `--socket-mode` differs from the defaults without a bearer token. | Pass `--auth-token-file`, or keep the default modes. |
+| `socket_path_too_long` | The socket path, with the room the private bind needs, exceeds the platform limit. | Shorten `--home` or `--socket` (see above). |
+
+A daemon that starts and answers on its socket is running locally. That alone does not show that encrypted messages
+reach the phone.
+
+[`wn-agent doctor`](#check-the-setup) checks this setup without starting or changing anything, and names a next step for
+each problem it finds.
 
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
@@ -194,15 +231,38 @@ To keep an existing Nostr identity instead of generating one, import it before b
 entry), optionally pinned with `--expected-identity <npub-or-hex>`.
 
 Other daemon flags: `--socket`, `--socket-dir-mode` (default `0700`), `--socket-mode` (default `0600`),
-`--auth-token-file`, and `--max-connections` (default 64). Development-only flags `--insecure-local-broker` (literal
-loopback `quic://` candidates without certificate verification) and `--allow-loopback-relays` (loopback relays only;
-private, link-local, and CGNAT stay rejected) must not be used in production.
+`--auth-token-file`, `--max-connections` (default 64), and `--no-default-relays`. Development-only flags
+`--insecure-local-broker` (literal loopback `quic://` candidates without certificate verification) and
+`--allow-loopback-relays` (loopback relays only; private, link-local, and CGNAT stay rejected) must not be used in
+production.
 
 Check the installed or locally built version with:
 
 ```sh
 wn-agent --version
 ```
+
+## Check the setup
+
+`wn-agent doctor` checks a connector setup without changing anything:
+
+```sh
+wn-agent doctor --home ~/.marmot-agent
+```
+
+It prints one line per check, each with a status (`ok`, `warn`, `fail` or `unknown`) and a next step, and exits
+nonzero when any check fails. Local checks cover the home directory, the socket directory and socket path, the token
+file, how many relays `wn-agent` would use and where they come from, the local-signing accounts and the account file
+modes. When the daemon answers, it also reports the protocol version, this device's KeyPackage, relay health and
+inbound catch-up from `diagnostic_status`.
+
+`--home`, `--socket`, `--auth-token-file` and the `MARMOT_*` variables resolve as they do for `bootstrap`. Pass the same
+`--relay`, `--no-default-relays` and `--socket-dir-mode` values you give the daemon. `--json` prints the same checks for
+scripts; each check has a stable `id`.
+
+The output contains no paths, account ids, public keys, relay URLs, group ids or tokens, so you can paste it into a
+support chat. A passing doctor shows the connector is set up and reachable, not that messages are delivered: send a test
+message from the phone app to confirm that.
 
 ## Invite policy
 
@@ -332,5 +392,6 @@ unconfirmed transport or protocol outcome is unknown, never an automatic retry.
 
 The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
 current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
-Claude Code, Codex, OpenCode, Pi, and Goose. Connector-specific configuration, manual setup, security notes, and development
-workflows live in each integration README under [`integrations/`](../../integrations/README.md).
+Claude Code, Codex, OpenCode, Pi, and Goose, plus the connector-only install for your own client. Connector-specific
+configuration, manual setup, security notes, and development workflows live in each integration README under
+[`integrations/`](../../integrations/README.md).

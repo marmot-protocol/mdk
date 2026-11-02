@@ -1,5 +1,11 @@
 # Every relay and HTTP client must follow the process SOCKS5 policy.
 # Build them through `crate::network_proxy` instead.
+#
+# Every account publisher must refuse once the account's device group unlinks
+# this device (mdk#2628 D67). Build account publishers only through
+# `MarmotApp::relay_client_for_account_id`, which gates them. The one
+# anonymous publisher (moderation reports) and the push-trigger funnel check
+# the unlink themselves and allow these lints there.
 disallowed-methods = [
     { path = "nostr_sdk::client::Client::builder", reason = "use crate::network_proxy::nostr_builder()" },
     { path = "nostr_sdk::client::Client::new", reason = "use crate::network_proxy::nostr_builder()" },
@@ -8,4 +14,9 @@ disallowed-methods = [
     { path = "reqwest::Client::new", reason = "wrap with crate::network_proxy::http_builder()" },
     { path = "reqwest::ClientBuilder::new", reason = "wrap with crate::network_proxy::http_builder()" },
     { path = "reqwest::get", reason = "wrap with crate::network_proxy::http_builder()" },
+    { path = "transport_nostr::MarmotRelayPlane::account_publish_client", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
+    { path = "transport_nostr::MarmotRelayPlaneAccountAdapter::publish_signed_event", reason = "publish push triggers through Client::publish_notification_trigger_tokens, which refuses an unlinked account" },
+    { path = "transport_nostr_adapter::NostrSdkRelayClient::new", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
+    { path = "transport_nostr_adapter::NostrSdkRelayClient::from_builder", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
+    { path = "transport_nostr_adapter::NostrSdkRelayClient::with_account_signer", reason = "use MarmotApp::relay_client_for_account_id, which refuses an unlinked account" },
 ]

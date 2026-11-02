@@ -161,70 +161,54 @@ pub(crate) fn epoch_key_pairs_id_legacy(
 mod tests {
     use super::*;
 
+    /// Pins every label's buffer class: a secret label flipped to public
+    /// would put key material in ordinary heap buffers, and a new label
+    /// fails here until it is classified.
     #[test]
-    fn secret_bearing_openmls_labels_require_zeroizing_buffers() {
-        let secret_labels = [
-            KEY_PACKAGE_LABEL,
-            PSK_LABEL,
-            ENCRYPTION_KEY_PAIR_LABEL,
-            SIGNATURE_KEY_PAIR_LABEL,
-            EPOCH_KEY_PAIRS_LABEL,
-            APPLICATION_EXPORT_TREE_LABEL,
-            GROUP_STATE_LABEL,
-            EPOCH_SECRETS_LABEL,
-            RESUMPTION_PSK_STORE_LABEL,
-            MESSAGE_SECRETS_LABEL,
+    fn every_openmls_label_pins_its_buffer_sensitivity() {
+        use ValueSensitivity::{Public, Secret};
+        let expected = [
+            (KEY_PACKAGE_LABEL, Secret),
+            (PSK_LABEL, Secret),
+            (ENCRYPTION_KEY_PAIR_LABEL, Secret),
+            (SIGNATURE_KEY_PAIR_LABEL, Secret),
+            (EPOCH_KEY_PAIRS_LABEL, Secret),
+            (TREE_LABEL, Public),
+            (GROUP_CONTEXT_LABEL, Public),
+            (APPLICATION_EXPORT_TREE_LABEL, Secret),
+            (INTERIM_TRANSCRIPT_HASH_LABEL, Public),
+            (CONFIRMATION_TAG_LABEL, Public),
+            (JOIN_CONFIG_LABEL, Public),
+            (OWN_LEAF_NODES_LABEL, Public),
+            (GROUP_STATE_LABEL, Secret),
+            (QUEUED_PROPOSAL_LABEL, Public),
+            (PROPOSAL_QUEUE_REFS_LABEL, Public),
+            (OWN_LEAF_NODE_INDEX_LABEL, Public),
+            (EPOCH_SECRETS_LABEL, Secret),
+            (RESUMPTION_PSK_STORE_LABEL, Secret),
+            (MESSAGE_SECRETS_LABEL, Secret),
         ];
-        for label in secret_labels {
-            assert_eq!(label.sensitivity(), ValueSensitivity::Secret);
-        }
-
         assert_eq!(
-            ALL_LABELS
-                .iter()
-                .filter(|label| label.sensitivity() == ValueSensitivity::Secret)
-                .count(),
-            secret_labels.len(),
-            "the secret-label test list must exhaust the label registry"
+            ALL_LABELS.len(),
+            expected.len(),
+            "the table must exhaust the label registry"
         );
-        for label in ALL_LABELS
-            .iter()
-            .filter(|label| label.sensitivity() == ValueSensitivity::Secret)
-        {
-            assert!(secret_labels.contains(label));
+        for label in ALL_LABELS {
+            assert!(
+                expected
+                    .iter()
+                    .any(|(listed, _)| listed.as_bytes() == label.as_bytes()),
+                "{:?} is missing from the table",
+                String::from_utf8_lossy(label.as_bytes())
+            );
         }
-    }
-
-    #[test]
-    fn public_only_openmls_labels_keep_ordinary_buffers() {
-        let public_labels = [
-            TREE_LABEL,
-            GROUP_CONTEXT_LABEL,
-            INTERIM_TRANSCRIPT_HASH_LABEL,
-            CONFIRMATION_TAG_LABEL,
-            JOIN_CONFIG_LABEL,
-            OWN_LEAF_NODES_LABEL,
-            QUEUED_PROPOSAL_LABEL,
-            PROPOSAL_QUEUE_REFS_LABEL,
-            OWN_LEAF_NODE_INDEX_LABEL,
-        ];
-        for label in public_labels {
-            assert_eq!(label.sensitivity(), ValueSensitivity::Public);
-        }
-
-        assert_eq!(
-            ALL_LABELS
-                .iter()
-                .filter(|label| label.sensitivity() == ValueSensitivity::Public)
-                .count(),
-            public_labels.len(),
-            "the public-label test list must exhaust the label registry"
-        );
-        for label in ALL_LABELS
-            .iter()
-            .filter(|label| label.sensitivity() == ValueSensitivity::Public)
-        {
-            assert!(public_labels.contains(label));
+        for (label, sensitivity) in expected {
+            assert_eq!(
+                label.sensitivity(),
+                sensitivity,
+                "{:?}",
+                String::from_utf8_lossy(label.as_bytes())
+            );
         }
     }
 }

@@ -5,7 +5,7 @@
 //! signing key.
 
 use cgka_traits::error::EngineError;
-use cgka_traits::group::ProtocolProfile;
+use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
@@ -134,9 +134,12 @@ impl Identity {
         self.account_identity_proof.protocol_profile()
     }
 
+    /// Extensions for a new own LeafNode, carrying `device_tag` when this
+    /// device can tag.
     pub(crate) fn leaf_extensions(
         &self,
         supported_app_components: &cgka_traits::app_components::AppComponentSet,
+        device_tag: Option<Vec<u8>>,
     ) -> Result<Extensions<LeafNode>, EngineError> {
         let extensions = match &self.account_identity_proof {
             crate::account_identity_proof::AccountIdentityProofMaterial::LegacyExtension(
@@ -145,6 +148,7 @@ impl Identity {
                 crate::app_components::leaf_app_components_extension(
                     supported_app_components,
                     None,
+                    device_tag,
                 )?,
                 extension.clone(),
             ],
@@ -153,6 +157,7 @@ impl Identity {
             ) => vec![crate::app_components::leaf_app_components_extension(
                 supported_app_components,
                 Some(component),
+                device_tag,
             )?],
         };
         Extensions::from_vec(extensions)
@@ -171,10 +176,10 @@ fn storage_err<T>(result: StorageResult<T>) -> Result<T, String> {
 /// x-only secp256k1 (BIP-340) public key, i.e. a field element `x < p` that
 /// lifts to a point on secp256k1.
 ///
-/// We validate with `k256::schnorr::VerifyingKey::from_bytes`, which performs
-/// the BIP-340 `lift_x` decompaction and on-curve check. The length check is
-/// performed first because the underlying field-element parser expects exactly
-/// 32 bytes.
+/// We validate with `k256::schnorr::VerifyingKey::from_slice`, which performs
+/// the BIP-340 `lift_x` decompaction and on-curve check. The explicit length
+/// check comes first so the error names the length; `from_slice` would also
+/// reject anything but 32 bytes.
 pub(crate) fn validate_credential_identity(identity: &[u8]) -> Result<(), EngineError> {
     if identity.len() != 32 {
         return Err(EngineError::InvalidCredentialIdentity(format!(
@@ -182,7 +187,7 @@ pub(crate) fn validate_credential_identity(identity: &[u8]) -> Result<(), Engine
             identity.len()
         )));
     }
-    k256::schnorr::VerifyingKey::from_bytes(identity).map_err(|_| {
+    k256::schnorr::VerifyingKey::from_slice(identity).map_err(|_| {
         EngineError::InvalidCredentialIdentity(
             "credential identity is not a valid x-only secp256k1 public key".to_string(),
         )
@@ -256,6 +261,15 @@ pub(crate) fn local_leaf_is_active(group: &MlsGroup, identity: &MemberId) -> boo
         })
 }
 
+/// Whether this device's local copy is still a member: its removal is not realized and the
+/// record lists its account. `removed` is set exactly when this device's own leaf leaves,
+/// while a sibling device's leaf keeps the account on the roster, so the roster alone never
+/// answers this. A copy whose leaf is gone but whose removal is not yet realized still
+/// counts, so realization can read its leave request.
+pub(crate) fn local_copy_is_member(record: &Group, identity: &MemberId) -> bool {
+    !record.removed && record.members.iter().any(|member| &member.id == identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_credential_identity;
@@ -271,7 +285,7 @@ mod tests {
             sha2::Digest::update(&mut hasher, seed);
             sha2::Digest::update(&mut hasher, counter.to_be_bytes());
             material.copy_from_slice(&sha2::Digest::finalize(hasher));
-            if let Ok(sk) = SigningKey::from_bytes(&material) {
+            if let Ok(sk) = SigningKey::from_slice(&material) {
                 return sk.verifying_key().to_bytes().into();
             }
             counter += 1;

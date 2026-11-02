@@ -141,7 +141,9 @@ MDK exposes typed errors for the client-significant external signer states:
 - `ExternalSignerMismatch`: the registered signer returned a different public
   key than the account being opened.
 - `ExternalSignerRejected`: the user rejected/cancelled an external signer
-  prompt.
+  prompt. MDK reports it the same way wherever the rejection happens: opening
+  the account, signing an identity proof for a KeyPackage or group change, or
+  publishing an event.
 
 Other callback failures may surface as runtime, publish, or transport failures,
 especially if the Nostr SDK erases the original signer error while publishing to

@@ -8,7 +8,8 @@ pub struct AttachmentTransferSubscription {
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
 impl AttachmentTransferSubscription {
-    /// Initial snapshot, then coalesced replacements. None means closed. Errors
+    /// Initial snapshot, then replacements: a transfer state change at once,
+    /// progress-only changes at most four per second. None means closed. Errors
     /// terminate this observation; close/drop never cancels acquisition.
     #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, MarmotKitError> {

@@ -12,8 +12,9 @@ status: implemented-first-slice
 should create a `MarmotAppRuntime` and send it intents. The runtime owns accounts, shared directory state, relay
 subscriptions, projections, and typed event streams.
 
-The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `cgka-session` owns
-one account-device session. `marmot-account` coordinates a session with transport and publish confirmation.
+The lower crates already point in this direction. `cgka-engine` owns convergence and engine state. `marmot-session` owns
+one account-device session and the runtime that coordinates it with transport and publish confirmation.
+`marmot-account` owns account identity, files and secrets.
 `marmot-app` is the place where those pieces become a product runtime.
 
 ## Shape
@@ -307,8 +308,9 @@ The remaining work is narrower than the original refactor, but still real:
 
 - `crates/traits`: shared transport, engine, app payload, and event types.
 - `crates/cgka-engine`: OpenMLS-backed engine and convergence.
-- `crates/cgka-session`: one encrypted account-device session.
-- `crates/marmot-account`: account/session coordinator for publish-before-apply and transport activation.
+- `crates/marmot-session`: one encrypted account-device session, and the account/session coordinator for
+  publish-before-apply and transport activation.
+- `crates/marmot-account`: account identity, files and secrets.
 - `crates/marmot-app`: multi-account runtime, shared services, projections, app events.
 - `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.

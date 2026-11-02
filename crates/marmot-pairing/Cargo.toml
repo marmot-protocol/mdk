@@ -1,0 +1,29 @@
+[package]
+name = "marmot-pairing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Device pairing for one Marmot account: the short-authentication-string exchange that links a new device, transport-neutral."
+
+[dependencies]
+cgka-traits.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# This crate's own integration tests pin keys through `test-support`.
+marmot-pairing = { workspace = true, features = ["test-support"] }
+
+[features]
+# Pins ephemeral keys and session ids for dependents' tests. Release builds
+# never enable it.
+test-support = []

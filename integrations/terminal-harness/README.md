@@ -477,6 +477,7 @@ just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
 just goose-installer-test
+just wn-agent-installer-test
 ```
 
 The process-level connector tests are ignored by default and use real

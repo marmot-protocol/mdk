@@ -5,8 +5,10 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    APP_OWNED_APP_COMPONENT_ID_START, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID,
+    APP_OWNED_APP_COMPONENT_ID_START, AccountEntryV1, AppComponentData, AppComponentId,
+    DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1, DeviceRosterUpdateV1,
+    DeviceSlotId, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    RejectedSlotReasonV1, decode_device_roster_update_v1, encode_device_roster_update_v1,
 };
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -14,9 +16,8 @@ use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId};
-use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
-use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{KeyPackage as MlsKeyPackage, LeafNodeIndex, MlsMessageOut};
 use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
@@ -69,6 +70,147 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
     ) -> Result<SendResult, EngineError> {
+        self.do_send_app_data_updates(group_id, updates, Vec::new())
+            .await
+    }
+
+    /// Stage a [`cgka_traits::engine::SendIntent::RecordRemovedSlot`]: one
+    /// roster `SetRejectedSlot` with reason `removed` and a tag signature
+    /// key, in a group that requires the roster, for a slot the roster lists
+    /// neither as a device nor as a rejected slot (mdk#2761). It goes out as a component update; its
+    /// intent kind is what keeps it out of the queue and out of re-issue.
+    /// Like an unlink, it is refused with
+    /// [`EngineError::LinkDeviceUnsettled`] while a Commit is in flight.
+    pub(crate) async fn do_send_record_removed_slot(
+        &mut self,
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        if self
+            .epoch_manager
+            .state(&group_id)
+            .is_some_and(|state| !matches!(state, EpochState::Stable { .. }))
+        {
+            return Err(EngineError::LinkDeviceUnsettled { group_id });
+        }
+        let update = decode_device_roster_update_v1(&roster_update).map_err(|error| {
+            EngineError::Serialize(format!("invalid device roster update: {error}"))
+        })?;
+        let [DeviceRosterOperationV1::SetRejectedSlot(slot, record)] = update.operations() else {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: it must set exactly one rejected slot".into(),
+            ));
+        };
+        if record.reason != RejectedSlotReasonV1::Removed || record.tag_signature_key.is_none() {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: it has reason removed and keeps a tag signature key"
+                    .into(),
+            ));
+        }
+        let held = self.with_mls_group(&group_id, |mls_group| {
+            if !crate::app_components::group_requires_device_roster(mls_group)? {
+                return Err(EngineError::InvalidTransition(
+                    cgka_traits::engine_state::InvalidTransition {
+                        from: "DeviceRosterNotRequired",
+                        to: "record_removed_slot",
+                        reason: "the group does not require marmot.account.device-roster.v1",
+                    },
+                ));
+            }
+            Ok(
+                crate::app_components::device_roster_of_group(mls_group).is_some_and(|roster| {
+                    roster.devices.contains_key(slot) || roster.rejected_slots.contains_key(slot)
+                }),
+            )
+        })?;
+        if held {
+            return Err(EngineError::Other(
+                "invalid removed-slot record: the roster already holds the slot".into(),
+            ));
+        }
+        self.do_send_update_app_components(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: roster_update,
+            }],
+        )
+        .await
+    }
+
+    /// Stage a [`cgka_traits::engine::SendIntent::ReplaceDeviceEntry`]: one
+    /// roster `SetDevice` of `slot`, only while the roster still holds
+    /// `expected` there. A direct send, a drained queued copy and a re-issue
+    /// after a lost fork are all prepared here, so an entry computed from an
+    /// older read never replaces a newer one.
+    pub(crate) async fn do_send_replace_device_entry(
+        &mut self,
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: DeviceEntryV1,
+        entry: DeviceEntryV1,
+    ) -> Result<SendResult, EngineError> {
+        let current = self.with_mls_group(&group_id, |mls_group| {
+            Ok(crate::app_components::device_entry_of_group(
+                mls_group, &slot,
+            ))
+        })?;
+        if current.as_ref() != Some(&expected) {
+            return Err(EngineError::DeviceEntryChanged { group_id });
+        }
+        let update =
+            DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(slot, entry)])
+                .and_then(|update| encode_device_roster_update_v1(&update))
+                .map_err(EngineError::Serialize)?;
+        self.do_send_update_app_components(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        )
+        .await
+    }
+
+    /// Stage a [`cgka_traits::engine::SendIntent::ReplaceAccountEntry`]: one
+    /// roster `SetAccount`, only while the roster still holds `expected` as
+    /// its account entry, compared wherever the Commit is prepared, as for
+    /// [`Self::do_send_replace_device_entry`].
+    pub(crate) async fn do_send_replace_account_entry(
+        &mut self,
+        group_id: GroupId,
+        expected: AccountEntryV1,
+        entry: AccountEntryV1,
+    ) -> Result<SendResult, EngineError> {
+        let current = self.with_mls_group(&group_id, |mls_group| {
+            Ok(crate::app_components::account_entry_of_group(mls_group))
+        })?;
+        if current.as_ref() != Some(&expected) {
+            return Err(EngineError::AccountEntryChanged { group_id });
+        }
+        let update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetAccount(entry)])
+            .and_then(|update| encode_device_roster_update_v1(&update))
+            .map_err(EngineError::Serialize)?;
+        self.do_send_update_app_components(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+        )
+        .await
+    }
+
+    /// Stage one admin Commit that sets each of `updates` and removes each of
+    /// `removals`. [`Self::do_send_update_app_components`] sends updates only;
+    /// account-devices activation also removes an entry its component never
+    /// defined ([`crate::account_devices_activation`]).
+    pub(crate) async fn do_send_app_data_updates(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+        removals: Vec<AppComponentId>,
+    ) -> Result<SendResult, EngineError> {
         if updates.is_empty() {
             return Err(EngineError::Other(
                 "UpdateAppComponents requires at least one component update".into(),
@@ -88,6 +230,13 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let mut seen = BTreeSet::new();
+        for component_id in &removals {
+            if !seen.insert(*component_id) {
+                return Err(EngineError::Other(
+                    "UpdateAppComponents contains duplicate component ids".into(),
+                ));
+            }
+        }
         for update in &updates {
             if !seen.insert(update.component_id) {
                 return Err(EngineError::Other(
@@ -104,6 +253,7 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                 });
             }
+            crate::app_components::refuse_local_group_context_entry(update.component_id)?;
             crate::app_components::validate_app_component_update(update)?;
         }
 
@@ -181,6 +331,9 @@ impl<S: StorageProvider> Engine<S> {
                     update.data.clone(),
                 )))
             })
+            .chain(removals.iter().map(|component_id| {
+                Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::remove(*component_id)))
+            }))
             .collect::<Vec<_>>();
         let commit_out = self
             .stage_commit_with_app_data_updates(
@@ -195,6 +348,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group.pending_commit().ok_or_else(|| {
             EngineError::Backend("app data update produced no pending commit".into())
         })?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
             staged_commit,
             &mls_group,
@@ -327,7 +486,7 @@ impl<S: StorageProvider> Engine<S> {
     /// removal path in `do_send_remove_members`, and invite-with-admin Adds.
     /// `context` prefixes error messages so failures stay attributable to the
     /// calling intent. Returns the commit and, when Adds were staged, the
-    /// Welcome.
+    /// Welcome. The commit also takes every proposal pending in the store.
     pub(crate) fn stage_commit_with_app_data_updates(
         &self,
         mls_group: &mut MlsGroup,
@@ -335,6 +494,41 @@ impl<S: StorageProvider> Engine<S> {
         removals: Vec<LeafNodeIndex>,
         adds: Vec<MlsKeyPackage>,
         proposals: Vec<Proposal>,
+        context: &str,
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        self.stage_app_data_commit(
+            mls_group, provider, removals, adds, proposals, true, context,
+        )
+    }
+
+    /// [`Self::stage_commit_with_app_data_updates`] for a commit that carries
+    /// only the given proposals, by value: proposals pending in the store
+    /// stay there. The link Commit and its undo use it, so linking or
+    /// unlinking one device never executes another member's queued Add,
+    /// Remove or roster update.
+    pub(crate) fn stage_exact_commit_with_app_data_updates(
+        &self,
+        mls_group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        removals: Vec<LeafNodeIndex>,
+        adds: Vec<MlsKeyPackage>,
+        proposals: Vec<Proposal>,
+        context: &str,
+    ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        self.stage_app_data_commit(
+            mls_group, provider, removals, adds, proposals, false, context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_app_data_commit(
+        &self,
+        mls_group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        removals: Vec<LeafNodeIndex>,
+        adds: Vec<MlsKeyPackage>,
+        proposals: Vec<Proposal>,
+        consume_pending: bool,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         // Validate the proposal set as one operation. In particular, removal
@@ -347,11 +541,18 @@ impl<S: StorageProvider> Engine<S> {
                 _ => None,
             }),
         )?;
+        let roster_required = crate::app_components::group_requires_device_roster(mls_group)?;
+        // The roster `proposals` leave decides whether a Commit that sets this
+        // device's own tag key tags its UpdatePath leaf; one another member's
+        // pending proposal changes as well is not foreseen here.
+        let leaf_node_parameters = self.own_commit_leaf_parameters(mls_group, &proposals)?;
         let mut builder = mls_group
             .commit_builder()
+            .consume_proposal_store(consume_pending)
             .propose_removals(removals)
             .propose_adds(adds)
             .add_proposals(proposals)
+            .leaf_node_parameters(leaf_node_parameters)
             .load_psks(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
                     provider,
@@ -359,19 +560,11 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|e| EngineError::Backend(format!("{context} load_psks: {e:?}")))?;
         let mut app_data = builder.app_data_dictionary_updater();
-        for proposal in builder.app_data_update_proposals() {
-            match proposal.operation() {
-                AppDataUpdateOperation::Update(data) => {
-                    app_data.set(ComponentData::from_parts(
-                        proposal.component_id(),
-                        data.clone(),
-                    ));
-                }
-                AppDataUpdateOperation::Remove => {
-                    app_data.remove(&proposal.component_id());
-                }
-            }
-        }
+        crate::app_components::apply_app_data_updates(
+            roster_required,
+            &mut app_data,
+            builder.app_data_update_proposals(),
+        )?;
         builder.with_app_data_dictionary_updates(app_data.changes());
         let commit_bundle = builder
             .build(

@@ -1,0 +1,211 @@
+{
+  "scenario_name": "account-devices-founding/v1",
+  "vector_version": "1",
+  "conformance_version": "0.15.0-dev",
+  "seed": null,
+  "application_profile": {
+    "name": "current",
+    "required_group_context_extensions": [
+      "0x0006"
+    ],
+    "required_proposals": [
+      "0x0008"
+    ],
+    "required_app_components": [
+      "0x8003",
+      "0x8009"
+    ],
+    "required_group_context_state_components": [
+      "0x8003"
+    ],
+    "leaf_only_app_components": [
+      "0x8009"
+    ]
+  },
+  "scenario": {
+    "name": "account-devices-founding/v1",
+    "spec_version": "3",
+    "clients": [
+      "alice",
+      "bob-phone",
+      "bob-laptop"
+    ],
+    "topology": {
+      "accounts": [
+        {
+          "id": "alice",
+          "roles": [
+            "member"
+          ]
+        },
+        {
+          "id": "bob",
+          "roles": [
+            "member"
+          ]
+        }
+      ],
+      "devices": [
+        {
+          "id": "device:alice",
+          "account": "alice",
+          "process": "process:alice",
+          "client": "alice"
+        },
+        {
+          "id": "device:bob-phone",
+          "account": "bob",
+          "process": "process:bob-phone",
+          "client": "bob-phone"
+        },
+        {
+          "id": "device:bob-laptop",
+          "account": "bob",
+          "process": "process:bob-laptop",
+          "client": "bob-laptop"
+        }
+      ],
+      "processes": [
+        {
+          "id": "process:alice",
+          "binary_version": "mdk-test",
+          "policy_version": "marmot-convergence-v1"
+        },
+        {
+          "id": "process:bob-phone",
+          "binary_version": "mdk-test",
+          "policy_version": "marmot-convergence-v1"
+        },
+        {
+          "id": "process:bob-laptop",
+          "binary_version": "mdk-test",
+          "policy_version": "marmot-convergence-v1"
+        }
+      ]
+    },
+    "steps": [
+      {
+        "type": "set_account_devices_support",
+        "client": "alice",
+        "supported": true
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob-phone",
+        "supported": true
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob-laptop",
+        "supported": true
+      },
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "devices",
+        "invitees": [
+          "bob-phone",
+          "bob-laptop"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "alice"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "selection": "welcome",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob-phone",
+          "bob-laptop"
+        ]
+      },
+      {
+        "type": "remove_own_account_devices",
+        "client": "bob-laptop",
+        "devices": [
+          "bob-phone"
+        ],
+        "pending": "remove-phone"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob-laptop",
+        "publication": "remove-phone",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob-phone",
+          "bob-laptop"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob-laptop"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob-laptop",
+      "pending": "remove-phone",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 2,
+      "member_count": 2
+    },
+    {
+      "type": "client_state",
+      "client": "bob-laptop",
+      "epoch": 2,
+      "member_count": 2
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob-laptop"
+      ]
+    },
+    {
+      "type": "account_devices_state",
+      "client": "alice",
+      "required": true
+    },
+    {
+      "type": "account_devices_state",
+      "client": "bob-laptop",
+      "required": true
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob-laptop"
+      ]
+    }
+  ]
+}

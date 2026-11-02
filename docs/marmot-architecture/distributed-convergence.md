@@ -100,7 +100,11 @@ stateDiagram-v2
     Syncing --> Syncing: queue outbound intents
 ```
 
-During `Syncing`, `Resolving`, or `Blocked`, outbound app messages and group changes are queued as local intents.
+During `Syncing`, `Resolving`, or `Blocked`, outbound app messages and group changes are queued as local intents. A
+send made after the group settles still queues while an earlier intent waits for the drain, so a sender's application
+messages are prepared in the order they were made and its generations follow its send order (mdk#2842). Only the
+fairness attempt after a pass, a requested disband and the engine's own maintenance commits let a group change go
+ahead of them.
 App-message intents are encrypted after convergence settles against the selected canonical state. Commit intents are
 regenerated after convergence settles because any pending MLS state
 created before sync may have been based on a stale epoch.
@@ -170,8 +174,9 @@ longer matches the record it was admitted from is an integrity failure, and that
 
 The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier
 cutoff. After a completed pass, one persisted, already-queued admin group-state intent receives one preparation attempt
-before an inbound-only follow-up generation. App messages, leave work, and automatic maintenance do not consume that
-slot; a failed preparation cannot hold it indefinitely.
+before an inbound-only follow-up generation. In a group that requires `marmot.group.account-devices.v1`, a queued
+same-account intent (adding or removing the sender's own devices) receives the same attempt. App messages, leave work,
+self-updates, and automatic maintenance do not consume that slot; a failed preparation cannot hold it indefinitely.
 
 ## Branch Selection
 
@@ -208,6 +213,10 @@ Branches are compared in this order:
 4. Prefer a `Privileged` tip commit over an `Ordinary` one.
 5. Lower authenticated tip committer account id.
 6. Lower tip commit digest.
+
+A tip is `Privileged` exactly when its Commit needs an admin committer (`cgka_engine::commit_class`). Self-updates,
+SelfRemove-only Commits and, in a group that requires `marmot.group.account-devices.v1`, Commits that only add or remove
+the committer's own account's leaves are `Ordinary`, whoever commits them.
 
 `valid_commit_depth` remains a score diagnostic and an input to effective depth. It has no separate comparison step:
 when effective depth and quorum status tie, raw depth is necessarily tied as well.

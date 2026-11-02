@@ -367,7 +367,7 @@ impl MarmotAppRuntime {
                         &account.account_id_hex,
                         &hex::encode(group.as_slice()),
                         &accepted.message_id_hex,
-                        &shared.app_performance_telemetry(),
+                        shared.observer.performance(),
                     );
                 }
             }

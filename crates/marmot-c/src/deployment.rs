@@ -189,30 +189,6 @@ pub unsafe extern "C" fn marmot_deployment_set_open_ranking(
     }
 }
 
-/// Replace the KeyPackage `client` tags ranked first and ranked last.
-/// # Safety
-/// deployment must be live; each list must point to its length of valid strings (or be NULL with 0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_deployment_set_key_package_client_preference(
-    deployment: *mut MarmotDeployment,
-    preferred: *const *const c_char,
-    preferred_len: usize,
-    last: *const *const c_char,
-    last_len: usize,
-) -> MarmotStatus {
-    unsafe {
-        edit(deployment, |inner| {
-            // Read both lists before changing either, so a failure leaves the
-            // handle as it was.
-            let preferred = str_array(preferred, preferred_len)?;
-            let last = str_array(last, last_len)?;
-            inner.key_package_preferred_clients = preferred;
-            inner.key_package_last_clients = last;
-            Ok(())
-        })
-    }
-}
-
 /// Set the NIP-32 namespace on moderation report labels; NULL unsets it, and
 /// reporting then refuses a destination.
 /// # Safety
@@ -333,16 +309,6 @@ mod tests {
                 MarmotStatus::Ok
             );
             assert_eq!(
-                marmot_deployment_set_key_package_client_preference(
-                    deployment,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    0
-                ),
-                MarmotStatus::Ok
-            );
-            assert_eq!(
                 marmot_deployment_set_moderation_label_namespace(deployment, namespace.as_ptr()),
                 MarmotStatus::Ok
             );
@@ -360,7 +326,6 @@ mod tests {
             );
             assert_eq!(inner.profile_image_endpoint, None);
             assert_eq!(inner.open_ranking, None);
-            assert!(inner.key_package_preferred_clients.is_empty());
             assert_eq!(
                 inner.moderation_label_namespace.as_deref(),
                 Some("org.example.report")
@@ -395,33 +360,6 @@ mod tests {
             );
             marmot_deployment_free(deployment);
             marmot_deployment_free(std::ptr::null_mut());
-        }
-    }
-
-    #[test]
-    fn a_failed_preference_setter_leaves_both_lists_unchanged() {
-        // Handles count against the process-wide allocation audit.
-        let _guard = crate::memory::audit::test_lock();
-        let deployment = white_noise();
-        let preferred = CString::new("other").unwrap();
-        let preferred = [preferred.as_ptr()];
-        let invalid = [0xff_u8, 0];
-        let last = [invalid.as_ptr().cast::<c_char>()];
-        unsafe {
-            assert_eq!(
-                marmot_deployment_set_key_package_client_preference(
-                    deployment,
-                    preferred.as_ptr(),
-                    1,
-                    last.as_ptr(),
-                    1
-                ),
-                MarmotStatus::InvalidUtf8
-            );
-            let inner = &(*deployment).inner;
-            assert_eq!(inner.key_package_preferred_clients, ["whitenoise"]);
-            assert_eq!(inner.key_package_last_clients, ["amethyst"]);
-            marmot_deployment_free(deployment);
         }
     }
 }

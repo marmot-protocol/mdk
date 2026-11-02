@@ -15,9 +15,10 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{GroupId, MemberId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use nostr::nips::nip59::UnwrappedGift;
 use nostr::prelude::{
     Event, EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl,
     Tag, Timestamp as NostrTimestamp, UnsignedEvent,
@@ -46,6 +47,29 @@ const GROUP_AAD: &[u8] = b"";
 pub struct WelcomePeelProvenance {
     pub rumor_event_id: [u8; 32],
     pub key_package_event_id: [u8; 32],
+}
+
+/// A gift wrap to the account, opened once.
+#[derive(Debug)]
+pub enum AccountGiftWrap {
+    /// A Welcome rumor, peeled and validated.
+    Welcome(Box<PeeledMessage>, WelcomePeelProvenance),
+    /// Any other rumor. NIP-59 verified the wrap and seal and matched the
+    /// rumor's author to the seal's; nothing else about it is checked.
+    Other(Box<UnwrappedGift>),
+}
+
+impl AccountGiftWrap {
+    /// The Welcome, or the error a Welcome peel returns for any other rumor.
+    pub fn into_welcome(self) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        match self {
+            Self::Welcome(peeled, provenance) => Ok((*peeled, provenance)),
+            Self::Other(unwrapped) => Err(PeelerError::Malformed(format!(
+                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
+                u16::from(unwrapped.rumor.kind)
+            ))),
+        }
+    }
 }
 
 /// Nostr implementation of the Marmot transport peeler.
@@ -195,6 +219,17 @@ impl NostrMlsPeeler {
         &self,
         msg: &TransportMessage,
     ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+        self.peel_account_gift_wrap(msg).await?.into_welcome()
+    }
+
+    /// Open a gift wrap to the account once. A Welcome rumor is peeled as
+    /// [`Self::peel_welcome_with_provenance`] peels it; any other rumor comes
+    /// back opened and unread, for the caller to read under its own rules
+    /// (device pairing's, for one).
+    pub async fn peel_account_gift_wrap(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<AccountGiftWrap, PeelerError> {
         let signer = self.welcome_signer()?;
         let event = NostrTransportEvent::from_transport_message(msg).map_err(to_peeler_error)?;
         if event.kind != KIND_NIP59_GIFT_WRAP {
@@ -218,10 +253,7 @@ impl NostrMlsPeeler {
                 .map_err(map_nip59_error)?;
 
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
-            return Err(PeelerError::Malformed(format!(
-                "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
-                u16::from(unwrapped.rumor.kind)
-            )));
+            return Ok(AccountGiftWrap::Other(Box::new(unwrapped)));
         }
 
         // NIP-59 verifies the signed gift wrap and seal and matches the rumor
@@ -253,17 +285,18 @@ impl NostrMlsPeeler {
             ));
         }
 
-        Ok((
-            PeeledMessage {
+        Ok(AccountGiftWrap::Welcome(
+            Box::new(PeeledMessage {
                 id: msg.id.clone(),
                 group_id: None,
                 sender: Some(MemberId::new(unwrapped.sender.to_bytes().to_vec())),
                 content: PeeledContent::Welcome {
                     created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                     bytes: welcome_bytes,
+                    key_package_event_id: Some(MessageId::new(key_package_event_id.to_vec())),
                 },
                 origin: msg.clone(),
-            },
+            }),
             WelcomePeelProvenance {
                 rumor_event_id,
                 key_package_event_id,
@@ -796,6 +829,69 @@ mod tests {
         assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
     }
 
+    /// The bound is exact for an event whose timestamps are as wide as a `u64`
+    /// allows, and holds for real wraps across base64 padding boundaries.
+    #[tokio::test]
+    async fn group_event_json_len_bound_covers_published_events() {
+        for mls_len in [0, 1, 2, 3, 100, 65_000] {
+            let widest = NostrTransportEvent {
+                id: "a".repeat(64),
+                pubkey: "b".repeat(64),
+                created_at: u64::MAX,
+                kind: KIND_MARMOT_GROUP_MESSAGE,
+                tags: vec![
+                    vec![GROUP_TAG.to_string(), "c".repeat(64)],
+                    vec![EXPIRATION_TAG.to_string(), u64::MAX.to_string()],
+                ],
+                content: BASE64_STANDARD.encode(vec![0; NOSTR_GROUP_CONTENT_MIN_LEN + mls_len]),
+                sig: Some("d".repeat(128)),
+            };
+            assert_eq!(
+                serde_json::to_vec(&widest).unwrap().len(),
+                crate::group_event_json_len_bound(mls_len),
+                "{mls_len}-byte MLS message"
+            );
+        }
+
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(vec![0x99; 32]),
+        );
+        for (mls_len, metadata) in [
+            (0, GroupMessageMetadata::commit_or_proposal()),
+            (
+                1,
+                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+            ),
+            (2, GroupMessageMetadata::application(1_700_000_000, None)),
+            (
+                65_000,
+                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+            ),
+        ] {
+            let wrapped = NostrMlsPeeler::default()
+                .wrap_group_message_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: vec![0x42; mls_len],
+                        aad: vec![],
+                    },
+                    &ctx,
+                    &metadata,
+                )
+                .await
+                .expect("wrap succeeds");
+            let event =
+                NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+            assert!(event.sig.is_some());
+            assert!(
+                serde_json::to_vec(&event).unwrap().len()
+                    <= crate::group_event_json_len_bound(mls_len),
+                "{mls_len}-byte MLS message"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn group_peel_accepts_valid_events_before_and_after_expiration() {
         let group_id = vec![0x99; 32];
@@ -1097,8 +1193,89 @@ mod tests {
             PeeledContent::Welcome {
                 created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                 bytes: b"mls welcome bytes".to_vec(),
+                // The engine decides from the `e` claim whether the delivery
+                // is addressed to this device, so it travels with the bytes.
+                key_package_event_id: Some(sample_welcome_metadata().key_package_event_id),
             }
         );
+    }
+
+    /// A one-invitee Welcome into a group of about 150 members carries about
+    /// 55 KB of MLS bytes. Its rumor and its seal both reach 65,536 bytes, so
+    /// both NIP-44 layers need the extended length prefix (#2335).
+    #[tokio::test]
+    async fn welcome_wrap_and_peel_round_trip_nip44_extended_length_payloads() {
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let welcome: Vec<u8> = (0..55_176u32).map(|i| i as u8).collect();
+
+        let wrapped = NostrMlsPeeler::new()
+            .with_welcome_signer(sender)
+            .wrap_welcome_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: welcome.clone(),
+                    aad: vec![],
+                },
+                &recipient,
+                &sample_welcome_metadata(),
+            )
+            .await
+            .expect("wrap succeeds");
+
+        let gift_wrap = NostrTransportEvent::from_transport_message(&wrapped)
+            .unwrap()
+            .to_verified_nostr_event()
+            .unwrap();
+        let seal_json = nostr::nips::nip44::decrypt(
+            receiver.secret_key(),
+            &gift_wrap.pubkey,
+            &gift_wrap.content,
+        )
+        .unwrap();
+        assert_nip44_extended_length(&gift_wrap.content, seal_json.len());
+        let seal = Event::from_json(&seal_json).unwrap();
+        let rumor_json =
+            nostr::nips::nip44::decrypt(receiver.secret_key(), &seal.pubkey, &seal.content)
+                .unwrap();
+        assert_nip44_extended_length(&seal.content, rumor_json.len());
+
+        let peeled = NostrMlsPeeler::new()
+            .with_welcome_signer(receiver)
+            .peel_welcome(&wrapped)
+            .await
+            .expect("peel succeeds");
+        assert!(matches!(
+            peeled.content,
+            PeeledContent::Welcome { ref bytes, .. } if *bytes == welcome
+        ));
+    }
+
+    /// `payload` is a NIP-44 v2 payload of a `plaintext_len`-byte plaintext
+    /// with the 6-byte extended length prefix: version, nonce, prefix, padded
+    /// plaintext and MAC.
+    #[track_caller]
+    fn assert_nip44_extended_length(payload: &str, plaintext_len: usize) {
+        assert!(plaintext_len >= 65_536, "{plaintext_len}-byte plaintext");
+        let decoded = BASE64_STANDARD.decode(payload).unwrap();
+        assert_eq!(
+            decoded.len(),
+            1 + 32 + 6 + nip44_padded_len(plaintext_len) + 32
+        );
+    }
+
+    /// NIP-44 v2 `calc_padded_len`.
+    fn nip44_padded_len(len: usize) -> usize {
+        if len <= 32 {
+            return 32;
+        }
+        let next_power = 1usize << (usize::BITS - (len - 1).leading_zeros());
+        let chunk = if next_power <= 256 {
+            32
+        } else {
+            next_power / 8
+        };
+        chunk * ((len - 1) / chunk + 1)
     }
 
     #[tokio::test]
@@ -1268,13 +1445,25 @@ mod tests {
             .to_transport_message()
             .unwrap();
 
-        let err = NostrMlsPeeler::new()
-            .with_welcome_signer(receiver)
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(receiver);
+        let err = peeler
             .peel_welcome(&wrapped)
             .await
             .expect_err("wrong rumor kind should not peel");
 
         assert!(matches!(err, PeelerError::Malformed(_)));
+
+        // Opened once as a gift wrap to the account, the rumor comes back
+        // unread, authored by the seal's signer.
+        let AccountGiftWrap::Other(unwrapped) = peeler
+            .peel_account_gift_wrap(&wrapped)
+            .await
+            .expect("an authentic gift wrap opens")
+        else {
+            panic!("a non-Welcome rumor is not a Welcome");
+        };
+        assert_eq!(unwrapped.rumor.kind, Kind::TextNote);
+        assert_eq!(unwrapped.sender, sender.public_key());
     }
 
     #[tokio::test]

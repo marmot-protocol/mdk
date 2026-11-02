@@ -137,6 +137,11 @@ pub enum InputRejectionCategory {
     /// The invitation references no private KeyPackage bundle on this device.
     /// Publish a fresh KeyPackage and request a new invitation.
     MissingWelcomeKeyPackage,
+    /// The Welcome delivery names a KeyPackage this device did not publish,
+    /// such as another device's of the same account. It is not addressed to
+    /// this device and is not a failed join (`protocol-core/joining.md`,
+    /// "Delivery").
+    NotAddressedToThisDevice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,5 +282,11 @@ pub enum PeeledContent {
         /// those Welcomes cannot cross a local group reset boundary.
         #[serde(default)]
         created_at: Option<crate::transport::Timestamp>,
+        /// The KeyPackage publication the delivery names as consumed: on
+        /// Nostr, the kind 444 rumor's `e` tag. A claim, not proof. It only
+        /// decides whether the delivery is addressed to this device. Absent on
+        /// transports that name none; the MLS Welcome alone then decides.
+        #[serde(default)]
+        key_package_event_id: Option<MessageId>,
     },
 }

@@ -378,6 +378,9 @@ pub async fn run_directory_sync_worker<
                                 request_block_reconcile(&directory, &mut block_rebuilds, &mut block_task);
                             }
                         } else {
+                            if record.event.kind == KIND_MARMOT_KEY_PACKAGE {
+                                directory.resources.account_key_package_published(&record.event.pubkey);
+                            }
                             let directory = directory.clone();
                             let _ = blocking_directory_task(move || directory.ingest_directory_relay_event(record)).await;
                         }

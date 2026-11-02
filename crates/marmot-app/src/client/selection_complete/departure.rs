@@ -93,7 +93,7 @@ impl AppClient {
                     .is_ok_and(|account| {
                         account.account_id_hex == account_id
                             && account.account_id_hex
-                                == hex::encode(self.runtime.session().self_id().as_slice())
+                                == hex::encode(self.runtime.self_id().as_slice())
                     })
         });
         if !live {
@@ -104,7 +104,6 @@ impl AppClient {
         // No roster/profile/body read or foreign callback enters this snapshot.
         let session_epoch = tokio::task::block_in_place(|| {
             self.runtime
-                .session()
                 .with_members_read_snapshot::<_, cgka_traits::StorageError>(|store, _| {
                     store
                         .app_storage()

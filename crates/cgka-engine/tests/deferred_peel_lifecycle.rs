@@ -54,7 +54,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -103,6 +103,7 @@ fn passthrough_welcome(msg: &TransportMessage) -> Result<PeeledMessage, PeelerEr
         content: PeeledContent::Welcome {
             created_at: None,
             bytes: msg.payload.clone(),
+            key_package_event_id: None,
         },
         origin: msg.clone(),
     })
@@ -345,7 +346,7 @@ impl TransportPeeler for NotifyEpochGatePeeler {
 }
 
 fn build_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -374,7 +375,7 @@ fn build_gated_client<P>(
 where
     P: TransportPeeler + Clone + 'static,
 {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(name))
@@ -464,7 +465,7 @@ where
 }
 
 fn build_epoch_sealed_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = build_epoch_sealed_client_with_storage(name, storage.clone());
     (engine, storage)
 }
@@ -696,7 +697,7 @@ async fn contested_rival_app_backlog_with_peeler<P>(
 where
     P: TransportPeeler + 'static,
 {
-    let incumbent_storage = SqliteAccountStorage::in_memory().unwrap();
+    let incumbent_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut incumbent = build_epoch_sealed_client_with_storage_and_peeler(
         b"candidate-cache-incumbent",
         incumbent_storage.clone(),
@@ -1295,6 +1296,21 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         .unwrap();
     let historical_attempts = peeler.attempts_for(&commit3.id);
 
+    // The existing row is historical-only under an unchanged fingerprint, so
+    // it neither blocks a direct send nor repeats ahead of queued work.
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "direct send"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap(),
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
+
     assert!(matches!(
         carol
             .queue_app_message(
@@ -1313,23 +1329,9 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         1
     );
 
-    // The existing row is historical-only under an unchanged fingerprint, so
-    // it neither blocks a newer direct send nor repeats ahead of queued work.
-    assert!(matches!(
-        carol
-            .send(SendIntent::AppMessage {
-                group_id: group_id.clone(),
-                payload: app_payload_for(&carol, "later direct send"),
-                expected_epoch: None,
-            })
-            .await
-            .unwrap(),
-        SendResult::ApplicationMessage { .. }
-    ));
-    assert_eq!(peeler.attempts_for(&commit3.id), historical_attempts);
-
     // A newly retained row is current-generation work, even with a queue. It
-    // receives a definitive foreground attempt before any wire is prepared.
+    // receives a definitive foreground attempt before the send is accepted;
+    // the send then queues behind the earlier one (mdk#2842).
     let fresh = TransportMessage {
         id: MessageId::new(b"fresh-row-ahead-of-queue".to_vec()),
         ..commit3
@@ -1348,7 +1350,7 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
             })
             .await
             .unwrap(),
-        SendResult::ApplicationMessage { .. }
+        SendResult::Queued { .. }
     ));
     assert_eq!(peeler.attempts_for(&fresh.id), fresh_attempts + 1);
 
@@ -1359,7 +1361,10 @@ async fn queued_intent_drains_before_historical_only_maintenance() {
         .unwrap();
     assert!(matches!(
         drained.as_slice(),
-        [SendResult::ApplicationMessage { .. }]
+        [
+            SendResult::ApplicationMessage { .. },
+            SendResult::ApplicationMessage { .. }
+        ]
     ));
     assert_eq!(
         peeler.attempts_for(&fresh.id),
@@ -1653,7 +1658,7 @@ async fn deferred_peel_redeferral_records_no_self_transition() {
     let dir = tempfile::TempDir::new().unwrap();
     let audit_path = dir.path().join("audit.jsonl");
     let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, "carol".into()).unwrap();
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let peeler = CountingEpochGatePeeler::new();
     let mut carol = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
@@ -1783,7 +1788,7 @@ async fn deferred_peel_retry_budget_refuses_without_terminal_dedup() {
 #[tokio::test]
 async fn deferred_peel_residence_survives_restart_and_backward_clock() {
     let clock = ManualConvergenceClock::new(1_000, 10_000);
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let carol_client =
         build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
     let (mut alice, mut carol, carol_storage, _peeler, group_id, commit2, commit3) =
@@ -4049,7 +4054,7 @@ async fn alice_disbanding_with_future_epoch_deferred_row() -> (
     TransportMessage,
     Vec<TransportMessage>,
 ) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let clock = ManualConvergenceClock::new(0, 10_000);
     let peeler = CountingEpochGatePeeler::new();
     let mut alice = build_current_gated_client(
@@ -4061,7 +4066,7 @@ async fn alice_disbanding_with_future_epoch_deferred_row() -> (
     let mut bob = build_current_gated_client(
         b"bob-disband-deferred",
         CountingEpochGatePeeler::new(),
-        SqliteAccountStorage::in_memory().unwrap(),
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
         ManualConvergenceClock::new(0, 10_000),
     );
 
@@ -4226,7 +4231,7 @@ async fn wedged_victim_crawling_a_rival_branch() -> (
     GroupId,
     TransportMessage,
 ) {
-    let victim_storage = SqliteAccountStorage::in_memory().unwrap();
+    let victim_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut victim =
         build_epoch_sealed_client_with_storage(b"crawl-victim", victim_storage.clone());
     let (mut rival, _rival_storage) = build_epoch_sealed_client(b"crawl-rival");

@@ -12,13 +12,16 @@ const MLS_GROUP_ID_MAX_LEN: usize = 1024;
 
 /// The local account's own membership in a group: an active `Member`, or a
 /// terminal state describing how it left — `Left` (a voluntary self-removal or
-/// declined invite) or `Removed` (evicted by another member). Surfaced on both
-/// the chat-list row and the group-detail record.
+/// declined invite), `Removed` (evicted by another member) or `DeviceRemoved`
+/// (this device's leaf was removed while the account keeps another device in
+/// the group; hosts show no "removed from group" notice for it). Surfaced on
+/// both the chat-list row and the group-detail record.
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum SelfMembershipFfi {
     Member,
     Left,
     Removed,
+    DeviceRemoved,
 }
 
 impl From<SelfMembership> for SelfMembershipFfi {
@@ -27,6 +30,7 @@ impl From<SelfMembership> for SelfMembershipFfi {
             SelfMembership::Member => SelfMembershipFfi::Member,
             SelfMembership::Left => SelfMembershipFfi::Left,
             SelfMembership::Removed => SelfMembershipFfi::Removed,
+            SelfMembership::DeviceRemoved => SelfMembershipFfi::DeviceRemoved,
         }
     }
 }

@@ -6,10 +6,14 @@
 pub(crate) mod authority;
 pub(crate) mod groups;
 mod handles;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod migrated_template;
 pub(crate) mod outbound;
 pub(crate) mod projection;
 pub(crate) mod release;
 pub(crate) mod routes;
 pub(crate) mod selection_roster;
+#[cfg(test)]
+mod tests;
 pub(crate) mod views;
 mod wipe;

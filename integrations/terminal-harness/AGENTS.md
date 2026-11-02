@@ -51,6 +51,9 @@ before changing this crate.
 - `tests/jsonl_process.rs` - process-runner integration tests.
 - `tests/test_installer.sh` - shared installer suite driven by each harness's
   `tests/test_installer.sh`.
+- `tests/test_connector_only_installer.sh` - the shared installer's
+  connector-only mode (`scripts/install-wn-agent.sh`) on mocked systemd and
+  launchd.
 
 For user-facing behavior (execution profiles, chat commands, shared behavior)
 see `README.md`.
@@ -72,4 +75,5 @@ just goose-dev-e2e-connector
 ```
 
 Run the matching `just <harness>-installer-test` recipes when changing installer
-behavior or `tests/test_installer.sh`.
+behavior or `tests/test_installer.sh`, and `just wn-agent-installer-test` when
+changing `scripts/install-terminal-harness-marmot.sh` or the connector-only test.

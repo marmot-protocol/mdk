@@ -5,7 +5,7 @@ use marmot_app::AppMessageQuery;
 use crate::Marmot;
 use crate::conversions::{
     AppMessageRecordFfi, PollTypeFfi, RetentionSweepReportFfi, SecureDeleteExpiredResultFfi,
-    SendSummaryFfi, group_id_from_hex,
+    SendSummaryFfi, StickerRefFfi, group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -49,6 +49,23 @@ impl Marmot {
             .send_tagged_text(&account_ref, &group_id, text, tags)
             .await?
             .into())
+    }
+
+    /// Send a Sonar sticker as a kind-9 message carrying the immutable
+    /// coordinate/shortcode/plaintext-hash reference. Native storage must
+    /// currently authorize the exact reference before the send is accepted.
+    pub async fn send_sticker(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        sticker_ref: StickerRefFfi,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_sticker(&account_ref, &group_id, sticker_ref.into())
+            .await?;
+        Ok(summary.into())
     }
 
     /// Re-attempt publishing a group's pending (committed-but-undelivered)
@@ -208,10 +225,10 @@ impl Marmot {
 
     /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
     /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
-    /// edit, delete, agent, group system, push token) are rejected so an app
-    /// cannot forge protocol events. Custom events appear in the timeline as
-    /// standalone rows and can be fetched via [`Marmot::messages`] with a
-    /// `kinds` filter.
+    /// edit, delete, agent, group system, push token, device group: 457, 459,
+    /// 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol
+    /// events. Custom events appear in the timeline as standalone rows and can
+    /// be fetched via [`Marmot::messages`] with a `kinds` filter.
     pub async fn send_custom_event(
         &self,
         account_ref: String,

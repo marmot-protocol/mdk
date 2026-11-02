@@ -89,7 +89,7 @@ impl AppClient {
             .app_storage()
             .chat_presentation_version()?
             .store_epoch;
-        let session = self.runtime.session();
+        let session = &self.runtime;
         let active: [u8; 32] = session.self_id().as_slice().try_into().map_err(|_| {
             cgka_traits::StorageError::Serialization(
                 "invalid native selection active identity".into(),

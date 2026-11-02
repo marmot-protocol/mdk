@@ -84,7 +84,8 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                 root = Path(temp) / "repo"
                 (root / "scripts").mkdir(parents=True)
                 for name in ("install-hermes-marmot.sh", "install-openclaw-marmot.sh",
-                             "install-terminal-harness-marmot.sh", "install-claude-marmot.sh"):
+                             "install-terminal-harness-marmot.sh", "install-claude-marmot.sh",
+                             "install-wn-agent.sh"):
                     shutil.copy2(source / "scripts" / name, root / "scripts" / name)
                 (root / "Cargo.toml").write_text(
                     f'[workspace.package]\nversion = "{workspace_version}"\n')
@@ -99,6 +100,7 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                     ("install-hermes-marmot.sh", ["--no-configure-hermes"]),
                     ("install-openclaw-marmot.sh", ["--allow-welcomer", welcomer]),
                     ("install-claude-marmot.sh", ["--allow-welcomer", welcomer]),
+                    ("install-wn-agent.sh", []),
                 ):
                     with self.subTest(workspace_version=workspace_version, installer=installer):
                         result = subprocess.run(

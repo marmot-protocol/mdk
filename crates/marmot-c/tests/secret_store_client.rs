@@ -239,6 +239,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
         cursor_persistence: 1,
         client_name: name.as_ptr(),
         store: &store,
+        device_platform: std::ptr::null(),
     };
     for (relay_policy, cursor_persistence) in [(u32::MAX, 1), (2, u32::MAX)] {
         options.relay_policy = relay_policy;
@@ -320,6 +321,7 @@ fn a_deployment_constructor_opens_with_a_host_store() {
         cursor_persistence: 0,
         client_name: std::ptr::null(),
         store: &store,
+        device_platform: std::ptr::null(),
     };
     let mut deployment = std::ptr::null_mut();
     assert_eq!(

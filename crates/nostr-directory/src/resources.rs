@@ -1,6 +1,5 @@
 //! What the directory asks the app for. `marmot-app` implements
-//! [`DirectoryResources`] over the cache lifecycle it keeps (step 3 of
-//! `docs/marmot-architecture/review/brief-directory.md`).
+//! [`DirectoryResources`] over the cache lifecycle it keeps.
 
 use std::future::Future;
 
@@ -49,6 +48,11 @@ pub trait DirectoryResources: Clone + Send + Sync + 'static {
 
     /// A stored entry changed, so presentation should refresh that account.
     fn directory_entry_changed(&self, account_id_hex: &str);
+
+    /// A KeyPackage `account_id_hex` published arrived live. A local
+    /// account's devices then check it for new sign-ins; the event itself
+    /// proves nothing.
+    fn account_key_package_published(&self, account_id_hex: &str);
 }
 
 /// Block lists are account state the app keeps. The sync worker receives

@@ -27,14 +27,17 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at};
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
-    NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossFloor,
-    NostrPublishOutcome, NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
-    NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription,
-    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
-    SubscriptionAttempt,
+    NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossBounds,
+    NostrNotificationLossFloor, NostrPublishOutcome, NostrReconciliationItem,
+    NostrReconciliationSummary, NostrRelayClient, NostrSdkNotification, NostrSdkRelayClient,
+    NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter, RelayExportConsent,
+    RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
-pub use transport_nostr_adapter::{ReplayAdmissionStatus, ReplayCaptureOutcome, ReplayCapturePlan};
+pub use transport_nostr_adapter::{
+    DeliveryRoute, MAX_DELIVERY_LOSS_ROUTES, ReplayAdmissionStatus, ReplayCaptureOutcome,
+    ReplayCapturePlan, ReplayFence, ReplayFencePlan, ReplayFenceTicket,
+};
 use transport_nostr_peeler::NostrTransportEvent;
 
 mod delivery_spill;
@@ -78,7 +81,7 @@ pub use directory::{
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
     DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
 };
-pub use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
+pub use safety::{RelaySafetyPolicy, canonical_relay, recovery_required_endpoints, same_relay};
 pub use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps
@@ -210,11 +213,20 @@ struct AccountDeliveryRoute {
     spill: Option<Arc<delivery_spill::AccountDeliverySpill>>,
 }
 
-/// Persists a queue-loss generation: its marker token, dropped count and the
+/// Persists a queue-loss generation: its marker token, dropped count, the
 /// earliest wire `created_at` among the dropped deliveries (`None` if any is
-/// unknown).
+/// unknown), and each route they arrived on with the earliest `created_at`
+/// dropped there (`None` if any had no route or time, or they touched more
+/// than [`MAX_DELIVERY_LOSS_ROUTES`]). Each write covers every drop under its
+/// token: the plane never writes a token whose earlier drops it did not count,
+/// so new loss always raises the count.
 pub type AccountDeliveryRecoveryMarker = Arc<
-    dyn Fn(u64, u64, Option<u64>) -> Result<(), AccountDeliveryRecoveryMarkerError>
+    dyn Fn(
+            u64,
+            u64,
+            Option<u64>,
+            Option<&[(DeliveryRoute, u64)]>,
+        ) -> Result<(), AccountDeliveryRecoveryMarkerError>
         + Send
         + Sync
         + 'static,
@@ -312,6 +324,11 @@ struct AccountDeliveryOverflowInner {
     started_at: Option<Instant>,
     recovery_started_at: Option<Instant>,
     marker_token: u64,
+    /// The generation carries a durable marker adopted after a restart or a
+    /// failed acknowledgment, whose earlier drops this process never counted.
+    /// Its first new drop takes a fresh token, so every token's count grows
+    /// from zero and a new drop always raises the count storage sees.
+    marker_adopted: bool,
     marker_in_progress: bool,
     marker_durable: bool,
     marker_closed: bool,
@@ -324,10 +341,20 @@ struct AccountDeliveryOverflowInner {
     /// whether any dropped delivery's time was unknown.
     earliest_dropped: Option<u64>,
     earliest_dropped_unknown: bool,
+    /// Running minimum `created_at` per route among the dropped deliveries,
+    /// and whether some dropped delivery's route or time was unknown or the
+    /// routes passed [`MAX_DELIVERY_LOSS_ROUTES`], which empties the map.
+    dropped_routes: BTreeMap<DeliveryRoute, u64>,
+    dropped_routes_unknown: bool,
     /// Running minimum of notification and replay losses' REQ floors, and
     /// whether any loss's floor was unknown.
     notification_floor: Option<u64>,
     notification_floor_unknown: bool,
+    /// Running minimum REQ floor per route among those losses, and whether
+    /// some loss's routes were unknown or they passed
+    /// [`MAX_DELIVERY_LOSS_ROUTES`], which empties the map.
+    notification_routes: BTreeMap<DeliveryRoute, u64>,
+    notification_routes_unknown: bool,
     /// What the account queue holds, and the restart floors a cursor commit
     /// must keep over it.
     admission: AccountDeliveryAdmission,
@@ -407,12 +434,18 @@ fn account_delivery_restart_key(delivery: &TransportDelivery) -> u64 {
 
 /// What one omission charges to the current loss generation.
 #[derive(Clone, Copy, Debug)]
-enum AccountDeliveryLossCharge {
-    /// A delivery the queue omitted, with its wire `created_at` if known.
-    Drop { created_at: Option<u64> },
+enum AccountDeliveryLossCharge<'a> {
+    /// A delivery the queue omitted, with its wire `created_at` and route if
+    /// known.
+    Drop {
+        created_at: Option<u64>,
+        route: Option<DeliveryRoute>,
+    },
     /// A notification or staged-replay loss, bounded by the REQ floors that
-    /// could have delivered the lost history.
-    Notification { floor: NostrNotificationLossFloor },
+    /// could have delivered the lost history, overall and per route.
+    Notification {
+        loss: &'a NostrNotificationLossBounds,
+    },
 }
 
 #[derive(Default)]
@@ -585,9 +618,10 @@ impl AccountDeliveryOverflowState {
 
     /// How far a commit may promote the cursor, decided under the placement
     /// lock: `candidate`, capped at the lowest key the persisted cursor still
-    /// covers of a delivery queued or taken and not yet released, plus the
-    /// lookback. `None` while loss or a spill hand-off is pending, and for a
-    /// replaced adapter, whose queue is not the one tracked here. The restart
+    /// covers of a delivery queued or taken and not yet released, or of a
+    /// frame the adapter's fence holds, plus the lookback. `None` while loss
+    /// or a spill hand-off is pending, and for a replaced adapter, whose
+    /// queue is not the one tracked here. The restart
     /// floor rises here, before the commit's save starts, so any delivery
     /// placed while that save runs and falls below it goes to the spill. A
     /// settled commit moves the settled floor up once its save succeeds; a
@@ -616,11 +650,18 @@ impl AccountDeliveryOverflowState {
         };
         let admission = &mut state.admission;
         let covered = admission.durable_since.unwrap_or(0);
+        // A frame a fence holds in the adapter is in no queue yet: it caps
+        // the commit like a queued delivery.
+        let held = replay.fence_held_since(covered);
         let cap = admission
             .queued
             .range(covered..)
             .next()
-            .map(|(key, _)| key.saturating_add(lookback));
+            .map(|(key, _)| *key)
+            .into_iter()
+            .chain(held)
+            .min()
+            .map(|key| key.saturating_add(lookback));
         let reached = cap.map_or(candidate, |cap| candidate.min(cap));
         let since = reached.saturating_sub(lookback);
         admission.durable_since = Some(admission.durable_since.map_or(since, |d| d.max(since)));
@@ -673,14 +714,31 @@ impl AccountDeliveryOverflowState {
 
     /// Record an omitted delivery and return the generation only when this
     /// caller must enqueue the generation's control record.
-    fn record_drop(&self, queue_depth: usize, created_at: Option<u64>) -> Option<u64> {
-        self.record_loss(queue_depth, AccountDeliveryLossCharge::Drop { created_at })
+    fn record_drop(
+        &self,
+        queue_depth: usize,
+        created_at: Option<u64>,
+        route: Option<DeliveryRoute>,
+    ) -> Option<u64> {
+        self.record_loss(
+            queue_depth,
+            AccountDeliveryLossCharge::Drop { created_at, route },
+        )
     }
 
-    /// Record notification or replay loss with its REQ floor, returning the
+    /// Start a new generation's dropped-delivery bounds.
+    fn reset_dropped(state: &mut AccountDeliveryOverflowInner) {
+        state.dropped = 0;
+        state.earliest_dropped = None;
+        state.earliest_dropped_unknown = false;
+        state.dropped_routes.clear();
+        state.dropped_routes_unknown = false;
+    }
+
+    /// Record notification or replay loss with its REQ floors, returning the
     /// generation only when this caller must enqueue its control record.
-    fn record_notification_loss(&self, floor: NostrNotificationLossFloor) -> Option<u64> {
-        self.record_loss(0, AccountDeliveryLossCharge::Notification { floor })
+    fn record_notification_loss(&self, loss: &NostrNotificationLossBounds) -> Option<u64> {
+        self.record_loss(0, AccountDeliveryLossCharge::Notification { loss })
     }
 
     fn record_loss(&self, queue_depth: usize, charge: AccountDeliveryLossCharge) -> Option<u64> {
@@ -691,31 +749,50 @@ impl AccountDeliveryOverflowState {
         if !state.pending {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
-            state.dropped = 0;
-            state.earliest_dropped = None;
-            state.earliest_dropped_unknown = false;
+            Self::reset_dropped(&mut state);
             Self::reset_notification_loss(&mut state);
             state.started_at = Some(Instant::now());
             state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+            state.marker_adopted = false;
             state.marker_in_progress = false;
             state.marker_durable = false;
             state.marker_closed = false;
         }
         match charge {
-            AccountDeliveryLossCharge::Notification { floor } => {
+            AccountDeliveryLossCharge::Notification { loss } => {
                 state.notification_losses = state.notification_losses.saturating_add(1);
                 // Each loss mints a token, so a changed floor always imports as
                 // new loss and bumps the obligation's revision.
                 state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
-                match floor.since_seconds() {
+                match loss.floor.since_seconds() {
                     Some(since) => {
                         state.notification_floor =
                             Some(state.notification_floor.map_or(since, |f| f.min(since)))
                     }
                     None => state.notification_floor_unknown = true,
                 }
+                match &loss.routes {
+                    Some(routes) if !state.notification_routes_unknown => {
+                        for (route, since) in routes {
+                            let floor = state.notification_routes.entry(*route).or_insert(*since);
+                            *floor = (*floor).min(*since);
+                        }
+                        if state.notification_routes.len() > MAX_DELIVERY_LOSS_ROUTES {
+                            state.notification_routes.clear();
+                            state.notification_routes_unknown = true;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.notification_routes.clear();
+                        state.notification_routes_unknown = true;
+                    }
+                }
             }
-            AccountDeliveryLossCharge::Drop { created_at } => {
+            AccountDeliveryLossCharge::Drop { created_at, route } => {
+                if std::mem::take(&mut state.marker_adopted) {
+                    state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+                }
                 state.dropped = state.dropped.saturating_add(1);
                 match created_at {
                     Some(at) => {
@@ -723,6 +800,21 @@ impl AccountDeliveryOverflowState {
                             Some(state.earliest_dropped.map_or(at, |e| e.min(at)))
                     }
                     None => state.earliest_dropped_unknown = true,
+                }
+                match (route, created_at) {
+                    (Some(route), Some(at)) if !state.dropped_routes_unknown => {
+                        let earliest = state.dropped_routes.entry(route).or_insert(at);
+                        *earliest = (*earliest).min(at);
+                        if state.dropped_routes.len() > MAX_DELIVERY_LOSS_ROUTES {
+                            state.dropped_routes.clear();
+                            state.dropped_routes_unknown = true;
+                        }
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ => {
+                        state.dropped_routes.clear();
+                        state.dropped_routes_unknown = true;
+                    }
                 }
                 state.marker_durable = false;
                 RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
@@ -745,10 +837,12 @@ impl AccountDeliveryOverflowState {
         state.notification_imported = 0;
         state.notification_floor = None;
         state.notification_floor_unknown = false;
+        state.notification_routes.clear();
+        state.notification_routes_unknown = false;
     }
 
-    fn record_retired_drop(&self, created_at: Option<u64>) {
-        self.record_drop(0, created_at);
+    fn record_retired_drop(&self, created_at: Option<u64>, route: Option<DeliveryRoute>) {
+        self.record_drop(0, created_at, route);
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -864,7 +958,7 @@ impl AccountDeliveryOverflowState {
             state.generation
         };
         loop {
-            let (marker_token, dropped, earliest) = {
+            let (marker_token, dropped, earliest, routes) = {
                 let state = self
                     .inner
                     .lock()
@@ -875,10 +969,20 @@ impl AccountDeliveryOverflowState {
                     state
                         .earliest_dropped
                         .filter(|_| !state.earliest_dropped_unknown),
+                    (!state.dropped_routes_unknown).then(|| {
+                        state
+                            .dropped_routes
+                            .iter()
+                            .map(|(route, at)| (*route, *at))
+                            .collect::<Vec<_>>()
+                    }),
                 )
             };
             let marker = marker.clone();
-            match tokio::task::spawn_blocking(move || marker(marker_token, dropped, earliest)).await
+            match tokio::task::spawn_blocking(move || {
+                marker(marker_token, dropped, earliest, routes.as_deref())
+            })
+            .await
             {
                 Ok(Ok(())) => {
                     let mut state = self
@@ -973,9 +1077,7 @@ impl AccountDeliveryOverflowState {
         if !state.pending {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
-            state.dropped = 0;
-            state.earliest_dropped = None;
-            state.earliest_dropped_unknown = false;
+            Self::reset_dropped(&mut state);
             // The resolved generation's lags must not charge this one's floor.
             Self::reset_notification_loss(&mut state);
             state.queue_depth = 0;
@@ -984,6 +1086,7 @@ impl AccountDeliveryOverflowState {
             // loaded after a restart; the process-local generation is already
             // covered before its first recovery subscription is issued.
             state.marker_token = durable_marker_token;
+            state.marker_adopted = true;
             state.marker_durable = true;
             state.marker_closed = false;
         }
@@ -1001,13 +1104,12 @@ impl AccountDeliveryOverflowState {
         if !state.pending {
             state.generation = state.generation.saturating_add(1);
             state.pending = true;
-            state.dropped = 0;
-            state.earliest_dropped = None;
-            state.earliest_dropped_unknown = false;
+            Self::reset_dropped(&mut state);
             Self::reset_notification_loss(&mut state);
             state.queue_depth = 0;
             state.started_at = Some(Instant::now());
             state.marker_token = durable_marker_token;
+            state.marker_adopted = true;
             state.marker_durable = true;
             state.marker_closed = false;
             state.recovery_in_progress = false;
@@ -1639,7 +1741,9 @@ impl MarmotRelayPlane {
                     recover_relay_notification_forwarder_scoped(
                         &self.inner.transport,
                         RelayNotificationConsumerExit::Closed,
-                        NostrNotificationLossFloor::Unbounded,
+                        NostrNotificationLossBounds::account_wide(
+                            NostrNotificationLossFloor::Unbounded,
+                        ),
                         Some(account_id),
                     );
                 }
@@ -2339,12 +2443,62 @@ impl MarmotRelayPlane {
         skipped_notifications: u64,
         floor: NostrNotificationLossFloor,
     ) {
+        self.simulate_routed_notification_lag_for_test(
+            account_id,
+            skipped_notifications,
+            NostrNotificationLossBounds::account_wide(floor),
+        );
+    }
+
+    /// [`Self::simulate_notification_lag_for_test`] with the per-route floors
+    /// the SDK context read at the lag.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn simulate_routed_notification_lag_for_test(
+        &self,
+        account_id: &MemberId,
+        skipped_notifications: u64,
+        bounds: NostrNotificationLossBounds,
+    ) {
         recover_relay_notification_forwarder_scoped(
             &self.inner.transport,
             RelayNotificationConsumerExit::Lagged(skipped_notifications),
-            floor,
+            bounds,
             Some(account_id),
         );
+    }
+
+    /// The SDK relay client whose pool carries `account_id`'s REQs, for the
+    /// recovery runner's sweeps and comparisons (mdk#2660). `None` without an
+    /// SDK client or an account context. It dials nothing: its pool admits
+    /// relays only through the dial-safety chokepoint.
+    #[doc(hidden)]
+    pub async fn account_history_relay_client(
+        &self,
+        account_id: &MemberId,
+    ) -> Option<NostrSdkRelayClient> {
+        self.inner
+            .transport
+            .sdk_relay_client
+            .as_ref()?
+            .account_relay_client(account_id)
+            .await
+    }
+
+    /// `account_id`'s deliveries for one fetched history event, as the
+    /// account adapter's `recovered_deliveries` gives them. The caller admits
+    /// them directly, never through the live queue.
+    #[doc(hidden)]
+    pub async fn recovered_deliveries_for_account(
+        &self,
+        account_id: &MemberId,
+        event: transport_nostr_adapter::NostrRelayEvent,
+    ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
+        self.inner
+            .transport
+            .adapter
+            .reconciled_deliveries(account_id, event)
+            .await
     }
 
     /// The SDK relay client the plane runs on, for tests that build a whole
@@ -2477,9 +2631,9 @@ type DirectoryNotificationStream =
 struct RelayNotificationConsumerOutcome {
     receiver: RelayNotificationStream,
     exit: RelayNotificationConsumerExit,
-    /// The source's REQ floor, read where a lag was recorded. Unbounded for
+    /// The source's REQ floors, read where a lag was recorded. Unbounded for
     /// every other exit.
-    lag_floor: NostrNotificationLossFloor,
+    lag_bounds: NostrNotificationLossBounds,
 }
 
 impl RelayNotificationConsumerOutcome {
@@ -2487,11 +2641,13 @@ impl RelayNotificationConsumerOutcome {
         Self {
             receiver,
             exit,
-            lag_floor: NostrNotificationLossFloor::Unbounded,
+            lag_bounds: NostrNotificationLossBounds::account_wide(
+                NostrNotificationLossFloor::Unbounded,
+            ),
         }
     }
 
-    /// Record `abandoned` notifications as receiver loss, reading the floor
+    /// Record `abandoned` notifications as receiver loss, reading the floors
     /// at that point.
     fn lagged(
         receiver: RelayNotificationStream,
@@ -2501,7 +2657,7 @@ impl RelayNotificationConsumerOutcome {
         Self {
             receiver,
             exit: RelayNotificationConsumerExit::Lagged(abandoned),
-            lag_floor: source.record_loss(abandoned),
+            lag_bounds: source.record_loss(abandoned),
         }
     }
 }
@@ -2537,13 +2693,13 @@ trait RelayNotificationSource: Send + Sync {
     fn notifications(&self) -> RelayNotificationStream;
     fn is_shutdown(&self) -> bool;
     /// Record receiver loss and return the lowest REQ `since` that could have
-    /// delivered the lost notifications. A source without that evidence
-    /// reports it unbounded.
-    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
-        NostrNotificationLossFloor::Unbounded
+    /// delivered the lost notifications, overall and per route. A source
+    /// without that evidence reports it unbounded.
+    fn record_loss(&self, _skipped: u64) -> NostrNotificationLossBounds {
+        NostrNotificationLossBounds::account_wide(NostrNotificationLossFloor::Unbounded)
     }
     /// Native sources may already have charged their own gap before yielding.
-    fn record_lag(&self, skipped: u64, abandoned: u64) -> NostrNotificationLossFloor {
+    fn record_lag(&self, skipped: u64, abandoned: u64) -> NostrNotificationLossBounds {
         self.record_loss(skipped.saturating_add(abandoned))
     }
     fn receiver_replaced(&self) {}
@@ -2584,21 +2740,21 @@ impl RelayNotificationSource for SdkRelayNotificationSource {
         self.client.client().is_shutdown()
     }
 
-    fn record_loss(&self, skipped: u64) -> NostrNotificationLossFloor {
+    fn record_loss(&self, skipped: u64) -> NostrNotificationLossBounds {
         self.client.record_notification_gap(skipped);
         // Fence all retained source/worker frames before the supervisor resumes
         // this same receiver. A live REQ may never emit another EOSE.
         self.client.notification_receiver_replaced();
         // Read at the lag: a later subscription change could raise it past
         // an event this gap lost.
-        self.client.notification_loss_floor()
+        self.client.notification_loss_bounds()
     }
 
-    fn record_lag(&self, _skipped: u64, abandoned: u64) -> NostrNotificationLossFloor {
+    fn record_lag(&self, _skipped: u64, abandoned: u64) -> NostrNotificationLossBounds {
         // Native source loss has already advanced the ordered reader frontier.
         // Only the frontend worker's additional abandoned tail remains to charge.
         self.client.record_notification_gap(abandoned);
-        self.client.notification_loss_floor()
+        self.client.notification_loss_bounds()
     }
 
     fn subscription_refusal(&self, reason: &str) -> transport_nostr_adapter::SubscriptionRefusal {
@@ -2748,7 +2904,7 @@ fn spawn_relay_notification_supervisor_scoped(
                             recover_relay_notification_forwarder_scoped(
                                 &transport,
                                 outcome.exit,
-                                outcome.lag_floor,
+                                outcome.lag_bounds,
                                 account_id.as_ref(),
                             );
                         }
@@ -2759,7 +2915,7 @@ fn spawn_relay_notification_supervisor_scoped(
                     recover_relay_notification_forwarder_scoped(
                         &transport,
                         outcome.exit,
-                        outcome.lag_floor,
+                        outcome.lag_bounds,
                         account_id.as_ref(),
                     );
                     if outcome.exit == RelayNotificationConsumerExit::Closed {
@@ -2783,7 +2939,9 @@ fn spawn_relay_notification_supervisor_scoped(
                     recover_relay_notification_forwarder_scoped(
                         &transport,
                         RelayNotificationConsumerExit::Closed,
-                        NostrNotificationLossFloor::Unbounded,
+                        NostrNotificationLossBounds::account_wide(
+                            NostrNotificationLossFloor::Unbounded,
+                        ),
                         account_id.as_ref(),
                     );
                     tokio::time::sleep(
@@ -2966,11 +3124,11 @@ async fn run_relay_notification_consumer_scoped(
                 }
                 Some(NotificationUpdate::Lagged { skipped }) => {
                     let abandoned = pending.load(Ordering::SeqCst);
-                    let lag_floor = source.record_lag(skipped, abandoned);
+                    let lag_bounds = source.record_lag(skipped, abandoned);
                     return RelayNotificationConsumerOutcome {
                         receiver,
                         exit: RelayNotificationConsumerExit::Lagged(skipped.saturating_add(abandoned)),
-                        lag_floor,
+                        lag_bounds,
                     };
                 }
                 None => {
@@ -3023,17 +3181,17 @@ fn recover_relay_notification_forwarder(
     recover_relay_notification_forwarder_scoped(
         transport,
         exit,
-        NostrNotificationLossFloor::Unbounded,
+        NostrNotificationLossBounds::account_wide(NostrNotificationLossFloor::Unbounded),
         None,
     );
 }
 
 /// Record a consumer lag, or close account delivery after an unexpected
-/// consumer exit. `lag_floor` is the source's REQ floor read at the lag.
+/// consumer exit. `lag_bounds` are the source's REQ floors read at the lag.
 fn recover_relay_notification_forwarder_scoped(
     transport: &Arc<RelayPlaneTransport>,
     exit: RelayNotificationConsumerExit,
-    lag_floor: NostrNotificationLossFloor,
+    lag_bounds: NostrNotificationLossBounds,
     account_id: Option<&MemberId>,
 ) {
     let account_count = match account_id {
@@ -3047,18 +3205,18 @@ fn recover_relay_notification_forwarder_scoped(
             // The live subscriptions did not fail; only this consumer fell
             // behind, and it resumes on the same receiver. Keep every route
             // open and charge the loss to each account's current generation.
-            // A shared receiver's floor cannot be attributed to one account.
-            let floor = if account_id.is_some() {
-                lag_floor
+            // A shared receiver's floors cannot be attributed to one account.
+            let bounds = if account_id.is_some() {
+                lag_bounds
             } else {
-                NostrNotificationLossFloor::Unbounded
+                NostrNotificationLossBounds::account_wide(NostrNotificationLossFloor::Unbounded)
             };
             let routes = account_deliveries_read(&transport.account_deliveries);
             for (route_account_id, route) in routes.iter() {
                 if account_id.is_some_and(|account_id| account_id != route_account_id) {
                     continue;
                 }
-                record_account_loss(&route.overflow, Some(&route.sender), floor);
+                record_account_loss(&route.overflow, Some(&route.sender), &bounds);
             }
             drop(routes);
             let health = &transport.notification_forwarder_health;
@@ -3070,7 +3228,8 @@ fn recover_relay_notification_forwarder_scoped(
                 method = "recover_relay_notification_forwarder",
                 skipped_notifications = skipped,
                 affected_accounts = account_count,
-                bounded = floor.since_seconds().is_some(),
+                bounded = bounds.floor.since_seconds().is_some(),
+                routed = bounds.routes.is_some(),
                 "relay notification consumer lagged; recording notification loss for comparison recovery",
             );
         }
@@ -3471,6 +3630,18 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    /// Whether everything the post-join maintenance session delivered so far
+    /// has been ingested. See [`NostrTransportAdapter::subscription_placed`].
+    #[doc(hidden)]
+    pub async fn group_maintenance_placed(&self, subscription_id: &str) -> Option<bool> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .subscription_placed(subscription_id)
+            .await
+    }
+
     /// Operational capability identity only; SDK presence proves neither
     /// endpoint availability nor exhaustive historical coverage.
     #[doc(hidden)]
@@ -3617,6 +3788,31 @@ impl MarmotRelayPlaneAccountAdapter {
             .adapter
             .capture_replay(&self.account_id, plan, cancellation)
             .await
+    }
+
+    /// Hold this account's groups' live frames behind the owner's fences from
+    /// now on (mdk#2660). Call it before activation, so the first counts are
+    /// held too.
+    #[doc(hidden)]
+    pub async fn enable_replay_fencing(&self) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .enable_replay_fencing(&self.account_id)
+            .await;
+    }
+
+    /// Apply the owner's fences on this account's groups' live frames, as of
+    /// the status `plan`'s ticket came from. Schedules no IO.
+    #[doc(hidden)]
+    pub async fn fence_replay(&self, plan: &ReplayFencePlan) {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .fence_replay(&self.account_id, plan)
+            .await;
     }
 
     /// Register ordered native input before activation. Retained group spill
@@ -3769,6 +3965,65 @@ impl MarmotRelayPlaneAccountAdapter {
             .unwrap_or_else(|p| p.into_inner());
         (state.pending && state.notification_losses > state.notification_imported)
             .then(|| AccountDeliveryOverflowState::snapshot(&state))
+    }
+
+    /// The routes `observed`'s notification and replay loss reached, each with
+    /// the lowest REQ floor it could have lost from, or `None` when some loss
+    /// in its generation reached unknown routes. A generation only adds routes
+    /// and lowers their floors, so reading after the snapshot still bounds
+    /// every loss the snapshot counted. A later generation's routes say
+    /// nothing about this one.
+    #[doc(hidden)]
+    pub fn notification_loss_routes(
+        &self,
+        observed: &AccountDeliveryOverflow,
+    ) -> Option<Vec<(DeliveryRoute, u64)>> {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (state.generation == observed.generation
+            && !state.notification_routes_unknown
+            && !state.notification_routes.is_empty())
+        .then(|| {
+            state
+                .notification_routes
+                .iter()
+                .map(|(route, since)| (*route, *since))
+                .collect()
+        })
+    }
+
+    /// The routes `observed`'s dropped deliveries arrived on, each with the
+    /// earliest `created_at` dropped there, or `None` when some drop in its
+    /// generation had no route or time, or they touched more than
+    /// [`MAX_DELIVERY_LOSS_ROUTES`]. The worker passes them with an
+    /// observation past the durable marker count, whose extra drops no marker
+    /// write has named yet. As for [`Self::notification_loss_routes`], reading
+    /// after the snapshot still bounds every drop it counted, and another
+    /// generation's or token's routes say nothing about these.
+    #[doc(hidden)]
+    pub fn delivery_loss_routes(
+        &self,
+        observed: &AccountDeliveryOverflow,
+    ) -> Option<Vec<(DeliveryRoute, u64)>> {
+        let state = self
+            .delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        (state.generation == observed.generation
+            && state.marker_token == observed.marker_token
+            && !state.dropped_routes_unknown
+            && !state.dropped_routes.is_empty())
+        .then(|| {
+            state
+                .dropped_routes
+                .iter()
+                .map(|(route, earliest)| (*route, *earliest))
+                .collect()
+        })
     }
 
     /// Whether a queued or deferred control record will still report the
@@ -4058,6 +4313,7 @@ fn route_account_delivery(transport: &RelayPlaneTransport, delivery: TransportDe
         .saturating_sub(route.sender.capacity());
     route.overflow.observe_queue_depth(queue_depth);
     let created_at = delivery.message.timestamp.0;
+    let delivery_route = DeliveryRoute::of(&delivery);
     let key = account_delivery_restart_key(&delivery);
     match route.overflow.place(
         route.epoch,
@@ -4103,22 +4359,30 @@ fn route_account_delivery(transport: &RelayPlaneTransport, delivery: TransportDe
             if !spilled {
                 // Record the loss before releasing the placement's fence, so
                 // the cursor stays fenced throughout.
-                omit_account_delivery(&route, Some(created_at));
+                omit_account_delivery(&route, Some(created_at), delivery_route);
                 route.overflow.finish_spill(1, 0, 0);
             }
         }
-        AccountDeliveryPlacement::Omit => omit_account_delivery(&route, Some(created_at)),
+        AccountDeliveryPlacement::Omit => {
+            omit_account_delivery(&route, Some(created_at), delivery_route)
+        }
     }
 }
 
 /// Omit one delivery from a full account queue into the current loss
 /// generation, persisting its evidence before the control record is queued.
-fn omit_account_delivery(route: &AccountDeliveryRoute, created_at: Option<u64>) {
+fn omit_account_delivery(
+    route: &AccountDeliveryRoute,
+    created_at: Option<u64>,
+    delivery_route: Option<DeliveryRoute>,
+) {
     let queue_depth = route
         .sender
         .max_capacity()
         .saturating_sub(route.sender.capacity());
-    let signal_generation = route.overflow.record_drop(queue_depth, created_at);
+    let signal_generation = route
+        .overflow
+        .record_drop(queue_depth, created_at, delivery_route);
     if let Some(marker) = route.recovery_marker.clone() {
         persist_queue_loss(&route.sender, &route.overflow, marker, signal_generation);
     } else if let Some(generation) = signal_generation {
@@ -4182,27 +4446,29 @@ fn import_replay_loss(
     account_id: &MemberId,
     floor: NostrNotificationLossFloor,
 ) {
+    // Staged replay loss is not attributed to routes.
+    let loss = NostrNotificationLossBounds::account_wide(floor);
     let routes = account_deliveries_read(&transport.account_deliveries);
     if let Some(route) = routes.get(account_id) {
-        record_account_loss(&route.overflow, Some(&route.sender), floor);
+        record_account_loss(&route.overflow, Some(&route.sender), &loss);
     } else if let Some(overflow) = transport
         .account_overflow_states
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(account_id)
     {
-        record_account_loss(overflow, None, floor);
+        record_account_loss(overflow, None, &loss);
     }
 }
 
 fn record_account_loss(
     overflow: &AccountDeliveryOverflowState,
     sender: Option<&mpsc::Sender<AccountDeliveryEvent>>,
-    floor: NostrNotificationLossFloor,
+    loss: &NostrNotificationLossBounds,
 ) {
     // A queued or deferred control record already carries this generation;
     // the worker imports subsequent losses from the same pending snapshot.
-    if let Some(generation) = overflow.record_notification_loss(floor)
+    if let Some(generation) = overflow.record_notification_loss(loss)
         && let Some(sender) = sender
     {
         enqueue_account_delivery_overflow_signal(sender, overflow, generation);

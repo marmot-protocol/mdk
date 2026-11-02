@@ -24,8 +24,8 @@ cargo insta review
 ## Tier 2 — Engine integration tests (this directory)
 
 **What they prove:** real OpenMLS-backed engine behavior across one or more engine instances using a pass-through
-`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>`; `sqlite_storage.rs` keeps the encrypted
-file-backed backend on the same rail.
+`MockPeeler`. Most files use in-memory `Engine<SqliteAccountStorage>` opened with `in_memory_for_test()`, which skips
+SQLCipher's per-allocation memory locking; `sqlite_storage.rs` keeps the encrypted file-backed backend on the same rail.
 
 **Transport visibility.** The pass-through `MockPeeler` gives every test client perfect cross-branch visibility, which
 production does not have: a real transport seals a group message under the sender's current-epoch exporter secret and
@@ -42,7 +42,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
 - **File:** `group_creation.rs`
-  - **Owns:** Fresh KeyPackage, create, join welcome, confirm
+  - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
+    writes no group
 
 - **File:** `group_context_view.rs`
   - **Owns:** `GroupContextView` exporter-secret length contract
@@ -54,7 +55,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
-  - **Owns:** `feature_status`, capability cache, capability matrix
+  - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
+    included), KeyPackage-based `constructable_capabilities`, capability matrix
 
 - **File:** `leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
@@ -85,6 +87,28 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     epoch's delivered ones for its sender's receive ratchet, and SQLite's content-filtered listing leaves out exactly
     what the engine's own projection of real messages would.
 
+- **File:** `distributed_convergence/phantom_own_commit_branch.rs`
+  - **Owns:** An own-commit checkpoint never restores after a sibling of the parent it was built on (mdk#2657): a
+    parked own commit and the canonical rival at its epoch yield one branch per tip commit, and a pass whose tie
+    would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
+    wall time to the first delivered message over a widened group.
+
+- **File:** `distributed_convergence/queued_send_order.rs`
+  - **Owns:** A send made once the group settles, while sends queued during convergence still wait for the drain,
+    is queued behind them, so the sender's generations follow its send order and a member reading the history in
+    `created_at` order decrypts every message (mdk#2842). Each other intent kind keeps that order behind a queued
+    row: a member's leave goes out after its queued message, an invite or a removal is committed after the
+    committer's queued message (the invitee never reads it, the removed member does), and a message made behind a
+    queued group change is encrypted after it. Also an epoch-pinned send behind a queued one is refused, not queued;
+    a drained intent awaiting its outcome holds no later send; and a queued change the settled state already holds is
+    retired at drain, so it holds no later send. The device-group refusals behind a queued row are in
+    `account_devices/link_device.rs` and `account_devices/device_roster.rs`.
+
+- **File:** `distributed_convergence/refused_queued_intents.rs`
+  - **Owns:** A queued admin change the settled state refuses (the sender was demoted while it waited) is retired and
+    announced as `GroupEvent::QueuedIntentRefused` for each admin intent kind, the work queued behind it still drains,
+    and no later drain prepares it again (mdk#2694). The storage-held counterpart lives in `record_write_atomicity.rs`.
+
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
     even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.
@@ -105,8 +129,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `record_write_atomicity.rs`
-  - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
-    seam that projects the record plus inbound capability-cache coverage. No torn record or capability cache,
+  - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
+    seam that projects the record. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
@@ -114,7 +138,15 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
     transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
     keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
-    write fails part way through the generic one (mdk#2330)
+    write fails part way through the generic one (mdk#2330). A queued intent held by a storage failure stays queued
+    (mdk#2694), and a queued `NoChange` whose retirement fails waits for the next drain while the pass keeps what it
+    prepared (mdk#2842). `record_write_atomicity/convergence_pass_retry.rs`: a
+    frozen batch whose apply keeps failing backs off and parks after its budget, reopens on a commit or a
+    current-epoch proposal it does not hold, including one a direct-path peel rewrote into an older row, but not on
+    application traffic or input beyond its horizon, reseeds nothing on loads with no new input, takes one explicit
+    retry (none for a quarantined group, whose park reads as none), and keeps its count, delay and park across a
+    restart; with `test-conformance-snapshot`, structural progress reports the backoff as a wake, the park as idle,
+    a due SelfRemove auto-commit behind either as waiting, and new input as runnable (mdk#2684)
 
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
@@ -151,6 +183,121 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 
+- **File:** `account_devices.rs`
+  - **Owns:** The `marmot.group.account-devices.v1` (0x800d) rules in groups that require it: no data, support, the
+    per-account leaf limit, never un-require, and Welcome acceptance. Each rule is checked by the committer, by replay
+    of a raw OpenMLS commit, at ingest for standalone proposals, and by the joiner of a raw OpenMLS Welcome, which
+    applies the state rules and the GroupInfo rule and accepts a Welcome from its own account; before activation, and on
+    the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Also same-account Commits
+    (mdk#2628 item 2.1c): which shapes a non-admin may commit, from both sides; the stamp's priority equal to replay's
+    for every class; and races settled the same way on every client. Also that the builder accepts 0x800d and still
+    refuses protocol ids the engine does not implement. Its `found_group(.., false, ..)` founds with a member that
+    does not advertise 0x800d and then removes it, because creation requires 0x800d whenever every founder advertises
+    it.
+
+- **File:** `account_devices/creation.rs`
+  - **Owns:** Creating a group (mdk#2628 item 2.3): the founding state requires 0x800d exactly when the creator's leaf
+    and every founding KeyPackage advertise it, without the host asking; a founding Add over the leaf limit is refused
+    with no group, Welcome or event left; invitees join the requiring group, a non-admin member then adds and removes
+    its own devices, and a device that does not advertise 0x800d cannot be added later, from both sides.
+
+- **File:** `account_devices/activation.rs`
+  - **Owns:** Turning account-devices on in an existing group (mdk#2628 item 2.4), `EnableAccountDevices`: an admin's
+    Commit that every member accepts; each refusal (not an admin, already required, a leaf without support or with data
+    under the id, an account over the leaf limit) comes before staging with the same aggregate reason the eligibility
+    read gives; a stray GroupContext entry is removed; a pending standalone Add of a device without support stays out
+    of the Commit. The legacy refusal is in `account_devices.rs`'s legacy test.
+
+- **File:** `account_devices/device_roster.rs` (test-policy builds only)
+  - **Owns:** `marmot.account.device-roster.v1` (0x800e, mdk#2628 item 3.1): a device group holds its roster from
+    creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the
+    update's bytes as the state is dropped; the roster's own invariants, one tag signature key per device included; every leaf is one
+    account, at creation, on invite, on replay and at join; the roster is required from creation or never, for
+    Commits and standalone proposals; and outside a device group roster bytes are unknown data. A device entry
+    replacement (`ReplaceDeviceEntry`) never lands on an entry that changed since it was read: not from its own
+    send's settlement, a rival branch at the same epoch, or the drain, and a lost one is re-issued only while its
+    entry is untouched (`DeviceEntryChanged`). An account entry replacement (`ReplaceAccountEntry`, 4.4a) holds to
+    the same rules for the account entry (`AccountEntryChanged`), and a send of one is refused rather than queued
+    while the group settles or behind a queued intent (`AccountEntryUnsettled`). The
+    `Parts::app_data_state` override in `account_devices.rs` lets a crafted Commit write resulting bytes of its own.
+
+- **File:** `account_devices/link_device.rs` (test-policy builds only)
+  - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked
+    device and sets its roster entry, accepted by every member, with the device joining through its Welcome. Each
+    refusal leaves the group as it was: not a device group, another account's KeyPackage, a device already in the
+    group, a KeyPackage without the group's required components, an update that doesn't set exactly one device entry,
+    an entry not for a new slot or not announcing the KeyPackage, a roster the link would leave invalid. Also the
+    sender rule refusing any own device-group Commit that takes an Add from the proposal store, and
+    `LinkDeviceUnsettled` instead of a queued link while convergence is unsettled, an own Commit is in flight, or an
+    intent waits in the queue. Its undo, `UnlinkDevice` (D40): one privileged Commit removing the linked leaf and its
+    entry, which the removed device sees as its removal; refused for another leaf than one other leaf of the account,
+    an update that doesn't remove exactly one listed entry, or while an own Commit is in flight or an intent waits in
+    the queue. A device it removed that forgot its copy joins again through the next link's Welcome, which no forget
+    cutoff dates. A link whose Welcome cannot be wrapped writes nothing.
+
+- **File:** `account_devices/device_group_welcome.rs` (test-policy builds only)
+  - **Owns:** Which Welcome a new device joins its device group through (mdk#2628 D28, D30): only the one a stored
+    expectation names, from the existing device's leaf and before the wait ends, which the join consumes. A
+    device-group Welcome no link expects, a forged one from another leaf, a chat Welcome under the reserved id, and a
+    Welcome after the wait or a withdrawal are refused before the join, and a refused forgery leaves the real Welcome
+    able to join. Also that this engine signs every leaf of a device with its one signature key (an implementation
+    fact, not a protocol rule, mdk#2628 D33), which lets a first link's Confirm name the creator's key before the
+    group exists.
+
+- **File:** `account_devices/device_tag.rs` (test-policy builds only)
+  - **Owns:** `marmot.member.device-tag.v1` (0x800f, mdk#2628 item 3.1d) through the engine: a member leaf whose tag
+    verifies under a roster device's key reads as that device, in the current tree only, or, read at an epoch, in the
+    tree of that epoch (a past one from its own retained anchor, writing nothing; one with no anchor reads nothing); a
+    tag that doesn't open never invalidates a Commit; another account's leaf is unclaimed; a Commit, standalone
+    proposal or Welcome that requires 0x800f is rejected; a GroupContext entry under it is unknown data the engine
+    never writes. Producing them:
+    a device that sets its own key in a roster update tags that Commit's UpdatePath; every KeyPackage it then builds
+    carries a fresh tag, and an untagged or no longer matching one is stale; only the entry at its own slot tags, so
+    another entry carrying its key tags nothing and an entry moved off its slot stops it tagging; a founder tags its
+    founding leaf from the roster it founds, from its own entry only; each kind of own Commit tags a leaf that needs a
+    tag, and the members accept it; a leaf whose tag reads as its own keeps it; without a named device group nothing is
+    tagged; naming a seeded group hydrates it, and a quarantined one tags nothing while a tagged KeyPackage stays
+    current. The tag crypto and the spec vector are unit-tested in `src/device_tag.rs`.
+
+- **File:** `account_devices/private_key_packages.rs`
+  - **Owns:** Private KeyPackages (mdk#2628 item 3.4b) through the engine: issued ones keep their keys in the same
+    transaction as their records and stay out of the KeyPackage inventory; a request stops earlier records counting
+    without deleting their keys, is answered once, and past the per-sibling cap is answered with the newest ones handed over again (D42); records that no longer
+    advertise this client's capabilities stop counting; an ordinary Welcome never consumes one; and a hand-off keeps
+    only KeyPackages tagged as its sender's slot (D33; the tagged case runs in test-policy builds only). A sibling
+    Welcome (3.5b) consumes only the private KeyPackage it names, issued to its sender, and one back into a chat still
+    held active is held, writing nothing, until that copy reads removed or unrecoverable. One carried no later than a
+    local forget is refused for that carrier alone, so the same Welcome in a later carrier joins. An invite with a
+    private KeyPackage, whose Welcome the Nostr binding cannot wrap, writes nothing.
+
+- **File:** `account_devices/send_intents.rs`
+  - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
+    `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its
+    proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
+    and sibling accepts, an added sibling joins through its sibling Welcome and a removed one sees its removal; restart
+    treats them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets,
+    never a self-update or a Leave, and only while the group requires 0x800d. A successful Add needs the device roster,
+    so those tests run in test-policy builds only.
+
+- **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
+  - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
+    failed by a rollback or a restart before it; one carrier at a time, and only that carrier delivers or fails it; owed
+    no more once its KeyPackage expires or its chat is disbanded; every refusal (a published KeyPackage, this device's
+    own slot, a slot named twice, a tag that reads as another slot, a last-resort KeyPackage, an untagged adder, a chat
+    that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
+    refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
+    by then. The read-only pre-check a host runs before it takes a KeyPackage (`sibling_add_refusal`,
+    `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
+    included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
+    invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
+
+- **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
+  - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
+    `found_group_routed_with`, `handed`, `assert_joins_from`) are how the gated same-account tests in
+    `sibling_welcomes.rs`, `send_intents.rs`, `creation.rs` and `device_tag.rs` add a sibling: tagged devices, a chat
+    that names relays, optionally with further leaves of an account, and a join through the sibling Welcome the Add
+    owes.
+
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
     model's own semantics, the fork shapes that only appear when post-fork traffic on an unadopted branch is
@@ -160,7 +307,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
-  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, no-op default behavior, and
+    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows
 
 ```sh
 cargo test -p cgka-engine

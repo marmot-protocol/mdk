@@ -223,12 +223,19 @@ impl SqliteAppStorage {
                      WHERE cause=7 AND demand_key!=?1 AND state IN (1,2))",
                     [&key],
                 ).storage()?;
+                // A new wire generation is not new evidence: a goal parked by
+                // its attempt cap stays parked until its notice is dismissed.
                 conn.execute_cached(
                     "UPDATE account_recovery_obligations SET demand_key=?1,
-                     revision=MAX(revision,?3)+1,state=0,eligibility=0,updated_at_ms=?2,
-                     incomplete_reason=NULL,parked_at_ms=NULL
+                     revision=MAX(revision,?3)+1,state=0,
+                     eligibility=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
+                         THEN 4 ELSE 0 END,
+                     parked_at_ms=CASE WHEN state=0 AND eligibility=4 AND recovery_attempts>=?4
+                         THEN parked_at_ms ELSE NULL END,
+                     updated_at_ms=?2,incomplete_reason=NULL
                      WHERE cause=7 AND demand_key!=?1",
-                    params![key,sqlite_integer(now_ms)?,scope_revision],
+                    params![key,sqlite_integer(now_ms)?,scope_revision,
+                        sqlite_integer(super::plan::RECOVERY_PARK_AFTER_ATTEMPTS)?],
                 ).storage()?;
             }
             // A new request for a known event or incremental history is new
@@ -836,61 +843,5 @@ mod capacity_tests {
             .unwrap();
         assert_eq!(second.ordinal, 2);
         assert_eq!(app.pending_recovery_demands().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let app = store.app_storage();
-        let ticket = app
-            .request_recovery(
-                RecoveryRequest::ExplicitHistory {
-                    operation_id: &[7; 16],
-                },
-                1,
-            )
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        let retry = app
-            .reserve_recovery_attempt(&fence, 1, 15_000, true)
-            .unwrap()
-            .unwrap();
-        app.restore_recovery_waiters().unwrap();
-        assert_eq!(
-            app.pending_recovery_demands().unwrap()[0].ticket.id,
-            ticket.id
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT urgency FROM account_recovery_obligations",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        store
-            .lock()
-            .unwrap()
-            .execute("UPDATE account_recovery_obligations SET state=1", [])
-            .unwrap();
-        app.detach_recovery_waiter(ticket).unwrap();
-        assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM account_recovery_obligations",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
     }
 }

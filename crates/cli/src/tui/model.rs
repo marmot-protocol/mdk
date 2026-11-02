@@ -420,6 +420,8 @@ pub(crate) struct ChatLastMessage {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaemonView {
     pub(crate) running: bool,
+    /// The daemon is still opening its accounts.
+    pub(crate) starting: bool,
     pub(crate) pid: Option<u64>,
     pub(crate) last_runtime_activity: Option<DaemonRuntimeActivityView>,
     pub(crate) stream_watches: Vec<DaemonStreamWatchView>,
@@ -1198,6 +1200,11 @@ impl GroupDetailView {
 /// Combine a group's members with its admin set into the group-detail view,
 /// tagging each member with admin/self flags and deriving the account's own
 /// admin status and the admin count that the leave guard needs.
+///
+/// `self_is_member` is this device's own membership. Another device of the
+/// account keeps its roster entry after this device's removal, so a removed
+/// device tags no row as itself and is never an admin here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_group_detail(
     group_id: &str,
     name: &str,
@@ -1206,14 +1213,16 @@ pub(crate) fn build_group_detail(
     admin_ids: &[String],
     relays: &[String],
     self_account_id: &str,
+    self_is_member: bool,
 ) -> GroupDetailView {
+    let is_self = |member_id: &str| self_is_member && member_id == self_account_id;
     let members = members
         .iter()
         .map(|(member_id, npub)| GroupMemberRow {
             member_id: member_id.clone(),
             npub: npub.clone(),
             is_admin: admin_ids.iter().any(|admin| admin == member_id),
-            is_self: member_id == self_account_id,
+            is_self: is_self(member_id),
         })
         .collect();
     GroupDetailView {
@@ -1222,7 +1231,7 @@ pub(crate) fn build_group_detail(
         description: description.to_owned(),
         members,
         relays: relays.to_vec(),
-        account_is_admin: admin_ids.iter().any(|admin| admin == self_account_id),
+        account_is_admin: admin_ids.iter().any(|admin| is_self(admin)),
         admin_count: admin_ids.len(),
         selected: 0,
     }
@@ -1275,6 +1284,16 @@ pub(crate) fn parse_group_relays(result: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether a `groups show` result says this device is still a member. A result
+/// without `self_membership` predates the field and reads as `member`, like
+/// `self_membership_json`'s own default.
+pub(crate) fn parse_self_is_member(result: &Value) -> bool {
+    result
+        .get("self_membership")
+        .and_then(Value::as_str)
+        .is_none_or(|membership| membership == "member")
 }
 
 /// Parse `(name, description)` from a `groups show` result's `profile` object.
@@ -4384,6 +4403,10 @@ pub(crate) fn parse_daemon_view(value: &Value) -> DaemonView {
     DaemonView {
         running: value
             .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        starting: value
+            .get("starting")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pid: value.get("pid").and_then(Value::as_u64),

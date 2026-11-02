@@ -11,10 +11,10 @@ use crate::{
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
-    SubjectUpdateGroupData, TraceExpectation, VectorFixture, build_scenario_oracle_report,
-    compare_trace_expectations, compile_scenario, drive_subject_to_quiescence,
-    preflight_compiled_scenario,
+    SubjectRemoveMembers, SubjectRemoveOwnAccountDevices, SubjectRequireAccountDevices,
+    SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    TraceExpectation, VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
+    compile_scenario, drive_subject_to_quiescence, preflight_compiled_scenario,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,35 @@ pub enum ScenarioStep {
         client: String,
         admins: Vec<String>,
         error: String,
+    },
+    /// Restart `client` on a build that does or does not advertise
+    /// `marmot.group.account-devices.v1`. Its later KeyPackages and leaves
+    /// follow; a leaf it already holds keeps its capabilities until it next
+    /// updates that leaf. Scenario IR v3 only.
+    SetAccountDevicesSupport {
+        client: String,
+        supported: bool,
+    },
+    /// Stage the Commit that adds `marmot.group.account-devices.v1` to the
+    /// group's required app components. Scenario IR v3 only.
+    RequireAccountDevices {
+        client: String,
+        pending: String,
+    },
+    /// Attempt that activation and record its normalized refusal. Scenario IR
+    /// v3 only.
+    ExpectRequireAccountDevicesError {
+        client: String,
+        error: String,
+    },
+    /// Stage a same-account Commit in which `client` removes the leaves of
+    /// `devices`, other devices of its own account, by value. It needs no
+    /// admin in a group that requires `marmot.group.account-devices.v1`.
+    /// Scenario IR v3 only.
+    RemoveOwnAccountDevices {
+        client: String,
+        devices: Vec<String>,
+        pending: String,
     },
     AcknowledgeOutbound {
         client: String,
@@ -268,6 +297,10 @@ impl ScenarioStep {
         "update_group_profile",
         "update_admin_policy",
         "expect_update_admin_policy_error",
+        "set_account_devices_support",
+        "require_account_devices",
+        "expect_require_account_devices_error",
+        "remove_own_account_devices",
         "acknowledge_outbound",
         "send_app_message",
         "leave",
@@ -335,6 +368,12 @@ impl ScenarioStep {
             ScenarioStep::UpdateGroupProfile { .. } => "update_group_profile",
             ScenarioStep::UpdateAdminPolicy { .. } => "update_admin_policy",
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => "expect_update_admin_policy_error",
+            ScenarioStep::SetAccountDevicesSupport { .. } => "set_account_devices_support",
+            ScenarioStep::RequireAccountDevices { .. } => "require_account_devices",
+            ScenarioStep::ExpectRequireAccountDevicesError { .. } => {
+                "expect_require_account_devices_error"
+            }
+            ScenarioStep::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
             ScenarioStep::AcknowledgeOutbound { .. } => "acknowledge_outbound",
             ScenarioStep::SendAppMessage { .. } => "send_app_message",
             ScenarioStep::Leave { .. } => "leave",
@@ -958,6 +997,76 @@ async fn execute_scenario_step(
                         step_index,
                         client: client_label,
                         operation: "update_admin_policy".into(),
+                        error: actual.code,
+                    });
+                }
+            }
+        }
+        ScenarioStep::SetAccountDevicesSupport { client, supported } => subject
+            .set_account_devices_support(client, *supported)
+            .map_err(|error| subject_step_error(step_index, error))?,
+        ScenarioStep::RequireAccountDevices { client, pending } => {
+            subject
+                .require_account_devices(SubjectRequireAccountDevices {
+                    action_id: Some(action_id),
+                    client,
+                    pending: Some(pending),
+                })
+                .await
+                .map_err(|error| {
+                    let mut failure = subject_step_error(step_index, error);
+                    failure.message = format!(
+                        "require_account_devices unexpectedly failed: {}",
+                        failure.message
+                    );
+                    failure
+                })?;
+        }
+        ScenarioStep::RemoveOwnAccountDevices {
+            client,
+            devices,
+            pending,
+        } => {
+            subject
+                .remove_own_account_devices(SubjectRemoveOwnAccountDevices {
+                    action_id,
+                    client,
+                    devices,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
+        }
+        ScenarioStep::ExpectRequireAccountDevicesError { client, error } => {
+            let client_label = client.clone();
+            match subject
+                .require_account_devices(SubjectRequireAccountDevices {
+                    action_id: None,
+                    client,
+                    pending: None,
+                })
+                .await
+            {
+                Ok(()) => {
+                    return Err(err(
+                        step_index,
+                        format!("require_account_devices unexpectedly succeeded; expected {error}"),
+                    ));
+                }
+                Err(actual) => {
+                    if &actual.code != error {
+                        return Err(err(
+                            step_index,
+                            format!(
+                                "require_account_devices failed with {}; expected {error}",
+                                actual.code
+                            ),
+                        ));
+                    }
+                    error_observations.push(ScenarioErrorObservation {
+                        step_index,
+                        client: client_label,
+                        operation: "require_account_devices".into(),
                         error: actual.code,
                     });
                 }
@@ -1620,7 +1729,9 @@ fn admin_gated_actor(step: &ScenarioStep) -> Option<&str> {
         ScenarioStep::InviteMembers { inviter, .. } => Some(inviter),
         ScenarioStep::UpdateGroupData { client, .. }
         | ScenarioStep::UpdateGroupProfile { client, .. } => Some(client),
-        ScenarioStep::UpdateAdminPolicy { client, .. } => Some(client),
+        ScenarioStep::UpdateAdminPolicy { client, .. }
+        | ScenarioStep::RequireAccountDevices { client, .. }
+        | ScenarioStep::ExpectRequireAccountDevicesError { client, .. } => Some(client),
         _ => None,
     }
 }

@@ -184,7 +184,9 @@ fn safe_failure_category(input: &str) -> String {
         | "peeler"
         | "serialize"
         | "invalid_welcome"
+        | "unexpected_device_group_welcome"
         | "missing_welcome_key_package"
+        | "welcome_not_addressed_to_this_device"
         | "welcome_already_processed"
         | "backend"
         | "other"
@@ -256,6 +258,7 @@ fn safe_failure_category(input: &str) -> String {
         | "account_home_unknown_account"
         | "account_home_unsupported_secret_backend"
         | "account_key_package"
+        | "account_key_package_announcement_pending"
         | "account_key_package_rotation_in_progress"
         | "account_session_busy"
         | "account_setup_key_package_recovery_available"
@@ -306,6 +309,7 @@ fn safe_failure_category(input: &str) -> String {
         | "full_history_repair_unconfirmed"
         | "group_create_includes_creator"
         | "group_disbanding"
+        | "group_invite_includes_inviter"
         | "group_invite_not_pending"
         | "group_removed"
         | "hex"
@@ -345,6 +349,7 @@ fn safe_failure_category(input: &str) -> String {
         | "missing_key_package"
         | "missing_member_inbox_route"
         | "missing_relay_lists"
+        | "not_addressed_to_this_device"
         | "not_for_this_client"
         | "notifications_disabled"
         | "onboarding_action_unavailable"
@@ -688,6 +693,7 @@ fn protect(value: &mut Value) -> Result<(), ContractError> {
                     | "route_kind"
                     | "refusal_category"
                     | "disposition"
+                    | "cap"
                     | "failure" => {
                         if matches!(child, Value::String(_) | Value::Array(_)) {
                             map_strings(&mut child, |s| Ok(safe_category(s)))?;

@@ -1661,9 +1661,12 @@ fn group_management_json(
         .iter()
         .filter(|member| is_admin(&member.member_id_hex))
         .count();
+    // A sibling device keeps this account on the roster after this device's own
+    // leaf is removed; only the local membership says whether this device is in.
     let self_member = members
         .iter()
-        .find(|member| member.member_id_hex == my_account_id_hex);
+        .find(|member| member.member_id_hex == my_account_id_hex)
+        .filter(|_| group.self_membership == marmot_app::SelfMembership::Member);
     let is_self_admin = self_member.is_some_and(|member| is_admin(&member.member_id_hex));
     let is_last_admin = is_self_admin && admin_count == 1;
     let lifecycle_terminal = matches!(mls.lifecycle_state, AppGroupLifecycleState::Disbanded);
@@ -1865,6 +1868,7 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, 
                 "member_id": member.member_id_hex,
                 "npub": npub_for_account_id(&member.member_id_hex)?,
                 "local": member.local,
+                "device_count": member.device_count,
             }))
         })
         .collect()
@@ -2014,5 +2018,51 @@ mod tests {
         );
         assert_eq!(listed.matches('\n').count(), 1);
         assert!(!listed.contains('\u{1b}'));
+    }
+
+    /// A device whose own leaf was removed gets no member affordances, even
+    /// while a sibling device keeps its account (and its admin role) on the roster.
+    #[test]
+    fn removed_device_with_sibling_on_roster_has_no_member_actions() {
+        let me = "cc".repeat(32);
+        let peer = "dd".repeat(32);
+        let mut group = sample_group("siblings", None);
+        group.admin_policy.admins = vec![me.clone()];
+        let members = [&me, &peer]
+            .into_iter()
+            .map(|id| AppGroupMemberRecord {
+                member_id_hex: id.clone(),
+                account: None,
+                local: id == &me,
+                device_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let mls: AppGroupMlsState = serde_json::from_value(json!({
+            "group_id_hex": group.group_id_hex,
+            "protocol_profile": "current",
+            "lifecycle_state": "stable",
+            "epoch": 3,
+            "member_count": 2,
+            "required_app_components": [],
+            "disbanding_enabled": true,
+        }))
+        .expect("sample MLS state");
+
+        let member = group_management_json(&me, &group, &members, &mls);
+        assert_eq!(member["is_self_admin"], true);
+        assert_eq!(member["can_invite"], true);
+        assert_eq!(member["requires_self_demote_before_leave"], true);
+
+        group.self_membership = marmot_app::SelfMembership::Removed;
+        let removed = group_management_json(&me, &group, &members, &mls);
+        for flag in [
+            "is_self_admin",
+            "can_invite",
+            "can_leave",
+            "requires_self_demote_before_leave",
+            "can_disband",
+        ] {
+            assert_eq!(removed[flag], false, "{flag}");
+        }
     }
 }

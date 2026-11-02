@@ -44,7 +44,7 @@ async fn restored_copy_retry_preserves_a_new_pending_send() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -122,7 +122,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
@@ -135,7 +135,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     connection
         .execute_batch("DROP TRIGGER fail_activity")
         .unwrap();
-    let newer = marmot_account::AccountDeviceEffects {
+    let newer = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::GroupStateInvalidated {
             group_id: group.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -148,7 +148,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     if checkpoint_retry {
         client
             .observe_account_device_effects(
-                &marmot_account::AccountDeviceEffects::default(),
+                &marmot_session::AccountDeviceEffects::default(),
                 &mut returned,
                 "older",
                 122,
@@ -213,7 +213,7 @@ async fn quiet_public_clients_return_repaired_activity_once() {
         let connection =
             super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
         connection.execute_batch(&format!("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 AND NEW.origin_commit_id = '{}' BEGIN SELECT RAISE(FAIL, 'injected activity'); END;", "77".repeat(32))).unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 rename(&group, &account.account_id_hex, 0x76),
                 rename(&group, &account.account_id_hex, 0x77),
@@ -277,7 +277,7 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let telemetry = AppPerformanceTelemetry::default();
+    let telemetry = PerformanceRecorder::default();
     let group = client
         .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
         .await
@@ -292,7 +292,7 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
         )
         .await
         .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -366,7 +366,7 @@ async fn cancelled_commit_keeps_output() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry(
                 "before rename",
@@ -510,7 +510,7 @@ async fn partial_sync_failure_transfers_the_committed_prefix_once() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch(&format!("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 AND NEW.origin_commit_id = '{}' BEGIN SELECT RAISE(FAIL, 'injected activity'); END;", "77".repeat(32))).unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             rename(&group, &account.account_id_hex, 0x76),
             rename(&group, &account.account_id_hex, 0x77),
@@ -562,7 +562,7 @@ async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_cleanup_conversion BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE direction = 'sent' AND invalidated = 1) BEGIN SELECT RAISE(FAIL, 'injected cleanup conversion'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -630,7 +630,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
             .await
@@ -661,7 +661,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             ]);
         }
         events.push(rename(&group, &account.account_id_hex, 0x76));
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events,
             ..Default::default()
         };
@@ -734,12 +734,13 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
     )
     .encode()
     .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::MessageReceived {
             authority: None,
             group_id: group.clone(),
             message_id: cgka_traits::MessageId::new(vec![0x81; 32]),
             sender: cgka_traits::MemberId::new(hex::decode(account.account_id_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: client.runtime.group_record(&group).unwrap().epoch,
             payload,
             retention: None,
@@ -787,7 +788,7 @@ async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activi
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x82)],
         ..Default::default()
     };
@@ -895,12 +896,13 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
             })
             .await
             .unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::MessageReceived {
                 authority: None,
                 group_id: group.clone(),
                 message_id: sent.reports[0].message_id.clone(),
                 sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                sender_leaf_index: None,
                 epoch: client.runtime.group_record(&group).unwrap().epoch,
                 payload,
                 retention: None,
@@ -1011,7 +1013,7 @@ async fn identical_fork_activity_adopts_canonical_origin_atomically() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_revival BEFORE UPDATE OF invalidated ON app_events WHEN OLD.invalidated = 1 AND NEW.invalidated = 0 BEGIN SELECT RAISE(FAIL, 'injected revival'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![winner],
         ..Default::default()
     };
@@ -1098,7 +1100,7 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
         client
             .record_send_intent_projection(&group, &account.account_id_hex, &event)
             .unwrap();
-        failed_app_messages.push(marmot_account::FailedApplicationMessage {
+        failed_app_messages.push(marmot_session::FailedApplicationMessage {
             group_id: group.clone(),
             app_event_id: event.id,
             message_id: cgka_traits::MessageId::new(vec![index as u8; 32]),
@@ -1109,7 +1111,7 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch(&format!("CREATE TRIGGER fail_metadata_conversion BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE message_id_hex = '{second}' AND invalidated = 1) BEGIN SELECT RAISE(FAIL, 'injected metadata conversion'); END;")).unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         failed_app_messages,
         ..Default::default()
     };
@@ -1180,7 +1182,7 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
         .groups
         .retain(|group| group.group_id_hex != terminal_hex);
     assert!(app.group("alice", &terminal_hex).unwrap().is_none());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::GroupJoined {
                 group_id: terminal.clone(),
@@ -1218,7 +1220,7 @@ async fn early_bookkeeping_failure_retains_native_effects() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("bookkeeping", &[]).await.unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
@@ -1891,7 +1893,7 @@ async fn ordinary_projection_failure_stays_retained_and_counts_toward_stall_warn
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
@@ -1950,18 +1952,20 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &joined(&deferred),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty(), "an outbox event replays instead");
     assert!(
-        !defer_event_projection(&joined(&deferred), groups, true, &mut summary),
+        !defer_event_projection(&joined(&deferred), groups, true, &mut summary, |_| true),
         "a projected outbox event must stage its acknowledgement"
     );
     assert!(!defer_event_projection(
         &joined(&healthy),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty());
 
@@ -1969,7 +1973,8 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
@@ -1980,13 +1985,26 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         true,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
         1,
         "a projected event is not published twice"
     );
+
+    // A group the host may not see, the account's device group, is deferred
+    // like any other, but none of its events reach subscribers.
+    let mut summary = SyncSummary::default();
+    assert!(defer_event_projection(
+        &quarantined,
+        groups,
+        false,
+        &mut summary,
+        |_| false
+    ));
+    assert!(summary.events.is_empty());
 }
 
 /// A drained batch whose projection succeeds but whose checkpoint keeps
@@ -2003,7 +2021,7 @@ async fn failed_drained_checkpoint_counts_toward_stall_warning() {
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("checkpoint", &[]).await.unwrap();
     client.fail_drained_effect_checkpoints = true;
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x78)],
         ..Default::default()
     };

@@ -81,6 +81,33 @@ fn publication_rejects_symlink_lock_and_releases_lock_after_error() {
     assert_eq!(fs::read(&target).unwrap(), b"salt");
 }
 
+#[test]
+fn publication_rejects_sources_that_break_its_preconditions() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("salt");
+    let stage = dir.path().join("staging");
+    let elsewhere = dir.path().join("other").join("staging");
+    let lock = publication_lock_path(&target);
+    fs::create_dir(elsewhere.parent().unwrap()).unwrap();
+    for path in [&stage, &elsewhere, &lock] {
+        fs_private::write_private(path, b"salt").unwrap();
+    }
+    for (source, destination, reason) in [
+        (&stage, &stage, "distinct paths in the same directory"),
+        (&elsewhere, &target, "distinct paths in the same directory"),
+        // Renaming the lock away would let a second publisher lock a new inode.
+        (&lock, &target, "must not be the publication lock"),
+    ] {
+        let error = rename_noreplace_with_lock(source, destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    assert!(!target.exists());
+    for path in [&stage, &elsewhere, &lock] {
+        assert_eq!(fs::read(path).unwrap(), b"salt");
+    }
+}
+
 // Invoked in fresh processes so the race cannot accidentally be protected
 // by an in-process Rust mutex. The parent holds the publication lock until
 // every child has staged and synced different complete candidate bytes.

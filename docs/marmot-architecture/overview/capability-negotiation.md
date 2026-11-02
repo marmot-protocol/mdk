@@ -3,7 +3,7 @@ title: "Capability Negotiation"
 created: 2026-04-19
 tags: [marmot, overview, capability-negotiation, interop]
 status: overview
-updated: 2026-05-08
+updated: 2026-10-27
 ---
 
 # Capability Negotiation
@@ -103,9 +103,9 @@ This is the single most important "baked into every client from the beginning" r
 The current engine has runtime `FeatureRegistry` support, required/optional capability registration, group creation
 checks, invite checks, and structured errors for missing capabilities.
 
-The per-leaf capability cache is still load-bearing: OpenMLS exposes capabilities on leaf nodes, but the engine cannot
-walk arbitrary public-group leaves through a stable public API in the shape we need. The cache is populated from
-KeyPackages, staged Add proposals, and the local member's own leaf node.
+Capability answers read every current leaf from the exported ratchet tree, so they come from authenticated state and
+every member computes the same answer. An account with several devices has one leaf per device, and a capability is
+available only when each of them advertises it. Nothing caches members' capabilities.
 
 ---
 

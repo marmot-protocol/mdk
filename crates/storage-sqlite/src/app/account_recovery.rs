@@ -2,6 +2,13 @@
 //! the narrow loss writer may only append monotonically increasing evidence.
 mod comparison;
 pub use comparison::{RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan};
+mod convert;
+#[cfg(test)]
+mod convert_tests;
+pub use convert::{
+    RecoveryConversionInput, RecoveryConversionReport, RecoveryConversionRoute,
+    RecoveryConvertedLoss, RecoveryConvertedObligations,
+};
 mod demand;
 pub use demand::{
     RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
@@ -13,15 +20,19 @@ mod plan;
 #[cfg(test)]
 mod replay_tests;
 mod stall;
-pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
+pub use loss::{
+    MAX_LOSS_ROUTES, RecoveryLossCause, RecoveryLossReach, RecoveryLossSnapshot,
+    RecoveryLossWatermark,
+};
 pub use notice::ParkedRecoveryObligation;
 pub use observe::{
     RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
 };
 pub use plan::{
-    RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
-    RecoveryPassProgress, RecoveryReplayPlacement, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
-    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+    RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility,
+    RecoveryEndpointCheckpoint, RecoveryPassProgress, RecoveryReplayPlacement,
+    RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken,
+    StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 
@@ -315,6 +326,7 @@ pub(crate) fn arm_overflow_tx(
     dropped: i64,
     now: i64,
     earliest_created_at: Option<u64>,
+    routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
 ) -> StorageResult<()> {
     // Import may have joined this generation before its queued control record
     // reaches the worker. Changing the represented identity must fence old
@@ -343,21 +355,62 @@ pub(crate) fn arm_overflow_tx(
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
+    // Drops past the durable count have no marker write naming their routes
+    // yet, and the import below covers their count, so the relay plane's
+    // routes for what the worker saw merge in as a marker write's would.
+    // Without them every route lost coverage; an absent row starts from them.
+    let durable: Option<i64> = conn
+        .query_row_cached(
+            "SELECT dropped_count FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+            params![label, token],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    let past_durable = durable.is_none_or(|durable| durable < dropped);
+    let routes = loss::listed_routes(routes);
+    // A marker write reads its floor and routes together, but the worker
+    // reads the routes after its snapshot, so they can name an older drop
+    // the snapshot missed. Recovery fetches from the floor, so it reaches
+    // down to every bound listed, as the marker's next write would.
+    let earliest_created_at = match routes {
+        Some(routes) if past_durable => earliest_created_at.map(|earliest| {
+            routes
+                .iter()
+                .fold(earliest, |lowest, (_, at)| lowest.min(*at))
+        }),
+        _ => earliest_created_at,
+    };
     let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
         &format!(
             "INSERT INTO account_delivery_loss_evidence
              (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
-              bound_state, bound_seconds)
-             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6)
+              bound_state, bound_seconds, route_state)
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6, ?7)
              ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
                  dropped_count = MAX(dropped_count, excluded.dropped_count),
                  imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
+                 route_state = CASE WHEN ?8 THEN MIN(route_state, excluded.route_state)
+                     ELSE route_state END,
                  {LOSS_BOUND_MERGE}"
         ),
-        params![label, token, now, dropped, bound_state, bound_seconds],
+        params![
+            label,
+            token,
+            now,
+            dropped,
+            bound_state,
+            bound_seconds,
+            i64::from(routes.is_some()),
+            past_durable
+        ],
     )
     .storage()?;
+    if past_durable {
+        loss::merge_routes_tx(conn, label, 0, token, routes)?;
+    }
     Ok(())
 }
 
@@ -376,6 +429,83 @@ pub(crate) fn loss_bound_values(
         Some(seconds) => (1, Some(sqlite_integer(seconds)?)),
         None => (2, None),
     })
+}
+
+/// What the generations one import charged lost: every route from the lowest
+/// floor among those that named no routes, and each named route from its own
+/// lowest bound. An import may charge any number of generations, so the named
+/// routes it holds are un-covered early once they pass [`MAX_LOSS_ROUTES`].
+#[derive(Default)]
+struct ChargedLoss {
+    every_route: Option<u64>,
+    routes: std::collections::BTreeMap<crate::TransportReconciliationRoute, u64>,
+}
+
+impl ChargedLoss {
+    /// Charge what the generation lost, and stamp it with the loss revision
+    /// its join just left: above every revision a checkpoint captured before
+    /// this import holds, and at most the one the import ends at. Call after
+    /// the generation's join; the caller un-covers it in the same
+    /// transaction.
+    fn charge(
+        &mut self,
+        conn: &Connection,
+        label: &str,
+        cause: i64,
+        token: i64,
+    ) -> StorageResult<()> {
+        conn.execute_cached(
+            "UPDATE account_delivery_loss_evidence SET import_revision =
+                 (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
+             WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+            params![label, cause, token],
+        )
+        .storage()?;
+        match loss::evidence_routes(conn, label, cause, token)? {
+            Some(routes) => {
+                for (route, bound) in routes {
+                    let lowest = self.routes.entry(route).or_insert(bound);
+                    *lowest = (*lowest).min(bound);
+                }
+                if self.routes.len() > MAX_LOSS_ROUTES {
+                    let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+                    for (route, bound) in std::mem::take(&mut self.routes) {
+                        crate::app::recovery_coverage::uncover_route_loss_tx(
+                            conn, &route, bound, now,
+                        )?;
+                    }
+                }
+            }
+            None => {
+                let floor = loss::evidence_floor(conn, label, cause, token)?;
+                self.every_route = Some(self.every_route.map_or(floor, |lowest| lowest.min(floor)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Un-cover what was lost, in the import's transaction. Returns whether
+    /// every route lost coverage.
+    fn uncover(self, conn: &Connection) -> StorageResult<bool> {
+        let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64())?;
+        if let Some(floor) = self.every_route {
+            crate::app::recovery_coverage::uncover_loss_tx(conn, floor, now)?;
+        }
+        for (route, bound) in self.routes {
+            match self.every_route {
+                Some(floor) if bound >= floor => {
+                    // Its coverage went with the account-wide floor, but that
+                    // widens only goals the ledger already holds, and this
+                    // route may have left current routing.
+                    crate::app::recovery_coverage::reopen_goal(conn, &route, floor)?
+                }
+                _ => {
+                    crate::app::recovery_coverage::uncover_route_loss_tx(conn, &route, bound, now)?
+                }
+            }
+        }
+        Ok(self.every_route.is_some())
+    }
 }
 
 /// The one obligation every generation of a loss cause joins.
@@ -449,7 +579,8 @@ fn join_loss_tx(
 /// Token-only legacy retirement cannot certify other generations joined into
 /// the same account demand. Reconstitute those generations in this transaction;
 /// their imported watermark remains distinct from low-level retirement. Loss
-/// the user already retired carries no debt and is not reconstituted.
+/// the user already retired carries no debt and is not reconstituted. Each
+/// restored generation un-covers as an import does.
 pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageResult<bool> {
     let rows = conn
         .prepare_cached(
@@ -470,6 +601,7 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
+    let mut lost = ChargedLoss::default();
     for (token, since, dropped) in &rows {
         join_loss_tx(conn, label, 0, *token, *dropped, *since, true)?;
         conn.execute_cached(
@@ -478,7 +610,9 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
             params![label, token],
         )
         .storage()?;
+        lost.charge(conn, label, 0, *token)?;
     }
+    lost.uncover(conn)?;
     Ok(!rows.is_empty())
 }
 
@@ -544,7 +678,13 @@ impl SqliteAppStorage {
             conn.execute_cached("UPDATE account_recovery_state SET route_snapshot=?1,route_revision=route_revision+?2 WHERE singleton=1",
                 params![snapshot.as_slice(),i64::from(changed)]).storage()?;
             if changed {
-                conn.execute_cached("UPDATE account_recovery_obligations SET eligibility=0 WHERE state=0", []).storage()?;
+                // A goal parked by its attempt cap waits for new loss or a
+                // dismissal, not for a route change elsewhere.
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET eligibility=0
+                     WHERE state=0 AND NOT (eligibility=4 AND recovery_attempts>=?1)",
+                    [sqlite_integer(RECOVERY_PARK_AFTER_ATTEMPTS)?],
+                ).storage()?;
             }
             Ok(changed)
         })
@@ -719,8 +859,8 @@ impl SqliteAppStorage {
     /// demand creation share a transaction, so cancellation cannot lose either.
     ///
     /// Returns what the import charged, at most one entry per loss cause, so
-    /// the owner can record the change. Loss that changed no obligation
-    /// revision reports nothing.
+    /// the owner can record the change. A cause whose import changed no
+    /// obligation revision reports only when it un-covered every route.
     pub fn synchronize_account_delivery_loss(
         &self,
         label: &str,
@@ -743,7 +883,10 @@ impl SqliteAppStorage {
             // evidence set is deliberately not disk-capped; do not mirror it
             // into an unbounded temporary Vec on reopen. The audit summary is
             // constant-size: one accumulator per cause.
-            let mut imports: [Option<(Option<observe::DemandRow>, u64)>; 2] = [None, None];
+            // Per cause: the demand before, the count charged, and what the
+            // generations this import charged lost.
+            let mut imports: [Option<(Option<observe::DemandRow>, u64, ChargedLoss)>; 2] =
+                [None, None];
             let mut cursor = (-1_i64, -1_i64);
             loop {
                 let row = conn
@@ -775,13 +918,12 @@ impl SqliteAppStorage {
                     .and_then(|cause| imports.get_mut(cause))
                 {
                     let charged = i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?;
-                    match slot {
-                        Some((_, total)) => *total = total.saturating_add(charged),
-                        None => {
-                            let before =
-                                observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
-                            *slot = Some((before, charged));
-                        }
+                    if slot.is_none() {
+                        let before = observe::demand_row(&conn, &loss_demand_key(cause, label)?)?;
+                        *slot = Some((before, 0, ChargedLoss::default()));
+                    }
+                    if let Some((_, total, _)) = slot {
+                        *total = total.saturating_add(charged);
                     }
                 }
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
@@ -791,22 +933,29 @@ impl SqliteAppStorage {
                     params![label, token, dropped, cause],
                 )
                 .storage()?;
+                if let Some(Some((_, _, lost))) = usize::try_from(cause)
+                    .ok()
+                    .and_then(|cause| imports.get_mut(cause))
+                {
+                    lost.charge(&conn, label, cause, token)?;
+                }
             }
             let mut changes = Vec::new();
             for (cause, slot) in imports.into_iter().enumerate() {
-                let Some((before, charged)) = slot else {
+                let Some((before, charged, lost)) = slot else {
                     continue;
                 };
                 let cause_value = i64::try_from(cause).map_err(|_| {
                     StorageError::Serialization("unsupported recovery loss cause".into())
                 })?;
+                let every_route = lost.uncover(&conn)?;
                 let Some(after) =
                     observe::demand_row(&conn, &loss_demand_key(cause_value, label)?)?
                 else {
                     continue;
                 };
                 let transition = observe::transition(before.as_ref(), &after);
-                if transition == RecoveryDemandTransition::Unchanged {
+                if transition == RecoveryDemandTransition::Unchanged && !every_route {
                     continue;
                 }
                 let cause = if cause == 0 {
@@ -814,12 +963,14 @@ impl SqliteAppStorage {
                 } else {
                     RecoveryLossCause::NotificationConsumer
                 };
+                let goal_floor = loss::goal_floor(&conn, label, cause)?;
                 changes.push(RecoveryLossImport {
                     cause,
                     obligation: observe::ticket(&after)?,
                     transition,
                     charged,
-                    goal_floor: loss::goal_floor(&conn, label, cause)?,
+                    goal_floor,
+                    every_route,
                 });
             }
             Ok(changes)
@@ -827,15 +978,21 @@ impl SqliteAppStorage {
     }
 
     /// [`Self::mark_account_delivery_recovery_bounded`], also reporting how the
-    /// worker's observation changed the queue-loss obligation, when it did.
-    /// The marker writer usually imported the generation first, so this is
-    /// most often `None`.
+    /// worker's observation changed the queue-loss obligation, when it did or
+    /// when it un-covered every route. The marker writer usually imported the
+    /// generation first, so this is most often `None`. It un-covers the
+    /// generation when it imported count. An observation past the durable
+    /// count merges `routes` into its generation as
+    /// [`Self::record_account_recovery_loss_routed`] would: the relay plane's
+    /// route map for every drop it counted, or `None` to un-cover every route.
+    /// The generation's floor drops to the lowest bound they list.
     pub fn mark_account_delivery_recovery_observed(
         &self,
         label: &str,
         marker_token: u64,
         dropped_count: u64,
         earliest_created_at: Option<u64>,
+        routes: Option<&[(crate::TransportReconciliationRoute, u64)]>,
     ) -> StorageResult<Option<RecoveryLossImport>> {
         let token = i64::try_from(marker_token).unwrap_or(i64::MAX);
         let dropped = i64::try_from(dropped_count).unwrap_or(i64::MAX);
@@ -860,20 +1017,38 @@ impl SqliteAppStorage {
                 dropped,
                 crate::base::codec::unix_now_seconds_i64(),
                 earliest_created_at,
+                routes,
             )?;
+            let charged: bool = conn
+                .query_row_cached(
+                    "SELECT ?3 IS NULL OR imported_count > ?3 FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+                    params![label, token, imported],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?
+                .unwrap_or(false);
+            let mut lost = ChargedLoss::default();
+            if charged {
+                lost.charge(&conn, label, 0, token)?;
+            }
+            let every_route = lost.uncover(&conn)?;
             let Some(after) = observe::demand_row(&conn, &key)? else {
                 return Ok(None);
             };
             let transition = observe::transition(before.as_ref(), &after);
-            if transition == RecoveryDemandTransition::Unchanged {
+            if transition == RecoveryDemandTransition::Unchanged && !every_route {
                 return Ok(None);
             }
+            let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
             Ok(Some(RecoveryLossImport {
                 cause: RecoveryLossCause::Queue,
                 obligation: observe::ticket(&after)?,
                 transition,
                 charged: i64_to_u64(dropped.saturating_sub(imported.unwrap_or(0)).max(0))?,
-                goal_floor: loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?,
+                goal_floor,
+                every_route,
             }))
         })
     }
@@ -931,12 +1106,32 @@ mod tests {
         store
     }
 
+    /// Panics unless `result` failed with a backend error containing `text`,
+    /// such as an injected trigger's message.
+    #[track_caller]
+    pub(super) fn assert_backend<T>(result: StorageResult<T>, text: &str) {
+        match result.map(|_| ()) {
+            Err(StorageError::Backend(message)) if message.contains(text) => {}
+            other => panic!("expected a backend error containing {text:?}, got {other:?}"),
+        }
+    }
+
+    /// Panics unless `result` failed with exactly the serialization error
+    /// `text` a guard raises.
+    #[track_caller]
+    pub(super) fn assert_serialization<T>(result: StorageResult<T>, text: &str) {
+        match result.map(|_| ()) {
+            Err(StorageError::Serialization(message)) if message == text => {}
+            other => panic!("expected the serialization error {text:?}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn review_legacy_clear_preserves_each_generation_across_reopen() {
         for (old, newer) in [(10, 90), (90, 10)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("loss.sqlite");
-            let key = SqlCipherKey::new("generation retirement test").unwrap();
+            let key = SqlCipherKey::raw([0x31; 32]);
             {
                 let store = SqliteAccountStorage::open_encrypted(&path, &key)
                     .unwrap()
@@ -973,11 +1168,15 @@ mod tests {
             );
             assert!(store.clear_account_delivery_recovery("alice", old).unwrap());
             assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            // The cleared generations keep their evidence watermarks: a late
+            // duplicate write neither rearms nor bumps the loss revision.
+            let before = store.recovery_revision_fence().unwrap();
             store
                 .record_account_delivery_loss("alice", newer, 15, 11)
                 .unwrap();
             store.synchronize_account_delivery_loss("alice").unwrap();
             assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            assert_eq!(store.recovery_revision_fence().unwrap(), before);
             store
                 .record_account_delivery_loss("alice", newer, 16, 12)
                 .unwrap();
@@ -1003,7 +1202,7 @@ mod tests {
         app.synchronize_account_delivery_loss("alice").unwrap();
         let before = app.recovery_revision_fence().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert!(app.clear_account_delivery_recovery("alice", 90).is_err());
+        assert_backend(app.clear_account_delivery_recovery("alice", 90), "injected");
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(
             app.account_delivery_recovery("alice")
@@ -1249,30 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retirement_keeps_evidence_watermark_for_a_late_writer() {
-        let store = fixture().app_storage();
-        store
-            .record_account_delivery_loss("alice", 3, 9, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.clear_account_delivery_recovery("alice", 3).unwrap());
-        let before = store.recovery_revision_fence().unwrap();
-        store
-            .record_account_delivery_loss("alice", 3, 9, 11)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
-        store
-            .record_account_delivery_loss("alice", 3, 10, 12)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations.len(),
-            1
-        );
-    }
-
-    #[test]
     fn reservation_fences_selected_demand_without_blocking_on_unrelated_joins() {
         let store = fixture();
         let app = store.app_storage();
@@ -1301,12 +1476,16 @@ mod tests {
                 .is_none(),
             "unselected eligible demand cannot authorize the selected quiescent scope"
         );
+        // Only the explicit override reserves it, and reserving fences
+        // nothing.
+        let joined = app.recovery_revision_fence().unwrap();
         assert!(
             app.reserve_recovery_attempt(&selected, 1000, 15000, true)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(app.recovery_revision_fence().unwrap().obligations.len(), 2);
+        assert_eq!(app.recovery_revision_fence().unwrap(), joined);
+        assert_eq!(joined.obligations.len(), 2);
     }
 
     #[test]
@@ -1333,7 +1512,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(store.consume_released_transport_receipts().is_err());
+        assert_backend(store.consume_released_transport_receipts(), "injected");
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         store
             .lock()
@@ -1362,24 +1541,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_does_not_take_mutation_ownership_from_the_worker() {
-        let store = fixture().app_storage();
-        store
-            .record_account_delivery_loss("alice", 9, 1, 10)
-            .unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(
-            store
-                .recovery_revision_fence()
-                .unwrap()
-                .obligations
-                .is_empty()
-        );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
-    }
-
-    #[test]
     fn zero_count_loss_is_still_imported_as_pending_evidence() {
         let store = fixture().app_storage();
         store
@@ -1404,9 +1565,9 @@ mod tests {
             .execute_batch("UPDATE account_recovery_scopes SET scope_format = 2")
             .unwrap();
         let fence = app.recovery_revision_fence().unwrap();
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000, 15000, true)
-                .is_err()
+        assert_serialization(
+            app.reserve_recovery_attempt(&fence, 1000, 15000, true),
+            "unsupported recovery scope format",
         );
         assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
     }
@@ -1418,6 +1579,9 @@ mod tests {
         app.record_account_delivery_loss("alice", 1, 4, 10).unwrap();
         app.record_account_delivery_loss("alice", 2, 7, 11).unwrap();
         app.record_account_delivery_loss("alice", 1, 2, 12).unwrap();
+        // The legacy read is not an import: it reports nothing and creates
+        // no demand before the worker imports.
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         let before = app.recovery_revision_fence().unwrap();
         assert!(before.obligations.is_empty());
         assert!(
@@ -1426,6 +1590,7 @@ mod tests {
                 .is_none()
         );
         app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
         let joined = app.recovery_revision_fence().unwrap();
         assert_eq!(joined.obligations.len(), 1);
         assert_eq!(joined.loss_revision, 2);
@@ -1471,7 +1636,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(app.synchronize_account_delivery_loss("alice").is_err());
+        assert_backend(app.synchronize_account_delivery_loss("alice"), "injected");
         assert!(
             app.recovery_revision_fence()
                 .unwrap()
@@ -1503,7 +1668,7 @@ mod tests {
     fn reservation_survives_reopen_and_clock_changes_without_free_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owner.sqlite");
-        let key = SqlCipherKey::new("owner retry test").unwrap();
+        let key = SqlCipherKey::raw([0x32; 32]);
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key)
                 .unwrap()
@@ -1592,31 +1757,5 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn incapable_pending_scope_does_not_wake_on_retry_deadline() {
-        let store = fixture();
-        let app = store.app_storage();
-        app.mark_account_delivery_recovery("alice", 1, 4).unwrap();
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3;")
-            .unwrap();
-        let fence = app.recovery_revision_fence().unwrap();
-        for now in [0, 300000, 600000, 1000000] {
-            assert!(
-                app.reserve_recovery_attempt(&fence, now, 300000, false)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert!(
-            app.reserve_recovery_attempt(&fence, 1000000, 300000, true)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
     }
 }

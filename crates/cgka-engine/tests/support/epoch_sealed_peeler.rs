@@ -156,6 +156,7 @@ impl TransportPeeler for EpochSealedPeeler {
             content: PeeledContent::Welcome {
                 created_at: (msg.timestamp.0 != 0).then_some(msg.timestamp),
                 bytes: msg.payload.clone(),
+                key_package_event_id: None,
             },
             origin: msg.clone(),
         })

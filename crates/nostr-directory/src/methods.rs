@@ -22,8 +22,9 @@ use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, O
 use super::resources::DirectoryResources;
 use crate::ids::parse_account_id_hex;
 use crate::published_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records,
-    latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
+    AccountKeyPackageSlots, KEY_PACKAGE_READ_PAGE, account_key_package_slots_from_records,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_queries,
+    merge_relay_list_status, relay_list_queries, select_key_packages_from_records,
 };
 use crate::records::{
     CachedIdentityProjection, CurrentFollowList, FetchedFollowList, MAX_CACHED_IDENTITY_PAGE_SIZE,
@@ -574,11 +575,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .relay_plane
             .fetch_directory_events_with_completion(
                 source_relays.clone(),
-                vec![DirectoryEventQuery::new(
-                    KIND_MARMOT_KEY_PACKAGE,
-                    vec![account_id_hex.to_owned()],
-                    12,
-                )],
+                key_package_queries(vec![account_id_hex.to_owned()]),
             )
             .await
             .map_err(|error| {
@@ -614,6 +611,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 discovery: &discovery_relays,
                 requirements: None,
                 cached_target,
+                wanted: 1,
             })
             .await?;
         let cached_entry = cached_entry.filter(|entry| {
@@ -624,13 +622,13 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     .is_none_or(|cached| evidence.allows_cached(cached))
             })
         });
-        let selection = latest_fresh_key_package_from_records(
+        let selection = select_key_packages_from_records(
             account_id_hex,
-            records.records,
+            &records.records,
             records.freshness,
-            &self.config.key_package_client_preference,
+            None,
         )?;
-        let from_cache = selection.value.is_none();
+        let from_cache = selection.value.is_empty();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
         // Without a fresh selection, only a successful cache fallback reaches this point.
         let source = if from_cache { "cache" } else { "network" };
@@ -850,6 +848,48 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             )
             .await
             .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))
+    }
+
+    /// Read every KeyPackage slot of `account_id_hex` from `source_relays`
+    /// (the directory relays when empty) in one inviter's read: one page of
+    /// KeyPackages and one of their deletion requests, each relay to its end
+    /// of stored events. With `own_slot`, the same read also asks each relay
+    /// for that slot alone (mdk#2628 item 3.4). See [`AccountKeyPackageSlots`].
+    pub async fn read_account_key_package_slots(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+        own_slot: Option<&str>,
+    ) -> Result<AccountKeyPackageSlots, DirectoryError> {
+        let account = PublicKey::parse(account_id_hex)
+            .map_err(|_| DirectoryError::InvalidPublicKey)?
+            .to_hex();
+        let mut queries = key_package_queries(vec![account.clone()]);
+        if let Some(slot) = own_slot {
+            // A page as large as the account's, so the slot's own page
+            // never cuts the account's read short sooner.
+            queries.push(DirectoryEventQuery::key_package_slot(
+                &account,
+                slot.to_owned(),
+                KEY_PACKAGE_READ_PAGE,
+            ));
+        }
+        let outcome = self
+            .relay_plane
+            .fetch_directory_events_with_completion(
+                self.directory_source_relays(source_relays),
+                queries,
+            )
+            .await
+            .map_err(|e| DirectoryError::RelayDirectory(format!("fetch key packages: {e}")))?;
+        Ok(account_key_package_slots_from_records(
+            &account,
+            &outcome.records,
+            outcome.complete,
+            &outcome.complete_endpoints,
+            self.directory_freshness(),
+            own_slot,
+        ))
     }
 
     pub(crate) async fn fetch_follow_list_for_account_id(

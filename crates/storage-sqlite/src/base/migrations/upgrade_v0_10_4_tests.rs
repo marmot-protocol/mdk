@@ -26,7 +26,6 @@ const PRESERVED_TABLES: &[&str] = &[
     "cgka_messages",
     "openmls_values",
     "cgka_group_snapshots",
-    "cgka_member_capabilities",
     "cgka_transport_group_routes",
     "cgka_group_maintenance",
     "account_groups",
@@ -145,6 +144,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
             .collect();
         assert_eq!(count(&conn, "cgka_groups"), 3);
         assert!(count(&conn, "message_timeline") >= 18);
+        assert!(count(&conn, "cgka_member_capabilities") > 0);
         (tables, cursor(&conn), retained_routes(&conn))
     };
     assert_eq!(before_cursor, Some(PERSISTED_CURSOR));
@@ -179,6 +179,12 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         // Same schema as a database created by this build.
         let fresh = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(schema(&conn), schema(&fresh.lock().unwrap()));
+        // The member-capability cache v0.10.4 kept is dropped (0121).
+        assert!(
+            !schema(&conn)
+                .iter()
+                .any(|row| row[1] == Value::Text("cgka_member_capabilities".into()))
+        );
 
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))

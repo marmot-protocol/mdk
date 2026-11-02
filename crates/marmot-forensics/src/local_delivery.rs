@@ -10,6 +10,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+mod retention;
+pub use retention::expire_closed_source;
+
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 96;
@@ -198,6 +201,20 @@ impl LocalAuditDelivery {
             delivery.publish()?;
         }
         Ok(delivery)
+    }
+
+    /// Filesystem identity of the exact prepared generation; no path re-read
+    /// that could accidentally identify a freshly rotated active file instead.
+    pub fn prepared_source_identity(&self, token: &DeliveryToken) -> Option<(u64, u64)> {
+        (token.destination == self.state.destination)
+            .then(|| {
+                self.state
+                    .journals
+                    .iter()
+                    .find(|journal| !journal.missing && journal.generation == token.generation)
+                    .map(|journal| (journal.device, journal.inode))
+            })
+            .flatten()
     }
 
     pub fn gaps(&self) -> &[DeliveryGap] {
@@ -613,6 +630,19 @@ impl LocalAuditDelivery {
                 changed = true;
             }
         }
+        // Expiry of an acknowledged sealed file is not missing evidence.
+        // Forget only retired, gap-free journals; retain every actual gap and
+        // unaccepted extent. Otherwise normal daily expiry accumulates a
+        // permanent journal for every file this device has ever uploaded.
+        let gap_generations: std::collections::HashSet<_> =
+            self.state.gaps.iter().map(|gap| gap.generation).collect();
+        let before = self.state.journals.len();
+        self.state.journals.retain(|journal| {
+            !journal.missing
+                || journal.acknowledged < journal.observed_len
+                || gap_generations.contains(&journal.generation)
+        });
+        changed |= before != self.state.journals.len();
         if changed {
             self.publish()?;
         }
@@ -796,6 +826,12 @@ fn source_paths(active: &Path) -> io::Result<Vec<PathBuf>> {
         segments.push(active.to_owned());
     }
     Ok(segments)
+}
+
+/// Read an inode identity without following a symlink. The caller must keep
+/// the source excluded from writers through the subsequent expiry operation.
+pub fn source_identity(path: &Path) -> io::Result<(u64, u64)> {
+    file_identity(&open_source(path)?)
 }
 
 fn open_source(path: &Path) -> io::Result<File> {
@@ -1819,5 +1855,258 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("size limit"));
+    }
+    #[test]
+    fn acknowledged_daily_file_expiry_keeps_cursor_bounded_without_replays_or_false_gaps() {
+        let (dir, active, state_dir, mut recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        for index in 0..1000 {
+            let sealed = dir
+                .path()
+                .join(format!("audit-engine-abc-v4-seg{index:06}.jsonl"));
+            // The recorder is not used while the test simulates its atomic
+            // daily rename. Reopen restores the actual writer for each turn.
+            drop(recorder);
+            fs::rename(&active, &sealed).unwrap();
+            let next = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+            drain(&mut worker, &mut sink);
+            let batches_before = sink.batches.len();
+            fs::remove_file(&sealed).unwrap();
+            drain(&mut worker, &mut sink);
+            assert_eq!(sink.batches.len(), batches_before);
+            assert!(worker.gaps().is_empty());
+            assert_eq!(worker.state.journals.len(), 1);
+            assert!(
+                fs::metadata(state_dir.join("local-delivery.json"))
+                    .unwrap()
+                    .len()
+                    < 4096
+            );
+            // Keep one recorder binding across iterations without leaving an
+            // old descriptor alive during the next rename.
+            recorder = next;
+        }
+    }
+    #[test]
+    fn retention_retires_fully_acknowledged_active_file_without_false_gap() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(recorder);
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&active, u64::MAX, &mut |p| retention::expire_closed_source(
+                    p, &state_dir
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Idle)
+        );
+        assert!(worker.gaps().is_empty());
+        assert!(worker.state.journals.is_empty());
+    }
+
+    #[test]
+    fn retention_preserves_unobserved_and_prepared_unsent_tail_evidence() {
+        for prepare_tail in [false, true] {
+            let (_dir, active, state_dir, recorder) = setup();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            drain(&mut worker, &mut FakeReceiver::default());
+            let acknowledged = worker.state.journals[0].acknowledged;
+            record(&recorder, "not-yet-uploaded");
+            let final_len = fs::metadata(&active).unwrap().len();
+            if prepare_tail {
+                let _ = prepared_batch(&mut worker);
+            }
+            drop(recorder);
+            assert!(
+                crate::NoopRecorder
+                    .expire_file_before(
+                        &active,
+                        u64::MAX,
+                        &mut |p| retention::expire_closed_source(p, &state_dir)
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                worker.prepare_once().unwrap(),
+                Preparation::Step(DeliveryStep::Gap)
+            );
+            assert_eq!(worker.gaps()[0].reason, GapReason::MissingSource);
+            assert_eq!(worker.gaps()[0].start, acknowledged);
+            assert_eq!(worker.state.journals[0].observed_len, final_len);
+        }
+    }
+
+    #[test]
+    fn retention_reconciles_a_roll_the_cursor_has_not_observed() {
+        let (dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        drop(recorder);
+        let sealed = dir.path().join("audit-engine-abc-v4-seg000003.jsonl");
+        fs::rename(&active, &sealed).unwrap();
+        let _new = JsonlRecorder::open(&active, "engine-abc".into()).unwrap();
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&sealed, u64::MAX, &mut |p| retention::expire_closed_source(
+                    p, &state_dir
+                ))
+                .unwrap()
+        );
+        let before = sink.batches.len();
+        drain(&mut worker, &mut sink);
+        assert!(worker.gaps().is_empty());
+        assert_eq!(sink.batches.len(), before + 1); // Only the new active session.
+    }
+
+    #[test]
+    fn retention_compensates_cursor_and_rename_when_publication_or_unlink_fails() {
+        for fail_publication in [false, true] {
+            let (dir, active, state_dir, recorder) = setup();
+            let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+            drain(&mut worker, &mut FakeReceiver::default());
+            drop(recorder);
+            let bytes = fs::read(&active).unwrap();
+            let state_before = fs::read(state_dir.join("local-delivery.json")).unwrap();
+            let result = retention::expire_with(
+                &active,
+                &state_dir,
+                |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                |delivery| {
+                    delivery.publish()?;
+                    if fail_publication {
+                        Err(io::Error::other("injected post-commit failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read(&active).unwrap(), bytes);
+            assert_eq!(
+                fs::read(state_dir.join("local-delivery.json")).unwrap(),
+                state_before
+            );
+            assert_eq!(source_paths(&active).unwrap().len(), 1);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+            assert!(
+                crate::NoopRecorder
+                    .expire_file_before(
+                        &active,
+                        u64::MAX,
+                        &mut |p| retention::expire_closed_source(p, &state_dir)
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                worker.prepare_once().unwrap(),
+                Preparation::Step(DeliveryStep::Idle)
+            );
+            assert!(worker.gaps().is_empty());
+        }
+    }
+
+    #[test]
+    fn retention_crash_after_cursor_publication_retries_sealed_inode_without_false_gap() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(recorder);
+        let bytes = fs::read(&active).unwrap();
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = retention::expire_with(
+                &active,
+                &state_dir,
+                |_| panic!("simulated process stop before unlink"),
+                |delivery| delivery.publish(),
+            );
+        }));
+        assert!(interrupted.is_err());
+        assert!(!active.exists());
+        let sealed = source_paths(&active).unwrap().pop().unwrap();
+        assert_eq!(fs::read(&sealed).unwrap(), bytes);
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&sealed, u64::MAX, &mut |p| retention::expire_closed_source(
+                    p, &state_dir
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Idle)
+        );
+        assert!(worker.gaps().is_empty());
+    }
+
+    #[test]
+    fn retention_failed_compensation_preserves_the_sealed_source_for_retry() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        drain(&mut worker, &mut FakeReceiver::default());
+        drop(recorder);
+        let bytes = fs::read(&active).unwrap();
+        let result = retention::expire_with(
+            &active,
+            &state_dir,
+            |_| panic!("unlink must not run"),
+            |delivery| {
+                delivery.publish()?;
+                fs::create_dir(delivery.state_path.with_extension("json.tmp"))?;
+                Err(io::Error::other("injected publication uncertainty"))
+            },
+        );
+        assert!(result.is_err());
+        assert!(!active.exists());
+        let sealed = source_paths(&active).unwrap().pop().unwrap();
+        assert_eq!(fs::read(&sealed).unwrap(), bytes);
+        fs::remove_dir(state_dir.join("local-delivery.json.tmp")).unwrap();
+        assert!(
+            crate::NoopRecorder
+                .expire_file_before(&sealed, u64::MAX, &mut |p| retention::expire_closed_source(
+                    p, &state_dir
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Idle)
+        );
+        assert!(worker.gaps().is_empty());
+    }
+    #[test]
+    fn retention_expires_idle_live_data_and_keeps_recording_without_false_gap() {
+        let (_dir, active, state_dir, recorder) = setup();
+        let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
+        let mut sink = FakeReceiver::default();
+        drain(&mut worker, &mut sink);
+        let before = fs::read(&active).unwrap();
+        let health = recorder.health_snapshot();
+        assert!(
+            recorder
+                .expire_file_before(&active, u64::MAX, &mut |closed| {
+                    assert_eq!(fs::read(closed).unwrap(), before);
+                    assert!(fs::read(&active).unwrap().is_empty());
+                    retention::expire_closed_source(closed, &state_dir)
+                })
+                .unwrap()
+        );
+        assert_eq!(recorder.health_snapshot(), health);
+        assert_eq!(
+            worker.prepare_once().unwrap(),
+            Preparation::Step(DeliveryStep::Idle)
+        );
+        assert!(worker.gaps().is_empty());
+        let count = sink.batches.len();
+        record(&recorder, "after-expiry");
+        drain(&mut worker, &mut sink);
+        assert_eq!(sink.batches.len(), count + 1);
+        assert!(worker.gaps().is_empty());
     }
 }

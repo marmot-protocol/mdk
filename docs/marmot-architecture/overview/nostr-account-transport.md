@@ -82,7 +82,7 @@ It should:
 - publish KeyPackages to relays from the account's kind `10002` NIP-65 list;
 - publish account relay-list events during bootstrap and updates.
 
-Multi-account dedupe belongs here, below `marmot-account`. The account runtime should not need a global view of every
+Multi-account dedupe belongs here, below `marmot-session`. The account runtime should not need a global view of every
 local account.
 
 ### Marmot Nostr Group Routing
@@ -122,8 +122,8 @@ from a group component, but that decision is local policy.
 
 ```mermaid
 flowchart TD
-  App["App / account manager"] --> Runtime["marmot-account"]
-  Runtime --> Session["cgka-session"]
+  App["App / account manager"] --> Runtime["marmot-session runtime"]
+  Runtime --> Session["marmot-session session"]
   Session --> Engine["cgka-engine"]
 
   App --> Directory["Nostr user directory"]
@@ -142,7 +142,7 @@ flowchart TD
   RelayClient --> Relays["Nostr relays"]
 ```
 
-`marmot-account` coordinates account-device work. It should stay transport-generic.
+`marmot-session`'s runtime coordinates account-device work. It should stay transport-generic.
 
 Nostr-specific directory state, relay-list publication, relay safety, and multi-account subscription dedupe belong in
 the Nostr account transport layer.

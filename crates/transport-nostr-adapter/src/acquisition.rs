@@ -1,8 +1,8 @@
 //! Owned transport evidence for a future bounded SDK acquisition backend.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
-use cgka_traits::{MemberId, TransportEndpoint};
+use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use transport_nostr_peeler::NostrTransportEvent;
 
 /// Request-local cancellation uses Tokio's shared cancellation primitive.
@@ -245,6 +245,76 @@ impl NostrNotificationLossFloor {
         match self {
             Self::Unbounded => None,
             Self::Since(seconds) => Some(seconds),
+        }
+    }
+}
+
+/// The most routes one loss generation lists. A generation that loses
+/// deliveries on more loses its routes, and recovery treats it as loss on
+/// every route.
+pub const MAX_DELIVERY_LOSS_ROUTES: usize = 256;
+
+/// The route a delivery arrived on, as recovery keys its coverage: a Welcome
+/// to the account arrives on its inbox, and a group message whose MLS group
+/// the plane knows arrives on that group's 32-byte transport route. A REQ
+/// selects the routes its filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeliveryRoute {
+    Inbox,
+    Group([u8; 32]),
+}
+
+impl DeliveryRoute {
+    /// The delivery's route, or `None` when recovery cannot place it: a
+    /// Welcome addressed to someone else, or a group message without a known
+    /// group.
+    pub fn of(delivery: &TransportDelivery) -> Option<Self> {
+        match &delivery.message.envelope {
+            cgka_traits::TransportEnvelope::Welcome { recipient }
+                if *recipient == delivery.account_id =>
+            {
+                Some(Self::Inbox)
+            }
+            cgka_traits::TransportEnvelope::GroupMessage { transport_group_id }
+                if delivery.group_id_hint.is_some() =>
+            {
+                <[u8; 32]>::try_from(transport_group_id.as_slice())
+                    .ok()
+                    .map(Self::Group)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What one receiver gap is known to have lost: the lowest floor, and each
+/// route's own floor when every REQ that could still deliver to the receiver
+/// names its routes.
+///
+/// A gap can falsify only coverage that relied on a notification arriving: a
+/// live boundary, which proves a route only from the `since` of a REQ that
+/// selects it. So a route's lowest such `since` bounds what the gap took from
+/// that route's coverage. That holds even when a relay sends an event under
+/// another REQ's id, which the SDK does not check: no proof on the event's
+/// route relies on that delivery, and losing it leaves the route as a relay
+/// that kept to the filter would. Comparisons and sweeps collect their own
+/// replies, so a gap on this receiver takes nothing they proved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrNotificationLossBounds {
+    pub floor: NostrNotificationLossFloor,
+    /// Each route those REQs select, with the lowest `since` among the ones
+    /// that select it. `None` when the floor is unbounded, a REQ's routes are
+    /// unknown, or they pass [`MAX_DELIVERY_LOSS_ROUTES`]: recovery then
+    /// treats the gap as loss on every route from the floor.
+    pub routes: Option<BTreeMap<DeliveryRoute, u64>>,
+}
+
+impl NostrNotificationLossBounds {
+    /// Loss bounded only by `floor`, on every route.
+    pub fn account_wide(floor: NostrNotificationLossFloor) -> Self {
+        Self {
+            floor,
+            routes: None,
         }
     }
 }

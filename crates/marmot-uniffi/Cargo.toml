@@ -21,7 +21,6 @@ marmot-app.workspace = true
 marmot-account.workspace = true
 marmot-markdown.workspace = true
 marmot-uniffi-macros.workspace = true
-cgka-engine.workspace = true
 cgka-traits.workspace = true
 nostr.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
@@ -34,6 +33,7 @@ uniffi = "0.29.4"
 zeroize.workspace = true
 
 [dev-dependencies]
+marmot-app = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 keyring-core.workspace = true

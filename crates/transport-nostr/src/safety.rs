@@ -279,6 +279,24 @@ pub fn same_relay(left: &str, right: &str) -> bool {
         )
 }
 
+/// One spelling per relay, so endpoint strings from different layers can key
+/// one ledger row: the parsed URL, or the trimmed input when it does not
+/// parse. Parsing keeps a root path's slash as given, so a bare root slash is
+/// dropped; any other path, slash included, still names its own endpoint.
+pub fn canonical_relay(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    let mut parsed =
+        RelayUrl::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string());
+    let authority = parsed.find("://").map_or(0, |index| index + 3);
+    if parsed[authority..]
+        .find('/')
+        .is_some_and(|slash| authority + slash + 1 == parsed.len())
+    {
+        parsed.pop();
+    }
+    parsed
+}
+
 /// The endpoints whose comparison certifies a recovery scope, chosen from the
 /// ones recovery may contact (`admitted`): the route's operated relays. Any
 /// other relay is best effort and never blocks completion. A route with no
@@ -639,6 +657,38 @@ mod tests {
         assert!(same_relay("wss://Relay.Example:443", "wss://relay.example"));
         assert!(same_relay("wss://relay.example/", "wss://relay.example"));
         assert!(!same_relay("wss://relay.example", "wss://other.example"));
+    }
+
+    #[test]
+    fn canonical_relay_spells_same_relays_alike() {
+        for spelling in [
+            "wss://relay.example/",
+            "wss://Relay.Example:443",
+            " wss://relay.example ",
+        ] {
+            assert_eq!(
+                canonical_relay(spelling),
+                canonical_relay("wss://relay.example")
+            );
+        }
+        assert_ne!(
+            canonical_relay("wss://relay.example"),
+            canonical_relay("wss://other.example")
+        );
+        // A path names its own endpoint, with or without a trailing slash.
+        assert_ne!(
+            canonical_relay("wss://relay.example/feed"),
+            canonical_relay("wss://relay.example/feed/")
+        );
+        assert_ne!(
+            canonical_relay("wss://relay.example/feed"),
+            canonical_relay("wss://relay.example")
+        );
+        assert_ne!(
+            canonical_relay("wss://relay.example/?a=1"),
+            canonical_relay("wss://relay.example")
+        );
+        assert_eq!(canonical_relay("wss://"), "wss://");
     }
 
     #[test]

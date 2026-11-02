@@ -909,6 +909,7 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 42,
         started_at: 7,
+        starting: false,
         last_runtime_activity: None,
     }));
     let workers = SharedDaemonWorkers::default();
@@ -948,6 +949,7 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 1,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     let events = DaemonEventHub::new();
@@ -1032,6 +1034,7 @@ async fn disabled_app_runtime_skips_relay_validation_and_preserves_nsec_sidecar(
         Arc::new(Mutex::new(DaemonState {
             pid: 1,
             started_at: 0,
+            starting: false,
             last_runtime_activity: None,
         })),
         DaemonEventHub::new(),
@@ -1301,6 +1304,7 @@ async fn finish_stream_compose_removes_session_for_invalid_terminal_report() {
         let state = Arc::new(Mutex::new(DaemonState {
             pid: 0,
             started_at: 0,
+            starting: false,
             last_runtime_activity: None,
         }));
         let mut runtime_host = AppRuntimeHost::default();
@@ -1362,6 +1366,7 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     let events = DaemonEventHub::new();
@@ -1533,6 +1538,7 @@ fn account_error_activity_message_excludes_account_identity() {
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,
         started_at: 0,
+        starting: false,
         last_runtime_activity: None,
     }));
     record_runtime_activity_error(&state, recorded.clone());
@@ -2026,5 +2032,600 @@ fn background_stream_watch_requires_account_scope() {
     assert_eq!(
         new_stream_watch_start(&cli).unwrap_err(),
         "background stream watch requires --account"
+    );
+}
+
+fn gated_daemon(home: &Path) -> (DaemonDefaults, Arc<StartGate>) {
+    let defaults = DaemonDefaults {
+        home: home.to_path_buf(),
+        socket: home.join("wnd.sock"),
+        pid_path: home.join("wnd.pid"),
+        log_path: home.join("wnd.log"),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("wn-test-keychain".to_owned()),
+    };
+    (defaults, Arc::new(StartGate::default()))
+}
+
+async fn serve_gated_daemon(
+    defaults: &DaemonDefaults,
+    gate: &Arc<StartGate>,
+) -> (
+    JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SharedDaemonWorkers,
+) {
+    let listener = UnixListener::bind(&defaults.socket).expect("bind daemon socket");
+    write_pid_file(&defaults.pid_path).expect("write pid file");
+    let workers = SharedDaemonWorkers::default();
+    workers.lock().await.runtime.start_gate = Some(gate.clone());
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: std::process::id(),
+        started_at: 0,
+        starting: true,
+        last_runtime_activity: None,
+    }));
+    let server = tokio::spawn(serve_daemon(
+        listener,
+        defaults.clone(),
+        state,
+        DaemonEventHub::new(),
+        workers.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.acquire())
+        .await
+        .expect("runtime start reaches the gate")
+        .expect("gate open")
+        .forget();
+    (server, workers)
+}
+
+async fn status_of(socket: &Path) -> DaemonStatus {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(socket, &DaemonRequest::Status),
+    )
+    .await
+    .expect("status answers while the runtime starts")
+    .expect("status request succeeds");
+    serde_json::from_str(output.stdout.trim()).expect("status JSON")
+}
+
+#[tokio::test]
+async fn daemon_status_reports_starting_until_its_runtime_has_started() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let (server, _workers) = serve_gated_daemon(&defaults, &gate).await;
+
+    let status = status_of(&defaults.socket).await;
+    assert!(status.running);
+    assert!(status.starting);
+
+    gate.release.add_permits(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status_of(&defaults.socket).await.starting {
+        assert!(Instant::now() < deadline, "daemon never finished starting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    send_request(&defaults.socket, &DaemonRequest::Shutdown)
+        .await
+        .expect("shutdown request succeeds");
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("daemon stops")
+        .expect("server task does not panic")
+        .expect("server shuts down cleanly");
+}
+
+#[tokio::test]
+async fn daemon_stop_during_startup_shuts_down_the_runtime_it_was_starting() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let (server, workers) = serve_gated_daemon(&defaults, &gate).await;
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(&defaults.socket, &DaemonRequest::Shutdown),
+    )
+    .await
+    .expect("stop answers while the runtime starts")
+    .expect("shutdown request succeeds");
+    assert_eq!(output.code, 0);
+    tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .expect("a stop during startup does not wait for the start")
+        .expect("server task does not panic")
+        .expect("server shuts down cleanly");
+
+    assert!(!defaults.socket.exists(), "socket removed");
+    assert!(!defaults.pid_path.exists(), "pid file removed");
+    let workers = workers.lock().await;
+    assert!(workers.runtime.starting.is_none());
+    assert!(workers.runtime.runtime.is_none());
+}
+
+#[tokio::test]
+async fn daemon_exits_with_an_error_when_its_runtime_startup_panics() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    gate.panic.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (server, workers) = serve_gated_daemon(&defaults, &gate).await;
+    assert!(status_of(&defaults.socket).await.starting);
+
+    gate.release.add_permits(1);
+    let err = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("daemon exits after its startup panics")
+        .expect("server task does not panic")
+        .expect_err("a startup panic is an error");
+    assert_eq!(err.to_string(), "app runtime startup panicked");
+    assert!(!defaults.socket.exists(), "socket removed");
+    assert!(!defaults.pid_path.exists(), "pid file removed");
+    assert!(workers.lock().await.runtime.starting.is_none());
+}
+
+#[tokio::test]
+async fn abort_all_shuts_down_a_runtime_whose_start_was_cancelled() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (defaults, gate) = gated_daemon(home.path());
+    let workers = SharedDaemonWorkers::default();
+    workers.lock().await.runtime.start_gate = Some(gate.clone());
+    let state = Arc::new(Mutex::new(DaemonState {
+        pid: 0,
+        started_at: 0,
+        starting: true,
+        last_runtime_activity: None,
+    }));
+    let start = tokio::spawn(start_app_runtime(
+        defaults.clone(),
+        state.clone(),
+        DaemonEventHub::new(),
+        workers.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.acquire())
+        .await
+        .expect("runtime start reaches the gate")
+        .expect("gate open")
+        .forget();
+    start.abort();
+    let _ = start.await;
+
+    let mut workers = workers.lock().await;
+    let runtime = workers
+        .runtime
+        .starting
+        .clone()
+        .expect("a cancelled start leaves its runtime for abort_all");
+    workers.abort_all().await;
+    assert!(runtime.is_stopping());
+    assert!(workers.runtime.starting.is_none());
+    assert!(
+        state.lock().unwrap().starting,
+        "a cancelled start never finished"
+    );
+}
+
+#[test]
+fn daemon_start_timeout_override_is_available_in_explicit_test_builds() {
+    assert_eq!(
+        resolve_daemon_start_timeout(Some("250"), true).unwrap(),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        resolve_daemon_start_timeout(None, true).unwrap(),
+        DAEMON_START_TIMEOUT
+    );
+}
+
+#[test]
+fn daemon_start_timeout_override_is_rejected_without_test_feature() {
+    let message = resolve_daemon_start_timeout(Some("0"), false).expect_err("feature rejection");
+    assert!(
+        message.contains("WN_DEV_DAEMON_START_TIMEOUT_MS"),
+        "{message}"
+    );
+    assert_eq!(
+        resolve_daemon_start_timeout(None, false).unwrap(),
+        DAEMON_START_TIMEOUT
+    );
+}
+
+/// Answer status and stop requests on `socket` as a daemon with `pid`, after
+/// dropping the first `unanswered` requests without a reply.
+fn fake_daemon_status(socket: &Path, pid: Option<u32>, unanswered: usize) -> JoinHandle<()> {
+    fake_starting_daemon_status(socket, pid, unanswered, 0)
+}
+
+/// [`fake_daemon_status`] whose first `starting` status answers report that it
+/// is still opening its accounts.
+fn fake_starting_daemon_status(
+    socket: &Path,
+    pid: Option<u32>,
+    unanswered: usize,
+    starting: usize,
+) -> JoinHandle<()> {
+    let listener = UnixListener::bind(socket).expect("bind fake daemon socket");
+    let socket = socket.to_owned();
+    tokio::spawn(async move {
+        let mut unanswered = unanswered;
+        let mut starting = starting;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_daemon_request(&mut stream).await;
+            if unanswered > 0 {
+                unanswered -= 1;
+                continue;
+            }
+            if let (Ok(DaemonRequest::Shutdown), Some(pid)) = (&request, pid) {
+                let output = CliOutput {
+                    code: 0,
+                    stdout: serde_json::to_string(&DaemonShutdownAck { pid }).expect("ack json"),
+                    stderr: String::new(),
+                };
+                write_daemon_output(&mut stream, &output).await;
+                continue;
+            }
+            let status = DaemonStatus {
+                running: true,
+                starting: starting > 0,
+                socket: socket.clone(),
+                pid,
+                pid_file: None,
+                stale_pid: None,
+                started_at: None,
+                home: None,
+                log: None,
+                last_runtime_activity: None,
+                relay_health: None,
+                stream_watches: Vec::new(),
+            };
+            starting = starting.saturating_sub(1);
+            let output = CliOutput {
+                code: 0,
+                stdout: serde_json::to_string(&status).expect("status json"),
+                stderr: String::new(),
+            };
+            write_daemon_output(&mut stream, &output).await;
+        }
+    })
+}
+
+/// A stand-in for a spawned `wnd` that is still starting.
+fn still_starting_child() -> std::process::Child {
+    Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep")
+}
+
+/// A stand-in for a spawned `wnd` that has already exited with `code`.
+fn exited_child(code: i32) -> std::process::Child {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(format!("exit {code}"))
+        .spawn()
+        .expect("spawn sh");
+    child.wait().expect("wait for sh");
+    child
+}
+
+fn stop_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn spawned_daemon_is_ready_once_it_answers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = still_starting_child();
+    let pid = Some(child.id());
+    let server = fake_daemon_status(&socket, pid, 1);
+
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        std::future::pending(),
+    )
+    .await;
+
+    server.abort();
+    stop_child(&mut child);
+    assert!(
+        matches!(&outcome, SpawnedDaemon::Ready(status) if status.pid == pid),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn spawned_daemon_is_ready_only_once_it_has_opened_its_accounts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = still_starting_child();
+    let pid = Some(child.id());
+    let server = fake_starting_daemon_status(&socket, pid, 0, 3);
+
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        std::future::pending(),
+    )
+    .await;
+
+    server.abort();
+    stop_child(&mut child);
+    assert!(
+        matches!(&outcome, SpawnedDaemon::Ready(status) if status.pid == pid && !status.starting),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn spawned_daemon_is_stopped_when_the_start_is_interrupted() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = still_starting_child();
+    let server = fake_starting_daemon_status(&socket, Some(child.id()), 0, usize::MAX);
+
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        tokio::time::sleep(Duration::from_millis(300)),
+    )
+    .await;
+
+    server.abort();
+    assert!(matches!(outcome, SpawnedDaemon::Interrupted), "{outcome:?}");
+    let exit = child
+        .try_wait()
+        .expect("try_wait")
+        .expect("the interrupted daemon was reaped");
+    assert_eq!(exit.signal(), Some(libc::SIGKILL));
+}
+
+#[tokio::test]
+async fn spawned_daemon_that_exits_before_answering_fails_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = exited_child(3);
+
+    let started = Instant::now();
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(
+        matches!(&outcome, SpawnedDaemon::Exited(exit) if exit.code() == Some(3)),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "an exited daemon must not wait for the timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn spawned_daemon_still_starting_at_the_timeout_is_stopped() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = still_starting_child();
+    let server = fake_starting_daemon_status(&socket, Some(child.id()), 0, usize::MAX);
+
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_millis(300),
+        std::future::pending(),
+    )
+    .await;
+
+    server.abort();
+    assert!(matches!(outcome, SpawnedDaemon::Stopped), "{outcome:?}");
+    let exit = child
+        .try_wait()
+        .expect("try_wait")
+        .expect("the stopped daemon was reaped");
+    assert_eq!(exit.signal(), Some(libc::SIGKILL));
+
+    // A daemon from before status answered during startup binds its socket and
+    // accepts nothing until its accounts are open. The status probe hangs,
+    // and the timeout must apply anyway.
+    std::fs::remove_file(&socket).expect("remove fake socket");
+    let _listener = UnixListener::bind(&socket).expect("bind");
+    let mut child = still_starting_child();
+
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_millis(300),
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(matches!(outcome, SpawnedDaemon::Stopped), "{outcome:?}");
+    let exit = child
+        .try_wait()
+        .expect("try_wait")
+        .expect("the stopped daemon was reaped");
+    assert_eq!(exit.signal(), Some(libc::SIGKILL));
+}
+
+#[tokio::test]
+async fn spawned_daemon_reports_another_daemon_that_holds_the_socket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let other = Some(std::process::id());
+
+    // The other daemon answers while the spawned one is still starting, so the
+    // spawned one is stopped before it can take the socket over later.
+    let server = fake_daemon_status(&socket, other, 0);
+    let mut child = still_starting_child();
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        std::future::pending(),
+    )
+    .await;
+    server.abort();
+    let exit = child.try_wait().expect("try_wait");
+    stop_child(&mut child);
+    assert!(
+        matches!(&outcome, SpawnedDaemon::AlreadyRunning(status) if status.pid == other),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        exit.and_then(|exit| std::os::unix::process::ExitStatusExt::signal(&exit)),
+        Some(libc::SIGKILL),
+        "the spawned daemon was stopped and reaped"
+    );
+
+    // The spawned one saw the other daemon and exited before the other daemon
+    // answered a probe.
+    std::fs::remove_file(&socket).expect("remove fake socket");
+    let server = fake_daemon_status(&socket, other, 1);
+    let mut child = exited_child(1);
+    let outcome = wait_for_spawned_daemon(
+        &socket,
+        &mut child,
+        Duration::from_secs(30),
+        std::future::pending(),
+    )
+    .await;
+    server.abort();
+    assert!(
+        matches!(&outcome, SpawnedDaemon::AlreadyRunning(status) if status.pid == other),
+        "{outcome:?}"
+    );
+}
+
+fn stop_output_json(output: &CliOutput) -> serde_json::Value {
+    serde_json::from_str(output.stdout.trim()).expect("stop output JSON")
+}
+
+#[tokio::test]
+async fn daemon_stop_reports_stopped_once_the_daemon_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let child = Command::new("sleep")
+        .arg("0.3")
+        .spawn()
+        .expect("spawn sleep");
+    let server = fake_daemon_status(&socket, Some(child.id()), 0);
+    // Reap the stand-in as soon as it exits; a zombie still counts as running.
+    let mut child = child;
+    let reaper = std::thread::spawn(move || child.wait());
+
+    let output = stop_daemon_within(true, &socket, Duration::from_secs(30)).await;
+
+    server.abort();
+    let exit = reaper.join().expect("reaper").expect("wait for sleep");
+    assert!(exit.success());
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(stop_output_json(&output)["result"]["running"], false);
+}
+
+#[tokio::test]
+async fn daemon_stop_counts_an_exited_daemon_its_parent_has_not_reaped_as_stopped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    // Not reaped until the stop returns, so it is a zombie once it exits.
+    let mut child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn sh");
+    let server = fake_daemon_status(&socket, Some(child.id()), 0);
+
+    let output = stop_daemon_within(true, &socket, Duration::from_secs(20)).await;
+
+    server.abort();
+    child.wait().expect("reap sh");
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(stop_output_json(&output)["result"]["running"], false);
+}
+
+#[tokio::test]
+async fn daemon_stop_reports_a_daemon_still_running_after_the_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+    let mut child = still_starting_child();
+    // The stop request is the only one answered; the pid comes from its answer.
+    let server = fake_daemon_status(&socket, Some(child.id()), 0);
+
+    let output = stop_daemon_within(true, &socket, Duration::from_millis(300)).await;
+
+    server.abort();
+    let still_running = child.try_wait().expect("try_wait").is_none();
+    stop_child(&mut child);
+    assert!(still_running, "stop must not kill the daemon");
+    assert_eq!(output.code, 1, "{output:?}");
+    let value = stop_output_json(&output);
+    assert_eq!(value["error"]["code"], "daemon_stop_timeout");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("still running"),
+        "{value}"
+    );
+}
+
+/// A daemon from before its stop answer carried a pid: it answers one stop
+/// request with no output and accepts nothing after it, like a daemon whose
+/// shutdown is under way. When `finishes`, it then removes its socket, as a
+/// daemon does at the end of its shutdown.
+fn fake_daemon_without_stop_pid(socket: &Path, finishes: bool) -> JoinHandle<()> {
+    let listener = UnixListener::bind(socket).expect("bind fake daemon socket");
+    let socket = socket.to_owned();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_daemon_request(&mut stream).await;
+        let output = CliOutput {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        write_daemon_output(&mut stream, &output).await;
+        if finishes {
+            let _ = std::fs::remove_file(&socket);
+        }
+        // Keep the listener open without accepting until the test aborts us.
+        std::future::pending::<()>().await;
+    })
+}
+
+#[tokio::test]
+async fn daemon_stop_without_a_pid_waits_for_the_socket_to_be_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("wnd.sock");
+
+    let server = fake_daemon_without_stop_pid(&socket, true);
+    let output = stop_daemon_within(true, &socket, Duration::from_secs(20)).await;
+    server.abort();
+    assert_eq!(output.code, 0, "{output:?}");
+
+    let server = fake_daemon_without_stop_pid(&socket, false);
+    let output = stop_daemon_within(true, &socket, Duration::from_millis(300)).await;
+    server.abort();
+    assert_eq!(output.code, 1, "{output:?}");
+    assert_eq!(
+        stop_output_json(&output)["error"]["code"],
+        "daemon_stop_timeout"
     );
 }

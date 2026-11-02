@@ -9,7 +9,6 @@ use cgka_traits::TransportEndpoint;
 use transport_nostr::{DirectorySyncPlan, MarmotRelayPlane};
 
 use crate::cache::{DirectoryCache, DirectorySearchGraphRecord};
-use crate::config::KeyPackageClientPreference;
 use crate::error::DirectoryError;
 use crate::member_key_packages::{
     MemberKeyPackagePrewarmCache, MemberResolutionPurpose, ResolvedMemberKeyPackages,
@@ -58,9 +57,10 @@ impl DirectoryCache {
     }
 }
 
-impl KeyPackageClientPreference {
-    pub fn rank_for_test(&self, client: Option<&str>) -> u8 {
-        self.rank(client)
+impl DirectoryFreshness {
+    /// The bound a directory with this clock and skew applies.
+    pub fn at_for_test(now: u64, max_future_skew: std::time::Duration) -> Self {
+        Self::at(now, max_future_skew)
     }
 }
 

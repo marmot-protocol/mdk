@@ -15,8 +15,9 @@ Map for SQLite group snapshots.
 
 ## Rules
 
-- Full snapshots include Marmot group metadata, messages, queued outbound intents, member capabilities, convergence
-  policy, validation state and group-scoped OpenMLS rows. `SnapshotScope::GroupState` deliberately excludes the message
+- Full snapshots include Marmot group metadata, messages, queued outbound intents, convergence policy, validation state
+  and group-scoped OpenMLS rows. The v2 envelope keeps the retired member-capability list as an empty body; decoding
+  skips the rows that older snapshots carry there. `SnapshotScope::GroupState` deliberately excludes the message
   ledger and outbound queue; restoring that scope must leave those live rows untouched.
 - Rollback should restore the captured state and leave unrelated groups alone.
 - Replay fingerprints cover live canonical/OpenMLS state and retained snapshot/checkpoint contents, including epochs.

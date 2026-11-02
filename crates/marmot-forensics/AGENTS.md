@@ -6,13 +6,25 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 
 - Own the append-only audit-log schema and the `ForensicRecorder` trait (with `JsonlRecorder` and `NoopRecorder`
   implementations) used by engine/runtime incident capture. Human overview: [`README.md`](README.md).
+- Keep `SharedRecorder` the one recorder per account-device: every owner records through a clone, so rows share one
+  writer, session and sequence. `swap` and `finish` drop the replaced recorder before returning, which closes its file;
+  never hand out the inner recorder, or a caller could keep a closed log's file open.
 - Keep this crate independent of engine, app, storage, transport SDK, and simulator crates.
 - Keep static snapshot dump analysis out of this repo; external tools should consume JSONL audit files.
 - Keep `JsonlRecorder` segment rotation transparent (mdk#1181). Sealing the active file at
   `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
   nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
   is written. Each fresh segment repeats the latest explicit `source_context` with a fresh sequence number; ordinary
-  events and sealed bytes remain unchanged. Retention and disk bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
+  events and sealed bytes remain unchanged during rotation. Also roll before the first row after a day (including
+  a quiet stop); preserve the age boundary across reopen. The app supplies expiry cutoffs to `expire_file_before`;
+  check under the writer lock and protect both the canonical path and the actual writer path after failed compensation.
+  Maintenance may seal an expired healthy writer without writing rows, then retire its now-closed inode; defer source
+  context to the next actual event. Never invoke uncertain-writer recovery or charge failed record attempts from
+  maintenance. An empty live file remains open without generating further metadata-only segments.
+  Retire a closed source through `local_delivery::expire_closed_source` before unlinking it: publish its immutable alias
+  and final length first, preserve unaccepted-tail evidence, and compensate cursor and filename on errors. Never relax
+  generic missing-active detection based on the cursor's previously observed length alone.
+  Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
   A failed flush must not seal buffered data. Preserve the actual writer path if rename compensation fails.
@@ -20,9 +32,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.
 - New opt-in app audit sessions record v5 into separate files. Keep `schema/audit-log-event.v5.schema.json`, the Rust
-  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 51 typed operational kinds and Welcome
-  evidence. Seven of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor,
-  historical lag-lost EOSE repair rows in `src/audit/recovery.rs`, and the subscription
+  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 52 typed operational kinds and Welcome
+  evidence. Eight of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor,
+  historical lag-lost EOSE repair and recovery-runner pause rows in `src/audit/recovery.rs`, and the subscription
   refusal row in `src/audit/refusal.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests
   exclude them. A new string field on an operational kind needs an explicit `protect` classification in
   `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5
@@ -46,8 +58,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 ## Layout
 
 - `src/audit.rs` — v4 `AuditEvent`/`AuditEventKind` catalog, `JsonlRecorder`/`NoopRecorder`, segment rotation,
-  `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/recovery.rs` — closed vocabularies for the v5-only
-  recovery-owner, transport-cursor, owned replay recovery and historical EOSE-repair rows. `src/audit/refusal.rs` — vocabularies for the v5-only
+  `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/shared.rs` — `SharedRecorder`, the cloneable swappable
+  handle. `src/audit/recovery.rs` — closed vocabularies for the v5-only
+  recovery-owner, transport-cursor, owned replay recovery, historical EOSE-repair and recovery-runner pause rows. `src/audit/refusal.rs` — vocabularies for the v5-only
   `subscription_refused` row. `src/audit/tests.rs` — catalog/schema lockstep tests.
 - `src/v5/` — v5 record contract: `types.rs` (candidate DTOs), `validation.rs` (semantic validation behind `Record`),
   `operational.rs` (operational kinds and per-field `protect` classification), `primitives.rs`, `strict_json.rs`

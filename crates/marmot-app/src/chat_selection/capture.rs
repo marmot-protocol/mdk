@@ -533,7 +533,7 @@ fn native_truth(
     })
 }
 fn nonmember(value: SelfMembership) -> bool {
-    matches!(value, SelfMembership::Removed | SelfMembership::Left)
+    value != SelfMembership::Member
 }
 
 /// Private worker request. Source scope is complete before the SQL cursor; an

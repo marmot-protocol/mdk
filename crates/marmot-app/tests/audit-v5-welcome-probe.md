@@ -172,7 +172,7 @@ device/day estimate. Source/session identifiers have fixed encoded width; timing
 change the byte count between runs.
 
 Live recording now also writes Welcome publication rows (from the
-`marmot-account` runtime owner) and bounded group baselines. Non-success engine
+`marmot-session` runtime owner) and bounded group baselines. Non-success engine
 join dispositions, crash-and-reopen scenarios, broad rejected-input
 classification, and reader missing-source conclusions are still not covered here. In
 particular this does not claim complete W01/W03/W04/W08 acceptance or resolve

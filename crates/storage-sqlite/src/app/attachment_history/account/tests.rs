@@ -178,7 +178,7 @@ fn reactions_are_quiet_and_additions_keep_old_seek_boundaries() {
     assert_eq!(refresh.entries[0].group_id_hex, "bb");
 }
 #[test]
-fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_results() {
+fn invalid_limits_and_queries_fail_and_oversized_metadata_comes_back_limited() {
     let s = SqliteAccountStorage::in_memory().unwrap();
     let s_app = s.app_storage();
     for limit in [0, 101, usize::MAX] {
@@ -201,8 +201,21 @@ fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_resul
             ..Default::default()
         },
         AccountAttachmentQuery {
+            senders: vec!["bb".repeat(32); 101],
+            ..Default::default()
+        },
+        AccountAttachmentQuery {
             min_timeline_at: Some(10),
             max_timeline_at: Some(9),
+            ..Default::default()
+        },
+        // Above i64::MAX the SQL bounds would wrap negative and match nothing.
+        AccountAttachmentQuery {
+            min_timeline_at: Some(i64::MAX as u64 + 1),
+            ..Default::default()
+        },
+        AccountAttachmentQuery {
+            max_timeline_at: Some(u64::MAX),
             ..Default::default()
         },
     ] {
@@ -462,7 +475,7 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
     let s_app = s.app_storage();
     for id in [1u64, 2] {
         s_app
-            .record_app_event_with_retention(
+            .record_app_event_with_source(
                 &crate::StoredAppEvent {
                     group_id_hex: "aa".into(),
                     message_id_hex: format!("{id:064x}"),
@@ -481,6 +494,7 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
                 Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
                     id, 10,
                 )),
+                None,
             )
             .unwrap();
     }

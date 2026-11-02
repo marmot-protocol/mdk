@@ -185,7 +185,7 @@ pub(crate) fn with_implicit_default_capabilities(mut caps: GroupCapabilities) ->
 
 /// Convert OpenMLS [`Capabilities`] into Marmot [`GroupCapabilities`]
 /// (extensions + proposals only; app components are carried separately).
-fn advertised_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
+pub(crate) fn advertised_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for ext in caps.extensions() {
         if !ext.is_grease() {

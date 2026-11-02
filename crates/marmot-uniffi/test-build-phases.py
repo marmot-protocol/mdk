@@ -352,10 +352,10 @@ class BuildPhases(unittest.TestCase):
                 step,
             )
 
-    def test_master_cache_warming_rejects_untrusted_source_ancestry(self):
+    def test_master_build_only_runs_reject_untrusted_source_ancestry(self):
         # Execute the workflow's actual identity script, rather than a copy of
-        # its policy. Master-scoped build-only runs must not seed caches using
-        # arbitrary branch source, even though branch rehearsals are allowed.
+        # its policy. Master-scoped build-only runs must build only master
+        # source, even though branch rehearsals are allowed.
         self.shim(self.bin / "git")
         (self.root / "Cargo.toml").write_text('version = "0.10.3"\n')
         workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()

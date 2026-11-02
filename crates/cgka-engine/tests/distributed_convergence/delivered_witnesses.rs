@@ -283,7 +283,8 @@ async fn a_lower_epoch_rival_admitted_mid_pass_takes_back_the_delivered_witnesse
 }
 
 /// What the engine itself keeps of a row under `filter`: the same decode and
-/// projection pass seeding, the send gate and the commit fingerprint apply.
+/// projection pass seeding, the send gate, the commit fingerprint and a failed
+/// batch's input check apply.
 /// A row it cannot classify is kept for the engine to judge.
 fn engine_keeps(record: &MessageRecord, filter: OpenMlsContentFilter) -> bool {
     let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
@@ -311,6 +312,13 @@ fn engine_keeps(record: &MessageRecord, filter: OpenMlsContentFilter) -> bool {
         OpenMlsContentFilter::ApplicationsAt(at) => {
             projection.kind == cgka_engine::openmls_projection::OpenMlsContentKind::Application
                 && epoch == at.0
+        }
+        OpenMlsContentFilter::CommitsAndProposalsBetween { from, through } => {
+            matches!(
+                projection.kind,
+                cgka_engine::openmls_projection::OpenMlsContentKind::Commit
+                    | cgka_engine::openmls_projection::OpenMlsContentKind::Proposal
+            ) && (from.0..=through.0).contains(&epoch)
         }
     }
 }
@@ -416,6 +424,14 @@ async fn sqlite_content_listing_matches_the_engines_projection() {
         OpenMlsContentFilter::WithoutProcessedApplicationsThrough(tip),
         OpenMlsContentFilter::ApplicationsAt(EpochId(tip.0 - 1)),
         OpenMlsContentFilter::ApplicationsAt(tip),
+        OpenMlsContentFilter::CommitsAndProposalsBetween {
+            from: EpochId(tip.0 - 1),
+            through: tip,
+        },
+        OpenMlsContentFilter::CommitsAndProposalsBetween {
+            from: EpochId(0),
+            through: EpochId(tip.0 - 1),
+        },
     ] {
         let expected: Vec<_> = all
             .iter()

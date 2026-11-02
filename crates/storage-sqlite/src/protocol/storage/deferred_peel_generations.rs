@@ -74,6 +74,21 @@ mod tests {
         store.put_deferred_peel_generation(&generation).unwrap();
         assert_eq!(
             store.deferred_peel_generation(&group.id).unwrap(),
+            Some(generation.clone())
+        );
+
+        let other = sample_group(gid(2), 4, 0);
+        store.put_group(&other).unwrap();
+        store
+            .put_deferred_peel_generation(&DeferredPeelGeneration {
+                group_id: other.id.clone(),
+                context_fingerprint: [9; 32],
+            })
+            .unwrap();
+        store.delete_deferred_peel_generation(&other.id).unwrap();
+        assert_eq!(store.deferred_peel_generation(&other.id).unwrap(), None);
+        assert_eq!(
+            store.deferred_peel_generation(&group.id).unwrap(),
             Some(generation)
         );
 

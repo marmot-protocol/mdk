@@ -536,14 +536,18 @@ impl MessageStorage for SqliteAccountStorage {
         at_or_after_epoch: EpochId,
         filter: OpenMlsContentFilter,
     ) -> StorageResult<Vec<MessageRecord>> {
-        let Some((sql, filter_epoch)) = openmls_filtered_message_sql(states, filter) else {
+        let Some((sql, filter_epochs)) = openmls_filtered_message_sql(states, filter) else {
             return Ok(Vec::new());
         };
         let mut bound = vec![
             rusqlite::types::Value::Blob(group_id.as_slice().to_vec()),
             rusqlite::types::Value::Integer(epoch_to_i64(at_or_after_epoch)?),
         ];
-        bound.extend(filter_epoch.map(rusqlite::types::Value::Integer));
+        bound.extend(
+            filter_epochs
+                .into_iter()
+                .map(rusqlite::types::Value::Integer),
+        );
         let conn = self.lock()?;
         let mut stmt = conn.prepare_cached(&sql).storage()?;
         let records = stmt
@@ -1109,8 +1113,8 @@ fn state_filtered_message_sql(states: &[MessageState]) -> String {
 }
 
 /// SQL for [`MessageStorage::list_openmls_messages_in_states`], binding the
-/// group id (`?1`), the epoch floor (`?2`) and, when the filter has one, the
-/// filter's MLS epoch (`?3`) returned beside it. `None` when no row can match.
+/// group id (`?1`), the epoch floor (`?2`) and the filter's MLS epochs, if
+/// any, from `?3` on, returned beside it. `None` when no row can match.
 ///
 /// Each arm selects row ids from the covering
 /// `(group_id, state, openmls_content, openmls_epoch)` index, so rows the
@@ -1120,7 +1124,7 @@ fn state_filtered_message_sql(states: &[MessageState]) -> String {
 fn openmls_filtered_message_sql(
     states: &[MessageState],
     filter: OpenMlsContentFilter,
-) -> Option<(String, Option<i64>)> {
+) -> Option<(String, Vec<i64>)> {
     let state_list = |states: &[&MessageState]| {
         states
             .iter()
@@ -1136,7 +1140,7 @@ fn openmls_filtered_message_sql(
     };
     let unknown = format!("{OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}");
     let mut arms = Vec::new();
-    let mut filter_epoch = None;
+    let mut filter_epochs = Vec::new();
     match filter {
         OpenMlsContentFilter::ApplicationsAt(epoch) => {
             let all: Vec<_> = states.iter().collect();
@@ -1147,10 +1151,30 @@ fn openmls_filtered_message_sql(
             arms.push(id_query(&all, &unknown));
             // No classified application holds an epoch SQLite cannot store.
             if let Ok(epoch) = i64::try_from(epoch.0) {
-                filter_epoch = Some(epoch);
+                filter_epochs.push(epoch);
                 arms.push(format!(
                     "{} AND openmls_epoch = ?3",
                     id_query(&all, &OPENMLS_CONTENT_APPLICATION.to_string())
+                ));
+            }
+        }
+        OpenMlsContentFilter::CommitsAndProposalsBetween { from, through } => {
+            let all: Vec<_> = states.iter().collect();
+            if all.is_empty() {
+                return None;
+            }
+            let all = state_list(&all);
+            arms.push(id_query(&all, &unknown));
+            // No classified commit or proposal holds an epoch SQLite cannot
+            // store, so a range starting beyond it holds none.
+            if let Ok(from) = i64::try_from(from.0) {
+                filter_epochs.extend([from, i64::try_from(through.0).unwrap_or(i64::MAX)]);
+                arms.push(format!(
+                    "{} AND openmls_epoch BETWEEN ?3 AND ?4",
+                    id_query(
+                        &all,
+                        &format!("{OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL}")
+                    )
                 ));
             }
         }
@@ -1187,7 +1211,7 @@ fn openmls_filtered_message_sql(
                 if let OpenMlsContentFilter::WithoutProcessedApplicationsThrough(epoch) = filter {
                     // An epoch beyond SQLite's INTEGER range leaves out every
                     // classified application, all of which hold smaller epochs.
-                    filter_epoch = Some(i64::try_from(epoch.0).unwrap_or(i64::MAX));
+                    filter_epochs.push(i64::try_from(epoch.0).unwrap_or(i64::MAX));
                     arms.push(format!(
                         "{} AND openmls_epoch > ?3",
                         id_query(&processed, &OPENMLS_CONTENT_APPLICATION.to_string())
@@ -1206,7 +1230,7 @@ fn openmls_filtered_message_sql(
              ORDER BY insert_order",
             arms.join(" UNION ALL ")
         ),
-        filter_epoch,
+        filter_epochs,
     ))
 }
 
@@ -1502,20 +1526,23 @@ mod tests {
         );
     }
 
+    /// Release and consume each commit their effects: the second connection
+    /// reads the journal the first wrote, and the first reads the recovery
+    /// intent and cleared receipts the second's consume left behind.
     #[test]
-    fn released_transport_receipts_survive_reopen_and_retire_both_receipt_stores() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("release.db");
-        let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        store
+    fn released_transport_receipts_are_committed_and_retire_both_receipt_stores() {
+        use crate::protocol::storage::write_contention::SharedDatabase;
+
+        let db = SharedDatabase::new();
+        let (releaser, consumer) = (db.open(), db.open());
+        releaser
             .app_storage()
             .ensure_account_projection("app-owner")
             .unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        releaser.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
-        store.put_message(&record).unwrap();
+        releaser.put_message(&record).unwrap();
         let seed_receipts = |store: &SqliteAccountStorage| {
             let conn = store.lock().unwrap();
             conn.execute(
@@ -1526,60 +1553,32 @@ mod tests {
             conn.execute("INSERT INTO transport_reconciliation_items(route_kind, route_id, event_id, created_at)
                 VALUES(1, ?1, ?2, 1)", params![vec![9_u8; 32], record.id.as_slice()]).unwrap();
         };
-        seed_receipts(&store);
-        store.release_message_for_replay(&record).unwrap();
+        let receipt_rows = |store: &SqliteAccountStorage| {
+            ["seen_events", "transport_reconciliation_items"].map(|table| {
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        seed_receipts(&releaser);
+        releaser.release_message_for_replay(&record).unwrap();
         assert!(matches!(
-            store.get_message(&record.id),
+            consumer.get_message(&record.id),
             Err(StorageError::NotFound)
         ));
-        for table in ["seen_events", "transport_reconciliation_items"] {
-            assert_eq!(
-                store
-                    .lock()
-                    .unwrap()
-                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
-                        .get::<_, i64>(0))
-                    .unwrap(),
-                0
-            );
-        }
+        assert_eq!(receipt_rows(&consumer), [0, 0]);
         // Model an old app checkpoint before it has consumed the release.
-        seed_receipts(&store);
-        store.close().unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        seed_receipts(&releaser);
         assert_eq!(
-            store.consume_released_transport_receipts().unwrap(),
+            consumer.consume_released_transport_receipts().unwrap(),
             vec![record.id.clone()]
         );
-        assert!(
-            store
-                .consume_released_transport_receipts()
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(
-            store
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .len(),
-            1
-        );
-        for table in ["seen_events", "transport_reconciliation_items"] {
-            assert_eq!(
-                store
-                    .lock()
-                    .unwrap()
-                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
-                        .get::<_, i64>(0))
-                    .unwrap(),
-                0
-            );
-        }
-        store.close().unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(
-            store
+            releaser
                 .app_storage()
                 .pending_epoch_backfill_intents()
                 .unwrap()
@@ -1587,7 +1586,13 @@ mod tests {
             1,
             "death after journal acknowledgement must not lose recovery intent"
         );
-        store.close().unwrap();
+        assert_eq!(receipt_rows(&releaser), [0, 0]);
+        assert!(
+            releaser
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1605,7 +1610,10 @@ mod tests {
             storage.release_message_for_replay(&record)?;
             Err(StorageError::Backend("injected interruption".into()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "injected interruption"),
+            "{result:?}"
+        );
         assert_eq!(store.get_message(&record.id).unwrap(), record);
         assert!(
             store
@@ -1619,10 +1627,14 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "CREATE TRIGGER fail_release_ack BEFORE DELETE ON
-            cgka_released_transport_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            cgka_released_transport_receipts BEGIN SELECT RAISE(ABORT, 'injected ack failure'); END;",
             )
             .unwrap();
-        assert!(store.consume_released_transport_receipts().is_err());
+        let consumed = store.consume_released_transport_receipts();
+        assert!(
+            matches!(&consumed, Err(StorageError::Backend(message)) if message.contains("injected ack failure")),
+            "{consumed:?}"
+        );
         assert!(
             store
                 .app_storage()
@@ -1719,11 +1731,8 @@ mod tests {
     }
 
     #[test]
-    fn deferred_metadata_preserves_legacy_and_normalized_rows_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.db");
-        let key = crate::SqlCipherKey::new("synthetic metadata regression").unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    fn deferred_metadata_reads_legacy_and_normalized_rows_alike() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
         let mut expected = Vec::new();
@@ -1766,8 +1775,6 @@ mod tests {
         let mut unrelated = sample_message(mid(4), gid(2), 0);
         unrelated.state = MessageState::PeelDeferred;
         store.put_message(&unrelated).unwrap();
-        store.close().unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
             store.list_deferred_message_metadata(&gid(1)).unwrap(),
             expected
@@ -1785,7 +1792,6 @@ mod tests {
             store.list_deferred_message_metadata(&gid(1)).unwrap(),
             expected
         );
-        store.close().unwrap();
     }
 
     /// Compare full-row preparation with metadata preparation in the same
@@ -1793,6 +1799,7 @@ mod tests {
     #[test]
     #[ignore = "explicit encrypted-storage preparation benchmark"]
     fn deferred_metadata_file_backed_benchmark() {
+        crate::base::connection::use_production_storage_for_test_process();
         let mut measurements = Vec::new();
         for processed in [0, 4096] {
             for deferred in [0, 64, 512, 2048] {
@@ -1886,6 +1893,7 @@ mod tests {
             group_id: gid(1),
             message_id,
             sender: MemberId::new(vec![7; 32]),
+            sender_leaf_index: None,
             epoch: EpochId(0),
             payload: b"authenticated chat".to_vec(),
             retention: None,
@@ -1893,32 +1901,39 @@ mod tests {
         }
     }
 
+    /// The `state` column holds a fixed integer per state. Older databases and
+    /// snapshots carry these values, so swapping two in both directions of
+    /// the codec would still round-trip through the API but misread every
+    /// stored row.
     #[test]
-    fn message_state_transitions() {
+    fn message_states_persist_as_their_pinned_integers() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let message = sample_message(mid(1), gid(1), 0);
         store.put_message(&message).unwrap();
-        assert_eq!(
-            store.get_message(&message.id).unwrap().state,
-            MessageState::Created
-        );
-
-        store
-            .update_message_state(&message.id, MessageState::Retryable)
-            .unwrap();
-        assert_eq!(
-            store.get_message(&message.id).unwrap().state,
-            MessageState::Retryable
-        );
-
-        store
-            .update_message_state(&message.id, MessageState::PeelDeferred)
-            .unwrap();
-        assert_eq!(
-            store.get_message(&message.id).unwrap().state,
-            MessageState::PeelDeferred
-        );
+        for (state, stored) in [
+            (MessageState::Sent, 0),
+            (MessageState::Created, 1),
+            (MessageState::Processed, 2),
+            (MessageState::Failed, 3),
+            (MessageState::Retryable, 4),
+            (MessageState::EpochInvalidated, 5),
+            (MessageState::PeelDeferred, 6),
+            (MessageState::ConvergenceDeferred, 7),
+        ] {
+            store.update_message_state(&message.id, state).unwrap();
+            let column: i64 = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM cgka_messages WHERE id = ?1",
+                    params![message.id.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(column, stored, "{state:?}");
+            assert_eq!(store.get_message(&message.id).unwrap().state, state);
+        }
     }
 
     #[cfg(feature = "storage-format-benchmarks")]
@@ -2154,16 +2169,6 @@ mod tests {
     }
 
     #[test]
-    fn ingress_dedup_markers_are_group_independent_and_idempotent() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let id = mid(42);
-        assert!(!store.has_ingress_dedup_marker(&id).unwrap());
-        store.put_ingress_dedup_marker(&id).unwrap();
-        store.put_ingress_dedup_marker(&id).unwrap();
-        assert!(store.has_ingress_dedup_marker(&id).unwrap());
-    }
-
-    #[test]
     fn ingress_prune_query_work() {
         use rusqlite::trace::{TraceEvent, TraceEventCodes};
         use rusqlite::{StatementStatus, params};
@@ -2249,18 +2254,37 @@ mod tests {
     #[test]
     fn pending_replay_query_work() {
         use rusqlite::StatementStatus;
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::Mutex;
         use std::time::Instant;
 
+        // Measure the statement production runs, captured from a real listing.
+        static LISTING_SQL: Mutex<String> = Mutex::new(String::new());
         let store = SqliteAccountStorage::in_memory().unwrap();
+        store.lock().unwrap().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(|event| {
+                let TraceEvent::Profile(statement, _) = event else {
+                    return;
+                };
+                let sql = statement.sql();
+                if sql.starts_with("SELECT") && sql.contains("FROM pending_application_events") {
+                    *LISTING_SQL.lock().unwrap() = sql.into_owned();
+                }
+            }),
+        );
+        assert!(store.list_pending_application_events().unwrap().is_empty());
         let conn = store.lock().unwrap();
+        conn.trace_v2(TraceEventCodes::empty(), None);
+        let production_sql = LISTING_SQL.lock().unwrap().clone();
+        assert!(!production_sql.is_empty());
+
         conn.execute_batch(
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 4096)
              INSERT INTO pending_application_events(message_id, group_id, message_insert_order, record)
              SELECT randomblob(16), randomblob(16), x, randomblob(128) FROM n",
         )
         .unwrap();
-        let legacy = "SELECT record FROM pending_application_events
-                      ORDER BY message_insert_order, message_id";
         conn.execute_batch("DROP INDEX idx_pending_application_events_order")
             .unwrap();
         let mut measurements = Vec::new();
@@ -2272,7 +2296,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let mut statement = conn.prepare(legacy).unwrap();
+            let mut statement = conn.prepare(&production_sql).unwrap();
             let start = Instant::now();
             for _ in 0..20 {
                 let rows = statement
@@ -2318,6 +2342,10 @@ mod tests {
         for id in &bounded_ids {
             store.put_ingress_dedup_marker(id).unwrap();
         }
+        // A repeated marker is idempotent, not a uniqueness failure.
+        store
+            .put_ingress_dedup_marker(bounded_ids.last().unwrap())
+            .unwrap();
 
         assert!(
             store.has_processed_transport_id(&processed_ids[0]).unwrap(),
@@ -2358,7 +2386,16 @@ mod tests {
             storage.put_processed_transport_id(&second_group.id, &transport_id)
         });
 
-        assert!(result.is_err());
+        // The conflict, not a nested-transaction failure in `put_message`:
+        // the message write joined the transaction and rolled back with it.
+        assert!(
+            matches!(
+                &result,
+                Err(StorageError::Backend(message))
+                    if message == "processed transport id is already assigned to another group"
+            ),
+            "{result:?}"
+        );
         assert!(matches!(
             store.get_message(&message.id),
             Err(StorageError::NotFound)
@@ -2372,16 +2409,43 @@ mod tests {
         cgka_traits::MessageId::new(bytes)
     }
 
+    /// `update_message_state` reads a row inside its write transaction. A
+    /// legacy row is rewritten whole from that read, so one read before
+    /// another connection deleted the row would write it back.
     #[test]
-    fn update_message_state_keeps_read_modify_write_in_one_transaction() {
-        let source = include_str!("messages.rs");
-        let body = source
-            .split("fn update_message_state")
-            .nth(1)
-            .expect("update_message_state body");
+    fn update_message_state_does_not_resurrect_a_row_deleted_while_it_waits() {
+        use crate::protocol::storage::write_contention::{Release, SharedDatabase};
 
-        assert!(body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"));
-        assert!(!body.contains("self.get_message(id)"));
+        let db = SharedDatabase::new();
+        let store = db.open();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                 VALUES (?1, ?2, 0, 1, ?3)",
+                params![
+                    message.id.as_slice(),
+                    message.group_id.as_slice(),
+                    serialize(&message).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let id = message.id.clone();
+        let blocker = db.hold_write_lock(Release::WhenTheStoreWaits, move |other| {
+            other.delete_message(&id).unwrap()
+        });
+        let result = store.update_message_state(&message.id, MessageState::Processed);
+        blocker.join();
+
+        assert!(matches!(result, Err(StorageError::NotFound)), "{result:?}");
+        assert!(matches!(
+            store.get_message(&message.id),
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]
@@ -2389,7 +2453,9 @@ mod tests {
         // #424 regression: when the convergence-apply path runs the disposition
         // writes inside an engine `with_transaction`, `update_message_state`
         // must reuse the open transaction instead of opening a nested one
-        // ("cannot start a transaction within a transaction").
+        // ("cannot start a transaction within a transaction"). A torn
+        // convergence apply must not leave a message state half-committed:
+        // when the outer transaction aborts, the state change rolls back too.
         use cgka_traits::storage::StorageProvider;
 
         let store = SqliteAccountStorage::in_memory().unwrap();
@@ -2399,56 +2465,26 @@ mod tests {
 
         let result: Result<(), StorageError> = store.with_transaction(|storage| {
             storage.update_message_state(&message.id, MessageState::Processed)?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
+        assert_eq!(
+            store.get_message(&message.id).unwrap().state,
+            MessageState::Created,
+            "message state must roll back with the aborted outer transaction",
+        );
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.update_message_state(&message.id, MessageState::Processed)?;
             Ok(())
         });
         assert!(result.is_ok(), "nested update must succeed: {result:?}");
         assert_eq!(
             store.get_message(&message.id).unwrap().state,
             MessageState::Processed
-        );
-    }
-
-    #[test]
-    fn put_message_reuses_outer_engine_transaction() {
-        use cgka_traits::storage::{StorageError, StorageProvider};
-
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        let message = sample_message(mid(1), gid(1), 0);
-
-        let result: Result<(), StorageError> = store.with_transaction(|storage| {
-            storage.put_message(&message)?;
-            Err(StorageError::Backend("force rollback".to_string()))
-        });
-
-        assert!(result.is_err());
-        assert!(matches!(
-            store.get_message(&message.id),
-            Err(StorageError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn update_message_state_rolls_back_with_outer_transaction() {
-        // #424 regression: a torn convergence apply must not leave a message
-        // state half-committed. When the outer transaction aborts, the state
-        // change made via `update_message_state` rolls back with it.
-        use cgka_traits::storage::{StorageError, StorageProvider};
-
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
-        let message = sample_message(mid(1), gid(1), 0);
-        store.put_message(&message).unwrap();
-
-        let result: Result<(), StorageError> = store.with_transaction(|storage| {
-            storage.update_message_state(&message.id, MessageState::Processed)?;
-            Err(StorageError::Backend("force rollback".to_string()))
-        });
-        assert!(result.is_err());
-        assert_eq!(
-            store.get_message(&message.id).unwrap().state,
-            MessageState::Created,
-            "message state must roll back with the aborted outer transaction",
         );
     }
 
@@ -2496,7 +2532,10 @@ mod tests {
             storage.delete_message(&ids[0])?;
             Err(StorageError::Backend("rollback source pruning".into()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "rollback source pruning"),
+            "{result:?}"
+        );
         assert_eq!(
             store
                 .pending_application_authority_batch(None, 100)
@@ -2604,7 +2643,10 @@ mod tests {
             storage.put_pending_application_event(&application_event(rolled_back.id.clone()))?;
             Err(StorageError::Backend("force rollback".to_owned()))
         });
-        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(StorageError::Backend(message)) if message == "force rollback"),
+            "{result:?}"
+        );
         assert_eq!(
             store.get_message(&rolled_back.id).unwrap().state,
             MessageState::Created
@@ -2618,6 +2660,68 @@ mod tests {
             .delete_pending_application_events(&[committed.id])
             .unwrap();
         assert!(store.list_pending_application_events().unwrap().is_empty());
+    }
+
+    /// An event stored before its source authority resolved takes that
+    /// authority (and a retention it lacked) in place; any other rewrite of
+    /// the stored event is refused, and an event needs its message row.
+    #[test]
+    fn a_pending_event_takes_a_late_authority_in_place_and_refuses_other_rewrites() {
+        use cgka_traits::app_event::{AppMessageAuthority, AppMessageRetentionDecision};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_message(&message).unwrap();
+        let unresolved = application_event(message.id.clone());
+        store.put_pending_application_event(&unresolved).unwrap();
+
+        let with = |authority: [u8; 32], payload: &[u8]| {
+            let mut event = unresolved.clone();
+            if let GroupEvent::MessageReceived {
+                authority: slot,
+                retention,
+                payload: body,
+                ..
+            } = &mut event
+            {
+                *slot = Some(AppMessageAuthority {
+                    source_context: authority,
+                    moderation_grant: false,
+                });
+                *retention = Some(AppMessageRetentionDecision::new(10, 60));
+                *body = payload.to_vec();
+            }
+            event
+        };
+        let refused = |rewrite: &GroupEvent| {
+            let result = store.put_pending_application_event(rewrite);
+            assert!(
+                matches!(&result, Err(StorageError::Backend(message))
+                    if message == "pending application event id reused with different content"),
+                "{result:?}"
+            );
+        };
+        refused(&with([1; 32], b"other chat"));
+        let resolved = with([1; 32], b"authenticated chat");
+        store.put_pending_application_event(&resolved).unwrap();
+        store.put_pending_application_event(&resolved).unwrap();
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![resolved.clone()]
+        );
+
+        refused(&with([2; 32], b"authenticated chat"));
+        refused(&unresolved);
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![resolved]
+        );
+
+        assert!(matches!(
+            store.put_pending_application_event(&application_event(mid(2))),
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]

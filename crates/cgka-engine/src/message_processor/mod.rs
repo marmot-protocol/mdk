@@ -23,6 +23,8 @@ enum OutboundQueueReason {
     ConvergencePending,
     ForegroundBudgetExhausted,
     SelfRemoveAutoCommit,
+    ReplayRotation,
+    EarlierIntentQueued,
     ExplicitQueueRequest,
 }
 
@@ -33,6 +35,8 @@ impl OutboundQueueReason {
             Self::ConvergencePending => "convergence_pending",
             Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
             Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
+            Self::ReplayRotation => "replay_rotation",
+            Self::EarlierIntentQueued => "earlier_intent_queued",
             Self::ExplicitQueueRequest => "explicit_queue_request",
         };
         tracing::debug!(
@@ -54,6 +58,7 @@ use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputConte
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::engine_metrics::DeferredPeelCapacityResource;
 use crate::openmls_projection::decode_openmls_wire_projection;
+use crate::queued_intent_refusal::QueuedPreparationFailure;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -204,9 +209,12 @@ pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 64 * 1024 * 1024;
 /// recovery path.
 ///
 /// Capacity is reclaimed on confirmation, not on drain. A drained row is
-/// deleted only by `confirm_queued_outbound_intent` — or, for a group-state
-/// intent, inside `confirm_published` — so a payload that was prepared and
-/// published but never acknowledged still holds its slot and stays in flight.
+/// deleted by `confirm_queued_outbound_intent` — or, for a group-state
+/// intent, inside `confirm_published` — or when its preparation leaves
+/// nothing to publish: the settled state refused it (mdk#2694) or already
+/// holds the change (mdk#2842; a failed delete leaves it for the next drain).
+/// A payload that was prepared and published but never acknowledged still
+/// holds its slot and stays in flight.
 /// A definite retry clears that in-flight association so the next drain
 /// re-prepares it. A group whose transport keeps failing therefore sits at the
 /// cap: its rows keep being re-attempted, but nothing frees a slot until a
@@ -676,14 +684,16 @@ enum LeaveGateCheck {
     DrainComplete,
 }
 
-struct AdminReservation {
+struct FairnessReservation {
     available: bool,
+    account_devices_required: bool,
 }
 
-impl AdminReservation {
+impl FairnessReservation {
     fn load<S: StorageProvider>(
         engine: &Engine<S>,
         group_id: &GroupId,
+        queued: &[QueuedOutboundIntent],
     ) -> Result<Self, EngineError> {
         let available = engine
             .storage
@@ -692,7 +702,12 @@ impl AdminReservation {
                 pass.phase == cgka_traits::ConvergencePassPhase::Completed
                     && pass.fairness_slot_available
             });
-        Ok(Self { available })
+        let account_devices_required =
+            available && engine.fair_scheduling_requires_account_devices(group_id, queued)?;
+        Ok(Self {
+            available,
+            account_devices_required,
+        })
     }
 
     fn is_available(&self) -> bool {
@@ -700,7 +715,7 @@ impl AdminReservation {
     }
 
     fn permits(&self, intent: &SendIntent) -> bool {
-        !self.available || is_admin_group_state_intent(intent)
+        !self.available || is_fair_scheduled_intent(intent, self.account_devices_required)
     }
 
     fn consume_if_dormant<S: StorageProvider>(
@@ -723,12 +738,12 @@ impl AdminReservation {
         queued: &[QueuedOutboundIntent],
     ) {
         if self.available
-            && queued
-                .iter()
-                .any(|record| is_admin_group_state_intent(&record.intent))
+            && queued.iter().any(|record| {
+                is_fair_scheduled_intent(&record.intent, self.account_devices_required)
+            })
         {
             // Diagnostic only: the completed-pass boundary is being held for a
-            // queued admin group-state intent while retained inbound waits.
+            // queued admin or same-account intent while retained inbound waits.
             engine.engine_metrics.note_admin_reservation_hold();
         }
     }
@@ -884,9 +899,42 @@ impl<S: StorageProvider> Engine<S> {
             } = &intent
             {
                 return Err(EngineError::AppMessageEpochUnsettled {
-                    expected: *expected,
+                    expected: expected.epoch,
                 });
             }
+            // A link never waits in the queue (device-group.md, "Linking a
+            // device"): the new device stops waiting for its Welcome, and a
+            // link drained after that would add a device that never joins.
+            // The caller retries while the new device still waits. Its undo
+            // is not queued either: the app decides it from the roster it
+            // read, and retries it until it lands. Nor is a removed slot's
+            // lone record, which only its caller makes again (mdk#2761).
+            if matches!(
+                &intent,
+                SendIntent::LinkDevice { .. }
+                    | SendIntent::UnlinkDevice { .. }
+                    | SendIntent::RecordRemovedSlot { .. }
+            ) {
+                return Err(EngineError::LinkDeviceUnsettled { group_id });
+            }
+            // Nor does an account entry replacement: the app answers a backup
+            // change only once it went out or was refused (D75), and a queued
+            // one could be refused at drain after the user was told it was
+            // made, with the words already forgotten. The caller retries. A
+            // re-issue after a lost fork is queued by the engine itself, not
+            // here.
+            if matches!(&intent, SendIntent::ReplaceAccountEntry { .. }) {
+                return Err(EngineError::AccountEntryUnsettled { group_id });
+            }
+            // An activation the current state already refuses is answered now,
+            // not accepted and then refused at drain.
+            if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
+                self.check_account_devices_activation(&group_id)?;
+            }
+            // So is a KeyPackage it carries; see `check_queued_key_packages`.
+            self.check_queued_key_packages(&intent)?;
+            // And a same-account Add's siblings; see `check_queued_sibling_add`.
+            self.check_queued_sibling_add(&intent)?;
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
@@ -1031,6 +1079,31 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        // device-group.md, "Linking a device": a device joins the device
+        // group only through `LinkDevice`. The sender rule in
+        // `authorize_own_staged_commit` refuses every other own Commit that
+        // adds a leaf there; this answers an Invite or a same-account Add
+        // before anything is queued, with a reason that names it.
+        let adds_devices = match intent {
+            SendIntent::Invite { key_packages, .. } => !key_packages.is_empty(),
+            SendIntent::AddOwnAccountDevices { siblings, .. } => !siblings.is_empty(),
+            _ => false,
+        };
+        if adds_devices
+            && group.is_some()
+            && self.with_mls_group(
+                &group_id,
+                crate::app_components::group_requires_device_roster,
+            )?
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "DeviceGroup",
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
+                    reason: "a device joins the device group only through LinkDevice",
+                },
+            ));
+        }
         Ok(group_id)
     }
 
@@ -1084,11 +1157,12 @@ impl<S: StorageProvider> Engine<S> {
 
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
         let mut drained = Vec::new();
-        let mut reservation = AdminReservation::load(self, group_id)?;
+        let mut reservation = FairnessReservation::load(self, group_id, &queued)?;
         reservation.consume_if_dormant(self, group_id)?;
         reservation.observe_hold(self, &queued);
-        // A persisted fairness slot orders one already-queued administrative
-        // evolution before automatic SelfRemove or leave-maintenance mutation.
+        // A persisted fairness slot orders one already-queued admin or
+        // same-account evolution before automatic SelfRemove or
+        // leave-maintenance mutation.
         if !reservation.is_available()
             && self
                 .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
@@ -1137,14 +1211,27 @@ impl<S: StorageProvider> Engine<S> {
             );
             let result = match prepared {
                 Ok(result) => result,
-                Err(_) if reservation.is_available() => {
-                    // The protocol grants one preparation attempt, not an
-                    // indefinite reservation. Keep the durable intent queued,
-                    // consume the slot, and let retained inbound work proceed.
-                    reservation.consume_attempt(self, group_id, false)?;
-                    break;
+                Err(error) => {
+                    // A refusal by the settled state retires the intent, as a
+                    // direct send's refusal leaves nothing behind; anything
+                    // else keeps it queued (mdk#2694, `queued_intent_refusal`).
+                    let refused = self.queued_preparation_failure(group_id, &error)
+                        == QueuedPreparationFailure::Refused;
+                    if refused {
+                        self.retire_refused_queued_intent(&record, &error)?;
+                    }
+                    if reservation.is_available() {
+                        // The protocol grants one preparation attempt, not an
+                        // indefinite reservation. Consume the slot and let
+                        // retained inbound work proceed.
+                        reservation.consume_attempt(self, group_id, false)?;
+                        break;
+                    }
+                    if refused {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             // The queued path bypasses the public send entry point. Record
@@ -1178,9 +1265,28 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
+                // The settled state already holds the change, and with nothing
+                // to publish no confirmation will retire the record. Kept, it
+                // would wait forever and hold every later send behind it. If
+                // the delete fails, the record stays for the next drain to
+                // retire: failing this one would drop what it has prepared.
+                SendResult::NoChange { .. } => {
+                    if self
+                        .storage
+                        .delete_queued_outbound_intent(&record.id)
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "cgka_engine::message_processor",
+                            method = "converge_and_drain_with_deadline",
+                            error_kind = "queued_no_change_retirement",
+                            "could not retire a queued intent that drained to no change"
+                        );
+                        self.schedule_pending_convergence_group(group_id);
+                    }
+                }
                 SendResult::GroupCreated { .. }
                 | SendResult::FoundingGroupCreated { .. }
-                | SendResult::NoChange { .. }
                 | SendResult::DisbandRequested { .. }
                 | SendResult::Queued { .. } => {}
             }
@@ -1196,8 +1302,8 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         if reservation.consume_ungranted(self, group_id)? {
-            // No already-queued admin group-state intent was eligible for the
-            // fairness attempt. Do not let unrelated app/leave/maintenance
+            // No already-queued admin or same-account intent was eligible for
+            // the fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
             if self
                 .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::DrainComplete)
@@ -1267,6 +1373,9 @@ impl<S: StorageProvider> Engine<S> {
             && self.load_leave_request_state(group_id)?.is_some()
         {
             return Ok(MaintenanceGate::LeaveGated);
+        }
+        if self.stage_replay_rotation(group_id).await? {
+            return Ok(MaintenanceGate::StagedCommit);
         }
         Ok(MaintenanceGate::Clear)
     }
@@ -1342,9 +1451,67 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
             }
         }
-        self.stage_due_self_remove_auto_commit(group_id, now_ms)
-            .await
-            .map(|staged| staged.then_some(OutboundQueueReason::SelfRemoveAutoCommit))
+        if matches!(intent, SendIntent::AppMessage { .. })
+            && self.needs_replay_rotation(group_id)?
+        {
+            let queued = self.storage.list_queued_outbound_intents(group_id)?;
+            if queued.len() >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+                return Err(EngineError::QueuedOutboundAtCapacity {
+                    group_id: group_id.clone(),
+                });
+            }
+            // An already-owned admin/same-account attempt still precedes
+            // automatic maintenance. Its eventual Commit also changes epochs;
+            // until confirmation no application may use the restored ratchet.
+            // Epoch-pinned sends are refused, so leave their publication to
+            // the scheduled drain instead of stranding effects on the error.
+            if matches!(
+                intent,
+                SendIntent::AppMessage {
+                    expected_epoch: None,
+                    ..
+                }
+            ) && !FairnessReservation::load(self, group_id, &queued)?.is_available()
+            {
+                self.stage_replay_rotation(group_id).await?;
+            }
+            self.schedule_pending_convergence_group(group_id);
+            return Ok(Some(OutboundQueueReason::ReplayRotation));
+        }
+        if self
+            .stage_due_self_remove_auto_commit(group_id, now_ms)
+            .await?
+        {
+            return Ok(Some(OutboundQueueReason::SelfRemoveAutoCommit));
+        }
+        // A send never goes ahead of one queued earlier for the same group
+        // (mdk#2842). Prepared now, an application message would take the
+        // sender's next generation while the queued ones wait for the
+        // scheduled drain, so their generations would run against send order.
+        // A member reading the group's history in `created_at` order, which
+        // is send order, would then reach the drained messages first and
+        // could step that sender's ratchet past its out-of-order window,
+        // losing the messages that went ahead. A group change going ahead
+        // would apply before a message sent ahead of it. So this send queues
+        // behind them, or is refused by the intents that never queue, and the
+        // drain prepares all of them in queue order.
+        Ok(self
+            .has_queued_intent_awaiting_preparation(group_id)?
+            .then_some(OutboundQueueReason::EarlierIntentQueued))
+    }
+
+    /// Whether an intent queued for `group_id` still waits for the drain to
+    /// prepare it. One the drain prepared and the host has not yet confirmed
+    /// or retried is in flight, not waiting: its generation is already taken.
+    fn has_queued_intent_awaiting_preparation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .storage
+            .list_queued_outbound_intents(group_id)?
+            .iter()
+            .any(|record| !self.queued_outbound_intent_in_flight(group_id, &record.id)))
     }
 
     /// Settle authenticated input and give current-fingerprint deferred rows
@@ -3008,6 +3175,18 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(None);
         }
+        // A failed batch runs before any sweep, so its retry time is the wake
+        // (mdk#2684). Reporting rows ready meanwhile would spin the host on an
+        // advance that waits for that batch. A deferred-peel generation still
+        // sweeps first and keeps its own readiness.
+        if self.storage.deferred_peel_generation(group_id)?.is_none()
+            && self
+                .storage
+                .convergence_pass(group_id)?
+                .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+        {
+            return Ok(None);
+        }
         let now = self.convergence_now();
         // Match the sweep's indexed state filter. Readiness must inspect all
         // deferred metadata, but neither payloads nor processed history are needed.
@@ -4024,29 +4203,79 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
+        | SendIntent::AddOwnAccountDevices { group_id, .. }
+        | SendIntent::RemoveOwnAccountDevices { group_id, .. }
         | SendIntent::Leave { group_id }
         | SendIntent::SelfUpdate { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
+        | SendIntent::ReplaceDeviceEntry { group_id, .. }
+        | SendIntent::ReplaceAccountEntry { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::EnableAccountDevices { group_id }
+        | SendIntent::LinkDevice { group_id, .. }
+        | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
 
 /// Single classification chokepoint for the convergence.md one-attempt
-/// reservation: only an admin-authorized local group-state evolution may hold
-/// the completed-pass boundary open (marmot#375). Queued application messages
-/// must never park pass admission.
-pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
-    matches!(
-        intent,
+/// reservation (marmot#375, mdk#2628 D6): only a local group-state evolution
+/// that needs admin or same-account authority may hold the completed-pass
+/// boundary open. A same-account intent counts only while the group requires
+/// account-devices (`account_devices_required`), so a group that does not
+/// require it reserves the slot for exactly the admin kinds. Self-updates,
+/// leaves and queued application messages must never park pass admission.
+pub(crate) fn is_fair_scheduled_intent(
+    intent: &SendIntent,
+    account_devices_required: bool,
+) -> bool {
+    match intent {
         SendIntent::Invite { .. }
-            | SendIntent::RemoveMembers { .. }
-            | SendIntent::UpdateAppComponents { .. }
-            | SendIntent::UpdateGroupData { .. }
-            | SendIntent::EnableDisbanding { .. }
-            | SendIntent::Disband { .. }
-    )
+        | SendIntent::RemoveMembers { .. }
+        | SendIntent::UpdateAppComponents { .. }
+        | SendIntent::ReplaceDeviceEntry { .. }
+        | SendIntent::ReplaceAccountEntry { .. }
+        | SendIntent::UpdateGroupData { .. }
+        | SendIntent::EnableDisbanding { .. }
+        | SendIntent::EnableAccountDevices { .. }
+        | SendIntent::LinkDevice { .. }
+        | SendIntent::UnlinkDevice { .. }
+        | SendIntent::RecordRemovedSlot { .. }
+        | SendIntent::Disband { .. } => true,
+        SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
+            account_devices_required
+        }
+        SendIntent::AppMessage { .. }
+        | SendIntent::Leave { .. }
+        | SendIntent::SelfUpdate { .. } => false,
+    }
+}
+
+impl<S: StorageProvider> Engine<S> {
+    /// The `account_devices_required` answer [`is_fair_scheduled_intent`]
+    /// needs for `queued`. The group is read only when a same-account intent
+    /// is queued, so other queues never pay for it.
+    pub(crate) fn fair_scheduling_requires_account_devices(
+        &self,
+        group_id: &GroupId,
+        queued: &[QueuedOutboundIntent],
+    ) -> Result<bool, EngineError> {
+        if !queued.iter().any(|record| {
+            matches!(
+                record.intent,
+                SendIntent::AddOwnAccountDevices { .. }
+                    | SendIntent::RemoveOwnAccountDevices { .. }
+            )
+        }) {
+            return Ok(false);
+        }
+        self.with_mls_group(
+            group_id,
+            crate::app_components::group_requires_account_devices,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -204,6 +204,31 @@ async fn complete_capture_app_two_phase_union_and_keyed_shrink() {
         .collect();
     captured.submit(1, &identity, &answers).unwrap();
     assert_eq!(captured.complete().unwrap(), vec![hex::encode([1; 4])]);
+    let removed_here = hex::encode([1; 4]);
+    let mut retained = store.get_group(&GroupId::new(vec![1; 4])).unwrap();
+    retained.removed = true;
+    store.put_group(&retained).unwrap();
+    store
+        .app_storage()
+        .set_group_self_membership(&removed_here, storage_sqlite::SelfMembership::DeviceRemoved)
+        .unwrap();
+    store
+        .app_storage()
+        .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
+        .unwrap();
+    // The account still has a leaf on a sibling device in the retained roster.
+    let mut req = request(&account.account_id_hex);
+    req.base = SelectionBaseScope::View(ChatListView::Left);
+    req.original_ids = Some(vec![removed_here.clone()]);
+    req.action_hints = true;
+    let captured = client.capture_complete_selection(req, &|| false).unwrap();
+    let ids = captured.resolved_ids().unwrap();
+    assert_eq!(ids, vec![removed_here]);
+    assert_eq!(
+        captured.affordances(&ids, None).unwrap().2,
+        Some(false),
+        "a chat removed from this device must not offer a departure action"
+    );
     app.close_storage().unwrap();
 }
 

@@ -316,6 +316,11 @@ fn spawn_wn_agent(home: &Path, socket: &Path, log_root: &Path) -> SpawnedChild {
         .arg("--socket")
         .arg(socket)
         .arg("--debug-controls")
+        // Stay offline: without relays from the flag or environment, `serve`
+        // would otherwise use the public default relays.
+        .arg("--no-default-relays")
+        .env_remove("MARMOT_RELAYS")
+        .env_remove("MARMOT_RELAY")
         .current_dir(repo_root())
         .env(
             "RUST_LOG",

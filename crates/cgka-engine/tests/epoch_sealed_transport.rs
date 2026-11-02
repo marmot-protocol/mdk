@@ -44,7 +44,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -56,7 +56,7 @@ fn build_client(id: &[u8]) -> Engine<SqliteAccountStorage> {
 }
 
 fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))

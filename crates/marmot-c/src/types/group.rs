@@ -1,14 +1,15 @@
 //! C mirrors of the group conversions.
 
 use marmot_uniffi::conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
-    AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
-    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi,
-    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
-    GroupLifecycleStateFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRecoveryStatusFfi,
-    GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi, SelfMembershipFfi,
+    AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi,
+    AppGroupHydrationQuarantineReasonFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi,
+    AppGroupMlsStateFfi, AppGroupRecordFfi, AppProtocolProfileFfi, AppQuarantinedGroupFfi,
+    CreatedGroupFfi, DisbandFailureReasonFfi, DisbandRequestFfi, EncryptedMediaVersionFfi,
+    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi,
+    GroupRecoveryStatusFfi, GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi,
+    SelfMembershipFfi,
 };
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
@@ -44,6 +45,20 @@ c_mirror! {
 }
 
 c_enum! {
+    /// Whether the account can turn on account-devices in a group now. Every
+    /// answer is about the whole group, never which members or devices.
+    MarmotAccountDevicesActivation from AccountDevicesActivationFfi {
+        Eligible,
+        NotAdmin,
+        AlreadyEnabled,
+        LegacyGroup,
+        MembersNeedUpdate,
+        DevicesNeedReplacement,
+        DeviceLimitExceeded,
+    }
+}
+
+c_enum! {
     /// Marmot protocol profile the group runs.
     MarmotAppProtocolProfile from AppProtocolProfileFfi {
         Legacy,
@@ -68,11 +83,14 @@ impl Default for MarmotEncryptedMediaVersion {
 
 c_enum! {
     /// Whether the local account is still a member of this group, and if
-    /// not, whether it left voluntarily or was removed.
+    /// not, whether it left voluntarily or was removed. `DeviceRemoved`: this
+    /// device's leaf was removed while the account keeps another device in
+    /// the group, which is not a removal from the group.
     MarmotSelfMembership from SelfMembershipFfi {
         Member,
         Left,
         Removed,
+        DeviceRemoved,
     }
 }
 
@@ -219,13 +237,16 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// One member row of the group roster.
+    /// One member account of the group roster. An account with several
+    /// devices in the group is one row.
     MarmotAppGroupMemberRecord from AppGroupMemberRecordFfi,
     list(MarmotAppGroupMemberRecordList, marmot_app_group_member_record_list_free) {
         str member_id_hex,
         /// Local account label when this member is one of ours. Nullable.
         opt_str account,
         copy local: bool,
+        /// How many of this account's devices are in the group.
+        copy device_count: u32,
     }
 }
 
@@ -240,7 +261,8 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// Enriched member row for group detail screens.
+    /// Enriched member row for group detail screens. An account with
+    /// several devices in the group is one row.
     MarmotGroupMemberDetails from GroupMemberDetailsFfi {
         str member_id_hex,
         opt_str account,
@@ -249,6 +271,8 @@ c_mirror! {
         copy is_self: bool,
         str npub,
         opt_str display_name,
+        /// How many of this account's devices are in the group.
+        copy device_count: u32,
     }
 }
 
@@ -270,6 +294,9 @@ c_mirror! {
         copy disbanding: bool,
         str_vec disbanding_blockers/disbanding_blockers_len,
         opt_rec disband_request: MarmotDisbandRequest,
+        /// Convergence stopped retrying a batch that kept failing; new
+        /// input or `marmot_retry_group_convergence` resumes it.
+        copy convergence_parked: bool,
     }
 }
 

@@ -94,6 +94,12 @@ pub struct DaemonRuntimeActivityReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub running: bool,
+    /// True while the daemon is still opening its accounts. It answers
+    /// status, ping and stop meanwhile; other requests wait. A daemon from
+    /// before this field answered only once it had started, so it reads as
+    /// false.
+    #[serde(default)]
+    pub starting: bool,
     pub socket: PathBuf,
     pub pid: Option<u32>,
     pub pid_file: Option<PathBuf>,
@@ -104,6 +110,14 @@ pub struct DaemonStatus {
     pub last_runtime_activity: Option<DaemonRuntimeActivityReport>,
     pub relay_health: Option<marmot_app::RelayPlaneHealth>,
     pub stream_watches: Vec<DaemonStreamWatchReport>,
+}
+
+/// The daemon's answer to [`DaemonRequest::Shutdown`]: its pid, so
+/// `wn daemon stop` can wait for that process to exit. A daemon answers
+/// before it shuts down.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DaemonShutdownAck {
+    pub(crate) pid: u32,
 }
 
 pub type DaemonStreamWatchReport = marmot_app::AgentStreamWatchReport;

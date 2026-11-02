@@ -167,7 +167,15 @@ async def run() -> None:
             "--socket",
             str(socket_path),
             "--debug-controls",
+            # Stay offline: without relays from the flag or environment,
+            # `serve` would otherwise use the public default relays.
+            "--no-default-relays",
             cwd=str(mdk_repo),
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in ("MARMOT_RELAYS", "MARMOT_RELAY")
+            },
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )

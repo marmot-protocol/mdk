@@ -286,8 +286,7 @@ impl AppClient {
                         .account_home()
                         .account(&self.state.label)
                         .is_ok_and(|account| {
-                            account.account_id_hex
-                                == hex::encode(self.runtime.session().self_id().as_slice())
+                            account.account_id_hex == hex::encode(self.runtime.self_id().as_slice())
                         })
             });
             if !owner_ok {

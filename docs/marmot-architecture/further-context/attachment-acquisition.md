@@ -330,8 +330,9 @@ Remove deletes local bytes and suppresses automatic reacquisition until an expli
 
 Disabling automatic work invalidates active automatic leases, pauses queued automatic demand and
 preserves explicit requests and cached bytes. Re-enabling never clears cancellation/removal.
-Native snapshot and subscription targets are bounded to 64 original slots. Replacement snapshots
-are coalesced to at most four per second; they include states, a transfer generation, received/known
+Native snapshot and subscription targets are bounded to 64 original slots. A replacement snapshot
+that changes a row's transfer state is delivered at once; progress-only replacements are coalesced
+to at most four per second. Snapshots include states, a transfer generation, received/known
 total ciphertext bytes, optional retry time and an opaque job reference. Verification phases precede
 Ready; only verified plaintext is exposed by local byte reads. Claim advances the generation
 and clears counters before HTTP starts; a later body restart or locator fallback advances it

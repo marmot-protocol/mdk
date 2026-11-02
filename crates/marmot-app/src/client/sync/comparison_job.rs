@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionRequest,
-    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCapturePlan, SubscriptionAttempt,
+    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCaptureOutcome, ReplayCapturePlan,
+    SubscriptionAttempt,
 };
 
 /// Owned events one worker turn admits before commands and live input run.
@@ -81,6 +82,8 @@ pub(crate) struct ComparisonAdmission {
     /// The grant changed mid-admission. The admitted prefix stays durable,
     /// but the pass certifies nothing.
     invalid: bool,
+    /// How the pass's owner capture ended, or `None` when it had none.
+    capture: Option<ReplayCaptureOutcome>,
 }
 
 /// Where an owned event came from. Only comparison events bear on the
@@ -238,7 +241,8 @@ impl ComparisonRouteWorkResult {
 
 pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
-    capture_error: Option<cgka_traits::TransportAdapterError>,
+    /// The owner capture's outcome, or `None` when the pass had none to run.
+    capture: Option<Result<ReplayCaptureOutcome, cgka_traits::TransportAdapterError>>,
 }
 
 impl ComparisonNetworkResult {
@@ -724,7 +728,10 @@ impl ComparisonNetworkJob {
             // Native capture and comparison share the cutoff, not each other's
             // wait. A quiet original REQ must not consume the whole pass first.
             let capture = async {
-                if !replay_capture.sources.is_empty() && tokio::time::Instant::now() < deadline {
+                if replay_capture.sources.is_empty() {
+                    return None;
+                }
+                if tokio::time::Instant::now() < deadline {
                     let cancellation = NostrAcquisitionCancellation::new();
                     let _cancel_on_drop = cancellation.clone().drop_guard();
                     let capture = adapter.capture_replay(replay_capture, cancellation.clone());
@@ -738,9 +745,10 @@ impl ComparisonNetworkJob {
                             capture.await
                         }
                     };
-                    return captured.err();
+                    return Some(captured);
                 }
-                None
+                // The cutoff passed before the capture could start.
+                Some(Ok(ReplayCaptureOutcome::Cancelled))
             };
             let compare = async {
                 // Refill a completed slot even while an earlier route is stalled.
@@ -921,14 +929,8 @@ impl ComparisonNetworkJob {
                     .map(|result| result.expect("every frozen route returned"))
                     .collect()
             };
-            let (capture_error, routes) = tokio::join!(capture, compare);
-            (
-                credit,
-                ComparisonNetworkResult {
-                    routes,
-                    capture_error,
-                },
-            )
+            let (capture, routes) = tokio::join!(capture, compare);
+            (credit, ComparisonNetworkResult { routes, capture })
         });
         Ok(Self { handle })
     }
@@ -1073,9 +1075,11 @@ impl AppClient {
         execution: &mut ComparisonExecution,
         mut network: ComparisonNetworkResult,
     ) -> Result<Option<ComparisonAdmission>, AppError> {
-        if let Some(error) = network.capture_error.take() {
-            return Err(error.into());
-        }
+        let capture = match network.capture.take() {
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok(outcome)) => Some(outcome),
+            None => None,
+        };
         let stable = self.comparison_grant_stable(grant, execution, true).await;
         if !matches!(stable, Ok(true)) {
             // The result is discarded unadmitted; its finish row still says
@@ -1086,7 +1090,10 @@ impl AppClient {
                 .observe_unsettled_routes(network.unsettled_routes());
             return stable.map(|_| None);
         }
-        let mut admission = ComparisonAdmission::default();
+        let mut admission = ComparisonAdmission {
+            capture,
+            ..ComparisonAdmission::default()
+        };
         for (index, route) in network.routes.into_iter().enumerate() {
             let inventory = grant
                 .inventory
@@ -1302,8 +1309,10 @@ impl AppClient {
         let mut native_examined = 0;
         let mut blocked = HashSet::new();
         let mut inventory = super::InventoryBatch::default();
+        // An unlinked account admits nothing more (mdk#2628 D67).
         while spent < MAX_COMPARISON_ADMISSION_PER_TURN
             && native_examined < MAX_COMPARISON_ADMISSION_PER_TURN
+            && !self.device_unlinked
         {
             let Some(input) = self.ordered_input(admission, &mut blocked).await else {
                 break;
@@ -1872,6 +1881,7 @@ impl AppClient {
             &mut execution.counts,
             &mut execution.tally,
             outcomes,
+            admission.capture,
             summary,
         )
         .await
@@ -1945,7 +1955,7 @@ mod tests {
                     credit,
                     ComparisonNetworkResult {
                         routes: Vec::new(),
-                        capture_error: None,
+                        capture: None,
                     },
                 )
             }
@@ -1985,7 +1995,7 @@ mod tests {
                     credit,
                     ComparisonNetworkResult {
                         routes: Vec::new(),
-                        capture_error: None,
+                        capture: None,
                     },
                 )
             }
@@ -2018,7 +2028,7 @@ mod tests {
                 credit,
                 ComparisonNetworkResult {
                     routes: Vec::new(),
-                    capture_error: None,
+                    capture: None,
                 },
             )
         });
@@ -2148,7 +2158,7 @@ mod tests {
         .unwrap();
         let (credit, network) = job.wait().await.unwrap();
         assert!(network.routes.is_empty());
-        assert!(network.capture_error.is_none());
+        assert!(network.capture.is_none());
         assert_eq!(
             fixture.relay.acquisition_calls.load(Ordering::SeqCst),
             calls
@@ -2176,7 +2186,9 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes: Vec::new(),
-                    capture_error: Some(cgka_traits::TransportAdapterError::InvalidInboundEncoding),
+                    capture: Some(Err(
+                        cgka_traits::TransportAdapterError::InvalidInboundEncoding,
+                    )),
                 },
             )
             .await;
@@ -2231,7 +2243,7 @@ mod tests {
                     Vec::new(),
                 )))),
             }],
-            capture_error: None,
+            capture: None,
         }
     }
 
@@ -3972,7 +3984,7 @@ mod tests {
                 .unwrap();
             sdk.client().shutdown().await;
             let network = ComparisonNetworkResult {
-                capture_error: None,
+                capture: None,
                 routes: vec![ComparisonRouteResult {
                     route: route.clone(),
                     initial_cursor,
@@ -4904,7 +4916,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await
@@ -4961,7 +4973,7 @@ mod tests {
                             result: ComparisonRouteWorkResult::TimedOut,
                         })
                         .collect(),
-                    capture_error: None,
+                    capture: None,
                 }
             };
             fixture
@@ -4994,8 +5006,12 @@ mod tests {
     async fn a_comparison_only_pass_without_a_backend_is_unserved_not_quiet() {
         use crate::client::audit_recovery::recorded_v5_rows;
         let mut fixture = fixture_with_options(None, false, true).await;
-        // Settle the create-group history demand, as the epoch-gap fixture
-        // does, so the next grant owns only the comparison slot.
+        // Settle the live REQs' native replay before the first grant, or its
+        // SubscriptionReplay duty can join every grant (mdk#2693). Then settle
+        // the create-group history demand, as the epoch-gap fixture does, so
+        // the next grant owns only the comparison slot.
+        let plane = fixture.client.app.relay_plane.clone();
+        crate::tests::settle_live_replay(&plane, &fixture.relay, &mut fixture.client).await;
         let baseline = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
@@ -5046,7 +5062,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await
@@ -5093,7 +5109,7 @@ mod tests {
                 execution,
                 ComparisonNetworkResult {
                     routes,
-                    capture_error: None,
+                    capture: None,
                 },
             )
             .await
@@ -5613,7 +5629,7 @@ mod tests {
                     &app,
                 );
             connection.execute_batch("CREATE TRIGGER fail_repaired_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-            let effects = marmot_account::AccountDeviceEffects {
+            let effects = marmot_session::AccountDeviceEffects {
                 events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
                     group_id: fixture.group_id.clone(),
                     epoch: cgka_traits::EpochId(1),
