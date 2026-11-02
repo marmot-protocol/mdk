@@ -600,38 +600,64 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
     assert_eq!(leaves_of(&phone, &laptop, &chats[0], &group), 0);
 }
 
-/// An unreadable issuer row cannot prevent a healthy later sibling from
-/// filling the same chat. SQLite scalar corruption is issuer-local.
+/// An unreadable target row cannot prevent a healthy later sibling from
+/// filling the same chat. Both stock and settings readiness fail locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unreadable_private_stock_does_not_starve_another_sibling_in_the_same_chat() {
-    let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
-    let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    let chat = chats(&mut phone, 1).await.remove(0);
-    let group = link(&relay, &mut phone, &mut first, "First").await;
-    hold_key_packages(&relay, &mut phone, &mut first).await;
-    link(&relay, &mut phone, &mut second, "Second").await;
-    hold_key_packages(&relay, &mut phone, &mut second).await;
-    assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
-    assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
-    account_database(&phone.app)
-        .execute(
-            "UPDATE private_key_packages_received
-             SET not_before = 'unreadable', not_after = 'unreadable'
-             WHERE issuer_slot_hex = ?1",
-            [first.slot_hex()],
-        )
-        .unwrap();
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
-        .await;
-    assert_eq!(taken_from(&phone, &first), 0);
-    assert_eq!(taken_from(&phone, &second), 1);
-    assert_eq!(leaves_of(&phone, &second, &chat, &group), 1);
+async fn unreadable_target_state_does_not_starve_another_sibling_in_the_same_chat() {
+    for corrupt_settings in [false, true] {
+        let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+        let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let chat = chats(&mut phone, 1).await.remove(0);
+        let group = link(&relay, &mut phone, &mut first, "First").await;
+        hold_key_packages(&relay, &mut phone, &mut first).await;
+        link(&relay, &mut phone, &mut second, "Second").await;
+        hold_key_packages(&relay, &mut phone, &mut second).await;
+        assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
+        assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
+        if corrupt_settings {
+            for device in [&mut phone, &mut first, &mut second] {
+                converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8)
+                    .await;
+            }
+            phone
+                .client
+                .rename_linked_device(&first.slot_hex(), "Unreadable settings")
+                .await
+                .unwrap();
+            // Corrupt a row written by the real host command, not a synthetic
+            // intention that supplies the standing this owner should derive.
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE device_renames SET label = x'00' WHERE slot_id_hex = ?1",
+                    [first.slot_hex()],
+                )
+                .unwrap();
+        } else {
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE private_key_packages_received
+                 SET not_before = 'unreadable', not_after = 'unreadable'
+                 WHERE issuer_slot_hex = ?1",
+                    [first.slot_hex()],
+                )
+                .unwrap();
+        }
+        phone
+            .client
+            .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+            .await;
+        assert_eq!(taken_from(&phone, &first), 0);
+        assert_eq!(
+            taken_from(&phone, &second),
+            1,
+            "the healthy target progresses, settings row corrupt: {corrupt_settings}"
+        );
+        assert_eq!(leaves_of(&phone, &second, &chat, &group), 1);
+    }
 }
 
 /// A successful send call may retain an unconfirmed Commit. The next

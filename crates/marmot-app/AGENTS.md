@@ -289,10 +289,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
   after ten minutes, and never authorize an Add; replay cannot extend one. A live own claim delays another local
   attempt after a terminal Add failure until that same expiry; restart can forget it. Only changed/due chats load their
-  MLS trees: compare effective target keys/exclusions, pending-setting readiness and claimant eligibility with the last actually scheduled
-  inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
-  invalidate all chats. Isolate stock read errors per target, report the error and retry the chat while healthy
-  siblings progress. Check chat quiet again before each target claim; keep original-expiry claims when readiness
+  MLS trees: compare effective target keys/exclusions, pending-setting readiness and claimant eligibility with the
+  last actually scheduled inputs. A blocked sender does not consume changes; routine busy/ready cycles and device-group commits do not
+  invalidate all chats. Preserve live claims and stock waiters for roster-eligible targets during a local settings
+  hold; use only ready targets for scheduling fingerprints, new Adds and stock requests. Isolate settings-readiness
+  and stock read errors per target, report the error and retry the chat while healthy siblings progress.
+  Check chat quiet again before each target claim; keep original-expiry claims when readiness
   changes during publication. With no eligible target, clear pending work without enumerating chats. Hydration
   recovery wakes the recovered chat, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
   exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Select compatible
