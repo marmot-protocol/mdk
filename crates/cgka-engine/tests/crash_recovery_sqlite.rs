@@ -45,6 +45,9 @@ use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 mod support;
 use support::proof_signer;
 
+#[path = "crash_recovery_sqlite/orphan_pending.rs"]
+mod orphan_pending;
+
 const CHILD_ENV: &str = "MDK_CGKA_CRASH_CHILD";
 const DATABASE_ENV: &str = "MDK_CGKA_CRASH_DATABASE";
 const CRASH_POINT_ENV: &str = "MDK_CGKA_TEST_CRASH_POINT";
@@ -215,7 +218,10 @@ async fn crash_child_runs_late_commit_convergence() {
         return;
     }
     let path = PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
-    if std::env::var(CRASH_POINT_ENV).is_ok_and(|point| point.starts_with("canonical-application-"))
+    if std::env::var(CRASH_POINT_ENV).as_deref() == Ok(orphan_pending::POINT) {
+        orphan_pending::run_child(&path).await;
+    } else if std::env::var(CRASH_POINT_ENV)
+        .is_ok_and(|point| point.starts_with("canonical-application-"))
     {
         run_application_child(&path).await;
     } else if std::env::var(CRASH_POINT_ENV)
