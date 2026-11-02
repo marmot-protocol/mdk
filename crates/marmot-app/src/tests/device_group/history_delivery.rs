@@ -305,9 +305,10 @@ async fn history_devices() -> (Devices, GroupId, GroupId, String) {
 /// only the label; Some changes the history flag. No maintenance replays it.
 async fn lose_phone_edit(devices: &mut Devices, group: &GroupId, history: Option<bool>) {
     use super::devices::{edit_own_entry, exchange};
-    let start = published_count(&devices.relay);
-    let mut cursors = (start, start);
-    deliver_all(&mut devices.phone, &devices.relay).await;
+    // An Add can leave an announcement in the relay that only its sender
+    // has seen. Replay both prefixes before forking, rather than skipping
+    // those inputs with a cursor starting at the relay's current end.
+    let mut cursors = (0, 0);
     exchange(
         &mut devices.phone,
         &mut devices.laptop,
@@ -317,6 +318,11 @@ async fn lose_phone_edit(devices: &mut Devices, group: &GroupId, history: Option
     )
     .await;
     let slot = slot_of(&devices.laptop);
+    assert_eq!(
+        roster(&devices.phone, group),
+        roster(&devices.laptop, group),
+        "the fork starts from a shared roster"
+    );
     if let Some(history) = history {
         devices
             .phone
