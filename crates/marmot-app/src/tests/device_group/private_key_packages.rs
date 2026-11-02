@@ -1551,8 +1551,8 @@ async fn a_sibling_welcome_refused_by_a_same_number_rival_is_sent_by_the_next_pa
 
 /// A sibling Welcome goes out only once its Add's Commit is published: an
 /// Add whose Commit every relay refused fails, and neither it nor a later
-/// pass sends the Welcome. The failed Add spent its KeyPackage, which is not
-/// handed back. Adding the phone again goes through.
+/// Welcome-delivery pass sends that Welcome. The failed Add spent its
+/// KeyPackage, which is not handed back. Adding the phone again goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_welcome_waits_for_its_commit() {
     let (mut devices, _, [chat]) = tagging_devices_with_chats::<1>().await;
@@ -1566,7 +1566,7 @@ async fn a_sibling_welcome_waits_for_its_commit() {
         .unwrap_err();
     assert_eq!(error.privacy_safe_kind(), "publish");
     assert_eq!(received_from(&devices.laptop, &phone_slot).len(), stock - 1);
-    devices.laptop.run_due_maintenance().await.unwrap();
+    devices.laptop.send_owed_sibling_welcomes(&[]).await;
     deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(stashed(&devices.phone), 0);
 

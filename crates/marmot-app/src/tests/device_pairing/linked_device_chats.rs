@@ -266,7 +266,28 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     passes(&relay, &mut [&mut low, &mut high], 4).await;
     assert!(chats.iter().all(|chat| joined(&high, chat)));
     link(&relay, &mut low, &mut target, "New device").await;
-    hold_key_packages(&relay, &mut high, &mut target).await;
+    let target_slot: [u8; 32] = hex::decode(target.slot_hex()).unwrap().try_into().unwrap();
+    // Observe the completed link without running this holder's maintenance:
+    // it has no private stock yet. Gap filling must request it, then a
+    // hand-off must wake the waiting chat even with no membership change.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            converge_device_group(&mut high.client, &relay, &mut high.cursor, &group, 1).await;
+            if high
+                .roster(&group)
+                .devices
+                .get(&target_slot)
+                .is_some_and(|entry| entry.tag_signature_key.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the holder observes the target's first tagged Commit");
+    assert_eq!(held_from(&high, &target), 0);
+    assert!(!chats.iter().any(|chat| joined(&target, chat)));
     let content = format!(
         "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
         low.slot_hex(),
