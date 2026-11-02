@@ -104,20 +104,42 @@ async fn hold_key_packages(
     phone: &mut Device,
     laptop: &mut Device,
 ) {
-    for _ in 0..3 {
-        deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-        phone.client.sibling_key_package_upkeep(&[]).await;
-        deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
-        laptop.client.run_due_maintenance().await.unwrap();
-    }
-    deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-    assert!(held_from(phone, laptop) > 0);
+    // Direct clients have no account worker to advance scheduled convergence.
+    // Drive that work too, and await the hand-off rather than assuming a fixed
+    // number of maintenance passes settles every replay slice (mdk#2861).
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            phone.client.sibling_key_package_upkeep(&[]).await;
+            deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
+            laptop.client.run_due_maintenance().await.unwrap();
+            for client in [&mut phone.client, &mut laptop.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            if held_from(phone, laptop) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the phone receives the laptop's private KeyPackage hand-off");
 }
 
 /// A removal of the laptop another device decided reaches the phone, which
 /// applies it with no decision of its own recorded, and, after a maintenance
-/// pass when `pass_between`, is dropped: the laptop, which never receives
-/// that branch, renames itself from the epoch before it until its branch is
+/// pass when `pass_between`, is dropped: the laptop, which has not received
+/// that branch yet, renames itself from the epoch before it until its branch is
 /// the deeper, and the phone adopts that branch, whose roster lists the
 /// laptop again.
 async fn drop_a_removal_decided_elsewhere(
@@ -133,7 +155,6 @@ async fn drop_a_removal_decided_elsewhere(
     if pass_between {
         phone.client.run_due_maintenance().await.unwrap();
     }
-    laptop.cursor = relay.published_events.lock().unwrap().len();
     let epoch = |device: &Device| device.client.runtime.group_record(group).unwrap().epoch;
     let phone_epoch = epoch(phone);
     let mut renames = 0;
