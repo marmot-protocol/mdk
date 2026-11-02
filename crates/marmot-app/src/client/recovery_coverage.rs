@@ -710,9 +710,9 @@ impl AppClient {
         }
     }
 
-    /// Widen `routes`' goals to `floor`. Every goal the client widens goes
-    /// through here: it may owe new debt, so the recovery runner, if one
-    /// runs, reads its ledger again.
+    /// Widen `routes`' goals to `floor` and wake the recovery runner to read
+    /// its ledger again. Only the runner's own routing-change settlement
+    /// widens directly without a wake: that turn immediately reads the debt.
     fn widen_coverage_goals(
         &self,
         app: &SqliteAppStorage,

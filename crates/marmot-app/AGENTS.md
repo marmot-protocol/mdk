@@ -588,7 +588,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
   through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
   route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
-  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
+  the ledger on every wake. Its own routing-change settlement widens goals without a wake because the same turn
+  immediately reads the debt. Every ledger and retry-state write happens in a worker turn; the
   credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
   tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline
