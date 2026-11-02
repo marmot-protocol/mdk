@@ -98,6 +98,9 @@
   ten-minute advisory claim to reduce competing Adds; the selected tree is
   checked again when an Add stages. Claims use byte-exact canonical content;
   leaving claimants stop participating and no longer hold other devices back.
+  A live own claim also delays another local attempt after a terminal failure
+  until its existing expiry. Routine device-group commits do not rescan all
+  chats; recovered quarantined chats are checked again.
   Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
