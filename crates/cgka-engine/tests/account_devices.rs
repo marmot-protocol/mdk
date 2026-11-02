@@ -2418,6 +2418,7 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
     .await;
 }
 
+#[cfg(feature = "test-policy-overrides")]
 async fn assert_priorities(
     committer: &Device,
     commit: &TransportMessage,
