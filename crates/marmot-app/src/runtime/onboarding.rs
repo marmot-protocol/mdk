@@ -138,6 +138,7 @@ pub enum OnboardingIssue {
     RecordChanged,
     Interrupted,
     TooManyRelays,
+    // Retained for checkpoint and binding compatibility; current notices omit it.
     MultiDeviceUnsupported,
     OtherInstallationPossible,
     DiscoveryIncomplete,
@@ -934,6 +935,12 @@ impl AccountManager {
             return Ok(None);
         };
         let mut checkpoint = decode_onboarding_checkpoint(&bytes, &account.account_id_hex)?;
+        // The historical capability claim is not discovery evidence. Retire
+        // it from resumed projections without changing consent or rewriting
+        // the retained checkpoint merely because a host read its snapshot.
+        checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()]
+            .findings
+            .retain(|finding| finding.issue != OnboardingIssue::MultiDeviceUnsupported);
         // Older checkpoints did not offer rechecks of finished steps. Refresh
         // these derived hints before exposing or validating the snapshot, while
         // retaining the offered-action contract and cancellation's sole exit.
