@@ -79,18 +79,27 @@ struct OfflineQueue {
     runtime: MarmotAppRuntime,
     group_id: GroupId,
     offline_sends: usize,
+    relay_count: usize,
 }
 
 impl OfflineQueue {
-    /// Create the group and publish one send while online.
+    /// Create the group on one relay and publish one send while online.
     async fn online() -> Self {
+        Self::online_on(&["wss://offline-queue.example"]).await
+    }
+
+    /// Create the group on `relays` and publish one send while online.
+    async fn online_on(relays: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("sender")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://offline-queue.example")
-            .with_test_relay_client(relay.clone());
+        let app = MarmotApp::with_relays(
+            dir.path(),
+            relays.iter().map(|relay| (*relay).to_owned()).collect(),
+        )
+        .with_test_relay_client(relay.clone());
         let mut setup_client = app.client("sender").await.unwrap();
         let group_id = setup_client
             .create_group("offline queue", &[])
@@ -115,6 +124,7 @@ impl OfflineQueue {
             runtime,
             group_id,
             offline_sends: 0,
+            relay_count: relays.len(),
         }
     }
 
@@ -131,6 +141,7 @@ impl OfflineQueue {
             }
         }
         let index = self.offline_sends;
+        let attempts_before = self.relay.attempted_event_ids().len();
         self.runtime
             .submit_text(
                 "sender",
@@ -141,7 +152,15 @@ impl OfflineQueue {
             .await
             .unwrap();
         self.offline_sends += 1;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The relay records an attempt before it fails it, so this proves the send was
+        // tried while offline rather than after connectivity returned.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.relay.attempted_event_ids().len() <= attempts_before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worker must attempt the offline send while the relay fails");
     }
 
     /// Restart the process while still offline, after the stored fanouts have failed
@@ -188,7 +207,8 @@ impl OfflineQueue {
             .expect("the host connectivity signal must reach the account worker");
     }
 
-    /// Require every send to publish within `budget`, each accepted once and in send order.
+    /// Require every send to publish within `budget`, accepted at most once per relay and
+    /// first accepted in send order.
     async fn assert_all_published_once_in_order(&self, budget: Duration, context: &str) {
         let published =
             wait_for_all_published(&self.app, &self.group_id, self.offline_sends + 1, budget).await;
@@ -205,9 +225,9 @@ impl OfflineQueue {
                 .iter()
                 .filter(|published| *published == id)
                 .count();
-            assert_eq!(
-                count, 1,
-                "{context}: {content} must be accepted exactly once"
+            assert!(
+                (1..=self.relay_count).contains(&count),
+                "{context}: {content} must be accepted at most once per relay, got {count}"
             );
             positions.push(
                 published_ids
@@ -325,4 +345,122 @@ async fn repeated_connectivity_edges_release_the_batch_once() {
         .assert_all_published_once_in_order(Duration::from_secs(1), "a later edge")
         .await;
     queue.runtime.shutdown().await;
+}
+
+/// A group on two relays where one relay stays down after the device reconnects. The first
+/// send meets quorum on the other relay and keeps retrying the dead one; the later sends
+/// must not wait behind that secondary replication (mdk#2762).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_behind_a_quorum_met_send_publish_while_another_relay_stays_down() {
+    let mut queue =
+        OfflineQueue::online_on(&["wss://relay-a.example", "wss://relay-b.example"]).await;
+    for _ in 0..3 {
+        queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    }
+    queue.relay.allow_publishes();
+    queue
+        .relay
+        .make_endpoints_unavailable(&["wss://relay-b.example"]);
+    queue.reconnect().await;
+    queue
+        .assert_all_published_once_in_order(Duration::from_secs(8), "relay b down")
+        .await;
+    queue.runtime.shutdown().await;
+}
+
+/// A cold start opens groups only seeded. An edge that lands before a group with retained
+/// sends is hydrated must still wake that group's sends, not skip them (mdk#2762).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connectivity_wake_reaches_retained_sends_of_an_unhydrated_group() {
+    let mut queue = OfflineQueue::online().await;
+    for _ in 0..2 {
+        queue.send_offline(OfflineFailure::PossiblyExposed).await;
+    }
+    queue.runtime.shutdown().await;
+
+    // Open the account the way a cold start does: every group seeded, none hydrated.
+    let plane = transport_nostr::MarmotRelayPlane::new(None, queue.relay.clone());
+    let mut client = queue
+        .app
+        .local_client_with_relay_plane_and_hydration("sender", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(
+        client
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&queue.group_id),
+        "the cold open must leave the group seeded only"
+    );
+    assert!(
+        client.runtime.outbound_fanouts().unwrap().is_empty(),
+        "an unhydrated group hides its fanouts until it is hydrated"
+    );
+    let woken = client.note_connectivity_restored().unwrap();
+    assert_eq!(woken, 2, "both retained sends must be woken");
+    for fanout in client
+        .runtime
+        .session()
+        .outbound_fanouts_for_group(&queue.group_id)
+        .unwrap()
+    {
+        for index in fanout.outstanding_target_indexes() {
+            assert_eq!(fanout.target_last_attempt_at_ms(index), None);
+        }
+    }
+}
+
+/// The group's retry cutoff follows the same barrier as the drain. A send that met quorum and
+/// owes only another relay must not hold the group's wakeup on its own clock while a later
+/// send behind it is already due (mdk#2762).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_cutoff_skips_a_send_that_only_owes_secondary_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("sender").await.unwrap();
+    let group_id = client.create_group("cutoff", &[]).await.unwrap();
+
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    client.send(&group_id, b"met quorum").await.unwrap();
+    relay.fail_publishes_as_unavailable();
+    client.send(&group_id, b"behind it").await.unwrap();
+
+    let fanouts = client
+        .runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap();
+    assert_eq!(fanouts.len(), 2, "both sends keep a retained fanout");
+    let first = fanouts[0].outcome();
+    assert!(
+        first.accepted_targets >= 1 && first.outstanding_targets >= 1,
+        "the first send met quorum and still owes relay b"
+    );
+    let mut behind = fanouts[1].clone();
+    assert!(behind.wake_targets_for_restored_connectivity() > 0);
+    client
+        .runtime
+        .session()
+        .put_outbound_fanout(&behind)
+        .unwrap();
+
+    assert_eq!(
+        client
+            .runtime
+            .outbound_fanout_retry_delay_ms(&group_id)
+            .unwrap(),
+        Some(0),
+        "the due send behind a quorum-met send sets the group's cutoff"
+    );
 }

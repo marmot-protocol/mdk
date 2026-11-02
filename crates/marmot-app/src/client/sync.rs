@@ -841,7 +841,28 @@ impl AppClient {
     /// event, which a relay that already holds it acknowledges as a duplicate.
     /// Leaving them on the ambiguity clock held a reconnecting device's queued
     /// sends for up to an hour (mdk#2762).
+    ///
+    /// A group the session opened only seeded hides its fanouts until it is
+    /// hydrated, so each group that holds one is hydrated first. Otherwise an
+    /// edge soon after a cold start would skip exactly the sends a previous
+    /// process left behind. A group that fails to hydrate moves to quarantine
+    /// and keeps its fanouts frozen, as at open.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        if !unhydrated.is_empty() {
+            for group_id in self.runtime.outbound_fanout_group_ids()? {
+                if unhydrated.contains(&group_id)
+                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::sync",
+                        method = "note_connectivity_restored",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "group with retained sends could not hydrate for the connectivity wake",
+                    );
+                }
+            }
+        }
         let mut woken_targets = 0;
         for mut fanout in self.runtime.outbound_fanouts()? {
             let woken = fanout.wake_targets_for_restored_connectivity();
