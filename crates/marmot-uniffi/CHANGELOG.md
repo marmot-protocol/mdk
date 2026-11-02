@@ -8,6 +8,8 @@
   account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
   rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.
   Generated host strings remain caller-managed; do not persist or log recovery words.
+  Background writer work defaults closed on every worker start; hosts must report both Wi-Fi and charging to admit
+  new passes. Already admitted passes settle after conditions change; manual restore remains independent.
 
 - `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
   Preserve it when saving an upload reference and sending it back, including
