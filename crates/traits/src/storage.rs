@@ -1335,6 +1335,23 @@ pub trait StorageProvider:
         f(self)
     }
 
+    /// Observe a successful write only after its owning storage unit commits.
+    ///
+    /// An implementation must defer `callback` through the outermost transaction
+    /// and any rollbackable savepoint, discarding it on rollback, failed commit,
+    /// or panic. Outside such a unit, it may run immediately after the caller's
+    /// successful write. Callbacks must not panic and are best-effort observers,
+    /// never part of the write's success or a completeness guarantee.
+    ///
+    /// The default drops the callback. A backend opts in only when it can uphold
+    /// this ordering, including its snapshot-backed savepoint fallback; running
+    /// immediately merely because an inner transaction returned would announce
+    /// work an enclosing unit can still undo. Unsupported backends therefore
+    /// omit positive stored-state audit evidence rather than record tentative
+    /// writes as committed. Wrappers may forward only when their complete
+    /// transaction and savepoint semantics share that boundary.
+    fn after_commit(&self, _callback: Box<dyn FnOnce() + Send + 'static>) {}
+
     /// Run `f` as one unit that a failure undoes without ending the caller's
     /// transaction. When `f` returns `Err`, `group_id`'s state as
     /// [`MessageStorage::create_group_snapshot`] captures it (group record,

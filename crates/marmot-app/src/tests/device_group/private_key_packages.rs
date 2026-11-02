@@ -41,6 +41,25 @@ fn received_from(client: &AppClient, issuer: &DeviceSlotId) -> Vec<ReceivedPriva
         .collect()
 }
 
+/// Direct Add tests deliberately skip preflight to exercise engine refusal
+/// after an allocation is spent. Normal app callers select compatible stock.
+fn private_candidate(client: &AppClient, issuer: &DeviceSlotId) -> ReceivedPrivateKeyPackage {
+    devices_storage(client)
+        .received_private_key_packages_from(&hex::encode(issuer), crate::unix_now_seconds())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn take_private_key_package(client: &AppClient, issuer: &DeviceSlotId) -> KeyPackage {
+    let record = devices_storage(client)
+        .take_received_private_key_package(&hex::encode(issuer), crate::unix_now_seconds())
+        .unwrap()
+        .unwrap();
+    AppClient::received_private_key_package(&record)
+}
+
 fn group_messages_since(relay: &ScriptedPushRelayClient, since: usize) -> usize {
     published_kinds(relay, since)
         .into_iter()
@@ -187,10 +206,74 @@ async fn a_device_takes_only_its_siblings_own_key_packages() {
     assert!(received_from(&devices.phone, &phone_slot).is_empty());
     assert_eq!(issued(&devices.phone).len(), phone_issued);
 
-    // The same leaf's hand-off of its own KeyPackages is kept.
+    // The insertion can fail after its first write too. Such a hand-off
+    // certifies no new stock; the issuer can hand the same unspent keys over
+    // again once the write works, without changing the allocation protocol.
+    let chat = devices
+        .phone
+        .create_group("receive stock", &[])
+        .await
+        .unwrap();
+    let mut selection = Default::default();
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none()
+    );
+    let database = phone_database(&devices);
+    database
+        .execute_batch(
+            "CREATE TRIGGER refuse_private_stock AFTER INSERT ON private_key_packages_received
+         BEGIN SELECT RAISE(ABORT, 'private hand-off write refused'); END;",
+        )
+        .unwrap();
     devices.laptop.run_due_maintenance().await.unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
+    assert!(received_from(&devices.phone, &laptop_slot).is_empty());
+    assert!(
+        devices
+            .phone
+            .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+            .unwrap()
+            .is_none(),
+        "a failed insert supplies no candidate to the retained context"
+    );
+    database
+        .execute_batch("DROP TRIGGER refuse_private_stock")
+        .unwrap();
+    let retry = PrivateKeyPackageHandOff {
+        from: laptop_slot,
+        to: phone_slot,
+        key_packages: issued(&devices.laptop)
+            .into_iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .map(|record| KeyPackage::new(record.key_package))
+            .collect(),
+    };
+    assert_eq!(retry.key_packages.len(), 10);
+    devices
+        .laptop
+        .send_device_group_message(
+            &group,
+            KIND_PRIVATE_KEY_PACKAGE_HAND_OFF,
+            base64::engine::general_purpose::STANDARD.encode(retry.encode().unwrap()),
+        )
+        .await
+        .unwrap();
+    deliver_all(&mut devices.phone, &devices.relay).await;
     assert_eq!(received_from(&devices.phone, &laptop_slot).len(), 10);
+    let selected = devices
+        .phone
+        .next_private_key_package_for_chat(&chat, &laptop_slot, &mut selection)
+        .unwrap()
+        .expect("the same retained context sees an authentic resend once insertion commits");
+    assert!(
+        issued(&devices.laptop)
+            .iter()
+            .any(|record| hex::encode(&record.key_package_ref) == selected.key_package_ref_hex)
+    );
 }
 
 /// A sibling takes one KeyPackage to add the issuer to a chat, asks for a
@@ -200,11 +283,7 @@ async fn a_sibling_takes_asks_for_more_and_discards_private_key_packages() {
     let (mut devices, _) = tagging_devices().await;
     let (phone_slot, laptop_slot) = (slot(&devices.phone), slot(&devices.laptop));
 
-    let taken = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let taken = take_private_key_package(&devices.laptop, &phone_slot);
     let metadata = marmot_session::key_package_metadata(&taken).unwrap();
     assert!(!metadata.last_resort);
     assert!(
@@ -478,11 +557,7 @@ async fn adding_the_phone(devices: &mut Devices, chat: &GroupId) -> SiblingWelco
 /// sibling Welcome owed.
 async fn add_the_phone_unpublished(devices: &mut Devices, chat: &GroupId) {
     let phone_slot = slot(&devices.phone);
-    let key_package = devices
-        .laptop
-        .take_private_key_package(&phone_slot)
-        .unwrap()
-        .unwrap();
+    let key_package = take_private_key_package(&devices.laptop, &phone_slot);
     confirm_unpublished(
         &mut devices.laptop,
         SendIntent::AddOwnAccountDevices {
@@ -1271,7 +1346,11 @@ async fn adding_a_sibling_sends_its_welcome_once_the_commit_is_published() {
     let before = devices.relay.published_events.lock().unwrap().len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert_eq!(group_messages_since(&devices.relay, before), 2);
@@ -1653,7 +1732,11 @@ async fn a_sibling_welcome_waits_for_its_commit() {
     devices.relay.reject_next_publish();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.privacy_safe_kind(), "publish");
@@ -1664,7 +1747,11 @@ async fn a_sibling_welcome_waits_for_its_commit() {
 
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
@@ -1699,7 +1786,11 @@ async fn a_refused_sibling_add_spends_its_key_package() {
     let before = devices.relay.published_events.lock().unwrap().len();
     let error = devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1755,7 +1846,11 @@ async fn a_queued_sibling_add_the_drain_refuses_spends_its_key_package() {
     let stock = received_from(&devices.laptop, &phone_slot).len();
     devices
         .laptop
-        .add_sibling_to_chat(&chat, &phone_slot)
+        .add_sibling_to_chat(
+            &chat,
+            &phone_slot,
+            private_candidate(&devices.laptop, &phone_slot),
+        )
         .await
         .unwrap();
     assert!(
