@@ -11,9 +11,11 @@ import tempfile
 import textwrap
 import tomllib
 import datetime as dt
+import io
 import sys
 import unittest
 import unittest.mock
+import tarfile
 from pathlib import Path
 
 
@@ -21,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import nightly_release  # noqa: E402
+import ci_runner  # noqa: E402
 from check_install_example_sha256 import documented_release_version  # noqa: E402
 
 
@@ -180,7 +183,7 @@ class MergeGatePolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
         self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
-        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      contents: read\n\n",
+        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      checks: read\n      contents: read\n\n",
                       watcher)
         # The branch lookup must name this run's own group and commit.
         self.assertIn("          HEAD_REF: ${{ github.ref }}\n          HEAD_SHA: ${{ github.sha }}\n", watcher)
@@ -205,6 +208,10 @@ class MergeGatePolicyTests(unittest.TestCase):
             gh() {
               if [[ "$1" == api ]]; then
                 echo "gh ${*:1:$#-1}" >> "$STATE/calls"
+                if [[ "$2" == */annotations ]]; then
+                  printf '%s' '[{"annotation_level":"failure","message":"No space left on device"}]' | jq -r "${@: -1}"
+                  return
+                fi
                 local kind=jobs
                 [[ "$*" != *matching-refs* ]] || kind=refs
                 local count=$(( $(cat "$STATE/$kind") + 1 ))
@@ -242,6 +249,10 @@ class MergeGatePolicyTests(unittest.TestCase):
         wait, cancel = "sleep 60", "gh run cancel 42"
         for name, jobs, refs, refused, expected, env in [
             ("failure cancels at once", [failed], [live], 0, [poll, cancel], {}),
+            ("dead runner annotations survive cancellation",
+             [running + [{**job("Rust tests (1/14)", "completed", "failure"),
+                          "check_run_url": "https://api.github.com/repos/o/r/check-runs/7"}]],
+             [live], 0, [poll, "gh api https://api.github.com/repos/o/r/check-runs/7/annotations --jq", cancel], {}),
             ("timeout or cancellation counts as a failure",
              [running + [job("Windows filesystem contracts", "completed", "cancelled")]], [live], 0,
              [poll, cancel], {}),
@@ -294,6 +305,8 @@ class MergeGatePolicyTests(unittest.TestCase):
                                                          "REFUSED_CANCELS": str(refused), **env})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((state / "calls").read_text().splitlines(), expected)
+                if name == "dead runner annotations survive cancellation":
+                    self.assertIn("No space left on device", result.stdout)
 
 
 class CacheBudgetPolicyTests(unittest.TestCase):
@@ -733,6 +746,126 @@ class NightlyPublishTests(unittest.TestCase):
         lane = bindings.split("\n  release-lane:\n", 1)[1].split("\n    steps:\n", 1)[0]
         self.assertNotIn("\n    if:", lane)
         self.assertIn("\n    needs: release-lane\n", bindings.split("\n  metadata:\n", 1)[1].split("\n    steps:", 1)[0])
+
+
+class RunnerEvidenceTests(unittest.TestCase):
+    def archive(self, root):
+        raw = root / "fixture.tar"
+        with tarfile.open(raw, "w") as tar:
+            member = tarfile.TarInfo("target/debug/deps/fixture")
+            member.size = 1001
+            tar.addfile(member, io.BytesIO(b"x" * member.size))
+        archive = root / "fixture.tar.zst"
+        subprocess.run(["zstd", "--quiet", str(raw), "-o", str(archive)], check=True)
+        return archive
+
+    def test_manifest_checks_the_complete_compressed_stream_and_sizes_expanded_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = self.archive(Path(tmp))
+            ci_runner.manifest(archive)
+            document = json.loads(ci_runner.manifest_path(archive).read_text())
+            self.assertEqual(document["expanded_bytes"], 8192)
+            self.assertEqual(document["archive_bytes"], archive.stat().st_size)
+            archive.write_bytes(archive.read_bytes()[:-1])
+            ci_runner.manifest_path(archive).unlink()
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/ci_runner.py"),
+                                     "manifest", str(archive)], capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"CI infrastructure error", result.stderr)
+            self.assertFalse(ci_runner.manifest_path(archive).exists())
+
+    def test_bad_transfer_and_insufficient_disk_refuse_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.archive(root)
+            ci_runner.manifest(archive)
+            contents = archive.read_bytes()
+            archive.write_bytes(b"wrong transfer")
+            with unittest.mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp}):
+                with self.assertRaisesRegex(ValueError, "checksum/size mismatch"):
+                    ci_runner.extract(archive)
+                archive.write_bytes(contents)
+                # Boundary values exercise the actual admission calculation;
+                # no unpacker is installed by this fixture.
+                usage = type("Usage", (), {"total": 100, "used": 99, "free": 1})()
+                with unittest.mock.patch.object(ci_runner.shutil, "disk_usage", return_value=usage):
+                    with self.assertRaisesRegex(ValueError, "insufficient runner disk"):
+                        ci_runner.extract(archive)
+            self.assertTrue(archive.exists(), "a refused archive remains available for diagnosis")
+
+    def test_command_failure_and_signal_survive_bounded_log_capture(self):
+        cases = [("import sys; sys.stdout.write('x'*1100000); sys.exit(37)", 37),
+                 ("import os,signal; os.kill(os.getpid(),signal.SIGTERM)", 143)]
+        for program, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts/ci_runner.py"), "run", "fixture",
+                     "--", sys.executable, "-c", program], cwd=tmp,
+                    env={**os.environ, "RUNNER_TEMP": tmp}, capture_output=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                reports = Path(tmp) / "mdk-ci-reports"
+                outcomes = [json.loads(p.read_text()) for p in reports.glob("fixture-*.json")]
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["exit_code"], 37 if expected == 37 else -15)
+                for log in reports.glob("*.log"):
+                    self.assertEqual(log.stat().st_size, ci_runner.TAIL_BYTES)
+                    self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_sdk_cleanup_refuses_non_hosted_invocation(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/ci_runner.py"), "prepare"],
+                                env={**os.environ, "GITHUB_ACTIONS": "false"}, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"only for GitHub-hosted Linux CI runners", result.stderr)
+
+
+class RunnerInfrastructurePolicyTests(unittest.TestCase):
+    def test_archive_jobs_prepare_disk_and_validate_before_running_tests(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", workflow.split("\njobs:\n", 1)[1])
+        consumers = [job for job in jobs if "uses: actions/download-artifact@" in job]
+        self.assertTrue(consumers, "the archive consumers must be found")
+        for job in consumers:
+            with self.subTest(job=job.splitlines()[0]):
+                self.assertIn("python3 scripts/ci_runner.py prepare", job)
+                self.assertLess(job.index("ci_runner.py prepare"), job.index("uses: actions/download-artifact@"))
+                self.assertIn("python3 scripts/ci_runner.py extract", job)
+                self.assertNotIn("nextest run --archive-file", job)
+                self.assertIn("--binaries-metadata target/nextest/binaries-metadata.json", job)
+                self.assertIn("if: always()", job)
+                self.assertIn("${{ runner.temp }}/mdk-ci-reports", job)
+
+    def test_producer_archives_carry_integrity_and_expanded_size_manifests(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", workflow.split("\njobs:\n", 1)[1])
+        producers = [job for job in jobs if "cargo nextest archive" in job]
+        self.assertTrue(producers)
+        for job in producers:
+            with self.subTest(job=job.splitlines()[0]):
+                self.assertIn("ci_runner.py prepare", job)
+                self.assertLess(job.index("ci_runner.py prepare"), job.index("uses: Swatinem/rust-cache@"))
+                self.assertIn("ci_runner.py manifest", job)
+                self.assertIn(".tar.zst.manifest.json", job)
+
+    def test_formal_bootstrap_rejects_the_unsupported_distro_maude(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        formal = workflow.split("\n  formal:\n", 1)[1].split("\n  hermes-installer-auth:\n", 1)[0]
+        self.assertNotIn("--no-install-recommends graphviz maude", formal)
+        script = workflow_step("ci.yml", "Install Maude")
+        self.assertIn("Maude3.5.1/Maude-3.5.1-linux-x86_64.zip", script)
+        self.assertLess(script.index("sha256sum"), script.index("unzip"))
+        self.assertIn("maude --version", script)
+
+    def test_corrupt_maude_download_cannot_reach_installation(self):
+        script = workflow_step("ci.yml", "Install Maude")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(["bash", "-c", '''
+curl() { printf 'corrupt transfer' > "$RUNNER_TEMP/maude.zip"; }
+sha256sum() { shasum -a 256 "$@"; }
+''' + script], env={**os.environ, "RUNNER_TEMP": tmp,
+                    "GITHUB_PATH": tmp + "/path", "GITHUB_ENV": tmp + "/env"}, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"checksum", result.stderr)
+            self.assertFalse((Path(tmp) / "maude-3.5.1").exists())
 
 
 if __name__ == "__main__":
