@@ -643,6 +643,7 @@ mod tests {
                         nonce_hex: "nonce".to_owned(),
                         version: "v1".to_owned(),
                         source_epoch: 1,
+                        source_epoch_identity: None,
                         locators: Vec::new(),
                         dim: None,
                         thumbhash: None,

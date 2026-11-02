@@ -461,7 +461,9 @@ impl MarmotApp {
             let payload = encode_inner_event(&event)?;
             for attachment in &request.attachments {
                 attachment.validate(self.allow_loopback_blob_endpoints())?;
-                if attachment.source_epoch != stored_group.epoch.0 {
+                if attachment.source_epoch != stored_group.epoch.0
+                    || attachment.upload_epoch_pin().is_none()
+                {
                     return Err(AppError::MediaReferenceStaleEpoch {
                         source_epoch: attachment.source_epoch,
                         current_epoch: stored_group.epoch.0,

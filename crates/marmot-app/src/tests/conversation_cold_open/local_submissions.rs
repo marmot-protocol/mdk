@@ -952,6 +952,7 @@ fn prepared_media_snapshot_fixture(
             media_type: attachment.media_type.clone(),
             version: "encrypted-media-v2".into(),
             source_epoch: 0,
+            source_epoch_identity: Some(h.upload_epoch_identity.clone()),
             dim: None,
             thumbhash: None,
         })
@@ -1215,6 +1216,71 @@ async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the
                 .is_none()
         );
     }
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_media_snapshot_missing_upload_identity_leaves_admission_and_draft_unchanged() {
+    use crate::local_submissions::LocalDraftAdmission;
+    let h = History::new(0).await;
+    let group = hex::encode(h.group.as_slice());
+    let (revision, mut request) = prepared_media_snapshot_fixture(&h);
+    let store = h.app.account_storage("alice").unwrap();
+    let epoch = cgka_traits::GroupStorage::get_group(&store, &h.group)
+        .unwrap()
+        .epoch
+        .0;
+    assert!(
+        request
+            .attachments
+            .iter()
+            .all(|reference| reference.source_epoch == epoch)
+    );
+    request.attachments[0].source_epoch_identity = None;
+    let draft_before = h.app.selected_message_draft("alice", &group).unwrap();
+    let query = storage_sqlite::TimelineMessageQuery {
+        group_id_hex: Some(group.clone()),
+        ..Default::default()
+    };
+    let timeline_before = h
+        .app
+        .timeline_messages_with_query("alice", query.clone())
+        .unwrap()
+        .messages;
+    let result = h.app.admit_local_message_with_draft_policy_at(
+        "alice",
+        &h.group,
+        "missing-upload-identity".into(),
+        request,
+        Some(LocalDraftAdmission::ConsumeIfCurrent(revision)),
+        None,
+        42,
+    );
+    match result {
+        Err(AppError::MediaReferenceStaleEpoch {
+            source_epoch,
+            current_epoch,
+        }) => assert_eq!((source_epoch, current_epoch), (epoch, epoch)),
+        Err(_) => panic!("missing upload identity returned the wrong admission error"),
+        Ok(_) => panic!("admitted a reference without its upload identity"),
+    }
+    assert!(
+        store
+            .app_storage()
+            .local_submission(&group, "missing-upload-identity")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        h.app
+            .timeline_messages_with_query("alice", query)
+            .unwrap()
+            .messages,
+        timeline_before
+    );
+    let draft_after = h.app.selected_message_draft("alice", &group).unwrap();
+    assert_eq!(draft_after.revision, draft_before.revision);
+    assert_eq!(draft_after.draft, draft_before.draft);
     h.app.close_storage().unwrap();
 }
 

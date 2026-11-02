@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
+  Preserve it when saving an upload reference and sending it back, including
+  custom emoji reactions. Outbound sends refuse a missing identity or a changed
+  upload branch with `InvalidMediaReference`; re-upload retained bytes. The
+  field is local metadata, never written to `imeta`. Received and legacy
+  references remain downloadable. Regenerate bindings with the matching library.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
   first records in the device group that it is leaving, which can take about

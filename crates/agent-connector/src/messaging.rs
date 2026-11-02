@@ -192,6 +192,7 @@ pub(crate) fn media_ref_to_reference(media: AgentControlMediaRef) -> MediaAttach
         media_type: media.media_type,
         version: media.version,
         source_epoch: media.source_epoch,
+        source_epoch_identity: media.source_epoch_identity,
         dim: media.dim,
         thumbhash: media.thumbhash,
     }

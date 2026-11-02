@@ -589,6 +589,9 @@ pub struct AgentControlMediaRef {
     pub nonce_hex: String,
     pub version: String,
     pub source_epoch: u64,
+    /// Local upload branch identity. Absent on received references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch_identity: Option<String>,
     pub locators: Vec<AgentControlMediaLocator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
@@ -2236,6 +2239,7 @@ mod tests {
                         nonce_hex: "0".repeat(24),
                         version: "marmot.encrypted-media.v1".to_owned(),
                         source_epoch: 0,
+                        source_epoch_identity: None,
                         locators: vec![crate::AgentControlMediaLocator {
                             kind: "blossom-v1".to_owned(),
                             value: "https://example.invalid/a".to_owned(),

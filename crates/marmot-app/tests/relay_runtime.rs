@@ -24,11 +24,10 @@ use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditLogSettings, ChatListRow, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
-    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    MissingRelayListKind, NotificationTrigger, NotificationWakeSource, PushPlatform,
-    RetentionSweepStatus, RuntimeMessageUpdate, RuntimeNotificationsSubscription, SelfMembership,
-    SignOutOptions, TimelineMessageQuery, TimelinePagination, UserDirectorySearch,
-    UserProfileMetadata, tag_value,
+    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
+    NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
+    RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
+    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
@@ -9047,47 +9046,46 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
-    // A reference is only sendable in the epoch that encrypted it; the
-    // synthetic references below claim the group's live epoch.
-    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
-    bob.send_media_attachments(
-        &group_id,
-        vec![
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: hex::encode([0x42_u8; 32]),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: Some("800x600".to_owned()),
-                thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
+    // Use real upload provenance: the projection must preserve the uploaded
+    // descriptors without putting their device-local identity on the wire.
+    let blossom = mock_blossom().await;
+    let uploaded = bob
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![
+                    MediaUploadAttachmentRequest {
+                        file_name: "diagram.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"diagram fixture".to_vec(),
+                        dim: Some("800x600".into()),
+                        thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".into()),
+                    },
+                    MediaUploadAttachmentRequest {
+                        file_name: "audio.ogg".into(),
+                        media_type: "audio/ogg".into(),
+                        plaintext: b"audio fixture".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                ],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
             },
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x12_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x12_u8; 32]),
-                plaintext_sha256: hex::encode([0x43_u8; 32]),
-                nonce_hex: hex::encode([0x25_u8; 12]),
-                file_name: "audio.ogg".to_owned(),
-                media_type: "audio/ogg".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: None,
-                thumbhash: None,
-            },
-        ],
-        Some("launch diagram".to_owned()),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
+    let references: Vec<_> = uploaded
+        .attachments
+        .into_iter()
+        .map(|attachment| attachment.reference)
+        .collect();
+    let diagram = references[0].clone();
+    bob.send_media_attachments(&group_id, references, Some("launch diagram".into()))
+        .await
+        .unwrap();
     let media = alice.sync().await.unwrap();
     // Media is a kind-9 chat: content is the caption, attachment is an `imeta`.
     assert_eq!(media.messages[0].plaintext, "launch diagram");
@@ -9099,17 +9097,23 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .collect();
     assert_eq!(imeta_tags.len(), 2);
     let imeta = imeta_tags[0];
-    assert!(imeta.iter().any(|field| field
-        == &format!(
-            "locator blossom-v1 https://media.example/{}.bin",
-            hex::encode([0x11_u8; 32])
-        )));
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == &format!("locator blossom-v1 {}", diagram.locators[0].value))
+    );
     assert!(imeta.iter().any(|field| field == "m image/png"));
     assert!(imeta.iter().any(|field| field == "filename diagram.png"));
     assert!(
         imeta
             .iter()
-            .any(|field| field == "nonce 242424242424242424242424")
+            .any(|field| field == &format!("nonce {}", diagram.nonce_hex))
+    );
+    assert!(imeta.iter().any(|field| field == "dim 800x600"));
+    assert!(
+        imeta
+            .iter()
+            .all(|field| !field.starts_with("source_epoch_identity "))
     );
     assert!(imeta.iter().any(|field| field == "v encrypted-media-v2"));
     assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
@@ -9120,26 +9124,10 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             .any(|field| field == "filename audio.ogg")
     );
 
+    let mut malformed = diagram;
+    malformed.plaintext_sha256 = "not-hex".into();
     let bad_media = bob
-        .send_media_attachments(
-            &group_id,
-            vec![MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: "not-hex".to_owned(),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
-                dim: None,
-                thumbhash: None,
-            }],
-            None,
-        )
+        .send_media_attachments(&group_id, vec![malformed], None)
         .await
         .unwrap_err();
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
