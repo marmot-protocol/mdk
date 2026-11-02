@@ -527,12 +527,41 @@ async fn serve_until_quiet(
 /// is not shut down; it answers the next pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_worker_repair_settles_its_quantum_before_it_answers() {
+    use cgka_traits::storage::GroupStorage;
     let sweeps = Sweeps {
         hold: true,
         ..Sweeps::default()
     };
-    let (_dir, _relay, mut client, storage, _) = client(&sweeps, true).await;
+    let (_dir, _relay, mut client, storage, route) = client(&sweeps, true).await;
     cover_inbox(&client, &storage);
+    // A newly joined copy owes only its standing window before explicit
+    // repair widens it to retention. Cover that window so this test's first
+    // held quantum belongs to the repair, not automatic startup recovery.
+    let current = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|current| current.route == route)
+        .unwrap();
+    let group = cgka_traits::GroupId::new(current.group_id.unwrap());
+    let account_storage = client.app.account_storage(&client.state.label).unwrap();
+    let now = unix_now_seconds();
+    let mut record = account_storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(now));
+    account_storage.put_group(&record).unwrap();
+    for relay in current.required {
+        storage
+            .record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route: &route,
+                    relay: &relay,
+                    since_seconds: now - 15 * 60,
+                    until_seconds: now + DAY,
+                    proof: RecoveryCoverageProof::Comparison,
+                }],
+                now,
+            )
+            .unwrap();
+    }
     let mut spawned = client.spawn_recovery_runner().await.unwrap();
     assert_eq!(
         serve_until_quiet(&mut client, &mut spawned, &sweeps).await,
