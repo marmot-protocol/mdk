@@ -324,6 +324,170 @@ async fn a_sibling_welcome_fails_with_its_commit() {
     assert_eq!(states, vec![MessageState::Failed; 2]);
 }
 
+/// A losing Add can still be selected again. A reopen keeps its Welcome
+/// held, without publishing it or permanently retiring it from a lost event.
+#[tokio::test]
+async fn a_losing_sibling_add_holds_its_welcome_across_restart() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let rival = send_commit(
+        &mut m.alice,
+        SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("selected branch".into()),
+            description: None,
+        },
+        &gid,
+    )
+    .await;
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    let own = send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    assert!(m.bob.engine.carry_sibling_welcome(&id, b"carrier").unwrap());
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    m.bob = super::device_roster::roster_device_on(storage, b"bob");
+    assert!(
+        owed(&m.bob).is_empty(),
+        "unhydrated state holds rather than withdraws"
+    );
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    m.bob.engine.hydrate_all_stored_groups().unwrap();
+    assert_eq!(owed(&m.bob)[0].carrier.as_deref(), Some(&b"carrier"[..]));
+    m.bob.engine.ingest(rival).await.unwrap();
+    m.bob
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        m.bob.engine.stored_message_state(&own.id).unwrap(),
+        Some(MessageState::ConvergenceDeferred)
+    );
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
+    assert!(
+        bob.engine
+            .sibling_welcome_delivered(&id, b"carrier")
+            .unwrap()
+    );
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Processed
+    );
+}
+
+/// Missing evidence and an unsettled chat hold new delivery. Proven terminal
+/// invalidation retires the row durably, even if the origin later reads live.
+#[tokio::test]
+async fn sibling_welcome_origin_unknown_and_settling_hold_but_terminal_retires_after_reopen() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin: cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(origin),
+        ..
+    } = StoredMessagePayload::decode(&m.bob.storage.get_message(&id).unwrap().payload).unwrap()
+    else {
+        panic!("expected a confirmed Add origin");
+    };
+    let commit = m.bob.storage.get_message(&origin).unwrap();
+    m.bob.storage.delete_message(&origin).unwrap();
+    assert!(owed(&m.bob).is_empty());
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    m.bob = super::device_roster::roster_device_on(storage, b"bob");
+    m.bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(!m.bob.engine.carry_sibling_welcome(&id, b"unknown").unwrap());
+    m.bob.storage.put_message(&commit).unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    let SendResult::GroupEvolution { pending, .. } = m
+        .bob
+        .engine
+        .send(SendIntent::SelfUpdate { group_id: gid })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a pending Commit");
+    };
+    assert!(owed(&m.bob).is_empty());
+    assert!(
+        !m.bob
+            .engine
+            .carry_sibling_welcome(&id, b"settling")
+            .unwrap()
+    );
+    m.bob.engine.publish_failed(pending).await.unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    m.bob
+        .storage
+        .update_message_state(&origin, MessageState::EpochInvalidated)
+        .unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    bob.storage.put_message(&commit).unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"retired").unwrap());
+}
+
+/// Development binaries once discarded an outbound Welcome's origin. Such
+/// persisted rows cannot guess that their Add remains selected after upgrade.
+#[tokio::test]
+async fn an_unproven_development_sibling_welcome_is_not_handed_off_after_reopen() {
+    use cgka_traits::message::SiblingWelcomeOrigin;
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    let mut record = m.bob.storage.get_message(&id).unwrap();
+    let mut legacy = StoredMessagePayload::decode(&record.payload).unwrap();
+    let StoredMessagePayload::OutboundSiblingWelcome { origin, .. } = &mut legacy else {
+        panic!("one outbound sibling Welcome");
+    };
+    *origin = SiblingWelcomeOrigin::LegacyUnproven;
+    record.payload = legacy.encode().unwrap();
+    m.bob.storage.put_message(&record).unwrap();
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
+}
+
 /// Each sibling Add the sender cannot back with a sibling Welcome is refused
 /// before anything is written: the chat's rows, record and epoch stay as they
 /// were, and no Commit is left staged, so a valid Add still goes through.

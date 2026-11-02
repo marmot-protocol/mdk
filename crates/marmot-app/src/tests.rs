@@ -22,6 +22,7 @@ mod message_journeys;
 mod multi_device_members;
 #[cfg(feature = "product-analytics-export")]
 mod observed_operations;
+mod offline_queued_sends;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
@@ -573,6 +574,9 @@ pub(crate) struct ScriptedPushRelayClient {
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
+    /// Fail every publish as a send that may have reached the relay, as a
+    /// stale socket does once the device drops offline (mdk#2762).
+    fail_publish_possibly_exposed: std::sync::atomic::AtomicBool,
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
@@ -1012,9 +1016,18 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn allow_publishes(&self) {
+    pub(crate) fn allow_publishes(&self) {
         self.fail_publish_unavailable
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.fail_publish_possibly_exposed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail every publish as possibly exposed: the frame left the device but
+    /// no relay acknowledgement arrived (mdk#2762).
+    pub(crate) fn fail_publishes_as_possibly_exposed(&self) {
+        self.fail_publish_possibly_exposed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fail single-endpoint publishes to these relays as unavailable.
@@ -1452,6 +1465,26 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                             endpoint,
                             reason: "relay unavailable".into(),
                             kind: cgka_traits::TransportEndpointFailureKind::RetryableUnavailable,
+                            rejection_category: None,
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        if self
+            .fail_publish_possibly_exposed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                    "send event timed out",
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            endpoint,
+                            reason: "send event timed out".into(),
+                            kind: cgka_traits::TransportEndpointFailureKind::PossiblyExposed,
                             rejection_category: None,
                         })
                         .collect(),

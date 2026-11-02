@@ -120,7 +120,8 @@ pub(crate) use sync::ScriptedComparisons;
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
-    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
+    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, RetainedSendWake,
+    SyncMode,
 };
 #[cfg(test)]
 pub(crate) use sync::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
