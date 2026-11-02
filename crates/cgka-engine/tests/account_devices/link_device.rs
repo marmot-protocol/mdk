@@ -255,6 +255,22 @@ async fn a_refused_link_leaves_the_group_as_it_was() {
         );
     }
 
+    let before = super::send_intents::Untouched::of(&phone, &gid);
+    let malformed = phone
+        .engine
+        .send(SendIntent::LinkDevice {
+            group_id: gid.clone(),
+            key_package: key_package.clone(),
+            roster_update: vec![],
+            deliver_until: NO_WELCOME_DEADLINE,
+        })
+        .await;
+    assert!(
+        matches!(&malformed, Err(EngineError::Serialize(message)) if message.starts_with("invalid device roster update: ")),
+        "{malformed:?}"
+    );
+    assert_eq!(super::send_intents::Untouched::of(&phone, &gid), before);
+
     // The KeyPackage is this account's, and not a device already here.
     let mut bob = roster_device(b"bob");
     let bobs = bob.engine.fresh_key_package().await.unwrap();
@@ -387,7 +403,15 @@ async fn a_link_needs_a_device_group() {
             vec![removed_slot(3, Some(vec![0x44; 32]))],
         ))
         .await;
-    for refused in [refused, refused_record] {
+    let refused_unlink = alice
+        .engine
+        .send(unlink(
+            &gid,
+            vec![0x44; 32],
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(3))],
+        ))
+        .await;
+    for refused in [refused, refused_record, refused_unlink] {
         assert!(
             matches!(
                 &refused,
@@ -1004,6 +1028,20 @@ async fn a_refused_unlink_leaves_the_group_as_it_was() {
     let remove = |n: u8| DeviceRosterOperationV1::RemoveDevice(slot(n));
     let epoch = phone.engine.epoch(&gid).unwrap();
     let held = roster_of(&phone, &gid);
+    let before = super::send_intents::Untouched::of(&phone, &gid);
+    let malformed = phone
+        .engine
+        .send(SendIntent::UnlinkDevice {
+            group_id: gid.clone(),
+            leaf_signature_key: tablet_key.clone(),
+            roster_update: vec![],
+        })
+        .await;
+    assert!(
+        matches!(&malformed, Err(EngineError::Serialize(message)) if message.starts_with("invalid device roster update: ")),
+        "{malformed:?}"
+    );
+    assert_eq!(super::send_intents::Untouched::of(&phone, &gid), before);
 
     let cases = [
         (
@@ -1193,8 +1231,12 @@ async fn a_lone_removed_record_is_checked_and_never_queued() {
     assert_accepted(&mut laptop, &commit, &gid).await;
     for device in [&phone, &laptop] {
         assert_eq!(
-            roster_of(device, &gid).rejected_slots[&slot(3)].reason,
-            RejectedSlotReasonV1::Removed
+            roster_of(device, &gid).rejected_slots[&slot(3)],
+            RejectedSlotV1 {
+                reason: RejectedSlotReasonV1::Removed,
+                rejected_at: 7,
+                tag_signature_key: key(),
+            }
         );
     }
 }

@@ -69,7 +69,7 @@ pub(super) fn roster_device_with_peeler(
 }
 
 /// [`roster_device`] on a manual convergence clock.
-fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
+pub(super) fn clocked_roster_device(account: &[u8], clock: &ManualConvergenceClock) -> Device {
     build_roster_device(
         SqliteAccountStorage::in_memory_for_test().unwrap(),
         account,
@@ -485,6 +485,7 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
     };
     let exactly_one = "adds exactly one device and sets its roster entry";
     let needs_founding_add = "a founding roster update needs a device group's founding Add";
+    let announcement = "a device group's Commit that adds a device sets its roster entry, for a new slot, announcing the added KeyPackage";
     let refusals = [
         (
             "no roster update",
@@ -530,19 +531,19 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
                 ),
                 DeviceRosterOperationV1::SetDevice(slot(3), entry("Tablet")),
             ])),
-            "",
+            "invalid link roster update: it must set exactly one device entry",
         ),
         (
             "a slot the founding roster lists",
             device_group_request(&full, vec![key_package.clone()]),
             Some(sets_laptop(&key_package)),
-            "",
+            announcement,
         ),
         (
             "another KeyPackage announced",
             device_group_request(&founding, vec![key_package.clone()]),
             Some(sets_laptop(&other_key_package)),
-            "",
+            announcement,
         ),
     ];
     for (case, request, roster_update, error) in refusals {
@@ -556,11 +557,25 @@ async fn a_device_groups_founding_add_sets_exactly_its_one_devices_entry() {
                 None,
             )
             .await
-            .expect_err(case)
-            .to_string();
-        assert!(refused.contains(error), "{case}: {refused}");
+            .expect_err(case);
+        if error == announcement {
+            assert!(
+                matches!(&refused, EngineError::InvalidTransition(transition)
+                if transition.from == "DeviceGroup" && transition.to == "Commit"
+                    && transition.reason == announcement),
+                "{case}: {refused:?}"
+            );
+        } else {
+            assert!(
+                matches!(&refused, EngineError::Other(message) if message.contains(error)),
+                "{case}: {refused:?}"
+            );
+        }
         assert!(
-            phone.storage.get_group(&chosen).is_err(),
+            matches!(
+                phone.storage.get_group(&chosen),
+                Err(cgka_traits::storage::StorageError::NotFound)
+            ),
             "{case}: no group record"
         );
         assert!(

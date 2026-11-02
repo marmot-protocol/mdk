@@ -29,7 +29,7 @@ use cgka_engine::commit_class::{CommitAuthorityError, CommitClass, authorize_sta
 use cgka_engine::convergence::BranchSelectionTrace;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
-use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder, ManualConvergenceClock};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
@@ -328,17 +328,39 @@ fn device_with_peeler(
 /// [`device`] advertising `extra` components beside the defaults.
 fn device_advertising(account: &[u8], extra: &[u16], peeler: Box<dyn TransportPeeler>) -> Device {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    build_device(storage, account, extra, peeler, None)
+}
+
+fn manual_convergence_clock() -> ManualConvergenceClock {
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    ManualConvergenceClock::new(1_000, wall_ms)
+}
+
+fn build_device(
+    storage: SqliteAccountStorage,
+    account: &[u8],
+    extra: &[u16],
+    peeler: Box<dyn TransportPeeler>,
+    clock: Option<&ManualConvergenceClock>,
+) -> Device {
     let mut supported: Vec<_> = default_group_components().into_iter().collect();
     supported.extend(extra.iter().copied());
-    let engine = EngineBuilder::new(storage.clone())
+    let mut builder = EngineBuilder::new(storage.clone())
         .identity(pad32(account))
         .account_identity_proof_signer(proof_signer(account))
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .peeler(peeler)
-        .build()
-        .unwrap();
+        .peeler(peeler);
+    if let Some(clock) = clock {
+        builder = builder.convergence_clock(std::sync::Arc::new(clock.clone()));
+    }
+    let engine = builder.build().unwrap();
     Device { engine, storage }
 }
 
@@ -349,6 +371,73 @@ fn route_to_group(msg: &TransportMessage, gid: &GroupId) -> TransportMessage {
         },
         ..msg.clone()
     }
+}
+
+#[test]
+fn a_stored_history_key_from_another_suite_is_refused_without_replacement() {
+    use cgka_traits::storage::{AccountDeviceHistoryKey, AccountDeviceHistoryKeyStorage as _};
+    use openmls_traits::types::Ciphersuite;
+    let device = device(b"alice", true);
+    let crypto = RustCrypto::default();
+    let other_suite = Ciphersuite::try_from(3u16).unwrap();
+    assert_ne!(other_suite, DEFAULT_CIPHERSUITE);
+    let pair = cgka_engine::history_key::generate_history_key_pair(&crypto, other_suite).unwrap();
+    let key = AccountDeviceHistoryKey {
+        marmot_identity: device.engine.self_id(),
+        ciphersuite: u16::from(other_suite),
+        public_key: pair.public,
+        private_key: pair.private.to_vec().into(),
+    };
+    device
+        .storage
+        .put_account_device_history_key_if_absent(&key)
+        .unwrap();
+    let sealed = cgka_engine::history_key::seal_history(
+        &crypto,
+        other_suite,
+        &key.public_key,
+        b"history offer",
+        b"bundle key",
+    )
+    .unwrap();
+    assert_eq!(
+        cgka_engine::history_key::open_history(
+            &crypto,
+            other_suite,
+            &key.private_key,
+            b"history offer",
+            &sealed,
+        ),
+        Some(b"bundle key".to_vec()),
+        "the stored pair and ciphertext are valid under their own suite"
+    );
+    let wrong_suite = |error: EngineError| {
+        assert!(
+            matches!(error, EngineError::UnsupportedCiphersuite { got, required }
+            if got == 3 && required == 1)
+        );
+    };
+    wrong_suite(
+        device
+            .engine
+            .history_public_key()
+            .expect_err("wrong-suite public key is not advertised"),
+    );
+    wrong_suite(
+        device
+            .engine
+            .open_history(b"history offer", &sealed)
+            .expect_err("wrong-suite private key is not used"),
+    );
+    let retained = device
+        .storage
+        .account_device_history_key(&device.engine.self_id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        retained == key,
+        "a refused read must preserve the complete stored key"
+    );
 }
 
 fn required(engine: &Engine<SqliteAccountStorage>, gid: &GroupId) -> AppComponentSet {
@@ -488,11 +577,28 @@ async fn assert_accepted(
     commit: &TransportMessage,
     gid: &GroupId,
 ) -> CanonicalizationResult {
+    assert_accepted_with_clock(receiver, commit, gid, None).await
+}
+
+async fn assert_accepted_with_clock(
+    receiver: &mut Device,
+    commit: &TransportMessage,
+    gid: &GroupId,
+    clock: Option<&ManualConvergenceClock>,
+) -> CanonicalizationResult {
     let before = receiver.engine.epoch(gid).unwrap().0;
     receiver.engine.ingest(commit.clone()).await.unwrap();
+    let cutoff = if let Some(clock) = clock {
+        // Keep a controlled receiver's public clock coherent with the same
+        // explicit full-settlement boundary the ordinary fixture uses.
+        clock.advance_ms(1_000_000);
+        cgka_engine::ConvergenceClock::now(clock).monotonic_ms
+    } else {
+        1_000_000
+    };
     let result = receiver
         .engine
-        .converge_stored_openmls_messages_at(gid, 1_000_000)
+        .converge_stored_openmls_messages_at(gid, cutoff)
         .unwrap();
     assert_eq!(
         result.accepted_commits,
@@ -544,6 +650,34 @@ fn assert_refused(result: Result<SendResult, EngineError>, reason: &str) {
         error.to_string().contains(reason),
         "expected {reason:?}, got: {error}"
     );
+}
+
+fn assert_serialize_error<T: std::fmt::Debug>(result: Result<T, EngineError>, expected: &str) {
+    let error = result.expect_err("the encoding is refused");
+    assert!(
+        matches!(&error, EngineError::Serialize(message) if message == expected),
+        "{error:?}"
+    );
+}
+
+fn assert_other_error<T: std::fmt::Debug>(result: Result<T, EngineError>, expected: &str) {
+    let error = result.expect_err("the operation is refused");
+    assert!(
+        matches!(&error, EngineError::Other(message) if message == expected),
+        "{error:?}"
+    );
+}
+
+fn assert_missing_account_devices(result: Result<SendResult, EngineError>) {
+    let Err(EngineError::MissingRequiredCapabilities { required, had }) = result else {
+        panic!("expected missing account-devices support: {result:?}")
+    };
+    assert!(
+        required
+            .app_components
+            .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+    );
+    assert!(!had.app_components.contains(ACCOUNT_DEVICES_COMPONENT_ID));
 }
 
 /// The refusal of a same-account intent in a group that does not require
@@ -1091,7 +1225,7 @@ async fn account_devices_data_is_unknown_data_before_activation() {
     );
     let outcome = bob.engine.ingest(proposal).await.unwrap();
     assert!(
-        !matches!(outcome, IngestOutcome::Rejected { .. }),
+        matches!(outcome, IngestOutcome::Processed),
         "unexpected rejection: {outcome:?}"
     );
 }
@@ -1131,12 +1265,9 @@ async fn activation_and_adds_need_every_leaf_to_advertise_account_devices() {
 
     // Committer: bob's leaf does not advertise 0x800d.
     let ids = with_account_devices(required(&alice.engine, &gid));
-    assert!(
-        alice
-            .engine
-            .send(update_required(&gid, &ids))
-            .await
-            .is_err()
+    assert_other_error(
+        alice.engine.send(update_required(&gid, &ids)).await,
+        "invalid current-profile resulting state: member lacks a required app component",
     );
 
     // Receiver: the same activation, crafted.
@@ -1159,7 +1290,7 @@ async fn activation_and_adds_need_every_leaf_to_advertise_account_devices() {
 
     let mut dave = device(b"dave", false);
     let dave_kp = dave.engine.fresh_key_package().await.unwrap();
-    assert!(
+    assert_missing_account_devices(
         alice
             .engine
             .send(SendIntent::Invite {
@@ -1167,8 +1298,7 @@ async fn activation_and_adds_need_every_leaf_to_advertise_account_devices() {
                 key_packages: vec![dave_kp.clone()],
                 initial_admins: vec![],
             })
-            .await
-            .is_err()
+            .await,
     );
     let crafted = crafted_commit(&alice, &gid, vec![dave_kp], vec![], None);
     assert_rejected_on_replay(&mut carol, &crafted, &gid).await;
@@ -1755,8 +1885,18 @@ struct Members {
 }
 
 async fn members(require: bool) -> Members {
-    let mut alice = device(b"alice", true);
-    let mut bob = device(b"bob", true);
+    members_with_alice(require, device(b"alice", true)).await
+}
+
+async fn members_with_alice(require: bool, alice: Device) -> Members {
+    members_with_initial_devices(require, alice, device(b"bob", true)).await
+}
+
+async fn members_with_initial_devices(
+    require: bool,
+    mut alice: Device,
+    mut bob: Device,
+) -> Members {
     let mut bob_sibling = device(b"bob", true);
     let mut carol = device(b"carol", true);
     let key_packages = vec![
@@ -2009,7 +2149,7 @@ async fn a_non_admin_cannot_commit_anything_beside_its_own_accounts_leaves() {
     let proposal = standalone_add(&m.alice, &gid, &bob_kp);
     let outcome = m.carol.engine.ingest(proposal.clone()).await.unwrap();
     assert!(
-        !matches!(outcome, IngestOutcome::Rejected { .. }),
+        matches!(outcome, IngestOutcome::Processed),
         "an admin's Add proposal is admitted: {outcome:?}"
     );
     let (verdict, by_reference) = craft(
@@ -2116,7 +2256,23 @@ async fn without_account_devices_own_account_commits_need_an_admin() {
 /// one each receiver's replay derives from the same parent.
 #[tokio::test]
 async fn the_stamp_and_replay_give_every_class_the_same_priority() {
-    let mut m = members(true).await;
+    let clock = manual_convergence_clock();
+    let bob_clock = manual_convergence_clock();
+    let alice = build_device(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        b"alice",
+        &[ACCOUNT_DEVICES_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+        Some(&clock),
+    );
+    let bob = build_device(
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        b"bob",
+        &[ACCOUNT_DEVICES_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+        Some(&bob_clock),
+    );
+    let mut m = members_with_initial_devices(true, alice, bob).await;
     let gid = m.gid.clone();
 
     // Self-update.
@@ -2128,10 +2284,14 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
         &gid,
     )
     .await;
-    assert_priorities(
+    assert_priorities_with_clocks(
         &m.carol,
         &commit,
-        &mut [&mut m.alice, &mut m.bob, &mut m.bob_sibling],
+        &mut [
+            (&mut m.alice, None),
+            (&mut m.bob, Some(&bob_clock)),
+            (&mut m.bob_sibling, None),
+        ],
         &gid,
         CommitOrderingPriority::Ordinary,
     )
@@ -2149,10 +2309,14 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
         &gid,
     )
     .await;
-    assert_priorities(
+    assert_priorities_with_clocks(
         &m.alice,
         &commit,
-        &mut [&mut m.bob, &mut m.bob_sibling, &mut m.carol],
+        &mut [
+            (&mut m.bob, Some(&bob_clock)),
+            (&mut m.bob_sibling, None),
+            (&mut m.carol, None),
+        ],
         &gid,
         CommitOrderingPriority::Ordinary,
     )
@@ -2174,10 +2338,14 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
         &gid,
     )
     .await;
-    assert_priorities(
+    assert_priorities_with_clocks(
         &m.alice,
         &commit,
-        &mut [&mut m.bob, &mut m.bob_sibling, &mut m.carol],
+        &mut [
+            (&mut m.bob, Some(&bob_clock)),
+            (&mut m.bob_sibling, None),
+            (&mut m.carol, None),
+        ],
         &gid,
         CommitOrderingPriority::Privileged,
     )
@@ -2197,7 +2365,7 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
     };
     let leave = route_to_group(&msg, &gid);
     m.alice.engine.ingest(leave.clone()).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(75);
     assert!(
         m.alice
             .engine
@@ -2216,22 +2384,34 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
         .unwrap();
     let commit = route_to_group(&publication.msg, &gid);
     m.bob.engine.ingest(leave).await.unwrap();
-    assert_priorities(
+    assert_priorities_with_clocks(
         &m.alice,
         &commit,
-        &mut [&mut m.bob],
+        &mut [(&mut m.bob, Some(&bob_clock))],
         &gid,
         CommitOrderingPriority::Ordinary,
     )
     .await;
 
+    // Bob also scheduled Carol's leave. The peer's confirmed commit has
+    // advanced his epoch, so the now-due old schedule retires quietly.
+    let before = send_intents::Untouched::of(&m.bob, &gid);
+    bob_clock.advance_ms(75);
+    let retired = m.bob.engine.advance_convergence(&gid).await;
+    assert!(
+        matches!(&retired, Ok(ready) if ready.is_empty()),
+        "a stale SelfRemove schedule must retire without failing public advance: {retired:?}"
+    );
+    assert!(m.bob.engine.drain_auto_publish().is_empty());
+    assert_eq!(send_intents::Untouched::of(&m.bob, &gid), before);
+
     // Same-account, by a non-admin: bob removes his other device.
     let sibling = signature_key(&m.bob_sibling, &gid);
     let commit = send_commit(&mut m.bob, remove_own_devices(&gid, vec![sibling]), &gid).await;
-    assert_priorities(
+    assert_priorities_with_clocks(
         &m.bob,
         &commit,
-        &mut [&mut m.alice],
+        &mut [(&mut m.alice, None)],
         &gid,
         CommitOrderingPriority::Ordinary,
     )
@@ -2248,6 +2428,20 @@ async fn assert_priorities(
     assert_eq!(stamped_priority(committer, commit), expected);
     for receiver in receivers.iter_mut() {
         let result = assert_accepted(receiver, commit, gid).await;
+        assert_eq!(traced_priority(&result, commit), expected);
+    }
+}
+
+async fn assert_priorities_with_clocks(
+    committer: &Device,
+    commit: &TransportMessage,
+    receivers: &mut [(&mut Device, Option<&ManualConvergenceClock>)],
+    gid: &GroupId,
+    expected: CommitOrderingPriority,
+) {
+    assert_eq!(stamped_priority(committer, commit), expected);
+    for (receiver, clock) in receivers.iter_mut() {
+        let result = assert_accepted_with_clock(receiver, commit, gid, *clock).await;
         assert_eq!(traced_priority(&result, commit), expected);
     }
 }
