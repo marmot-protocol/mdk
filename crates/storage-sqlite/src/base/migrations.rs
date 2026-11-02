@@ -323,8 +323,6 @@ mod migration_0164_backup_ledger;
 mod migration_0165_drop_announced_key_packages;
 #[path = "migrations/0166_blossom_history_deliveries.rs"]
 mod migration_0166_blossom_history_deliveries;
-#[path = "migrations/0171_device_edit_settings.rs"]
-mod migration_0171_device_edit_settings;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -341,6 +339,11 @@ pub(crate) struct Migration {
     pub(crate) suspend_foreign_keys: &'static [&'static str],
     pub(crate) apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
+
+#[path = "migrations/0167_reaction_attachment_sources.rs"]
+mod migration_0167_reaction_attachment_sources;
+#[path = "migrations/0171_device_edit_settings.rs"]
+mod migration_0171_device_edit_settings;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1281,6 +1284,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0166_blossom_history_deliveries",
         suspend_foreign_keys: &[],
         apply: migration_0166_blossom_history_deliveries::apply,
+    },
+    Migration {
+        version: 167,
+        name: "0167_reaction_attachment_sources",
+        suspend_foreign_keys: &[],
+        apply: migration_0167_reaction_attachment_sources::apply,
     },
     Migration {
         version: 171,

@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-10-21
+updated: 2026-11-02
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -1279,7 +1279,21 @@ Metadata notes:
 
 ### `message_state_changed`
 
-Emitted when a stored message is inserted or changes `MessageState`.
+Emitted after the storage unit that inserted a stored message or changed its `MessageState` commits. A successful
+inner write or nested transaction is not a commit: the owning outer transaction or savepoint may still undo it.
+Rolled-back state transitions are omitted; operation entry and error observations remain available. Several
+transitions within one committed unit can be appended together, so each row describes a transition in that unit,
+not a snapshot of the latest stored state.
+
+The engine uses `StorageProvider::after_commit`; SQLite releases these observations after the outermost commit and
+discards them on rollback, failed commit, or an abandoned savepoint. The optional hook defaults to dropping its
+callback: a backend or wrapper without the complete boundary contract omits these positive state rows rather than
+claiming tentative writes committed. Recording remains best effort, and a crash or recorder failure after a database
+commit can leave no row. Absence is never proof that no storage transition happened. Context is captured at the
+transition; sequence and recording timestamps are assigned when the recorder actually appends it.
+
+Historical rows from producers predating mdk#2877 can include writes that later rolled back. The wire shape is
+unchanged; without reliable producer provenance, an older row alone does not establish commit-aware emission.
 
 | Field | Meaning |
 | --- | --- |

@@ -1,5 +1,5 @@
 //! Local attachment discovery and opaque process-local cursor/version ownership.
-use crate::commands::{deliver, try_arg};
+use crate::commands::{deliver, deliver_opt, try_arg};
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{
     CFree, boxed, boxed_opt, free_boxed, free_guard, free_vec, owned_vec, required_str,
@@ -34,7 +34,8 @@ impl CFree for MarmotAttachmentHistoryVersion {
 c_enum! { MarmotAttachmentCategory from AttachmentCategoryFfi { Image, Video, Audio, File, Rejected, } }
 c_enum! { MarmotAttachmentRole from AttachmentRoleFfi { Shared, InlineEmoji, } }
 c_enum! { MarmotAttachmentHistoryChange from AttachmentHistoryChangeFfi { Unchanged, Additions, RestartRequired, } }
-c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
+c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi,
+free marmot_attachment_entry_free {
     str message_id_hex,
     str source_message_id_hex,
     str sender,
@@ -45,6 +46,34 @@ c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
     copy role: MarmotAttachmentRole,
     rec attachment: MarmotMediaAttachmentOutcome,
 } }
+/// Resolve one active custom-emoji reaction's encrypted artwork without network work.
+/// Writes NULL with MARMOT_STATUS_OK when no eligible matching artwork is available.
+/// Use the returned original source slot with attachment acquisition and local reads.
+/// Free a non-NULL result with marmot_attachment_entry_free. Blocking: call off the UI thread.
+/// # Safety
+/// Client and strings must be live; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_reaction_attachment(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    reaction_message_id_hex: *const c_char,
+    out: *mut *mut MarmotAttachmentEntry,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let reaction = try_arg!(unsafe { required_str(reaction_message_id_hex) });
+        unsafe {
+            deliver_opt(
+                client.block_on(client.marmot.reaction_attachment(account, group, reaction)),
+                out,
+            )
+        }
+    })
+}
 /// All fields, including opaque handles, are owned by this page's result.
 /// Keep that result live while borrowing its cursor/version; do not free fields separately.
 #[repr(C)]
@@ -252,6 +281,59 @@ mod tests {
             Ok(())
         }
     }
+    // A real upload supplies the local provenance that an outbound reference needs.
+    async fn upload_sink() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let base = url.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let base = base.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    let end = loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                        if let Some(end) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    assert!(headers.starts_with("PUT /upload "));
+                    let header = |name: &str| {
+                        headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                            .unwrap()
+                            .1
+                            .trim()
+                            .to_owned()
+                    };
+                    let len: usize = header("content-length").parse().unwrap();
+                    let hash = header("x-sha-256");
+                    while request.len() < end + len {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let body = serde_json::json!({"url": format!("{base}/{hash}"), "sha256": hash,
+                        "size": len, "type": "application/octet-stream", "uploaded": 1})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (url, task)
+    }
     /// C results preserve slot metadata while page and cloned-version ownership remain independent.
     #[test]
     fn attachment_c_handles_preflight_borrowing_and_deep_free() {
@@ -269,7 +351,7 @@ mod tests {
         let kit = Marmot::new_with_options(
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
-            marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
             Some(Arc::new(Store::default())),
             marmot_uniffi::marmot_deployment_white_noise(),
         )
@@ -294,26 +376,45 @@ mod tests {
                 None,
             ))
             .unwrap();
-        let reference = MediaAttachmentReferenceFfi {
-            locators: vec![MediaLocatorFfi {
-                kind: "blossom-v1".into(),
-                value: format!("https://media.example/{}.bin", "11".repeat(32)),
-            }],
-            ciphertext_sha256: "11".repeat(32),
-            plaintext_sha256: "22".repeat(32),
-            nonce_hex: "33".repeat(12),
-            file_name: "image.png".into(),
-            media_type: "image/png".into(),
-            version: EncryptedMediaVersionFfi::V2,
-            source_epoch: 0,
-            dim: None,
-            thumbhash: None,
-        };
-        client
+        let (server, upload_task) = client.block_on(upload_sink());
+        let uploaded = client
+            .block_on(client.marmot.upload_media(
+                account.clone(),
+                group.clone(),
+                MediaUploadRequestFfi {
+                    attachments: vec![MediaUploadAttachmentRequestFfi {
+                        file_name: "image.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"C attachment fixture".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    }],
+                    caption: None,
+                    send: false,
+                    blossom_server: Some(server),
+                    message_tags: Vec::new(),
+                },
+            ))
+            .unwrap();
+        let reference = uploaded.attachments.into_iter().next().unwrap().reference;
+        assert!(
+            reference.source_epoch_identity.is_some(),
+            "upload must carry local provenance"
+        );
+        // Exercise the C input conversion and deep free with a populated identity.
+        let mut mirrored =
+            crate::types::media::MarmotMediaAttachmentReference::from(reference.clone());
+        let restored = unsafe { mirrored.to_ffi() }.unwrap();
+        assert_eq!(
+            restored.source_epoch_identity,
+            reference.source_epoch_identity
+        );
+        unsafe { mirrored.free_in_place() };
+        let sent = client
             .block_on(client.marmot.send_media_attachments(
                 account.clone(),
                 group.clone(),
-                vec![reference.clone(), reference],
+                vec![reference.clone(), reference.clone()],
                 None,
             ))
             .unwrap();
@@ -422,6 +523,43 @@ mod tests {
         let account = CString::new(account).unwrap();
         let group = CString::new(group).unwrap();
         unsafe {
+            let reaction = CString::new("aa".repeat(32)).unwrap();
+            let mut artwork = ptr::dangling_mut();
+            assert_eq!(
+                marmot_reaction_attachment(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    ptr::null(),
+                    &mut artwork,
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert!(artwork.is_null());
+            assert_eq!(
+                marmot_reaction_attachment(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    reaction.as_ptr(),
+                    ptr::null_mut(),
+                ),
+                MarmotStatus::NullPointer
+            );
+            // An unknown reaction has no standalone result or image allocation.
+            artwork = ptr::dangling_mut();
+            assert_eq!(
+                marmot_reaction_attachment(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    reaction.as_ptr(),
+                    &mut artwork,
+                ),
+                MarmotStatus::Ok
+            );
+            assert!(artwork.is_null());
+            marmot_attachment_entry_free(artwork);
             assert_eq!(
                 marmot_attachment_history_page(
                     &client,
@@ -536,6 +674,49 @@ mod tests {
             ] {
                 marmot_attachment_page_read_free(boxed(MarmotAttachmentPageRead::from(result)));
             }
+            // Exercise a non-NULL standalone result through both binding layers.
+            let reacted = client
+                .block_on(client.marmot.react_with_media(
+                    account.to_str().unwrap().into(),
+                    group.to_str().unwrap().into(),
+                    sent.message_ids[0].clone(),
+                    ":c_art:".into(),
+                    vec![vec![
+                        "emoji".into(),
+                        "c_art".into(),
+                        reference.locators[0].value.clone(),
+                    ]],
+                    vec![reference],
+                ))
+                .unwrap();
+            let reaction = CString::new(reacted.message_ids[0].clone()).unwrap();
+            let mut artwork = ptr::null_mut();
+            assert_eq!(
+                marmot_reaction_attachment(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    reaction.as_ptr(),
+                    &mut artwork,
+                ),
+                MarmotStatus::Ok
+            );
+            assert!(!artwork.is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*artwork).message_id_hex)
+                    .to_str()
+                    .unwrap(),
+                reacted.message_ids[0]
+            );
+            assert_eq!((*artwork).role, MarmotAttachmentRole::InlineEmoji);
+            assert!(matches!(
+                (*artwork).attachment,
+                MarmotMediaAttachmentOutcome::Accepted {
+                    attachment_index: 0,
+                    ..
+                }
+            ));
+            marmot_attachment_entry_free(artwork);
             let rejected = MarmotAttachmentEntry::from(AttachmentEntryFfi {
                 message_id_hex: "m".into(),
                 source_message_id_hex: "s".into(),
@@ -553,8 +734,9 @@ mod tests {
                     },
                 },
             });
-            free_boxed(boxed(rejected));
+            marmot_attachment_entry_free(boxed(rejected));
         }
+        upload_task.abort();
         client.block_on(client.marmot.shutdown_and_close()).unwrap();
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);

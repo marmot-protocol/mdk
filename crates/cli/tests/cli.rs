@@ -9718,11 +9718,25 @@ fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoc
     assert_eq!(rows[1]["file_name"], "second.txt");
     assert_eq!(rows[1]["source_epoch"], source_epoch);
 
-    // A projected attachment can be re-sent by plaintext hash while the group
-    // is still in the epoch that encrypted it.
-    let forwarded = run_json(
+    // Projected wire metadata has no upload provenance even at the same epoch.
+    // Retaining the original upload JSON preserves that local identity.
+    let unknown_by_hash = run_json_error(
         home.path(),
         &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(unknown_by_hash["code"], "media_reference_stale_epoch");
+    assert_eq!(unknown_by_hash["source_epoch"], source_epoch);
+    assert_eq!(unknown_by_hash["current_epoch"], source_epoch);
+    let forwarded = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &first_reference,
+        ],
     );
     assert_eq!(forwarded["published"], 1);
     assert_eq!(forwarded["attachments"][0]["plaintext_sha256"], first_hash);
@@ -9775,8 +9789,7 @@ fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoc
     assert_eq!(media_message_ids.len(), 2, "{after}");
 
     // The documented repair: upload the same file again at the current epoch
-    // and send that reference. Only projected messages are visible to the hash
-    // lookup, so the fresh upload goes out by its `media` JSON object first.
+    // and send its complete JSON reference, preserving the new local identity.
     let reupload = run_json(
         home.path(),
         &[
@@ -9806,13 +9819,30 @@ fn media_upload_many_and_send_existing_references_preserve_order_and_source_epoc
     );
     assert_eq!(repaired["published"], 1);
     assert_eq!(repaired["attachments"][0]["source_epoch"], source_epoch + 1);
-    // The plaintext hash is content-addressed, so the projection now holds
-    // both the epoch-N and the epoch-N+1 reference for this file. Sending by
-    // hash must bind the newest one; a first-match (oldest-first) lookup would
-    // refuse the repaired file forever.
-    let forwarded_again = run_json(
+    // The plaintext hash finds the newest projected epoch but still carries no
+    // upload identity. The saved upload JSON remains reusable on its exact branch.
+    let unknown_after_reupload = run_json_error(
         home.path(),
         &["--account", &alice, "media", "send", group_id, &first_hash],
+    );
+    assert_eq!(
+        unknown_after_reupload["code"],
+        "media_reference_stale_epoch"
+    );
+    assert_eq!(unknown_after_reupload["source_epoch"], source_epoch + 1);
+    assert_eq!(unknown_after_reupload["current_epoch"], source_epoch + 1);
+    let forwarded_again = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "media",
+            "send",
+            group_id,
+            &reuploaded.to_string(),
+            "--message",
+            "reused current upload",
+        ],
     );
     assert_eq!(forwarded_again["published"], 1);
     assert_eq!(

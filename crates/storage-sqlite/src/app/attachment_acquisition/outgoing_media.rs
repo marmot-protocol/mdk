@@ -317,6 +317,7 @@ impl AttachmentUploadPromotion {
                 params![self.group, self.message, self.token, u64_to_i64(now)?],
                 |r| {
                     Ok(crate::AttachmentHistoryEntry {
+                        reaction_artwork: false,
                         emoji_tags: Vec::new(),
                         message_id_hex: r.get(0)?,
                         attachment_index: r.get::<_, u32>(1)? as usize,

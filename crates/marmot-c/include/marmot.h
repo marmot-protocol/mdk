@@ -1784,6 +1784,10 @@ typedef struct MarmotMediaAttachmentReference {
    */
   uint32_t version;
   uint64_t source_epoch;
+  /**
+   * Nullable local upload branch identity; preserve unchanged when sending.
+   */
+  char *source_epoch_identity;
   char *dim;
   char *thumbhash;
 } MarmotMediaAttachmentReference;
@@ -7080,6 +7084,30 @@ MarmotStatus marmot_attachment_local_assets(const struct MarmotClient *client,
                                             const struct MarmotAttachmentLocalTarget *targets,
                                             uintptr_t targets_len,
                                             struct MarmotAttachmentLocalAssetList **out);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_entry_free(struct MarmotAttachmentEntry *ptr);
+
+/**
+ * Resolve one active custom-emoji reaction's encrypted artwork without network work.
+ * Writes NULL with MARMOT_STATUS_OK when no eligible matching artwork is available.
+ * Use the returned original source slot with attachment acquisition and local reads.
+ * Free a non-NULL result with marmot_attachment_entry_free. Blocking: call off the UI thread.
+ * # Safety
+ * Client and strings must be live; out must be writable.
+ */
+MarmotStatus marmot_reaction_attachment(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const char *group_id_hex,
+                                        const char *reaction_message_id_hex,
+                                        struct MarmotAttachmentEntry **out);
 
 /**
  * Deep-free a page result and its cursor/version. NULL is a no-op.

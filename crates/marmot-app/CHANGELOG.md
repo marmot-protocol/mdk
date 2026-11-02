@@ -8,6 +8,17 @@
   marker-only non-user changes before staging. It preserves caller-supplied ids for write-ahead recovery;
   custom lower-level settings writers from the earlier draft must update first (mdk#2628 D86).
 
+- Uploaded media references carry local `source_epoch_identity` provenance.
+  Preserve it through host storage and reference round trips. Media and custom
+  reaction sends require that exact upload branch, including a branch switch at
+  the same epoch number, and refuse missing or stale provenance with
+  `MediaReferenceStaleEpoch`. Older and received references remain downloadable;
+  upload their verified bytes again before sending. The `imeta` wire format is
+  unchanged. Attachment-bearing reactions receive the same engine pin and
+  no-retention guarantee as media messages (mdk#2840, mdk#2151). Rust callers
+  constructing `MediaAttachmentOutcome::Accepted` box its `reference`; the
+  Swift, Kotlin, and C outcome shapes are unchanged.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It
@@ -114,6 +125,13 @@
   Missed invitations with that setting off await a re-invite. Automatic
   duplicate cleanup and delivered-Welcome resend remain deferred. Only
   behind `dev_device_groups`.
+
+- Custom emoji reaction artwork is available through the bounded local
+  `MarmotAppRuntime::reaction_attachment` lookup (mdk#2151). Pass its original
+  message/source/slot to host-managed acquisition and opaque local reads.
+  Reaction-only media preserves its authenticated source-epoch key; deletion,
+  retraction and convergence withdrawal revoke its acquisition source.
+
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
@@ -417,6 +435,15 @@
 
 ### Changed
 
+- Interactive sign-in replaces the blanket `MultiDeviceUnsupported` finding
+  with guidance that signing in alone does not restore existing chats or
+  messages (mdk#2628). Old checkpoints omit only that obsolete finding when
+  read. Discovery evidence, explicit acknowledgment, revision/recovery-epoch
+  checks and the KeyPackage publication gate stay unchanged. Existing host
+  apps must adopt the updated notice localization; device linking remains
+  disabled in normal released builds. Existing enum, DTO and method names
+  remain compatible.
+
 - Sign-in checks no longer load the unused roster announcement history or
   attach an internal `Announcement` label (mdk#2863, D81). Slot
   classification and the own-slot compromise warning keep their behavior.
@@ -632,6 +659,11 @@
   event keeps its fields, level, message and `method`.
 
 ### Fixed
+
+- Received media sources and available decryption keys commit together, so a
+  failed key write remains retryable after restart instead of acknowledging
+  unusable artwork. Authenticated carried keys and retained canonical source
+  exporters replace stale same-epoch cache entries (mdk#2840).
 
 - A device cleans up after every device its device group's roster stops
   listing, not only one whose `removed` record it still reads (mdk#2761):

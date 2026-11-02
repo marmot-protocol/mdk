@@ -18,6 +18,7 @@ per feature.
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
+  [custom reaction artwork](#custom-reaction-artwork),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
@@ -162,6 +163,14 @@ through `marmot_onboarding_snapshot_free`; do not free the arrays separately.
 See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interactive-account-onboarding)
 before interpreting query success as relay capability or publication evidence.
 
+The historical `SingleDevice` onboarding step is a sign-in chat/history notice,
+not a blanket claim that multi-device use is unsupported. Its notice, actions,
+acknowledgment calls and publication gate are unchanged; `MultiDeviceUnsupported`
+is retained for compatibility and omitted from current findings. Adopt the shared
+[notice copy and evidence limits](../marmot-uniffi/README.md#single-device-notice)
+in host localization with a published binding artifact. Continue is still an
+explicit acknowledgment, not permission to link devices or dismiss sign-in prompts.
+
 For a general or inbox onboarding relay failure, call
 `marmot_propose_onboarding_relay_repair` and inspect the optional
 `proposal->relay_repair` in the returned snapshot. Its ordered before/after
@@ -236,11 +245,26 @@ window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
 
+## Custom reaction artwork
+
+`marmot_reaction_attachment` performs a bounded local lookup using the exact
+reaction event ID. It blocks off the UI thread and writes a standalone owned
+`MarmotAttachmentEntry`, or NULL with `MARMOT_STATUS_OK` when unavailable. Free
+the standalone result with `marmot_attachment_entry_free`; never use that free
+for an entry borrowed from a page. Use its original source target with ordinary
+attachment acquisition and local reads. See the
+[shared reaction contract](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork).
+
 ## File-backed media upload
 
 `marmot_upload_media_files` and its token-aware twin take borrowed
 `MarmotMediaFileUploadRequest` inputs with private regular-file paths instead of
 plaintext arrays. See the [shared contract](../marmot-uniffi/README.md#file-backed-media-upload).
+`MarmotMediaAttachmentReference.source_epoch_identity` is a nullable local upload
+identity. Preserve the returned string when saving and sending a reference;
+NULL references remain readable but require a fresh upload before sending. See
+the [shared upload provenance contract](../marmot-uniffi/README.md#file-backed-media-upload).
+The field changes the reference layout, including records embedding it.
 Calls block; run them off the UI thread. Strings and request arrays must remain
 valid until return. Create one `MarmotMediaFileTransferControl` per call, query or
 cancel it from another thread, and free it only after all calls on the handle

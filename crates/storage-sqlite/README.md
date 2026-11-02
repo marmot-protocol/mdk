@@ -376,3 +376,15 @@ query still enumerates all deferred metadata so an unattempted row beyond a prev
 
 
 Media upgrades 0104 and 0105 preserve existing payload pages during account open. Retained legacy bodies gain a sentinel length column with validation/accounting on mutation; they retain the legacy byte-array bound, while larger files use the chunk tables. Already-upgraded stores keep their compatible physical layout. Partial upgrades replace only parent metadata: the migration runner suspends connection-local foreign-key enforcement before BEGIN, validates the affected parent/child references before commit, and restores the original setting on success, rollback and unwind. Checkpoint chunks are preserved in place; no migration ledger is relabeled. Optional encrypted-open observation reports fixed phases and schema numbers without paths, SQL, keys or user data.
+
+## Reaction artwork sources
+
+Active kind-7 reactions retain their encrypted `imeta` slots in the attachment
+index even though reactions are modifiers and have no standalone timeline row.
+Migration 0167 backfills these sources from retained events. Normal event
+projection maintains them in the same transaction as reaction tallies; unchanged
+slots survive timeline rebuilds. Author retractions, convergence withdrawals,
+retention and group deletion revoke their sources through the ordinary
+acquisition lifecycle. Host applications resolve artwork through
+[`reaction_attachment`](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork)
+and use the returned source slot with existing acquisition and local-read APIs.
