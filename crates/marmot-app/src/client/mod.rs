@@ -804,6 +804,9 @@ pub struct AppClient {
     /// promotion. It shares the engine's close state.
     pub(crate) engine_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
+    /// Changes only after a hand-off commits genuinely new received stock.
+    /// Pass-local selectors observe native projection retries through it.
+    pub(crate) received_private_key_package_generation: u64,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // and the engine connection before this guard so ownership is released
     // only after engine teardown.
@@ -1597,7 +1600,9 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
-        self.add_linked_devices_to_chats(&held).await;
+        let mut private_stock = private_key_packages::PrivateKeyPackageSelection::default();
+        self.add_linked_devices_to_chats(&held, &mut private_stock)
+            .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;

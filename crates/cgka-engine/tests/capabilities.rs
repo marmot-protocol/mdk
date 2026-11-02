@@ -1275,6 +1275,10 @@ async fn create_group_rejects_invitee_missing_required_role_capability() {
         initial_admins: vec![],
     };
     let requirements = alice.create_key_package_requirements(&request).unwrap();
+    assert!(
+        !requirements
+            .supports_metadata(&cgka_engine::key_package::key_package_metadata(&bob_kp).unwrap())
+    );
     assert!(matches!(
         requirements.validate(&bob_kp),
         Err(EngineError::MissingRequiredCapabilities { .. })
@@ -1295,6 +1299,10 @@ async fn create_group_rejects_invitee_missing_required_role_capability() {
         agent_stream_supported_components(),
     );
     let carol_kp = carol.fresh_key_package().await.unwrap();
+    assert!(
+        requirements
+            .supports_metadata(&cgka_engine::key_package::key_package_metadata(&carol_kp).unwrap())
+    );
     let created = alice
         .create_group(CreateGroupRequest {
             name: "agent-stream".into(),
@@ -1352,6 +1360,10 @@ async fn invite_rejects_member_missing_required_role_capability() {
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
     let requirements = alice.invite_key_package_requirements(&group_id).unwrap();
+    assert!(
+        !requirements
+            .supports_metadata(&cgka_engine::key_package::key_package_metadata(&bob_kp).unwrap())
+    );
     assert!(matches!(
         requirements.validate(&bob_kp),
         Err(EngineError::MissingRequiredCapabilities { .. })
@@ -1859,4 +1871,50 @@ async fn every_key_package_of_an_account_bounds_what_a_new_group_can_require() {
         matches!(error, EngineError::MissingRequiredCapabilities { .. }),
         "{error:?}"
     );
+}
+
+/// Metadata filtering expands implicit MLS support without accepting explicit
+/// default advertisements, and retains the requirement owner's profile/suite.
+#[tokio::test]
+async fn key_package_metadata_filter_keeps_implicit_defaults_profile_and_suite() {
+    let mut registry = registry_selfremove_only();
+    for (feature, requires) in [
+        (Feature("implicit-extension"), Capability::Extension(1)),
+        (Feature("implicit-proposal"), Capability::Proposal(1)),
+    ] {
+        registry.register(
+            feature,
+            CapabilityRequirement {
+                requires,
+                level: RequirementLevel::Required,
+                description: "implicit MLS default",
+            },
+        );
+    }
+    let mut alice =
+        build_engine_with_registry_and_components(b"alice", registry, default_group_components());
+    let package = alice.fresh_key_package().await.unwrap();
+    let requirements = alice
+        .create_key_package_requirements(&CreateGroupRequest {
+            name: "defaults".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .unwrap();
+    let metadata = cgka_engine::key_package::key_package_metadata(&package).unwrap();
+    assert!(!metadata.mls_extensions.contains(&1));
+    assert!(!metadata.mls_proposals.contains(&1));
+    requirements.validate(&package).unwrap();
+    assert!(requirements.supports_metadata(&metadata));
+    let mut refused = vec![metadata.clone(); 4];
+    refused[0].protocol_profile = cgka_traits::group::ProtocolProfile::Current;
+    refused[1].ciphersuite = 0x0003;
+    refused[2].mls_extensions.push(1);
+    refused[3].mls_proposals.push(1);
+    for metadata in refused {
+        assert!(!requirements.supports_metadata(&metadata));
+    }
 }
