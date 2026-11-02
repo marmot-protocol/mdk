@@ -130,18 +130,26 @@ impl OfflineQueue {
 
     /// Admit one text send while the relay fails as `failure`, and let the worker attempt it.
     async fn send_offline(&mut self, failure: OfflineFailure) {
+        // Switch failure modes without passing through an allowed state: a publish that
+        // lands in such a gap would be accepted while the device is meant to be offline.
+        // Unavailability is checked first, so it covers the moment both flags are set.
+        let ordering = std::sync::atomic::Ordering::SeqCst;
         match failure {
             OfflineFailure::Unavailable => {
-                self.relay.allow_publishes();
                 self.relay.fail_publishes_as_unavailable();
+                self.relay
+                    .fail_publish_possibly_exposed
+                    .store(false, ordering);
             }
             OfflineFailure::PossiblyExposed => {
-                self.relay.allow_publishes();
+                self.relay.fail_publishes_as_unavailable();
                 self.relay.fail_publishes_as_possibly_exposed();
+                self.relay.fail_publish_unavailable.store(false, ordering);
             }
         }
         let index = self.offline_sends;
-        let attempts_before = self.relay.attempted_event_ids().len();
+        let earlier: std::collections::HashSet<String> =
+            self.relay.attempted_event_ids().into_iter().collect();
         self.runtime
             .submit_text(
                 "sender",
@@ -153,14 +161,29 @@ impl OfflineQueue {
             .unwrap();
         self.offline_sends += 1;
         // The relay records an attempt before it fails it, so this proves the send was
-        // tried while offline rather than after connectivity returned.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while self.relay.attempted_event_ids().len() <= attempts_before {
+        // tried on every relay while offline rather than after connectivity returned. It
+        // waits for this send's own event: with several relays, the previous send's later
+        // attempts would satisfy a bare count and leave this one untried.
+        let relays = self.relay_count;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attempted = self.relay.attempted_event_ids();
+                let tried_everywhere = attempted
+                    .iter()
+                    .filter(|id| !earlier.contains(*id))
+                    .any(|id| attempted.iter().filter(|other| *other == id).count() >= relays);
+                if tried_everywhere {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the worker must attempt the offline send while the relay fails");
+        .expect("the worker must attempt the offline send on every relay while it fails");
+        // The worker records the failure after the relay sees the attempt. A command queued
+        // behind that pass returns once it is stored, so a restart cannot find the send
+        // still mid-attempt.
+        self.runtime.drain_in_flight_work().await.unwrap();
     }
 
     /// Restart the process while still offline, after the stored fanouts have failed
@@ -238,7 +261,22 @@ impl OfflineQueue {
         }
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "{context}: queued sends must publish in send order: {rows:?} at {positions:?}"
+            "{context}: queued sends must publish in send order: {rows:?} at {positions:?}; \
+             attempts={:?}; published={:?}",
+            self.relay
+                .attempted_events()
+                .iter()
+                .zip(self.relay.attempted_routes())
+                .map(|(event, (kind, routes))| (
+                    event.id.chars().take(8).collect::<String>(),
+                    kind,
+                    routes.len()
+                ))
+                .collect::<Vec<_>>(),
+            published_ids
+                .iter()
+                .map(|id| id.chars().take(8).collect::<String>())
+                .collect::<Vec<_>>()
         );
     }
 
