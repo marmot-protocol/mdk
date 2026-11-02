@@ -109,9 +109,8 @@ async fn a_device_signs_out_through_its_sibling() {
 /// laptop leaves it itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chat_with_no_sibling_in_it_is_left_by_the_device() {
-    let (mut devices, _group) = tagging_devices().await;
+    let (mut devices, _group, [own]) = tagging_devices_with_chats::<1>().await;
     let shared = chat_with_both(&mut devices).await;
-    let own = devices.laptop.create_group("notes", &[]).await.unwrap();
     assert!(devices.laptop.group_requires_account_devices(&own).unwrap());
     let _laptop_signing_out = devices
         .laptop_app
@@ -223,7 +222,7 @@ async fn a_device_without_a_made_link_signs_out_on_its_own() {
 /// finds the stored removal and unlinks it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_removed_while_signing_out_is_not_unlinked() {
-    let (devices, group) = tagging_devices().await;
+    let (devices, group, [notes]) = tagging_devices_with_chats::<1>().await;
     let Devices {
         _dirs,
         relay,
@@ -235,7 +234,6 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
     laptop
         .drive_device_pairing_at(crate::unix_now_seconds())
         .await;
-    let notes = laptop.create_group("notes", &[]).await.unwrap();
     laptop
         .upsert_and_share_push_registration(
             PushPlatform::Fcm,
@@ -600,7 +598,7 @@ async fn a_worker_still_opening_at_the_deadline_counts_as_not_reached() {
 /// deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
-    let (mut devices, group) = tagging_devices().await;
+    let (mut devices, group, [with_bob]) = tagging_devices_with_chats::<1>().await;
     let chat = chat_with_both(&mut devices).await;
     let Devices {
         _dirs,
@@ -623,7 +621,7 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     let mut bob = bob_app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     remember_test_member_inbox(&laptop_app, &bob_id, "wss://relay.example");
-    let with_bob = laptop.create_group("with bob", &[&bob_id]).await.unwrap();
+    laptop.invite_members(&with_bob, &[&bob_id]).await.unwrap();
     laptop.promote_admin(&with_bob, &bob_id).await.unwrap();
     laptop.self_demote_admin(&with_bob).await.unwrap();
     drop(laptop);

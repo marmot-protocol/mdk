@@ -375,6 +375,38 @@ fn peel(
     .expect("a branch survey over healthy storage")
 }
 
+fn sliced_peel(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    max_rewind_commits: u64,
+) -> CandidateBranchPeel {
+    let before = replay_state(storage, group_id);
+    let ledger = storage.list_messages(group_id, EpochId(0)).unwrap();
+    let epoch = storage.get_group(group_id).unwrap().epoch.0;
+    let mut slot = None;
+    for _ in 0..512 {
+        let result = super::candidate_peel_slice(
+            storage,
+            group_id,
+            epoch.saturating_sub(max_rewind_commits),
+            max_rewind_commits,
+            ReplayProfilePolicy::default(),
+            MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
+            &mut slot,
+            &mut super::ReplaySlice::new(std::time::Instant::now(), 1),
+        )
+        .expect("a halted survey is a complete result, not a storage error");
+        assert_eq!(replay_state(storage, group_id), before);
+        assert_eq!(storage.list_messages(group_id, EpochId(0)).unwrap(), ledger);
+        if let Some(result) = result {
+            assert!(slot.is_none(), "a completed survey retains no scratch work");
+            return result;
+        }
+        assert!(slot.is_some(), "a yielded survey retains its progress");
+    }
+    panic!("candidate survey did not finish across bounded slices");
+}
+
 thread_local! {
     static PANIC_AFTER_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -441,7 +473,7 @@ async fn encrypted_replay_graph_fixture_with_apps(
     let root = tempfile::tempdir().unwrap();
     let storage = SqliteAccountStorage::open_encrypted(
         root.path().join("observer.sqlite3"),
-        &storage_sqlite::SqlCipherKey::new("replay transaction fixture").unwrap(),
+        &storage_sqlite::SqlCipherKey::raw([0x73; 32]),
     )
     .unwrap();
     let build = |seed: &[u8], store: SqliteAccountStorage| {
@@ -782,7 +814,7 @@ async fn resumable_public_background_advance_retains_progress_until_complete() {
     let (_root, storage, group_id, messages) = encrypted_replay_graph_fixture(6, 4, 3).await;
     let writer = SqliteAccountStorage::open_encrypted(
         _root.path().join("observer.sqlite3"),
-        &storage_sqlite::SqlCipherKey::new("replay transaction fixture").unwrap(),
+        &storage_sqlite::SqlCipherKey::raw([0x73; 32]),
     )
     .unwrap();
     let clock = crate::ManualConvergenceClock::new(1_000_000, 1_800_000_000_000);
@@ -1220,30 +1252,30 @@ async fn replay_transaction_preserves_results_and_restores_after_error_and_panic
     let mut invalid = rivals[0].clone();
     invalid.payload = vec![0xff];
     let messages = [rivals[0].clone(), invalid];
-    assert!(
+    assert!(matches!(
         super::replay_openmls_messages_prevalidated_output(
             &storage,
             &group_id,
             &messages,
             &own,
             ReplayProfilePolicy::default()
-        )
-        .is_err()
-    );
+        ),
+        Err(super::OpenMlsProjectionError::Decode(_))
+    ));
     check();
     // A nested caller may catch a probe error and continue its own transaction.
     storage
         .with_transaction(|_| -> Result<(), super::OpenMlsProjectionError> {
-            assert!(
+            assert!(matches!(
                 super::replay_openmls_messages_prevalidated_output(
                     &storage,
                     &group_id,
                     &messages,
                     &own,
                     ReplayProfilePolicy::default()
-                )
-                .is_err()
-            );
+                ),
+                Err(super::OpenMlsProjectionError::Decode(_))
+            ));
             check();
             Ok(())
         })
@@ -1469,8 +1501,9 @@ async fn own_checkpoint_checks_parent() {
         ReplayProfilePolicy::default(),
     );
     assert!(
-        replay.is_err(),
-        "own checkpoint must authenticate its source parent"
+        matches!(&replay, Err(super::OpenMlsProjectionError::Replay(reason))
+            if reason.starts_with("authenticate own commit parent:")),
+        "own checkpoint must authenticate its source parent: {replay:?}"
     );
     assert_eq!(replay_state(&storage, &group_id), wrong_parent);
     let applied = super::apply_openmls_canonicalization_result(
@@ -1480,8 +1513,9 @@ async fn own_checkpoint_checks_parent() {
         V1_MAX_REWIND_COMMITS,
     );
     assert!(
-        applied.is_err(),
-        "apply must reject the same wrong parent as selection"
+        matches!(&applied, Err(super::OpenMlsProjectionError::Replay(reason))
+            if reason.starts_with("authenticate own commit parent:")),
+        "apply must reject the same wrong parent as selection: {applied:?}"
     );
     assert_eq!(replay_state(&storage, &group_id), wrong_parent);
     assert_eq!(
@@ -1987,7 +2021,8 @@ async fn own_private_checkpoint_refused() {
     );
     assert!(matches!(
         replay,
-        Err(super::OpenMlsProjectionError::Replay(_))
+        Err(super::OpenMlsProjectionError::Replay(reason))
+            if reason == "own checkpoint requires an authenticated public commit"
     ));
     assert_eq!(replay_state(&storage, &group_id), before);
     let apply = super::apply_openmls_canonicalization_result(
@@ -1998,7 +2033,8 @@ async fn own_private_checkpoint_refused() {
     );
     assert!(matches!(
         apply,
-        Err(super::OpenMlsProjectionError::Replay(_))
+        Err(super::OpenMlsProjectionError::Replay(reason))
+            if reason == "own checkpoint requires an authenticated public commit"
     ));
     assert_eq!(replay_state(&storage, &group_id), before);
     assert_eq!(
@@ -2194,6 +2230,45 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     );
     let before = replay_state(&alice_storage, &group_id);
     let ledger = alice_storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let sliced = sliced_peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
+    assert!(sliced.contested && sliced.contexts.is_empty());
+    assert_eq!(sliced.replay_probe_count, halted.replay_probe_count);
+    for (now_ms, status) in [
+        (0, super::ConvergenceStatus::Syncing),
+        (100_000, super::ConvergenceStatus::Blocked),
+    ] {
+        let mut slot = None;
+        let result = (0..64)
+            .find_map(|_| {
+                let result = super::canonicalize_stored_slice(
+                    &alice_storage,
+                    &group_id,
+                    reconstruction_state(2),
+                    vec![],
+                    super::CanonicalizationPolicy::default(),
+                    now_ms,
+                    Default::default(),
+                    1,
+                    &mut slot,
+                    &mut super::ReplaySlice::new(std::time::Instant::now(), 1),
+                )
+                .expect("missing checkpoint has a complete canonicalization verdict");
+                assert_eq!(replay_state(&alice_storage, &group_id), before);
+                assert_eq!(
+                    alice_storage.list_messages(&group_id, EpochId(0)).unwrap(),
+                    ledger
+                );
+                result
+            })
+            .expect("missing checkpoint must finish the sliced pass");
+        assert_eq!(
+            result.errors,
+            vec![super::CanonicalizationError::MissingOwnCommitCheckpoint]
+        );
+        assert_eq!(result.convergence_status, status);
+        assert!(result.selected_branch_id.is_none() && result.accepted_commits.is_empty());
+        assert!(slot.is_none());
+    }
     let applied = super::apply_openmls_canonicalization_result(
         &alice_storage,
         &group_id,
@@ -2278,6 +2353,12 @@ async fn an_exhausted_replay_budget_halts_enumeration_and_keeps_the_fork() {
         halted.contested,
         "the fork is in the stored graph, not in what enumeration managed to read"
     );
+    let sliced = sliced_peel(&alice_storage, &group_id, 0);
+    assert!(sliced.contested && sliced.contexts.is_empty());
+    assert_eq!(
+        sliced.replay_probe_count, halted.replay_probe_count,
+        "yielding must not reset the cumulative replay budget"
+    );
 }
 
 // --- The cap -------------------------------------------------------------
@@ -2351,16 +2432,8 @@ async fn a_fork_wider_than_the_cap_keeps_the_same_branches_on_every_peer() {
         "the capped subset is content-derived, so peers holding the same \
          evidence must keep the same branches in the same order"
     );
-}
-
-#[tokio::test]
-async fn a_deeper_branch_outranks_shallow_rivals_for_the_capped_contexts() {
-    let (group_id, alice_storage, _dave_storage) = wide_fork_with_one_deep_branch().await;
-
-    let survey = peel(&alice_storage, &group_id, V1_MAX_REWIND_COMMITS);
-
     assert_eq!(
-        survey.contexts.iter().map(|c| c.tip_epoch).max(),
+        alice.contexts.iter().map(|c| c.tip_epoch).max(),
         Some(FORK_EPOCH + 2),
         "a branch carried two commits deep holds traffic the one-commit \
          rivals cannot unseal, so filling the cap with rivals must not \

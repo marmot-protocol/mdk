@@ -159,6 +159,39 @@ fn process_orchestrator_coverage_runs_outside_the_parallel_simulator_suites() {
 }
 
 #[test]
+fn nightly_slow_properties_keep_wide_counts_without_rebuilding_every_test_target() {
+    let justfile = include_str!("../../../Justfile");
+    for recipe in ["simulator-full", "simulator-filter-contract"] {
+        let body = recipe_body(justfile, recipe);
+        let slow_commands: Vec<_> = body
+            .lines()
+            .filter(|line| line.contains("--features conformance-slow"))
+            .collect();
+        assert!(
+            !slow_commands.is_empty(),
+            "{recipe} must retain the wide property-test pass"
+        );
+        for command in slow_commands {
+            assert!(
+                command.contains("--test proptest_invariants"),
+                "{recipe} must scope slow builds to the property-test target (issue #2858)"
+            );
+            if recipe == "simulator-full" {
+                assert!(
+                    command.trim_start().starts_with("cargo nextest run ")
+                        && !command.contains("--no-run"),
+                    "nightly must execute the wide property tests"
+                );
+            }
+        }
+        assert!(
+            body.contains("{{simulator-dedicated-filter}} and not binary(proptest_invariants)"),
+            "{recipe} must retain all other generic tests in the default build"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_builds_exact_ancestor_image_and_verifies_one_bundle() {
     let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
     for contract in [

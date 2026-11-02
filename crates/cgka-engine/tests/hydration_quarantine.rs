@@ -1766,8 +1766,23 @@ async fn quarantined_group_blocks_convergence_and_send() {
 
 #[tokio::test]
 async fn quarantined_group_accessors_all_report_unknown_group() {
-    let (mut alice, _storage, _bob, group_id) = quarantined_alice_with_live_bob().await;
+    let (mut alice, storage, mut bob, group_id) = quarantined_alice_with_live_bob().await;
     let component = cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
+    let package = bob.fresh_key_package().await.expect("healthy candidate");
+    let state_before = storage
+        .inner
+        .group_replay_state_fingerprint(&group_id)
+        .expect("state before admission query")
+        .expect("SQLite tracks group state");
+    let requirements = alice.invite_key_package_requirements(&group_id);
+    assert!(
+        storage
+            .inner
+            .group_replay_state_fingerprint(&group_id)
+            .expect("state after admission query")
+            == Some(state_before),
+        "admission query must not change durable group state"
+    );
 
     let unknown = |result: Result<(), EngineError>, name: &str| {
         assert!(
@@ -1824,6 +1839,23 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
         alice.safe_export_secret(&group_id, component).map(drop),
         "safe_export_secret",
     );
+
+    // Healing storage alone did not promote the group. Explicit recovery
+    // makes the same query serve a usable admission snapshot again.
+    assert_eq!(
+        alice.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )]
+    );
+    assert!(alice.retry_hydrate_quarantined_group(&group_id).unwrap());
+    alice
+        .invite_key_package_requirements(&group_id)
+        .expect("requirements after recovery")
+        .validate(&package)
+        .expect("recovered group's candidate is admissible");
+    unknown(requirements.map(drop), "invite_key_package_requirements");
 }
 
 /// After repair, input retained while quarantined replays through the

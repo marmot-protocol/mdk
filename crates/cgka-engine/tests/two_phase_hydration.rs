@@ -23,7 +23,7 @@ use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::GroupStorage;
+use cgka_traits::storage::{GroupStorage, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -233,9 +233,18 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
     let mut initial = build_engine(storage.clone());
     let group_id = create_confirmed_group(&mut initial, false).await;
     let stored_epoch = storage.get_group(&group_id).unwrap().epoch;
+    let package = initial
+        .fresh_key_package()
+        .await
+        .expect("healthy candidate");
+    initial
+        .invite_key_package_requirements(&group_id)
+        .expect("requirements of a live group")
+        .validate(&package)
+        .expect("live group's candidate is admissible");
     drop(initial);
 
-    let mut reopened = build_engine(storage);
+    let mut reopened = build_engine(storage.clone());
     reopened
         .hydrate_stable_groups_from_storage()
         .expect("cheap pass");
@@ -254,12 +263,34 @@ async fn seeded_group_is_listed_but_gated_until_hydrated() {
         reopened.epoch(&group_id),
         Err(EngineError::GroupNotHydrated(id)) if id == group_id
     ));
+    let state_before = storage
+        .group_replay_state_fingerprint(&group_id)
+        .expect("state before admission query")
+        .expect("SQLite tracks group state");
+    let requirements = reopened.invite_key_package_requirements(&group_id);
+    assert!(
+        storage
+            .group_replay_state_fingerprint(&group_id)
+            .expect("state after admission query")
+            == Some(state_before),
+        "admission query must not change durable group state"
+    );
+    assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
 
     // Explicit promotion makes the group fully live.
     reopened.ensure_hydrated(&group_id).expect("hydrate");
     assert!(reopened.unhydrated_group_ids().is_empty());
     assert_eq!(reopened.epoch(&group_id).unwrap(), stored_epoch);
     assert!(reopened.members(&group_id).is_ok());
+    reopened
+        .invite_key_package_requirements(&group_id)
+        .expect("requirements after promotion")
+        .validate(&package)
+        .expect("hydrated group's candidate is admissible");
+    assert!(
+        matches!(&requirements, Err(EngineError::GroupNotHydrated(id)) if *id == group_id),
+        "invite_key_package_requirements must report GroupNotHydrated before promotion, got {requirements:?}"
+    );
 }
 
 #[tokio::test]

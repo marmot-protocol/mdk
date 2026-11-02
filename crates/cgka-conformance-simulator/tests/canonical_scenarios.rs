@@ -3576,9 +3576,9 @@ async fn cross_route_recovery_uses_retained_history_after_restart() {
 #[tokio::test]
 async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
     // Harness mirror of the cgka-engine regression test
-    // `failed_invite_staging_does_not_poison_fork_detection`: a send-path
-    // staging failure must leave no phantom "we committed from this epoch"
-    // bookkeeping behind. Historically it did, and once the client advanced
+    // `rejected_duplicate_invite_does_not_poison_fork_detection`: a refused
+    // invite must leave no phantom "we committed from this epoch" bookkeeping
+    // behind. Historically a staging failure did, and once the client advanced
     // past that epoch via a PEER's commit (settled through convergence, so
     // no fork-recovery incumbent of its own exists), a legitimate sibling
     // commit for the poisoned epoch failed closed with ForkedEpoch and stuck
@@ -3619,10 +3619,9 @@ async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
     assert_eq!(bob.epoch().0, 1);
     assert_eq!(dave.epoch().0, 1);
 
-    // Alice's invite fails DURING commit staging: the duplicate-Bob
-    // KeyPackage carries Bob's existing leaf signature key, which OpenMLS
-    // rejects inside add_members — after capability validation, before the
-    // pending-publish state transition. Nothing reaches the bus.
+    // The duplicate-Bob KeyPackage carries a signature key already on the
+    // roster. Device filtering now refuses this empty invite before staging;
+    // the test name retains the historical failure shape. Nothing reaches the bus.
     let duplicate_bob_kp = bob.fresh_key_package().await;
     let failed = alice.try_invite(vec![duplicate_bob_kp]).await;
     assert!(

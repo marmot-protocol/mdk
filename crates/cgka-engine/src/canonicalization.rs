@@ -1250,24 +1250,34 @@ mod witness_window_tests {
 
     #[test]
     fn v1_default_policy_constants_are_pinned() {
-        use crate::convergence::{
-            V1_MAX_REWIND_COMMITS, V1_MAX_WITNESS_OVERRIDE_DEPTH, V1_WITNESS_QUORUM_EPOCHS,
-            V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
+        let pinned = CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 5,
+                witness_quorum_senders_per_epoch: 2,
+                witness_quorum_epochs: 1,
+                max_witness_override_depth: 1,
+            },
+            app_message_past_epoch_limit: 5,
+            settlement_quiescence_ms: 1_000,
+            max_convergence_pass_ms: 5_000,
         };
-        assert_eq!(
-            CanonicalizationPolicy::default(),
-            CanonicalizationPolicy {
-                convergence: ConvergencePolicy {
-                    max_rewind_commits: V1_MAX_REWIND_COMMITS,
-                    witness_quorum_senders_per_epoch: V1_WITNESS_QUORUM_SENDERS_PER_EPOCH,
-                    witness_quorum_epochs: V1_WITNESS_QUORUM_EPOCHS,
-                    max_witness_override_depth: V1_MAX_WITNESS_OVERRIDE_DEPTH,
+        assert_eq!(CanonicalizationPolicy::default(), pinned);
+        // Policies saved before the absolute pass cap existed inherit the
+        // adopted value, rather than silently disabling that bound.
+        let older: CanonicalizationPolicy = serde_json::from_str(
+            r#"{
+                "convergence": {
+                    "max_rewind_commits": 5,
+                    "witness_quorum_senders_per_epoch": 2,
+                    "witness_quorum_epochs": 1,
+                    "max_witness_override_depth": 1
                 },
-                app_message_past_epoch_limit: V1_APP_MESSAGE_PAST_EPOCH_LIMIT,
-                settlement_quiescence_ms: V1_SETTLEMENT_QUIESCENCE_MS,
-                max_convergence_pass_ms: V1_MAX_CONVERGENCE_PASS_MS,
-            }
-        );
+                "app_message_past_epoch_limit": 5,
+                "settlement_quiescence_ms": 1000
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(older, pinned);
         assert!(CanonicalizationPolicy::default().ensure_pinned_v1().is_ok());
         assert_eq!(
             CanonicalizationPolicy {

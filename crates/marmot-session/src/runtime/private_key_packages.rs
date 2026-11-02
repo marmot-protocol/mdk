@@ -62,6 +62,11 @@ where
         Ok(self.session.owed_sibling_welcomes(now)?)
     }
 
+    /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
+    pub fn carried_sibling_welcomes(&self) -> AccountResult<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self.session.carried_sibling_welcomes()?)
+    }
+
     /// Record `carrier`, the app event id of the device-group message about
     /// to carry the owed sibling Welcome `id`. See
     /// [`cgka_engine::Engine::carry_sibling_welcome`].
@@ -82,6 +87,12 @@ where
         id: &MessageId,
         carrier: &[u8],
     ) -> AccountResult<bool> {
+        // An ambiguous error can leave the exact carrier in durable retry.
+        // Keep its association to the Welcome until that retry settles;
+        // otherwise the next pass can create a duplicate new carrier.
+        if self.session.sibling_welcome_carrier_in_flight(carrier)? {
+            return Ok(false);
+        }
         Ok(self.session.sibling_welcome_send_failed(id, carrier)?)
     }
 

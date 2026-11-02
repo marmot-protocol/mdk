@@ -402,6 +402,11 @@ bounded investigation can leave unresolved debt parked for new evidence or expli
 
 ## Linked devices
 
+While device groups are enabled, creating a chat includes linked siblings from the start when this device holds compatible
+private KeyPackages for them. This applies even with "Add to all my chats" off, which covers older chats. Missing private
+KeyPackages never delay creation or fall back to public slots; the missing device needs a later Add or invite. Sibling
+Welcomes travel privately through the device group, independently of the other accounts' Welcome deliveries.
+
 `MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
 the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
 its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
