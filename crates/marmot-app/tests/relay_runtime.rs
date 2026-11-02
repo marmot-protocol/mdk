@@ -5284,14 +5284,24 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
         view.tokens[0].token_fingerprint,
         registration.token_fingerprint
     );
-    assert!(
-        app.push_registration(&bob.account.account_id_hex)
-            .unwrap()
-            .unwrap()
-            .last_shared_at_ms
-            .is_some(),
-        "automatic publication must commit durable share completion"
-    );
+    // Alice can receive the token before Bob's publication completion commits.
+    // Observe that durable completion without initiating another share or retry.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if app
+                .push_registration(&bob.account.account_id_hex)
+                .unwrap()
+                .unwrap()
+                .last_shared_at_ms
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic publication must commit durable share completion");
     runtime.shutdown().await;
 }
 

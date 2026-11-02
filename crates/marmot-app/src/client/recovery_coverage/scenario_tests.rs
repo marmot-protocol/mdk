@@ -49,17 +49,37 @@ pub(in crate::client) async fn fixture() -> Fixture {
 /// [`fixture`], with the relay returning one stored event created at
 /// `stored` before each EOSE, or none.
 pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
+    fixture_on(vec![RELAY.into()], false, stored, None).await
+}
+
+pub(in crate::client) async fn fixture_on(
+    relays: Vec<String>,
+    runner_owns_debt: bool,
+    stored: Option<u64>,
+    lookback: Option<std::time::Duration>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = crate::MarmotApp::with_relays_and_config(
+    let mut app = crate::MarmotApp::with_relays_and_config(
         dir.path(),
-        vec![RELAY.into()],
+        relays,
         crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay.clone());
+    app.relay_plane = transport_nostr::MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        lookback,
+        relay.clone(),
+        relay.clone(),
+        app.config.allow_loopback_relay_endpoints,
+    );
+    let app = if runner_owns_debt {
+        app.with_recovery_runner_owning_debt()
+    } else {
+        app
+    };
     *relay.stored_before_eose.lock().unwrap() = stored;
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
@@ -97,13 +117,16 @@ pub(super) async fn fixture_with_stored(stored: Option<u64>) -> Fixture {
 /// Start the account's REQs again, as a reconnect does, and wait until the
 /// new generation's boundaries are admitted.
 pub(super) async fn reactivate(fixture: &mut Fixture) {
-    fixture.client.prepare_transport().await.unwrap();
+    reactivate_client(&mut fixture.client).await;
+}
+
+pub(in crate::client) async fn reactivate_client(client: &mut AppClient) {
+    client.prepare_transport().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            fixture.client.synchronize_native_replay().await.unwrap();
-            let observation = fixture.client.adapter.replay_admission().await;
-            if fixture
-                .client
+            client.synchronize_native_replay().await.unwrap();
+            let observation = client.adapter.replay_admission().await;
+            if client
                 .recovery_owner
                 .native_replay_authorizes(observation.generation())
             {
@@ -974,7 +997,10 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         } else {
             super::retention_floor(now)
         };
-        assert_eq!(fixture.client.standing_floor(current, now), expected);
+        assert_eq!(
+            fixture.client.standing_floor(current, now).unwrap(),
+            expected
+        );
     }
     assert_eq!(
         app.recovery_coverage_goal(&group_route).unwrap(),
@@ -1034,9 +1060,67 @@ async fn a_copys_welcome_time_starts_only_its_standing_goal() {
         fixture.storage.put_group(&record).unwrap();
         for current in &fixture.client.current_coverage_routes() {
             assert_eq!(
-                fixture.client.standing_floor(current, now),
+                fixture.client.standing_floor(current, now).unwrap(),
                 super::retention_floor(now)
             );
         }
     }
+}
+
+/// Runtime startup defers MLS hydration. Its standing goal must still use
+/// the persisted Welcome hint, since a later goal cannot narrow it (#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_open_starts_the_goal_at_the_durable_welcome_floor() {
+    use cgka_traits::storage::GroupStorage;
+    let Fixture {
+        client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec![RELAY.into()],
+        false,
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )
+    .await;
+    let app = client.app.clone();
+    let route = client
+        .current_coverage_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    assert_eq!(
+        storage
+            .app_storage()
+            .recovery_coverage_goal(&route)
+            .unwrap(),
+        None
+    );
+    let welcome_at = unix_now_seconds() - 60 * 60;
+    let mut record = storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+    drop(client);
+
+    let reopened = app
+        .local_client_with_relay_plane_and_hydration("alice", &app.relay_plane, None, true, None)
+        .await
+        .unwrap();
+    let error = crate::AppError::from(reopened.runtime.group_record(&group).unwrap_err());
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    assert_eq!(
+        storage
+            .app_storage()
+            .recovery_coverage_goal(&route)
+            .unwrap(),
+        Some(welcome_at - 15 * 60),
+        "deferred startup must not pin the group to the 30-day retention floor"
+    );
 }

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use cgka_traits::storage::StorageResult;
 use cgka_traits::{MemberId, TransportDelivery, TransportEndpoint};
 use nostr::prelude::{Event, RelayUrl};
 use storage_sqlite::{RecoveryUnitPolicy, SqliteAppStorage, TransportReconciliationRoute};
@@ -172,9 +173,9 @@ impl RunnerHost for AccountRunnerHost {
         .await
     }
 
-    async fn debt_turn<T, F>(&self, turn: F) -> Option<T>
+    async fn debt_turn<T, F>(&self, turn: F) -> Option<StorageResult<T>>
     where
-        F: FnOnce(&DebtTurn<'_>) -> T + Send + 'static,
+        F: FnOnce(&DebtTurn<'_>) -> StorageResult<T> + Send + 'static,
         T: Send + 'static,
     {
         // Every quantum begins in a debt turn, so its sweep finds the pool
@@ -185,7 +186,9 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
-                client.settle_recovery_route_changes(&app, now);
+                if let Err(error) = client.settle_recovery_route_changes(&app, now) {
+                    return Some(Err(error));
+                }
                 let tails = client.recovery_runner_live_tails(&app, now).await;
                 let mut routes = client.recovery_runner_routes();
                 if inbox.is_none() {

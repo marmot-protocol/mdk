@@ -32,8 +32,8 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::prelude::{
-    ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal,
-    ProtocolMessage, QueuedProposal, Sender, ValidationError,
+    ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage, ProcessedMessageContent,
+    Proposal, ProtocolMessage, QueuedProposal, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -188,6 +188,29 @@ struct PastPeelRecovery {
     source_epoch: EpochId,
     source: PeelRecoverySource,
     attempt_count: u64,
+}
+
+/// A direct receive's durable work, prepared before its transaction commits.
+/// Application delivery and hot-state updates only happen after this returns.
+enum DirectMessageContent {
+    Application {
+        event: Box<GroupEvent>,
+        previous: Option<(MessageState, EpochId)>,
+    },
+    UnattributableApplication,
+    InvalidApplicationPayload,
+    Proposal(Box<QueuedProposal>),
+    ExternalJoinProposal,
+    OwnEcho,
+    UnexpectedCommit,
+}
+
+struct DirectApplicationContext<'a> {
+    group_id: &'a GroupId,
+    msg: &'a TransportMessage,
+    msg_epoch: EpochId,
+    current_epoch: EpochId,
+    recovered_source_retention: Option<(EpochId, Option<u64>)>,
 }
 
 /// Which non-live context read a message the live peel could not.
@@ -1315,12 +1338,11 @@ impl<S: StorageProvider> Engine<S> {
             )?);
         }
 
-        // The retained row, exact wrapper identity, and the secret-tree
-        // ratchet `process_message` writes share one durable unit: under
-        // `synchronous = FULL` every COMMIT is an fsync, and these were three
-        // per inbound message. The processing result leaves the closure as a
-        // value so a decrypt failure still commits the row the error branches
-        // below transition.
+        // Retained input, wrapper identity, receive-ratchet progress and any
+        // accepted application output share one durable unit. Failed output
+        // writes leave the ratchet and wrapper retryable (mdk#2872). Processing
+        // rejections leave the closure as values so the error branches below
+        // still transition their retained input.
         let processed = match self.storage.with_transaction(|_storage| {
             // A commit row's epoch is the epoch it forks from, and the
             // `commit_should_enter_convergence` decision above left only
@@ -1338,7 +1360,24 @@ impl<S: StorageProvider> Engine<S> {
                 MessageState::Created,
                 &raw_msg_id,
             )?;
-            Ok::<_, EngineError>(mls_group.process_message(&provider, proto))
+            let processed = match mls_group.process_message(&provider, proto) {
+                Ok(processed) => processed,
+                // Retain decrypt/validation failures for the existing error-row
+                // transitions below, rather than rolling their input back.
+                Err(error) => return Ok(Err(error)),
+            };
+            self.prepare_direct_message_content(
+                &mls_group,
+                processed,
+                DirectApplicationContext {
+                    group_id: &group_id,
+                    msg: &openmls_msg,
+                    msg_epoch,
+                    current_epoch,
+                    recovered_source_retention,
+                },
+            )
+            .map(Ok)
         })? {
             Ok(p) => p,
             // Every arm below transitions a row that may carry a commit's
@@ -1495,171 +1534,56 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
 
-        // Classify content.
-        let sender_id = member_id_of_processed_message(&processed, &mls_group);
-        let sender_leaf_index = match processed.sender() {
-            Sender::Member(leaf) => Some(leaf.u32()),
-            _ => None,
-        };
-        match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(bytes) => {
-                let Some(sender) = sender_id else {
-                    // OpenMLS allows external senders for some
-                    // ProcessedMessageContent variants but Marmot
-                    // does not surface unattributable application
-                    // messages to applications: a `MessageReceived`
-                    // event without a real sender is silent
-                    // attribution loss. Mark the message Failed and
-                    // skip the event. (We deliberately avoid logging
-                    // payload contents per observability.md.)
-                    tracing::warn!(
-                        target: "cgka_engine::message_processor",
-                        method = "ingest_group_message",
-                        "dropping application message with unattributable sender"
-                    );
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    // Peeled successfully but terminally rejected: retire
-                    // the raw deferred row so it leaves the retry
-                    // lifecycle instead of holding a cap slot (mdk#339).
-                    self.mark_raw_transport_message_failed_if_awaiting_retry(
-                        &raw_msg_id,
-                        "unattributable_sender",
-                    )?;
-                    return reported(IngestOutcome::Ignored {
-                        category: InputRejectionCategory::InvalidSignature,
-                    });
-                };
-                let payload = bytes.into_bytes();
-                let app_event =
-                    match crate::app_payload::validate_app_payload_for_sender(&payload, &sender) {
-                        Ok(event) => event,
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "cgka_engine::message_processor",
-                                method = "ingest_group_message",
-                                "dropping application message with invalid Marmot app event",
-                            );
-                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                            // Peeled successfully but terminally rejected: retire
-                            // the raw deferred row (mdk#339).
-                            self.mark_raw_transport_message_failed_if_awaiting_retry(
-                                &raw_msg_id,
-                                "invalid_app_payload",
-                            )?;
-                            return reported(IngestOutcome::Ignored {
-                                category: InputRejectionCategory::InvalidEncoding,
-                            });
-                        }
-                    };
-                let needs_authority =
-                    cgka_traits::reporting::requires_source_authority(app_event.kind);
-                let historical_source = if needs_authority && msg_epoch != current_epoch {
-                    if let Some(snapshot) = crate::app_payload::retained_source_snapshot(
-                        &self.storage,
-                        &group_id,
-                        msg_epoch,
-                    )? {
-                        use sha2::{Digest, Sha256};
-                        let request = cgka_traits::app_event::PendingAppMessageAuthority {
-                            group_id: group_id.clone(),
-                            message_id: msg.id.clone(),
-                            epoch: msg_epoch,
-                            sender: sender.clone(),
-                            payload_digest: Sha256::digest(&payload).into(),
-                            retention: None,
-                        };
-                        crate::app_payload::historical_source(
-                            &self.storage,
-                            &self.crypto,
-                            &request,
-                            &snapshot,
-                            &openmls_msg.payload,
-                        )?
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let retention_seconds = if msg_epoch == current_epoch {
-                    Some(
-                        crate::app_components::message_retention_seconds_of_group(&mls_group)?
-                            .unwrap_or(0),
-                    )
-                } else {
-                    // Successful authentication supplies both policies in one
-                    // visit. If it remains unresolved, retain the ordinary
-                    // source-epoch retention fallback; missing moderation proof
-                    // must not exempt report explanations from expiry.
-                    let recovered = historical_source
-                        .as_ref()
-                        .map(|source| source.retention_seconds)
-                        .or_else(|| {
-                            recovered_source_retention.and_then(|(epoch, seconds)| {
-                                (epoch == msg_epoch).then_some(seconds.unwrap_or(0))
-                            })
-                        });
-                    match recovered {
-                        Some(seconds) => Some(seconds),
-                        None => self
-                            .message_retention_seconds_for_retained_source_epoch(
-                                &group_id,
-                                msg_epoch,
-                                current_epoch,
-                            )?
-                            .map(|seconds| seconds.unwrap_or(0)),
-                    }
-                };
-                let authority = if needs_authority && msg_epoch == current_epoch {
-                    Some(crate::app_payload::source_authority(&mls_group, &sender)?)
-                } else {
-                    historical_source.map(|source| source.authority)
-                };
-                let encrypted_media_secret = if msg_epoch == current_epoch {
-                    crate::app_payload::encrypted_media_source_secret(
-                        &mls_group,
-                        &self.crypto,
-                        &app_event,
-                    )?
-                } else {
-                    None
-                };
-                let event = GroupEvent::MessageReceived {
-                    group_id: group_id.clone(),
-                    message_id: msg.id.clone(),
-                    sender,
-                    sender_leaf_index,
-                    epoch: msg_epoch,
-                    payload,
-                    authority,
-                    retention: retention_seconds.map(|seconds| {
-                        AppMessageRetentionDecision::new(app_event.created_at, seconds)
-                    }),
-                    encrypted_media_secret,
-                };
-                let previous = self.storage.get_message(&msg.id).ok();
-                self.storage.with_transaction(|storage| {
-                    storage.update_message_state(&msg.id, MessageState::Processed)?;
-                    storage.put_pending_application_event(&event)?;
-                    Ok::<_, EngineError>(())
-                })?;
+        match processed {
+            DirectMessageContent::Application { event, previous } => {
+                let event = *event;
                 let transition = crate::audit_helpers::message_state_transition_event(
                     hex::encode(msg.id.as_slice()),
-                    previous.as_ref().map(|record| record.state),
+                    previous.map(|(state, _)| state),
                     MessageState::Processed,
-                    previous.as_ref().map(|record| record.epoch),
+                    previous.map(|(_, epoch)| epoch),
                     "state_update",
                 );
                 self.audit_group(&group_id, transition);
                 self.events_buf.push_back(event);
-                // In-memory fast path mirrors the durable record, keyed on
-                // the content-derived id so a re-wrapped duplicate is caught
-                // before the durable lookup.
+                // Publish hot state only after the receive/output transaction
+                // commits. A failure drops the taken group and reloads the
+                // rolled-back ratchet on retry.
                 self.seen_message_ids.insert(msg.id.clone());
                 self.return_mls_group(&group_id, mls_group);
                 reported(IngestOutcome::Processed)
             }
-            ProcessedMessageContent::ProposalMessage(queued) => {
+            DirectMessageContent::UnattributableApplication => {
+                tracing::warn!(
+                    target: "cgka_engine::message_processor",
+                    method = "ingest_group_message",
+                    "dropping application message with unattributable sender"
+                );
+                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.mark_raw_transport_message_failed_if_awaiting_retry(
+                    &raw_msg_id,
+                    "unattributable_sender",
+                )?;
+                reported(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::InvalidSignature,
+                })
+            }
+            DirectMessageContent::InvalidApplicationPayload => {
+                tracing::warn!(
+                    target: "cgka_engine::message_processor",
+                    method = "ingest_group_message",
+                    "dropping application message with invalid Marmot app event",
+                );
+                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.mark_raw_transport_message_failed_if_awaiting_retry(
+                    &raw_msg_id,
+                    "invalid_app_payload",
+                )?;
+                reported(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::InvalidEncoding,
+                })
+            }
+            DirectMessageContent::Proposal(queued) => {
                 if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
                     &group_id,
                     matches!(queued.proposal(), Proposal::Add(_)),
@@ -1733,7 +1657,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.valid_proposal_groups.insert(group_id);
                 reported(IngestOutcome::Processed)
             }
-            ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+            DirectMessageContent::ExternalJoinProposal => {
                 reported(self.terminalize_rejected_proposal(
                     &group_id,
                     &msg.id,
@@ -1741,8 +1665,7 @@ impl<S: StorageProvider> Engine<S> {
                     ProposalRejectionCategory::UnsupportedProposal,
                 )?)
             }
-            ProcessedMessageContent::OwnPendingCommit
-            | ProcessedMessageContent::OwnPrivateMessage => {
+            DirectMessageContent::OwnEcho => {
                 // This normally returns through the durable sent-content
                 // marker before OpenMLS processing. Keep the library-level
                 // classification as a safe fallback, but do not merge the
@@ -1755,8 +1678,7 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::OwnEcho,
                 })
             }
-            ProcessedMessageContent::StagedCommitMessage(_)
-            | ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+            DirectMessageContent::UnexpectedCommit => {
                 // Direct ingest never stages a commit: one at or above the live
                 // epoch entered convergence above, and OpenMLS refuses every
                 // other with `WrongEpoch`. Merging belongs to convergence alone,
@@ -1771,6 +1693,143 @@ impl<S: StorageProvider> Engine<S> {
                 ))
             }
         }
+    }
+
+    /// Prepare direct application output inside the receive transaction.
+    /// Rejected payloads remain values so their retained rows still receive the
+    /// same terminal disposition after commit; genuine storage/preparation
+    /// errors roll back receive progress and drop the taken group.
+    fn prepare_direct_message_content(
+        &self,
+        mls_group: &MlsGroup,
+        processed: ProcessedMessage,
+        context: DirectApplicationContext<'_>,
+    ) -> Result<DirectMessageContent, EngineError> {
+        let sender_id = member_id_of_processed_message(&processed, mls_group);
+        let sender_leaf_index = match processed.sender() {
+            Sender::Member(leaf) => Some(leaf.u32()),
+            _ => None,
+        };
+        let bytes = match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(bytes) => bytes,
+            ProcessedMessageContent::ProposalMessage(queued) => {
+                return Ok(DirectMessageContent::Proposal(queued));
+            }
+            ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                return Ok(DirectMessageContent::ExternalJoinProposal);
+            }
+            ProcessedMessageContent::OwnPendingCommit
+            | ProcessedMessageContent::OwnPrivateMessage => {
+                return Ok(DirectMessageContent::OwnEcho);
+            }
+            ProcessedMessageContent::StagedCommitMessage(_)
+            | ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                return Ok(DirectMessageContent::UnexpectedCommit);
+            }
+        };
+        let Some(sender) = sender_id else {
+            return Ok(DirectMessageContent::UnattributableApplication);
+        };
+        let payload = bytes.into_bytes();
+        let app_event = match crate::app_payload::validate_app_payload_for_sender(&payload, &sender)
+        {
+            Ok(event) => event,
+            Err(_) => return Ok(DirectMessageContent::InvalidApplicationPayload),
+        };
+        let DirectApplicationContext {
+            group_id,
+            msg,
+            msg_epoch,
+            current_epoch,
+            recovered_source_retention,
+        } = context;
+        let needs_authority = cgka_traits::reporting::requires_source_authority(app_event.kind);
+        let historical_source = if needs_authority && msg_epoch != current_epoch {
+            if let Some(snapshot) =
+                crate::app_payload::retained_source_snapshot(&self.storage, group_id, msg_epoch)?
+            {
+                use sha2::{Digest, Sha256};
+                let request = cgka_traits::app_event::PendingAppMessageAuthority {
+                    group_id: group_id.clone(),
+                    message_id: msg.id.clone(),
+                    epoch: msg_epoch,
+                    sender: sender.clone(),
+                    payload_digest: Sha256::digest(&payload).into(),
+                    retention: None,
+                };
+                crate::app_payload::historical_source(
+                    &self.storage,
+                    &self.crypto,
+                    &request,
+                    &snapshot,
+                    &msg.payload,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let retention_seconds = if msg_epoch == current_epoch {
+            Some(crate::app_components::message_retention_seconds_of_group(mls_group)?.unwrap_or(0))
+        } else {
+            // Successful authentication supplies both policies in one
+            // visit. If it remains unresolved, retain the ordinary
+            // source-epoch retention fallback; missing moderation proof
+            // must not exempt report explanations from expiry.
+            let recovered = historical_source
+                .as_ref()
+                .map(|source| source.retention_seconds)
+                .or_else(|| {
+                    recovered_source_retention.and_then(|(epoch, seconds)| {
+                        (epoch == msg_epoch).then_some(seconds.unwrap_or(0))
+                    })
+                });
+            match recovered {
+                Some(seconds) => Some(seconds),
+                None => self
+                    .message_retention_seconds_for_retained_source_epoch(
+                        group_id,
+                        msg_epoch,
+                        current_epoch,
+                    )?
+                    .map(|seconds| seconds.unwrap_or(0)),
+            }
+        };
+        let authority = if needs_authority && msg_epoch == current_epoch {
+            Some(crate::app_payload::source_authority(mls_group, &sender)?)
+        } else {
+            historical_source.map(|source| source.authority)
+        };
+        let encrypted_media_secret = if msg_epoch == current_epoch {
+            crate::app_payload::encrypted_media_source_secret(mls_group, &self.crypto, &app_event)?
+        } else {
+            None
+        };
+        let event = GroupEvent::MessageReceived {
+            group_id: group_id.clone(),
+            message_id: msg.id.clone(),
+            sender,
+            sender_leaf_index,
+            epoch: msg_epoch,
+            payload,
+            authority,
+            retention: retention_seconds
+                .map(|seconds| AppMessageRetentionDecision::new(app_event.created_at, seconds)),
+            encrypted_media_secret,
+        };
+        let previous = self
+            .storage
+            .get_message(&msg.id)
+            .ok()
+            .map(|record| (record.state, record.epoch));
+        self.storage
+            .update_message_state(&msg.id, MessageState::Processed)?;
+        self.storage.put_pending_application_event(&event)?;
+        Ok(DirectMessageContent::Application {
+            event: Box::new(event),
+            previous,
+        })
     }
 
     pub(crate) async fn stage_due_self_remove_auto_commit(

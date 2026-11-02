@@ -7702,6 +7702,7 @@ mod live_cursor_checkpoint_tests {
     fn a_fenced_drain_checkpoint_keeps_spilling_what_live_promotion_exposed() {
         run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
             let mut fixture = LiveCursorFixture::open().await;
+            let (spill_gate, writing) = fixture.hold_spill_writes();
             let cursor_before = fixture.cursor_before;
             let promoting = fixture.probe(cursor_before + 4_000, "promoting");
             queue_in_order(&fixture, [promoting.clone()]).await;
@@ -7715,13 +7716,15 @@ mod live_cursor_checkpoint_tests {
             let second = fixture
                 .delivery(fixture.probe(cursor_before + 1_001, "second"))
                 .await;
-            // The spill writer has not run yet, so its hand-off fences the
-            // drain checkpoint that follows, which a later ingest would
-            // otherwise have moved past the live promotion.
+            // Hold the real spill write through the checkpoint. Even a writer
+            // scheduled immediately must leave its hand-off fencing the cursor.
             fixture
                 .app
                 .relay_plane
                 .route_account_delivery_for_test(first);
+            tokio::time::timeout(std::time::Duration::from_secs(5), writing.notified())
+                .await
+                .expect("the spill writer reaches its store gate");
             assert!(fixture.client.adapter.delivery_loss_blocks_cursor());
             fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
             fixture
@@ -7743,6 +7746,7 @@ mod live_cursor_checkpoint_tests {
                     .is_none(),
                 "a delivery only the live promotion exposed is still spilled"
             );
+            drop(spill_gate);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while fixture
                     .app

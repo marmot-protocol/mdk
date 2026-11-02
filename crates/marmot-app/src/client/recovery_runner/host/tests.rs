@@ -152,6 +152,272 @@ async fn a_direct_client_runs_no_runner_with_the_gate_off() {
     assert!(matches!(client.recovery_runner, RunnerSeat::Absent));
 }
 
+/// Read through the real account host's debt turn, then publish the production
+/// survey to the same status watch the runner uses. No relay work is scripted.
+async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Survey {
+    let counts = client.recovery_runner_live_counts().await.counts;
+    let AccountRunner {
+        runner, mut turns, ..
+    } = client.build_recovery_runner().await;
+    let host = runner.host.clone();
+    let surveyed = tokio::spawn(async move {
+        let result = host
+            .debt_turn(move |turn| {
+                let turn = super::super::DebtTurn {
+                    live_counts: &counts,
+                    ..*turn
+                };
+                assert!(
+                    super::super::admission::live_fences(&turn)
+                        .unwrap()
+                        .is_empty(),
+                    "restart debt and an empty live count never fence"
+                );
+                super::super::select::survey(
+                    &turn,
+                    &RecoveryRunnerPolicy::default(),
+                    &super::super::admission::Stalled::default(),
+                )
+            })
+            .await
+            .expect("the debt turn was served")
+            .expect("route preparation and survey succeeded");
+        host.surveyed(result.catching_up.clone());
+        result
+    });
+    turns.recv().await.unwrap().serve(client).await;
+    surveyed.await.unwrap()
+}
+
+/// A cursor-present reopen must owe a group added after cold start on each
+/// relay. A quiet replay cannot erase that gap, and only proving both relays
+/// clears the group's catching-up status (mdk#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_reopen_owes_each_relays_restart_gap_without_fencing() {
+    for fail_open_write in [false, true] {
+        cursor_reopen_owes_restart_gap(fail_open_write).await;
+    }
+}
+
+async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
+    use crate::client::recovery_coverage::scenario_tests::{fixture_on, reactivate_client};
+    let Fixture {
+        client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec!["wss://a.example".into(), "wss://b.example".into()],
+        false,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let app = client.app.clone();
+    let ledger = storage.app_storage();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap();
+    assert_eq!(route.required.len(), 2);
+    let now = unix_now_seconds();
+    let last_proof = now - HOUR;
+    for relay in &route.required {
+        ledger
+            .record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route: &route.route,
+                    relay,
+                    since_seconds: now - 30 * DAY,
+                    until_seconds: last_proof,
+                    proof: RecoveryCoverageProof::Comparison,
+                }],
+                now,
+            )
+            .unwrap();
+    }
+    assert_eq!(ledger.recovery_coverage_goal(&route.route).unwrap(), None);
+    assert!(client.state.last_transport_timestamp.is_some());
+    assert!(
+        app.relay_plane
+            .subscription_rebuild_since(app.load_state("alice").unwrap().last_transport_timestamp)
+            .is_some(),
+        "the persisted cursor must select the production incremental REQ path"
+    );
+    let faults = fail_open_write.then(|| fault_connection(&client));
+    if let Some(faults) = &faults {
+        faults
+            .execute_batch(
+                "CREATE TRIGGER fail_open_goal BEFORE INSERT ON account_recovery_coverage_goals
+                 BEGIN SELECT RAISE(FAIL, 'open goal write failed'); END;",
+            )
+            .unwrap();
+    }
+    drop(client);
+
+    // Open on the existing plane, without network maintenance: the goal must
+    // exist before transport activation or any epoch-gap demand can supply it.
+    let mut reopened = app
+        .local_client_with_relay_plane("alice", &app.relay_plane, None)
+        .await
+        .unwrap();
+    assert!(reopened.state.last_transport_timestamp.is_some());
+    let goal = ledger.recovery_coverage_goal(&route.route).unwrap();
+    if let Some(faults) = faults {
+        assert_eq!(goal, None, "the failed open write left no group goal");
+        faults.execute_batch("DROP TRIGGER fail_open_goal").unwrap();
+    } else {
+        assert!(
+            goal.is_some(),
+            "account open must give a cursor-present group's route a goal"
+        );
+    }
+    assert!(
+        ledger
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| demand.cause != RecoveryCause::IncrementalHistory),
+        "ledger widening must not start the old owner's history job"
+    );
+    let off = reopened.account_recovery_status().unwrap();
+    assert!(off.catching_up_group_ids_hex.is_empty());
+    assert!(!off.inbox_catching_up);
+    assert!(off.notices.is_empty());
+
+    reopened.app = reopened.app.clone().with_recovery_runner_owning_debt();
+    reactivate_client(&mut reopened).await;
+    let counts = reopened.recovery_runner_live_counts().await.counts;
+    let group_counts = counts
+        .iter()
+        .filter(|count| count.routes.contains(&route.route))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        group_counts.len(),
+        2,
+        "both relays answered the quiet group"
+    );
+    assert!(group_counts.iter().all(|count| count.oldest_seen.is_none()));
+    for (proved, relay) in route.required.iter().enumerate() {
+        let survey = restart_goal_survey(&mut reopened).await;
+        let remaining = survey
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.key.route == route.route)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), route.required.len() - proved);
+        for candidate in remaining {
+            assert_eq!(candidate.position, last_proof + 1);
+            assert!(!candidate.blocked);
+        }
+        assert_eq!(
+            reopened
+                .account_recovery_status()
+                .unwrap()
+                .catching_up_group_ids_hex,
+            [hex::encode(group.as_slice())]
+        );
+        ledger
+            .record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route: &route.route,
+                    relay,
+                    since_seconds: last_proof + 1,
+                    until_seconds: now + DAY,
+                    proof: RecoveryCoverageProof::Comparison,
+                }],
+                now + DAY,
+            )
+            .unwrap();
+    }
+    let survey = restart_goal_survey(&mut reopened).await;
+    assert!(
+        survey
+            .candidates
+            .iter()
+            .all(|candidate| candidate.key.route != route.route)
+    );
+    assert!(
+        reopened
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex
+            .is_empty()
+    );
+}
+
+/// A group becoming current during an open account gets a goal before the
+/// runner selects work, with no restart or epoch-gap demand (mdk#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_current_route_gets_a_standing_goal_before_the_runner_selects_it() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    let first_route = group_routes(&client).pop().unwrap();
+    restart_goal_survey(&mut client).await;
+    let first_goal = ledger.recovery_coverage_goal(&first_route).unwrap();
+    assert!(first_goal.is_some());
+    let second_group = client
+        .create_group("after the first survey", &[])
+        .await
+        .unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(second_group.as_slice()))
+        .unwrap()
+        .route;
+    let before = unix_now_seconds();
+    let mut settling_wake = wake(&client);
+    let survey = restart_goal_survey(&mut client).await;
+    assert!(
+        !woken(&mut settling_wake),
+        "settling a route change must not wake its own runner"
+    );
+    let candidate = survey
+        .candidates
+        .iter()
+        .find(|candidate| candidate.key.route == route)
+        .expect("a new group's retained history is runnable without an epoch gap");
+    assert!(candidate.position <= before);
+    let goal = ledger.recovery_coverage_goal(&route).unwrap().unwrap();
+    assert!(goal >= before - 30 * DAY);
+    assert!(goal <= unix_now_seconds() - 30 * DAY);
+    let catching_up = client
+        .account_recovery_status()
+        .unwrap()
+        .catching_up_group_ids_hex;
+    assert!(catching_up.contains(&hex::encode(group.as_slice())));
+    assert!(catching_up.contains(&hex::encode(second_group.as_slice())));
+    assert_eq!(
+        ledger.recovery_coverage_goal(&first_route).unwrap(),
+        first_goal
+    );
+    let mut wake = wake(&client);
+    restart_goal_survey(&mut client).await;
+    assert!(
+        !woken(&mut wake),
+        "unchanged routes must not keep waking an idle runner"
+    );
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), Some(goal));
+}
+
 /// With the gate on, an explicit sync runs one pass in place, and the pass
 /// serves each unit due then once: two groups that each owe the last hour
 /// are each swept once over the account's own relay pool.
@@ -198,6 +464,213 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     );
     assert!(report.advanced >= 2, "each group's empty hour was proved");
     assert_eq!(passes(&client), 2);
+}
+
+async fn serve_goal_future<T>(
+    client: &mut AppClient,
+    turns: &mut tokio::sync::mpsc::Receiver<RunnerTurn>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            turn = turns.recv() => turn.unwrap().serve(client).await,
+        }
+    }
+}
+
+/// Failed mandatory goal writes must schedule a bounded local retry, retain
+/// the prior status, and recover without a new route/receipt wake (#2862).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_route_goal_writes_retry_without_spinning_or_a_new_wake() {
+    for failed_steps in [1, 4] {
+        failed_route_goal_writes(failed_steps).await;
+    }
+}
+
+async fn failed_route_goal_writes(failed_steps: usize) {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        relay: _relay,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    restart_goal_survey(&mut client).await;
+    let now = unix_now_seconds();
+    for route in client.recovery_runner_routes() {
+        for relay in route.required.iter().chain(&route.best_effort) {
+            ledger
+                .record_recovery_coverage(
+                    &[RecoveryCoverageSlice {
+                        route: &route.route,
+                        relay,
+                        since_seconds: 0,
+                        until_seconds: now + DAY,
+                        proof: RecoveryCoverageProof::Comparison,
+                    }],
+                    now,
+                )
+                .unwrap();
+        }
+    }
+    let mut account = client.build_recovery_runner().await;
+    let group = client
+        .create_group("goal write failure", &[])
+        .await
+        .unwrap();
+    let route = client
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| route.group_id.as_deref() == Some(group.as_slice()))
+        .unwrap()
+        .route;
+    let previous_status = client.routing.recovery_runner_catching_up_now();
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_route_goal BEFORE INSERT ON account_recovery_coverage_goals
+             BEGIN SELECT RAISE(FAIL, 'route goal write failed'); END;",
+        )
+        .unwrap();
+    let mut wake = wake(&client);
+    for _ in 0..failed_steps {
+        let before = unix_now_seconds();
+        let step = serve_goal_future(
+            &mut client,
+            &mut account.turns,
+            Box::pin(account.runner.step()),
+        )
+        .await;
+        let super::super::Step::Idle {
+            next_due: Some(due),
+        } = step
+        else {
+            panic!("a failed goal write must schedule a local retry, not report no debt");
+        };
+        assert!(due > before, "persistent failure must not spin");
+        assert!(
+            due <= unix_now_seconds() + 60,
+            "use the bounded local retry policy"
+        );
+        assert!(!woken(&mut wake), "failed preparation must not self-wake");
+        assert!(client.routing.recovery_runner_catching_up_now() == previous_status);
+        assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+    }
+    faults
+        .execute_batch("DROP TRIGGER fail_route_goal")
+        .unwrap();
+    assert!(
+        !woken(&mut wake),
+        "removing the fault supplied no unrelated wake"
+    );
+    let host = account.runner.host.clone();
+    let survey = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(|turn| {
+            super::super::select::survey(
+                turn,
+                &RecoveryRunnerPolicy::default(),
+                &super::super::admission::Stalled::default(),
+            )
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        survey
+            .candidates
+            .iter()
+            .any(|candidate| candidate.key.route == route)
+    );
+    assert!(ledger.recovery_coverage_goal(&route).unwrap().is_some());
+    host.surveyed(survey.catching_up);
+    assert!(
+        client
+            .account_recovery_status()
+            .unwrap()
+            .catching_up_group_ids_hex
+            .contains(&hex::encode(group.as_slice()))
+    );
+}
+
+/// An unavailable stored Welcome is a preparation failure, not proof that
+/// the copy has no hint: a broad goal could never narrow after recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_welcome_metadata_never_widens_the_goal() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use cgka_traits::storage::{GroupStorage, StorageError};
+    let Fixture {
+        mut client,
+        storage,
+        group,
+        _dir,
+        _pump,
+        relay: _relay,
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let ledger = storage.app_storage();
+    let route = group_routes(&client).pop().unwrap();
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+    let welcome_at = unix_now_seconds() - 60 * 60;
+    let mut record = storage.get_group(&group).unwrap();
+    record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+    storage.put_group(&record).unwrap();
+    let faults = fault_connection(&client);
+    faults
+        .execute(
+            "UPDATE cgka_groups SET record = x'ff' WHERE id = ?1",
+            [group.as_slice()],
+        )
+        .unwrap();
+    let mut account = client.build_recovery_runner().await;
+    let host = account.runner.host.clone();
+    let read_route = route.clone();
+    let result = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(move |turn| turn.app.recovery_coverage_goal(&read_route)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(StorageError::Serialization(_))),
+        "unreadable metadata must fail preparation"
+    );
+    assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
+
+    let mut wake = wake(&client);
+    storage.put_group(&record).unwrap();
+    assert!(
+        !woken(&mut wake),
+        "restoring metadata emits no routing wake"
+    );
+    let goal = serve_goal_future(
+        &mut client,
+        &mut account.turns,
+        host.debt_turn(move |turn| turn.app.recovery_coverage_goal(&route)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(goal, Some(welcome_at - 15 * 60));
 }
 
 /// With the gate on, a directly owned client's `next_event()` runs one pass
@@ -690,15 +1163,15 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
             .state
     };
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
 
     // Emptied while it may be waiting to hydrate, then back.
     client.routing.replace_group_routes(&group, Vec::new());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     client
         .routing
         .replace_group_routes(&group, installed.clone());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
 
     // Dropped and restored within one command.
@@ -708,13 +1181,13 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
     client
         .routing
         .replace_group_routes(&group, installed.clone());
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert!(matches!(state(&storage), RecoveryUnitState::Broken(_)));
     assert_eq!(storage.parked_recovery_routes().unwrap().len(), 1);
 
     // Dropped for good: the group's route goes on without the relay.
     client.routing.replace_group_routes(&group, moved);
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert_eq!(state(&storage), RecoveryUnitState::Retired);
     assert!(
         storage
@@ -733,7 +1206,7 @@ async fn a_relay_dropped_from_its_route_retires_once_confirmed() {
 
     // Back on the route: it owes the whole goal again.
     client.routing.replace_group_routes(&group, installed);
-    client.settle_recovery_route_changes(&storage, now);
+    client.settle_recovery_route_changes(&storage, now).unwrap();
     assert_eq!(state(&storage), RecoveryUnitState::Active);
     assert!(
         storage

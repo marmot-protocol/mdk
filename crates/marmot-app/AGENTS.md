@@ -531,14 +531,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
+  at owner seams only: account open (`record_open_coverage_goals`), the runner's routing-change settlement,
+  loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
   routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
   requests (`record_recovery_request`), native
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. A live boundary proves only what its relay's count does, once per generation: from the
+  replaces the obligations. Every account open widens every current route's standing goal, cursor or not; a runner
+  settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
+  without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
+  what its relay's count does, once per generation: from the
   second after the oldest event counted (never before the REQ's `since`) through the second before the count's
   `requested_at`. An empty count proves nothing, and no NIP-11 limit is read: the relay pool drops some frames
   uncounted, so a count cannot show a reply was not cut, and relays are assumed to cut newest first. Read the
@@ -569,7 +573,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   their required relays, so what they still owe below the floor is parked as each route's remainder; the prune settles
   every route there, so restoring a pending loss's goal below it each report parks nothing twice. Standing goals
   (startup history, epoch gaps) start at `standing_floor`: a group copy's Welcome time less the allowance, never below
-  the window. That time is only a hint: never use it to retire, un-cover or drop debt. It logs aggregate counts only.
+  the window. Read that hint from durable group metadata, not the hydration-gated live accessor: runtime opens defer
+  MLS hydration, and an overly early goal cannot narrow later. Propagate metadata read errors instead of treating
+  them as a missing hint; validate all standing floors before widening goals. That time is only a hint: never use it to retire,
+  un-cover or drop debt. It logs aggregate counts only.
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
@@ -585,12 +592,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch. The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
+  loss branch. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  changes and returns its storage error without running the debt read. The existing admission/survey local-failure
+  backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
+  The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
   adapter's installed subscriptions, which trail the routes a debt turn reads: a valid event that routes nowhere yet
   stops its slice uncovered as a local failure (`SinkStop::Unrouted`), and only an invalid one is dropped. Wake it
   through `AppTransportRouting`'s sender at the chokepoint that changes debt or routes (loss import, goal widening,
   route replacement, a released receipt, a dismissal, a group lifecycle effect), never per call site; it re-reads
-  the ledger on every wake. Every ledger and retry-state write happens in a worker turn; the
+  the ledger on every wake. Its own routing-change settlement widens goals without a wake because the same turn
+  immediately reads the debt. Every ledger and retry-state write happens in a worker turn; the
   credit wait, caps read and sweep run off the worker, and nothing read before the credit wait is planned on. Live
   tails are a query read fresh in each turn, never stored. A quantum's outcome comes from `quantum::classify` alone (the plan's outcome table): newly
   covered seconds settle `Advanced` before any relay verdict, a local write failure outranks both, and a deadline

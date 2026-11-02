@@ -85,19 +85,22 @@ fn graph_seed_read_boundaries() {
         storage.put_message(&old).unwrap();
         // Retained processed witnesses and unresolved history stay readable
         // inputs; malformed bytes in either must still propagate an error.
-        assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, None).is_err());
+        assert!(matches!(
+            seed_stored_openmls_graph_inputs(&storage, &group_id, 10, None),
+            Err(OpenMlsProjectionError::Serialize(_))
+        ));
         assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, Some(&admitted)).is_ok());
     }
     assert!(seed_stored_openmls_graph_inputs(&storage, &group_id, 10, Some(&[])).is_ok());
-    assert!(
+    assert!(matches!(
         seed_stored_openmls_graph_inputs(
             &storage,
             &group_id,
             10,
             Some(std::slice::from_ref(&old.id))
-        )
-        .is_err()
-    );
+        ),
+        Err(OpenMlsProjectionError::Serialize(_))
+    ));
     let mut other_group = storage.get_group(&group_id).unwrap();
     other_group.id = GroupId::new(vec![2; 16]);
     storage.put_group(&other_group).unwrap();
@@ -119,6 +122,7 @@ fn graph_seed_read_boundaries() {
     ));
 }
 
+/// Run with `cargo test -p cgka-engine --locked --lib graph_seed_benchmark -- --ignored --nocapture`.
 #[test]
 #[ignore = "manual graph-seeding benchmark"]
 fn graph_seed_benchmark() {

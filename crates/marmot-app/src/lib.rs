@@ -2271,6 +2271,7 @@ impl MarmotApp {
                 open.pairing_inbox,
             )),
         };
+        client.record_open_coverage_goals();
         // Loss the open imported, and the startup history request, become
         // audit rows once the client that records them exists.
         client.record_recovery_loss_imports(recovery_loss_imports);
