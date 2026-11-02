@@ -1,6 +1,7 @@
 //! Account/group-scoped attachment pages independent of engine readiness.
 use crate::conversions::{
-    AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentPageReadFfi, group_id_from_hex,
+    AttachmentEntryFfi, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentPageReadFfi,
+    group_id_from_hex,
 };
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
@@ -8,6 +9,23 @@ use std::sync::Arc;
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
 impl Marmot {
+    /// Resolve one active custom-emoji reaction's matching encrypted artwork.
+    /// This bounded local read starts no download. Use the returned original
+    /// source slot with attachment acquisition and opaque local reads.
+    pub async fn reaction_attachment(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reaction_message_id_hex: String,
+    ) -> Result<Option<AttachmentEntryFfi>, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .reaction_attachment(&account_ref, &group, &reaction_message_id_hex)
+            .await?
+            .map(Into::into))
+    }
+
     /// Read 1..=100 attachment slots in canonical newest-first order. Rejected slots
     /// consume the limit. Filter categories within returned pages; an empty filtered
     /// page is not exhaustion while has_more is true. No downloads are started.

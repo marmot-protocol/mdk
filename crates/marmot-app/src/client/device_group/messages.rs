@@ -44,6 +44,7 @@ use marmot_session::{
 use super::device_slot;
 use crate::client::AppClient;
 use crate::client::private_key_packages::SiblingWelcomeAdmission;
+use crate::client::sibling_chat_gaps::KIND_GAP_FILL_CLAIM;
 use crate::history_delivery::KIND_HISTORY_DELIVERY;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
 use crate::{AppError, unix_now_seconds};
@@ -62,6 +63,7 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
         KIND_DEVICE_HEARTBEAT
+            | KIND_GAP_FILL_CLAIM
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
             | KIND_SIBLING_WELCOME
@@ -181,6 +183,20 @@ impl AppClient {
             }
             KIND_PRIVATE_KEY_PACKAGE_REQUEST => {
                 self.receive_key_package_request(group_id, message_id, sender, &message.content)
+            }
+            KIND_GAP_FILL_CLAIM => {
+                if message.tags.is_empty() {
+                    self.receive_gap_fill_claim(
+                        group_id,
+                        sender,
+                        message.created_at,
+                        &message.content,
+                    )
+                } else {
+                    Err(AppError::InvalidAppMessagePayload(
+                        "gap-fill claim tags".into(),
+                    ))
+                }
             }
             KIND_PRIVATE_KEY_PACKAGE_HAND_OFF => {
                 self.receive_key_package_hand_off(group_id, sender, &message.content)

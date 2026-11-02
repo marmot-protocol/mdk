@@ -249,11 +249,10 @@ async fn a_device_without_account_devices_cannot_be_added_later() {
         "{invite:?}"
     );
     let bob_laptop_kp = key_package(b"bob", false).await;
-    assert!(
+    assert_missing_account_devices(
         bob.engine
             .send(add_own_devices(&gid, vec![unnamed(bob_laptop_kp)]))
-            .await
-            .is_err()
+            .await,
     );
     assert_eq!(alice.engine.epoch(&gid).unwrap(), epoch);
     assert_eq!(bob.engine.epoch(&gid).unwrap(), epoch);
