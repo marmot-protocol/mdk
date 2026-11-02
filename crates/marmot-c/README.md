@@ -241,6 +241,11 @@ while passing its `next_cursor`, then free the page. Calls block. See the
 `marmot_upload_media_files` and its token-aware twin take borrowed
 `MarmotMediaFileUploadRequest` inputs with private regular-file paths instead of
 plaintext arrays. See the [shared contract](../marmot-uniffi/README.md#file-backed-media-upload).
+`MarmotMediaAttachmentReference.source_epoch_identity` is a nullable local upload
+identity. Preserve the returned string when saving and sending a reference;
+NULL references remain readable but require a fresh upload before sending. See
+the [shared upload provenance contract](../marmot-uniffi/README.md#file-backed-media-upload).
+The field changes the reference layout, including records embedding it.
 Calls block; run them off the UI thread. Strings and request arrays must remain
 valid until return. Create one `MarmotMediaFileTransferControl` per call, query or
 cancel it from another thread, and free it only after all calls on the handle

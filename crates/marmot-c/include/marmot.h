@@ -1851,6 +1851,10 @@ typedef struct MarmotMediaAttachmentReference {
    */
   uint32_t version;
   uint64_t source_epoch;
+  /**
+   * Nullable local upload branch identity; preserve unchanged when sending.
+   */
+  char *source_epoch_identity;
   char *dim;
   char *thumbhash;
 } MarmotMediaAttachmentReference;

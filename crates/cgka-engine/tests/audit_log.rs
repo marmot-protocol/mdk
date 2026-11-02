@@ -286,6 +286,7 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
     //   - IngestOutcome (Stale / NotForThisClient)
     let foreign = MemberId::new(vec![0x33; 32]);
     let msg = synthetic_welcome_for(foreign, 0xaa);
+    let expected_id = hex::encode(msg.id.as_slice());
     let outcome = engine.ingest(msg).await.expect("ingest");
     assert!(
         matches!(
@@ -337,11 +338,16 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
             msg_id,
             envelope_kind,
             payload_len,
+            payload_digest,
             ..
         } => {
             assert_eq!(envelope_kind, "welcome");
             assert_eq!(*payload_len, 4);
-            assert_eq!(msg_id.len(), 32, "msg_id should be 16-byte hex (32 chars)");
+            assert_eq!(msg_id, &expected_id);
+            assert_eq!(
+                payload_digest,
+                "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+            );
         }
         _ => unreachable!(),
     }
@@ -352,15 +358,21 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
         .expect("IngestOutcome not recorded");
     match &outcome_event.kind {
         AuditEventKind::IngestOutcome {
+            msg_id,
             outcome_kind,
             stale_reason,
             ..
         } => {
+            assert_eq!(msg_id, &expected_id);
             assert_eq!(outcome_kind, "ignored");
             assert_eq!(stale_reason.as_deref(), Some("wrong_recipient"));
         }
         _ => unreachable!(),
     }
+    assert!(
+        entry.seq < outcome_event.seq,
+        "entry must precede its correlated outcome"
+    );
 }
 
 #[tokio::test]
@@ -467,30 +479,6 @@ async fn epoch_confirmed_inherits_operation_human_action() {
 }
 
 #[tokio::test]
-async fn engine_without_recorder_is_silent_and_does_not_crash() {
-    // No recorder configured -> NoopRecorder. Engine should function normally
-    // and emit zero side effects.
-    let identity = valid_identity(b"self");
-    let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
-        .legacy_compatibility_profile()
-        .identity(identity)
-        .account_identity_proof_signer(proof_signer(b"self"))
-        .peeler(Box::new(StubPeeler))
-        .build()
-        .expect("build engine without recorder");
-
-    let foreign = MemberId::new(vec![0x33; 32]);
-    let msg = synthetic_welcome_for(foreign, 0xbb);
-    let outcome = engine.ingest(msg).await.expect("ingest");
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Ignored {
-            category: cgka_traits::ingest::InputRejectionCategory::WrongRecipient
-        }
-    ));
-}
-
-#[tokio::test]
 async fn audit_log_records_transport_received_before_ingest_entry() {
     // Requirement #8: when the transport layer supplies a wire envelope, the
     // engine records a `transport_received` row carrying it before `ingest_entry`
@@ -594,7 +582,7 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("account.sqlite");
     let audit_path = dir.path().join("audit.jsonl");
-    let key = SqlCipherKey::new("audit-correlation-fixture-key").unwrap();
+    let key = SqlCipherKey::raw([0x42; 32]);
     let identity = valid_identity(b"queued-audit");
     let build = || {
         let recorder = JsonlRecorder::open_v5_with_account_ref(

@@ -317,6 +317,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   (`stage_auto_commit_for_queued_proposals`). A swallowed mirror error resurfaces as a wrong epoch on the next open. A
   failed inbound apply must also hand the retained commit back via `schedule_pending_convergence_group`, or the group
   parks one epoch behind a commit nothing will apply.
+- **Stored-message audit rows describe work in a committed storage unit.** Route every `MessageStateChanged` through
+  `audit_with_context`, which captures context at the transition and appends through `StorageProvider::after_commit`.
+  Inner helper success is not an outer commit; rollback and abandoned savepoints emit no positive state row. A backend
+  without the optional boundary hook omits state rows; operation observations remain best effort and immediate.
 - **A branch-selection withdrawal is provisional: announced once, and reversible.** A losing commit is parked
   `ConvergenceDeferred` (still a canonicalization input) so a later pass with deeper evidence can re-adopt it. Both
   halves of `distributed_convergence.rs` key on the commit's stored state *before* the pass's disposition persistence
@@ -505,8 +509,8 @@ From the 2026-05-09 engine audit and follow-ups. Grep the rule when touching the
 | Rule | Test |
 | --- | --- |
 | Convergence-side replay refreshes the recipient's Marmot record (`required_capabilities`, `name`, `description`) via `update_group_record_from_replay` | `tests/update_group_data.rs::convergence_refreshes_recipient_marmot_record_name_and_description`, `tests/capabilities.rs::convergence_refreshes_recipient_required_capabilities_on_upgrade` |
-| `GroupContextView::exporter_secret` returns `None` when asked for more bytes than cached | `tests/group_context_view.rs` |
-| Snapshot names never embed plaintext group ids (hash to a digest) | `tests/snapshot_privacy.rs` |
+| `GroupContextView::exporter_secret` returns `None` when asked for more bytes than cached | `src/group_context_view.rs::tests`; exact-length assembly and staged-source exports: `tests/group_creation.rs` |
+| Snapshot names never embed plaintext group ids (hash to a digest) | `tests/group_creation.rs::snapshot_names_do_not_embed_plaintext_group_id` |
 | Every admitted message gets a current disposition; a child commit missing its frozen-batch parent is explicitly `deferred` and the pass reaches its fixed point | simulator `canonicalization_contract.rs::frozen_batch_defers_orphan_commit_and_settles_at_fixed_point` |
 | No `MessageReceived` with an empty/unresolvable sender on either seam (direct: `Failed`; replay: `Ignored`; `emit_application_replay_events` skips empty senders as a backstop) | `app_payload::tests`; `tests/distributed_convergence.rs::terminal_undecryptable_app_emits_invalidation_without_message_received` |
 | `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` run the fallible transition before mutating maps (mdk#146); auto-commit ingest staging requires `EpochState::is_stable` | `epoch_manager::tests::begin_pending_failure_leaves_state_intact`, `begin_pending_success_records_all_bookkeeping` |

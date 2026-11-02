@@ -149,6 +149,16 @@ jobs:
           jq -s -e 'all(.[]; .metadata.storage_backend == "encrypted-file-sqlite")' \
             target/cgka-conformance-simulator-nightly-reports/*-report.json >/dev/null
 
+      - name: Record nightly target breakdown
+        if: always()
+        continue-on-error: true
+        run: |
+          umask 077
+          # Count apparent bytes, including Cargo's hard-linked copies. Unlike
+          # the collector's file lengths, du also counts directory metadata.
+          du --bytes --count-links --max-depth=2 target | sort -n \
+            > "$CGKA_LANE_EVIDENCE_DIR/target-sizes.txt"
+
       - name: Collect nightly lane observation
         if: always()
         run: |

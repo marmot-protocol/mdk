@@ -347,7 +347,7 @@ pub struct Engine<S: StorageProvider> {
     /// engine only records: the layer that built it owns the log's file,
     /// rotation and end, through a shared handle it keeps (`marmot-session`
     /// passes a clone of its `marmot_forensics::SharedRecorder`).
-    pub(crate) recorder: Box<dyn ForensicRecorder>,
+    pub(crate) recorder: Arc<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,
     /// Audit context for the in-flight local operation. The send and
     /// create-group `*_with_audit_context` entry points set this through an
@@ -749,7 +749,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_clock: self.convergence_clock,
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
-            recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
+            recorder: Arc::from(self.recorder.unwrap_or_else(|| Box::new(NoopRecorder))),
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
@@ -2190,10 +2190,11 @@ impl<S: StorageProvider> Engine<S> {
             && !restored_pending
             && !restored_durable_evolution
         {
-            // Clear the staged commit transactionally (preserves the #421
-            // crash-safety fix): the MLS storage mutation must be atomic so a
-            // crash mid-clear cannot leave torn group state.
-            self.storage
+            // Retire the staged Welcomes, clear the pending MLS commit and
+            // persist its corrected mirror in one durable unit (#421, #2422).
+            // Losing the pending marker before the mirror is durable would
+            // let a later hydration promote the canceled invitees as members.
+            let recovered_epoch = self.storage
                 .with_transaction(|storage| {
                     let source_epoch = EpochId(mls_group.epoch().as_u64());
                     crate::message_processor::transition_staged_invite_welcomes(
@@ -2211,17 +2212,17 @@ impl<S: StorageProvider> Engine<S> {
                         .clear_pending_commit(
                             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
                         )
-                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                    crate::test_crash_hooks::pause_if_requested("orphan-pending-after-clear");
+                    let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+                    group.epoch = recovered_epoch;
+                    group.members = crate::group_lifecycle::marmot_members(&mls_group);
+                    group.required_capabilities =
+                        crate::capability_manager::required_capabilities_from_group(&mls_group);
+                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
+                    storage.put_group(&group)?;
+                    Ok::<_, EngineError>(recovered_epoch)
                 })
-                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            let recovered_epoch = EpochId(mls_group.epoch().as_u64());
-            group.epoch = recovered_epoch;
-            group.members = crate::group_lifecycle::marmot_members(&mls_group);
-            group.required_capabilities =
-                crate::capability_manager::required_capabilities_from_group(&mls_group);
-            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-            self.storage
-                .put_group(&group)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             self.audit_group(
                 group_id,
@@ -3097,6 +3098,9 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
         kind: AuditEventKind,
     ) {
+        if !self.recorder.is_enabled() {
+            return;
+        }
         // Fall back to the in-flight operation's context so secondary rows
         // emitted via the context-less `audit`/`audit_group` helpers still
         // carry the operation's `human_action`. An explicit context always wins.
@@ -3106,7 +3110,17 @@ impl<S: StorageProvider> Engine<S> {
             kind,
         );
         record.context = context;
-        self.recorder.record(record);
+        if matches!(&record.kind, AuditEventKind::MessageStateChanged { .. }) {
+            // A helper's successful write may still belong to a caller's outer
+            // transaction or savepoint. Capture provenance now, but let storage
+            // release the observation only after the owning unit commits. The
+            // recorder assigns its envelope/sequence at that later append.
+            let recorder = Arc::clone(&self.recorder);
+            self.storage
+                .after_commit(Box::new(move || recorder.record(record)));
+        } else {
+            self.recorder.record(record);
+        }
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that

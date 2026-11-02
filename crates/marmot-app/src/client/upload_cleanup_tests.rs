@@ -143,7 +143,7 @@ fn fault_connection(app: &MarmotApp) -> rusqlite::Connection {
 }
 
 /// Serve genuine encrypted PUTs and reject any unexpected acquisition.
-async fn upload_endpoint() -> (
+pub(crate) async fn upload_endpoint() -> (
     String,
     Arc<std::sync::atomic::AtomicUsize>,
     tokio::task::JoinHandle<()>,

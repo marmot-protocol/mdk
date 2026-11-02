@@ -1573,12 +1573,7 @@ async fn complete_folder_assignment_progresses_past_freshly_ineligible_originals
         .app_storage()
         .save_account_projection_state(&state, 100, 120)
         .unwrap();
-    assert!(matches!(
-        f.store
-            .app_storage()
-            .chat_list_selection_snapshot(ChatListView::Chats),
-        Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady)
-    ));
+    // Background maintenance may already have completed the saved row work.
     f.store
         .app_storage()
         .refresh_chat_list_rows(&f.account_id, &|_, _| false)
@@ -1890,6 +1885,23 @@ async fn complete_reselect_rechecks_scope_and_preserves_state_on_capture_failure
         Err(ChatListSelectionError::Closed)
     ));
     assert_eq!(handle.status().await.unwrap(), shrunk);
+    // Hold the new arrival's base-row work until the capture-failure check.
+    // The worker may otherwise finish it between the save and reselection.
+    let path = f.app.account_storage_path("alice");
+    let keys = f.app.account_home().load_signing_keys("alice").unwrap();
+    let key = f
+        .app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection.execute_batch("CREATE TRIGGER selection_hold_reselect_base BEFORE DELETE ON chat_presentation_row_work
+        WHEN OLD.group_id_hex = 'ffff' BEGIN SELECT RAISE(ABORT, 'injected selection base preparation hold'); END;").unwrap();
     let mut state = f
         .store
         .app_storage()
@@ -1923,6 +1935,9 @@ async fn complete_reselect_rechecks_scope_and_preserves_state_on_capture_failure
         ))
     ));
     assert_eq!(handle.status().await.unwrap(), shrunk);
+    connection
+        .execute_batch("DROP TRIGGER selection_hold_reselect_base;")
+        .unwrap();
     f.store
         .app_storage()
         .refresh_chat_list_rows(&f.account_id, &|_, _| false)

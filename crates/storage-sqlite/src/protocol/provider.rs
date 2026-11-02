@@ -76,6 +76,10 @@ impl StorageProvider for SqliteAccountStorage {
         self.connection.with_transaction(|| f(self))
     }
 
+    fn after_commit(&self, callback: Box<dyn FnOnce() + Send + 'static>) {
+        self.connection.after_commit(callback);
+    }
+
     fn with_group_savepoint<T, E, F>(
         &self,
         _group_id: &cgka_traits::types::GroupId,

@@ -34,8 +34,7 @@ use cgka_traits::types::{GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 
-mod support;
-use support::proof_signer;
+use crate::support::proof_signer;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     use k256::schnorr::SigningKey;
@@ -153,6 +152,7 @@ fn open(
     id: &[u8],
     storage: SqliteAccountStorage,
     supported: Vec<AppComponentId>,
+    clock: &cgka_engine::ManualConvergenceClock,
 ) -> Engine<SqliteAccountStorage> {
     let mut engine = EngineBuilder::new(storage)
         .identity(pad32(id))
@@ -161,6 +161,7 @@ fn open(
         .feature_registry(registry())
         .supported_app_components(supported)
         .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
         .build()
         .unwrap();
     engine.hydrate_all_stored_groups().unwrap();
@@ -171,22 +172,25 @@ struct Device {
     id: &'static [u8],
     storage: SqliteAccountStorage,
     engine: Engine<SqliteAccountStorage>,
+    clock: cgka_engine::ManualConvergenceClock,
 }
 
 impl Device {
     fn old(id: &'static [u8]) -> Self {
         let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
-        let engine = open(id, storage.clone(), old_components());
+        let clock = cgka_engine::ManualConvergenceClock::new(0, 1_800_000_000_000);
+        let engine = open(id, storage.clone(), old_components(), &clock);
         Self {
             id,
             storage,
             engine,
+            clock,
         }
     }
 
     /// Reopen on the same storage as a build that supports the vehicle.
     fn upgrade(&mut self) {
-        self.engine = open(self.id, self.storage.clone(), new_components());
+        self.engine = open(self.id, self.storage.clone(), new_components(), &self.clock);
     }
 }
 
@@ -242,6 +246,7 @@ async fn commit_and_deliver(
     to: &mut Engine<SqliteAccountStorage>,
     gid: &GroupId,
     intent: SendIntent,
+    clock: &cgka_engine::ManualConvergenceClock,
 ) {
     let (commit, pending) = match from.send(intent).await.unwrap() {
         SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
@@ -254,7 +259,7 @@ async fn commit_and_deliver(
         if to.epoch(gid).unwrap() == target {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        clock.advance_ms(250);
         to.advance_convergence(gid).await.unwrap();
     }
     assert_eq!(to.epoch(gid).unwrap(), target, "peer applied the commit");
@@ -293,6 +298,7 @@ async fn self_update_readvertises_newly_supported_components() {
         SendIntent::SelfUpdate {
             group_id: gid.clone(),
         },
+        &bob.clock,
     )
     .await;
 

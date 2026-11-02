@@ -755,7 +755,7 @@ mod tests {
             },
             GroupStateChange::AdminRemoved { member },
             GroupStateChange::GroupRenamed {
-                name: "renamed".into(),
+                name: "private audit title".into(),
                 previous_name: None,
             },
             GroupStateChange::GroupAvatarChanged,
@@ -765,6 +765,59 @@ mod tests {
             },
             GroupStateChange::GroupDisbanded,
         ];
+        let expected_kinds = [
+            "member_added",
+            "member_removed",
+            "member_left",
+            "admin_added",
+            "admin_removed",
+            "group_renamed",
+            "group_avatar_changed",
+            "message_retention_changed",
+            "group_disbanded",
+        ];
+        for (change, expected) in changes.iter().zip(expected_kinds) {
+            assert_eq!(group_state_change_kind_str(change), expected);
+
+            let event = group_state_changed_event(EpochId(7), None, change, None);
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(!encoded.contains("private audit title"));
+            if let AuditEventKind::GroupStateChanged {
+                membership_change_source,
+                value,
+                ..
+            } = event
+            {
+                if matches!(change, GroupStateChange::MemberAdded { .. }) {
+                    assert_eq!(
+                        membership_change_source,
+                        Some(MembershipChangeSource::RemoteCommit)
+                    );
+                }
+                let expected_value = match change {
+                    GroupStateChange::GroupRenamed { .. } => Some((
+                        "d5677e31020186e606a271449d8ba3989de2abb07accab38cc5ecac63fedf51b",
+                        19,
+                    )),
+                    GroupStateChange::MessageRetentionChanged { .. } => Some((
+                        "6dc9572acea1eb3d2fd803631ec01ccabd9bf9dc78f284dab9bb5a52a09eaa91",
+                        8,
+                    )),
+                    _ => None,
+                };
+                match expected_value {
+                    Some((digest, len)) => {
+                        let value =
+                            value.expect("sensitive changes carry only a digest and length");
+                        assert_eq!(value.digest.as_deref(), Some(digest));
+                        assert_eq!(value.len, Some(len));
+                    }
+                    None => assert!(value.is_none()),
+                }
+            } else {
+                panic!("group change must produce its own audit record");
+            }
+        }
         let emitted = changes
             .iter()
             .map(group_state_change_kind_str)

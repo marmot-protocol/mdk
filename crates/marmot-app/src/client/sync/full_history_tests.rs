@@ -57,10 +57,39 @@ fn control<'a>(
     cancelled: &'a (dyn Fn() -> bool + Sync),
 ) -> FullHistoryRepairControl<'a> {
     FullHistoryRepairControl {
-        started: Instant::now(),
+        started: tokio::time::Instant::now(),
         timeout,
         cancelled,
     }
+}
+
+/// Stop polling only while the real repair has checkpointed a nonempty proper
+/// prefix. A Pending before admission or after the entire batch is not enough.
+async fn wait_for_durable_admission_prefix<T>(
+    mut repair: std::pin::Pin<&mut impl std::future::Future<Output = T>>,
+    app: &MarmotApp,
+    ids: &[String],
+) {
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        match repair.as_mut().poll(cx) {
+            Poll::Ready(_) => panic!("repair must yield while its batch is being admitted"),
+            Poll::Pending => {
+                let saved = app.load_state("alice").unwrap();
+                let admitted = ids
+                    .iter()
+                    .filter(|id| saved.seen_events.contains(id))
+                    .count();
+                if admitted == 0 {
+                    Poll::Pending
+                } else {
+                    assert!(admitted < ids.len(), "the batch is still being admitted");
+                    Poll::Ready(())
+                }
+            }
+        }
+    })
+    .await;
 }
 
 /// A relay may still hold an event older than the retained-inventory window.
@@ -134,15 +163,18 @@ async fn certified_window_closes_the_request_and_names_the_history_below_it() {
     );
 }
 
-/// A comparison that returns just inside the budget can hand over a large
-/// batch. Admission stops at the first turn boundary past the deadline: the
-/// admitted prefix stays durable and the repair reports the deadline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A completed comparison hands over more events than one admission turn.
+/// Admission stops at the first turn boundary past the deadline: the admitted
+/// prefix stays durable and the repair reports the deadline.
+#[tokio::test(start_paused = true)]
 async fn the_deadline_stops_admission_at_a_turn_boundary() {
-    const FETCHED: usize = 200;
+    const FETCHED: usize = comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN + 1;
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client.create_group("large batch", &[]).await.unwrap();
+    let group = client
+        .create_group("admission boundary", &[])
+        .await
+        .unwrap();
     let route = app
         .group("alice", &hex::encode(group.as_slice()))
         .unwrap()
@@ -175,13 +207,17 @@ async fn the_deadline_stops_admission_at_a_turn_boundary() {
             },
         )))
     }));
-    // The budget outlives the instant comparison but not a whole batch of
-    // SQLCipher admissions.
     let budget = Duration::from_millis(300);
-    let failure = client
-        .repair_full_history_with_control(&control(budget, &|| false))
-        .await
-        .unwrap_err();
+    let repair_control = control(budget, &|| false);
+    let failure = {
+        let repair = client.repair_full_history_with_control(&repair_control);
+        tokio::pin!(repair);
+        wait_for_durable_admission_prefix(repair.as_mut(), &app, &ids).await;
+        // The first turn checkpointed its prefix inside the budget. Expire the
+        // whole budget before polling the turn that would admit the remainder.
+        tokio::time::advance(Duration::from_millis(400)).await;
+        repair.await.unwrap_err()
+    };
     assert_eq!(
         failure.source.full_history_repair_incomplete(),
         Some((crate::FullHistoryRepairIncompleteReason::Deadline, false))
@@ -190,6 +226,10 @@ async fn the_deadline_stops_admission_at_a_turn_boundary() {
         .iter()
         .filter(|id| client.state.seen_events.contains(id))
         .count();
+    assert!(
+        admitted > 0,
+        "the first turn's durable prefix remains admitted"
+    );
     assert!(
         admitted < FETCHED,
         "admission stopped before the whole batch ({admitted} admitted)"
@@ -786,7 +826,7 @@ async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
 /// while admitting. The certified window wins over the clock: the repair
 /// reports the unsearched history below it and closes its request, not
 /// `Deadline`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
     const FETCHED: usize = 24;
     let (_dir, app, _relay) = fixture();
@@ -814,7 +854,7 @@ async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
     let budget = Duration::from_secs(6);
     let calls = Arc::new(AtomicUsize::new(0));
     let answered_calls = calls.clone();
-    client.test_comparison_results = Some(ScriptedComparisons::timed(move |_| {
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(move |_| {
         let mut answer = Ok(Some((
             transport_nostr_adapter::NostrReconciliationSummary {
                 relays_succeeded: 1,
@@ -823,26 +863,37 @@ async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
             Vec::new(),
         )));
         if answered_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            // The first route finishes just inside the cutoff with a batch
-            // whose admission crosses it.
+            // Both routes finish before any virtual time passes; admission
+            // will cross the cutoff after its first durable prefix.
             if let Ok(Some((_, returned))) = &mut answer {
                 returned.extend(events.clone());
             }
-            (Some(Duration::from_millis(4_950)), answer)
-        } else {
-            (None, answer)
         }
+        answer
     }));
-    let started = Instant::now();
-    let failure = client
-        .repair_full_history_with_control(&control(budget, &|| false))
-        .await
-        .unwrap_err();
+    let started = tokio::time::Instant::now();
+    let repair_control = control(budget, &|| false);
+    let failure = {
+        let repair = client.repair_full_history_with_control(&repair_control);
+        tokio::pin!(repair);
+        wait_for_durable_admission_prefix(repair.as_mut(), &app, &ids).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes finished");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        tokio::time::advance(Duration::from_millis(5_100)).await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "admission crossed the network cutoff"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "and remains inside the whole repair budget"
+        );
+        repair.await.unwrap_err()
+    };
     assert!(
-        started.elapsed() >= Duration::from_secs(5),
-        "admission crossed the network cutoff"
+        started.elapsed() < budget,
+        "admission finished inside the budget"
     );
-    assert!(started.elapsed() < budget, "and finished inside the budget");
     assert_eq!(calls.load(Ordering::SeqCst), 2, "both routes were compared");
     assert_eq!(
         failure.source.full_history_repair_incomplete(),

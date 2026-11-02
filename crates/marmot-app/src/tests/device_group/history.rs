@@ -312,6 +312,9 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
         media_type: "image/jpeg".into(),
         version: crate::media::EncryptedMediaVersion::V2.as_str().into(),
         source_epoch: 0,
+        source_epoch_identity: Some(hex::encode(
+            alice.runtime.epoch_pin(&chat).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
@@ -355,6 +358,7 @@ async fn an_imported_photo_comes_with_its_attachment_key() {
     bob.accept_group_invite(&chat).unwrap();
     let source = crate::media::MediaAttachmentReference {
         source_epoch: epoch,
+        source_epoch_identity: None,
         ..reference.clone()
     };
     assert!(

@@ -214,7 +214,7 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
 
 /// Read-only admission snapshot used to filter discovery candidates before ranking.
 /// Sending still revalidates against canonical group state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageRequirements {
     profile: ProtocolProfile,
     ciphersuite: openmls_traits::types::Ciphersuite,
@@ -222,6 +222,41 @@ pub struct KeyPackageRequirements {
 }
 
 impl KeyPackageRequirements {
+    /// Cheap, time-independent rejection using authenticated publication
+    /// metadata. This is only a prefilter: it does not authenticate the
+    /// supplied metadata, check lifetime or device tags, or authorize an Add.
+    /// Callers must still validate the actual candidate before consuming it.
+    pub fn supports_metadata(&self, metadata: &KeyPackageMetadata) -> bool {
+        use crate::capabilities::{
+            DEFAULT_MLS_EXTENSION_TYPES, DEFAULT_MLS_PROPOSAL_TYPES,
+            with_implicit_default_capabilities,
+        };
+        // Invitees must omit implicit MLS defaults from their signed
+        // advertisements, as `validate_invitee_capabilities` requires.
+        if metadata.protocol_profile != self.profile
+            || metadata.ciphersuite != u16::from(self.ciphersuite)
+            || metadata
+                .mls_extensions
+                .iter()
+                .any(|id| DEFAULT_MLS_EXTENSION_TYPES.contains(id))
+            || metadata
+                .mls_proposals
+                .iter()
+                .any(|id| DEFAULT_MLS_PROPOSAL_TYPES.contains(id))
+        {
+            return false;
+        }
+        let had =
+            with_implicit_default_capabilities(cgka_traits::capabilities::GroupCapabilities {
+                extensions: metadata.mls_extensions.iter().copied().collect(),
+                proposals: metadata.mls_proposals.iter().copied().collect(),
+                app_components: cgka_traits::app_components::AppComponentSet::new(
+                    metadata.app_components.iter().copied(),
+                ),
+            });
+        self.required.missing_from(&had).is_empty()
+    }
+
     /// Validate identity, lifetime, profile, ciphersuite, and required capabilities.
     /// Client labels never participate in this admission check.
     pub fn validate(&self, package: &KeyPackage) -> Result<(), EngineError> {
@@ -248,6 +283,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<KeyPackageRequirements, EngineError> {
+        self.ensure_group_live(group_id)?;
         let record = self.storage.get_group(group_id)?;
         self.with_mls_group(group_id, |group| {
             let mut required = record.required_capabilities.clone();
