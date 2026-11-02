@@ -116,6 +116,9 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
                         key_package_ref.clone(),
                         *deliver_until,
                         None,
+                        cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(
+                            staged_origin_commit_id.clone(),
+                        ),
                     )
                     .encode()
                     .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;

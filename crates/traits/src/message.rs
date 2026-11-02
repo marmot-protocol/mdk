@@ -63,6 +63,19 @@ pub struct OwnApplicationConvergenceStamp {
     pub source_epoch_authenticator: String,
 }
 
+/// The canonical operation that produced a retained sibling Welcome.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiblingWelcomeOrigin {
+    /// Older development payloads did not retain their origin. They cannot
+    /// establish that the Welcome is still deliverable.
+    #[default]
+    LegacyUnproven,
+    /// The founding Add was made canonical in the creation transaction.
+    CanonicalFounding,
+    /// A published Add whose stored disposition must still be selected.
+    ConfirmedCommit(MessageId),
+}
+
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].
 ///
 /// The database column remains a byte blob so backends do not need a schema
@@ -110,7 +123,9 @@ pub struct OwnApplicationConvergenceStamp {
 ///   no longer holds its key.
 /// - `OutboundSiblingWelcome`: such a Welcome once its Commit confirmed, owed
 ///   until a 461 carrying it is published. `carrier` is that 461's app event
-///   id, recorded before its send; a failed send clears it.
+///   id, recorded before its send; a failed send clears it once no frozen
+///   retry remains. Its explicit origin survives promotion and restart;
+///   older development payloads without one decode as `LegacyUnproven`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum StoredMessagePayload {
@@ -158,6 +173,8 @@ pub enum StoredMessagePayload {
         deliver_until: Timestamp,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         carrier: Option<Vec<u8>>,
+        #[serde(default)]
+        origin: SiblingWelcomeOrigin,
     },
 }
 
@@ -244,12 +261,14 @@ impl StoredMessagePayload {
         key_package_ref: Vec<u8>,
         deliver_until: Timestamp,
         carrier: Option<Vec<u8>>,
+        origin: SiblingWelcomeOrigin,
     ) -> Self {
         Self::OutboundSiblingWelcome {
             welcome,
             key_package_ref,
             deliver_until,
             carrier,
+            origin,
         }
     }
 
@@ -548,14 +567,27 @@ fn encode_stored_message_payload_v2(
             key_package_ref,
             deliver_until,
             carrier,
+            origin,
         } => {
-            out.push(11);
+            out.push(if *origin == SiblingWelcomeOrigin::LegacyUnproven {
+                11
+            } else {
+                12
+            });
             encode_var_bytes(welcome, &mut out, "sibling Welcome")?;
             encode_var_bytes(key_package_ref, &mut out, "Welcome KeyPackageRef")?;
             out.extend_from_slice(&deliver_until.0.to_be_bytes());
             encode_option(carrier.as_ref(), &mut out, |carrier, out| {
                 encode_var_bytes(carrier, out, "sibling Welcome carrier")
             })?;
+            match origin {
+                SiblingWelcomeOrigin::LegacyUnproven => {}
+                SiblingWelcomeOrigin::CanonicalFounding => out.push(1),
+                SiblingWelcomeOrigin::ConfirmedCommit(id) => {
+                    out.push(2);
+                    encode_var_bytes(id.as_slice(), &mut out, "sibling Welcome origin commit id")?;
+                }
+            }
         }
     }
     Ok(out)
@@ -633,6 +665,20 @@ fn decode_stored_message_payload_v2(
             key_package_ref: decoder.var_bytes("Welcome KeyPackageRef")?,
             deliver_until: Timestamp(decoder.u64("Welcome delivery deadline")?),
             carrier: decoder.option(|decoder| decoder.var_bytes("sibling Welcome carrier"))?,
+            origin: SiblingWelcomeOrigin::LegacyUnproven,
+        },
+        12 => StoredMessagePayload::OutboundSiblingWelcome {
+            welcome: decoder.var_bytes("sibling Welcome")?,
+            key_package_ref: decoder.var_bytes("Welcome KeyPackageRef")?,
+            deliver_until: Timestamp(decoder.u64("Welcome delivery deadline")?),
+            carrier: decoder.option(|decoder| decoder.var_bytes("sibling Welcome carrier"))?,
+            origin: match decoder.u8("sibling Welcome origin")? {
+                1 => SiblingWelcomeOrigin::CanonicalFounding,
+                2 => SiblingWelcomeOrigin::ConfirmedCommit(MessageId::new(
+                    decoder.var_bytes("sibling Welcome origin commit id")?,
+                )),
+                value => return Err(invalid(format!("unknown sibling Welcome origin {value}"))),
+            },
         },
         variant => {
             return Err(invalid(format!(
@@ -1150,12 +1196,14 @@ mod stored_payload_codec_tests {
                 vec![0x58; 32],
                 Timestamp(1_700_000_600),
                 None,
+                SiblingWelcomeOrigin::CanonicalFounding,
             ),
             StoredMessagePayload::outbound_sibling_welcome(
                 vec![0x61; 40],
                 vec![0x58; 32],
                 Timestamp(1_700_000_600),
                 Some(vec![0x62; 32]),
+                SiblingWelcomeOrigin::ConfirmedCommit(MessageId::new([0x55, 0x56])),
             ),
         ];
 
@@ -1186,6 +1234,42 @@ mod stored_payload_codec_tests {
             hex::encode(value.encode().unwrap()),
             "4d444b4d5000020201aa02bbcc00000000000000070001780001dd"
         );
+    }
+
+    /// Old development rows retain their exact bytes but cannot establish
+    /// canonical provenance. New rows distinguish founding from a real Add.
+    #[test]
+    fn sibling_welcome_origin_has_distinct_bytes_and_legacy_is_unproven() {
+        let legacy = b"MDKMP\0\x02\x0b\x01w\x01k\0\0\0\0\0\0\0\x09\0";
+        let decoded = StoredMessagePayload::decode(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            StoredMessagePayload::OutboundSiblingWelcome {
+                origin: SiblingWelcomeOrigin::LegacyUnproven,
+                ..
+            }
+        ));
+        assert_eq!(decoded.encode().unwrap(), legacy);
+        for (origin, tail) in [
+            (SiblingWelcomeOrigin::CanonicalFounding, vec![1]),
+            (
+                SiblingWelcomeOrigin::ConfirmedCommit(MessageId::new(b"c")),
+                vec![2, 1, b'c'],
+            ),
+        ] {
+            let payload = StoredMessagePayload::outbound_sibling_welcome(
+                b"w".to_vec(),
+                b"k".to_vec(),
+                Timestamp(9),
+                None,
+                origin,
+            );
+            let mut expected = legacy.to_vec();
+            expected[7] = 12;
+            expected.extend(tail);
+            assert_eq!(payload.encode().unwrap(), expected);
+            assert_eq!(StoredMessagePayload::decode(&expected).unwrap(), payload);
+        }
     }
 
     #[test]

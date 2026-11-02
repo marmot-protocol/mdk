@@ -1020,6 +1020,14 @@ mod same_account_welcome {
         use super::tagged_siblings::*;
         let dir = tempfile::tempdir().unwrap();
         let (mut phone, mut laptop, device_group) = tagged_phone_and_laptop(&dir).await;
+        let wall = Arc::new(TestWallClock::new(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        ));
+        phone.runtime = phone.runtime.with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
         let chat = bobs_chat_with(&dir, &mut phone).await;
         let phone_epoch = phone.runtime.session().epoch(&chat).unwrap();
         let sibling = handed(&mut laptop, &phone);
@@ -1039,20 +1047,15 @@ mod same_account_welcome {
             phone_epoch.0 + 1
         );
         assert!(
-            phone
-                .adapter
-                .publishes()
-                .iter()
-                .all(|publish| !matches!(publish.message.envelope, TransportEnvelope::Welcome { .. }))
+            phone.adapter.publishes().iter().all(|publish| !matches!(
+                publish.message.envelope,
+                TransportEnvelope::Welcome { .. }
+            ))
         );
-        let [owed] = &phone
-            .runtime
-            .owed_sibling_welcomes(Timestamp(NOW))
-            .unwrap()[..]
-        else {
+        let [owed] = &phone.runtime.owed_sibling_welcomes(Timestamp(NOW)).unwrap()[..] else {
             panic!("one owed sibling Welcome");
         };
-        let carried = carry(&mut phone, &device_group, owed).await;
+        let carried = carry(&mut phone, &device_group, owed, &wall).await;
         assert!(
             phone
                 .runtime

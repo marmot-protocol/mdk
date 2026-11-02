@@ -9,6 +9,7 @@ use super::*;
 use crate::AppCreateGroupOptions;
 use crate::client::linked_device_chats::{LINK_CHAT_ADD_SECS, LINK_CHAT_ADDS_PER_PASS};
 use crate::tests::device_group::{commit_removal_decided_elsewhere, converge_device_group};
+use cgka_traits::EpochId;
 
 /// `count` chats `device` makes on its own.
 async fn chats(device: &mut Device, count: usize) -> Vec<GroupId> {
@@ -266,6 +267,12 @@ async fn a_device_being_removed_is_added_to_no_chat() {
         )
         .unwrap();
 
+    let founded = phone
+        .client
+        .create_group("new while removing", &[])
+        .await
+        .unwrap();
+    assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
     phone.client.add_linked_devices_to_chats(&[]).await;
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
@@ -285,6 +292,12 @@ async fn a_device_a_dropped_removal_held_as_removed_is_added_to_no_chat() {
     drop_a_removal_decided_elsewhere(&relay, &mut phone, &mut laptop, &group, false).await;
     let mut phone = reopen(phone).await;
 
+    let founded = phone
+        .client
+        .create_group("new after dropped removal", &[])
+        .await
+        .unwrap();
+    assert_eq!(leaves_of(&phone, &laptop, &founded, &group), 0);
     phone.client.add_linked_devices_to_chats(&[]).await;
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
@@ -482,5 +495,288 @@ async fn a_pass_adds_the_new_device_to_at_most_its_cap_of_chats() {
         chats
             .iter()
             .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 1)
+    );
+}
+
+/// The old-chat opt-out does not exclude a linked sibling from a new
+/// chat's founding Add. The private Welcome is owed at canonical creation,
+/// and its normal 461 delivery installs epoch 1 without a follow-up Add.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let group = link_with(
+        &relay,
+        &mut phone,
+        &mut laptop,
+        DeviceLinkChoices {
+            add_to_all_chats: false,
+            ..DeviceLinkChoices::new("Laptop")
+        },
+    )
+    .await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let before = taken_from(&phone, &laptop);
+    let chat = phone.client.create_group("new chat", &[]).await.unwrap();
+    assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
+    assert_eq!(
+        leaves_of(&phone, &laptop, &chat, &group),
+        1,
+        "the sibling belongs to the founding Add, before maintenance"
+    );
+    assert_eq!(
+        phone.client.runtime.group_record(&chat).unwrap().epoch,
+        EpochId(1)
+    );
+    assert_eq!(taken_from(&phone, &laptop), before + 1);
+    let owed = phone
+        .client
+        .runtime
+        .owed_sibling_welcomes(Timestamp(crate::unix_now_seconds()))
+        .unwrap();
+    assert_eq!(
+        owed.iter()
+            .filter(|welcome| welcome.group_id == chat)
+            .count(),
+        0,
+        "canonical founding drives the initial carrier before returning"
+    );
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    laptop.client.run_due_maintenance().await.unwrap();
+    assert!(joined(&laptop, &chat));
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let before = taken_from(&phone, &laptop);
+    // A deferred open has not yet named the engine's trusted tag source.
+    // Creation must synchronize it before spending durable private stock.
+    let Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    } = phone;
+    drop(client);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    let mut phone = Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    };
+    assert_eq!(phone.client.runtime.device_tag_group(), None);
+    let chat = phone
+        .client
+        .create_group("after deferred open", &[])
+        .await
+        .unwrap();
+    assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), before + 1);
+}
+
+/// Missing private stock never falls back to the sibling's public slot or
+/// blocks creation. Active and inactive linked entries qualify once stock
+/// exists; leaving and keyless entries do not consume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn founding_sibling_selection_uses_private_stock_and_linked_status() {
+    use cgka_traits::app_components::DeviceStatusV1;
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let group = link_with(
+        &relay,
+        &mut phone,
+        &mut laptop,
+        DeviceLinkChoices {
+            add_to_all_chats: false,
+            ..DeviceLinkChoices::new("Laptop")
+        },
+    )
+    .await;
+    let slot = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    // No hand-off has arrived yet, though the laptop's public slot is valid.
+    let missing = phone
+        .client
+        .create_group("no private stock", &[])
+        .await
+        .unwrap();
+    assert_eq!(leaves_of(&phone, &laptop, &missing, &group), 0);
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let before = taken_from(&phone, &laptop);
+    let database = account_database(&phone.app);
+    // Optional stock reads and consumption writes can fail independently.
+    // Neither failure prevents an ordinary chat or spends unchecked stock.
+    for (break_stock, restore_stock) in [
+        (
+            "ALTER TABLE private_key_packages_received RENAME TO held_aside",
+            "ALTER TABLE held_aside RENAME TO private_key_packages_received",
+        ),
+        (
+            "CREATE TRIGGER refuse_founding_take BEFORE UPDATE ON private_key_packages_received
+             BEGIN SELECT RAISE(ABORT, 'private stock unavailable'); END;",
+            "DROP TRIGGER refuse_founding_take",
+        ),
+    ] {
+        database.execute_batch(break_stock).unwrap();
+        let result = phone
+            .client
+            .create_group("unavailable private stock", &[])
+            .await;
+        database.execute_batch(restore_stock).unwrap();
+        let chat = result.unwrap();
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+        assert_eq!(phone.client.runtime.members(&chat).unwrap().len(), 1);
+        assert_eq!(taken_from(&phone, &laptop), before);
+    }
+    drop(database);
+    // The routing is valid for a chat, but repeats a relay once parsed, so
+    // no sibling Welcome can carry it. Creation spends no private package.
+    let before = taken_from(&phone, &laptop);
+    let closed = phone
+        .client
+        .create_group_with_options(
+            "closed routing",
+            &[],
+            AppCreateGroupOptions {
+                relays: Some(vec![
+                    "wss://relay.example".into(),
+                    "wss://relay.example/".into(),
+                ]),
+                ..AppCreateGroupOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(leaves_of(&phone, &laptop, &closed, &group), 0);
+    assert_eq!(taken_from(&phone, &laptop), before);
+    let key = laptop.client.runtime.own_signature_key();
+    for (status, tagged, expected) in [
+        (DeviceStatusV1::Inactive, true, 1),
+        (DeviceStatusV1::Leaving, true, 0),
+        (DeviceStatusV1::Active, false, 0),
+    ] {
+        phone
+            .client
+            .runtime
+            .edit_device_roster_entry(&group, &slot, &[], |entry| {
+                entry.status = status;
+                entry.tag_signature_key = tagged.then(|| key.clone());
+            })
+            .await
+            .unwrap();
+        let before = taken_from(&phone, &laptop);
+        let chat = phone.client.create_group("status", &[]).await.unwrap();
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), expected);
+        assert_eq!(taken_from(&phone, &laptop), before + expected);
+    }
+    phone
+        .client
+        .runtime
+        .edit_device_roster_entry(&group, &slot, &[], |entry| {
+            entry.status = DeviceStatusV1::Active;
+            entry.tag_signature_key = Some(key.clone());
+        })
+        .await
+        .unwrap();
+    // The durable link verdict, written by the linking lifecycle, beats a
+    // current roster key. Exercise both unfinished and terminal failures
+    // through that storage boundary without asking maintenance to remove it.
+    let link = link_record(&phone, &group, &laptop.slot_hex());
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    storage
+        .record_device_link(
+            &link.group_id_hex,
+            &link.slot_hex,
+            &link.key_package_ref_hex,
+            &link.leaf_signature_key_hex,
+            link.linked_at,
+        )
+        .unwrap();
+    for outcome in [DeviceLinkOutcome::Pending, DeviceLinkOutcome::Failed] {
+        if outcome == DeviceLinkOutcome::Failed {
+            assert!(
+                storage
+                    .decide_device_link(
+                        &link.group_id_hex,
+                        &link.slot_hex,
+                        outcome,
+                        crate::unix_now_seconds()
+                    )
+                    .unwrap()
+            );
+        }
+        let before = taken_from(&phone, &laptop);
+        let chat = phone.client.create_group("unmade link", &[]).await.unwrap();
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+        assert_eq!(taken_from(&phone, &laptop), before);
+    }
+}
+
+/// A local failed link belongs to the entry this device approved. Another
+/// sibling can link that slot later, and the old approver must include the
+/// newly linked device when it creates a chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_link_by_another_approver_outlives_a_local_failed_link() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    let slot = choose_link(&relay, &mut phone, &mut laptop).await;
+    laptop.op(DeviceLinkOp::ConfirmMatch).await;
+    laptop.step(&relay).await;
+    phone.step(&relay).await;
+    phone
+        .client
+        .drive_device_pairing_at(crate::unix_now_seconds() + LINK_DEADLINE_SECS + 1)
+        .await;
+    phone.step(&relay).await;
+    let ended = laptop.step(&relay).await;
+    assert_eq!(
+        ended.new_device,
+        Some(NewDeviceLinkState::Ended {
+            reason: DeviceLinkEndReason::LinkFailed
+        })
+    );
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed
+    );
+    tablet.step(&relay).await;
+    published_key_package(&mut laptop.client, &relay).await;
+    assert_eq!(
+        link_with(
+            &relay,
+            &mut tablet,
+            &mut laptop,
+            DeviceLinkChoices {
+                add_to_all_chats: false,
+                ..DeviceLinkChoices::new("Laptop linked by tablet")
+            }
+        )
+        .await,
+        group
+    );
+    phone.step(&relay).await;
+    let laptop_slot: [u8; 32] = hex::decode(&slot).unwrap().try_into().unwrap();
+    let tablet_slot: [u8; 32] = hex::decode(tablet.slot_hex()).unwrap().try_into().unwrap();
+    assert_eq!(
+        phone.roster(&group).devices[&laptop_slot].linked_by,
+        Some(tablet_slot)
+    );
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Failed,
+        "another approver's link does not rewrite this device's old record"
+    );
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let chat = phone
+        .client
+        .create_group("after another approver linked", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        leaves_of(&phone, &laptop, &chat, &group),
+        1,
+        "the current entry's approver owns its link outcome"
     );
 }

@@ -1311,7 +1311,23 @@ impl<S: StorageProvider> Engine<S> {
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
-        self.create_group_audited(req, optional_app_components, None, context)
+        self.create_group_audited(req, optional_app_components, Vec::new(), None, context)
+            .await
+    }
+
+    /// Create a chat with private KeyPackages authenticated by the trusted device group.
+    /// Siblings cannot weaken the requirements negotiated for `req.members`; their
+    /// Welcomes are retained atomically with creation for delivery inside the device group.
+    /// Siblings are optional: candidates whose eligibility cannot be established are
+    /// omitted before staging, while ordinary-founder and creation failures remain errors.
+    pub async fn create_group_with_siblings_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_audited(req, optional_app_components, siblings, None, context)
             .await
     }
 
@@ -1339,7 +1355,7 @@ impl<S: StorageProvider> Engine<S> {
             roster_update,
             welcome_deliver_until,
         };
-        self.create_group_audited(req, Vec::new(), Some(chosen), context)
+        self.create_group_audited(req, Vec::new(), Vec::new(), Some(chosen), context)
             .await
     }
 
@@ -1347,6 +1363,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<crate::group_lifecycle::ChosenGroup>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
@@ -1358,7 +1375,7 @@ impl<S: StorageProvider> Engine<S> {
             None,
             Some(context.clone()),
             AuditEventKind::CreateGroupEntry {
-                member_count: req.members.len() as u64,
+                member_count: (req.members.len() + siblings.len()) as u64,
                 required_feature_count: req.required_features.len() as u64,
                 app_component_count: (req.app_components.len() + optional_app_components.len())
                     as u64,
@@ -1369,7 +1386,7 @@ impl<S: StorageProvider> Engine<S> {
         // `group_context` row carries no context of its own and inherits it.
         let mut engine = OperationAuditScope::enter(self, context.clone());
         let result = engine
-            .do_create_group(req, optional_app_components, chosen)
+            .do_create_group(req, optional_app_components, siblings, chosen)
             .await;
         match &result {
             Ok((group_id, send_result)) => {
