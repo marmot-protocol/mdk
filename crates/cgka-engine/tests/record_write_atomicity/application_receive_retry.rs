@@ -586,6 +586,84 @@ async fn sent_message_audit_waits_for_both_durable_rows() {
         MessageState::Sent
     );
     assert_eq!(audit_transitions(&audit_path, &following.id).len(), 1);
+
+    let payload = MarmotAppEvent::new(
+        hex::encode(alice.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "retain this operation context",
+    )
+    .encode()
+    .unwrap();
+    let (message_id, content_id, operation_ref) = storage
+        .with_transaction(|_| {
+            let sent = futures::executor::block_on(alice.send_with_audit_context(
+                SendIntent::AppMessage {
+                    group_id: group.clone(),
+                    payload,
+                    expected_epoch: Some(alice.epoch_pin(&group).unwrap()),
+                },
+                Some(marmot_forensics::AuditEventContext {
+                    human_action: Some(marmot_forensics::AuditHumanActionContext {
+                        action: "send_message".into(),
+                        origin: "local_user".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            ))?;
+            let SendResult::ApplicationMessage { msg, .. } = sent else {
+                panic!("expected an application send inside the outer transaction");
+            };
+            let content_id = MessageId::new(Sha256::digest(&msg.payload).to_vec());
+            assert_ne!(msg.id, content_id);
+            for id in [&msg.id, &content_id] {
+                assert!(audit_transitions(&audit_path, id).is_empty());
+            }
+            let events = audit_events(&audit_path);
+            let entry = events
+                .iter()
+                .rfind(|event| event["type"] == "send_entry")
+                .expect("context-bearing send entry");
+            let operation_ref = entry["record_context"]["operation_ref"].clone();
+            assert!(operation_ref.as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(
+                entry["record_context"]["human_action"]["action"],
+                "send_message"
+            );
+
+            // This public observation proves the send's operation scope has
+            // ended while its state rows still await the caller's COMMIT.
+            alice.audit_engine_context();
+            let events = audit_events(&audit_path);
+            let observation = events.last().unwrap();
+            assert_eq!(observation["type"], "engine_context");
+            assert_eq!(
+                observation["record_context"]["human_action"]["origin"],
+                "system"
+            );
+            assert!(observation["record_context"].get("operation_ref").is_none());
+            Ok::<_, EngineError>((msg.id, content_id, operation_ref))
+        })
+        .unwrap();
+    for id in [&message_id, &content_id] {
+        assert_eq!(storage.get_message(id).unwrap().state, MessageState::Sent);
+        let rows = audit_transitions(&audit_path, id);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["record_context"]["operation_ref"], operation_ref,
+            "deferred state row retains the operation captured before scope exit"
+        );
+        assert_eq!(
+            rows[0]["record_context"]["human_action"]["action"],
+            "send_message"
+        );
+        assert_eq!(
+            rows[0]["record_context"]["human_action"]["origin"],
+            "local_user"
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,15 +696,22 @@ async fn welcome_state_audit_waits_for_the_callers_outermost_transaction() {
     // The public engine call succeeds in an inner transaction, but that does
     // not grant permission to announce the outer transaction's pending write.
     let failed: Result<(), EngineError> = storage.with_transaction(|outer| {
-        outer.with_transaction(|_| {
-            alice.mark_sent_welcome_delivered(id)?;
-            assert_eq!(
-                audit_transitions(&audit_path, id),
-                before,
-                "a successful nested unit is not an outer commit"
-            );
-            Ok::<_, EngineError>(())
+        outer.with_group_savepoint(&group, "unused-successful-savepoint", |unit| {
+            unit.with_transaction(|_| {
+                alice.mark_sent_welcome_delivered(id)?;
+                assert_eq!(
+                    audit_transitions(&audit_path, id),
+                    before,
+                    "a successful nested unit is not an outer commit"
+                );
+                Ok::<_, EngineError>(())
+            })
         })?;
+        assert_eq!(
+            audit_transitions(&audit_path, id),
+            before,
+            "a released savepoint still waits for the outer commit"
+        );
         Err(StorageError::Backend("abandon outer audit unit".into()).into())
     });
     assert!(
