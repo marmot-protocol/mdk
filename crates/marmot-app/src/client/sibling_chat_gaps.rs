@@ -113,8 +113,8 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
 }
 
 /// Effective admission inputs, independent of routine device-group commits.
-/// Select targets through `gap_siblings` so local link/removal decisions (and
-/// any future target readiness gate there) participate in invalidation.
+/// Select targets through `gap_siblings` so local link/removal decisions and
+/// pending settings intentions participate in invalidation.
 #[derive(PartialEq, Eq)]
 struct GapEligibility {
     group: GroupId,
@@ -222,24 +222,25 @@ impl AppClient {
         }
     }
 
-    fn gap_siblings(&self, exchange: &Exchange) -> Result<Vec<DeviceSlotId>, AppError> {
+    fn gap_siblings(&mut self, exchange: &Exchange) -> Result<Vec<DeviceSlotId>, AppError> {
         let excluded = self.excluded_sibling_slots(exchange)?;
-        Ok(exchange
-            .roster
-            .devices
-            .iter()
-            .filter_map(|(slot, entry)| {
-                (*slot != exchange.own_slot
-                    && !excluded.contains(slot)
-                    && matches!(
-                        entry.status,
-                        DeviceStatusV1::Active | DeviceStatusV1::Inactive
-                    )
-                    && entry.settings.add_to_all_chats
-                    && entry.tag_signature_key.is_some())
-                .then_some(*slot)
-            })
-            .collect())
+        let mut siblings = Vec::new();
+        for (slot, entry) in &exchange.roster.devices {
+            if *slot != exchange.own_slot
+                && !excluded.contains(slot)
+                && matches!(
+                    entry.status,
+                    DeviceStatusV1::Active | DeviceStatusV1::Inactive
+                )
+                && entry.settings.add_to_all_chats
+                && entry.tag_signature_key.is_some()
+                && self
+                    .device_setting_ready(exchange, slot, |settings| settings.add_to_all_chats)?
+            {
+                siblings.push(*slot);
+            }
+        }
+        Ok(siblings)
     }
 
     fn gap_is_missing(
@@ -440,10 +441,6 @@ impl AppClient {
             return Ok(());
         }
         for slot in siblings {
-            if !self.device_setting_ready(exchange, slot, |settings| settings.add_to_all_chats)? {
-                self.sibling_chat_gaps.schedule(chat.clone(), 0);
-                continue;
-            }
             let gap = (chat.clone(), *slot);
             if !self.gap_is_missing(exchange, chat, *slot)? {
                 self.sibling_chat_gaps.claims.remove(&gap);
@@ -509,8 +506,6 @@ impl AppClient {
                 || !current.tagged
                 || !self.group_quiet(&current.group_id)?
                 || !self.gap_siblings(&current)?.contains(slot)
-                || !self
-                    .device_setting_ready(&current, slot, |settings| settings.add_to_all_chats)?
                 || !self.group_quiet(chat)?
                 || !self.gap_is_missing(&current, chat, *slot)?
             {

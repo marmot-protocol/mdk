@@ -757,8 +757,17 @@ async fn automatic_adds_wait_for_a_lost_local_old_chat_toggle() {
             "the opt-out lost to the longer non-user branch"
         );
         assert!(held_from(&phone, &laptop) > 0);
-        assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
-        phone.client.fill_sibling_chat_gaps(&[], 1).await;
+        assert_eq!(
+            phone
+                .client
+                .add_linked_devices_to_chats(&[], &mut Default::default())
+                .await,
+            0
+        );
+        phone
+            .client
+            .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+            .await;
         assert_eq!(
             taken_from(&phone, &laptop),
             0,
@@ -787,14 +796,117 @@ async fn automatic_adds_wait_for_a_lost_local_old_chat_toggle() {
                     [i64::try_from(LINK_CHAT_ADD_SECS).unwrap()],
                 )
                 .unwrap();
-            assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 0);
-            phone.client.fill_sibling_chat_gaps(&[], 1).await;
+            assert_eq!(
+                phone
+                    .client
+                    .add_linked_devices_to_chats(&[], &mut Default::default())
+                    .await,
+                0
+            );
+            phone
+                .client
+                .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+                .await;
         } else {
-            assert_eq!(phone.client.add_linked_devices_to_chats(&[]).await, 1);
+            assert_eq!(
+                phone
+                    .client
+                    .add_linked_devices_to_chats(&[], &mut Default::default())
+                    .await,
+                1
+            );
         }
         assert_eq!(taken_from(&phone, &laptop), 1);
         assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
     }
+}
+
+/// Cancelling a pending opt-out changes only local intention state. With a
+/// second eligible sibling keeping sender readiness true, the effective target
+/// set must wake the missing sibling even though the DG pin never changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_lost_toggle_wakes_gap_targets_without_a_roster_change() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    passes(&relay, &mut [&mut phone, &mut tablet], 4).await;
+    assert!(joined(&tablet, &chat));
+    assert_eq!(leaves_of(&phone, &tablet, &chat, &group), 1);
+    assert_eq!(link(&relay, &mut phone, &mut laptop, "Laptop").await, group);
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    for device in [&mut phone, &mut laptop, &mut tablet] {
+        converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+    }
+    let slot_hex = laptop.slot_hex();
+    let slot: [u8; 32] = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+    phone
+        .client
+        .update_linked_device_settings(&slot_hex, Some(false), None, None)
+        .await
+        .unwrap();
+    for platform in ["fork-a", "fork-b"] {
+        let edit = laptop
+            .client
+            .runtime
+            .edit_device_roster_entry(&group, &slot, &[], |entry| {
+                entry.platform = platform.to_owned();
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            edit,
+            marmot_session::DeviceRosterEdit::Committed(_)
+        ));
+    }
+    for device in [&mut phone, &mut laptop, &mut tablet] {
+        converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+    }
+    assert!(
+        phone.roster(&group).devices[&slot]
+            .settings
+            .add_to_all_chats
+    );
+    assert!(held_from(&phone, &laptop) > 0);
+    let pin = phone.client.runtime.epoch_pin(&group).unwrap();
+    let tablet_taken = taken_from(&phone, &tablet);
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    let published = relay.published_event_ids();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(
+        relay.published_event_ids(),
+        published,
+        "pending work starts no claim or Add"
+    );
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+
+    // This covered no-op cancels the lost disable before recovery can replay
+    // it. The other eligible target and claimant set remain exactly the same.
+    phone
+        .client
+        .update_linked_device_settings(&slot_hex, Some(true), None, None)
+        .await
+        .unwrap();
+    assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        1,
+        "local target eligibility wakes the chat without a DG epoch event"
+    );
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    assert_eq!(leaves_of(&phone, &tablet, &chat, &group), 1);
 }
 
 /// A chat with a commit of the phone's own still staged takes no Add and no
