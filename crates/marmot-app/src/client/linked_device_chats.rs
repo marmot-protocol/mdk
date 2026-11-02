@@ -44,10 +44,11 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::SiblingKeyPackage;
-use storage_sqlite::{ChatListQuery, DeviceLinkOutcome};
+use storage_sqlite::{ChatListQuery, DeviceLinkOutcome, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
 use super::device_group::{Exchange, device_slot};
+use super::private_key_packages::PrivateKeyPackageSelection;
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::linked_device_chats";
@@ -78,13 +79,17 @@ struct NewDevice {
 impl AppClient {
     /// One pass; a failure waits for the next one. Return how many Add
     /// attempts used the per-pass budget, so gap filling shares its remainder.
-    pub(crate) async fn add_linked_devices_to_chats(&mut self, held: &[GroupId]) -> usize {
+    pub(crate) async fn add_linked_devices_to_chats(
+        &mut self,
+        held: &[GroupId],
+        selection: &mut PrivateKeyPackageSelection,
+    ) -> usize {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return 0;
         }
         let mut budget = LINK_CHAT_ADDS_PER_PASS;
         if let Err(error) = self
-            .try_add_linked_devices_to_chats(held, &mut budget)
+            .try_add_linked_devices_to_chats(held, &mut budget, selection)
             .await
         {
             tracing::warn!(
@@ -103,6 +108,7 @@ impl AppClient {
         &mut self,
         held: &[GroupId],
         budget: &mut usize,
+        selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
@@ -153,28 +159,26 @@ impl AppClient {
                         continue;
                     }
                 }
-                let key_package = match self.next_private_key_package(&device.slot) {
-                    Ok(Some(key_package)) => key_package,
-                    Ok(None) => break,
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                        break;
-                    }
-                };
-                let sibling = SiblingKeyPackage {
-                    slot: device.slot,
-                    key_package,
-                };
-                match self.runtime.sibling_add_refusal(&chat, &sibling) {
-                    Ok(None) => {}
-                    Ok(Some(_)) => continue,
-                    Err(error) => {
-                        first_error.get_or_insert(error.into());
-                        continue;
-                    }
-                }
+                let candidate =
+                    match self.next_private_key_package_for_chat(&chat, &device.slot, selection) {
+                        Ok(Some(candidate)) => candidate,
+                        Ok(None) => {
+                            if !selection.has_unexpired_stock(&device.slot, unix_now_seconds()) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
                 *budget -= 1;
-                if let Err(error) = self.add_sibling_to_chat(&chat, &device.slot).await {
+                selection.record_attempt(&device.slot, &candidate.key_package_ref_hex);
+                if let Err(error) = self
+                    .add_sibling_to_chat(&chat, &device.slot, candidate)
+                    .await
+                {
                     first_error.get_or_insert(error);
                 }
             }
@@ -214,9 +218,9 @@ impl AppClient {
             }
         };
         let mut taken_siblings = Vec::with_capacity(selected.len());
-        for sibling in selected {
-            match self.take_private_key_package(&sibling.slot) {
-                Ok(Some(taken)) if taken == sibling.key_package => taken_siblings.push(sibling),
+        for (sibling, candidate) in selected {
+            match self.take_private_key_package_exact(&sibling.slot, &candidate) {
+                Ok(true) => taken_siblings.push(sibling),
                 // Expiry or a failed read/write while taking one candidate
                 // omits it. Never retry creation or return a possibly spent
                 // package to stock; other admitted candidates remain usable.
@@ -253,7 +257,7 @@ impl AppClient {
         optional_components: &[cgka_traits::app_components::AppComponentData],
         constructable: &cgka_traits::capabilities::GroupCapabilities,
         relays: &[String],
-    ) -> Result<Vec<SiblingKeyPackage>, AppError> {
+    ) -> Result<Vec<(SiblingKeyPackage, ReceivedPrivateKeyPackage)>, AppError> {
         use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, default_group_components};
         if !self.app.device_groups_enabled()
             || !cgka_traits::app_components::valid_sibling_welcome_relays(relays)
@@ -297,8 +301,7 @@ impl AppClient {
                 .map(|entry| entry.component_id),
         );
         fixed.extend(optional_components.iter().map(|entry| entry.component_id));
-        let account = self.app.account_home().account(&self.state.label)?;
-        let account = cgka_traits::MemberId::new(hex::decode(&account.account_id_hex)?);
+        let mut selection = PrivateKeyPackageSelection::default();
         let mut selected = Vec::new();
         for slot in exchange.siblings() {
             let entry = &exchange.roster.devices[&slot];
@@ -311,26 +314,25 @@ impl AppClient {
             {
                 continue;
             }
-            let Some(key_package) = self.next_private_key_package(&slot)? else {
-                self.want_founding_private_key_package(&slot);
-                continue;
-            };
-            let valid = marmot_session::validate_received_private_key_package(
-                &key_package,
-                &account,
-                &exchange.roster,
-                &slot,
-                unix_now_seconds(),
-            )
-            .ok();
-            if !valid
-                .is_some_and(|metadata| fixed.iter().all(|id| metadata.app_components.contains(id)))
-                || requirements.validate(&key_package).is_err()
-            {
-                self.want_founding_private_key_package(&slot);
-                continue;
+            let now = unix_now_seconds();
+            let stock =
+                self.prepared_private_key_packages(&slot, &exchange, now, &mut selection)?;
+            let mut compatible = None;
+            for record in stock.compatible_records(&requirements, &fixed, now) {
+                let key_package = Self::received_private_key_package(record);
+                // The metadata cache rejects only stable incompatibility.
+                // Lifetime and actual bytes are checked again before claim.
+                if requirements.validate(&key_package).is_err() {
+                    continue;
+                }
+                compatible = Some((SiblingKeyPackage { slot, key_package }, record.clone()));
+                break;
             }
-            selected.push(SiblingKeyPackage { slot, key_package });
+            if let Some(candidate) = compatible {
+                selected.push(candidate);
+            } else {
+                self.want_founding_private_key_package(&slot);
+            }
         }
         Ok(selected)
     }

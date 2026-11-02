@@ -374,10 +374,12 @@ simulator-smoke:
     cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-smoke-filter}}'
     cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E '{{simulator-process-filter}}'
 
-# Complete generic simulator coverage for the nightly lane. Dedicated
-# adversarial and independent-verification binaries run in later recipes.
+# Complete generic simulator coverage for the nightly lane. Only the property
+# target uses wider conformance-slow counts; a crate-wide feature build duplicates
+# every linked test binary. Dedicated verification runs in later recipes.
 simulator-full: simulator-filter-contract
-    cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked --profile ci -E '{{simulator-dedicated-filter}}'
+    cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-dedicated-filter}} and not binary(proptest_invariants)'
+    cargo nextest run -p cgka-conformance-simulator --features conformance-slow --test proptest_invariants --locked --profile ci
 
 # Deliberately test-filtered: `test-policy-overrides` also switches the
 # harness's default constructor to marmot-app's instant-settlement test
@@ -406,8 +408,11 @@ simulator-filter-contract:
     list_tests() {
         jq -r '."rust-suites" | to_entries[] | .key as $suite | .value.testcases | to_entries[] | select(.value["filter-match"].status == "matches") | "\($suite)::\(.key)"' | sort
     }
-    cargo nextest list -p cgka-conformance-simulator --features conformance-slow --locked --profile ci \
-        -E '{{simulator-dedicated-filter}}' --message-format json | list_tests >"$work_dir/full"
+    cargo nextest list -p cgka-conformance-simulator --locked --profile ci \
+        -E '{{simulator-dedicated-filter}} and not binary(proptest_invariants)' --message-format json | list_tests >"$work_dir/full"
+    cargo nextest list -p cgka-conformance-simulator --features conformance-slow --test proptest_invariants --locked --profile ci \
+        --message-format json | list_tests >>"$work_dir/full"
+    sort -o "$work_dir/full" "$work_dir/full"
     cargo nextest list -p cgka-conformance-simulator --locked --profile ci \
         -E '{{simulator-smoke-filter}}' --message-format json | list_tests >"$work_dir/smoke"
     comm -23 "$work_dir/full" "$work_dir/smoke" >"$work_dir/actual"

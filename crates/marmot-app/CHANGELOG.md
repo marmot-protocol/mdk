@@ -106,6 +106,9 @@
   ten-minute advisory claim to reduce competing Adds; the selected tree is
   checked again when an Add stages. Claims use byte-exact canonical content;
   leaving claimants stop participating and no longer hold other devices back.
+  A live own claim also delays another local attempt after a terminal failure
+  until its existing expiry. Routine device-group commits do not rescan all
+  chats; recovered quarantined chats are checked again.
   Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
@@ -114,8 +117,9 @@
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
-  relay is sent again by the next maintenance pass. Only behind
-  `dev_device_groups`.
+  relay is sent again by the next maintenance pass. When the device group
+  is ready, other chats awaiting hydration do not delay an initial Welcome.
+  Only behind `dev_device_groups`.
 - The backup writer writes the account's backup once a day (mdk#2628 item
   4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
   as blobs on the deployment's Blossom servers under a fresh archive key, and

@@ -15,6 +15,8 @@ Source-local rules. The full module map, invariants, and design notes are in [`.
   test filters work. Encrypted-database process-kill checks stay in `../tests/crash_recovery_sqlite.rs`.
 - `message_processor/tests/application_replay.rs` holds the opt-in encrypted negative-discovery scan measurement and a
   test-only visited-row counter; keep aggregate measurements separate from app acceptance.
+- `mls_group_cache.rs::tests` proves cache coherence with public context epochs and real local rollback / independent
+  connection writes; preserve those boundaries when changing cache generations or return paths.
 - No new Nostr types. `account_identity_proof.rs` is the one tracked exception (`TODO(mdk#755)`).
 
 ## Verification

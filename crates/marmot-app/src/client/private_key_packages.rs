@@ -60,8 +60,8 @@
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
-use cgka_traits::engine::{SendIntent, SiblingKeyPackage};
-use cgka_traits::error::EngineError;
+use cgka_traits::engine::{EpochPin, SendIntent, SiblingKeyPackage};
+use cgka_traits::error::{EngineError, SiblingAddRefusal};
 use cgka_traits::storage::{IssuedPrivateKeyPackage, MessageStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin;
 use cgka_traits::{
@@ -70,11 +70,12 @@ use cgka_traits::{
 };
 use marmot_session::{
     KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, KIND_PRIVATE_KEY_PACKAGE_REQUEST, KIND_SIBLING_WELCOME,
-    MAX_HAND_OFF_KEY_PACKAGES, MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW,
-    PRIVATE_KEY_PACKAGE_STOCK_TARGET, PrivateKeyPackageHandOff, PrivateKeyPackageRequest,
-    SiblingWelcome, private_key_package_stock, validate_received_private_key_package,
+    KeyPackageMetadata, KeyPackageRequirements, MAX_HAND_OFF_KEY_PACKAGES,
+    MAX_PRIVATE_KEY_PACKAGE_WANT, PRIVATE_KEY_PACKAGE_STOCK_LOW, PRIVATE_KEY_PACKAGE_STOCK_TARGET,
+    PrivateKeyPackageHandOff, PrivateKeyPackageRequest, SiblingWelcome, private_key_package_stock,
+    validate_received_private_key_package,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use storage_sqlite::{PrivateKeyPackageNeed, ReceivedPrivateKeyPackage, StashedSiblingWelcome};
 
 use super::AppClient;
@@ -86,6 +87,94 @@ const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
 const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
+
+/// Advisory selection data for one maintenance/creation pass. Entries refresh
+/// when a hand-off adds stock or the trusted device-group pin changes; each
+/// maintenance/creation pass starts with a new context.
+#[derive(Default)]
+pub(crate) struct PrivateKeyPackageSelection {
+    issuers: BTreeMap<DeviceSlotId, PreparedPrivateKeyPackages>,
+}
+
+impl PrivateKeyPackageSelection {
+    /// Forget only an actual claim attempt, never an advisory peek. A failed
+    /// claim is retried from fresh stock next pass, rather than repeatedly
+    /// attempting the same stale allocation in this pass.
+    pub(crate) fn record_attempt(&mut self, issuer: &DeviceSlotId, reference: &str) {
+        if let Some(stock) = self.issuers.get_mut(issuer) {
+            stock
+                .held
+                .retain(|candidate| candidate.record.key_package_ref_hex != reference);
+        }
+    }
+
+    pub(crate) fn has_unexpired_stock(&self, issuer: &DeviceSlotId, now: u64) -> bool {
+        self.issuers.get(issuer).is_some_and(|stock| {
+            stock
+                .held
+                .iter()
+                .any(|candidate| candidate.record.not_after > now && candidate.not_after > now)
+        })
+    }
+}
+
+struct PreparedPrivateKeyPackage {
+    record: ReceivedPrivateKeyPackage,
+    not_after: u64,
+    class: usize,
+}
+
+pub(crate) struct PreparedPrivateKeyPackages {
+    group: GroupId,
+    pin: EpochPin,
+    received_generation: u64,
+    held: Vec<PreparedPrivateKeyPackage>,
+    // Representatives are authenticated metadata, not unchecked wire bytes.
+    // Equal signed advertisements have equal time-independent eligibility.
+    classes: Vec<KeyPackageMetadata>,
+    requirements: Vec<(KeyPackageRequirements, Vec<bool>)>,
+}
+
+impl PreparedPrivateKeyPackages {
+    pub(crate) fn compatible_records(
+        &mut self,
+        requirements: &KeyPackageRequirements,
+        fixed: &BTreeSet<u16>,
+        now: u64,
+    ) -> Vec<&ReceivedPrivateKeyPackage> {
+        let index = self
+            .requirements
+            .iter()
+            .position(|(held, _)| held == requirements)
+            .unwrap_or_else(|| {
+                let matches = self
+                    .classes
+                    .iter()
+                    .map(|metadata| requirements.supports_metadata(metadata))
+                    .collect();
+                self.requirements.push((requirements.clone(), matches));
+                self.requirements.len() - 1
+            });
+        let matches = &self.requirements[index].1;
+        let (usable, mut fallback): (Vec<_>, Vec<_>) = self
+            .held
+            .iter()
+            .filter(|candidate| {
+                candidate.record.not_after > now
+                    && candidate.not_after > now
+                    && matches[candidate.class]
+                    && fixed
+                        .iter()
+                        .all(|id| self.classes[candidate.class].app_components.contains(id))
+            })
+            .map(|candidate| &candidate.record)
+            .partition(|record| record.usable_at(now));
+        // Received rows already use ascending expiry/ref. Before-half stock
+        // stays in that order; only the unexpired fallback runs in reverse.
+        fallback.reverse();
+        usable.into_iter().chain(fallback).collect()
+    }
+}
 
 /// Where the chat a held sibling Welcome is into stands.
 enum HeldChat {
@@ -199,6 +288,8 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let kept = storage.insert_received_private_key_packages(&received)?;
         if kept > 0 {
+            self.received_private_key_package_generation =
+                self.received_private_key_package_generation.wrapping_add(1);
             self.sibling_gap_stock_arrived(&hand_off.from);
         }
         tracing::debug!(
@@ -651,48 +742,130 @@ impl AppClient {
         Ok(())
     }
 
-    /// The KeyPackage [`Self::take_private_key_package`] would take from
-    /// `issuer` now, left in place.
-    pub(crate) fn next_private_key_package(
-        &mut self,
+    pub(crate) fn prepared_private_key_packages<'a>(
+        &self,
         issuer: &DeviceSlotId,
-    ) -> Result<Option<KeyPackage>, AppError> {
+        exchange: &Exchange,
+        now: u64,
+        selection: &'a mut PrivateKeyPackageSelection,
+    ) -> Result<&'a mut PreparedPrivateKeyPackages, AppError> {
+        let fresh = selection.issuers.get(issuer).is_some_and(|stock| {
+            stock.group == exchange.group_id
+                && stock.pin == exchange.pin
+                && stock.received_generation == self.received_private_key_package_generation
+        });
+        if !fresh {
+            let account = self.app.account_home().account(&self.state.label)?;
+            let account = MemberId::new(hex::decode(account.account_id_hex)?);
+            let records = self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .received_private_key_packages_from(&hex::encode(issuer), now)?;
+            let mut stock = PreparedPrivateKeyPackages {
+                group: exchange.group_id.clone(),
+                pin: exchange.pin,
+                received_generation: self.received_private_key_package_generation,
+                held: Vec::new(),
+                classes: Vec::new(),
+                requirements: Vec::new(),
+            };
+            for record in records {
+                let package = Self::received_private_key_package(&record);
+                let Ok(metadata) = validate_received_private_key_package(
+                    &package,
+                    &account,
+                    &exchange.roster,
+                    issuer,
+                    now,
+                ) else {
+                    continue;
+                };
+                let class = stock
+                    .classes
+                    .iter()
+                    .position(|held| {
+                        held.protocol_profile == metadata.protocol_profile
+                            && held.ciphersuite == metadata.ciphersuite
+                            && held.mls_extensions == metadata.mls_extensions
+                            && held.mls_proposals == metadata.mls_proposals
+                            && held.app_components == metadata.app_components
+                    })
+                    .unwrap_or_else(|| {
+                        stock.classes.push(metadata.clone());
+                        stock.classes.len() - 1
+                    });
+                stock.held.push(PreparedPrivateKeyPackage {
+                    record,
+                    not_after: metadata.not_after,
+                    class,
+                });
+            }
+            selection.issuers.insert(*issuer, stock);
+        }
+        Ok(selection.issuers.get_mut(issuer).expect("prepared above"))
+    }
+
+    /// Select compatible stock from one pass's authenticated batch, using the
+    /// current clock and existing usable-first/longest-fallback preference.
+    /// Full current engine admission still decides every candidate returned.
+    pub(crate) fn next_private_key_package_for_chat(
+        &mut self,
+        chat: &GroupId,
+        issuer: &DeviceSlotId,
+        selection: &mut PrivateKeyPackageSelection,
+    ) -> Result<Option<ReceivedPrivateKeyPackage>, AppError> {
+        let Some(exchange) = self.device_group_exchange()? else {
+            return Ok(None);
+        };
+        let requirements = self
+            .runtime
+            .invite_key_package_requirements(chat)
+            .map_err(marmot_session::SessionError::from)?;
+        let now = unix_now_seconds();
+        let stock = self.prepared_private_key_packages(issuer, &exchange, now, selection)?;
+        for record in stock.compatible_records(&requirements, &BTreeSet::new(), now) {
+            let sibling = SiblingKeyPackage {
+                slot: *issuer,
+                key_package: Self::received_private_key_package(record),
+            };
+            match self.runtime.sibling_add_refusal(chat, &sibling)? {
+                None => return Ok(Some(record.clone())),
+                Some(SiblingAddRefusal::KeyPackage) => {}
+                Some(_) => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn received_private_key_package(record: &ReceivedPrivateKeyPackage) -> KeyPackage {
+        KeyPackage::new(record.key_package.clone())
+            .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+    }
+
+    pub(crate) fn take_private_key_package_exact(
+        &self,
+        issuer: &DeviceSlotId,
+        candidate: &ReceivedPrivateKeyPackage,
+    ) -> Result<bool, AppError> {
+        if candidate.issuer_slot_hex != hex::encode(issuer) {
+            return Ok(false);
+        }
         Ok(self
             .app
             .account_storage(&self.state.label)?
             .app_storage()
-            .next_received_private_key_package(&hex::encode(issuer), unix_now_seconds())?
-            .map(|record| {
-                KeyPackage::new(record.key_package)
-                    .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
-            }))
+            .take_received_private_key_package_exact(candidate, unix_now_seconds())?)
     }
 
-    /// Take one KeyPackage `issuer` handed this device, to add that sibling
-    /// to a chat (3.5): a usable one first. `None` when it holds none
-    /// unexpired; never a public KeyPackage instead.
-    pub(crate) fn take_private_key_package(
-        &mut self,
-        issuer: &DeviceSlotId,
-    ) -> Result<Option<KeyPackage>, AppError> {
-        Ok(self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
-            .take_received_private_key_package(&hex::encode(issuer), unix_now_seconds())?
-            .map(|record| {
-                KeyPackage::new(record.key_package)
-                    .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
-            }))
-    }
-
-    /// Add the sibling in `sibling` to `chat` with a KeyPackage it handed
-    /// this device, then send the sibling Welcome the Add leaves owed once
+    /// Add the sibling in `sibling` to `chat` with the exact received
+    /// `candidate` the caller admitted, then send the sibling Welcome owed once
     /// its Commit is published. The engine refuses the Add, writing nothing,
     /// unless both devices are tagged in the trusted device group and the
     /// chat names its relays; it checks a queued Add again at drain, and a
     /// refusal there retires the queued Add with its KeyPackage. The
-    /// KeyPackage is spent either way and never handed back: an error after
+    /// candidate must still be held and unexpired when claimed. Once claimed,
+    /// the KeyPackage is spent either way and never handed back: an error after
     /// the engine took the Add reads the same as a refusal, and a KeyPackage
     /// returned then could reach two Welcomes. Upkeep asks the sibling for
     /// more.
@@ -700,10 +873,12 @@ impl AppClient {
         &mut self,
         chat: &GroupId,
         sibling: &DeviceSlotId,
+        candidate: ReceivedPrivateKeyPackage,
     ) -> Result<(), AppError> {
-        let key_package = self
-            .take_private_key_package(sibling)?
-            .ok_or(AppError::DeviceGroupRefused("no_private_key_package"))?;
+        if !self.take_private_key_package_exact(sibling, &candidate)? {
+            return Err(AppError::DeviceGroupRefused("no_private_key_package"));
+        }
+        let key_package = Self::received_private_key_package(&candidate);
         let audit_context = Self::local_human_action_context(
             "add_own_account_devices",
             vec!["members"],
@@ -725,8 +900,9 @@ impl AppClient {
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .await?;
-        let held = self.epoch_gap_held_groups()?;
-        self.send_owed_sibling_welcomes(&held).await;
+        // The shared sender reads its device group's hold itself, and
+        // leaves the durable Welcome owed if that readiness cannot be read.
+        self.send_owed_sibling_welcomes(&[]).await;
         Ok(())
     }
 
@@ -760,7 +936,14 @@ impl AppClient {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        if held.contains(&exchange.group_id) || !exchange.tagged {
+        // Immediate post-create/post-Add callers have no precomputed hold
+        // list. Read this device group directly even then; an error defers
+        // sending through the outer error path, never treating unknown as
+        // an empty hold. Other groups need not be hydrated to deliver a 461.
+        if held.contains(&exchange.group_id)
+            || !exchange.tagged
+            || self.epoch_gap_holds_group(&exchange.group_id, super::recovery::wall_now_ms()?)?
+        {
             return Ok(());
         }
         let mut sent = 0usize;

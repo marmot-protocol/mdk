@@ -250,7 +250,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   be untagged.
 - Send a sibling Welcome (mdk#2628 3.5b-2, `src/client/private_key_packages.rs`) only once the engine owes it, after its
   Add's Commit confirmed, as a 461 in the trusted device group while this device's leaf there is tagged: right after the
-  Add and in each maintenance pass. Pin each 461 to the device group's epoch and branch (`EpochPin`) whose tag was read
+  Add and in each maintenance pass. The shared sender checks the exact device group's epoch-gap hold directly
+  without scanning unrelated chats; a device-group read error defers it, and missing transport readiness leaves it owed.
+  Pin each 461 to the device group's epoch and branch (`EpochPin`) whose tag was read
   (`send_device_group_event_at`), so the engine sends it there or refuses it (`AppMessageEpochUnsettled`,
   `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
   and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
@@ -272,18 +274,31 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   pass, in chat-list order; a chat holds the device when a leaf of this account carries its tag or its tag signature
   key. Pass over a chat while this device's commit there is queued, in flight or settling (`group_quiet`), so no Add is
   doubled. Check the Add with the engine's read-only `sibling_add_refusal` against the KeyPackage
-  `next_private_key_package` names before taking it, so a chat that would refuse never spends one;
+  `next_private_key_package_for_chat` selects from compatible private stock before taking that exact record,
+  so a chat that would refuse never spends one and a changed stock preference never spends another allocation.
+  Each pass shares one issuer-filtered received-stock batch and authenticates its metadata once. Cache only
+  time-independent capability matches by the engine's complete `KeyPackageRequirements` and signed advertisement
+  class; use the current clock for ordering/expiry and full engine admission before exact claim. Refresh a batch
+  when its trusted device-group pin changes or a hand-off commits genuinely new stock, including through a pending
+  native projection retry. Failed/duplicate inserts do not advance the memory-only received-stock generation.
+  Never retain a selection context across maintenance passes.
   `chats_closed_to_linked_devices` counts the chats that take no same-account Add at all. Add at most
   `LINK_CHAT_ADDS_PER_PASS` chats a pass.
 - Fill missing sibling chat memberships in `client/sibling_chat_gaps.rs` (mdk#2628 3.5e, D82–D84), through
   kind-458 advisory claims and the existing private Add path. Claim content must match its canonical bytes; a leaving
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
-  after ten minutes, and never authorize an Add; replay cannot extend one. Only changed/due chats load their
-  MLS trees, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
-  exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Missing or unusable
-  selected private stock waits without public fallback; the current stock picker does not search later allocations
-  for chat compatibility. Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling
-  presence at actual direct/queued preparation.
+  after ten minutes, and never authorize an Add; replay cannot extend one. A live own claim delays another local
+  attempt after a terminal Add failure until that same expiry; restart can forget it. Only changed/due chats load their
+  MLS trees: effective target keys/exclusions, claimant eligibility and own readiness invalidate work, routine device-group
+  commits do not. With no eligible target, clear pending work without enumerating chats. Hydration recovery wakes the
+  recovered chat, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
+  exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Select compatible
+  private stock before the claim and again afterward, reusing the direct burst's pass-local selection context;
+  record the second selection as attempted immediately before atomically taking that exact record for the Add.
+  Missing compatible stock waits without public fallback. The existing refill owner counts time-usable stock,
+  so incompatible held stock can still prevent a compatible replacement request (mdk#2883).
+  Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling presence at actual
+  direct/queued preparation.
 - Send a chat's history to a sibling only as sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77,
   `src/history_delivery.rs` for the format, `src/client/history_delivery.rs` for both sides). Only the adder sends: the engine records each
   sibling an own confirmed Commit adds (`SiblingAddStorage`), and maintenance owes each its chat's history

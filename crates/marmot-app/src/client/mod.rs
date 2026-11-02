@@ -805,6 +805,9 @@ pub struct AppClient {
     /// promotion. It shares the engine's close state.
     pub(crate) engine_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
+    /// Changes only after a hand-off commits genuinely new received stock.
+    /// Pass-local selectors observe native projection retries through it.
+    pub(crate) received_private_key_package_generation: u64,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // and the engine connection before this guard so ownership is released
     // only after engine teardown.
@@ -1601,10 +1604,14 @@ impl AppClient {
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
-        let sibling_add_attempts = self.add_linked_devices_to_chats(&held).await;
+        let mut private_stock = private_key_packages::PrivateKeyPackageSelection::default();
+        let sibling_add_attempts = self
+            .add_linked_devices_to_chats(&held, &mut private_stock)
+            .await;
         self.fill_sibling_chat_gaps(
             &held,
             linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
+            &mut private_stock,
         )
         .await;
         self.sibling_key_package_upkeep(&held).await;
@@ -2742,15 +2749,9 @@ impl AppClient {
         // sibling delivery now, as for a later Add; any optional device-group
         // read or delivery failure leaves it owed for maintenance.
         if has_founding_siblings {
-            match self.epoch_gap_held_groups() {
-                Ok(held) => self.send_owed_sibling_welcomes(&held).await,
-                Err(error) => tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "create_group",
-                    error_kind = error.privacy_safe_kind(),
-                    "initial sibling Welcome waits for device-group state"
-                ),
-            }
+            // The shared sender checks its device group's hold directly;
+            // unrelated chats may still be awaiting deferred hydration.
+            self.send_owed_sibling_welcomes(&[]).await;
         }
         Ok(CanonicalCreatedGroup {
             group_id,

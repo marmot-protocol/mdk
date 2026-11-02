@@ -43,10 +43,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm; a legacy create whose Welcome cannot be wrapped
-    writes no group
-
-- **File:** `group_context_view.rs`
-  - **Owns:** `GroupContextView` exporter-secret length contract
+    writes no group; creator component admission, exact-length and staged-source exporter assembly, and snapshot-name privacy.
+    Pure exporter prefix, overlength and unknown-label policy belongs in `../src/group_context_view.rs::tests`
 
 - **File:** `ingest.rs`
   - **Owns:** Every `StaleReason` variant; send(AppMessage) round-trip
@@ -126,7 +124,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `pending_commit_recovery.rs`
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_all_stored_groups` detects a surviving
-    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
+    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150). Its `recovery_mirror`
+    module owns rollback and retry after the corrected mirror write fails, keeping the complete staged Welcome,
+    pending MLS state and group record in one durable unit (mdk#2422).
 
 - **File:** `record_write_atomicity.rs`
   - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
@@ -163,11 +163,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     route backfill (missing and stale-stamped route sets), eager full hydration of unrecoverable groups, and
     retention-window route retirement across rotation and restart
 
-- **File:** `snapshot_privacy.rs`
-  - **Owns:** Snapshot names do not expose plaintext group ids
-
 - **File:** `sqlite_storage.rs`
-  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke
+  - **Owns:** SQLCipher-backed `Engine<SqliteAccountStorage>` create + confirm smoke, sender-ratchet migration,
+    history-key continuity, safe-export source/puncture persistence, and local-forget atomicity and restart behavior
 
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
@@ -178,6 +176,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     hydration, both standalone and inside an outer transaction.
     Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must
     recover live state and queued work, discard scratch progress, and select the same winning branch.
+    Its `orphan_pending` module kills recovery after clearing an orphan pending commit and checks the complete
+    original MLS, group and message rows survive together before hydration retries (mdk#2422).
     Every parent spawns and waits through `spawn_crash_child` / `CrashChild::kill_when_ready`; the ready bound is
     120 s (`MDK_CGKA_CRASH_READY_TIMEOUT_SECS` overrides). Keep child fixture peers on the migrated in-memory template
     so setup cost does not eat that bound on loaded CI runners.
@@ -320,8 +320,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
-  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, no-op default behavior, and
-    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and
+    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows.
+    Default construction with successful wrong-recipient ingest belongs in `ingest.rs`
 
 ```sh
 cargo test -p cgka-engine

@@ -55,8 +55,6 @@ pub(crate) struct MlsGroupCache {
     entries: Mutex<HashMap<GroupId, CachedMlsGroup>>,
     /// Generation observed when each in-flight group was taken.
     taken: Mutex<HashMap<GroupId, u64>>,
-    #[cfg(test)]
-    hits: std::sync::atomic::AtomicU64,
 }
 
 impl MlsGroupCache {
@@ -116,10 +114,6 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(cached) = cached
                 && cached.generation == generation
             {
-                #[cfg(test)]
-                self.mls_group_cache
-                    .hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Some(cached.group));
             }
         }
@@ -181,88 +175,110 @@ impl<S: StorageProvider> Engine<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
-    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent};
+    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageProvider;
+    use cgka_traits::types::EpochId;
+    use openmls::prelude::{LeafNodeParameters, MlsGroup};
+    use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+    use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
-    use crate::distributed_convergence::tests::test_engine;
+    use crate::distributed_convergence::tests::test_engine_with_storage;
+    use crate::provider::EngineOpenMlsProvider;
 
     #[tokio::test]
-    async fn cached_group_is_reused_until_storage_is_written_behind_it() {
-        let mut engine = test_engine();
-        let (group_id, _) = engine
-            .create_group(CreateGroupRequest {
-                name: "cache".into(),
-                description: String::new(),
-                members: vec![],
-                required_features: vec![],
-                app_components: vec![],
-                initial_admins: vec![],
-            })
-            .await
-            .unwrap();
-        let payload = MarmotAppEvent::new(
-            hex::encode(engine.self_id().as_slice()),
-            1_700_000_000,
-            MARMOT_APP_EVENT_KIND_CHAT,
-            vec![],
-            "cache",
-        )
-        .encode()
-        .unwrap();
-        async fn send(
-            engine: &mut crate::Engine<storage_sqlite::SqliteAccountStorage>,
-            group_id: &cgka_traits::types::GroupId,
-            payload: &[u8],
-        ) -> Result<(), EngineError> {
-            engine
-                .send(SendIntent::AppMessage {
-                    group_id: group_id.clone(),
-                    payload: payload.to_vec(),
-                    expected_epoch: None,
+    async fn group_context_tracks_storage_after_rollback_and_foreign_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        let key = SqlCipherKey::raw([0x43; 32]);
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let foreign = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut engine = test_engine_with_storage(storage.clone());
+
+        for return_kind in ["cached", "modified", "unmodified"] {
+            let (group_id, created) = engine
+                .create_group(CreateGroupRequest {
+                    name: "cache".into(),
+                    description: String::new(),
+                    members: vec![],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
                 })
                 .await
-                .map(|_| ())
+                .unwrap();
+            let SendResult::GroupCreated { pending, .. } = created else {
+                panic!("expected a legacy creation");
+            };
+            engine.confirm_published(pending).await.unwrap();
+            assert_eq!(engine.group_context(&group_id).unwrap().epoch(), EpochId(0));
+            assert_eq!(engine.group_context(&group_id).unwrap().epoch(), EpochId(0));
+
+            let mls_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+            if return_kind == "cached" {
+                // A genuine MLS advance is returned while the outer transaction is
+                // still open. Its rollback must invalidate that advanced object.
+                let aborted = storage.with_transaction(|_| {
+                    let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+                        &engine.crypto,
+                        storage.mls_storage(),
+                    );
+                    let mut group = engine.take_mls_group(&group_id)?.unwrap();
+                    group
+                        .self_update(
+                            &provider,
+                            &engine.identity.signer,
+                            LeafNodeParameters::default(),
+                        )
+                        .unwrap();
+                    group.merge_pending_commit(&provider).unwrap();
+                    engine.return_mls_group(&group_id, group);
+                    assert_eq!(engine.group_context(&group_id)?.epoch(), EpochId(1));
+                    Err::<(), EngineError>(EngineError::Other("rollback cache fixture".into()))
+                });
+                assert!(matches!(aborted, Err(EngineError::Other(reason))
+                    if reason == "rollback cache fixture"));
+                assert_eq!(
+                    MlsGroup::load(storage.mls_storage(), &mls_id)
+                        .unwrap()
+                        .unwrap()
+                        .epoch()
+                        .as_u64(),
+                    0
+                );
+                assert_eq!(engine.group_context(&group_id).unwrap().epoch(), EpochId(0));
+            }
+
+            let mut taken = match return_kind {
+                "cached" => None,
+                _ => Some(engine.take_mls_group(&group_id).unwrap().unwrap()),
+            };
+            if return_kind == "modified" {
+                let group = taken.as_mut().unwrap();
+                let configuration = group.configuration().clone();
+                group
+                    .set_configuration(storage.mls_storage(), &configuration)
+                    .unwrap();
+            }
+            // This is a separate SQLCipher connection, not a clone sharing the
+            // writer's generation counter. Its committed write changes data_version.
+            OpenMlsStorageProvider::delete_group_state(foreign.mls_storage(), &mls_id).unwrap();
+            assert!(
+                MlsGroup::load(foreign.mls_storage(), &mls_id)
+                    .unwrap()
+                    .is_none()
+            );
+            if let Some(group) = taken {
+                match return_kind {
+                    "modified" => engine.return_mls_group(&group_id, group),
+                    "unmodified" => engine.return_unmodified_mls_group(&group_id, group),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                matches!(engine.group_context(&group_id), Err(EngineError::UnknownGroup(id)) if id == group_id),
+                "{return_kind}: a public context must never expose stale MLS state"
+            );
         }
-        let hits = |engine: &crate::Engine<storage_sqlite::SqliteAccountStorage>| {
-            engine.mls_group_cache.hits.load(Ordering::Relaxed)
-        };
-        let cached = |engine: &crate::Engine<storage_sqlite::SqliteAccountStorage>| {
-            engine.mls_group_cache.entries.lock().unwrap().len()
-        };
-
-        // Group creation reads the new group back through a cached accessor,
-        // so the entry may already exist; measure hits relative to here.
-        send(&mut engine, &group_id, &payload).await.unwrap();
-        assert_eq!(cached(&engine), 1, "a successful send stores the group");
-        let after_first_send = hits(&engine);
-
-        send(&mut engine, &group_id, &payload).await.unwrap();
-        assert_eq!(
-            hits(&engine),
-            after_first_send + 1,
-            "the next send reuses it"
-        );
-
-        // A rolled-back transaction counts as a write: whatever the cached
-        // object believes about storage can no longer be trusted.
-        let generation = engine.storage.mls_write_generation().unwrap();
-        engine
-            .storage
-            .with_transaction(|_| Err::<(), EngineError>(EngineError::Other("abort".into())))
-            .unwrap_err();
-        assert_ne!(engine.storage.mls_write_generation().unwrap(), generation);
-
-        send(&mut engine, &group_id, &payload).await.unwrap();
-        assert_eq!(
-            hits(&engine),
-            after_first_send + 1,
-            "a foreign write forces a reload"
-        );
-        send(&mut engine, &group_id, &payload).await.unwrap();
-        assert_eq!(hits(&engine), after_first_send + 2);
     }
 }
