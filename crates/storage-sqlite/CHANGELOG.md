@@ -440,6 +440,13 @@
 - Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
   publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
 
+- Migration 0167 indexes active kind-7 reaction attachments from retained app
+  events without creating timeline rows (mdk#2151), backfilling existing
+  artwork and sharing normal acquisition, permission and retention behavior.
+  `reaction_attachment_candidates` provides bounded message-scoped source
+  discovery. Incremental projection and rebuilds preserve unchanged slots;
+  authenticated reaction retractions and withdrawals revoke changed sources.
+
 - `dismiss_recovery_route_park_on` dismisses a route's broken units on the
   given relays and its remainder, checking the revision against them only;
   a broken unit on any other relay stays as it is (mdk#2660 phase 4).

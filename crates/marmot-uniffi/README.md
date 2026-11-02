@@ -90,6 +90,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
 | Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
 | Reaction details | `messageReactions` for complete effective participants | Window references contain bounded previews only. See [complete reaction details](CONVERSATION-WINDOW.md#complete-reaction-details). |
+| Custom reaction artwork | `reactionAttachment` using the reaction's `reactionMessageIdHex`, then ordinary attachment acquisition/local reads | Resolves one reaction's matching encrypted artwork without a group-wide media scan. See [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork). |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
 | Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
@@ -873,7 +874,7 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
-`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 459, 460, 461, 473, 475 and 476 included. Those
+`sendCustomEvent` refuses every kind MDK owns, the device-group kinds 457, 458, 459, 460, 461, 473, 475 and 476 included. Those
 are read only in the account's own device group, so a chat never shows one, as a row, a message or a notification.
 
 
@@ -1282,6 +1283,9 @@ See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
 Use the asynchronous attachment history page/version methods for canonical media-library
 discovery. See [the native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
+Custom reaction artwork uses the bounded `reactionAttachment` lookup with the
+reaction event ID, followed by the same acquisition and local-read path as chat
+attachments; see [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork).
 
 ## Local attachment access
 

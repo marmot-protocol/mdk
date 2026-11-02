@@ -49,7 +49,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -86,6 +86,582 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 }
 
 struct MockPeeler;
+
+// Suspend at the transport await, after the real commit has been staged.
+struct ParkGroupWrapPeeler {
+    park: Arc<AtomicBool>,
+    reached: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl TransportPeeler for ParkGroupWrapPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        if self.park.load(Ordering::SeqCst) {
+            self.reached.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+}
+
+fn stored_mls_group(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+) -> openmls::group::MlsGroup {
+    openmls::group::MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .unwrap()
+    .expect("the actual persisted MLS group")
+}
+
+fn sorted_message_rows(
+    storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    epoch: EpochId,
+) -> Vec<MessageRecord> {
+    let mut rows = storage.list_messages(group_id, epoch).unwrap();
+    rows.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    rows
+}
+
+fn current_client(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    clock: &ManualConvergenceClock,
+) -> cgka_engine::Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .unwrap()
+}
+
+fn evolution(result: SendResult) -> (TransportMessage, cgka_traits::PendingStateRef) {
+    match result {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected a real staged evolution: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn active_rival_rearms_disband_then_terminal_retry_keeps_authenticated_roster() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    use sha2::{Digest, Sha256};
+    // Two fixed genuine accounts; the smaller committer wins the privileged tie.
+    let labels: [&[u8]; 2] = [b"disband-rival-one", b"disband-rival-two"];
+    let (requester, rival) = if pad32(labels[0]) > pad32(labels[1]) {
+        (labels[0], labels[1])
+    } else {
+        (labels[1], labels[0])
+    };
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("terminal.sqlite3");
+    let key = storage_sqlite::SqlCipherKey::raw([52; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut alice = current_client(requester, storage.clone(), &clock);
+    let mut bob = current_client(
+        rival,
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    let mut sibling = current_client(
+        requester,
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    assert!(bob.self_id().as_slice() < alice.self_id().as_slice());
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "active rival".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding create")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    // A real second leaf of the requester's account makes roster dedup observable.
+    let SendResult::GroupEvolution {
+        msg,
+        pending,
+        mut welcomes,
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![sibling.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("real sibling invite")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    sibling.join_welcome(welcomes.remove(0)).await.unwrap();
+    bob.ingest(msg).await.unwrap();
+    clock.advance_ms(1_000);
+    bob.advance_convergence(&gid).await.unwrap();
+    assert_eq!(alice.members(&gid).unwrap().len(), 3);
+    let source_epoch = alice.epoch(&gid).unwrap();
+    assert_eq!(bob.epoch(&gid).unwrap(), source_epoch);
+    let (other_gid, _) = alice
+        .create_group(CreateGroupRequest {
+            name: "unrelated".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let unrelated = storage.get_group(&other_gid).unwrap();
+    let unrelated_maintenance = storage.group_maintenance(&other_gid).unwrap();
+
+    let (active, active_pending) = evolution(
+        bob.send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("active winner".into()),
+            description: None,
+        })
+        .await
+        .unwrap(),
+    );
+    bob.confirm_published(active_pending).await.unwrap();
+    let SendResult::DisbandRequested { request } = alice
+        .send(SendIntent::Disband {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("disband request")
+    };
+    let prepared = alice.advance_convergence(&gid).await.unwrap();
+    let (_, pending) = evolution(
+        prepared
+            .into_iter()
+            .next()
+            .expect("first terminal candidate"),
+    );
+    let old_candidates = storage.list_disband_candidates(&gid).unwrap();
+    assert_eq!(old_candidates.len(), 1);
+    assert_eq!(old_candidates[0].source_epoch, source_epoch);
+    alice.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        alice.ingest(active).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    clock.advance_ms(1_000);
+    alice
+        .converge_stored_openmls_messages_at(&gid, 3_000)
+        .unwrap();
+    assert_eq!(storage.get_group(&gid).unwrap().name, "active winner");
+    assert!(storage.disband_tombstone(&gid).unwrap().is_none());
+    assert!(
+        storage.list_disband_candidates(&gid).unwrap().is_empty(),
+        "losing terminal evidence is stale"
+    );
+    assert_eq!(
+        alice.disband_request(&gid).unwrap(),
+        Some(request),
+        "irreversible request resets its epoch-bound preparation"
+    );
+    assert!(alice.drain_pending_convergence_groups().contains(&gid));
+    let winner_epoch = alice.epoch(&gid).unwrap();
+    assert_eq!(winner_epoch, EpochId(source_epoch.0 + 1));
+    alice.drain_events();
+    let prepared = alice.advance_convergence(&gid).await.unwrap();
+    assert_eq!(prepared.len(), 1);
+    let (terminal, pending) = evolution(prepared.into_iter().next().unwrap());
+    let candidates = storage.list_disband_candidates(&gid).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let candidate = &candidates[0];
+    assert_eq!(candidate.source_epoch, winner_epoch);
+    assert_eq!(candidate.actor, alice.self_id());
+    assert_eq!(candidate.commit_id, terminal.id);
+    assert_eq!(
+        candidate.commit_digest,
+        <[u8; 32]>::from(Sha256::digest(&terminal.payload))
+    );
+    assert_eq!(
+        candidate.content_commit_id.as_slice(),
+        candidate.commit_digest
+    );
+    assert!(candidate.local_was_committer_leaf);
+    let mut former_accounts = candidate
+        .former_members
+        .iter()
+        .map(|member| member.id.clone())
+        .collect::<Vec<_>>();
+    former_accounts.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected = vec![alice.self_id(), bob.self_id()];
+    expected.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(
+        former_accounts, expected,
+        "former roster deduplicates genuine sibling leaves"
+    );
+    assert!(!storage.list_group_snapshots(&gid).unwrap().is_empty());
+    alice.confirm_published(pending).await.unwrap();
+    clock.advance_ms(1_000);
+    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    // Confirmation schedules the terminal pass; its first advance opens the
+    // mandatory collection window, and the next advance settles that window.
+    assert!(storage.disband_tombstone(&gid).unwrap().is_none());
+    clock.advance_ms(1_000);
+    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    let tombstone = storage
+        .disband_tombstone(&gid)
+        .unwrap()
+        .expect("selected terminal evidence");
+    assert_eq!(tombstone.epoch, EpochId(winner_epoch.0 + 1));
+    assert_eq!(tombstone.actor, candidate.actor);
+    assert_eq!(tombstone.commit_digest, candidate.commit_digest);
+    assert_eq!(tombstone.origin_commit_id, Some(terminal.id.clone()));
+    assert_eq!(tombstone.former_members, candidate.former_members);
+    assert!(tombstone.local_was_committer_leaf);
+    let events = alice.drain_events();
+    let changes = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                origin_commit_id,
+                ..
+            } if group_id == &gid => Some((epoch, actor, change, origin_commit_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        vec![(
+            &tombstone.epoch,
+            &Some(alice.self_id()),
+            &GroupStateChange::GroupDisbanded,
+            &Some(terminal.id.clone())
+        )],
+        "disband is one terminal activity, without invented member/admin departures"
+    );
+    assert!(storage.disband_request(&gid).unwrap().is_none());
+    assert!(storage.list_disband_candidates(&gid).unwrap().is_empty());
+    assert!(
+        storage.list_group_snapshots(&gid).unwrap().is_empty(),
+        "terminal settlement retires actual retained anchors"
+    );
+    assert!(
+        storage
+            .list_group_evolutions_for_group(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .list_outbound_fanouts_for_group(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(alice.disbanding_support_blockers(&gid).unwrap().is_empty());
+    assert!(
+        openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(gid.as_slice())
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(storage.get_group(&other_gid).unwrap(), unrelated);
+    assert_eq!(
+        storage.group_maintenance(&other_gid).unwrap(),
+        unrelated_maintenance
+    );
+    drop(alice);
+    drop(storage);
+    let reopened = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert_eq!(
+        reopened.disband_tombstone(&gid).unwrap(),
+        Some(tombstone.clone())
+    );
+    let mut alice = current_client(requester, reopened.clone(), &clock);
+    alice.hydrate_all_stored_groups().unwrap();
+    assert!(matches!(
+        alice.epoch_state(&gid),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ));
+    assert_eq!(
+        alice
+            .group_record(&gid)
+            .unwrap()
+            .disbanded
+            .unwrap()
+            .commit_digest,
+        tombstone.commit_digest
+    );
+    assert!(alice.disbanding_support_blockers(&gid).unwrap().is_empty());
+    assert_eq!(reopened.get_group(&other_gid).unwrap(), unrelated);
+}
+
+#[tokio::test]
+async fn demoted_disband_request_fails_durably_and_is_acknowledged_once() {
+    use cgka_traits::app_components::{
+        AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, encode_quic_varint,
+    };
+    use cgka_traits::storage::DisbandFailureReason;
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("demotion.sqlite3");
+    let key = storage_sqlite::SqlCipherKey::raw([41; 32]);
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut alice = current_client(b"demoted-alice", storage.clone(), &clock);
+    let mut bob = current_client(
+        b"demoting-bob",
+        SqliteAccountStorage::in_memory_for_test().unwrap(),
+        &clock,
+    );
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "demotion".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id().clone()],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("founding create")
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
+    // A real co-admin's signed policy change removes authority, not membership.
+    let mut admins = Vec::new();
+    encode_quic_varint(bob.self_id().as_slice().len() as u64, &mut admins);
+    admins.extend_from_slice(bob.self_id().as_slice());
+    let (demotion, pending) = evolution(
+        bob.send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: admins,
+            }],
+        })
+        .await
+        .unwrap(),
+    );
+    bob.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        alice
+            .send(SendIntent::Disband {
+                group_id: gid.clone()
+            })
+            .await
+            .unwrap(),
+        SendResult::DisbandRequested { .. }
+    ));
+    assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
+    alice.ingest(demotion).await.unwrap();
+    clock.advance_ms(1_000);
+    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    let failed = alice.disband_request(&gid).unwrap().unwrap();
+    assert_eq!(
+        failed.status,
+        DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin)
+    );
+    assert_eq!(failed.last_prepared_epoch, None);
+    assert!(
+        alice
+            .members(&gid)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == alice.self_id())
+    );
+    assert_eq!(
+        alice.admin_pubkeys(&gid).unwrap(),
+        vec![<[u8; 32]>::try_from(bob.self_id().as_slice()).unwrap()]
+    );
+    assert!(!alice.disbanding_in_progress(&gid).unwrap());
+    assert!(alice.epoch_state(&gid).unwrap().is_stable());
+    assert!(stored_mls_group(&storage, &gid).pending_commit().is_none());
+    assert!(storage.list_disband_candidates(&gid).unwrap().is_empty());
+    assert!(
+        storage
+            .list_group_evolutions_for_group(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    drop(alice);
+    drop(storage);
+
+    let reopened = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut alice = current_client(b"demoted-alice", reopened.clone(), &clock);
+    alice.hydrate_all_stored_groups().unwrap();
+    assert_eq!(alice.disband_request(&gid).unwrap(), Some(failed));
+    assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+    assert!(alice.acknowledge_disband_failure(&gid).unwrap());
+    assert_eq!(alice.disband_request(&gid).unwrap(), None);
+    assert_eq!(reopened.disband_request(&gid).unwrap(), None);
+    assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
+    let SendResult::ApplicationMessage { msg, .. } = alice
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: app_payload_for(&alice, "still a member"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("demotion leaves ordinary member sends usable")
+    };
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+}
+
+#[tokio::test]
+async fn disband_request_preserves_a_held_publish_and_retires_queued_plaintext() {
+    for confirm in [false, true] {
+        let clock = ManualConvergenceClock::new(1_000, 10_000);
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let mut alice = current_client(b"held-disband", storage.clone(), &clock);
+        let (gid, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "held".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(created, SendResult::FoundingGroupCreated { .. }));
+        let (_, pending) = evolution(
+            alice
+                .send(SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                })
+                .await
+                .unwrap(),
+        );
+        let held = storage.list_group_evolutions_for_group(&gid).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].phase, GroupEvolutionPhase::Prepared);
+        assert!(matches!(
+            alice
+                .send(SendIntent::AppMessage {
+                    group_id: gid.clone(),
+                    payload: app_payload_for(&alice, "retire me"),
+                    expected_epoch: None
+                })
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+        assert_eq!(storage.list_queued_outbound_intents(&gid).unwrap().len(), 1);
+        assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
+        let SendResult::DisbandRequested { request } = alice
+            .send(SendIntent::Disband {
+                group_id: gid.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("request only")
+        };
+        assert_eq!(request.status, DisbandRequestStatus::Pending);
+        assert_eq!(request.last_prepared_epoch, None);
+        assert_eq!(alice.disband_request(&gid).unwrap(), Some(request.clone()));
+        assert_eq!(
+            alice
+                .send(SendIntent::Disband {
+                    group_id: gid.clone()
+                })
+                .await
+                .unwrap(),
+            SendResult::DisbandRequested {
+                request: request.clone()
+            }
+        );
+        assert!(!alice.acknowledge_disband_failure(&gid).unwrap());
+        assert!(alice.disbanding_in_progress(&gid).unwrap());
+        assert!(
+            storage
+                .list_queued_outbound_intents(&gid)
+                .unwrap()
+                .is_empty(),
+            "disband retires retained plaintext immediately"
+        );
+        assert_eq!(
+            storage.list_group_evolutions_for_group(&gid).unwrap(),
+            held,
+            "the existing publish remains durable"
+        );
+        assert!(stored_mls_group(&storage, &gid).pending_commit().is_some());
+        assert!(alice.advance_convergence(&gid).await.unwrap().is_empty());
+        assert!(storage.list_disband_candidates(&gid).unwrap().is_empty());
+        assert!(
+            matches!(alice.send(SendIntent::AppMessage { group_id: gid.clone(), payload: app_payload_for(&alice, "gated"), expected_epoch: None }).await, Err(EngineError::InvalidTransition(ref transition)) if transition.from == "Disbanding")
+        );
+        if confirm {
+            alice.confirm_published(pending).await.unwrap();
+        } else {
+            alice.publish_failed(pending).await.unwrap();
+        }
+        let source_epoch = stored_mls_group(&storage, &gid).epoch().as_u64();
+        let prepared = alice.advance_convergence(&gid).await.unwrap();
+        assert!(
+            matches!(prepared.as_slice(), [SendResult::GroupEvolution { .. }]),
+            "request prepares only after the held outcome: {prepared:?}"
+        );
+        let candidates = storage.list_disband_candidates(&gid).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_epoch, EpochId(source_epoch));
+        let (_, pending) = evolution(prepared.into_iter().next().unwrap());
+        alice.publish_failed(pending).await.unwrap();
+    }
+}
 
 struct FailFirstGroupWrapPeeler {
     inner: MockPeeler,
@@ -289,7 +865,111 @@ fn retained_anchor_snapshot_names(
 }
 
 #[tokio::test]
-async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() {
+async fn cancelling_a_staged_self_update_cleans_mls_and_preparing_intent() {
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let park = Arc::new(AtomicBool::new(false));
+    let reached = Arc::new(AtomicBool::new(false));
+    let mut alice = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"cancel-update"))
+        .account_identity_proof_signer(proof_signer(b"cancel-update"))
+        .peeler(Box::new(ParkGroupWrapPeeler {
+            park: park.clone(),
+            reached: reached.clone(),
+        }))
+        .build()
+        .unwrap();
+    let (gid, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "cancel".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("legacy creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let original = storage.get_group(&gid).unwrap();
+    let source_epoch = stored_mls_group(&storage, &gid).epoch();
+    let source_messages = sorted_message_rows(&storage, &gid, EpochId(source_epoch.as_u64()));
+
+    park.store(true, Ordering::SeqCst);
+    let mut send = Box::pin(alice.send(SendIntent::SelfUpdate {
+        group_id: gid.clone(),
+    }));
+    assert!(futures::poll!(send.as_mut()).is_pending());
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the actual transport await was reached"
+    );
+    let staged = stored_mls_group(&storage, &gid);
+    assert_eq!(staged.epoch(), source_epoch);
+    assert!(
+        staged.pending_commit().is_some(),
+        "cancellation must follow actual MLS staging"
+    );
+    let preparing = storage.list_group_evolutions_for_group(&gid).unwrap();
+    assert_eq!(preparing.len(), 1);
+    assert_eq!(preparing[0].phase, GroupEvolutionPhase::Preparing);
+    assert_eq!(preparing[0].source_epoch, EpochId(source_epoch.as_u64()));
+    assert!(preparing[0].signed_message_id.is_none());
+    assert!(preparing[0].pending_ref.is_none());
+    drop(send);
+
+    let cleaned = stored_mls_group(&storage, &gid);
+    assert_eq!(cleaned.epoch(), source_epoch);
+    assert!(
+        cleaned.pending_commit().is_none(),
+        "cancelled send left an orphan MLS commit"
+    );
+    assert!(
+        storage
+            .list_group_evolutions_for_group(&gid)
+            .unwrap()
+            .is_empty(),
+        "cancelled send left Preparing intent"
+    );
+    assert_eq!(storage.get_group(&gid).unwrap(), original);
+    assert_eq!(
+        sorted_message_rows(&storage, &gid, EpochId(source_epoch.as_u64())),
+        source_messages
+    );
+    assert!(
+        storage
+            .list_outbound_fanouts_for_group(&gid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(alice.epoch_state(&gid).unwrap().is_stable());
+    assert!(alice.drain_auto_publish().is_empty());
+    park.store(false, Ordering::SeqCst);
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("retry stages normally")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        alice.epoch(&gid).unwrap(),
+        EpochId(source_epoch.as_u64() + 1)
+    );
+    assert_eq!(
+        storage.list_group_evolutions_for_group(&gid).unwrap()[0].phase,
+        GroupEvolutionPhase::Confirmed
+    );
+}
+
+#[tokio::test]
+async fn self_update_is_staged_and_retains_the_exact_transport_message() {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
@@ -307,6 +987,9 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
         alice.confirm_published(pending).await.unwrap();
     }
 
+    let source = stored_mls_group(&storage, &group_id);
+    let source_epoch = source.epoch();
+    assert!(source.pending_commit().is_none());
     let result = alice
         .send(SendIntent::SelfUpdate {
             group_id: group_id.clone(),
@@ -333,6 +1016,13 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
     assert_eq!(evolutions.len(), 1);
     assert_eq!(evolutions[0].signed_message_id.as_ref(), Some(&message.id));
     assert_eq!(evolutions[0].phase, GroupEvolutionPhase::Prepared);
+    let staged = stored_mls_group(&storage, &group_id);
+    assert_eq!(
+        staged.epoch(),
+        source_epoch,
+        "staging must not merge the commit"
+    );
+    assert!(staged.pending_commit().is_some());
 
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
@@ -468,7 +1158,7 @@ async fn current_group_creation_persists_automatic_maintenance_enrollment() {
 }
 
 #[tokio::test]
-async fn self_update_restart_republishes_the_identical_signed_event() {
+async fn self_update_restart_republishes_the_identical_transport_message() {
     let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
     let mut alice = build_engine_with_storage(b"alice", storage.clone());
     let (group_id, created) = alice
@@ -573,7 +1263,7 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         Some(&invite_commit_id)
     );
     assert!(
-        alice.stored_sent_welcome(&failed_welcome_id).is_err(),
+        matches!(alice.stored_sent_welcome(&failed_welcome_id), Err(EngineError::Backend(ref reason)) if reason == "stored message is not an outbound Welcome transport record"),
         "a staged invite Welcome must not be deliverable before commit confirmation"
     );
     assert_eq!(
@@ -609,6 +1299,28 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
     let members = alice.members(&gid).unwrap();
     assert_eq!(members.len(), 2, "carol dropped on rollback: {members:?}");
 
+    // Capture a second authentic failed attempt for the historical raw-format
+    // fixture. Neither fixture invents ids, origins or transport bytes.
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("historical invite attempt")
+    };
+    let historical_welcome = welcomes.remove(0);
+    let historical_row = storage.get_message(&historical_welcome.id).unwrap();
+    alice.publish_failed(pending).await.unwrap();
+    assert_eq!(alice.members(&gid).unwrap().len(), 2);
+
     // Group is immediately re-usable for a fresh invite.
     let carol_kp2 = carol.fresh_key_package().await.unwrap();
     let retry = alice
@@ -629,43 +1341,16 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         _ => panic!("expected GroupEvolution"),
     };
     let retry_welcome_id = retry_welcome.id.clone();
-    // A stale staged Welcome at the same source epoch must not be promoted by
-    // this new commit's confirmation.
-    let stale_welcome_id = MessageId::new(b"stale-same-epoch-welcome".to_vec());
-    let mut stale_welcome = retry_welcome.clone();
-    stale_welcome.id = stale_welcome_id.clone();
-    storage
-        .put_message(&MessageRecord {
-            id: stale_welcome_id.clone(),
-            group_id: gid.clone(),
-            epoch: EpochId(1),
-            state: MessageState::Sent,
-            payload: StoredMessagePayload::staged_invite_welcome(
-                stale_welcome,
-                MessageId::new(b"rolled-back-origin-commit".to_vec()),
-                None,
-                None,
-            )
-            .encode()
-            .unwrap(),
-            deferred_peel: None,
-        })
+    // Replay authentic artifacts in their historical storage formats at the
+    // same source epoch. Only the new attempt's exact origin may be promoted.
+    let stale_welcome_id = failed_welcome.id.clone();
+    storage.put_message(&staged).unwrap();
+    let legacy_stale_welcome_id = historical_welcome.id.clone();
+    let mut legacy_row = historical_row;
+    legacy_row.payload = StoredMessagePayload::raw_transport(historical_welcome)
+        .encode()
         .unwrap();
-    let legacy_stale_welcome_id = MessageId::new(b"legacy-stale-same-epoch-welcome".to_vec());
-    let mut legacy_stale_welcome = retry_welcome.clone();
-    legacy_stale_welcome.id = legacy_stale_welcome_id.clone();
-    storage
-        .put_message(&MessageRecord {
-            id: legacy_stale_welcome_id.clone(),
-            group_id: gid.clone(),
-            epoch: EpochId(1),
-            state: MessageState::Sent,
-            payload: StoredMessagePayload::raw_transport(legacy_stale_welcome)
-                .encode()
-                .unwrap(),
-            deferred_peel: None,
-        })
-        .unwrap();
+    storage.put_message(&legacy_row).unwrap();
     alice.confirm_published(retry_pending).await.unwrap();
     let retained = storage.get_message(&retry_welcome_id).unwrap();
     assert_eq!(retained.state, MessageState::Sent);
@@ -693,20 +1378,32 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
             .is_some(),
         "same-epoch Welcome owned by another commit must remain explicitly staged"
     );
-    assert!(alice.stored_sent_welcome(&stale_welcome_id).is_err());
+    assert!(
+        matches!(alice.stored_sent_welcome(&stale_welcome_id), Err(EngineError::Backend(ref reason)) if reason == "stored message is not an outbound sent record")
+    );
     assert_eq!(
         storage.get_message(&legacy_stale_welcome_id).unwrap().state,
         MessageState::Failed,
         "ambiguous legacy Welcome at the source epoch must be retired"
     );
-    assert!(alice.stored_sent_welcome(&legacy_stale_welcome_id).is_err());
+    assert!(
+        matches!(alice.stored_sent_welcome(&legacy_stale_welcome_id), Err(EngineError::Backend(ref reason)) if reason == "stored message is not an outbound sent record")
+    );
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
 }
 
 #[tokio::test]
 async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
-    let mut alice = build_with_peeler(b"alice", Box::new(FailFirstGroupWrapPeeler::new()));
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(FailFirstGroupWrapPeeler::new()))
+        .build()
+        .unwrap();
     let mut bob = build(b"bob");
     let mut carol = build(b"carol");
 
@@ -730,6 +1427,8 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
     assert_eq!(alice.members(&gid).unwrap().len(), 2);
 
+    let original = storage.get_group(&gid).unwrap();
+    let original_rows = sorted_message_rows(&storage, &gid, EpochId(1));
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let err = alice
         .send(SendIntent::Invite {
@@ -740,12 +1439,24 @@ async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
         .await
         .expect_err("first invite should fail at transport wrapping");
     assert!(
-        matches!(err, EngineError::Peeler(PeelerError::WrapFailed(_))),
+        matches!(err, EngineError::Peeler(PeelerError::WrapFailed(ref reason)) if reason == "injected group-wrap failure"),
         "unexpected error: {err:?}"
     );
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
     assert_eq!(alice.members(&gid).unwrap().len(), 2);
 
+    assert_eq!(storage.get_group(&gid).unwrap(), original);
+    assert_eq!(
+        sorted_message_rows(&storage, &gid, EpochId(1)),
+        original_rows
+    );
+    let fresh = stored_mls_group(&storage, &gid);
+    assert_eq!(fresh.epoch().as_u64(), 1);
+    assert!(
+        fresh.pending_commit().is_none(),
+        "wrap refusal leaves no orphan pending MLS commit"
+    );
+    assert!(alice.epoch_state(&gid).unwrap().is_stable());
     let carol_kp2 = carol.fresh_key_package().await.unwrap();
     let retry = alice
         .send(SendIntent::Invite {
@@ -820,20 +1531,21 @@ async fn confirmed_commits_prune_retained_anchor_snapshots_to_rewind_horizon() {
         alice.confirm_published(pending).await.unwrap();
 
         let snapshots = retained_anchor_snapshot_names(&storage, &gid);
-        assert!(
-            snapshots.len() <= 2,
-            "retained anchors exceeded max_rewind_commits=1 after update {i}: {snapshots:?}"
+        assert_eq!(
+            snapshots,
+            vec![
+                format!("openmls-retained-anchor-{}", i + 1),
+                format!("openmls-retained-anchor-{}", i + 2)
+            ],
+            "both required anchors must survive after update {i}"
         );
     }
 
     assert_eq!(alice.epoch(&gid).unwrap().0, 4);
     let snapshots = retained_anchor_snapshot_names(&storage, &gid);
-    assert!(
-        !snapshots.is_empty()
-            && snapshots.iter().all(|snapshot| {
-                snapshot == "openmls-retained-anchor-3" || snapshot == "openmls-retained-anchor-4"
-            }),
-        "only the current rewind horizon's anchors should remain: {snapshots:?}"
+    assert_eq!(
+        snapshots,
+        vec!["openmls-retained-anchor-3", "openmls-retained-anchor-4"]
     );
 }
 
@@ -1839,9 +2551,30 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
             .is_some()
     );
 
+    let before_request = handle.disband_request(&group_id).unwrap();
+    let before_candidates = handle.list_disband_candidates(&group_id).unwrap();
+    let before_record = handle.get_group(&group_id).unwrap();
+    let before_mls = stored_mls_group(&handle, &group_id);
+    assert!(before_mls.pending_commit().is_some());
     disband_request_fault.arm(1);
     let error = alice.publish_failed(pending).await.unwrap_err();
     assert!(error.is_transient(), "unexpected rollback error: {error:?}");
+    assert!(
+        matches!(error, EngineError::Storage(StorageError::Busy(ref reason)) if reason == "injected disband rollback reconciliation lock"),
+        "{error:?}"
+    );
+    assert_eq!(handle.disband_request(&group_id).unwrap(), before_request);
+    assert_eq!(
+        handle.list_disband_candidates(&group_id).unwrap(),
+        before_candidates
+    );
+    assert_eq!(handle.get_group(&group_id).unwrap(), before_record);
+    let after_mls = stored_mls_group(&handle, &group_id);
+    assert_eq!(after_mls.epoch(), before_mls.epoch());
+    assert!(
+        after_mls.pending_commit().is_some(),
+        "failed rollback must retain the actual pending MLS commit"
+    );
     assert!(matches!(
         alice.epoch_state(&group_id),
         Some(cgka_traits::EpochState::PendingPublish(_))
@@ -1912,9 +2645,13 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     };
 
     lifecycle_fault.arm(1);
-    engine
+    let error = engine
         .stage_key_package_replacement(&mut state, Timestamp(10_000), 60, Vec::new())
         .expect_err("the injected lifecycle write must abort the transaction");
+    assert!(
+        matches!(error, EngineError::Storage(StorageError::Busy(ref reason)) if reason == "injected lifecycle-intent write failure"),
+        "{error:?}"
+    );
 
     assert!(
         handle.stored_key_package_bundles().unwrap().is_empty(),
@@ -1935,9 +2672,13 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     let old_state = state.clone();
     let old_bundles = handle.stored_key_package_bundles().unwrap();
     lifecycle_fault.arm(1);
-    engine
+    let error = engine
         .stage_key_package_replacement(&mut state, Timestamp(10_001), 60, Vec::new())
         .expect_err("superseding an old pending bundle must also be atomic");
+    assert!(
+        matches!(error, EngineError::Storage(StorageError::Busy(ref reason)) if reason == "injected lifecycle-intent write failure"),
+        "{error:?}"
+    );
     assert_eq!(state, old_state);
     assert_eq!(
         handle.key_package_lifecycle().unwrap(),
@@ -2008,12 +2749,38 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     assert_eq!(persisted_epoch_before, 1, "record unmerged before confirm");
 
     // Arm the lock for the confirm's `Processed` write, then confirm.
+    let before_record = storage.get_group(&gid).unwrap();
+    let before_rows = sorted_message_rows(&storage, &gid, EpochId(persisted_epoch_before));
+    let before_mls = stored_mls_group(&storage, &gid);
+    assert!(before_mls.pending_commit().is_some());
+    let before_leaf =
+        tls_codec::Serialize::tls_serialize_detached(before_mls.own_leaf_node().unwrap()).unwrap();
     fault.arm(1);
     let first = alice.confirm_published(inv_pending).await;
     let err = first.expect_err("confirm must surface the injected lock, not swallow it");
     assert!(
         err.is_transient(),
         "lock must surface as a transient error, got {err:?}"
+    );
+
+    assert!(
+        matches!(err, EngineError::Storage(StorageError::Busy(ref reason)) if reason == "injected confirm-path lock"),
+        "{err:?}"
+    );
+    let after_mls = stored_mls_group(&storage, &gid);
+    assert_eq!(after_mls.epoch(), before_mls.epoch());
+    assert!(
+        after_mls.pending_commit().is_some(),
+        "failed confirm must retain the actual staged MLS commit"
+    );
+    assert_eq!(
+        tls_codec::Serialize::tls_serialize_detached(after_mls.own_leaf_node().unwrap()).unwrap(),
+        before_leaf
+    );
+    assert_eq!(storage.get_group(&gid).unwrap(), before_record);
+    assert_eq!(
+        sorted_message_rows(&storage, &gid, EpochId(persisted_epoch_before)),
+        before_rows
     );
 
     // The durable transaction (merge + record mirror + `Processed` write) rolled
@@ -2313,6 +3080,13 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         else {
             panic!("rename stages a commit");
         };
+        let mut expected_apps = vec![
+            cgka_traits::app_event::MarmotAppEvent::decode(&app_payload_for(
+                &bob,
+                "retained across confirmation",
+            ))
+            .unwrap(),
+        ];
         let SendResult::ApplicationMessage { mut msg, .. } = bob
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
@@ -2336,7 +3110,13 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             let SendResult::ApplicationMessage { mut msg, .. } = bob
                 .send(SendIntent::AppMessage {
                     group_id: group_id.clone(),
-                    payload: app_payload_for(&bob, &format!("retained message {index}")),
+                    payload: {
+                        let payload = app_payload_for(&bob, &format!("retained message {index}"));
+                        expected_apps.push(
+                            cgka_traits::app_event::MarmotAppEvent::decode(&payload).unwrap(),
+                        );
+                        payload
+                    },
                     expected_epoch: None,
                 })
                 .await
@@ -2481,6 +3261,10 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             .await
             .unwrap_err();
         assert!(retry_error.is_transient());
+        assert!(
+            matches!(retry_error, EngineError::Storage(StorageError::Busy(ref reason)) if reason == "injected post-confirm replay read"),
+            "{retry_error:?}"
+        );
         assert!(alice.drain_pending_convergence_groups().contains(&group_id));
         assert_eq!(
             alice
@@ -2588,6 +3372,23 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 ))
                 .count(),
             96
+        );
+        let mut delivered_apps = replay_events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived {
+                    sender, payload, ..
+                } if sender == &bob.self_id() => {
+                    Some(cgka_traits::app_event::MarmotAppEvent::decode(payload).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        delivered_apps.sort_by(|a, b| a.id.cmp(&b.id));
+        expected_apps.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            delivered_apps, expected_apps,
+            "all 96 caller events must replay exactly once"
         );
         assert!(!replay_events.iter().any(|event| matches!(
             event,
@@ -2969,6 +3770,7 @@ async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
     };
 
     let payload = app_payload_for(&alice, "written before the epoch moved");
+    let expected = cgka_traits::app_event::MarmotAppEvent::decode(&payload).unwrap();
     assert!(matches!(
         alice
             .send(SendIntent::AppMessage {
@@ -3021,6 +3823,30 @@ async fn retained_app_message_encrypts_under_the_drain_time_epoch() {
     assert!(
         matches!(outcome, IngestOutcome::Processed),
         "bob at the drain-time epoch must decrypt the retained message; got {outcome:?}"
+    );
+    let delivered = bob
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id: gid,
+                sender,
+                epoch,
+                payload,
+                ..
+            } => {
+                assert_eq!(gid, group_id);
+                assert_eq!(sender, alice.self_id());
+                assert_eq!(epoch, drain_time_epoch);
+                Some(cgka_traits::app_event::MarmotAppEvent::decode(&payload).unwrap())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered,
+        vec![expected],
+        "the exact caller event drains once"
     );
 }
 
@@ -3289,6 +4115,61 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
         );
     }
 
+    let (other_group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "independent capacity".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending: create_pending,
+        ..
+    } = created
+    else {
+        panic!("independent create")
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    let (_, other_pending) = evolution(
+        alice
+            .send(SendIntent::SelfUpdate {
+                group_id: other_group.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    let other_send = alice
+        .send(SendIntent::AppMessage {
+            group_id: other_group.clone(),
+            payload: app_payload_for(&alice, "independent retained event"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(other_send, SendResult::Queued { ref group_id, .. } if group_id == &other_group),
+        "a full group must not spend another group's capacity"
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&other_group)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP
+    );
+    alice.publish_failed(other_pending).await.unwrap();
+
     // One past it, the caller is told the message was not accepted.
     let payload = app_payload_for(&alice, "one past the cap");
     let refused = alice
@@ -3392,10 +4273,16 @@ async fn queued_outbound_intents_are_capped_per_group_while_a_publish_stays_unre
 /// under a publication this client is still holding.
 #[tokio::test]
 async fn a_publication_is_never_staged_while_a_convergence_input_is_unresolved() {
-    let mut alice = build_engine_with_storage(
-        b"alice",
-        SqliteAccountStorage::in_memory_for_test().unwrap(),
-    );
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory_for_test().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(clock))
+        .build()
+        .unwrap();
     let mut bob = build(b"bob");
     let group_id = group_with_bob(&mut alice, &mut bob).await;
     let stable_epoch = alice.epoch(&group_id).unwrap();

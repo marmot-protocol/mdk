@@ -8,8 +8,8 @@ Group IDs are opaque MLS IDs, including 16-byte IDs, rather than 32-byte route I
 
 ## Paging and categories
 
-1. Start with no cursor and a limit from 1 through 100. The limit counts original
-   slots, including rejected attachments. Each entry includes source/message IDs,
+1. Start with no cursor and a limit from 1 through 100. The limit counts source
+   candidates, including rejected chat attachments. Each entry includes source/message IDs,
    sender, display/received timestamps, optional source epoch, MDK category and the
    shared parser's accepted reference or typed rejection with its original index.
    Discovery honors the runtime's explicit loopback-development flag. The existing
@@ -30,13 +30,69 @@ Legacy rows retain `source_epoch = None`; the reference's compatibility fallback
 of zero is not evidence that epoch zero was stored. Discovery is not assurance of
 local bytes, permission to fetch, or availability of an epoch secret. Existing
 `download_media` still enforces fetch policy. Automatic attachment acquisition
-remains deferred until invitation acceptance and is not implemented by C8-B.
+remains deferred until invitation acceptance; use the
+[attachment acquisition contract](ATTACHMENT-ACCESS.md) for demand and local reads.
+
+## Reaction artwork
+
+Use `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
+to resolve one custom reaction's artwork. Pass `reactionMessageIdHex` from the
+conversation reaction or reaction details, not the message the reaction targets.
+This bounded local read requires no account worker or relay connection and starts
+no download. It returns one `AttachmentEntryFfi` only when the active reaction's
+custom shortcode names a matching validated encrypted image attachment. An absent,
+removed, invalidated, hidden, expired or unmatched source returns `None`; keep the
+sanitized `:shortcode:` fallback. An `emoji` tag URL alone is not an attachment
+and must never be fetched directly.
+
+The reaction ID must be exactly 64 hexadecimal characters; malformed IDs return
+`InvalidMediaReference`. The lookup considers only original `imeta` indices
+0 through 99, with no continuation scan. Source tag JSON and each candidate slot
+are limited to 16 KiB, and reaction content to 64 UTF-8 bytes including the
+surrounding colons. Oversized metadata, artwork beyond those indices, or no
+eligible match produces `None`; keep the shortcode fallback. The first
+well-formed definition for the reaction's exact shortcode wins, even if its
+locator matches no image; a later duplicate definition does not override it.
+Only image slots naming that definition enter the reaction candidate index;
+unrelated image, video and file slots produce no discovery or automatic demand.
+The shared strict parser decides which candidate is usable. Rejected named artwork
+is omitted from group and account discovery pages, retaining their continuation,
+and is rejected before acquisition performs network I/O.
+
+Build an `AttachmentLocalTargetFfi` from the returned `messageIdHex`,
+`sourceMessageIdHex` and accepted attachment's original `attachmentIndex`. Use
+`attachmentLocalAssets` and `readAttachmentAsset` for verified local bytes. When
+they are absent, submit `requestAutomaticAttachment` under the account's existing
+host-managed permissions, observe the ordinary transfer state, then read the local
+asset. An explicit user download uses `requestExplicitAttachment`. Neither path
+needs `listMedia` or `downloadMedia`, and discovery itself grants no permission.
+
+Scope requests and any in-memory image cache to the account, runtime incarnation,
+chat and exact reaction source target. Different events using the same shortcode
+can name different images. Re-resolve when the projected earliest active reaction
+ID changes; discard late results for a prior ID. Retraction, deletion, invalidation,
+blocking, expiry and local source removal revoke subsequent acquisition/local
+reads. Opaque asset references do not authorize retaining an old image after its
+reaction disappears. Replace it or show the shortcode fallback as authoritative
+reaction state changes.
+
+### Adoption and database upgrade
+
+The reaction source migration is additive and backfills eligible retained reaction
+events; no account reset or host-owned reaction database is needed. Pair generated
+Swift/Kotlin bindings and C headers with their matching native library. Existing
+reaction metadata and ordinary attachment APIs remain supported. The capability
+is a source contract, not proof that a published MarmotKit artifact or downstream
+app already includes it. On adoption, qualify a retained reaction across upgrade
+and restart, a new peer reaction, repeated shortcodes with different artwork,
+earliest-reaction replacement, deletion, permission denial and stale late results.
 
 ## Inline emoji artwork
 
 Each entry carries `role` (`Shared` or `InlineEmoji`) separately from its MIME
-category. Gallery clients exclude `InlineEmoji`; the API still returns every
-original slot and its parser verdict, so an emoji-only page can have no gallery
+category. Gallery clients exclude `InlineEmoji`; chat attachments retain every
+original slot and parser verdict, while reaction discovery returns only validated
+inline artwork. An emoji-only page can have no gallery
 items while `has_more` remains true. Never renumber slots or stop on a filtered page.
 
 The native classifier matches accepted image locators exactly against well-formed
@@ -111,6 +167,11 @@ Swift releases these objects through ARC; drop unneeded references at the same
 lifecycle boundaries. Do not accumulate every page's handles until screen teardown.
 
 ## C ownership
+
+`marmot_reaction_attachment` blocks off the UI thread and writes an owned
+`MarmotAttachmentEntry`, or NULL with `MARMOT_STATUS_OK` when unavailable. Free
+this standalone result with `marmot_attachment_entry_free`. Entries borrowed
+from a page belong to that page and must not be freed separately.
 
 `marmot_attachment_history_page` returns a `MarmotAttachmentPageRead`. A successful
 page owns entries, version and optional cursor. Borrow those handles only while the

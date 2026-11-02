@@ -342,6 +342,9 @@ pub(crate) struct Migration {
     pub(crate) apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
 
+#[path = "migrations/0167_reaction_attachment_sources.rs"]
+mod migration_0167_reaction_attachment_sources;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1281,6 +1284,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0166_blossom_history_deliveries",
         suspend_foreign_keys: &[],
         apply: migration_0166_blossom_history_deliveries::apply,
+    },
+    Migration {
+        version: 167,
+        name: "0167_reaction_attachment_sources",
+        suspend_foreign_keys: &[],
+        apply: migration_0167_reaction_attachment_sources::apply,
     },
     Migration {
         version: 170,
