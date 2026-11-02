@@ -160,12 +160,14 @@ fn selfremove_registry() -> FeatureRegistry {
 fn build_selfremove_client(
     storage: SqliteAccountStorage,
     identity: &[u8],
+    clock: std::sync::Arc<dyn cgka_engine::ConvergenceClock>,
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(selfremove_registry())
+        .convergence_clock(clock)
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
@@ -179,7 +181,7 @@ fn build_selfremove_client(
 async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice.sqlite");
-    let key = SqlCipherKey::new("pending commit recovery key").unwrap();
+    let key = SqlCipherKey::raw([0x42; 32]);
 
     let group_id;
     let stranded_welcome_id;
@@ -355,8 +357,9 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
 
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice.sqlite");
-    let key = SqlCipherKey::new("deferred selfremove key").unwrap();
+    let key = SqlCipherKey::raw([0x42; 32]);
 
+    let clock = cgka_engine::ManualConvergenceClock::new(0, 10_000);
     let group_id;
     let bob_member_id;
 
@@ -367,9 +370,18 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
         let bob_store = SqliteAccountStorage::in_memory_for_test().unwrap();
         let carol_store = SqliteAccountStorage::in_memory_for_test().unwrap();
-        let mut alice = build_selfremove_client(alice_store, b"alice-dsr");
-        let mut bob = build_selfremove_client(bob_store, b"bob-dsr");
-        let mut carol = build_selfremove_client(carol_store, b"carol-dsr");
+        let mut alice = build_selfremove_client(
+            alice_store,
+            b"alice-dsr",
+            std::sync::Arc::new(clock.clone()),
+        );
+        let mut bob =
+            build_selfremove_client(bob_store, b"bob-dsr", std::sync::Arc::new(clock.clone()));
+        let mut carol = build_selfremove_client(
+            carol_store,
+            b"carol-dsr",
+            std::sync::Arc::new(clock.clone()),
+        );
         bob_member_id = bob.self_id();
 
         let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -423,7 +435,7 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         let outcome = alice.ingest(routed).await.unwrap();
         assert!(matches!(outcome, IngestOutcome::Processed));
         assert!(alice.drain_auto_publish().is_empty());
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        clock.advance_ms(75);
         let advanced = alice.advance_convergence(&group_id).await.unwrap();
         assert!(advanced.is_empty());
         // Once the delayed auto-commit is staged, bob is projected out of the
@@ -448,7 +460,11 @@ async fn reopen_preserves_deferred_selfremove_auto_commit() {
         "forward-projected leave persisted across the crash"
     );
 
-    let mut alice = build_selfremove_client(reopened_store, b"alice-dsr");
+    let mut alice = build_selfremove_client(
+        reopened_store,
+        b"alice-dsr",
+        std::sync::Arc::new(clock.clone()),
+    );
     alice
         .hydrate_all_stored_groups()
         .expect("hydrate must not error on a deferred selfremove");

@@ -893,6 +893,10 @@ mod tests {
     fn reorg_rate_is_none_without_settles() {
         let metrics = EngineMetrics::default();
         assert_eq!(metrics.snapshot().observed_reorg_rate(), None);
+        assert_eq!(
+            metrics.snapshot().reorg_lateness_ms.approx_percentile(0.5),
+            None
+        );
     }
 
     #[test]
@@ -940,6 +944,31 @@ mod tests {
             Some(30)
         );
         assert_eq!(snap.queued_outbound_wait_ms.sample_count(), 1);
+        assert_eq!(
+            snap.outbound_required_convergence_ms.approx_percentile(1.0),
+            Some(20)
+        );
+        assert_eq!(
+            snap.outbound_deferred_peel_ms.approx_percentile(1.0),
+            Some(300)
+        );
+        assert_eq!(
+            snap.outbound_queue_accept_ms.approx_percentile(1.0),
+            Some(5)
+        );
+        assert_eq!(
+            snap.foreground_deferred_rows_attempted
+                .approx_percentile(1.0),
+            Some(4)
+        );
+        assert_eq!(
+            snap.foreground_deferred_backlog.approx_percentile(1.0),
+            Some(64)
+        );
+        assert_eq!(
+            snap.queued_outbound_wait_ms.approx_percentile(1.0),
+            Some(1500)
+        );
     }
 
     #[test]
@@ -953,8 +982,15 @@ mod tests {
             Some(250),
         );
 
+        metrics.note_outbound_deferred_peel(3, 2, 7, DeferredPeelMetricOutcome::Error, Some(250));
         let snap = metrics.snapshot();
         assert_eq!(snap.foreground_deferred_normalization_pending, 1);
         assert_eq!(snap.foreground_deferred_budget_exhausted, 0);
+        assert_eq!(snap.foreground_deferred_errors, 1);
+        assert_eq!(snap.foreground_deferred_completed, 0);
+        assert_eq!(snap.foreground_deferred_unchanged, 0);
+        assert_eq!(snap.outbound_deferred_peel_ms.sample_count(), 2);
+        assert_eq!(snap.foreground_deferred_rows_attempted.sample_count(), 2);
+        assert_eq!(snap.foreground_deferred_backlog.sample_count(), 2);
     }
 }

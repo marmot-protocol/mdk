@@ -499,8 +499,8 @@ From the 2026-05-09 engine audit and follow-ups. Grep the rule when touching the
 | Rule | Test |
 | --- | --- |
 | Convergence-side replay refreshes the recipient's Marmot record (`required_capabilities`, `name`, `description`) via `update_group_record_from_replay` | `tests/update_group_data.rs::convergence_refreshes_recipient_marmot_record_name_and_description`, `tests/capabilities.rs::convergence_refreshes_recipient_required_capabilities_on_upgrade` |
-| `GroupContextView::exporter_secret` returns `None` when asked for more bytes than cached | `tests/group_context_view.rs` |
-| Snapshot names never embed plaintext group ids (hash to a digest) | `tests/snapshot_privacy.rs` |
+| `GroupContextView::exporter_secret` returns `None` when asked for more bytes than cached | `src/group_context_view.rs::tests`; exact-length assembly and staged-source exports: `tests/group_creation.rs` |
+| Snapshot names never embed plaintext group ids (hash to a digest) | `tests/group_creation.rs::snapshot_names_do_not_embed_plaintext_group_id` |
 | Every admitted message gets a current disposition; a child commit missing its frozen-batch parent is explicitly `deferred` and the pass reaches its fixed point | simulator `canonicalization_contract.rs::frozen_batch_defers_orphan_commit_and_settles_at_fixed_point` |
 | No `MessageReceived` with an empty/unresolvable sender on either seam (direct: `Failed`; replay: `Ignored`; `emit_application_replay_events` skips empty senders as a backstop) | `app_payload::tests`; `tests/distributed_convergence.rs::terminal_undecryptable_app_emits_invalidation_without_message_received` |
 | `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` run the fallible transition before mutating maps (mdk#146); auto-commit ingest staging requires `EpochState::is_stable` | `epoch_manager::tests::begin_pending_failure_leaves_state_intact`, `begin_pending_success_records_all_bookkeeping` |
