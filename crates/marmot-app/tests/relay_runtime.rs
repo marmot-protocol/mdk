@@ -15579,7 +15579,35 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         notice.single_device_notice.as_ref().unwrap().discovery,
         OnboardingDeviceDiscovery::NoneFound
     );
-    assert!(acknowledge_single_device_notice(&first, notice).await.ready);
+    // Model an older retained discovery result without sleeping or changing
+    // any approval identity, prior prerequisite or publication evidence.
+    let home = AccountHome::open(first_directory.path());
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&home.account_onboarding(&id).unwrap().unwrap()).unwrap();
+    let discovered_at = notice.steps[4].checked_at.unwrap() - 60;
+    checkpoint["snapshot"]["steps"][4]["checked_at"] = serde_json::json!(discovered_at);
+    home.set_account_onboarding(&id, &serde_json::to_vec(&checkpoint).unwrap())
+        .unwrap();
+    let retained = first.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(retained.revision, notice.revision);
+    assert_eq!(retained.recovery_epoch, notice.recovery_epoch);
+    assert_eq!(retained.steps[4].checked_at, Some(discovered_at));
+    let completed = acknowledge_single_device_notice(&first, retained).await;
+    assert!(completed.ready);
+    assert!(
+        completed
+            .single_device_notice
+            .as_ref()
+            .unwrap()
+            .acknowledged_at
+            .unwrap()
+            > discovered_at
+    );
+    assert_eq!(
+        completed.steps[4].checked_at,
+        Some(discovered_at),
+        "Continue must not refresh the discovery observation time"
+    );
 
     // An older publication under another slot still carries usable material.
     // Its timestamp is not grounds for asserting that installation is inactive.

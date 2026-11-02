@@ -174,11 +174,15 @@ impl AccountManager {
         notice.acknowledged_at = Some(unix_now_seconds());
         checkpoint.single_device_acknowledged = true;
         let findings = step.findings.clone();
+        let checked_at = step.checked_at;
         checkpoint.set(
             OnboardingStep::SingleDevice,
             OnboardingStatus::Passed,
             findings,
         );
+        // Consent changes the status, not the age of retained discovery,
+        // including a result whose findings are empty.
+        checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()].checked_at = checked_at;
         self.save_onboarding(&mut checkpoint)?;
         self.run_onboarding_locked(&mut checkpoint).await?;
         Ok(checkpoint.snapshot)
