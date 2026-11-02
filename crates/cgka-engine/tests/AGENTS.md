@@ -292,8 +292,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
 
   The sibling-Welcome owner also covers 3.5f: a real losing Add holds its Welcome across reopen instead of becoming
-  sendable or terminal from a lost event, and legacy development rows with no provable origin are not handed off
-  after reopen. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
+  sendable or terminal from a lost event, missing origin evidence and a settling chat hold delivery, terminal origin
+  invalidation stays retired after reopen, and legacy development rows with no provable origin are not handed off
+  after reopen. Exact delivered carrier outcomes settle even while held. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
   compatibility live in `cgka-traits` `message::stored_payload_codec_tests`.
 
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)

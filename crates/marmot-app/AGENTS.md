@@ -246,6 +246,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `AppMessageEpochMismatch`) before anything is encrypted, and never queues it; a refused one clears its carrier at once
   and stays owed, and the pass stops there. Record the 461's app event id on the Welcome before the send. A drain that
   reports that 461 published marks it delivered (`settle_sibling_welcome_carriers`, from `retain_effect_projection`);
+  settlement locates carried rows independently of new-send eligibility, so a source chat held by convergence,
+  hydration, or a pending Commit still records its exact carrier's outcome without starting a new delivery;
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it, and a carrier not in that set was sent before this run or never settled, so its Welcome
   is sent again; a second 461 joins nothing twice. Never send a delivered one again: resending is 3.5e. The Add spends

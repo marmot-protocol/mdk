@@ -1411,6 +1411,11 @@ impl AccountDeviceSession {
         Ok(self.engine.owed_sibling_welcomes(now)?)
     }
 
+    /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
+    pub fn carried_sibling_welcomes(&self) -> SessionResult<Vec<(MessageId, Vec<u8>)>> {
+        Ok(self.engine.carried_sibling_welcomes()?)
+    }
+
     /// See [`cgka_engine::Engine::carry_sibling_welcome`].
     pub fn carry_sibling_welcome(&self, id: &MessageId, carrier: &[u8]) -> SessionResult<bool> {
         Ok(self.engine.carry_sibling_welcome(id, carrier)?)

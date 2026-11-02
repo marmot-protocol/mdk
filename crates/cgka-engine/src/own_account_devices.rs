@@ -571,6 +571,35 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
+    /// Existing sibling-Welcome carriers whose transport outcomes still need
+    /// settling. Unlike new-send eligibility, settlement remains possible
+    /// while the originating chat or Add is temporarily held.
+    pub fn carried_sibling_welcomes(&self) -> Result<Vec<(MessageId, Vec<u8>)>, EngineError> {
+        let mut carried = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            for record in self.storage.list_messages_in_states(
+                &group_id,
+                &[MessageState::Sent],
+                EpochId(0),
+            )? {
+                let Ok(StoredMessagePayload::OutboundSiblingWelcome {
+                    carrier: Some(carrier),
+                    origin,
+                    ..
+                }) = StoredMessagePayload::decode(&record.payload)
+                else {
+                    continue;
+                };
+                if self.check_sibling_welcome_origin(&record, &origin)?
+                    != SiblingWelcomeOriginState::Withdrawn
+                {
+                    carried.push((record.id, carrier));
+                }
+            }
+        }
+        Ok(carried)
+    }
+
     /// Derive withdrawal from persisted state rather than an in-memory
     /// convergence event. A temporarily unhydrated or settling group holds
     /// delivery; only a proven loss or an unprovable legacy origin retires it.
@@ -627,7 +656,7 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         carrier: &[u8],
     ) -> Result<bool, EngineError> {
-        self.update_owed_sibling_welcome(id, |current, _| {
+        self.update_owed_sibling_welcome(id, true, |current, _| {
             if current.is_some() {
                 return false;
             }
@@ -638,14 +667,15 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Mark the sibling Welcome `id` delivered once the 461 `carrier` was
     /// published, so no 461 carries it again: when to resend one is not
-    /// specified yet. `false` when `carrier` does not carry it, or it is no
-    /// longer owed.
+    /// specified yet. Exact carrier outcomes settle even while new delivery
+    /// is held. `false` when the carrier differs or the row is retired or
+    /// already settled.
     pub fn sibling_welcome_delivered(
         &self,
         id: &MessageId,
         carrier: &[u8],
     ) -> Result<bool, EngineError> {
-        self.update_owed_sibling_welcome(id, |current, state| {
+        self.update_owed_sibling_welcome(id, false, |current, state| {
             let carried = current.as_deref() == Some(carrier);
             if carried {
                 *state = MessageState::Processed;
@@ -655,14 +685,14 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Clear `carrier` from the sibling Welcome `id` once that 461 failed and
-    /// reached no one, so the Welcome is owed again. `false` when `carrier`
-    /// does not carry it, or it is no longer owed.
+    /// reached no one. A held origin still waits before another handoff.
+    /// `false` when the carrier differs or the row is retired or settled.
     pub fn sibling_welcome_send_failed(
         &self,
         id: &MessageId,
         carrier: &[u8],
     ) -> Result<bool, EngineError> {
-        self.update_owed_sibling_welcome(id, |current, _| {
+        self.update_owed_sibling_welcome(id, false, |current, _| {
             let carried = current.as_deref() == Some(carrier);
             if carried {
                 *current = None;
@@ -673,10 +703,12 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Apply `update` to the carrier and state of the owed sibling Welcome
     /// `id`, writing them back when it returns `true`. Like withdrawal, it
-    /// rechecks the Welcome's origin before changing its own row.
+    /// rechecks the Welcome's origin before changing its own row. Only a new
+    /// handoff requires Ready; an exact existing carrier can settle while Held.
     fn update_owed_sibling_welcome(
         &self,
         id: &MessageId,
+        new_handoff: bool,
         update: impl FnOnce(&mut Option<Vec<u8>>, &mut MessageState) -> bool,
     ) -> Result<bool, EngineError> {
         let mut record = match self.storage.get_message(id) {
@@ -698,9 +730,10 @@ impl<S: StorageProvider> Engine<S> {
         else {
             return Ok(false);
         };
-        if self.check_sibling_welcome_origin(&record, &origin)? != SiblingWelcomeOriginState::Ready
-        {
-            return Ok(false);
+        match self.check_sibling_welcome_origin(&record, &origin)? {
+            SiblingWelcomeOriginState::Withdrawn => return Ok(false),
+            SiblingWelcomeOriginState::Held if new_handoff => return Ok(false),
+            _ => {}
         }
         if !update(&mut carrier, &mut record.state) {
             return Ok(false);
@@ -899,6 +932,10 @@ mod origin_disposition_tests {
                 MessageState::ConvergenceDeferred,
                 SiblingWelcomeOriginState::Held,
             ),
+            (MessageState::Sent, SiblingWelcomeOriginState::Held),
+            (MessageState::Created, SiblingWelcomeOriginState::Held),
+            (MessageState::Retryable, SiblingWelcomeOriginState::Held),
+            (MessageState::PeelDeferred, SiblingWelcomeOriginState::Held),
             (MessageState::Processed, SiblingWelcomeOriginState::Ready),
             (
                 MessageState::EpochInvalidated,

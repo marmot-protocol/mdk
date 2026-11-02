@@ -377,15 +377,85 @@ async fn a_losing_sibling_add_holds_its_welcome_across_restart() {
     );
     assert!(!bob.engine.carry_sibling_welcome(&id, b"new").unwrap());
     assert!(
-        !bob.engine
+        bob.engine
             .sibling_welcome_delivered(&id, b"carrier")
             .unwrap()
     );
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Processed
+    );
+}
+
+/// Missing evidence and an unsettled chat hold new delivery. Proven terminal
+/// invalidation retires the row durably, even if the origin later reads live.
+#[tokio::test]
+async fn sibling_welcome_origin_unknown_and_settling_hold_but_terminal_retires_after_reopen() {
+    let (mut m, mut new) = siblings(1).await;
+    let gid = m.gid.clone();
+    let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob)[0].id.clone();
+    let StoredMessagePayload::OutboundSiblingWelcome {
+        origin: cgka_traits::message::SiblingWelcomeOrigin::ConfirmedCommit(origin),
+        ..
+    } = StoredMessagePayload::decode(&m.bob.storage.get_message(&id).unwrap().payload).unwrap()
+    else {
+        panic!("expected a confirmed Add origin");
+    };
+    let commit = m.bob.storage.get_message(&origin).unwrap();
+    m.bob.storage.delete_message(&origin).unwrap();
+    assert!(owed(&m.bob).is_empty());
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    m.bob = super::device_roster::roster_device_on(storage, b"bob");
+    m.bob.engine.hydrate_all_stored_groups().unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(!m.bob.engine.carry_sibling_welcome(&id, b"unknown").unwrap());
+    m.bob.storage.put_message(&commit).unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    let SendResult::GroupEvolution { pending, .. } = m
+        .bob
+        .engine
+        .send(SendIntent::SelfUpdate { group_id: gid })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a pending Commit");
+    };
+    assert!(owed(&m.bob).is_empty());
     assert!(
-        !bob.engine
-            .sibling_welcome_send_failed(&id, b"carrier")
+        !m.bob
+            .engine
+            .carry_sibling_welcome(&id, b"settling")
             .unwrap()
     );
+    m.bob.engine.publish_failed(pending).await.unwrap();
+    assert_eq!(owed(&m.bob).len(), 1);
+    m.bob
+        .storage
+        .update_message_state(&origin, MessageState::EpochInvalidated)
+        .unwrap();
+    assert!(owed(&m.bob).is_empty());
+    assert_eq!(
+        m.bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    let Device { engine, storage } = m.bob;
+    drop(engine);
+    let mut bob = super::device_roster::roster_device_on(storage, b"bob");
+    bob.engine.hydrate_all_stored_groups().unwrap();
+    bob.storage.put_message(&commit).unwrap();
+    assert!(owed(&bob).is_empty());
+    assert_eq!(
+        bob.storage.get_message(&id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(!bob.engine.carry_sibling_welcome(&id, b"retired").unwrap());
 }
 
 /// Development binaries once discarded an outbound Welcome's origin. Such

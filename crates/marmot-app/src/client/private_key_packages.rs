@@ -863,18 +863,14 @@ impl AppClient {
         }
         let result = self
             .runtime
-            .owed_sibling_welcomes(Timestamp(0))
+            .carried_sibling_welcomes()
             .map_err(AppError::from)
-            .and_then(|owed| {
-                for owed in owed {
-                    let Some(carrier) = owed.carrier else {
-                        continue;
-                    };
+            .and_then(|carried| {
+                for (id, carrier) in carried {
                     if published.contains(&carrier) {
-                        self.runtime.sibling_welcome_delivered(&owed.id, &carrier)?;
+                        self.runtime.sibling_welcome_delivered(&id, &carrier)?;
                     } else if failed.contains(&carrier) {
-                        self.runtime
-                            .sibling_welcome_send_failed(&owed.id, &carrier)?;
+                        self.runtime.sibling_welcome_send_failed(&id, &carrier)?;
                     }
                 }
                 Ok(())
