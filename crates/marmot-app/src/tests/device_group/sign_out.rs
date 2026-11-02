@@ -598,7 +598,28 @@ async fn a_worker_still_opening_at_the_deadline_counts_as_not_reached() {
 /// deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
-    let (mut devices, group, [with_bob]) = tagging_devices_with_chats::<1>().await;
+    let (mut devices, group) = linked_devices().await;
+    // Keep this chat older than private stock: founding Adds include siblings
+    // regardless of the old-chat setting. Gap filling must leave it alone too.
+    let with_bob = devices
+        .laptop
+        .create_group("existing chat", &[])
+        .await
+        .unwrap();
+    let phone_slot = slot_of(&devices.phone);
+    assert!(matches!(
+        devices
+            .phone
+            .runtime
+            .edit_device_roster_entry(&group, &phone_slot, &[], |entry| {
+                entry.settings.add_to_all_chats = false;
+            })
+            .await
+            .unwrap(),
+        DeviceRosterEdit::Committed(_)
+    ));
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let (mut devices, group) = tag_linked_devices(devices, group).await;
     let chat = chat_with_both(&mut devices).await;
     let Devices {
         _dirs,
@@ -624,6 +645,7 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     laptop.invite_members(&with_bob, &[&bob_id]).await.unwrap();
     laptop.promote_admin(&with_bob, &bob_id).await.unwrap();
     laptop.self_demote_admin(&with_bob).await.unwrap();
+    let laptop_key = laptop.runtime.own_signature_key();
     drop(laptop);
     let mut phone_cursor = published_count(&relay);
     let _eose = scripted_eose_pump(
@@ -636,6 +658,25 @@ async fn sign_out_and_wipe_finishes_when_removed_mid_wait() {
     runtime.catch_up_accounts().await.unwrap();
     // The worker's first maintenance pass sends before the wipe starts.
     runtime.run_due_maintenance("alice").await.unwrap();
+    let with_bob_record = cgka_traits::storage::GroupStorage::get_group(
+        &laptop_app.account_storage("alice").unwrap(),
+        &with_bob,
+    )
+    .unwrap();
+    assert!(!with_bob_record.is_terminal());
+    assert!(
+        with_bob_record
+            .members
+            .iter()
+            .any(|member| { member.credential == laptop_key })
+    );
+    assert!(
+        with_bob_record
+            .members
+            .iter()
+            .all(|member| member.credential != phone.runtime.own_signature_key()),
+        "bob's chat has no phone leaf before the wipe"
+    );
     let account_id_hex = account_id_hex(&laptop_app);
 
     relay.block_next_publish();
