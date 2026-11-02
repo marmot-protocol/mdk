@@ -399,3 +399,8 @@ owns native accepted source proof for direct application/standalone Proposal and
 buffering/probes do not observe, source epoch/leaf/current-roster attribution, and rewrapped duplicate immutability.
 The scalar order, delayed partial-proof attribution, deadline and file restart/snapshot contracts belong to SQLite's
 `cross::sibling_welcome_resends` temporal owner; app orchestration remains in its existing lost-Welcome owner.
+
+`account_devices/device_tag.rs::device_group_proposal_profile_read_failure_keeps_native_receive_retryable`
+owns rollback on a real proposal-admission profile read failure: file-backed SQL trigger, independent group/MLS reads,
+wrapper/source absence and exact retry. Propagate storage errors inside native acceptance; only actual policy
+`InvalidTransition` remains the outer terminal rejection path.

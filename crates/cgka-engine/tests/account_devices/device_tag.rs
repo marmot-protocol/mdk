@@ -1234,3 +1234,113 @@ async fn accepted_device_group_application_commit_and_proposal_retain_their_exac
         );
     }
 }
+
+/// A real storage read failure during proposal admission must remain inside
+/// native receive's rollback boundary. The independent file observer verifies
+/// ratchets, wrapper/source provenance and the group row before exact retry.
+#[tokio::test]
+async fn device_group_proposal_profile_read_failure_keeps_native_receive_retryable() {
+    use super::tagged_siblings::tag_devices;
+    use cgka_traits::storage::StorageError;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proposal-source.sqlite");
+    let key = SqlCipherKey::raw([0x52; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let account = b"proposal-profile-failure";
+    let (mut phone, mut siblings, gid) = tag_devices(vec![
+        roster_device_on(storage.clone(), account),
+        roster_device(account),
+    ])
+    .await;
+    let laptop = siblings.remove(0);
+    let mut new_device = roster_device(account);
+    let package = new_device.engine.fresh_key_package().await.unwrap();
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, laptop.storage.mls_storage());
+    let (proposal, _) = load_group(&laptop, &gid)
+        .propose_add_member(
+            &provider,
+            &device_signer(&laptop),
+            &parse_key_package(&package),
+        )
+        .unwrap();
+    let mut proposal = group_transport(proposal, &gid, "proposal-source-failure");
+    proposal.id = MessageId::new(vec![0xdd; 32]);
+    let content_id = hash_id(&proposal.payload);
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let group_row = || {
+        observer
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id = ?1",
+                [gid.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+    };
+    let mls_rows = || {
+        let group_key =
+            serde_json::to_vec(&openmls::group::GroupId::from_slice(gid.as_slice())).unwrap();
+        observer.prepare("SELECT provider_version, label, storage_key, group_key, value FROM openmls_values WHERE group_key = ?1 ORDER BY storage_key")
+            .unwrap().query_map([group_key], |row| (0..5).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let before_group = group_row();
+    let before_mls = mls_rows();
+    assert!(!before_mls.is_empty());
+    for operation in ["INSERT", "UPDATE"] {
+        observer
+            .execute_batch(&format!(
+            "CREATE TRIGGER fail_proposal_profile_{operation} AFTER {operation} ON cgka_messages
+             WHEN NEW.id = X'{}' AND NEW.openmls_content = 2
+             BEGIN UPDATE cgka_groups SET record = X'ff' WHERE id = NEW.group_id; END;",
+            hex::encode(content_id.as_slice()),
+        ))
+            .unwrap();
+    }
+    let failed = phone.engine.ingest(proposal.clone()).await;
+    assert!(
+        matches!(
+            failed,
+            Err(EngineError::Storage(StorageError::Serialization(_)))
+        ),
+        "corrupting the native input's group record must reach the actual profile read"
+    );
+    assert!(
+        group_row() == before_group,
+        "profile-read failure must roll back its native storage unit"
+    );
+    assert!(
+        mls_rows() == before_mls,
+        "receive ratchet cannot commit without accepted source provenance"
+    );
+    assert!(!storage.has_processed_transport_id(&proposal.id).unwrap());
+    let observations: i64 = observer.query_row(
+        "SELECT count(*) FROM cgka_processed_transport_ids WHERE content_id = ?1 AND source_observed_order IS NOT NULL",
+        [content_id.as_slice()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(observations, 0);
+    observer
+        .execute_batch(
+            "DROP TRIGGER fail_proposal_profile_INSERT; DROP TRIGGER fail_proposal_profile_UPDATE;",
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.ingest(proposal).await.unwrap(),
+        IngestOutcome::Processed
+    );
+    let current_roster = roster_of(&phone, &gid);
+    assert!(
+        phone
+            .engine
+            .pending_device_group_activity(&gid, &current_roster)
+            .unwrap()
+            .iter()
+            .any(|(id, _, slot)| *id == content_id && *slot == Some(super::device_roster::slot(2))),
+        "exact retry must authenticate and retain the real target source"
+    );
+    drop(observer);
+    storage.close().unwrap();
+}

@@ -1715,12 +1715,18 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => bytes,
             ProcessedMessageContent::ProposalMessage(queued) => {
-                if self
-                    .strict_cutover_rejects_legacy_group_addition(
-                        context.group_id,
-                        matches!(queued.proposal(), Proposal::Add(_)),
-                    )
-                    .is_ok()
+                let admitted_profile = match self.strict_cutover_rejects_legacy_group_addition(
+                    context.group_id,
+                    matches!(queued.proposal(), Proposal::Add(_)),
+                ) {
+                    Ok(()) => true,
+                    // The outer proposal handler keeps the existing terminal
+                    // rejection behavior. Backend failures instead roll back
+                    // this receive transaction, including its source facts.
+                    Err(EngineError::InvalidTransition(_)) => false,
+                    Err(error) => return Err(error),
+                };
+                if admitted_profile
                     && crate::app_components::authorize_standalone_proposal(mls_group, &queued)
                         .is_ok()
                     && let Some(source) = source.as_mut()
