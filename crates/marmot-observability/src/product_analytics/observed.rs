@@ -158,6 +158,8 @@ mod tests {
                         row["eventName"].as_str()?.to_owned(),
                         props["operation"].as_str()?.to_owned(),
                         props["outcome"].as_str()?.to_owned(),
+                        props["unit"].as_str()?.to_owned(),
+                        props["count_bucket"].as_str()?.to_owned(),
                     ))
                 })
                 .collect();
@@ -168,6 +170,13 @@ mod tests {
                         event.to_string(),
                         operation.to_string(),
                         outcome.to_string(),
+                        if matches!(*event, "mdk_welcome_summary" | "mdk_notification_summary") {
+                            "attempt"
+                        } else {
+                            "action"
+                        }
+                        .to_string(),
+                        "1".to_string(),
                     )
                 })
                 .collect();

@@ -1441,6 +1441,139 @@ mod tests {
                 .any(|bucket| bucket.upper_bound_ms == 50 && bucket.count == 1)
         );
         assert_eq!(snapshot.app_start.duration_ms.overflow_count, 1);
+
+        // These operations have no separate stage table below. Give each a distinct
+        // duration so switching two recorder or snapshot destinations cannot pass.
+        macro_rules! check_operations {
+            ($($operation:ident => $field:ident),+ $(,)?) => {{
+                let mut duration_ms = 1;
+                $(
+                    let telemetry = AppPerformanceTelemetry::default();
+                    telemetry.record(
+                        AppPerformanceOperation::$operation,
+                        Duration::from_millis(duration_ms),
+                        false,
+                    );
+                    let operation = telemetry.snapshot().$field;
+                    assert_eq!((operation.attempts, operation.successes, operation.failures), (1, 0, 1));
+                    assert_eq!(operation.duration_ms.sample_count(), 1);
+                    assert_eq!(operation.duration_ms.sum_ms, duration_ms, stringify!($operation));
+                    duration_ms += 1;
+                )+
+                let _ = duration_ms;
+            }};
+        }
+        check_operations! {
+            DirectorySubscriptionSync => directory_subscription_sync,
+            AccountReconcile => account_reconcile,
+            AccountOpen => account_open,
+            InboundDeliveryProjection => inbound_delivery_projection,
+            OutboundMessageSend => outbound_message_send,
+            OutboundMessageQueueWait => outbound_message_queue_wait,
+            OutboundMessageLocalProjection => outbound_message_local_projection,
+            OutboundMessageLocalAccept => outbound_message_local_accept,
+            OutboundMessagePublish => outbound_message_publish,
+            OutboundMessageResponse => outbound_message_response,
+            HostOutboundMessageVisible => host_outbound_message_visible,
+            HostInboundMessageVisible => host_inbound_message_visible,
+            GroupInviteKeyPackageLookup => group_invite_key_package_lookup,
+            GroupInviteRoutingRefresh => group_invite_routing_refresh,
+            GroupInvitePreSendSync => group_invite_pre_send_sync,
+            GroupInviteEnginePublish => group_invite_engine_publish,
+            GroupInviteLocalRefresh => group_invite_local_refresh,
+            GroupInviteNotificationTrigger => group_invite_notification_trigger,
+            GroupInviteWelcomePublish => group_invite_welcome_publish,
+            GroupInvitePostMutationCatchUp => group_invite_post_mutation_catch_up,
+            GroupPromoteAdmin => group_promote_admin,
+            GroupDetailsRead => group_details_read,
+            GroupConversationSnapshotRead => group_conversation_snapshot_read,
+            ChatListRowRead => chat_list_row_read,
+            ExistingDirectConversationRead => existing_direct_conversation_read,
+            GroupMlsStateRead => group_mls_state_read,
+            GroupRosterRead => group_roster_read,
+            MediaUpload => media_upload,
+            MediaDownload => media_download,
+        }
+
+        // Hosts can supply durations larger than the counter representation.
+        telemetry.record(AppPerformanceOperation::AppStart, Duration::MAX, true);
+        telemetry.record(
+            AppPerformanceOperation::AppStart,
+            Duration::from_millis(1),
+            true,
+        );
+        let saturated = telemetry.snapshot().app_start;
+        assert_eq!(saturated.duration_ms.sum_ms, u64::MAX);
+        assert_eq!(saturated.duration_ms.overflow_count, 2);
+        assert_eq!(saturated.duration_ms.sample_count(), 4);
+    }
+
+    #[test]
+    fn snapshot_reads_latest_process_probe_counters() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Register the real process-wide reader in an isolated test process so
+        // neither earlier registrations nor later snapshots can interfere.
+        const CHILD: &str = "MDK_SQLCIPHER_PROBE_COUNTER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app_telemetry::tests::snapshot_reads_latest_process_probe_counters",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+                "the isolated snapshot test must actually execute"
+            );
+            return;
+        }
+
+        static RUNS: AtomicU64 = AtomicU64::new(7);
+        static SKIPS: AtomicU64 = AtomicU64::new(11);
+        fn process_counters() -> (u64, u64) {
+            (RUNS.load(Ordering::SeqCst), SKIPS.load(Ordering::SeqCst))
+        }
+        hand_in_sqlcipher_probe_counters(process_counters);
+        let telemetry = AppPerformanceTelemetry::default();
+        let first = telemetry.snapshot();
+        assert_eq!(
+            (
+                first.sqlcipher_migration_probe_runs,
+                first.sqlcipher_migration_probe_skips
+            ),
+            (7, 11)
+        );
+
+        RUNS.store(13, Ordering::SeqCst);
+        SKIPS.store(29, Ordering::SeqCst);
+        for recorder in [telemetry.clone(), AppPerformanceTelemetry::default()] {
+            let latest = recorder.snapshot();
+            assert_eq!(
+                (
+                    latest.sqlcipher_migration_probe_runs,
+                    latest.sqlcipher_migration_probe_skips
+                ),
+                (13, 29)
+            );
+        }
+        // Snapshots are values; fetching the latest counts does not rewrite a prior sample.
+        assert_eq!(
+            (
+                first.sqlcipher_migration_probe_runs,
+                first.sqlcipher_migration_probe_skips
+            ),
+            (7, 11)
+        );
     }
 
     #[test]
@@ -1541,7 +1674,7 @@ mod tests {
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.group_create_key_package_cache_reuse.attempts, 0);
-        for stage in [
+        for (index, stage) in [
             snapshot.group_create_queue_wait,
             snapshot.group_create_key_package_lookup,
             snapshot.group_member_key_package_prewarm,
@@ -1556,41 +1689,49 @@ mod tests {
             snapshot.group_create_subscription_refresh,
             snapshot.group_create_post_mutation_catch_up,
             snapshot.group_create_total_caller_latency,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(stage.attempts, 1);
             assert_eq!(stage.successes, 1);
             assert_eq!(stage.duration_ms.sample_count(), 1);
+            assert_eq!(stage.duration_ms.sum_ms, index as u64 + 1);
         }
     }
 
     #[test]
     fn records_group_accept_invite_operation() {
-        let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record_classified_result(
-            AppPerformanceOperation::GroupAcceptInvite,
-            Duration::from_millis(30),
-            None,
-        );
         let failure = SyncFailureClassification::new(
             SyncFailureStage::AccountWorker,
             SyncErrorClass::Timeout,
         );
-        telemetry.record_classified_result(
-            AppPerformanceOperation::GroupAcceptInvite,
-            Duration::from_millis(70),
-            Some(failure),
-        );
-
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.group_accept_invite.attempts, 2);
-        assert_eq!(snapshot.group_accept_invite.successes, 1);
-        assert_eq!(snapshot.group_accept_invite.failures, 1);
-        assert_eq!(
-            snapshot.group_accept_invite.failure_classifications[0].classification,
-            failure
-        );
-        assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
-        assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
+        macro_rules! check_classified {
+            ($($operation:ident => $field:ident),+ $(,)?) => {$(
+                let telemetry = AppPerformanceTelemetry::default();
+                telemetry.record_classified_result(
+                    AppPerformanceOperation::$operation,
+                    Duration::from_millis(30),
+                    None,
+                );
+                telemetry.record_classified_result(
+                    AppPerformanceOperation::$operation,
+                    Duration::from_millis(70),
+                    Some(failure),
+                );
+                let operation = telemetry.snapshot().$field;
+                assert_eq!((operation.attempts, operation.successes, operation.failures), (2, 1, 1));
+                assert_eq!(operation.failure_classifications, vec![SyncFailureCount { classification: failure, count: 1 }]);
+                assert_eq!(operation.duration_ms.sample_count(), 2);
+                assert_eq!(operation.duration_ms.sum_ms, 100);
+            )+};
+        }
+        check_classified! {
+            GroupAcceptInvite => group_accept_invite,
+            AccountOpen => account_open,
+            AccountSync => account_sync,
+            AccountCatchUp => account_catch_up,
+        }
     }
 
     /// Every media phase is retained as an aggregate operation with no dynamic
@@ -1614,7 +1755,7 @@ mod tests {
         }
 
         let snapshot = telemetry.snapshot();
-        for phase in [
+        for (index, phase) in [
             snapshot.media_download_queue_wait,
             snapshot.media_download_preparation,
             snapshot.media_download_host_setup,
@@ -1625,11 +1766,15 @@ mod tests {
             snapshot.media_download_ciphertext_verify,
             snapshot.media_download_decrypt,
             snapshot.media_download_plaintext_verify,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(phase.attempts, 1);
             assert_eq!(phase.successes, 1);
             assert_eq!(phase.failures, 0);
             assert_eq!(phase.duration_ms.sample_count(), 1);
+            assert_eq!(phase.duration_ms.sum_ms, index as u64 + 1);
         }
     }
 
@@ -1662,6 +1807,329 @@ mod tests {
         assert_eq!(snapshot.host_foreground_local_ready.duration_ms.sum_ms, 200);
     }
 
+    #[cfg(feature = "product-analytics-export")]
+    #[test]
+    fn performance_recording_forwards_only_reviewed_product_operations() {
+        use crate::product_analytics::fixtures::{configured, grant};
+        use AppPerformanceOperation as Op;
+
+        for (operation, event, name) in [
+            (Op::AppStart, "mdk_runtime_summary", "startup"),
+            (Op::AccountOpen, "mdk_storage_summary", "open"),
+            (
+                Op::AccountSetupNetworkReady,
+                "mdk_account_summary",
+                "network_ready",
+            ),
+            (
+                Op::AccountSetupKeyPackageLocal,
+                "mdk_key_package_summary",
+                "generate",
+            ),
+            (
+                Op::AccountDefaultProfilePublish,
+                "mdk_account_summary",
+                "profile_update",
+            ),
+            (
+                Op::GroupCreateTotalCallerLatency,
+                "mdk_group_summary",
+                "create",
+            ),
+            (Op::GroupInviteMembers, "mdk_group_summary", "invite"),
+            (Op::GroupAcceptInvite, "mdk_group_summary", "accept_invite"),
+            (Op::GroupPromoteAdmin, "mdk_group_summary", "promote_admin"),
+            (Op::MediaUpload, "mdk_media_summary", "upload"),
+            (Op::MediaDownload, "mdk_media_summary", "download"),
+            (
+                Op::GroupCreateImageUpload,
+                "mdk_media_summary",
+                "group_image",
+            ),
+            (
+                Op::AccountWorkerReadiness,
+                "mdk_runtime_summary",
+                "readiness",
+            ),
+            (
+                Op::HostForegroundLocalReady,
+                "mdk_runtime_summary",
+                "readiness",
+            ),
+            (
+                Op::AccountTransportActivation,
+                "mdk_connectivity_summary",
+                "connect",
+            ),
+            (
+                Op::AccountGroupHydration,
+                "mdk_recovery_summary",
+                "hydration",
+            ),
+            (
+                Op::GroupCreateWelcomePublish,
+                "mdk_welcome_summary",
+                "publish",
+            ),
+            (
+                Op::GroupInviteWelcomePublish,
+                "mdk_welcome_summary",
+                "publish",
+            ),
+            (
+                Op::MediaDownloadLocatorFailover,
+                "mdk_media_summary",
+                "failover",
+            ),
+            (
+                Op::MediaDownloadCiphertextVerify,
+                "mdk_media_summary",
+                "integrity",
+            ),
+            (
+                Op::MediaDownloadPlaintextVerify,
+                "mdk_media_summary",
+                "integrity",
+            ),
+            (Op::MediaDownloadDecrypt, "mdk_media_summary", "decrypt"),
+            // An internal substage must not duplicate the canonical product operation.
+            (Op::AccountSetupLocalReadyHandoff, "", ""),
+        ] {
+            for success in [true, false] {
+                let (collector, clock) = configured();
+                grant(&collector);
+                clock
+                    .mono
+                    .store(1_000, std::sync::atomic::Ordering::Relaxed);
+                let telemetry = AppPerformanceTelemetry::with_product_analytics(collector.clone());
+                let recorder = crate::PerformanceRecorder::from(&telemetry);
+                if matches!(operation, Op::AccountOpen | Op::GroupAcceptInvite) {
+                    recorder.record_classified_result(
+                        operation,
+                        Duration::from_millis(50),
+                        (!success).then_some(SyncFailureClassification::UNKNOWN),
+                    );
+                } else {
+                    recorder.record(operation, Duration::from_millis(50), success);
+                }
+                let payloads: Vec<_> = collector
+                    .test_payloads()
+                    .into_iter()
+                    .filter(|row| row["props"]["unit"] == "attempt")
+                    .collect();
+                let suppressed = name.is_empty()
+                    || (success
+                        && matches!(
+                            operation,
+                            Op::MediaDownloadCiphertextVerify
+                                | Op::MediaDownloadPlaintextVerify
+                                | Op::MediaDownloadDecrypt
+                        ));
+                if suppressed {
+                    assert!(
+                        payloads.is_empty(),
+                        "{operation:?}: only the canonical operation reports product activity"
+                    );
+                } else {
+                    assert_eq!(payloads.len(), 1, "{operation:?}");
+                    let row = &payloads[0];
+                    assert_eq!(row["eventName"], event, "{operation:?}");
+                    assert_eq!(row["props"]["operation"], name, "{operation:?}");
+                    assert_eq!(
+                        row["props"]["outcome"],
+                        if success { "success" } else { "failure" }
+                    );
+                    assert_eq!(row["props"]["duration_bucket"], "le_50ms");
+                    assert_eq!(row["props"]["count_bucket"], "1");
+                    assert!(row["props"].get("media_kind").is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "product-analytics-export")]
+    #[test]
+    fn media_recording_forwards_closed_kinds_without_raw_mime_values() {
+        use crate::product_analytics::fixtures::{configured, grant};
+        use AppPerformanceOperation as Op;
+
+        for (operation, name) in [
+            (Op::MediaUpload, "upload"),
+            (Op::MediaDownload, "download"),
+            (Op::GroupCreateImageUpload, "group_image"),
+        ] {
+            for (mime, kind) in [
+                ("image/private-format;name=secret", "image"),
+                ("video/private-format;name=secret", "video"),
+                ("audio/private-format;name=secret", "audio"),
+                ("application/pdf", "document"),
+                ("text/private-format;name=secret", "document"),
+                ("application/private-format;name=secret", "other"),
+            ] {
+                let (collector, clock) = configured();
+                grant(&collector);
+                clock
+                    .mono
+                    .store(1_000, std::sync::atomic::Ordering::Relaxed);
+                let telemetry = AppPerformanceTelemetry::with_product_analytics(collector.clone());
+                let recorder = crate::PerformanceRecorder::from(&telemetry);
+                for success in [true, false] {
+                    recorder.record_media(operation, Duration::from_millis(25), success, mime);
+                }
+                let payloads: Vec<_> = collector
+                    .test_payloads()
+                    .into_iter()
+                    .filter(|row| row["props"]["unit"] == "attempt")
+                    .collect();
+                assert_eq!(payloads.len(), 2, "{operation:?}: {mime}");
+                let mut outcomes = Vec::new();
+                for row in &payloads {
+                    assert_eq!(row["eventName"], "mdk_media_summary");
+                    assert_eq!(row["props"]["operation"], name);
+                    assert_eq!(row["props"]["media_kind"], kind);
+                    assert_eq!(row["props"]["duration_bucket"], "le_25ms");
+                    assert_eq!(row["props"]["count_bucket"], "1");
+                    assert!(!row.to_string().contains("private-format"));
+                    assert!(!row.to_string().contains("secret"));
+                    outcomes.push(row["props"]["outcome"].as_str().unwrap());
+                }
+                outcomes.sort_unstable();
+                assert_eq!(outcomes, ["failure", "success"]);
+                let snapshot = telemetry.snapshot();
+                let expected = match operation {
+                    Op::MediaUpload => [2, 0, 0],
+                    Op::MediaDownload => [0, 2, 0],
+                    Op::GroupCreateImageUpload => [0, 0, 2],
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    [
+                        snapshot.media_upload.attempts,
+                        snapshot.media_download.attempts,
+                        snapshot.group_create_image_upload.attempts,
+                    ],
+                    expected,
+                    "product reporting must preserve each operation's counters"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "product-analytics-export")]
+    #[test]
+    fn classified_sync_recording_forwards_bounded_failure_attributes() {
+        use crate::product_analytics::fixtures::{configured, grant};
+        use SyncErrorClass as Class;
+        use SyncFailureStage as Stage;
+
+        // These are emitted values, not enum getter witnesses: each pair passes
+        // through the recorder, collector admission and serialized payload.
+        for (stage, class, stage_name, class_name) in [
+            (
+                Stage::TransportActivation,
+                Class::Timeout,
+                "transport_activation",
+                "timeout",
+            ),
+            (
+                Stage::GroupSubscriptionSync,
+                Class::TransportClosed,
+                "group_subscription_sync",
+                "transport_closed",
+            ),
+            (
+                Stage::RelayReceive,
+                Class::RelayDirectory,
+                "relay_receive",
+                "relay_directory",
+            ),
+            (
+                Stage::CgkaIngest,
+                Class::Protocol,
+                "cgka_ingest",
+                "protocol",
+            ),
+            (
+                Stage::StatePersist,
+                Class::Crypto,
+                "state_persist",
+                "crypto",
+            ),
+            (
+                Stage::AccountWorker,
+                Class::Storage,
+                "account_worker",
+                "storage",
+            ),
+            (
+                Stage::Unknown,
+                Class::StorageBusy,
+                "unknown",
+                "storage_busy",
+            ),
+            (
+                Stage::StatePersist,
+                Class::StorageCorruption,
+                "state_persist",
+                "storage_corruption",
+            ),
+            (
+                Stage::StatePersist,
+                Class::StorageCapacity,
+                "state_persist",
+                "storage_capacity",
+            ),
+            (
+                Stage::AccountWorker,
+                Class::Cancelled,
+                "account_worker",
+                "cancelled",
+            ),
+            (Stage::Unknown, Class::Unknown, "unknown", "unknown"),
+        ] {
+            for (operation, name) in [
+                (AppPerformanceOperation::AccountSync, "background"),
+                (AppPerformanceOperation::AccountCatchUp, "foreground"),
+            ] {
+                let (collector, clock) = configured();
+                grant(&collector);
+                clock
+                    .mono
+                    .store(1_000, std::sync::atomic::Ordering::Relaxed);
+                let telemetry = AppPerformanceTelemetry::with_product_analytics(collector.clone());
+                let recorder = crate::PerformanceRecorder::from(&telemetry);
+                recorder.record_classified_result(operation, Duration::from_millis(50), None);
+                recorder.record_classified_result(
+                    operation,
+                    Duration::from_millis(50),
+                    Some(SyncFailureClassification::new(stage, class)),
+                );
+                let payloads: Vec<_> = collector
+                    .test_payloads()
+                    .into_iter()
+                    .filter(|row| row["eventName"] == "mdk_sync_summary")
+                    .collect();
+                assert_eq!(payloads.len(), 2);
+                let failure = payloads
+                    .iter()
+                    .find(|row| row["props"]["outcome"] == "failure")
+                    .unwrap();
+                assert_eq!(failure["props"]["operation"], name);
+                assert_eq!(failure["props"]["failure_stage"], stage_name);
+                assert_eq!(failure["props"]["error_class"], class_name);
+                assert_eq!(failure["props"]["duration_bucket"], "le_50ms");
+                assert_eq!(failure["props"]["count_bucket"], "1");
+                let success = payloads
+                    .iter()
+                    .find(|row| row["props"]["outcome"] == "success")
+                    .unwrap();
+                assert_eq!(success["props"]["operation"], name);
+                assert!(success["props"].get("failure_stage").is_none());
+                assert!(success["props"].get("error_class").is_none());
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_advisory_step_returns_the_value_and_records_success() {
         let telemetry = AppPerformanceTelemetry::default();
@@ -1675,7 +2143,7 @@ mod tests {
         assert_eq!(snapshot.account_setup_advisory_step.failures, 0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn bounded_advisory_step_caps_a_stalled_future_and_records_the_cap() {
         let telemetry = AppPerformanceTelemetry::default();
         let value: Option<()> = bounded_advisory_step(
