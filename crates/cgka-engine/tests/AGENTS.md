@@ -276,8 +276,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
     and sibling accepts, an added sibling joins through its sibling Welcome and a removed one sees its removal; restart
     treats them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets,
-    never a self-update or a Leave, and only while the group requires 0x800d. A successful Add needs the device roster,
-    so those tests run in test-policy builds only.
+    never a self-update or a Leave, and only while the group requires 0x800d. A refused queued same-account Add is
+    retired and announced exactly once without blocking the self-update behind it; this queue-progress proof does
+    not pin which validation layer refused it. Same-account leaf-limit refusal with a valid tagged sender and private
+    KeyPackage is owned by `sibling_welcomes.rs`. A successful Add needs the device roster, so those tests run in
+    test-policy builds only.
 
 - **File:** `account_devices/sibling_welcomes.rs` (test-policy builds only)
   - **Owns:** The sibling Welcome a same-account Add owes (mdk#2628 3.5b-2): owed only once its Commit confirms, and
