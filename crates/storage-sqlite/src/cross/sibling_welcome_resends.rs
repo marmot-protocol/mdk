@@ -136,13 +136,18 @@ pub(crate) fn observe_native_source(
             .ok_or_else(|| StorageError::Backend("sibling Welcome deadline overflow".into()))?,
     )?;
     store.with_transaction(|store| {
+        struct SourceOwner {
+            wrapper: Vec<u8>,
+            identity: Option<Vec<u8>>,
+            proof: Option<Vec<u8>>,
+        }
         let conn = store.lock()?;
-        let current: Option<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn.query_row_cached(
+        let current: Option<SourceOwner> = conn.query_row_cached(
             "SELECT id, source_identity, source_proof FROM cgka_processed_transport_ids WHERE group_id = ?1 AND content_id = ?2
              ORDER BY source_observed_order IS NULL, source_observed_order, id LIMIT 1",
-            params![group_id.as_slice(), content_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            params![group_id.as_slice(), content_id.as_slice()], |row| Ok(SourceOwner { wrapper: row.get(0)?, identity: row.get(1)?, proof: row.get(2)? }),
         ).optional().storage()?;
-        let Some((wrapper, mut identity, prior)) = current else { return Ok(()); };
+        let Some(SourceOwner { wrapper, mut identity, proof: prior }) = current else { return Ok(()); };
         if let Some(prior) = prior {
             let old = decode_source_proof(&prior)?;
             if old.leaf.is_none() && source.leaf.is_some() && old.epoch == source.epoch && old.sender == source.sender
