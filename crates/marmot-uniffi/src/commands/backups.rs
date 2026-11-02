@@ -224,7 +224,14 @@ mod tests {
         };
         assert_eq!(words.words.len(), 12);
         assert_eq!(words.confirm_positions.len(), 2);
-        assert!(!format!("{words:?}").contains(&words.words[0]));
+        let redaction_probe = RecoveryWordsFfi {
+            words: vec!["<private-probe>".into(); words.words.len()],
+            confirm_positions: words.confirm_positions.clone(),
+        };
+        assert!(
+            format!("{words:?}") == format!("{redaction_probe:?}"),
+            "recovery output Debug must be independent of secret words"
+        );
         let answers = words
             .confirm_positions
             .iter()
