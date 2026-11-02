@@ -2077,13 +2077,37 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
         MessageState::PeelDeferred
     );
 
+    // Only the older row expires at the next millisecond. A partial expiry
+    // must preserve the younger input and re-arm work independently of the
+    // wake that admitting the younger row already produced.
+    let younger_payload = app_payload_for(&alice, "younger residence control");
+    let younger = send_app(&mut alice, &group_id, "younger residence control").await;
+    let younger_content = content_id(&younger);
+    assert!(matches!(
+        backwards.ingest(younger.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let younger_before_expiry = carol_storage.get_message(&younger.id).unwrap();
+    backwards.drain_pending_convergence_groups();
+
     clock.advance_monotonic_ms(1);
     backwards.retry_deferred_peels(&group_id).await.unwrap();
     assert!(matches!(
         carol_storage.get_message(&stuck_app.id),
         Err(StorageError::NotFound)
     ));
-    assert!(backwards.drain_events().iter().any(|event| {
+    assert_eq!(
+        carol_storage.get_message(&younger.id).unwrap(),
+        younger_before_expiry
+    );
+    assert!(
+        backwards
+            .drain_pending_convergence_groups()
+            .contains(&group_id),
+        "partial residence expiry must re-arm the remaining row"
+    );
+    let expiry_events = backwards.drain_events();
+    assert!(expiry_events.iter().any(|event| {
         matches!(
             event,
             GroupEvent::TransportObjectResourceRefused {
@@ -2094,6 +2118,10 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
             } if message_id == &stuck_app.id
         )
     }));
+    assert!(!expiry_events.iter().any(|event| matches!(event,
+        GroupEvent::TransportObjectResourceRefused { message_id, .. }
+            if message_id == &younger.id
+    )));
 
     // Resource release is not terminal dedup: the same exact transport id
     // reaches the peeler and becomes locally retryable again.
@@ -2109,6 +2137,24 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
         MessageState::Processed,
         "same-id redelivery must process once the missing commits arrive"
     );
+    assert_eq!(
+        carol_storage.get_message(&younger.id).unwrap().state,
+        MessageState::Processed
+    );
+    let younger_deliveries: Vec<_> = backwards
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::MessageReceived {
+                message_id,
+                sender,
+                payload,
+                ..
+            } if message_id == younger_content => Some((sender, payload)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(younger_deliveries, vec![(alice.self_id(), younger_payload)]);
 }
 
 /// A flood of undecryptable group-routed input (fresh transport id per
@@ -2500,7 +2546,7 @@ async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry
         carol.ingest(original.clone()).await.unwrap(),
         IngestOutcome::Buffered { .. }
     ));
-    carol.drain_events();
+    let mut events = carol.drain_events();
 
     peeler.unavailable.store(false, Ordering::SeqCst);
     let fresh = send_app(&mut alice, &group_id, "fresh deferred slot control").await;
@@ -2539,17 +2585,7 @@ async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry
         carol.epoch(&group_id).unwrap(),
         alice.epoch(&group_id).unwrap()
     );
-    let mut events = carol.drain_events();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event,
-                GroupEvent::MessageReceived { message_id, .. } if message_id == &original_content
-            ))
-            .count(),
-        0,
-        "the retryable raw input is still waiting for publish-cycle replay"
-    );
+    events.extend(carol.drain_events());
 
     let (_, pending) = evolution(
         carol
@@ -2559,12 +2595,36 @@ async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry
             .await
             .unwrap(),
     );
+    // A real input behind this publish gate guarantees confirmation replay
+    // work even if background recovery already delivered the original.
+    let confirmation_payload = app_payload_for(&alice, "queued behind the confirmation gate");
+    let confirmation = send_app(&mut alice, &group_id, "queued behind the confirmation gate").await;
+    let confirmation_content = content_id(&confirmation);
+    assert!(matches!(
+        carol.ingest(confirmation.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let before_confirmation = storage.get_message(&confirmation.id).unwrap();
+    assert_eq!(
+        cgka_traits::message::StoredMessagePayload::decode(&before_confirmation.payload)
+            .unwrap()
+            .as_raw_transport(),
+        Some(&confirmation)
+    );
+    let original_before_confirmation = storage.get_message(&original.id).unwrap();
     peeler.unavailable.store(true, Ordering::SeqCst);
     carol
         .confirm_published(pending)
         .await
         .expect("durable confirmation succeeds while failed replay remains pending");
-    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+    assert_eq!(
+        storage.get_message(&original.id).unwrap(),
+        original_before_confirmation
+    );
+    assert_eq!(
+        storage.get_message(&confirmation.id).unwrap(),
+        before_confirmation
+    );
     assert!(carol.drain_pending_convergence_groups().contains(&group_id));
     let confirmed_mls = storage.group_replay_state_fingerprint(&group_id).unwrap();
     let failed = carol.advance_convergence(&group_id).await;
@@ -2572,7 +2632,14 @@ async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry
         Err(cgka_traits::error::EngineError::Peeler(PeelerError::Backend(detail)))
             if detail == "injected peeler unavailable"
     ));
-    assert_eq!(storage.get_message(&original.id).unwrap(), expected);
+    assert_eq!(
+        storage.get_message(&original.id).unwrap(),
+        original_before_confirmation
+    );
+    assert_eq!(
+        storage.get_message(&confirmation.id).unwrap(),
+        before_confirmation
+    );
     assert!(storage.group_replay_state_fingerprint(&group_id).unwrap() == confirmed_mls);
     assert!(carol.drain_pending_convergence_groups().contains(&group_id));
     events.extend(carol.drain_events());
@@ -2582,30 +2649,47 @@ async fn retained_peeler_failure_preserves_bytes_capacity_and_confirmation_retry
         carol.advance_convergence(&group_id).await.unwrap();
         events.extend(carol.drain_events());
     }
-    assert_eq!(events.iter().filter(|event| matches!(event,
-        GroupEvent::MessageReceived { message_id, sender, payload, .. }
-            if message_id == &original_content && sender == &alice.self_id() && payload == &original_payload
-    )).count(), 1, "the original application must recover exactly once");
-    assert!(!events.iter().any(|event| matches!(event,
-        GroupEvent::AppMessageInvalidated { message_id, .. } if message_id == &original_content
-    )));
-    assert_eq!(
-        storage.get_message(&original.id).unwrap().state,
-        MessageState::Processed
-    );
-    assert!(storage.has_processed_transport_id(&original.id).unwrap());
-    assert_eq!(
-        storage
-            .list_pending_application_events()
-            .unwrap()
-            .iter()
-            .filter(|event| matches!(event,
-                GroupEvent::MessageReceived { message_id, payload, .. }
-                    if message_id == &original_content && payload == &original_payload
-            ))
-            .count(),
-        1
-    );
+    let pending_outputs = storage.list_pending_application_events().unwrap();
+    for (message, content, expected_payload) in [
+        (&original, &original_content, &original_payload),
+        (&confirmation, &confirmation_content, &confirmation_payload),
+    ] {
+        for observed in [&events, &pending_outputs] {
+            let delivered: Vec<_> = observed
+                .iter()
+                .filter(|event| {
+                    matches!(event,
+                        GroupEvent::MessageReceived { message_id, .. } if message_id == content
+                    )
+                })
+                .collect();
+            assert_eq!(
+                delivered.len(),
+                1,
+                "each actual application must recover once"
+            );
+            let GroupEvent::MessageReceived {
+                group_id: id,
+                sender,
+                payload,
+                ..
+            } = delivered[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(id, &group_id);
+            assert_eq!(sender, &alice.self_id());
+            assert_eq!(payload, expected_payload);
+        }
+        assert!(!events.iter().any(|event| matches!(event,
+            GroupEvent::AppMessageInvalidated { message_id, .. } if message_id == content
+        )));
+        assert_eq!(
+            storage.get_message(&message.id).unwrap().state,
+            MessageState::Processed
+        );
+        assert!(storage.has_processed_transport_id(&message.id).unwrap());
+    }
 }
 
 /// Carol follows alice to epoch 3, retaining the anchors of the epochs she

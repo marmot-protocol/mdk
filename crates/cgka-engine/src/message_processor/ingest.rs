@@ -3219,6 +3219,8 @@ mod tests {
                     reason: StaleReason::InvalidAgainstCanonicalState,
                 },
             ),
+            // Preserve the closed result enum's defensive/legacy mappings,
+            // independently of which reasons current producers construct.
             (
                 DroppedMessageReason::UnsupportedPolicy,
                 MessageKind::Commit,
