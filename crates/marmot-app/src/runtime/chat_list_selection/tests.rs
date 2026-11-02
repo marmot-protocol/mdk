@@ -249,136 +249,115 @@ fn complete_capture_request(account: &str) -> crate::chat_selection::capture::Ca
         cancelled: Arc::new(AtomicBool::new(false)),
     }
 }
-// One worker is required to prove block_in_place yields the only async executor.
+// The helper must hand off the sole executor while real account SQL is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn complete_capture_worker_yields_one_thread_and_discards_aborted_response() {
+async fn complete_capture_ready_yields_one_thread_and_cancels_abandoned_response() {
+    fn hold_sql(
+        store: SqliteAccountStorage,
+    ) -> (
+        oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<Result<(), std::sync::mpsc::RecvTimeoutError>>,
+    ) {
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store
+                .with_read_snapshot(|_| {
+                    locked_tx.send(()).unwrap();
+                    Ok::<_, cgka_traits::StorageError>(
+                        release_rx.recv_timeout(std::time::Duration::from_secs(3)),
+                    )
+                })
+                .unwrap()
+        });
+        (locked_rx, release_tx, holder)
+    }
+
     let f = Fixture::new(0);
-    let manager = f.runtime.accounts();
-    manager.catch_up_accounts().await.unwrap();
-    let worker_id = manager
-        .workers
-        .lock()
-        .await
-        .get(&f.account_id)
-        .unwrap()
-        .handle
-        .id();
-    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let waits = observed.clone();
-    f.store
-        .set_timing_observer(Some(Arc::new(move |operation, duration, success| {
-            if success
-                && operation == storage_sqlite::SqliteTimingOperation::ConnectionWait
-                && duration >= std::time::Duration::from_millis(5)
-            {
-                eprintln!(
-                    "selection connection-wait diagnostic: actual_worker={} async_task={} elapsed_ms={}",
-                    tokio::task::try_id() == Some(worker_id),
-                    tokio::task::try_id().is_some(),
-                    duration.as_millis(),
-                );
-            }
-            if success
-                && operation == storage_sqlite::SqliteTimingOperation::ConnectionWait
-                && tokio::task::try_id() == Some(worker_id)
-                && duration >= std::time::Duration::from_millis(5)
-            {
-                waits.lock().unwrap().push(std::thread::current().id());
-            }
-        })));
-    let ready = manager
-        .capture_selection_context("alice", complete_capture_request(&f.account_id))
-        .await
-        .unwrap();
-    assert!(ready.complete().unwrap().is_empty());
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let store = f.store.clone();
-    let holder = std::thread::spawn(move || {
-        store
-            .with_read_snapshot(|_| {
-                locked_tx.send(()).unwrap();
-                release_rx
-                    .recv_timeout(std::time::Duration::from_secs(3))
-                    .unwrap();
-                Ok::<_, cgka_traits::StorageError>(())
-            })
+    // AccountManager workers are deliberately not started: their command tails
+    // also read this store, which would obstruct a different operation.
+    let client = f.app.client("alice").await.unwrap();
+    let ready =
+        capture_selection_ready(&client, complete_capture_request(&f.account_id), &|| false)
             .unwrap();
-    });
-    locked_rx.recv().unwrap();
+    assert!(ready.complete().unwrap().is_empty());
+
+    let (locked, release, holder) = hold_sql(f.store.clone());
+    locked.await.unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel();
     let progressed = Arc::new(AtomicBool::new(false));
+    let observed = progressed.clone();
+    let request = complete_capture_request(&f.account_id);
+    let capture = tokio::spawn(async move {
+        let capture_thread = std::thread::current().id();
+        entered_tx.send(()).unwrap();
+        // No await separates entry from the real synchronous capture.
+        let result = capture_selection_ready(&client, request, &|| false);
+        let progressed_before_return = observed.load(Ordering::Acquire);
+        (client, result, progressed_before_return, capture_thread)
+    });
     let mark = progressed.clone();
-    let other = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let peer = tokio::spawn(async move {
+        entered_rx.await.unwrap();
         mark.store(true, Ordering::Release);
-        release_tx.send(()).unwrap();
+        let _ = release.send(());
         std::thread::current().id()
     });
-    let captured = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        manager.capture_selection_context("alice", complete_capture_request(&f.account_id)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(progressed.load(Ordering::Acquire));
-    assert!(captured.complete().unwrap().is_empty());
-    let unrelated_thread = other.await.unwrap();
-    holder.join().unwrap();
+    let (client, captured, progressed_before_return, capture_thread) = capture.await.unwrap();
+    let peer_thread = peer.await.unwrap();
+    let released = holder.join().unwrap();
     assert!(
-        !observed.lock().unwrap().is_empty(),
-        "actual worker must have waited on this cached connection"
+        progressed_before_return,
+        "capture must let its executor peer release SQL before returning"
     );
     assert!(
-        observed
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|worker_thread| *worker_thread != unrelated_thread)
+        released.is_ok(),
+        "SQL holder watchdog expired: {released:?}"
     );
-    // Gate an actual worker cached-owner preflight through the existing public
-    // observer. This proves in-progress receiver abandonment, not SQL interruption.
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let entered = std::sync::Mutex::new(Some(entered_tx));
-    let release = std::sync::Mutex::new(release_rx);
-    f.store
-        .set_timing_observer(Some(Arc::new(move |operation, _, success| {
-            if success
-                && operation == storage_sqlite::SqliteTimingOperation::ConnectionWait
-                && tokio::task::try_id() == Some(worker_id)
-                && let Some(entered) = entered.lock().unwrap().take()
-            {
-                let _ = entered.send(());
-                // Never reenter storage. Timeout guarantees eventual release if
-                // the async assertion fails or the request is cancelled early.
-                let _ = release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(3));
+    assert_ne!(capture_thread, peer_thread);
+    assert!(captured.unwrap().complete().unwrap().is_empty());
+
+    let (locked, release, holder) = hold_sql(f.store.clone());
+    locked.await.unwrap();
+    let (respond, response) = oneshot::channel::<
+        Result<crate::client::BoundSelectionCapture, crate::chat_selection::capture::CaptureError>,
+    >();
+    let (first_tx, first_rx) = oneshot::channel();
+    let request = complete_capture_request(&f.account_id);
+    let capture = tokio::spawn(async move {
+        let first = std::cell::Cell::new(Some(first_tx));
+        let result = capture_selection_ready(&client, request, &|| {
+            let closed = respond.is_closed();
+            if let Some(first) = first.take() {
+                let _ = first.send(closed);
             }
-        })));
-    let mut pending = Box::pin(
-        manager.capture_selection_context("alice", complete_capture_request(&f.account_id)),
+            closed
+        });
+        (client, result)
+    });
+    let peer = tokio::spawn(async move {
+        let initially_closed = first_rx.await.unwrap();
+        drop(response);
+        let _ = release.send(());
+        initially_closed
+    });
+    let (client, abandoned) = capture.await.unwrap();
+    let initially_closed = peer.await.unwrap();
+    let released = holder.join().unwrap();
+    assert!(
+        !initially_closed,
+        "capture must enter before its receiver closes"
     );
-    let entered_result = tokio::select! {
-        result = &mut pending => Err(format!("capture completed before actual preflight gate: {result:?}")),
-        entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx) => {
-            entered.map_err(|_| "preflight gate timed out".to_owned())
-                .and_then(|entry| entry.map_err(|_| "preflight gate closed".to_owned()))
-        },
-    };
-    // Release on every ordinary assertion path, including an entry timeout.
-    drop(pending);
-    let _ = release_tx.send(());
-    f.store.set_timing_observer(None);
-    entered_result.unwrap();
-    let after = manager
-        .capture_selection_context("alice", complete_capture_request(&f.account_id))
-        .await
-        .unwrap();
-    assert!(after.complete().unwrap().is_empty());
-    f.store.set_timing_observer(None);
+    assert!(
+        released.is_ok(),
+        "SQL holder watchdog expired: {released:?}"
+    );
+    assert!(matches!(
+        abandoned,
+        Err(crate::chat_selection::capture::CaptureError::Cancelled)
+    ));
+    drop(client);
     f.runtime.shutdown_and_close().await.unwrap();
 }
 // This operation must explicitly refuse real current-thread worker dispatch.
