@@ -53,8 +53,8 @@ pub struct SearchPresentation {
     pub messages: Vec<SearchMessage>,
     pub capture_now_ms: i64,
 }
-macro_rules! redacted_debug { ($($kind:ty),*) => { $(impl fmt::Debug for $kind { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result { f.write_str(concat!(stringify!($kind), " { redacted }")) } })* }; }
-redacted_debug!(SearchPreviewMessage, SearchMessage, SearchPresentation);
+macro_rules! impl_redacted_format { ($($kind:ty),*) => { $(impl fmt::Debug for $kind { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result { f.write_str(concat!(stringify!($kind), " { redacted }")) } })* }; }
+impl_redacted_format!(SearchPreviewMessage, SearchMessage, SearchPresentation);
 impl SearchPreviewMessage {
     pub(crate) fn text_bytes(&self) -> Option<usize> {
         let mut total = self
