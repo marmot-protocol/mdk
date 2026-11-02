@@ -1212,6 +1212,29 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn update_linked_device_settings(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpdateLinkedDeviceSettings {
+                slot_id_hex,
+                add_to_all_chats,
+                bring_history,
+                keep_while_inactive,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn remove_linked_device(
         &self,
         account_ref: &str,

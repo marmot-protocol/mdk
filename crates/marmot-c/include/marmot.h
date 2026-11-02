@@ -8479,7 +8479,7 @@ MarmotStatus marmot_key_package_refresh_overdue(const struct MarmotClient *clien
  * string clears it. Fails while device groups are off, for an unknown
  * device, or while the device group has an earlier change in flight
  * (retry later). A rename whose commit loses a fork is made again later,
- * unless another rename of that device won. Re-read on the
+ * unless another user edit of that device won. Re-read on the
  * `LinkedDevicesChanged` event.
  *
  * # Safety
@@ -8492,6 +8492,34 @@ MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client,
                                          const char *account_ref,
                                          const char *slot_id_hex,
                                          const char *label);
+
+/**
+ * Patch a linked device's settings off the UI thread. Each `has_` flag
+ * selects its value; zero leaves it unchanged, nonzero means supplied.
+ * Values also use zero=false, nonzero=true. Earlier lost edits recover
+ * first; retry `device_group_busy` while they settle. Disabling add-to-all
+ * does not leave chats; enabling history does not backfill joined chats.
+ * Keep does not cancel explicit removal. Refused with nothing sent while
+ * device groups are off (`roster_unsupported`), without a trusted device
+ * group (`no_device_group`), for an unknown slot (`unknown_device`), or
+ * while its roster cannot be read (`roster_unavailable`). Re-read on
+ * LinkedDevicesChanged.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_update_linked_device_settings(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const char *slot_id_hex,
+                                                  uint8_t has_add_to_all_chats,
+                                                  uint8_t add_to_all_chats,
+                                                  uint8_t has_bring_history,
+                                                  uint8_t bring_history,
+                                                  uint8_t has_keep_while_inactive,
+                                                  uint8_t keep_while_inactive);
 
 /**
  * Remove another of this account's devices, by its `slot_id_hex` from

@@ -127,6 +127,10 @@
 
 ### Added
 
+- Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
 - `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
   resolves one active custom-emoji reaction's matching encrypted image to its
   original attachment source slot (mdk#2151). Use ordinary host-managed

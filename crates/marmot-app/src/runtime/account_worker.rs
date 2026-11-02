@@ -528,6 +528,13 @@ pub(crate) enum AccountWorkerCommand {
         label: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    UpdateLinkedDeviceSettings {
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     RemoveLinkedDevice {
         slot_id_hex: String,
         respond: oneshot::Sender<Result<(), AppError>>,
@@ -6383,6 +6390,24 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = client.rename_linked_device(&slot_id_hex, &label).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::UpdateLinkedDeviceSettings {
+            slot_id_hex,
+            add_to_all_chats,
+            bring_history,
+            keep_while_inactive,
+            respond,
+        } => Box::pin(async move {
+            let result = client
+                .update_linked_device_settings(
+                    &slot_id_hex,
+                    add_to_all_chats,
+                    bring_history,
+                    keep_while_inactive,
+                )
+                .await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

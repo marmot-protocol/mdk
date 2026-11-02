@@ -113,14 +113,22 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
 }
 
 /// Effective admission inputs, independent of routine device-group commits.
-/// Select targets through `gap_siblings` so local link/removal decisions (and
-/// any future target readiness gate there) participate in invalidation.
+/// Select targets through `gap_siblings` so local link/removal decisions and
+/// pending settings intentions participate in invalidation.
 #[derive(PartialEq, Eq)]
 struct GapEligibility {
     group: GroupId,
     own_slot: DeviceSlotId,
     targets: BTreeMap<DeviceSlotId, Vec<u8>>,
     claimants: BTreeSet<DeviceSlotId>,
+}
+
+/// Canonical eligibility keeps advisory bookkeeping alive while a local
+/// settings intention temporarily prevents a new attempt for that target.
+struct GapSiblings {
+    eligible: Vec<DeviceSlotId>,
+    ready: Vec<DeviceSlotId>,
+    first_error: Option<AppError>,
 }
 
 /// Only changed or due chats are examined. Routine device-group commits
@@ -240,24 +248,36 @@ impl AppClient {
         }
     }
 
-    fn gap_siblings(&self, exchange: &Exchange) -> Result<Vec<DeviceSlotId>, AppError> {
+    fn gap_siblings(&mut self, exchange: &Exchange) -> Result<GapSiblings, AppError> {
         let excluded = self.excluded_sibling_slots(exchange)?;
-        Ok(exchange
-            .roster
-            .devices
-            .iter()
-            .filter_map(|(slot, entry)| {
-                (*slot != exchange.own_slot
-                    && !excluded.contains(slot)
-                    && matches!(
-                        entry.status,
-                        DeviceStatusV1::Active | DeviceStatusV1::Inactive
-                    )
-                    && entry.settings.add_to_all_chats
-                    && entry.tag_signature_key.is_some())
-                .then_some(*slot)
-            })
-            .collect())
+        let mut siblings = GapSiblings {
+            eligible: Vec::new(),
+            ready: Vec::new(),
+            first_error: None,
+        };
+        for (slot, entry) in &exchange.roster.devices {
+            if *slot != exchange.own_slot
+                && !excluded.contains(slot)
+                && matches!(
+                    entry.status,
+                    DeviceStatusV1::Active | DeviceStatusV1::Inactive
+                )
+                && entry.settings.add_to_all_chats
+                && entry.tag_signature_key.is_some()
+            {
+                siblings.eligible.push(*slot);
+                match self
+                    .device_setting_ready(exchange, slot, |settings| settings.add_to_all_chats)
+                {
+                    Ok(true) => siblings.ready.push(*slot),
+                    Ok(false) => {}
+                    Err(error) => {
+                        siblings.first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        Ok(siblings)
     }
 
     fn gap_is_missing(
@@ -301,7 +321,7 @@ impl AppClient {
         };
         if claim.from == exchange.own_slot
             || !claimant_is_eligible(&exchange, &claim.from)
-            || !self.gap_siblings(&exchange)?.contains(&claim.to)
+            || !self.gap_siblings(&exchange)?.eligible.contains(&claim.to)
             || !self.sibling_commit_chats().contains(&claim.chat)
         {
             return Ok(());
@@ -338,8 +358,12 @@ impl AppClient {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
-        let siblings = self.gap_siblings(&exchange)?;
-        let sender_ready = !siblings.is_empty()
+        let GapSiblings {
+            eligible,
+            ready,
+            mut first_error,
+        } = self.gap_siblings(&exchange)?;
+        let sender_ready = !ready.is_empty()
             && !held.contains(&exchange.group_id)
             && claimant_is_eligible(&exchange, &exchange.own_slot)
             && exchange.tagged
@@ -347,7 +371,7 @@ impl AppClient {
         let eligibility = GapEligibility {
             group: exchange.group_id.clone(),
             own_slot: exchange.own_slot,
-            targets: siblings
+            targets: ready
                 .iter()
                 .filter_map(|slot| {
                     exchange.roster.devices[slot]
@@ -364,7 +388,7 @@ impl AppClient {
                 .copied()
                 .collect(),
         };
-        if siblings.is_empty() {
+        if eligible.is_empty() {
             self.sibling_chat_gaps.eligibility = None;
             self.sibling_chat_gaps.due.clear();
             self.sibling_chat_gaps.claims.clear();
@@ -375,7 +399,7 @@ impl AppClient {
             .sibling_chat_gaps
             .schedule_eligibility(eligibility, sender_ready);
         if !sender_ready {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         }
         let now = unix_now_seconds();
         self.sibling_chat_gaps.expire(now);
@@ -385,18 +409,18 @@ impl AppClient {
             }
         }
         if self.sibling_chat_gaps.due.values().all(|at| *at > now) {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         }
         let known: HashSet<_> = self.sibling_commit_chats().into_iter().collect();
         self.sibling_chat_gaps
             .claims
             .retain(|(chat, target), claims| {
                 claims.retain(|slot, _| claimant_is_eligible(&exchange, slot));
-                known.contains(chat) && siblings.contains(target) && !claims.is_empty()
+                known.contains(chat) && eligible.contains(target) && !claims.is_empty()
             });
         self.sibling_chat_gaps
             .waiting_for_stock
-            .retain(|(chat, target)| known.contains(chat) && siblings.contains(target));
+            .retain(|(chat, target)| known.contains(chat) && eligible.contains(target));
         self.sibling_chat_gaps
             .due
             .retain(|chat, _| known.contains(chat));
@@ -408,11 +432,10 @@ impl AppClient {
             .map(|(chat, _)| chat.clone())
             .collect();
         due.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-        let mut first_error = None;
         for chat in due {
             self.sibling_chat_gaps.due.remove(&chat);
             let result = self
-                .fill_one_chat_gap(&exchange, &chat, &siblings, &mut budget, selection)
+                .fill_one_chat_gap(&exchange, &chat, &ready, &mut budget, selection)
                 .await;
             if let Err(error) = result {
                 self.sibling_chat_gaps.schedule(chat, 0);
@@ -421,6 +444,9 @@ impl AppClient {
         }
         let mut needed = HashMap::<DeviceSlotId, u32>::new();
         for (_, slot) in &self.sibling_chat_gaps.waiting_for_stock {
+            if !ready.contains(slot) {
+                continue;
+            }
             let count = needed.entry(*slot).or_default();
             *count = count.saturating_add(1);
         }
@@ -521,10 +547,16 @@ impl AppClient {
                 || !claimant_is_eligible(&current, &current.own_slot)
                 || !current.tagged
                 || !self.group_quiet(&current.group_id)?
-                || !self.gap_siblings(&current)?.contains(slot)
                 || !self.group_quiet(chat)?
                 || !self.gap_is_missing(&current, chat, *slot)?
             {
+                continue;
+            }
+            let current_siblings = self.gap_siblings(&current)?;
+            if let Some(error) = current_siblings.first_error {
+                first_error.get_or_insert(error);
+            }
+            if !current_siblings.ready.contains(slot) {
                 continue;
             }
             // Sending the claim may have advanced local effects. Select

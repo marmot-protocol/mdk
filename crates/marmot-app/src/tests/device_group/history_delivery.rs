@@ -299,7 +299,13 @@ async fn edit_laptop_entry(
     let edited = devices
         .phone
         .runtime
-        .edit_device_roster_entry(group, &laptop_slot, &[], edit)
+        .edit_device_roster_entry(group, &laptop_slot, &[], |entry| {
+            let before = (entry.label.clone(), entry.settings);
+            edit(entry);
+            if (entry.label.clone(), entry.settings) != before {
+                entry.rename_id = Some(rand::random());
+            }
+        })
         .await
         .unwrap();
     assert!(matches!(edited, DeviceRosterEdit::Committed(_)));
@@ -317,6 +323,7 @@ async fn name_phone(devices: &mut Devices, group: &GroupId, label: &str) {
         .runtime
         .edit_device_roster_entry(group, &phone_slot, &[], |entry| {
             entry.label = label.to_owned();
+            entry.rename_id = Some(rand::random());
         })
         .await
         .unwrap();
@@ -396,6 +403,142 @@ async fn history_devices() -> (Devices, GroupId, GroupId, String) {
     let chat = devices.phone.create_group("team", &[]).await.unwrap();
     let first = send_text(&mut devices.phone, &chat, "before the laptop").await;
     (devices, group, chat, first)
+}
+
+/// A real longer non-user branch drops the phone's local edit. None edits
+/// only the label; Some changes the history flag. No maintenance replays it.
+async fn lose_phone_edit(devices: &mut Devices, group: &GroupId, history: Option<bool>) {
+    use super::devices::{edit_own_entry, exchange};
+    // An Add can leave an announcement in the relay that only its sender
+    // has seen. Replay both prefixes before forking, rather than skipping
+    // those inputs with a cursor starting at the relay's current end.
+    let mut cursors = (0, 0);
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        group,
+        &mut cursors,
+    )
+    .await;
+    let slot = slot_of(&devices.laptop);
+    assert_eq!(
+        roster(&devices.phone, group),
+        roster(&devices.laptop, group),
+        "the fork starts from a shared roster"
+    );
+    if let Some(history) = history {
+        devices
+            .phone
+            .update_linked_device_settings(&hex::encode(slot), None, Some(history), None)
+            .await
+            .unwrap();
+    } else {
+        devices
+            .phone
+            .rename_linked_device(&hex::encode(slot), "Unrelated name")
+            .await
+            .unwrap();
+    }
+    edit_own_entry(&mut devices.laptop, group, &["fork-a", "fork-b"]).await;
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        group,
+        &mut cursors,
+    )
+    .await;
+    let entry = &roster(&devices.phone, group).devices[&slot];
+    let record = storage(&devices.phone_app)
+        .device_rename(&hex::encode(slot))
+        .unwrap()
+        .unwrap();
+    assert!(record.replaced.contains(&entry.rename_id));
+    assert!(
+        !record.written.contains(&entry.rename_id.unwrap()),
+        "the local edit is Lost"
+    );
+}
+
+/// A lost local history toggle waits for D37 before either disclosing history
+/// or irreversibly forgetting debt. Maintenance recovers before making that
+/// destination decision. An unrelated lost label does not hold history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owed_history_waits_only_for_a_differing_local_history_toggle() {
+    for desired in [Some(false), Some(true), None] {
+        let (mut devices, group) = tagging_devices().await;
+        if desired != Some(true) {
+            edit_laptop_entry(&mut devices, &group, |entry| {
+                entry.settings.bring_history = true;
+            })
+            .await;
+        }
+        let chat = devices.phone.create_group("owed", &[]).await.unwrap();
+        send_text(&mut devices.phone, &chat, "owed history").await;
+        add_laptop(&mut devices, &chat).await;
+        lose_phone_edit(&mut devices, &group, desired).await;
+        let slot = slot_of(&devices.laptop);
+        assert_eq!(
+            roster(&devices.phone, &group).devices[&slot]
+                .settings
+                .bring_history,
+            desired != Some(true)
+        );
+        let phone_storage = storage(&devices.phone_app);
+        let deliveries = || {
+            phone_storage
+                .device_group_messages()
+                .unwrap()
+                .into_iter()
+                .filter(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+                .count()
+        };
+        let before = deliveries();
+        devices.phone.drive_history_deliveries().await;
+        let Some(desired) = desired else {
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                deliveries(),
+                before + 1,
+                "a lost label never holds the history flag"
+            );
+            continue;
+        };
+        assert_eq!(
+            phone_storage.unsent_history_deliveries().unwrap().len(),
+            1,
+            "pending toggle preserves existing debt in either direction"
+        );
+        assert_eq!(
+            deliveries(),
+            before,
+            "pending disable cannot disclose history"
+        );
+        devices.phone.run_due_maintenance().await.unwrap();
+        assert_eq!(
+            roster(&devices.phone, &group).devices[&slot]
+                .settings
+                .bring_history,
+            desired
+        );
+        assert!(
+            phone_storage
+                .unsent_history_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            deliveries(),
+            before + usize::from(desired),
+            "once ready, current false forgets and current true sends"
+        );
+    }
 }
 
 /// The phone's confirmed Commit that adds the laptop to a chat owes the
@@ -735,7 +878,7 @@ async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn_
 /// message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_history_too_long_to_send_inline_goes_through_blossom() {
-    let (mut devices, _group, chat, _first) = history_devices().await;
+    let (mut devices, group, chat, _first) = history_devices().await;
     let phone_storage = storage(&devices.phone_app);
     let blossom = local_blossom();
     // Two of these overflow one inline bundle, so each takes its own; the
@@ -774,9 +917,44 @@ async fn a_history_too_long_to_send_inline_goes_through_blossom() {
     devices.phone.drive_history_deliveries().await;
     assert_eq!(published_count(&devices.relay), before, "none goes inline");
     assert!(blossom.blobs.lock().unwrap().is_empty());
+    let upload = devices.phone.prepare_history_upload().unwrap().unwrap();
+    let outcome = upload.run().await;
+    assert_eq!(
+        blossom.blobs.lock().unwrap().len(),
+        1,
+        "one uploaded bundle"
+    );
+    lose_phone_edit(&mut devices, &group, Some(false)).await;
+    assert!(
+        devices.phone.prepare_history_upload().unwrap().is_none(),
+        "a pending history toggle holds new uploads without forgetting debt"
+    );
+    let before_completion = published_count(&devices.relay);
+    assert!(
+        devices.phone.finish_history_upload(outcome).await,
+        "the upload completion settles independently of its held new carrier"
+    );
+    assert_eq!(published_count(&devices.relay), before_completion);
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    // Choosing the current true value cancels this lost disable before replay.
+    devices
+        .phone
+        .update_linked_device_settings(
+            &hex::encode(slot_of(&devices.laptop)),
+            None,
+            Some(true),
+            None,
+        )
+        .await
+        .unwrap();
+    let before_carrier = published_count(&devices.relay);
     devices.phone.drive_history_blobs().await;
-    assert_eq!(blossom.blobs.lock().unwrap().len(), 1, "one 8 MiB bundle");
-    assert_eq!(published_count(&devices.relay), before + 1);
+    assert_eq!(
+        blossom.blobs.lock().unwrap().len(),
+        2,
+        "one bundle per attempt; the held upload had no carrier"
+    );
+    assert_eq!(published_count(&devices.relay), before_carrier + 1);
     assert!(
         phone_storage
             .unsent_history_deliveries()

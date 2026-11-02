@@ -46,7 +46,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     an outcome), and the sends. The runtime's roster-writing steps use these rather than
     their own copies. Device entries have one write path (`edit_device_roster_entry`, mdk#2628 3.4, 3.6): one
     `SetDevice` commit replacing one device entry with an edit applied to the roster as read now, sent as
-    `SendIntent::ReplaceDeviceEntry` naming the entry it read. The engine stages it only while the slot still holds
+    `SendIntent::ReplaceDeviceEntry` naming the entry it read. Label/settings changes must supply a present fresh
+    rename id (D86); other edits must preserve it. Validate before staging, and never generate an id behind a caller's
+    write-ahead journal. The engine stages it only while the slot still holds
     that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
     the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
@@ -89,6 +91,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     ambiguous send failure (3.5f); already-handed-off fanout finishes under the ordinary transport contract.
     Carried-row settlement is separate from Ready-filtered new-send eligibility, so exact carrier outcomes settle
     even while the originating chat is unhydrated, deferred, or settling.
+    Delivered-Welcome repair reserves the actual generated carrier timestamp/id and attaches its engine association
+    through the named storage cross transaction on this session's own connection, never under the app cache's SQL
+    lock. A failed reservation or readiness callback commits neither owner. Already accepted, unprojected fanouts
+    and outstanding targets keep their association; new repair cannot bypass them. First accepted publication is
+    durably observed with its fanout before projection; an old accepted row with unknown timing stays unknown.
     The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only

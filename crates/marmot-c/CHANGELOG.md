@@ -78,6 +78,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_update_linked_device_settings`, using presence/value `uint8_t` pairs for optional booleans. It blocks on the account worker and returns no allocation (mdk#2628 D86).
+
 - `marmot_reaction_attachment` resolves one active custom-emoji reaction to an
   owned nullable `MarmotAttachmentEntry`, freed with
   `marmot_attachment_entry_free` (mdk#2151). Acquisition and local reads use its

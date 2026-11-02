@@ -1086,6 +1086,7 @@ pub struct AppClient {
     /// settles. A carrier the engine holds that is not here was in flight
     /// when the app last stopped, so its Welcome is owed again.
     pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
+    pub(crate) sibling_welcome_retirement_cursor: Option<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1603,10 +1604,10 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
-        self.drive_history_deliveries().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
+        self.drive_history_deliveries().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
