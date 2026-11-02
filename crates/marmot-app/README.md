@@ -453,8 +453,7 @@ when rows are read, so a rename shows after `LinkedDevicesChanged`. The additive
 identifies either `Device(slot)` or `Backup(source)` in core timeline pages, incremental projections and conversation
 windows. Live rows have no provenance. The legacy `imported_from` field remains sibling-only: its absence alone does
 not distinguish live history from a backup. A backup is "restored from backup", never an unnamed device; its public
-archive identity proves neither its writer nor historical authorship. Existing foreign DTOs still expose only sibling
-provenance; complete backup bindings are a separate adoption step.
+archive identity proves neither its writer nor historical authorship. The UniFFI and C timeline/conversation DTOs carry the same typed provenance; their legacy sibling field stays unchanged.
 
 `MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
 waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
@@ -483,6 +482,11 @@ device group's roster holds them now. Two devices changing backups at once can d
 only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
 are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. The selected
 writer writes bounded backup passes during maintenance; only an accepted pointer publication counts as a backup.
+The account worker requires reported Wi-Fi and charging conditions before preparing background writer work. Call
+`set_backup_background_conditions(account_ref, wifi, charging)` on worker start and condition changes; a replacement
+worker defaults closed. Already admitted passes finish and settle after conditions become false, while later passes
+wait. Manual restore is unaffected. This worker scheduling gate does not redefine supported lower-level `AppClient`
+backup APIs or grant a host indefinite OS background execution.
 These experimental flows require `dev_device_groups` (off by default), and builds without experimental device-group
 support refuse them as `DeviceGroupRefused("roster_unsupported")`.
 

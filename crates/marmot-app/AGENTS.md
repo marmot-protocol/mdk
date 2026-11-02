@@ -137,6 +137,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
   the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
+  Worker background admission is memory-only and defaults closed: Wi-Fi AND charging must be reported before
+  `prepare_backup_pass`, including cleanup/retry passes. An admitted whole pass still runs and settles after false;
+  do not interrupt its blobs or bypass the gate through generic maintenance/shared media completion. Replacement
+  workers reset the facts. This gate does not apply to manual restore or redefine lower-level AppClient APIs.
 - Manual backup restore (`src/client/backup_restore.rs`, mdk#2628 4.4c, D93) owns one ephemeral account-worker job.
   Never drive `BackupPass` from its manual dispatcher: that pass deletes and publishes. Use the shared read-only
   pointer discovery and bounded media credits; retain the credit through serialized completion. Check the actual
@@ -150,7 +154,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   entropy and archive keys stay zeroizing and job-local, drop on cancel/close/terminal completion, and never persist
   for automatic retry. The restore watch carries only aggregate status and availability wakeups after retained
   projection; a real later join can expose a cached hint, never an automatic join. Core timeline provenance is batched;
-  legacy `imported_from` stays sibling-only and foreign backup DTOs/controls are separate 4.4d adoption.
+  legacy `imported_from` stays sibling-only in core and foreign DTOs. Host wrappers expose the existing job/watch;
+  closing a watch never cancels a job. Keep operation token parsing in the core codec and queued confirmation answers
+  in their zeroizing guard; zeroizing ownership does not imply Debug redaction or managed-host-copy erasure.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -979,6 +985,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `media-benchmarks`: internal surface for the media transport benchmarks.
 - `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
+
+Background condition ownership extends `the_runtime_writes_a_due_backup`: durable pre-prepare ledger state proves
+closed/default admission, held real PUT proves current-pass settlement after false, and worker replacement resets
+facts. The bounded host token codec owner lives in `client/backup_restore.rs`; wrappers own stale-token, watch-close,
+DTO cache and C deep-free tests rather than duplicating history/crypto owners.
 
 Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
 current own-leaf admission before GET and serialized apply, cold indexed-chat hydration without loading unrelated chats,

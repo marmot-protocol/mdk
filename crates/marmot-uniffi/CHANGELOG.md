@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Expose recovery-word setup/settings, manual backup restore begin/cancel/status/watch/current-chat hints, and
+  account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
+  rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.
+  Generated host strings remain caller-managed; do not persist or log recovery words.
+
 - `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
   Preserve it when saving an upload reference and sending it back, including
   custom emoji reactions. Outbound sends refuse a missing identity or a changed
