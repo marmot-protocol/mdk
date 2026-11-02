@@ -523,7 +523,10 @@ impl AppClient {
     /// The tag signature keys rosters of `group_id` this device applied
     /// listed in the last 30 days (mdk#2761): by slot, and within a slot the
     /// most recently seen first. The engine records them.
-    fn remembered_tag_keys(&self, group_id: &GroupId) -> Result<Vec<RosterTagKey>, AppError> {
+    pub(super) fn remembered_tag_keys(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<RosterTagKey>, AppError> {
         let since = unix_now_seconds().saturating_sub(ROSTER_TAG_KEY_RETENTION_SECS);
         Ok(self
             .app

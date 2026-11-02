@@ -12,7 +12,9 @@
 //! fingerprint reads them, so group state and branch selection are what they
 //! would be without them. The app reads them to clean up after a device the
 //! roster no longer lists, whether a removal's record was dropped before this
-//! device acted on it, a link failed, or a branch dropped a made link.
+//! device acted on it, a link failed, or a branch dropped a made link; and,
+//! adding a newly linked device to its chats (mdk#2628 3.5c), to skip a slot
+//! a state it applied held as removed.
 
 use std::collections::BTreeSet;
 
