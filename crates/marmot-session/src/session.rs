@@ -48,7 +48,8 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    DeviceGroupWelcomeExpectation, MaintenanceStorage, RosterTagKey, StorageError,
+    DeviceGroupWelcomeExpectation, MaintenanceStorage, OutboundFanoutStorage, RosterTagKey,
+    StorageError,
 };
 use cgka_traits::transport::{Timestamp, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -1427,6 +1428,17 @@ impl AccountDeviceSession {
         carrier: &[u8],
     ) -> SessionResult<bool> {
         Ok(self.engine.sibling_welcome_send_failed(id, carrier)?)
+    }
+
+    /// A carrier's durable retry survives hydration deferral too. Read the
+    /// account-owned fanout records directly rather than the live-group view.
+    pub(crate) fn sibling_welcome_carrier_in_flight(&self, carrier: &[u8]) -> SessionResult<bool> {
+        Ok(self.storage.list_outbound_fanouts()?.iter().any(|fanout| {
+            fanout.outcome().outstanding_targets > 0
+                && fanout.application_message().is_some_and(|application| {
+                    hex::decode(&application.app_event_id).is_ok_and(|id| id == carrier)
+                })
+        }))
     }
 
     pub async fn advance_convergence(

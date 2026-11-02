@@ -221,6 +221,11 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 
 ## Invariants
 
+- Sibling Welcomes retain explicit canonical-founding or confirmed-commit origin. Every owed/carrier transition
+  derives new-delivery eligibility from that stored origin; terminal loss retires the row permanently, but a deferred
+  Add or temporarily unavailable state holds it. Already-handed-off carrier fanout follows the existing transport
+  contract. Older development rows with no provable origin are never handed off again.
+
 - **Mirror every ingest invariant on every inbound seam.** An inbound MLS message reaches application-visible state
   through two seams — **direct ingest** (`message_processor/ingest.rs::ingest_group_message`) and
   **stored-convergence/replay** (`openmls_projection.rs::process_openmls_messages_inner`, materialization and apply;

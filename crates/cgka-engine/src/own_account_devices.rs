@@ -35,7 +35,9 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::{KeyPackage, SendIntent, SendResult, SiblingKeyPackage};
 use cgka_traits::engine_state::{EpochState, InvalidTransition, StagedCommitHandle};
 use cgka_traits::error::{EngineError, SiblingAddRefusal};
-use cgka_traits::message::{MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    MessageRecord, MessageState, SiblingWelcomeOrigin, StoredMessagePayload,
+};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, Timestamp};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -81,6 +83,29 @@ pub struct OwedSiblingWelcome {
     /// The app event id of the 461 sent to carry it, while that send is not
     /// resolved.
     pub carrier: Option<Vec<u8>>,
+}
+
+/// Whether a retained sibling Welcome can begin a new carrier delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SiblingWelcomeOriginState {
+    /// Its originating operation is still canonical and available.
+    Ready,
+    /// Its group or originating operation is temporarily unavailable.
+    Held,
+    /// Its origin is terminal, or a legacy row never retained one.
+    Withdrawn,
+}
+
+/// Convergence can re-adopt a deferred branch. Only a terminal disposition
+/// ends the Welcome; mere non-selection must not strand a later winning Add.
+fn sibling_commit_origin_state(state: MessageState) -> SiblingWelcomeOriginState {
+    match state {
+        MessageState::EpochInvalidated | MessageState::Failed => {
+            SiblingWelcomeOriginState::Withdrawn
+        }
+        MessageState::Processed => SiblingWelcomeOriginState::Ready,
+        _ => SiblingWelcomeOriginState::Held,
+    }
 }
 
 /// The row id of the sibling Welcome for the KeyPackage `key_package_ref`
@@ -515,13 +540,6 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<OwedSiblingWelcome>, EngineError> {
         let mut owed = Vec::new();
         for group_id in self.storage.list_groups()? {
-            if self.ensure_group_live(&group_id).is_err()
-                || self
-                    .stored_group_record(&group_id)?
-                    .is_none_or(|group| group.disbanded.is_some())
-            {
-                continue;
-            }
             for record in self.storage.list_messages_in_states(
                 &group_id,
                 &[MessageState::Sent],
@@ -531,12 +549,16 @@ impl<S: StorageProvider> Engine<S> {
                     welcome,
                     deliver_until,
                     carrier,
+                    origin,
                     ..
                 }) = StoredMessagePayload::decode(&record.payload)
                 else {
                     continue;
                 };
-                if now < deliver_until {
+                if self.check_sibling_welcome_origin(&record, &origin)?
+                    == SiblingWelcomeOriginState::Ready
+                    && now < deliver_until
+                {
                     owed.push(OwedSiblingWelcome {
                         id: record.id,
                         group_id: group_id.clone(),
@@ -547,6 +569,54 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(owed)
+    }
+
+    /// Derive withdrawal from persisted state rather than an in-memory
+    /// convergence event. A temporarily unhydrated or settling group holds
+    /// delivery; only a proven loss or an unprovable legacy origin retires it.
+    fn check_sibling_welcome_origin(
+        &self,
+        record: &MessageRecord,
+        origin: &SiblingWelcomeOrigin,
+    ) -> Result<SiblingWelcomeOriginState, EngineError> {
+        use SiblingWelcomeOriginState::{Held, Ready, Withdrawn};
+        if record.state == MessageState::Failed {
+            return Ok(Withdrawn);
+        }
+        let terminal_chat = self.epoch_manager.is_unrecoverable(&record.group_id)
+            || self.epoch_manager.is_disbanded(&record.group_id)
+            || match self.storage.get_group(&record.group_id) {
+                Ok(group) => group.disbanded.is_some(),
+                Err(StorageError::NotFound) => true,
+                Err(error) => return Err(error.into()),
+            };
+        let disposition = if terminal_chat {
+            Withdrawn
+        } else {
+            match origin {
+                SiblingWelcomeOrigin::LegacyUnproven => Withdrawn,
+                SiblingWelcomeOrigin::CanonicalFounding => Ready,
+                SiblingWelcomeOrigin::ConfirmedCommit(id) => match self.storage.get_message(id) {
+                    Ok(commit) if commit.group_id != record.group_id => Withdrawn,
+                    Ok(commit) => sibling_commit_origin_state(commit.state),
+                    Err(StorageError::NotFound) => Held,
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        };
+        if disposition == Withdrawn {
+            self.update_stored_message_state(&record.id, MessageState::Failed)?;
+            return Ok(Withdrawn);
+        }
+        if disposition == Held
+            || self.ensure_group_live(&record.group_id).is_err()
+            || self
+                .epoch_state(&record.group_id)
+                .is_none_or(|state| !state.is_stable())
+        {
+            return Ok(Held);
+        }
+        Ok(Ready)
     }
 
     /// Record `carrier`, the app event id of the 461 about to carry the owed
@@ -603,7 +673,7 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Apply `update` to the carrier and state of the owed sibling Welcome
     /// `id`, writing them back when it returns `true`. Like withdrawal, it
-    /// reads only the Welcome's own row.
+    /// rechecks the Welcome's origin before changing its own row.
     fn update_owed_sibling_welcome(
         &self,
         id: &MessageId,
@@ -623,10 +693,15 @@ impl<S: StorageProvider> Engine<S> {
             key_package_ref,
             deliver_until,
             mut carrier,
+            origin,
         }) = StoredMessagePayload::decode(&record.payload)
         else {
             return Ok(false);
         };
+        if self.check_sibling_welcome_origin(&record, &origin)? != SiblingWelcomeOriginState::Ready
+        {
+            return Ok(false);
+        }
         if !update(&mut carrier, &mut record.state) {
             return Ok(false);
         }
@@ -635,6 +710,7 @@ impl<S: StorageProvider> Engine<S> {
             key_package_ref,
             deliver_until,
             carrier,
+            origin,
         )
         .encode()
         .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
@@ -807,4 +883,30 @@ pub(crate) fn own_account_leaves(
             Ok(member.index)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod origin_disposition_tests {
+    use super::{SiblingWelcomeOriginState, sibling_commit_origin_state};
+    use cgka_traits::message::MessageState;
+
+    /// A losing candidate may be selected later; treating deferred as final
+    /// would strand the KeyPackage leaf without its Welcome after re-adoption.
+    #[test]
+    fn a_deferred_add_holds_its_welcome_until_reselected_or_terminal() {
+        for (state, expected) in [
+            (
+                MessageState::ConvergenceDeferred,
+                SiblingWelcomeOriginState::Held,
+            ),
+            (MessageState::Processed, SiblingWelcomeOriginState::Ready),
+            (
+                MessageState::EpochInvalidated,
+                SiblingWelcomeOriginState::Withdrawn,
+            ),
+            (MessageState::Failed, SiblingWelcomeOriginState::Withdrawn),
+        ] {
+            assert_eq!(sibling_commit_origin_state(state), expected, "{state:?}");
+        }
+    }
 }

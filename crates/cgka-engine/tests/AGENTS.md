@@ -291,6 +291,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
 
+  The sibling-Welcome owner also covers 3.5f: a real losing Add holds its Welcome across reopen instead of becoming
+  sendable or terminal from a lost event, and legacy development rows with no provable origin are not handed off
+  after reopen. The pure origin-disposition table lives in `src/own_account_devices.rs`; stored bytes and legacy
+  compatibility live in `cgka-traits` `message::stored_payload_codec_tests`.
+
 - **File:** `account_devices/tagged_siblings.rs` (test-policy builds only)
   - **Owns:** No tests. Its fixtures (`tagged_devices`, `tag_devices`, `found_routed_group`,
     `found_group_routed_with`, `handed`, `assert_joins_from`) are how the gated same-account tests in

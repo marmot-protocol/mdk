@@ -82,6 +82,12 @@ where
         id: &MessageId,
         carrier: &[u8],
     ) -> AccountResult<bool> {
+        // An ambiguous error can leave the exact carrier in durable retry.
+        // Keep its association to the Welcome until that retry settles;
+        // otherwise the next pass can create a duplicate new carrier.
+        if self.session.sibling_welcome_carrier_in_flight(carrier)? {
+            return Ok(false);
+        }
         Ok(self.session.sibling_welcome_send_failed(id, carrier)?)
     }
 
