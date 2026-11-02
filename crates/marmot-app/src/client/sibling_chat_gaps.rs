@@ -4,11 +4,11 @@
 //! membership. They are intentionally local transient state. The selected
 //! tree is checked again by the engine when an Add actually stages.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::{GroupEvent, SiblingKeyPackage};
-use cgka_traits::{EpochId, EpochPin, GroupId};
+use cgka_traits::{EpochId, GroupId};
 use serde::{Deserialize, Serialize};
 
 use super::AppClient;
@@ -111,11 +111,23 @@ fn claimant_is_eligible(exchange: &Exchange, slot: &DeviceSlotId) -> bool {
     })
 }
 
-/// Only changed or due chats are examined. Application traffic at an
-/// unchanged device-group tip never reloads every chat's MLS tree.
+/// Effective admission inputs, independent of routine device-group commits.
+/// Select targets through `gap_siblings` so local link/removal decisions (and
+/// any future target readiness gate there) participate in invalidation.
+#[derive(PartialEq, Eq)]
+struct GapEligibility {
+    group: GroupId,
+    own_slot: DeviceSlotId,
+    sender_ready: bool,
+    targets: BTreeMap<DeviceSlotId, Vec<u8>>,
+    claimants: BTreeSet<DeviceSlotId>,
+}
+
+/// Only changed or due chats are examined. Routine device-group commits
+/// with unchanged admission inputs never reload every chat's MLS tree.
 #[derive(Default)]
 pub(crate) struct SiblingChatGaps {
-    roster_tip: Option<(GroupId, EpochPin)>,
+    eligibility: Option<GapEligibility>,
     due: HashMap<GroupId, u64>,
     claims: HashMap<Gap, BTreeMap<DeviceSlotId, u64>>,
     waiting_for_stock: HashSet<Gap>,
@@ -154,6 +166,18 @@ impl SiblingChatGaps {
         }
     }
 
+    /// A previous local attempt keeps its original advisory deadline even
+    /// after a terminal rollback. Do not emit fresh claims or spend fresh
+    /// stock every maintenance tick. Restart may forget this local hygiene.
+    fn claim_wait_until(&self, gap: &Gap, own: &DeviceSlotId, now: u64) -> Option<u64> {
+        self.claims
+            .get(gap)
+            .and_then(|claims| claims.get(own))
+            .copied()
+            .filter(|expiry| *expiry > now)
+            .or_else(|| self.lower_claim_until(gap, own, now))
+    }
+
     fn lower_claim_until(&self, gap: &Gap, own: &DeviceSlotId, now: u64) -> Option<u64> {
         self.claims
             .get(gap)?
@@ -173,10 +197,15 @@ impl AppClient {
             | GroupEvent::EpochChanged { group_id, .. }
             | GroupEvent::GroupStateInvalidated { group_id, .. }
             | GroupEvent::GroupStateRevalidated { group_id, .. }
-            | GroupEvent::LocalGroupCopyRestored { group_id } => group_id,
+            | GroupEvent::LocalGroupCopyRestored { group_id }
+            | GroupEvent::GroupHydrationRecovered { group_id, .. } => group_id,
             _ => return,
         };
-        self.sibling_chat_gaps.schedule(group.clone(), 0);
+        // A device-group epoch event is not chat work. Its relevant roster
+        // or readiness changes are detected by the effective snapshot below.
+        if self.is_device_group(group).ok() == Some(false) {
+            self.sibling_chat_gaps.schedule(group.clone(), 0);
+        }
     }
 
     pub(super) fn sibling_gap_stock_arrived(&mut self, slot: &DeviceSlotId) {
@@ -279,34 +308,67 @@ impl AppClient {
         mut budget: usize,
     ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
+            // A later readable/tagged exchange must wake old chats even if
+            // it has the same roster as before this loss of readiness.
+            if let Some(prior) = self.sibling_chat_gaps.eligibility.as_mut() {
+                prior.sender_ready = false;
+            }
             return Ok(());
         };
-        if held.contains(&exchange.group_id)
-            || !claimant_is_eligible(&exchange, &exchange.own_slot)
-            || !exchange.tagged
-            || !self.group_quiet(&exchange.group_id)?
+        let siblings = self.gap_siblings(&exchange)?;
+        let sender_ready = !siblings.is_empty()
+            && !held.contains(&exchange.group_id)
+            && claimant_is_eligible(&exchange, &exchange.own_slot)
+            && exchange.tagged
+            && self.group_quiet(&exchange.group_id)?;
+        let eligibility = GapEligibility {
+            group: exchange.group_id.clone(),
+            own_slot: exchange.own_slot,
+            sender_ready,
+            targets: siblings
+                .iter()
+                .filter_map(|slot| {
+                    exchange.roster.devices[slot]
+                        .tag_signature_key
+                        .clone()
+                        .map(|key| (*slot, key))
+                })
+                .collect(),
+            claimants: exchange
+                .roster
+                .devices
+                .keys()
+                .filter(|slot| claimant_is_eligible(&exchange, slot))
+                .copied()
+                .collect(),
+        };
+        let changed = self.sibling_chat_gaps.eligibility.as_ref() != Some(&eligibility);
+        if self
+            .sibling_chat_gaps
+            .eligibility
+            .as_ref()
+            .is_some_and(|prior| prior.group != exchange.group_id)
         {
+            self.sibling_chat_gaps.claims.clear();
+            self.sibling_chat_gaps.waiting_for_stock.clear();
+        }
+        self.sibling_chat_gaps.eligibility = Some(eligibility);
+        if siblings.is_empty() {
+            self.sibling_chat_gaps.due.clear();
+            self.sibling_chat_gaps.claims.clear();
+            self.sibling_chat_gaps.waiting_for_stock.clear();
+            return Ok(());
+        }
+        if !sender_ready {
             return Ok(());
         }
         let now = unix_now_seconds();
         self.sibling_chat_gaps.expire(now);
-        let tip = (exchange.group_id.clone(), exchange.pin);
-        if self.sibling_chat_gaps.roster_tip.as_ref() != Some(&tip) {
-            if self
-                .sibling_chat_gaps
-                .roster_tip
-                .as_ref()
-                .is_some_and(|(group, _)| *group != exchange.group_id)
-            {
-                self.sibling_chat_gaps.claims.clear();
-                self.sibling_chat_gaps.waiting_for_stock.clear();
-            }
-            self.sibling_chat_gaps.roster_tip = Some(tip);
+        if changed {
             for chat in self.sibling_commit_chats() {
                 self.sibling_chat_gaps.schedule(chat, 0);
             }
         }
-        let siblings = self.gap_siblings(&exchange)?;
         if self.sibling_chat_gaps.due.values().all(|at| *at > now) {
             return Ok(());
         }
@@ -377,7 +439,7 @@ impl AppClient {
                 self.sibling_chat_gaps.schedule(chat.clone(), 0);
                 break;
             }
-            if let Some(expiry) = self.sibling_chat_gaps.lower_claim_until(
+            if let Some(expiry) = self.sibling_chat_gaps.claim_wait_until(
                 &gap,
                 &exchange.own_slot,
                 unix_now_seconds(),
@@ -542,11 +604,16 @@ mod tests {
         state.retain_claim(Claim::decode(CLAIM, 100, 200).unwrap().unwrap());
         assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 200), Some(700));
         assert_eq!(state.lower_claim_until(&gap, &[0x01; 32], 200), None);
+        assert_eq!(state.claim_wait_until(&gap, &[0x11; 32], 200), Some(700));
+        assert_eq!(state.claim_wait_until(&gap, &[0x01; 32], 200), None);
         state.retain_claim(Claim::decode(CLAIM, 100, 699).unwrap().unwrap());
         assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 699), Some(700));
         assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 700), None);
+        state.due.clear();
         state.expire(700);
         assert_eq!(state.lower_claim_until(&gap, &[0x33; 32], 700), None);
+        assert_eq!(state.claim_wait_until(&gap, &[0x11; 32], 700), None);
+        assert_eq!(state.due.get(&gap.0), Some(&0));
         assert!(Claim::decode(CLAIM, 100, 700).unwrap().is_none());
         assert!(Claim::decode(CLAIM, 201, 200).unwrap().is_none());
         assert!(Claim::decode(CLAIM, u64::MAX, u64::MAX).unwrap().is_none());

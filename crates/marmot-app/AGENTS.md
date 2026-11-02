@@ -269,8 +269,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Fill missing sibling chat memberships in `client/sibling_chat_gaps.rs` (mdk#2628 3.5e, D82–D84), through
   kind-458 advisory claims and the existing private Add path. Claim content must match its canonical bytes; a leaving
   device neither claims nor suppresses another claimant. Claims are transient, expire from their original event time
-  after ten minutes, and never authorize an Add; replay cannot extend one. Only changed/due chats load their
-  MLS trees, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
+  after ten minutes, and never authorize an Add; replay cannot extend one. A live own claim delays another local
+  attempt after a terminal Add failure until that same expiry; restart can forget it. Only changed/due chats load their
+  MLS trees: effective target keys/exclusions, claimant eligibility and own readiness invalidate work, routine device-group
+  commits do not. With no eligible target, clear pending work without enumerating chats. Hydration recovery wakes the
+  recovered chat, and a hand-off wakes the chats waiting on that sibling's stock. Use the shared current-link/removal
   exclusion helper. Active and inactive siblings remain eligible with the old-chat setting on. Missing or unusable
   selected private stock waits without public fallback; the current stock picker does not search later allocations
   for chat compatibility. Share `LINK_CHAT_ADDS_PER_PASS` with the direct post-link burst. The engine rechecks sibling

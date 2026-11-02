@@ -403,6 +403,89 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     assert_eq!(leaves_of(&high, &target, &chats[0], &group), 1);
 }
 
+/// A terminally rejected Add rolls back to a quiet chat, but the live own
+/// claim still prevents another stock spend. An independent chat progresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let mut chats = chats(&mut phone, 2).await;
+    chats.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert!(
+        chats
+            .iter()
+            .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 0)
+    );
+
+    // Accept the claim, then definitively reject the first chat's Commit.
+    // The fixture gates actual publishes; it supplies no retry decision.
+    let blocked = relay
+        .blocked_publish_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    relay.block_next_publishes(2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(phone.client.fill_sibling_chat_gaps(&[], 2), async {
+            relay.wait_for_blocked_publishes(blocked + 1).await;
+            relay.release_publish();
+            relay.wait_for_blocked_publishes(blocked + 2).await;
+            relay.reject_next_publish();
+            relay.release_publish();
+        });
+    })
+    .await
+    .expect("the claim and terminally rejected Commit complete");
+    assert!(phone.client.group_quiet(&chats[0]).unwrap());
+    assert_eq!(leaves_of(&phone, &laptop, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &chats[1], &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), 2);
+    let published = relay.published_event_ids();
+    phone.client.fill_sibling_chat_gaps(&[], 2).await;
+    assert_eq!(
+        relay.published_event_ids(),
+        published,
+        "no fresh claim or Add"
+    );
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        2,
+        "no fresh private stock spend"
+    );
+}
+
+/// Recovering a quarantined chat wakes its missing-membership work without
+/// a device-group or chat epoch change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovering_a_quarantined_chat_wakes_gap_filling() {
+    use cgka_traits::storage::GroupStorage;
+
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let storage = phone.app.account_storage("alice").unwrap();
+    let original = storage.get_group(&chat).unwrap();
+    let mut damaged = original.clone();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    let mut phone = reopen(phone).await;
+    assert_eq!(phone.client.quarantined_groups().len(), 1);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    let pin = phone.client.runtime.epoch_pin(&group).unwrap();
+    phone.client.fill_sibling_chat_gaps(&[], 1).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+
+    storage.put_group(&original).unwrap();
+    assert!(phone.client.retry_hydrate_quarantined_group(&chat).unwrap());
+    phone.client.drain_pending_session_events().await.unwrap();
+    assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+    phone.client.fill_sibling_chat_gaps(&[], 1).await;
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+}
+
 /// With "add to all my chats" off, the new device is added to no chat,
 /// though the phone holds its KeyPackages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -753,6 +836,11 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
         .await
         .unwrap();
     assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
+    assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
+    assert!(
+        phone.client.group_quiet(&group).unwrap(),
+        "unrelated unhydrated chats do not hide the quiet device group"
+    );
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
     assert_eq!(taken_from(&phone, &laptop), before + 1);
 }
