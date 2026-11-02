@@ -93,11 +93,19 @@
 
 ### Added
 
+- Linked devices fill missing sibling chat memberships with private
+  KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
+  ten-minute advisory claim to reduce competing Adds; the selected tree is
+  checked again when an Add stages. Gap filling requires the sibling's
+  "add to all my chats" setting and shares the existing per-pass Add cap.
+  Missed invitations with that setting off await a re-invite. Automatic
+  duplicate cleanup and delivered-Welcome resend remain deferred. Only
+  behind `dev_device_groups`.
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
   relay is sent again by the next maintenance pass. Only behind
-  `dev_device_groups`; nothing outside tests adds a sibling yet.
+  `dev_device_groups`.
 - The backup writer writes the account's backup once a day (mdk#2628 item
   4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
   as blobs on the deployment's Blossom servers under a fresh archive key, and
@@ -632,8 +640,8 @@
   refused with nothing written. Each used to fail after writing its commit or
   group record, and the record stayed. Every Add path now wraps each Welcome
   before its first write.
-- Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
+- Kinds sent only in a device group (heartbeat 457, gap-fill claim 458,
+  private KeyPackage request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
   small-state update 475 and broadcast request 476) are ignored in any other
   group (mdk#2628). One received in a chat makes no timeline row, host
   message or notification, and `send_custom_event` refuses each as reserved
