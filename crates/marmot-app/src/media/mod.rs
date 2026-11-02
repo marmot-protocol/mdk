@@ -130,6 +130,7 @@ impl MediaDownloadBenchmarkTransport {
             dim: None,
             thumbhash: None,
             source_epoch: 0,
+            source_epoch_identity: None,
         };
         fetch_encrypted_media_blob_classified(
             &reference,
@@ -442,7 +443,7 @@ impl From<MediaAttachmentRejection> for AppError {
 pub enum MediaAttachmentOutcome {
     Accepted {
         attachment_index: u32,
-        reference: MediaAttachmentReference,
+        reference: Box<MediaAttachmentReference>,
     },
     Rejected {
         attachment_index: u32,
@@ -459,7 +460,7 @@ impl MediaAttachmentOutcome {
         match result {
             Ok(reference) => Self::Accepted {
                 attachment_index,
-                reference,
+                reference: Box::new(reference),
             },
             Err(rejection) => Self::Rejected {
                 attachment_index,
@@ -485,11 +486,26 @@ pub struct MediaAttachmentReference {
     pub media_type: String,
     pub version: String,
     pub source_epoch: u64,
+    /// Local provenance from this device's upload. Preserve it when saving or
+    /// returning a reference for a send. Never serialized into an `imeta` tag.
+    /// Received and legacy references have none and require a fresh upload
+    /// before they can be sent; their download semantics are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch_identity: Option<String>,
     pub dim: Option<String>,
     pub thumbhash: Option<String>,
 }
 
 impl MediaAttachmentReference {
+    /// Provenance retained only by local upload/reference round trips.
+    pub(crate) fn upload_epoch_pin(&self) -> Option<cgka_traits::EpochPin> {
+        let identity = hex::decode(self.source_epoch_identity.as_deref()?).ok()?;
+        Some(cgka_traits::EpochPin {
+            epoch: cgka_traits::EpochId(self.source_epoch),
+            identity: identity.try_into().ok()?,
+        })
+    }
+
     /// Structurally validate the reference. This is the ingest check: a
     /// reference is invalid ONLY for structural reasons (bad hashes/nonce, no
     /// locator, a locator with an empty kind/value or an unparseable URL, empty
@@ -877,6 +893,7 @@ async fn upload_encrypted_media_attachment(
         media_type,
         version: policy.version.as_str().to_owned(),
         source_epoch,
+        source_epoch_identity: None,
         dim: request.dim,
         thumbhash: request.thumbhash,
     };
@@ -1664,6 +1681,7 @@ pub fn parse_media_attachment(
         media_type: required("m", media_type)?,
         version,
         source_epoch: source_epoch.unwrap_or_default(),
+        source_epoch_identity: None,
         dim,
         thumbhash,
     };

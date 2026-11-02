@@ -236,6 +236,7 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
         media_type: "image/png".into(),
         version: "encrypted-media-v2".into(),
         source_epoch: epoch + 1,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     };
@@ -266,6 +267,9 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
         );
     }
     reference.source_epoch = epoch;
+    reference.source_epoch_identity = Some(hex::encode(
+        client.runtime.epoch_pin(&group).unwrap().identity,
+    ));
     let invalid = crate::messages::build_inner_event_with_media_reply(
         &AppMessageIntent::Media {
             message_tags: Vec::new(),

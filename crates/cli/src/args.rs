@@ -499,7 +499,7 @@ pub(crate) enum MediaCommand {
         #[arg(
             value_name = "ATTACHMENT",
             required = true,
-            help = "A `media` object from `media upload` JSON, or the plaintext SHA-256 of a projected attachment"
+            help = "A complete `media upload` JSON object including source_epoch_identity; projected/hash references require a fresh upload"
         )]
         attachments: Vec<String>,
         #[arg(long, help = "Caption to send with the attachments")]

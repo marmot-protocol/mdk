@@ -952,6 +952,7 @@ fn prepared_media_snapshot_fixture(
             media_type: attachment.media_type.clone(),
             version: "encrypted-media-v2".into(),
             source_epoch: 0,
+            source_epoch_identity: Some(h.upload_epoch_identity.clone()),
             dim: None,
             thumbhash: None,
         })

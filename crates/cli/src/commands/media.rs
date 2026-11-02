@@ -326,6 +326,8 @@ struct MediaReferenceInput {
     version: String,
     source_epoch: u64,
     #[serde(default)]
+    source_epoch_identity: Option<String>,
+    #[serde(default)]
     dim: Option<String>,
     #[serde(default)]
     thumbhash: Option<String>,
@@ -359,6 +361,7 @@ fn parse_media_reference_json(raw: &str) -> Result<MediaAttachmentReference, WnE
         media_type: input.media_type,
         version: input.version,
         source_epoch: input.source_epoch,
+        source_epoch_identity: input.source_epoch_identity,
         dim: input.dim,
         thumbhash: input.thumbhash,
     })
@@ -388,6 +391,7 @@ fn media_records_json(messages: Vec<AppMessageRecord>, allow_loopback_http: bool
                 "version": reference.version,
                 "media_type": reference.media_type,
                 "source_epoch": reference.source_epoch,
+                "source_epoch_identity": reference.source_epoch_identity,
                 "dim": reference.dim,
                 "thumbhash": reference.thumbhash,
                 "caption": caption,
@@ -416,6 +420,7 @@ fn media_attachment_json(reference: &MediaAttachmentReference) -> Value {
         "version": reference.version,
         "media_type": reference.media_type,
         "source_epoch": reference.source_epoch,
+                "source_epoch_identity": reference.source_epoch_identity,
         "dim": reference.dim,
         "thumbhash": reference.thumbhash,
     })
@@ -660,6 +665,25 @@ mod tests {
             "m image/png".to_owned(),
             format!("filename {file_name}"),
         ]
+    }
+
+    #[test]
+    fn cli_media_upload_reference_json_preserves_local_provenance() {
+        let mut reference = media_attachment_from_imeta_tag(
+            &valid_cli_imeta_tag(0x11, "uploaded.png"),
+            Some(7),
+            false,
+        )
+        .unwrap();
+        reference.source_epoch_identity = Some("ab".repeat(32));
+        let uploaded = marmot_app::MediaUploadAttachmentResult {
+            reference,
+            encrypted_size_bytes: 32,
+        };
+        let json = media_upload_attachment_json(&uploaded);
+        let restored = parse_media_reference_json(&json["media"].to_string()).unwrap();
+        assert_eq!(restored.source_epoch, 7);
+        assert_eq!(restored.source_epoch_identity, Some("ab".repeat(32)));
     }
 
     #[test]
