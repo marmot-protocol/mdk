@@ -287,8 +287,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     that names no relays or one relay spelled two ways) writes nothing; and an Add sent while convergence is pending is
     refused before the queue when its sibling checks fail, and refused at drain as `QueuedIntentRefused` when they fail
     by then. A sibling that lands through another adder while its Add waits is refused at drain, before a direct
-    retry, and by the advisory check; distinct MLS signers exercise both authenticated slot presence and the pre-link
-    signature-key fallback (mdk#2628 3.5e). The read-only pre-check a host runs before it takes a KeyPackage
+    retry, and by the advisory check; distinct MLS signers exercise authenticated slot presence in both signer orientations
+    (mdk#2628 3.5e). These tagged fixtures do not independently isolate the pre-link signature-key fallback. The read-only pre-check a host runs before it takes a KeyPackage
     (`sibling_add_refusal`, `chat_sibling_add_refusal`, 3.5c) names the same refusals, the chat's requirements and the account's leaf limit
     included, and passes the valid Add, writing nothing. A delivered sibling Welcome writes the forensic state row an
     invite Welcome writes, through `device_roster.rs`'s `recorded_roster_device_on`.
