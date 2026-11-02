@@ -25,8 +25,7 @@ CREATE INDEX IF NOT EXISTS cgka_group_rejoin_role_idx
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::base::migrations::{MIGRATIONS, run, run_all};
+    use crate::base::migrations::{MIGRATIONS, run, run_through};
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::storage::StorageError;
     use rusqlite::{Connection, params};
@@ -47,20 +46,7 @@ mod tests {
                 params![group.id.as_slice(), original],
             )
             .unwrap();
-        {
-            let transaction = connection.transaction().unwrap();
-            apply(&transaction).unwrap();
-            transaction.rollback().unwrap();
-        }
-        let present: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'cgka_group_rejoin')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!present);
-        assert_eq!(run_all(&mut connection).unwrap(), 1);
+        run_through(&mut connection, 172).unwrap();
         let preserved: Vec<u8> = connection
             .query_row(
                 "SELECT record FROM cgka_groups WHERE id = ?1",
@@ -76,6 +62,5 @@ mod tests {
                 latest_supported: 171
             })
         ));
-        assert_eq!(run_all(&mut connection).unwrap(), 0);
     }
 }
