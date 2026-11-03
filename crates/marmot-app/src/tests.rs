@@ -1914,6 +1914,7 @@ fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
             .unwrap();
@@ -13547,7 +13548,8 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
         let cursor = crate::unix_now_seconds() - 3_600;
 
         {
-            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_recovery_runner_ownership_for_test(false);
             app.ensure_account_state("alice").unwrap();
             let mut state = app.load_state("alice").unwrap();
             state.last_transport_timestamp = Some(cursor);
@@ -13561,6 +13563,7 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
 
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         reopened.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
