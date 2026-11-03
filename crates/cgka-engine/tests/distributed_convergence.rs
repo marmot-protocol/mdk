@@ -4862,20 +4862,8 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
 
-    // Inbound ingest is halted too: a fresh inbound group message is retained
-    // (buffered), not applied, until a verified repair path.
-    let outcome = carol
-        .ingest(bob_commit.clone())
-        .await
-        .expect("ingest does not error on an unrecoverable group");
-    assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Buffered { .. } | IngestOutcome::Stale { .. }
-        ),
-        "inbound must not be applied while Unrecoverable; got {outcome:?}"
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    // Fresh inbound halting is owned by
+    // `unrecoverable_halt_survives_engine_restart_until_verified_repair`.
 }
 
 #[tokio::test]
