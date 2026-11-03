@@ -6080,10 +6080,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         "test adapter must exercise transport id replacement"
     );
     let expected_publication = PublishedApplicationMessage {
-        publication_observation: Some(cgka_traits::PublicationObservation {
-            order: 1,
-            at_ms: 42_000_000,
-        }),
+        publication_observation: Some(cgka_traits::PublicationObservation { at_ms: 42_000_000 }),
         authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),

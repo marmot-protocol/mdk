@@ -33,7 +33,7 @@ impl SqliteAppStorage {
                  AND (last_carrier_created_at < excluded.last_carrier_created_at
                     OR (last_carrier_created_at = excluded.last_carrier_created_at
                         AND prepared_carrier = excluded.prepared_carrier
-                        AND (publication_order IS NULL OR carrier != excluded.prepared_carrier)))",
+                        AND (published_at_ms IS NULL OR carrier != excluded.prepared_carrier)))",
                 params![
                     welcome_id,
                     chat_id,
@@ -57,7 +57,7 @@ impl SqliteAppStorage {
         self.lock()?
             .query_row_cached(
                 "SELECT prepared_carrier, last_carrier_created_at FROM sibling_welcome_resends
-             WHERE welcome_id = ?1 AND (publication_order IS NULL OR carrier != prepared_carrier)",
+             WHERE welcome_id = ?1 AND (published_at_ms IS NULL OR carrier != prepared_carrier)",
                 params![welcome_id],
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -68,15 +68,15 @@ impl SqliteAppStorage {
     }
 
     /// Bounded keyset walk of the existing per-Welcome owner, including rows
-    /// whose activity wait has not armed. No expiry or origin is mirrored here.
+    /// whose publication time is unknown. No expiry or origin is mirrored here.
     pub fn sibling_welcome_resend_batch(
         &self,
         after: Option<&[u8]>,
         limit: usize,
-    ) -> StorageResult<Vec<Vec<u8>>> {
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT welcome_id FROM sibling_welcome_resends WHERE welcome_id > ?1 ORDER BY welcome_id LIMIT ?2"
+            "SELECT welcome_id, carrier FROM sibling_welcome_resends WHERE welcome_id > ?1 ORDER BY welcome_id LIMIT ?2"
         ).storage()?;
         stmt.query_map(
             params![
@@ -85,33 +85,37 @@ impl SqliteAppStorage {
                     "resend batch limit overflow".into()
                 ))?
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .storage()?
         .collect::<Result<_, _>>()
         .storage()
     }
 
-    /// Indexed due work, as original Welcome and current carrier identities.
-    /// The engine rechecks selected origin, expiry and participation before
-    /// rearming; transport must settle the previous carrier first.
-    pub fn due_sibling_welcome_resends(
+    /// A heartbeat for the CURRENT roster incarnation must be at least ten
+    /// minutes after this Welcome's latest actual accepted carrier. The caller
+    /// supplies the current entry's linked_at; neither first sighting nor
+    /// activity retained for an older incarnation qualifies. Unknown carrier
+    /// timing stays unknown. Dividing milliseconds first avoids SQL overflow.
+    pub fn sibling_welcome_resend_is_due(
         &self,
-        now_ms: u64,
-    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT welcome_id, carrier FROM sibling_welcome_resends
-             WHERE due_at_ms <= ?1 ORDER BY due_at_ms, welcome_id",
+        welcome_id: &[u8],
+        linked_at: u64,
+    ) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(
+                 SELECT 1 FROM sibling_welcome_resends AS r
+                 JOIN device_activity AS a ON a.slot_id_hex = lower(hex(r.target_slot))
+                 WHERE r.welcome_id = ?1 AND a.linked_at = ?2
+                   AND r.published_at_ms IS NOT NULL
+                   AND a.last_active_at >= r.published_at_ms / 1000 + 600
+                       + CASE WHEN r.published_at_ms % 1000 = 0 THEN 0 ELSE 1 END
+             )",
+                params![welcome_id, u64_to_i64(linked_at)?],
+                |row| row.get(0),
             )
-            .storage()?;
-        stmt.query_map(params![u64_to_i64(now_ms)?], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .storage()?
-        .collect::<Result<_, _>>()
-        .storage()
+            .storage()
     }
 
     /// Retire completed, expired or terminal repair work. A held origin keeps

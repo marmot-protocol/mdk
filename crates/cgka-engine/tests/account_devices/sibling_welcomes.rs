@@ -2230,11 +2230,13 @@ async fn sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire()
             .unwrap()
     );
     assert!(
-        storage
+        !storage
             .app_storage()
-            .due_sibling_welcome_resends(u64::MAX / 2)
-            .unwrap()
-            .is_empty(),
+            .sibling_welcome_resend_is_due(
+                original.id.as_slice(),
+                roster.devices[&slot(2)].linked_at
+            )
+            .unwrap(),
         "not armed: retirement must not rely only on due rows"
     );
     assert!(

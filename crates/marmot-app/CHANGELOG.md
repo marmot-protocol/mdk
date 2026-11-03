@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Simplify experimental sibling-Welcome repair to existing current-incarnation heartbeat activity at least ten minutes after actual carrier acceptance (D100). Unknown publication time holds repair; cadence/skew remain best effort. Remove per-message activity proof/alias recovery work.
+
 - Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
 
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing

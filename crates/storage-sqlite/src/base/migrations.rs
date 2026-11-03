@@ -351,6 +351,9 @@ mod migration_0167_reaction_attachment_sources;
 #[path = "migrations/0171_device_edit_settings.rs"]
 mod migration_0171_device_edit_settings;
 
+#[path = "migrations/0174_heartbeat_welcome_repair.rs"]
+mod migration_0174_heartbeat_welcome_repair;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1320,6 +1323,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0171_device_edit_settings",
         suspend_foreign_keys: &[],
         apply: migration_0171_device_edit_settings::apply,
+    },
+    Migration {
+        version: 174,
+        name: "0174_heartbeat_welcome_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0174_heartbeat_welcome_repair::apply,
     },
 ];
 
