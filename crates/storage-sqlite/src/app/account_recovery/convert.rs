@@ -550,23 +550,7 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
         .chain(reach.routes.values().copied())
         .any(|lowest| lowest < floor)
     {
-        let certifying = input
-            .routes
-            .iter()
-            .map(|current| (current.route.clone(), current.required_relays.clone()))
-            .collect::<Vec<_>>();
-        park_overtaken_tx(conn, floor, &certifying, now)?;
-        settle_goals_tx(conn, floor)?;
-        let parked: i64 = conn
-            .query_row_cached(
-                "SELECT COUNT(*) FROM account_recovery_coverage_remainders",
-                [],
-                |row| row.get(0),
-            )
-            .storage()?;
-        if parked > 0 {
-            notices_changed_tx(conn)?;
-        }
+        park_loss_below_floor_tx(conn, input)?;
     }
     let uncharged =
         format!("{LIVE_LOSS} AND (imported_count IS NULL OR imported_count < dropped_count)");
@@ -615,6 +599,32 @@ fn loss_tx(conn: &Connection, input: &RecoveryConversionInput<'_>) -> StorageRes
         [],
     )
     .storage()?;
+    Ok(())
+}
+
+/// Loss below retention remains a parked remainder, never coverage.
+fn park_loss_below_floor_tx(
+    conn: &Connection,
+    input: &RecoveryConversionInput<'_>,
+) -> StorageResult<()> {
+    let (floor, now) = (input.retention_floor_seconds, input.now_seconds);
+    let certifying = input
+        .routes
+        .iter()
+        .map(|current| (current.route.clone(), current.required_relays.clone()))
+        .collect::<Vec<_>>();
+    park_overtaken_tx(conn, floor, &certifying, now)?;
+    settle_goals_tx(conn, floor)?;
+    let parked: i64 = conn
+        .query_row_cached(
+            "SELECT COUNT(*) FROM account_recovery_coverage_remainders",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if parked > 0 {
+        notices_changed_tx(conn)?;
+    }
     Ok(())
 }
 
@@ -832,6 +842,123 @@ impl SqliteAppStorage {
             }
         }
         Ok(())
+    }
+
+    /// Import only new or grown loss generations into ledger debt after the
+    /// one-time conversion has finished. Never creates old-owner obligations.
+    /// Current routes and retention rules have the same meaning as conversion.
+    /// Each generation's reach is un-covered and stamped in the transaction
+    /// that marks it imported; duplicates leave later fetch proofs untouched.
+    /// Loss below retention remains parked, and the exact acknowledgment set
+    /// stays in [`Self::converted_recovery_loss`] until the caller hands it off
+    /// to the relay plane and reclaims it. Returns whether evidence was imported.
+    pub fn import_recovery_loss_to_ledger(
+        &self,
+        label: &str,
+        input: &RecoveryConversionInput<'_>,
+    ) -> StorageResult<bool> {
+        input.current()?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if step_tx(&conn)? != DONE {
+                return Err(StorageError::Serialization(
+                    "recovery conversion is pending".into(),
+                ));
+            }
+            // Unresolved loss is not capped on disk. Stream one generation at
+            // a time, retaining only two per-cause flags and its bounded routes.
+            let mut causes = [false; 2];
+            let mut cursor = (-1_i64, -1_i64);
+            let mut stamped = false;
+            let mut below_floor = false;
+            loop {
+                let row = conn
+                    .query_row_cached(
+                        &format!(
+                            "SELECT cause, marker_token, dropped_count, ({LIVE_LOSS})
+                     FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND (cause, marker_token) > (?2, ?3)
+                         AND (imported_count IS NULL OR dropped_count > imported_count)
+                     ORDER BY cause, marker_token LIMIT 1"
+                        ),
+                        params![label, cursor.0, cursor.1],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, bool>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .storage()?;
+                let Some((cause, token, count, live)) = row else {
+                    break;
+                };
+                let decoded = loss_cause(cause)?;
+                causes[decoded as usize] = true;
+                cursor = (cause, token);
+                if live {
+                    if !stamped {
+                        conn.execute_cached(
+                            "UPDATE account_recovery_state SET loss_revision = loss_revision + 1
+                             WHERE singleton = 1",
+                            [],
+                        )
+                        .storage()?;
+                        stamped = true;
+                    }
+                    conn.execute_cached(
+                        "UPDATE account_delivery_loss_evidence SET import_revision =
+                            (SELECT loss_revision FROM account_recovery_state WHERE singleton = 1)
+                         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+                        params![label, cause, token],
+                    )
+                    .storage()?;
+                    if let Some(routes) = loss::evidence_routes(&conn, label, cause, token)? {
+                        for (route, bound) in routes {
+                            uncover_route_loss_tx(&conn, &route, bound, input.now_seconds)?;
+                            below_floor |= bound < input.retention_floor_seconds;
+                        }
+                    } else {
+                        let bound = loss::evidence_floor(&conn, label, cause, token)?;
+                        uncover_loss_tx(&conn, bound, input.now_seconds)?;
+                        // Include current routes the ledger has never seen.
+                        for route in input.routes {
+                            reopen_goal(&conn, &route.route, bound)?;
+                        }
+                        below_floor |= bound < input.retention_floor_seconds;
+                    }
+                }
+                conn.execute_cached(
+                    "UPDATE account_delivery_loss_evidence SET imported_count = ?4
+                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+                    params![label, cause, token, count],
+                )
+                .storage()?;
+            }
+            if below_floor {
+                park_loss_below_floor_tx(&conn, input)?;
+            }
+            for (cause, changed) in causes.into_iter().enumerate() {
+                if changed {
+                    // Include retired generations too, so their guards can
+                    // be acknowledged without reopening retired history.
+                    conn.execute_cached(
+                        "INSERT INTO account_recovery_conversion_loss
+                             (account_label, cause, marker_token, observed_count)
+                         SELECT account_label, cause, marker_token, dropped_count
+                         FROM account_delivery_loss_evidence WHERE account_label = ?1 AND cause = ?2
+                         ON CONFLICT (account_label, cause, marker_token) DO UPDATE SET
+                             observed_count = MAX(observed_count, excluded.observed_count)",
+                        params![label, cause as i64],
+                    )
+                    .storage()?;
+                }
+            }
+            Ok(causes.into_iter().any(|changed| changed))
+        })
     }
 
     /// What the finished conversion converted, until

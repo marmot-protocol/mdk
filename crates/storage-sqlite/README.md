@@ -339,7 +339,11 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   the changed "history may be incomplete" notices. Converted loss evidence stays, imported and with no obligation;
   `converted_recovery_loss` lists it by account and cause until the worker has finished the relay plane's overflow
   recovery and calls `reclaim_converted_recovery_loss`, which deletes each generation still at its converted count
-  (newer or grown loss stays for the import). Nothing calls the conversion yet.
+  (newer or grown loss stays for the import). After conversion, `import_recovery_loss_to_ledger` imports only
+  new or grown evidence into ledger debt, without creating old-owner obligations. It uses the same route and
+  retention inputs, stamps loss revisions, un-covers the generations' reach and keeps below-window debt parked,
+  atomically with the imported counts and exact acknowledgment set. Duplicate observations leave subsequent fetch
+  proof intact. The existing `converted_recovery_loss` and reclaim handoff also own these later generations.
 
 ## Tests and benchmarks
 
