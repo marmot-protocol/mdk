@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
+  writer work, with replacement workers closed by default. Admitted passes settle after conditions change; manual
+  restore stays independent. Add an opaque restore-operation host codec and zeroizing queued confirmation answers.
+
 - Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded
   downloads, ephemeral recovery words, explicit cancellation, partial results, later-join availability hints and
   typed core backup provenance. Archived preferences and automatic membership recovery remain outside this flow.

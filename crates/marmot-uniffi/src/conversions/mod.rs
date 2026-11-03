@@ -25,6 +25,7 @@ pub use product_analytics::*;
 mod account;
 mod agent_stream;
 mod audit;
+mod backups;
 mod chat_list;
 mod common;
 mod compromise_warning;
@@ -55,6 +56,7 @@ pub(super) fn saturating_u32(value: usize) -> u32 {
 pub use account::*;
 pub use agent_stream::*;
 pub use audit::*;
+pub use backups::*;
 pub use chat_list::*;
 pub use common::*;
 pub use compromise_warning::*;
