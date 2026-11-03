@@ -281,7 +281,7 @@ async fn a_device_removed_while_signing_out_is_not_unlinked() {
             .retry_pending_push_registration_shares_best_effort()
             .await
     );
-    let refused = laptop.leave_group(&notes).await.unwrap_err();
+    let refused = laptop.leave_group_for_sign_out(&notes).await.unwrap_err();
     assert!(matches!(
         refused.as_engine_error(),
         Some(cgka_traits::error::EngineError::AdminCannotSelfRemove { .. })

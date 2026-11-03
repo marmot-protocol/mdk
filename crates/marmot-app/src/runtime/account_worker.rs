@@ -470,6 +470,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     LeaveGroup {
         group_id: GroupId,
+        for_sign_out: bool,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     ForgetGroupLocal {
@@ -6224,8 +6225,16 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
-        AccountWorkerCommand::LeaveGroup { group_id, respond } => Box::pin(async move {
-            let result = client.leave_group(&group_id).await;
+        AccountWorkerCommand::LeaveGroup {
+            group_id,
+            for_sign_out,
+            respond,
+        } => Box::pin(async move {
+            let result = if for_sign_out {
+                client.leave_group_for_sign_out(&group_id).await
+            } else {
+                client.leave_group(&group_id).await
+            };
             // Drain the kind-1210 "member left" row this commit queued. Sibling
             // mutators (invite/remove/profile) already flush
             // `pending_projection_updates`; without this the live timeline stays

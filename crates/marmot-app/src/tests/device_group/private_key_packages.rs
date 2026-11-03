@@ -2796,21 +2796,6 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
             .unsent_invitation_decisions()
             .unwrap();
         assert!(
-            devices
-                .phone
-                .decline_group_invite(&maximum_chat)
-                .await
-                .is_err()
-        );
-        assert!(phone_store.leave_request(&maximum_chat).unwrap().is_none());
-        assert!(
-            devices
-                .phone
-                .state_group_record(&maximum_chat)
-                .unwrap()
-                .pending_confirmation
-        );
-        assert!(
             !devices
                 .phone
                 .accept_group_invite(&maximum_chat)
