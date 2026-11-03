@@ -4862,20 +4862,8 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
 
-    // Inbound ingest is halted too: a fresh inbound group message is retained
-    // (buffered), not applied, until a verified repair path.
-    let outcome = carol
-        .ingest(bob_commit.clone())
-        .await
-        .expect("ingest does not error on an unrecoverable group");
-    assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Buffered { .. } | IngestOutcome::Stale { .. }
-        ),
-        "inbound must not be applied while Unrecoverable; got {outcome:?}"
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    // Fresh inbound halting is owned by
+    // `unrecoverable_halt_survives_engine_restart_until_verified_repair`.
 }
 
 #[tokio::test]
@@ -5068,8 +5056,25 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
             .any(|member| member.id == eve.self_id())
     );
 
+    // Bob's id is already durably admitted by the public buffer call, so its
+    // duplicate outcome cannot exercise inbound halting. Use genuinely fresh
+    // authenticated application data from the selected epoch instead.
+    let mut fresh = send_app(&mut alice, &group_id, b"fresh input while halted".to_vec()).await;
+    fresh.id = MessageId::new(Sha256::digest(b"fresh unrecoverable wrapper").to_vec());
+    let fresh_content_id = content_id(&fresh);
+    assert_ne!(fresh.id, fresh_content_id);
+    for id in [&fresh.id, &fresh_content_id] {
+        assert!(matches!(
+            carol_storage.get_message(id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ));
+        assert!(!carol_storage.has_processed_transport_id(id).unwrap());
+        assert!(!carol_storage.has_ingress_dedup_marker(id).unwrap());
+    }
+    let members_before = restarted.members(&group_id).unwrap();
+    restarted.drain_events();
     let outcome = restarted
-        .ingest(bob_commit.clone())
+        .ingest(fresh.clone())
         .await
         .expect("ingest does not error on a restarted unrecoverable group");
     assert!(
@@ -5080,6 +5085,29 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         "inbound must stay halted after restart; got {outcome:?}"
     );
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(restarted.members(&group_id).unwrap(), members_before);
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(matches!(
+        restarted.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Unrecoverable(_))
+    ));
+    assert_eq!(
+        carol_storage.get_message(&fresh.id).unwrap().state,
+        MessageState::Retryable,
+        "fresh raw input stays retained without opening its MLS application"
+    );
+    assert!(matches!(
+        carol_storage.get_message(&fresh_content_id),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+    assert!(
+        !restarted
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
+        "halted fresh input must not produce an application delivery"
+    );
 
     let send_err = restarted
         .send(SendIntent::AppMessage {
