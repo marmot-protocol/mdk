@@ -512,7 +512,11 @@ impl AppClient {
                             affected = true;
                             return Ok(false);
                         }
-                        if unhydrated.contains(&chat) {
+                        // Failed hydration leaves the pending set but still
+                        // cannot authorize this chat's burst contribution.
+                        if unhydrated.contains(&chat)
+                            || super::group_is_quarantined(&self.runtime, &chat)
+                        {
                             affected = true;
                             return Ok(false);
                         }
@@ -522,7 +526,6 @@ impl AppClient {
                         if !projected.contains(&chat)
                             || !eligible
                             || super::group_is_terminal(&self.runtime, &chat)
-                            || super::group_is_quarantined(&self.runtime, &chat)
                         {
                             return Ok(false);
                         }

@@ -661,6 +661,12 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
                 account.get_group(&pending[0]),
                 Err(cgka_traits::StorageError::Serialization(_))
             ));
+            assert!(matches!(
+                phone.client.is_device_group(&pending[0]),
+                Err(AppError::Storage(cgka_traits::StorageError::Serialization(
+                    _
+                )))
+            ));
             Some(original)
         } else {
             None
@@ -713,6 +719,135 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
         narrowed_unrequested.expect("unmet raw need is retained even before a first request");
     assert_eq!(narrowed_unrequested.need, 3);
     assert!(narrowed_unrequested.requested_at.is_none());
+}
+
+/// Quarantine can leave readable metadata after pending hydration ends. Only
+/// healthy chats justify a burst, while another issuer's baseline continues;
+/// native repair makes the original third obligation usable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_chat_holds_its_stock_demand_until_native_recovery() {
+    use cgka_traits::storage::GroupStorage as _;
+    let ChatStockDemand {
+        relay,
+        devices: [phone, mut laptop, mut tablet],
+        group: _,
+        pending,
+        _bob_dir,
+        bob: _bob,
+    } = Box::pin(chat_stock_demand(true, 2)).await;
+    let account = phone.app.account_storage("alice").unwrap();
+    let original = account.get_group(&pending[0]).unwrap();
+    let mut damaged = original.clone();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    account.put_group(&damaged).unwrap();
+    let mut phone = reopen(phone).await;
+    assert_eq!(
+        account.get_group(&pending[0]).unwrap().protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    assert!(!phone.client.is_device_group(&pending[0]).unwrap());
+    assert!(
+        !phone
+            .client
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&pending[0])
+    );
+    assert_eq!(phone.client.runtime.quarantined_group_count(), 1);
+    let error = phone.client.runtime.group_record(&pending[0]).unwrap_err();
+    assert!(matches!(error.as_engine_error(),
+        Some(cgka_traits::EngineError::UnknownGroup(id)) if id == &pending[0]));
+    for chat in &pending[1..] {
+        assert!(
+            phone
+                .client
+                .runtime
+                .chat_sibling_add_refusal(chat)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let stock = account.app_storage();
+    let need = stock
+        .private_key_package_need(&laptop.slot_hex())
+        .unwrap()
+        .unwrap();
+    assert_eq!(need.need, 3);
+    assert!(need.requested_at.is_none());
+    assert_eq!(held_from(&phone, &laptop), 2);
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    let phone_slot: [u8; 32] = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
+    assert_eq!(
+        tablet
+            .client
+            .runtime
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .count(),
+        10,
+        "quarantine cannot hide another issuer's independent baseline request"
+    );
+    assert_eq!(
+        laptop
+            .client
+            .runtime
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .count(),
+        2,
+        "readable metadata cannot make the quarantined chat's burst usable"
+    );
+    assert_eq!(
+        stock.private_key_package_need(&laptop.slot_hex()).unwrap(),
+        Some(need)
+    );
+    assert_eq!(taken_from(&phone, &laptop), 0);
+
+    // The normal explicit native recovery changes readiness, not the recorded
+    // demand or its provenance. No Add or new scheduling policy is needed.
+    account.put_group(&original).unwrap();
+    assert!(
+        phone
+            .client
+            .retry_hydrate_quarantined_group(&pending[0])
+            .unwrap()
+    );
+    assert_eq!(phone.client.runtime.quarantined_group_count(), 0);
+    assert!(
+        phone
+            .client
+            .runtime
+            .chat_sibling_add_refusal(&pending[0])
+            .unwrap()
+            .is_none()
+    );
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    let resumed = stock
+        .private_key_package_need(&laptop.slot_hex())
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.need, 3);
+    assert!(resumed.requested_at.is_some());
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    assert_eq!(
+        laptop
+            .client
+            .runtime
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .count(),
+        12,
+        "the recovered third obligation resumes the ordinary ten-package refill"
+    );
+    assert_eq!(taken_from(&phone, &laptop), 0);
 }
 
 /// Public deletion and a realized Leave retain admission authority without a
@@ -776,6 +911,17 @@ async fn a_hidden_departed_decline_still_narrows_private_stock() {
     .await
     .expect("the native admin commits the actual SelfRemove");
     let mut phone = reopen(phone).await;
+    assert!(phone.client.runtime.unhydrated_group_ids().is_empty());
+    assert_eq!(phone.client.runtime.quarantined_group_count(), 0);
+    assert!(
+        phone
+            .client
+            .runtime
+            .group_record(chat)
+            .unwrap()
+            .is_terminal()
+    );
+    assert_eq!(account.list_groups().unwrap().len(), 4);
     assert!(phone.client.state_group_record(chat).is_none());
     assert!(phone.app.group("alice", &chat_hex).unwrap().is_none());
     assert!(account.get_group(chat).unwrap().removed);
