@@ -1047,13 +1047,15 @@ mod tests {
                 1 => invalid[1].group_id_hint = None,
                 2 => invalid[1].message.id = MessageId::new(vec![2; 31]),
                 3 => {
-                    invalid = (0..=REPLAY_BUFFER_MAX_ITEMS).map(|index| {
-                        let mut frame = delivery(1, "retained");
-                        let mut id = [0; 32];
-                        id[..8].copy_from_slice(&(index as u64).to_be_bytes());
-                        frame.message.id = MessageId::new(id.to_vec());
-                        frame
-                    }).collect();
+                    invalid = (0..=REPLAY_BUFFER_MAX_ITEMS)
+                        .map(|index| {
+                            let mut frame = delivery(1, "retained");
+                            let mut id = [0; 32];
+                            id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                            frame.message.id = MessageId::new(id.to_vec());
+                            frame
+                        })
+                        .collect();
                 }
                 4 => invalid[1].message.payload = vec![0; REPLAY_BUFFER_MAX_BYTES],
                 _ => unreachable!(),
@@ -1063,25 +1065,53 @@ mod tests {
                 Err(error) => error,
             };
             if case < 3 {
-                assert!(matches!(error, TransportAdapterError::InvalidInboundEncoding));
+                assert!(matches!(
+                    error,
+                    TransportAdapterError::InvalidInboundEncoding
+                ));
             } else {
                 assert!(matches!(error, TransportAdapterError::Other(reason)
                     if reason == "retained replay exceeds native input bounds"));
             }
             let retained = delivery(10, "retained");
-            let mut ingress = adapter.open_replay_ingress(&account, vec![retained.clone(), retained.clone()]).await.unwrap();
-            assert_eq!(ingress.shared.held(), (1, 1), "rejection queued no prefix; duplicate input owns one copy");
-            assert_eq!(ingress.shared.queue.lock().unwrap().retained, vec![retained.clone()]);
+            let mut ingress = adapter
+                .open_replay_ingress(&account, vec![retained.clone(), retained.clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                ingress.shared.held(),
+                (1, 1),
+                "rejection queued no prefix; duplicate input owns one copy"
+            );
+            assert_eq!(
+                ingress.shared.queue.lock().unwrap().retained,
+                vec![retained.clone()]
+            );
             assert!(!ingress.is_closed(), "preactivation is not a closed scope");
-            assert!(matches!(ingress.take_batch(None).await, ReplayBatchTake::Empty));
-            assert!(matches!(adapter.open_replay_ingress(&account, vec![delivery(20, "other")]).await,
-                Err(TransportAdapterError::Other(reason)) if reason == "native replay consumer already registered"));
+            assert!(matches!(
+                ingress.take_batch(None).await,
+                ReplayBatchTake::Empty
+            ));
+            assert!(
+                matches!(adapter.open_replay_ingress(&account, vec![delivery(20, "other")]).await,
+                Err(TransportAdapterError::Other(reason)) if reason == "native replay consumer already registered")
+            );
             assert_eq!(ingress.shared.held(), (1, 1));
             drop(ingress);
-            let mut reopened = adapter.open_replay_ingress(&account, vec![retained]).await.unwrap();
-            assert_eq!(reopened.shared.held(), (1, 1), "reopening the same durable row does not charge it twice");
+            let mut reopened = adapter
+                .open_replay_ingress(&account, vec![retained])
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.shared.held(),
+                (1, 1),
+                "reopening the same durable row does not charge it twice"
+            );
             drop(adapter);
-            assert!(matches!(reopened.take_batch(None).await, ReplayBatchTake::Empty));
+            assert!(matches!(
+                reopened.take_batch(None).await,
+                ReplayBatchTake::Empty
+            ));
         }
     }
 

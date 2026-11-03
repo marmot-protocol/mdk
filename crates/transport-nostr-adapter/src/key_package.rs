@@ -335,9 +335,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((endpoints.to_vec(), event.clone(), required_acks));
-            Ok(self.outcome.lock().unwrap().clone().unwrap_or_else(|| {
-                NostrPublishOutcome::accepted(endpoints.to_vec())
-            }))
+            Ok(self
+                .outcome
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| NostrPublishOutcome::accepted(endpoints.to_vec())))
         }
     }
 
@@ -357,11 +360,18 @@ mod tests {
         assert_eq!(tag(&event, "encoding"), None);
         assert_eq!(tag(&event, "relays"), None);
         for (name, expected) in [
-            ("mls_extensions", vec!["mls_extensions", "0x0006", "0xf2f1", "0x000a"]),
+            (
+                "mls_extensions",
+                vec!["mls_extensions", "0x0006", "0xf2f1", "0x000a"],
+            ),
             ("mls_proposals", vec!["mls_proposals", "0x0008", "0x000a"]),
         ] {
             assert_eq!(
-                event.tags.iter().find(|tag| tag.first().is_some_and(|tag| tag == name)).unwrap(),
+                event
+                    .tags
+                    .iter()
+                    .find(|tag| tag.first().is_some_and(|tag| tag == name))
+                    .unwrap(),
                 &expected,
             );
         }
@@ -442,8 +452,10 @@ mod tests {
             "é".repeat(CLIENT_NAME_MAX_BYTES / 2 + 1),
         ] {
             publication.client_name = Some(name);
-            assert!(matches!(publication.to_event(), Err(TransportAdapterError::Publish(reason))
-                if reason == "Marmot KeyPackage client tag must carry a 1 to 64 byte name"));
+            assert!(
+                matches!(publication.to_event(), Err(TransportAdapterError::Publish(reason))
+                if reason == "Marmot KeyPackage client tag must carry a 1 to 64 byte name")
+            );
         }
     }
 
@@ -521,26 +533,50 @@ mod tests {
         assert_eq!(published[0].2, 2);
         let event = &published[0].1;
         assert_eq!(event, &publication.to_event_at(event.created_at).unwrap());
-        assert_eq!(outcome.message_id, Some(MessageId::new(hex::decode(&event.id).unwrap())));
+        assert_eq!(
+            outcome.message_id,
+            Some(MessageId::new(hex::decode(&event.id).unwrap()))
+        );
     }
 
     #[test]
     fn key_package_publication_rejects_each_missing_required_field() {
         let invalid: [(fn(&mut NostrKeyPackagePublication), &str); 8] = [
-            (|p| p.account_id = MemberId::new(vec![0; 31]), "account id must be a 32-byte Nostr pubkey"),
+            (
+                |p| p.account_id = MemberId::new(vec![0; 31]),
+                "account id must be a 32-byte Nostr pubkey",
+            ),
             (|p| p.key_package_slot_id.clear(), "d tag must not be empty"),
             (|p| p.key_package_ref.clear(), "i tag must not be empty"),
-            (|p| p.mls_ciphersuite.clear(), "mls_ciphersuite tag must not be empty"),
-            (|p| p.mls_extensions.clear(), "mls_extensions tag must not be empty"),
-            (|p| p.mls_proposals.clear(), "mls_proposals tag must not be empty"),
-            (|p| p.app_components.clear(), "app_components tag must not be empty"),
-            (|p| p.publish_endpoints.clear(), "publish endpoints must not be empty"),
+            (
+                |p| p.mls_ciphersuite.clear(),
+                "mls_ciphersuite tag must not be empty",
+            ),
+            (
+                |p| p.mls_extensions.clear(),
+                "mls_extensions tag must not be empty",
+            ),
+            (
+                |p| p.mls_proposals.clear(),
+                "mls_proposals tag must not be empty",
+            ),
+            (
+                |p| p.app_components.clear(),
+                "app_components tag must not be empty",
+            ),
+            (
+                |p| p.publish_endpoints.clear(),
+                "publish endpoints must not be empty",
+            ),
         ];
         for (invalidate, reason) in invalid {
             let mut publication = sample_publication();
             invalidate(&mut publication);
-            assert!(matches!(publication.to_event_at(42), Err(TransportAdapterError::Publish(actual))
-                if actual == format!("Marmot KeyPackage {reason}")), "{reason}");
+            assert!(
+                matches!(publication.to_event_at(42), Err(TransportAdapterError::Publish(actual))
+                if actual == format!("Marmot KeyPackage {reason}")),
+                "{reason}"
+            );
         }
         assert_eq!(sample_publication().to_event_at(42).unwrap().created_at, 42);
     }
@@ -552,9 +588,18 @@ mod tests {
         publication.account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
         let unsigned = publication.to_event_at(42).unwrap();
         let signed = EventBuilder::new(Kind::Custom(30_443), unsigned.content.clone())
-            .tags(unsigned.tags.iter().cloned().map(Tag::parse).collect::<Result<Vec<_>, _>>().unwrap())
+            .tags(
+                unsigned
+                    .tags
+                    .iter()
+                    .cloned()
+                    .map(Tag::parse)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
             .custom_created_at(Timestamp::from_secs(42))
-            .finalize(&keys).unwrap();
+            .finalize(&keys)
+            .unwrap();
         let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
         let relay = Arc::new(RecordingRelay::default());
         let publisher = NostrKeyPackagePublisher::new(relay.clone()).required_acks(2);
@@ -568,26 +613,46 @@ mod tests {
         for alter in invalid {
             let mut changed = event.clone();
             alter(&mut changed);
-            assert!(matches!(publisher.publish_prepared_key_package(&publication, &changed).await,
+            assert!(
+                matches!(publisher.publish_prepared_key_package(&publication, &changed).await,
                 Err(TransportAdapterError::Publish(reason))
-                    if reason == "prepared KeyPackage event does not match publication"));
+                    if reason == "prepared KeyPackage event does not match publication")
+            );
             assert!(relay.published.lock().unwrap().is_empty());
         }
-        let fallback = publisher.publish_prepared_key_package(&publication, &event).await.unwrap();
-        assert_eq!(fallback.message_id, Some(MessageId::new(signed.id.to_bytes().to_vec())));
-        assert_eq!(fallback.accepted, NostrPublishOutcome::accepted(publication.publish_endpoints.clone()).accepted);
+        let fallback = publisher
+            .publish_prepared_key_package(&publication, &event)
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback.message_id,
+            Some(MessageId::new(signed.id.to_bytes().to_vec()))
+        );
+        assert_eq!(
+            fallback.accepted,
+            NostrPublishOutcome::accepted(publication.publish_endpoints.clone()).accepted
+        );
         assert!(fallback.failed.is_empty());
         let supplied = NostrPublishOutcome {
             message_id: Some(MessageId::new(vec![0xEF; 32])),
             ..NostrPublishOutcome::accepted(vec![publication.publish_endpoints[0].clone()])
         };
         *relay.outcome.lock().unwrap() = Some(supplied.clone());
-        assert_eq!(publisher.publish_prepared_key_package(&publication, &event).await.unwrap(), supplied);
+        assert_eq!(
+            publisher
+                .publish_prepared_key_package(&publication, &event)
+                .await
+                .unwrap(),
+            supplied
+        );
         let published = relay.published.lock().unwrap();
-        assert_eq!(published.as_slice(), &[
-            (publication.publish_endpoints.clone(), event.clone(), 2),
-            (publication.publish_endpoints.clone(), event, 2),
-        ]);
+        assert_eq!(
+            published.as_slice(),
+            &[
+                (publication.publish_endpoints.clone(), event.clone(), 2),
+                (publication.publish_endpoints.clone(), event, 2),
+            ]
+        );
     }
 
     fn sample_publication() -> NostrKeyPackagePublication {

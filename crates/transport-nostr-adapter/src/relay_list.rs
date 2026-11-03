@@ -216,10 +216,13 @@ mod tests {
             assert_eq!(event.kind, expected_kind);
             assert_eq!(event.pubkey, "a1".repeat(32));
             assert_eq!(event.content, "");
-            assert_eq!(event.tags, vec![
-                vec![tag.to_string(), "wss://relay1.example".to_string()],
-                vec![tag.to_string(), "wss://relay2.example".to_string()],
-            ]);
+            assert_eq!(
+                event.tags,
+                vec![
+                    vec![tag.to_string(), "wss://relay1.example".to_string()],
+                    vec![tag.to_string(), "wss://relay2.example".to_string()],
+                ]
+            );
         }
     }
 

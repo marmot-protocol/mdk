@@ -121,21 +121,34 @@ fn request_validation_rejects_invalid_inputs() {
     ] {
         let mut invalid = request();
         invalidate(&mut invalid);
-        assert_eq!(invalid.validate(), Err(NostrAcquisitionError::InvalidRequest));
+        assert_eq!(
+            invalid.validate(),
+            Err(NostrAcquisitionError::InvalidRequest)
+        );
     }
-    for routes in [vec![], vec![[1; 32], [1; 32]],
-        (0..=transport_nostr_adapter::GROUP_BATCH_ROUTES).map(|index| [index as u8; 32]).collect()] {
+    for routes in [
+        vec![],
+        vec![[1; 32], [1; 32]],
+        (0..=transport_nostr_adapter::GROUP_BATCH_ROUTES)
+            .map(|index| [index as u8; 32])
+            .collect(),
+    ] {
         let mut invalid = request();
         invalid.scope = NostrAcquisitionScope::GroupsWindow {
             transport_group_ids: routes,
             since: 9,
             until: 10,
         };
-        assert_eq!(invalid.validate(), Err(NostrAcquisitionError::InvalidRequest));
+        assert_eq!(
+            invalid.validate(),
+            Err(NostrAcquisitionError::InvalidRequest)
+        );
     }
     let mut groups = request();
     groups.scope = NostrAcquisitionScope::GroupsWindow {
-        transport_group_ids: (0..transport_nostr_adapter::GROUP_BATCH_ROUTES).map(|index| [index as u8; 32]).collect(),
+        transport_group_ids: (0..transport_nostr_adapter::GROUP_BATCH_ROUTES)
+            .map(|index| [index as u8; 32])
+            .collect(),
         since: 10,
         until: 10,
     };
