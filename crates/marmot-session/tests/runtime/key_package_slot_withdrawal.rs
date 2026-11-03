@@ -69,7 +69,7 @@ impl KeyPackagePublisher for WithdrawingKeyPackages {
 
 #[tokio::test]
 async fn a_withdrawn_slot_stays_empty_until_the_device_runs_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawn").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -130,7 +130,7 @@ async fn a_withdrawn_slot_stays_empty_until_the_device_runs_again() {
 
 #[tokio::test]
 async fn a_withdrawal_no_relay_accepts_leaves_the_slot_as_it_was() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal refused").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -171,7 +171,7 @@ async fn a_withdrawal_no_relay_accepts_leaves_the_slot_as_it_was() {
 
 #[tokio::test]
 async fn a_refused_second_withdrawal_keeps_the_first_one() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot second withdrawal refused").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = WithdrawingKeyPackages::default();
@@ -202,7 +202,7 @@ async fn a_refused_second_withdrawal_keeps_the_first_one() {
 
 #[tokio::test]
 async fn a_restart_while_withdrawing_the_slot_republishes_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal restart").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -246,7 +246,7 @@ async fn a_restart_while_withdrawing_the_slot_republishes_it() {
 
 #[tokio::test]
 async fn a_replacement_prepared_before_the_withdrawal_is_not_published_after_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal pending").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -306,7 +306,7 @@ async fn a_replacement_prepared_before_the_withdrawal_is_not_published_after_it(
 
 #[tokio::test]
 async fn withdrawing_again_after_the_clock_moves_back_keeps_the_later_time() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal clock").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -347,7 +347,7 @@ async fn withdrawing_again_after_the_clock_moves_back_keeps_the_later_time() {
 
 #[tokio::test]
 async fn a_device_that_never_published_withdraws_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal unpublished").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));

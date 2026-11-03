@@ -267,7 +267,7 @@ mod tagged_siblings {
             decode_device_roster_v1(&bytes).unwrap().devices[slot].clone()
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let (mut phone, _laptop, group) = tagged_phone_and_laptop(&dir).await;
         let slot = own_slot(&phone);
         let fresh = [0x71; 16];

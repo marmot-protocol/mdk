@@ -33,6 +33,12 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
     `support/recovery_scorecard.rs` holds the report-only large-account recovery scorecard: it asserts
     recovery correctness only and records latency, per-relay traffic and idle downloads in `scorecard.json`.
+    It runs with either history owner, and records bob's per-endpoint history requests too.
+    `support/recovery_runner_proofs.rs` holds the explicit slow recovery-runner proofs (mdk#2660): a stalled relay
+    that never answers history, and tens of thousands of owed events through a restart, an idle window and a
+    reconnect. Bob runs in process with the runner owning debt. While the earlier owner still runs beside it (until
+    PR 5g), the wire bounds count both of bob's owners. Count bob's own history requests
+    (`client_history_requests`), and give any bound that an idle runner would meet a control that it fails.
 
 - **File:** `app_runtime_interaction_journeys.rs`
   - **Owns:** Public app interaction journeys that the serialized generated families do not reach: two groups on

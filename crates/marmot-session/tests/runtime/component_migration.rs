@@ -35,7 +35,7 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
     use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
     const WINDOW_5_DAYS: u64 = 5 * 24 * 60 * 60;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("component migration key").unwrap();
     let mut old = AccountDeviceRuntime::new(
@@ -191,7 +191,7 @@ async fn maintenance_refreshes_a_stale_leaf_at_a_persisted_random_time() {
 
 #[tokio::test]
 async fn a_current_leaf_in_a_group_without_a_maintenance_row_writes_no_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("component migration no-row key").unwrap();
     let mut runtime = AccountDeviceRuntime::new(

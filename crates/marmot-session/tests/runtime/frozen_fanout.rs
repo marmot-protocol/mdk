@@ -55,7 +55,7 @@ async fn assert_frozen_fanout_case(
     error_kind: Option<TransportEndpointFailureKind>,
     expect_unresolved: bool,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot fanout matrix key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -219,7 +219,7 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 
 #[tokio::test]
 async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal app fanout key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -334,7 +334,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
 
 #[tokio::test]
 async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal queued app key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -405,7 +405,7 @@ async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
 
 #[tokio::test]
 async fn queued_app_message_with_missing_route_remains_retryable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot queued app missing route key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -457,7 +457,7 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
 
 #[tokio::test]
 async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
     let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
@@ -612,7 +612,7 @@ async fn met_quorum_tail_does_not_hide_newer_unmet_quorum_fanout() {
 
 /// Exercise both replication-only debt and an unsafe publication hidden behind it.
 async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot met quorum ordered fanout key").unwrap();
     let alice_path = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("application-audit.jsonl");
@@ -864,7 +864,7 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
 
 #[tokio::test]
 async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-unknown-retry.sqlite");
     let key_text = "marmot unknown retry key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -991,7 +991,7 @@ async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance
 
 #[tokio::test]
 async fn ambiguous_application_publish_is_retained_without_definite_failure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot unknown app message key").unwrap();
     let mut alice = session(
         dir.path().join("alice-unknown-app.sqlite"),
@@ -1075,7 +1075,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
 
 #[tokio::test]
 async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-create-unknown.sqlite");
     let key_text = "marmot unknown create key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1166,7 +1166,7 @@ async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry
 
 #[tokio::test]
 async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-invite-unknown.sqlite");
     let key_text = "marmot unknown invite key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1280,7 +1280,7 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
 
 #[tokio::test]
 async fn ambiguous_disband_recovery_preserves_terminal_pending_kind() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-disband-unknown.sqlite");
     let key_text = "marmot unknown disband key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1403,7 +1403,7 @@ async fn assert_frozen_fanout_restart_edge(
     send_before_ack_persist: bool,
     resume_via_deferred_advance: bool,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-restart-edge.sqlite");
     let key_text = "marmot fanout restart edge key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1559,7 +1559,7 @@ async fn scheduled_advance_hydrates_before_resuming_frozen_fanout() {
 
 #[tokio::test]
 async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-frozen-fanout.sqlite");
     let key_text = "marmot frozen fanout key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1817,7 +1817,7 @@ async fn wait_for_publish_count<F: std::future::Future>(
 #[tokio::test]
 async fn invite_quorum_survives_restart() {
     for required_acks in [0, 1, 2] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new("invite quorum test key").unwrap();
         let alice_path = dir.path().join("alice.sqlite");
         let mut alice = session(&alice_path, &key, b"invite-quorum-alice");
@@ -2003,7 +2003,7 @@ async fn invite_quorum_survives_restart() {
 #[tokio::test]
 async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
     for required_acks in [1, 2] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new("secondary retry yield key").unwrap();
         let path = dir.path().join("alice.sqlite");
         let mut alice = session(&path, &key, b"secondary-yield-alice");

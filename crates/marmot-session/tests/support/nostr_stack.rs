@@ -161,6 +161,7 @@ impl NostrRelayClient for FakeRelayClient {
 
 impl NostrStackHarness {
     pub fn new() -> Self {
+        storage_sqlite::relax_storage_for_test_process();
         let relay = Arc::new(FakeRelayClient::default());
         let adapter = NostrTransportAdapter::new(relay.clone());
         Self {
