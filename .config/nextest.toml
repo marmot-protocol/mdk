@@ -37,8 +37,8 @@ process-orchestrator = { max-threads = 1 }
 # and then waits on real settlement windows. Two at a time keeps the smoke lane
 # moving without letting eleven of them starve each other's relay admission.
 app-runtime-journeys = { max-threads = 2 }
-# These session delivery scripts retain real convergence waits and encrypted
-# reopen paths. Keep at most two active alongside the rest of the workspace.
+# These session delivery scripts retain real adapter/peeler flows and convergence
+# waits over encrypted SQLCipher sessions. Keep at most two active.
 session-chaos = { max-threads = 2 }
 
 [[profile.default.overrides]]
