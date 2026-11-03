@@ -2,11 +2,116 @@
 
 use super::AppClient;
 use crate::{AppError, AppGroupRecord, SelfMembership};
-use cgka_traits::GroupId;
 use cgka_traits::storage::{GroupStorage, LeaveRequestStorage};
+use cgka_traits::{EngineError, GroupId};
 use storage_sqlite::InvitationDecision;
 
+/// Invocation, not persisted state: only User creates a new replicated choice.
+#[derive(Clone, Copy)]
+pub(super) enum AccountLeaveReason<'a> {
+    User,
+    SignOut,
+    ReceivedDecline(&'a InvitationDecision),
+}
+
 impl AppClient {
+    /// Read current local membership and distinct active administrator accounts
+    /// before a new choice or departure publication. Native send still validates.
+    pub(super) fn account_leave_needs_demotion(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let (authority, membership, mut admins, leaving) = self
+            .runtime
+            .group_authority_view()
+            .with_group_authority_snapshot(group_id, |_, authority| {
+                Ok::<_, AppError>((
+                    authority,
+                    self.runtime.canonical_group_membership(group_id)?,
+                    self.runtime.admin_pubkeys(group_id)?,
+                    self.runtime
+                        .leave_in_progress(group_id)
+                        .map_err(marmot_session::SessionError::from)?,
+                ))
+            })?;
+        let refusal = |error| AppError::from(marmot_session::SessionError::Engine(error));
+        if authority.facts.unrecoverable {
+            return Err(refusal(EngineError::GroupUnrecoverableRepairRequired {
+                group_id: group_id.clone(),
+            }));
+        }
+        if !membership.local_leaf_active {
+            return Err(refusal(EngineError::NotAMember {
+                group_id: group_id.clone(),
+            }));
+        }
+        if authority.disbanding || authority.facts.disbanded {
+            return Err(refusal(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Disbanding",
+                    to: "Leave",
+                    reason: "disband is terminal or requested",
+                },
+            )));
+        }
+        if leaving {
+            return Err(refusal(EngineError::LeaveAlreadyRequested {
+                group_id: group_id.clone(),
+            }));
+        }
+        admins.sort();
+        admins.dedup();
+        admins.retain(|admin| {
+            membership
+                .member_leaves
+                .iter()
+                .any(|leaf| leaf.member.as_slice() == admin.as_slice())
+        });
+        let own = self.runtime.self_id();
+        let is_admin = admins
+            .iter()
+            .any(|admin| admin.as_slice() == own.as_slice());
+        if is_admin && admins.len() == 1 {
+            return Err(refusal(EngineError::AdminDepletion {
+                group_id: group_id.clone(),
+            }));
+        }
+        Ok(is_admin)
+    }
+
+    /// Ordinary UserLeave includes an already accepted current copy. Unknown
+    /// identity/trust and a held MAX leave ordinary leaf departure independent.
+    pub(super) fn record_user_leave_decision(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<InvitationDecision>, AppError> {
+        if !self.app.device_groups_enabled()
+            || group_id.as_slice().is_empty()
+            || group_id.as_slice().len() > 256
+            || self.trusted_device_group()?.is_none()
+            || self.is_device_group(group_id)?
+        {
+            return Ok(None);
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(None);
+        };
+        let chat = hex::encode(group_id.as_slice());
+        let store = account.app_storage();
+        if store
+            .invitation_decision(&chat, &admission.generation)?
+            .is_some_and(|held| held.version == storage_sqlite::MAX_SMALL_STATE_NUMBER)
+        {
+            return Ok(None);
+        }
+        Ok(Some(store.record_invitation_decision(
+            &chat,
+            admission.generation,
+            true,
+        )?))
+    }
+
     /// An existing automatic Add obligation never spreads an invitation this
     /// copy's current authenticated generation already declined. Unknown
     /// legacy admissions and decisions for another generation stay independent.
@@ -24,8 +129,8 @@ impl AppClient {
             .is_none_or(|decision| !decision.declined))
     }
 
-    /// Only an actual pending invitation action is replicated; the existing
-    /// decline entry point also supports ordinary departure and stays local then.
+    /// Pending invitation acceptance uses its existing presentation guard.
+    /// UserLeave records its current admission separately, including accepted copies.
     pub(super) fn record_local_invitation_decision(
         &self,
         group_id: &GroupId,
@@ -272,8 +377,24 @@ impl AppClient {
                         Ok::<_, AppError>(authority)
                     })?;
                 native_member = authority.facts.is_member;
+                let last_admin = if native_member {
+                    match self.account_leave_needs_demotion(&group_id) {
+                        Ok(_) => false,
+                        Err(error)
+                            if matches!(
+                                error.as_engine_error(),
+                                Some(EngineError::AdminDepletion { .. })
+                            ) =>
+                        {
+                            true
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
                 if native_member
-                    && (authority.facts.is_admin
+                    && (last_admin
                         || authority.disbanding
                         || authority.lifecycle != cgka_traits::GroupLifecycleState::Stable
                         || !self.group_quiet(&group_id)?)
@@ -289,7 +410,7 @@ impl AppClient {
                 let result = Box::pin(self.leave_group_with_audit_context(
                     &group_id,
                     Default::default(),
-                    Some(decision),
+                    AccountLeaveReason::ReceivedDecline(decision),
                 ))
                 .await;
                 leave_requested = account.leave_request(&group_id)?.is_some();

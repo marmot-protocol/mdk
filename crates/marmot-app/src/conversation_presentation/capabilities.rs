@@ -91,8 +91,9 @@ impl ConversationAuthority {
             can_send: ordinary,
             can_invite: manage,
             can_edit_group: manage,
-            can_leave: ordinary && !admin,
-            requires_self_demote_before_leave: manage,
+            can_leave: ordinary && (!admin || self.admin_count > 1),
+            // UserLeave performs any eligible account demotion in core.
+            requires_self_demote_before_leave: false,
             can_enable_disbanding: manage
                 && self.lifecycle == AppGroupLifecycleState::Stable
                 && !self.disbanding_enabled

@@ -1593,7 +1593,8 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
         .chat_list_row("0000")
         .unwrap()
         .unwrap();
-    // Compare independently implemented public policies, including admin preflight.
+    // Compare availability when Leave is eligible for either role. A coarse row
+    // does not load the admin roster; the detailed capability refuses a last admin.
     // Engine-only facts are deliberately tested separately below: list rendering
     // must not hydrate an engine just to obtain those facts.
     for membership in [
@@ -1622,7 +1623,7 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
                                 is_member: membership == SelfMembership::Member,
                                 self_membership: membership,
                                 is_admin: admin,
-                                admin_count: 1,
+                                admin_count: 2,
                                 pending_confirmation: pending,
                                 leave_request_pending: leaving,
                                 lifecycle: lifecycle.into(),

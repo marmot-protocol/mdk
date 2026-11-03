@@ -940,11 +940,31 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
+        self.leave_group_for_reason(account_ref, group_id, false)
+            .await
+    }
+
+    pub(crate) async fn leave_group_for_sign_out(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.leave_group_for_reason(account_ref, group_id, true)
+            .await
+    }
+
+    async fn leave_group_for_reason(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        for_sign_out: bool,
+    ) -> Result<SendSummary, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::LeaveGroup {
                 group_id: group_id.clone(),
+                for_sign_out,
                 respond,
             })
             .await
