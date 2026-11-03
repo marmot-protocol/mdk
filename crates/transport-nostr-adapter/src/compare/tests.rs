@@ -261,6 +261,19 @@ fn local(events: &[Event]) -> Vec<LocalItem> {
     items
 }
 
+fn signed_spread(range: SweepRange, count: u64) -> Vec<Event> {
+    let keys = Keys::generate();
+    let span = range.until - range.since + 1;
+    (0..count)
+        .map(|n| {
+            EventBuilder::new(Kind::MlsGroupMessage, format!("history-{n}"))
+                .tags([Tag::custom("h", [hex::encode(GROUP)])])
+                .custom_created_at(Timestamp::from_secs(range.since + n * span / count))
+                .finalize(&keys).unwrap()
+        })
+        .collect()
+}
+
 async fn compare(
     relay: &ModelRelay,
     range: SweepRange,
@@ -587,12 +600,11 @@ async fn a_cut_fetch_reports_what_it_read() {
 #[tokio::test(start_paused = true)]
 async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
     for stop in ["bytes", "restricted", "disconnected", "rate_limited"] {
-        let mut factory = EventFactory::new();
-        let events = factory.spread(day(), 6);
+        let events = signed_spread(day(), 6);
         let mut by_id = events.clone();
         by_id.sort_by_key(|event| event.id);
         let first = by_id[..2].to_vec();
-        let first_bytes = first.iter().map(|event| event.as_json().len() as u64).sum();
+        let first_bytes: u64 = first.iter().map(|event| event.as_json().len() as u64).sum();
         let relay = ModelRelay::holding(events);
         relay.fetch_replies.lock().unwrap().push_back(IdsReply::Answered(first.clone()));
         let mut limits = policy(10);
@@ -612,16 +624,20 @@ async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
                 CompareEnd::Unreachable(UnreachableKind::Disconnected)
             }
             "rate_limited" => {
-                limits.pacing.max_rate_limit_waits = 0;
-                relay.fetch_replies.lock().unwrap().push_back(IdsReply::Closed(ClosedReason(Some(TransportEndpointRejectionCategory::RateLimited))));
+                limits.pacing.max_rate_limit_waits = 1;
+                for _ in 0..2 {
+                    relay.fetch_replies.lock().unwrap().push_back(IdsReply::Closed(ClosedReason(Some(TransportEndpointRejectionCategory::RateLimited))));
+                }
                 CompareEnd::RateLimited
             }
             _ => unreachable!(),
         };
 
+        let started = Instant::now();
         let (report, sink) = compare(&relay, day(), &[], limits).await;
 
         assert_eq!(report.end, expected, "{stop}");
+        assert_eq!(report.rate_limited, stop == "rate_limited");
         assert!(report.certified.is_empty(), "{stop}");
         assert_eq!(sink.batches.len(), 1, "{stop}");
         let batch = &sink.batches[0];
@@ -632,7 +648,13 @@ async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
         assert_eq!(batch.events, expected, "{stop}");
         assert_eq!(report.stats.events, 2, "{stop}");
         assert_eq!(sink.bytes + report.unadmitted_bytes, first_bytes, "{stop}");
-        assert_eq!(relay.fetch_chunks.lock().unwrap().len(), if stop == "bytes" { 1 } else { 2 }, "{stop}");
+        let chunks = relay.fetch_chunks.lock().unwrap();
+        assert_eq!(chunks.len(), match stop { "bytes" => 1, "rate_limited" => 3, _ => 2 }, "{stop}");
+        if stop == "rate_limited" {
+            assert_eq!(chunks[1], chunks[2], "retry the same unfinished ids");
+            assert_eq!(report.stats.rate_limited_waits, 1);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+        }
     }
 }
 
@@ -649,8 +671,7 @@ async fn sink_failure_never_certifies_a_complete_or_partial_window() {
     }
 
     for partial in [false, true] {
-        let mut factory = EventFactory::new();
-        let events = factory.spread(day(), 4);
+        let events = signed_spread(day(), 4);
         let mut by_id = events.clone();
         by_id.sort_by_key(|event| event.id);
         let relay = ModelRelay::holding(events);
@@ -676,7 +697,7 @@ async fn sink_failure_never_certifies_a_complete_or_partial_window() {
         assert_eq!(sink.0[0].certified, !partial);
         let mut expected = if partial { by_id[..2].to_vec() } else { by_id };
         expected.sort_by_key(|event| (event.created_at, event.id));
-        let expected_bytes = expected.iter().map(|event| event.as_json().len() as u64).sum();
+        let expected_bytes: u64 = expected.iter().map(|event| event.as_json().len() as u64).sum();
         assert_eq!(sink.0[0].events, expected);
         assert_eq!(sink.1 + report.unadmitted_bytes, expected_bytes);
     }
@@ -686,8 +707,7 @@ async fn sink_failure_never_certifies_a_complete_or_partial_window() {
 async fn set_limits_and_spent_budgets_leave_saturated_seconds_unproven() {
     let second = SweepRange { since: T0, until: T0 };
     for count in [4, 5] {
-        let mut factory = EventFactory::new();
-        let events = (0..count).map(|_| factory.event(T0)).collect::<Vec<_>>();
+        let events = signed_spread(second, count);
         let relay = ModelRelay::holding(events);
         let mut limits = policy(10);
         limits.set_limit = 4;
@@ -705,9 +725,8 @@ async fn set_limits_and_spent_budgets_leave_saturated_seconds_unproven() {
         }
     }
 
-    let mut factory = EventFactory::new();
-    let first = (0..2).map(|_| factory.event(T0)).collect::<Vec<_>>();
-    let later = (0..10).map(|_| factory.event(T0 + 1)).collect::<Vec<_>>();
+    let first = signed_spread(second, 2);
+    let later = signed_spread(SweepRange { since: T0 + 1, until: T0 + 1 }, 10);
     let relay = ModelRelay::holding(first.iter().chain(&later).cloned().collect());
     let (report, sink) = compare(&relay, SweepRange { since: T0, until: T0 + 1 }, &[], policy(4)).await;
     assert_eq!(report.end, CompareEnd::BudgetSpent);
@@ -747,7 +766,7 @@ async fn only_requested_route_events_can_satisfy_a_difference() {
         relay_set: good.len() + foreign.len(),
     });
     let incoming = foreign.iter().cloned().chain([unsolicited]).chain(good.iter().rev().cloned()).collect::<Vec<_>>();
-    let incoming_bytes = incoming.iter().map(|event| event.as_json().len() as u64).sum();
+    let incoming_bytes: u64 = incoming.iter().map(|event| event.as_json().len() as u64).sum();
     relay.fetch_replies.lock().unwrap().push_back(IdsReply::Answered(incoming));
     let (report, sink) = compare(&relay, day(), &[], policy(20)).await;
     assert_eq!(report.end, CompareEnd::Withheld);

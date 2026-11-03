@@ -1289,8 +1289,13 @@ async fn local_failures_preserve_admitted_and_saved_prefixes() {
     }
 
     for fault in ["load", "first_admit", "second_admit", "first_save", "second_save"] {
-        let mut factory = EventFactory::new();
-        let events = (0..3).map(|n| factory.event(GROUP, T0 + n)).collect::<Vec<_>>();
+        let keys = Keys::generate();
+        let events = (0..3).map(|n| {
+            EventBuilder::new(NostrKind::MlsGroupMessage, format!("history-{n}"))
+                .tags([Tag::custom("h", [hex::encode(GROUP)])])
+                .custom_created_at(Timestamp::from_secs(T0 + n))
+                .finalize(&keys).unwrap()
+        }).collect::<Vec<_>>();
         let wanted = events.iter().map(|event| event.id).collect::<HashSet<_>>();
         let relay = ModelRelay::new(Profile::Strfry, events);
         let operations = Arc::new(Mutex::new(Vec::new()));
