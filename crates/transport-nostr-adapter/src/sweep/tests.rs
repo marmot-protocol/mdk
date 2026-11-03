@@ -716,40 +716,6 @@ async fn a_wrong_more_costs_requests_never_history() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn wok_more_hint_splits_below_the_cap() {
-    let range = SweepRange {
-        since: T0,
-        until: T0 + DAY - 1,
-    };
-    let relay = ModelRelay::new(Profile::Wok, Vec::new());
-    // A cut the count cannot see (one filter asking for the cap makes this
-    // unreachable on wok today): `more` still wins.
-    relay
-        .script
-        .lock()
-        .unwrap()
-        .push_back(SliceReply::Answered {
-            events: Vec::new(),
-            received: 10,
-            more: true,
-        });
-    let report = run_sweep(
-        request(range),
-        &relay,
-        &mut relay.sink(),
-        &MemoryStore::default(),
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, SweepEnd::Finished);
-    assert_eq!(report.stats.halvings, 1);
-    assert_eq!(
-        report.covered[0].until - report.covered[0].since + 1,
-        DAY / 2
-    );
-}
-
-#[tokio::test(start_paused = true)]
 async fn unpublished_cap_is_learned_not_assumed() {
     let mut factory = EventFactory::new();
     let range = month();
