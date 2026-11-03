@@ -41,6 +41,33 @@ impl AppClient {
         app: &SqliteAppStorage,
         now: u64,
     ) -> Box<dyn LiveTailRead> {
-        Box::new(self.live_tails(app, now).await)
+        let live = self.live_tails(app, now).await;
+        Box::new(PostJoinTails {
+            live,
+            collecting: self
+                .runner_post_join
+                .values()
+                .filter(|collection| collection.active && collection.collecting)
+                .map(|collection| (collection.route.clone(), collection.until))
+                .collect(),
+        })
+    }
+}
+
+/// A joined copy owes a finite collection through its activation time, even
+/// inside an otherwise healthy live tail. After completion ordinary tail
+/// authority resumes; this never authorizes periodic history polling.
+struct PostJoinTails {
+    live: LiveTails,
+    collecting: std::collections::BTreeMap<TransportReconciliationRoute, u64>,
+}
+
+impl LiveTailRead for PostJoinTails {
+    fn owed_until(&self, route: &TransportReconciliationRoute, relay: &str, now: u64) -> u64 {
+        self.collecting
+            .get(route)
+            .copied()
+            .unwrap_or_else(|| self.live.owed_until(route, relay, now))
+            .min(now)
     }
 }

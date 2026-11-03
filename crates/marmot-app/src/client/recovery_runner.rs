@@ -57,6 +57,7 @@ mod epoch_gap;
 pub(crate) mod host;
 mod open_attempts;
 mod policy;
+pub(crate) mod post_join;
 mod quantum;
 mod recheck;
 mod repair;

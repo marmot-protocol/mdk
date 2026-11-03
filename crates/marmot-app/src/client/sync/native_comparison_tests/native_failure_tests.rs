@@ -852,3 +852,186 @@ async fn mixed_receipts_yield() {
         held + MAX_COMPARISON_ADMISSION_PER_TURN + 1
     );
 }
+
+/// A real Welcome's post-join history prerequisite must progress under the
+/// new owner once ordinary count/boundary evidence is settled. Cursor and
+/// projection tests do not assert the engine maintenance/history-fetch handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_owned_history_starts_grace_without_fabricating_coverage() {
+    let mut fixture = crypto_fixture().await;
+    fixture
+        .receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    fixture.receiver.sync().await.unwrap();
+    fixture
+        .receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let status = fixture.receiver.maintenance_status(&fixture.group).unwrap();
+    let post_join = status
+        .obligations
+        .iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .expect("real Welcome created the post-join obligation");
+    assert_eq!(
+        post_join.phase,
+        cgka_traits::MaintenancePhase::Grace,
+        "runner-owned history must supply the post-join boundary without an old comparison grant"
+    );
+    let fetch = fixture
+        .receiver
+        .runtime
+        .post_join_history_fetch(&fixture.group)
+        .unwrap()
+        .expect("the joined copy owns its fetch");
+    assert_eq!(
+        fetch.completion.map(|value| value.outcome),
+        None,
+        "a scripted empty EOSE without a sweep backend cannot certify history"
+    );
+    let before = post_join.clone();
+    let app = fixture.receiver.app.clone();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&fixture.group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "unfinished collection does not move maintenance's EOSE deadline on reopen"
+    );
+    assert_eq!(
+        after.grace_until, before.grace_until,
+        "unfinished collection does not restart grace on reopen"
+    );
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap(),
+        Some(fetch),
+        "reopening an unfinished fetch preserves its durable identity and deadline"
+    );
+}
+
+#[path = "../../../../tests/support/limited_relay.rs"]
+mod post_join_relay;
+
+/// Actual SDK acquisition, encrypted history admission, durable completion,
+/// and client replacement at the app handoff. The capped relay supplies wire
+/// evidence, not the asserted maintenance or fetched state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_owned_history_releases_post_join_maintenance() {
+    let (_relay, url) = post_join_relay::mock_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = crate::AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let recipient = home.create_account("receiver").unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config);
+    remember_test_member_inbox(&app, &recipient.account_id_hex, &url);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.publish_key_package().await.unwrap();
+    receiver.prepare_transport().await.unwrap();
+    let mut sender = client_on_app_relay_plane(&app, "sender").await;
+    let group = sender
+        .create_group("runner post-join history", &[&recipient.account_id_hex])
+        .await
+        .unwrap();
+    sender
+        .send(&group, b"history before the join")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            receiver.sync().await.unwrap();
+            receiver
+                .advance_post_join_maintenance_subscriptions()
+                .await
+                .unwrap();
+            if receiver
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .is_some_and(|fetch| fetch.completion.is_some())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bounded new-owner collection finishes without a comparison grant");
+    let fetch = receiver
+        .runtime
+        .post_join_history_fetch(&group)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetch.completion.as_ref().map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+    );
+    assert!(
+        app.messages("receiver")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "history before the join"),
+        "fetched means the encrypted input was admitted and persisted"
+    );
+    let before = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(before.phase, cgka_traits::MaintenancePhase::Grace);
+    assert!(before.eose_deadline_at.is_some());
+    let account = receiver.adapter.account_id().clone();
+    drop(receiver);
+    app.relay_plane
+        .deactivate_account_context(&account)
+        .await
+        .unwrap();
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.runtime.post_join_history_fetch(&group).unwrap(),
+        Some(fetch),
+        "reopen retains this copy's completed fetch"
+    );
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "reopen does not move the EOSE deadline"
+    );
+    assert_eq!(
+        after.grace_until, before.grace_until,
+        "reopen does not restart grace"
+    );
+    assert!(
+        receiver.runner_post_join.is_empty(),
+        "a fetched copy in grace does not re-arm history on reopen"
+    );
+}

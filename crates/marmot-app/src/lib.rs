@@ -2281,6 +2281,7 @@ impl MarmotApp {
             fail_next_convergence_retry_advance: false,
             post_join_maintenance_subscriptions: HashMap::new(),
             post_join_history_sessions: HashMap::new(),
+            runner_post_join: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
             #[cfg(feature = "unreleased-device-pairing")]

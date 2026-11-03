@@ -1051,7 +1051,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
   recorder and its comparison with pending obligations, mdk#2660), `recovery_runner.rs` (the per-account recovery
   runner behind the internal `runner_owns_debt` gate, mdk#2660; `recovery_runner/host.rs` seats it on the worker or
-  a direct client), `invite_recovery.rs` (durable invitation recovery),
+  a direct client; `recovery_runner/post_join.rs` gives each joined copy a bounded collection on the same runner,
+  using fresh ordinary boundary facts for grace and admitted ledger coverage for fetched completion), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).

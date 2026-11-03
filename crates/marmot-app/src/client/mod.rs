@@ -1126,6 +1126,7 @@ pub struct AppClient {
     /// The history fetch each live post-join session serves, by subscription
     /// id. Pruned to the live sessions on every post-join pass.
     pub(crate) post_join_history_sessions: HashMap<String, recovery::PostJoinHistorySession>,
+    pub(crate) runner_post_join: HashMap<GroupId, recovery_runner::post_join::Collection>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1820,7 +1821,11 @@ impl AppClient {
                     .remove(&group_id);
             }
             self.retain_live_post_join_history_sessions();
+            self.runner_post_join.clear();
             return Ok(());
+        }
+        if self.app.recovery_runner_owns_debt() {
+            return self.advance_runner_post_join().await;
         }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
