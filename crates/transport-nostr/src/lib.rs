@@ -3808,6 +3808,19 @@ impl MarmotRelayPlaneAccountAdapter {
             .await;
     }
 
+    /// Install ledger-owned recovery before this account activates. The
+    /// adapter continues subscription ingress but starts neither native
+    /// backward-paging entry point for the account.
+    #[doc(hidden)]
+    pub async fn delegate_replay_recovery(&self) -> Result<(), TransportAdapterError> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .delegate_replay_recovery(&self.account_id)
+            .await
+    }
+
     /// Apply the owner's fences on this account's groups' live frames, as of
     /// the status `plan`'s ticket came from. Schedules no IO.
     #[doc(hidden)]

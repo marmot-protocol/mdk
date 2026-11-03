@@ -8,8 +8,8 @@
 //! not go ahead of the older history the owner still fetches. So, once the
 //! owner enables fencing for the account:
 //!
-//! - **Arming.** Such a count, unless clamped (native paging fetches that
-//!   window itself), holds every group its REQ routes from the REQ's `since`
+//! - **Arming.** Such a count, unless native paging fetches that window
+//!   itself, holds every group its REQ routes from the REQ's `since`
 //!   on, from its EOSE. A count only becomes a fact the owner can see once its
 //!   boundary is admitted, and a boundary is admitted only once its group's
 //!   range left the native hold, so without this the frames would be gone
@@ -219,7 +219,7 @@ impl AccountReplayCoverage {
     }
 
     /// `relay`'s EOSE for `id` just installed a live count: unless it is
-    /// empty or clamped, it holds every group the REQ routes until the owner
+    /// empty or being paged natively, it holds every group the REQ routes until the owner
     /// answers it, or one replay deadline. One that does not fence retires
     /// the endpoint's earlier counts that are no fact.
     pub(super) fn arm_fence(&mut self, id: &str, relay: RelayIndex) {
@@ -235,7 +235,7 @@ impl AccountReplayCoverage {
         };
         if !endpoint
             .live_count
-            .is_some_and(|count| count.events > 0 && !count.clamped())
+            .is_some_and(|count| count.events > 0 && (self.recovery_delegated || !count.clamped()))
         {
             self.retire_fence_armings(id, relay);
             return;
@@ -939,23 +939,32 @@ mod tests {
         assert_eq!(released(&mut coverage), vec![(0, 160)]);
     }
 
-    /// A clamped reply is paged backwards natively, so it fences nothing.
+    /// A full reply starts native paging only for a legacy owner. A delegated
+    /// account admits the received input behind its fence without certifying
+    /// that the relay served the original query completely.
     #[tokio::test]
-    async fn a_clamped_count_fences_nothing() {
-        let (mut coverage, id, _) = fenced_coverage(true);
-        for at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
-            coverage.record_stored_event(&id, RelayIndex(1), SINCE + at);
+    async fn a_full_live_reply_delegates_debt_without_certifying_complete_history() {
+        for delegated in [false, true] {
+            let (mut coverage, id, _) = fenced_coverage(true);
+            coverage.recovery_delegated = delegated;
+            for at in 0..RELAY_REPLAY_PAGE_LIMIT as u64 {
+                coverage.record_stored_event(&id, RelayIndex(1), SINCE + at);
+            }
+            let capture = coverage.record_eose(&id, RelayIndex(1), 0);
+            assert_eq!(capture.is_some(), !delegated, "only the legacy path pages");
+            assert!(
+                coverage.endpoint_deadlines[&id][&RelayIndex(1)]
+                    .live_count
+                    .is_some_and(|count| count.clamped())
+            );
+            assert_eq!(coverage.snapshot().relay_subscription_attempts_with_eose, 0);
+            for group in [0, 1] {
+                assert_eq!(held_from(&coverage, group), delegated.then_some(SINCE));
+            }
+            if delegated {
+                assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+            }
         }
-        assert!(
-            coverage.record_eose(&id, RelayIndex(1), 0).is_some(),
-            "pages"
-        );
-        assert!(
-            coverage.endpoint_deadlines[&id][&RelayIndex(1)]
-                .live_count
-                .is_some_and(|count| count.clamped())
-        );
-        assert_eq!(held_from(&coverage, 0), None);
     }
 
     /// A fence holds at most one replay deadline: then what it held goes out

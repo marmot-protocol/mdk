@@ -95,6 +95,10 @@ for reconnect/backoff and relay status mechanics.
     only then does that relay's EOSE count.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
+  - An account that delegates replay recovery before activation starts neither native paging entry point.
+    A full live reply becomes `Delegated`, not complete-query `Eose`: its received input can be admitted under
+    the owner's bounded fence, while the coverage gate stays incomplete. Raw live counts survive; the ledger
+    owner proves the missing range. Direct adapter callers retain native paging unless they delegate explicitly.
 - Keep each endpoint's `ReplayLiveCount` to its own physical EOSE in one source generation (the endpoint serial), for
   the coverage ledger's live boundary (#2660). Backward paging keeps it. Its `requested_at` must be no later
   than when the relay ran the query: the endpoint's stamp taken before its REQ is issued, raised for a REQ the SDK
@@ -174,11 +178,12 @@ for reconnect/backoff and relay status mechanics.
 - A fence (`src/replay_fence.rs`) holds one group's live frames from its point on, never the account: held frames count
   neither in `admission_pending` nor against request placement or stream admission, and every release path
   (`GroupReplay::release`, native ingress, both `stage_delivery` fast paths) lets out only what lies below the point.
-  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not clamped holds the REQ's
+  Nothing arms until `enable_replay_fencing`. Then a live EOSE whose count is non-empty and not being paged natively holds the REQ's
   groups from its `since` until a `fence_replay` plan whose ticket saw that count as admitted answers it. An arming
   belongs to its own count: `ReplayEndpoint::count_id` moves whenever a live count is installed or ends, and only an
   arming whose count is still current can be admitted or kept unanswered, so a count that ends or is replaced (an empty
-  or clamped recount) before admission drops its arming. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`;
+  or natively paged recount) before admission drops its arming. Delegated accounts also fence nonempty full replies,
+  without counting them as complete coverage. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`;
   then its frames go out as late input and plans are ignored until a new count arms the group; a plan older than the
   last applied is ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
