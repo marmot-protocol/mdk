@@ -43,7 +43,8 @@ pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
 pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 /// Staged bytes the whole account may hold.
 pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
-/// Staged events one runner step's admission turn ingests before retry selection, as the
+/// Staged events one worker admission turn ingests; pending epoch gaps yield to
+/// retry selection after that batch, as the
 /// comparison job's admission does (A13).
 pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 4;
 /// Capture ranges one unit keeps fenced across a restart. Past it the newest

@@ -694,7 +694,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
-  Each runner step admits at most the configured batch before retry selection; an immediate next admission turn
+  With pending epoch-gap work, each runner step admits at most the configured batch before retry selection; an immediate next admission turn
   cannot make a due epoch-gap visit wait for the entire queue. Explicit passes continue these immediate steps
   within their existing time bound. Admission releases a group's staged events oldest first below its admission frontier, never past an event the
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or

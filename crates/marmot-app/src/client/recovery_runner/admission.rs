@@ -712,8 +712,9 @@ impl Memory {
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
-    /// Admit one bounded batch, then return to retry selection. A large staged
-    /// backlog must not keep a due history visit waiting for the entire drain.
+    /// Admit in bounded worker batches. Pending epoch-gap work returns to retry
+    /// selection after each batch; other passes drain their ready staging.
+    /// A large backlog must not keep a due gap visit waiting for its entire drain.
     /// Returns how the pass ended, or the step to end with.
     /// Holds and waits are armed from the clock as read after the awaits
     /// that led to them, so none is born expired.
@@ -777,15 +778,28 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 .iter()
                 .map(|(_, event_id)| event_id.clone())
                 .collect::<Vec<_>>();
-            let removed = match self
+            let (removed, more_staged, gap_pending) = match self
                 .host
                 .turn(move |turn| {
-                    event_ids
+                    let removed = event_ids
                         .iter()
                         .map(|event_id| {
                             Ok(turn.app.remove_seen_staged_recovery_events(&[event_id])? > 0)
                         })
-                        .collect::<StorageResult<Vec<bool>>>()
+                        .collect::<StorageResult<Vec<bool>>>()?;
+                    let gap_pending = turn.app.pending_recovery_demands()?.iter().any(|demand| {
+                        demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                            && matches!(
+                                demand.eligibility,
+                                storage_sqlite::RecoveryEligibility::Ready
+                                    | storage_sqlite::RecoveryEligibility::Retry
+                            )
+                    });
+                    Ok::<_, cgka_traits::storage::StorageError>((
+                        removed,
+                        gap_pending && turn.app.staged_recovery_total()?.events > 0,
+                        gap_pending,
+                    ))
                 })
                 .await
             {
@@ -829,11 +843,13 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     .failed("admission_ingest", kind, now, &self.policy));
             }
             self.admission.failures = 0;
-            // Revisit admission promptly, but first let the scheduler observe
-            // due work. NoTrace groups remain held and cannot buy a fetch.
-            let mut drained = self.admission.end(now, self.admission.held_at(now));
-            drained.due = Some(now);
-            return Ok(drained);
+            if gap_pending {
+                // Revisit admission promptly, but first let the scheduler
+                // observe due gap work. NoTrace groups still cannot buy a fetch.
+                let mut drained = self.admission.end(now, self.admission.held_at(now));
+                drained.due = super::sooner(drained.due, more_staged.then_some(now));
+                return Ok(drained);
+            }
         }
     }
 }
