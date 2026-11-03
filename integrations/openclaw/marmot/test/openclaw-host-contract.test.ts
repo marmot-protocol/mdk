@@ -279,6 +279,9 @@ afterEach(() => {
  * This file is also run by openclaw-host-compat.sh against the pinned beta host.
  */
 describe("installed OpenClaw inbound host contract", () => {
+  // This first full-host action includes the SDK's cold SQLite worker startup.
+  // It owns the loader -> generic message action -> registered adapter -> socket
+  // contract, which adapter-only tests cannot cover.
   it("sends an authorized workspace image through the public message action", async () => {
     const imageBytes = Buffer.from("workspace-image-bytes");
     const sent = await runPublicSend(async (workspaceDir) => {
@@ -300,7 +303,7 @@ describe("installed OpenClaw inbound host contract", () => {
       caption: "workspace image",
       attachments: [{ media_type: "image/png", file_name: "generated.png" }],
     });
-  });
+  }, 10_000);
 
   it("sends a buffer and filename through the public message action", async () => {
     const imageBytes = Buffer.from("buffer-image-bytes");
