@@ -579,7 +579,7 @@ impl ParticipantServer {
             init.settlement_ms,
             init.immediate_maintenance
                 .then(marmot_app::MaintenanceTiming::immediate),
-            false,
+            None,
         );
         let runtime = MarmotAppRuntime::new(app.clone());
         let setup: Result<String, WireError> = async {
