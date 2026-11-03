@@ -20,6 +20,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const SETTLEMENT: Duration = Duration::from_secs(60);
 #[path = "support/offline_catchup.rs"]
 mod offline_catchup;
+#[path = "support/recovery_runner_proofs.rs"]
+mod recovery_runner_proofs;
 #[path = "support/recovery_scorecard.rs"]
 mod recovery_scorecard;
 
@@ -703,4 +705,28 @@ async fn public_app_1024_message_backlog_with_extra_epochs_recovers_completely()
 #[ignore = "report-only #1945 recovery scorecard; see APP_PATH_COVERAGE.md"]
 async fn public_app_large_account_recovery_scorecard() {
     recovery_scorecard::run().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "report-only #1945 recovery scorecard with the recovery runner owning debt"]
+async fn public_app_large_account_recovery_scorecard_runner_owns_debt() {
+    recovery_scorecard::run_runner_owning_debt().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_stalled_relay_does_not_loop() {
+    recovery_runner_proofs::stalled_relay_loop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_stalled_relay_does_not_loop_bob_current() {
+    recovery_runner_proofs::stalled_relay_loop_bob_current().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
+    recovery_runner_proofs::owed_history().await;
 }
