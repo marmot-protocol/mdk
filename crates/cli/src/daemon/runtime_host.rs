@@ -210,6 +210,16 @@ async fn dispatch_hosted_runtime_command(
     };
 
     let output = match cli.command.clone() {
+        #[cfg(feature = "dev-device-groups")]
+        crate::Command::Devices { command } => {
+            crate::commands::devices::devices_command_with_runtime(
+                &account_home,
+                runtime,
+                command,
+                cli.account.clone(),
+            )
+            .await
+        }
         crate::Command::UsageDiagnostics { command } => {
             crate::usage_diagnostics_command(runtime, command)
         }
@@ -352,6 +362,8 @@ async fn dispatch_hosted_runtime_command(
 
 pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
+        #[cfg(feature = "dev-device-groups")]
+        crate::Command::Devices { .. } => true,
         crate::Command::UsageDiagnostics { .. } => true,
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
         crate::Command::Chats { command } => !matches!(

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
+
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
   writer work, with replacement workers closed by default. Admitted passes settle after conditions change; manual
   restore stays independent. Add an opaque restore-operation host codec and zeroizing queued confirmation answers.

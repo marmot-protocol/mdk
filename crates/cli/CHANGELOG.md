@@ -9,6 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged; ordinary releases keep it off.
+
 ### Added
 
 - Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
