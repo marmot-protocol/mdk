@@ -445,6 +445,27 @@ fn readmit_admission(
     }
 }
 
+/// Complete one real storage observation before deciding whether work is cancelled.
+async fn cancellation_observed(
+    storage: &SqliteAccountStorage,
+    job: &AttachmentAcquisition,
+    permission: Option<&super::super::attachment_permission::PermissionLease>,
+) -> bool {
+    let store = storage.app_storage();
+    let current = job.clone();
+    let active = tokio::task::spawn_blocking(move || {
+        Ok::<_, cgka_traits::StorageError>((
+            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
+            store.attachment_request_is_explicit(&current.reference)?,
+        ))
+    })
+    .await;
+    // Failure to observe is not cancellation. The transfer deadline and
+    // publication fence still bound work while a storage read is unavailable.
+    matches!(active, Ok(Ok((false, _))))
+        || (permission.is_some_and(|p| !p.allowed()) && !matches!(active, Ok(Ok((_, true)))))
+}
+
 async fn cancelled(
     storage: SqliteAccountStorage,
     job: AttachmentAcquisition,
@@ -452,21 +473,7 @@ async fn cancelled(
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
-        let store = storage.app_storage();
-        let current = job.clone();
-        let active = tokio::task::spawn_blocking(move || {
-            Ok::<_, cgka_traits::StorageError>((
-                store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
-                store.attachment_request_is_explicit(&current.reference)?,
-            ))
-        })
-        .await;
-        // Failure to observe is not cancellation. The transfer deadline and
-        // publication fence still bound work while a storage read is unavailable.
-        if matches!(active, Ok(Ok((false, _))))
-            || (permission.as_ref().is_some_and(|p| !p.allowed())
-                && !matches!(active, Ok(Ok((_, true)))))
-        {
+        if cancellation_observed(&storage, &job, permission.as_ref()).await {
             return;
         }
         tokio::select! {
