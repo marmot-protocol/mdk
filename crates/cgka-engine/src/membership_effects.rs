@@ -83,7 +83,105 @@ impl MembershipSnapshot {
     }
 }
 
+/// Current trusted tag namespace, pinned before historical reconstruction.
+/// A leaf must authenticate both this account and the exact tagged slot.
+/// No roster that cannot be read can make a leaf read as a sibling.
+pub(crate) struct SiblingSelfRemovalContext {
+    account: MemberId,
+    roster: cgka_traits::app_components::DeviceRosterV1,
+}
+
+impl SiblingSelfRemovalContext {
+    pub(crate) fn staged_slots(
+        &self,
+        group: &MlsGroup,
+        staged: &openmls::group::StagedCommit,
+    ) -> std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId> {
+        use openmls::prelude::{Proposal, Sender};
+        staged
+            .queued_proposals()
+            .filter_map(|proposal| {
+                if !matches!(proposal.proposal(), Proposal::SelfRemove) {
+                    return None;
+                }
+                let Sender::Member(index) = proposal.sender() else {
+                    return None;
+                };
+                if *index == group.own_leaf_index() {
+                    return None;
+                }
+                self.leaf_slot(group.public_group().leaf(*index)?)
+            })
+            .collect()
+    }
+
+    fn leaf_slot(
+        &self,
+        leaf: &openmls::prelude::LeafNode,
+    ) -> Option<cgka_traits::app_components::DeviceSlotId> {
+        use cgka_traits::app_components::DeviceTagClaim;
+        if !crate::identity::validated_member_id_of_leaf(leaf)
+            .is_ok_and(|account| account == self.account)
+        {
+            return None;
+        }
+        match crate::device_tag::device_tag_claim(leaf, &self.roster) {
+            DeviceTagClaim::Device(slot) => Some(slot),
+            _ => None,
+        }
+    }
+
+    /// Only the final selected tree can end a current-membership hold.
+    pub(crate) fn clear_present(&self, group: &MlsGroup, record: &mut cgka_traits::Group) {
+        for member in group.members() {
+            if let Some(slot) = group
+                .public_group()
+                .leaf(member.index)
+                .and_then(|leaf| self.leaf_slot(leaf))
+            {
+                record.self_removed_sibling_slots.remove(&slot);
+            }
+        }
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
+    pub(crate) fn sibling_self_removal_context(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<SiblingSelfRemovalContext>, EngineError> {
+        let Some(trusted) = self
+            .device_tag_group
+            .as_ref()
+            .filter(|trusted| *trusted != group_id)
+        else {
+            return Ok(None);
+        };
+        self.ensure_group_live(trusted)?;
+        // Reading another leaf's tag does not require this observer's own
+        // entry to have announced its tag key. Reuse the same trusted live
+        // roster, but preserve real load/storage errors for transaction retry.
+        let device_group = MlsGroup::load(
+            self.storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(trusted.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load device group: {error:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(trusted.clone()))?;
+        if !device_group.is_active()
+            || !crate::app_components::group_requires_device_roster(&device_group)?
+        {
+            return Ok(None);
+        }
+        Ok(
+            crate::app_components::device_roster_of_group(&device_group).map(|roster| {
+                SiblingSelfRemovalContext {
+                    account: self.identity.self_id().clone(),
+                    roster,
+                }
+            }),
+        )
+    }
+
     pub(crate) fn canonical_membership_snapshot(
         &self,
         group_id: &GroupId,

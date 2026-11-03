@@ -262,6 +262,15 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   unresolved *commits* below the new copy's `MlsGroup::epoch()`. Bound it by locally derived authenticated epochs only,
   keep it to commits (prior-interval applications may still decrypt, which is why a replacement Welcome records
   `join_epoch = 0`), and never move it to a seam that reads inbound claims.
+- **A sibling's voluntary departure is local current-membership knowledge (mdk#2628 D99).** Only an authenticated
+  `Proposal::SelfRemove` in an actually selected/applied staged commit records its source leaf's own-account tagged
+  slot in `Group.self_removed_sibling_slots`; ordinary Remove, proposal receipt and candidate probes record nothing.
+  Publication writes it before the existing own-commit checkpoint. Selected apply retains known slots through anchor
+  rewind/checkpoint reconstruction and clears only slots present in the final selected tree. Fresh Welcome admission
+  resets the set. Shared private Add admission returns `SiblingLeft` for an absent held slot before stock is spent.
+  Source-roster storage errors propagate through normal transaction retry; malformed/unclaimed tags identify no slot.
+  Owners: `account_devices/sibling_welcomes.rs::an_applied_sibling_self_remove_holds_private_adds` and
+  `::a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns`.
 - **Commit-derived group records are atomic with the MLS apply.** Every durable projection of an accepted commit (the
   Marmot group record and its mirrored required capabilities and components) shares the transaction that mutates
   OpenMLS state, and every projection read/write error propagates. On a failed direct

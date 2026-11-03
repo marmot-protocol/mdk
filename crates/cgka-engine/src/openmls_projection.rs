@@ -1375,7 +1375,12 @@ pub(crate) fn process_current_openmls_application<S: StorageProvider>(
         std::slice::from_ref(message),
         &PrevalidatedOwnCommits::default(),
         profile_policy,
-        Some((None, clock)),
+        Some(ReplayAcceptance {
+            retain_anchors: None,
+            clock,
+            sibling_context: None,
+            known_departures: None,
+        }),
     )?
     .observations)
 }
@@ -2689,6 +2694,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
         max_retained_anchor_rewind,
         ReplayProfilePolicy::default(),
         &crate::engine::SystemWallClock,
+        None,
     )
     .map(|output| output.observations)
 }
@@ -2702,12 +2708,10 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     max_retained_anchor_rewind: u64,
     profile_policy: ReplayProfilePolicy,
     clock: &dyn cgka_traits::WallClock,
+    sibling_context: Option<&crate::membership_effects::SiblingSelfRemovalContext>,
 ) -> Result<OpenMlsApplyOutput, OpenMlsProjectionError> {
-    let current_epoch = storage
-        .get_group(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .epoch
-        .0;
+    let current_record = storage.get_group(group_id)?;
+    let current_epoch = current_record.epoch.0;
     // The selected branch's already-applied prefix — leading `Processed`
     // commits below the live tip — IS the live canonical chain: skip it and
     // start state reconstruction from the first genuinely new commit, avoiding
@@ -2768,7 +2772,12 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             result,
             &replay_messages,
             &own_commits,
-            (max_retained_anchor_rewind, clock),
+            ReplayAcceptance {
+                retain_anchors: Some(max_retained_anchor_rewind),
+                clock,
+                sibling_context,
+                known_departures: Some(&current_record.self_removed_sibling_slots),
+            },
             profile_policy,
         )?;
         if rewind_to_retained_anchor {
@@ -3120,6 +3129,15 @@ fn oldest_retained_epoch(retained_epoch: u64, max_retained_anchor_rewind: u64) -
     retained_epoch.saturating_sub(max_retained_anchor_rewind)
 }
 
+/// Inputs owned by the selected-apply transaction, never by candidate probes.
+#[derive(Clone, Copy)]
+struct ReplayAcceptance<'a> {
+    retain_anchors: Option<u64>,
+    clock: &'a dyn cgka_traits::WallClock,
+    sibling_context: Option<&'a crate::membership_effects::SiblingSelfRemovalContext>,
+    known_departures: Option<&'a BTreeSet<cgka_traits::app_components::DeviceSlotId>>,
+}
+
 /// Atomically merge replay messages, refresh canonical group state and persist dispositions.
 /// Activity is returned only after successful apply, so candidate probes cannot publish it.
 fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
@@ -3128,7 +3146,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
-    acceptance: (u64, &dyn cgka_traits::WallClock),
+    acceptance: ReplayAcceptance<'_>,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsApplyOutput, OpenMlsProjectionError> {
     // #157/#424: the convergence-apply multi-write durable sequence
@@ -3144,7 +3162,6 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // anywhere in the apply commits none of it. The transaction still matters
     // on its own for backends whose savepoint is the full-snapshot fallback.
     storage.with_transaction(|storage| {
-        let (max_retained_anchor_rewind, clock) = acceptance;
         // Use the same parent-authenticated own-checkpoint reconstruction as
         // candidate selection, including own commits after remote commits.
         // Leaving own-application stamps out is load-bearing: those apps
@@ -3156,7 +3173,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
             replay_messages,
             own_commits,
             profile_policy,
-            Some((Some(max_retained_anchor_rewind), clock)),
+            Some(acceptance),
         )?;
         update_group_record_from_replay(storage, group_id, &output)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
@@ -3716,9 +3733,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
-    accepted: Option<(Option<u64>, &dyn cgka_traits::WallClock)>,
+    accepted: Option<ReplayAcceptance<'_>>,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
-    let retain_replayed_anchors = accepted.and_then(|(anchors, _)| anchors);
+    let retain_replayed_anchors = accepted.and_then(|accepted| accepted.retain_anchors);
+    let sibling_context = accepted.and_then(|accepted| accepted.sibling_context);
     let reject_legacy_group_additions = profile_policy.reject_legacy_group_additions
         && storage
             .get_group(group_id)
@@ -3732,6 +3750,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         .map_err(|e| OpenMlsProjectionError::Replay(format!("load: {e:?}")))?
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
 
+    let mut self_removed_slots = accepted
+        .and_then(|accepted| accepted.known_departures)
+        .cloned()
+        .unwrap_or_default();
     let mut observations = Vec::new();
     let mut group_changes = Vec::new();
     let mut roster_tag_keys = Vec::new();
@@ -3838,6 +3860,18 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 || actual_authenticator != expected_authenticator
             {
                 return Err(OpenMlsProjectionError::CheckpointStateMismatch);
+            }
+            if retain_replayed_anchors.is_some()
+                && (sibling_context.is_some() || !self_removed_slots.is_empty())
+            {
+                self_removed_slots.extend(storage.get_group(group_id)?.self_removed_sibling_slots);
+                if !self_removed_slots.is_empty() {
+                    let mut record = storage.get_group(group_id)?;
+                    record
+                        .self_removed_sibling_slots
+                        .extend(self_removed_slots.iter().copied());
+                    storage.put_group(&record)?;
+                }
             }
             epoch_authenticators.insert(mls_group.epoch().as_u64(), actual_authenticator);
             observations.push(OpenMlsReplayObservation::CommitStaged {
@@ -3955,7 +3989,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         category: rejection.category,
                     });
                 }
-                if let (Some(source), Some((_, clock))) = (source.as_mut(), accepted) {
+                if let (Some(source), Some(accepted)) = (source.as_mut(), accepted) {
                     crate::device_tag::bind_proposal_source_identity(
                         source,
                         queued.proposal_reference_ref().as_slice(),
@@ -3964,7 +3998,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         group_id,
                         &message.id,
                         source,
-                        clock.now_ms(),
+                        accepted.clock.now_ms(),
                     )?;
                 }
                 let proposal_ref = tls_hex(queued.proposal_reference_ref())?;
@@ -4154,18 +4188,23 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
-                if let (Some(source), Some((_, clock))) = (source.as_ref(), accepted) {
+                if let (Some(source), Some(accepted)) = (source.as_ref(), accepted) {
                     storage.observe_authenticated_device_group_source(
                         group_id,
                         &message.id,
                         source,
-                        clock.now_ms(),
+                        accepted.clock.now_ms(),
                     )?;
                 }
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));
                 let additions = group_activity::staged_additions(&staged)?;
                 let leavers = group_activity::staged_leavers(&mls_group, &staged);
+                if retain_replayed_anchors.is_some()
+                    && let Some(context) = sibling_context
+                {
+                    self_removed_slots.extend(context.staged_slots(&mls_group, &staged));
+                }
                 mls_group
                     .merge_staged_commit(&provider, *staged)
                     .map_err(|e| {
@@ -4215,6 +4254,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         epoch_authenticators: BTreeMap::new(),
                         roster_tag_keys: Vec::new(),
                     };
+                    if !self_removed_slots.is_empty() {
+                        let mut record = storage.get_group(group_id)?;
+                        record
+                            .self_removed_sibling_slots
+                            .extend(self_removed_slots.iter().copied());
+                        storage.put_group(&record)?;
+                    }
                     update_group_record_from_replay(storage, group_id, &intermediate)?;
                     retain_current_group_epoch_snapshot(
                         storage,
@@ -4225,13 +4271,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();
-                if let (Some(source), Some((_, clock))) = (source.as_mut(), accepted) {
+                if let (Some(source), Some(accepted)) = (source.as_mut(), accepted) {
                     crate::device_tag::bind_application_source_identity(source, &payload);
                     storage.observe_authenticated_device_group_source(
                         group_id,
                         &message.id,
                         source,
-                        clock.now_ms(),
+                        accepted.clock.now_ms(),
                     )?;
                 }
                 // Mirror the direct ingest seam (audit item S3): an
@@ -4332,6 +4378,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 ));
             }
         }
+    }
+    if retain_replayed_anchors.is_some() && !self_removed_slots.is_empty() {
+        let mut record = storage.get_group(group_id)?;
+        record.self_removed_sibling_slots.extend(self_removed_slots);
+        if let Some(context) = sibling_context {
+            context.clear_present(&mls_group, &mut record);
+        }
+        storage.put_group(&record)?;
     }
     Ok(OpenMlsReplayOutput {
         observations,

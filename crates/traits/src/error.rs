@@ -466,6 +466,9 @@ pub enum SiblingAddRefusal {
     AccountLeaves,
     /// This device is not tagged in a device group it trusts.
     NotTagged,
+    /// This copy applied the sibling's own SelfRemove and no selected leaf
+    /// reads as that slot again. A different KeyPackage cannot resolve it.
+    SiblingLeft,
     /// The KeyPackage cannot add that sibling to this chat: it is published,
     /// expired, another account's, not tagged as the sibling's slot, or does
     /// not advertise or prove what the chat requires, or the chat already

@@ -53,6 +53,11 @@ supports it. The default drops observations, so an alternate backend or wrapper 
 boundary omits positive stored-message audit rows; other forensic observations remain available. Missing audit rows
 never prove that a mutation did not happen.
 
+**Current-membership sibling departures.** `Group.self_removed_sibling_slots` records authenticated sibling
+SelfRemoves applied by this local copy. Storage and snapshots preserve it; an empty set is omitted from JSON, and
+older records read as empty. Selected leaf return clears the corresponding slot, and fresh Welcome admission starts a
+new membership without prior holds. This is local metadata, not a replicated invitation choice or another journal.
+
 **Publish-before-apply.** `AutoPublish` follows the same contract as explicit group evolution: callers publish the
 message, then confirm or fail the attached `PendingStateRef`.
 

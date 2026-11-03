@@ -919,6 +919,7 @@ fn snapshot_group_and_member() {
             disbanded: None,
             join_epoch: EpochId(2),
             local_copy_install_epoch: EpochId(2),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
         }
     );
@@ -986,6 +987,7 @@ fn unrecoverable_defaults_false_for_old_records() {
     }))
     .unwrap();
     assert!(!legacy.unrecoverable);
+    assert!(legacy.self_removed_sibling_slots.is_empty());
 }
 
 /// A disband tombstone written before the announce-once marker existed carries

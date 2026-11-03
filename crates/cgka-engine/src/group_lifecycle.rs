@@ -822,6 +822,7 @@ impl<S: StorageProvider> Engine<S> {
             disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
             local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+            self_removed_sibling_slots: Default::default(),
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
         };
@@ -1891,6 +1892,7 @@ impl<S: StorageProvider> Engine<S> {
                 // Unconditional, unlike `join_epoch`: a first join and a
                 // replacement join both install a copy that starts here.
                 local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+                self_removed_sibling_slots: Default::default(),
                 // Clamped to this device's own clock. The value is the welcome
                 // rumor's `created_at`, which no relay validates, so an inviter
                 // running fast — or lying — would otherwise push the floor into

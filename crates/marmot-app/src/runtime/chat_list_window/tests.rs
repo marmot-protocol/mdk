@@ -1509,6 +1509,7 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
             disbanded: None,
             join_epoch: cgka_traits::EpochId(0),
             local_copy_install_epoch: cgka_traits::EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
         })
         .unwrap();

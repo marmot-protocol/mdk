@@ -2366,6 +2366,15 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             None
         };
+        let sibling_context = if result.selected_tip.is_some() {
+            self.sibling_self_removal_context(group_id)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))
+                .map_err(ConvergencePassFailure::at(
+                    ConvergencePassStep::PrepareApply,
+                ))?
+        } else {
+            None
+        };
         let (group_changes, application_events, membership_effects) = self
             .storage
             .with_transaction(|storage| {
@@ -2376,6 +2385,7 @@ impl<S: StorageProvider> Engine<S> {
                     max_retained_anchor_rewind,
                     replay_profile_policy,
                     self.wall_clock.as_ref(),
+                    sibling_context.as_ref(),
                 )?;
                 // Membership cleanup belongs to canonical apply: a failed queue or
                 // leave-request write must roll back MLS and the completed pass too.
