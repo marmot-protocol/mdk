@@ -24495,6 +24495,8 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
+    // The scripted relay has no socket forwarder to finish native stored input.
+    let _pump = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -25679,6 +25681,8 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let plane = MarmotRelayPlane::new(None, relay.clone());
+        // The scripted relay has no socket forwarder to finish native stored input.
+        let _pump = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
         let mut alice = app
             .client_with_relay_plane("alice", &plane, None)
             .await
