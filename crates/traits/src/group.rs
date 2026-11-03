@@ -9,6 +9,20 @@ use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 use serde::{Deserialize, Serialize};
 
+/// The immutable invitation associated with this installed local copy.
+///
+/// Derived from a validated admission context, or inherited from an
+/// authenticated sibling Welcome. Older unidentified copies have no record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvitationAdmission {
+    pub generation: [u8; 32],
+    /// This device founded the group rather than joining a Welcome.
+    pub created_locally: bool,
+    /// Exact local successful join output; never a shared generation seed.
+    /// None only for native founding.
+    pub via_welcome: Option<crate::MessageId>,
+}
+
 /// Marmot application-profile generation for a group or KeyPackage.
 ///
 /// This is the strict-cutover classification used for decisions that differ

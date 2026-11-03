@@ -248,3 +248,9 @@ For the Marmot app-component model used by new groups, see
 
 Single internal consumer; not semver-stable. Versioned with the workspace. For readiness and open production work, see
 [`current-state.md`](../../docs/marmot-architecture/overview/current-state.md).
+
+Invitation-decision metadata is captured on successful native creation/join in all builds, including ordinary chats
+with device groups disabled: it serializes/hashes the validated admission context and persists its local association.
+It adds no per-message observation work. Custom `GroupStorage` providers must implement the transactional
+`invitation_admission` and `put_invitation_admission` methods; an older unidentified copy is never seeded from its
+current epoch. Experimental sibling-Welcome V2 inheritance requires updated receivers; retained V1 bodies stay V1.

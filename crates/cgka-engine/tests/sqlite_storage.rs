@@ -160,6 +160,7 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
     let key = SqlCipherKey::raw([0x42; 32]);
 
     let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    let alice_inspection = alice_store.clone();
     let bob_store = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
     let mut alice = build_client(alice_store, b"alice-sqlite");
     let mut bob = build_client(bob_store, b"bob-sqlite");
@@ -184,18 +185,61 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
         }
         other => panic!("expected group creation result, got {other:?}"),
     };
-    alice.confirm_published(pending).await.expect("confirm");
+    // Fault the actual new admission write inside the founding confirmation,
+    // after its earlier MLS and group writes, through an independent connection.
+    let before = alice_inspection.get_group(&group_id).unwrap();
+    let fault = rusqlite::Connection::open(&alice_path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &fault,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_invitation_admission BEFORE INSERT ON cgka_invitation_admissions BEGIN SELECT RAISE(ABORT, 'invitation admission fault'); END;").unwrap();
+    let error = alice.confirm_published(pending).await.unwrap_err();
+    assert!(error.to_string().contains("invitation admission fault"));
+    assert_eq!(alice_inspection.get_group(&group_id).unwrap(), before);
+    assert!(
+        alice_inspection
+            .invitation_admission(&group_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        load_openmls_group(&alice_inspection, &group_id)
+            .pending_commit()
+            .is_some()
+    );
+    fault
+        .execute_batch("DROP TRIGGER refuse_invitation_admission")
+        .unwrap();
+    drop(fault);
+    alice
+        .confirm_published(pending)
+        .await
+        .expect("healed confirm retry");
+    let admission = alice_inspection
+        .invitation_admission(&group_id)
+        .unwrap()
+        .unwrap();
+    assert!(admission.created_locally);
+    assert!(admission.via_welcome.is_none());
 
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
     assert_eq!(alice.members(&group_id).unwrap().len(), 2);
 
     drop(alice);
     drop(bob);
+    drop(alice_inspection);
 
     let file_bytes = std::fs::read(&alice_path).unwrap();
     assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
 
     let reopened = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    assert_eq!(
+        reopened.invitation_admission(&group_id).unwrap(),
+        Some(admission)
+    );
     let reopened_group = reopened.get_group(&group_id).unwrap();
     assert_eq!(reopened_group.epoch, EpochId(1));
     assert_eq!(

@@ -327,6 +327,8 @@ mod migration_0166_blossom_history_deliveries;
 mod migration_0168_backup_restore;
 #[path = "migrations/0169_sibling_welcome_resends.rs"]
 mod migration_0169_sibling_welcome_resends;
+#[path = "migrations/0170_invitation_decisions.rs"]
+mod migration_0170_invitation_decisions;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1306,6 +1308,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0169_sibling_welcome_resends",
         suspend_foreign_keys: &[],
         apply: migration_0169_sibling_welcome_resends::apply,
+    },
+    Migration {
+        version: 170,
+        name: "0170_invitation_decisions",
+        suspend_foreign_keys: &[],
+        apply: migration_0170_invitation_decisions::apply,
     },
     Migration {
         version: 171,

@@ -477,6 +477,25 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   through `ensure_sent_by`. A withdrawn update owes every held item again, whoever sent it, and a withdrawn broadcast
   request owes a new one; a withdrawn message with no record in the trusted device group owes both. A winning pin for
   an archived chat waits, unobserved, until the chat is unarchived.
+- Invitation decisions (`client/invitation_decisions.rs`, mdk#2628 4.3b/D96) are explicit per-admission intent, never
+  inferred from archive/leave/delete snapshots. Native `InvitationAdmission` holds the original validated generation
+  and local `via_welcome` association; compare that existing GroupJoined source before re-arming work, and never seed
+  legacy copies from current state. A local decision/owed broadcast/necessary decline work is one durable row change
+  before external effects. Remote acceptance uses existing confirmation guards and rollback, without a local human
+  action. Uninstalled decisions retain value but defer work until a matching native join. A decline does not reach a
+  copy this device already deleted locally; never restore its projection or act on hidden native membership. Decline uses existing
+  LeaveRequest and worker maintenance; recheck current generation/winner after send preflight. Higher acceptance
+  can replace unrequested intent but cannot cancel native LeaveRequest. Box the rare internal Leave future as the
+  foreground owner does, to keep it out of idle maintenance frames. A known current-generation decline holds new
+  direct/gap sibling Adds at candidate and final preparation; private-stock requests follow their ordinary rules. Keep claims/waiters and
+  exposed work settlement independent. Reuse durable winner work to schedule the affected chat's existing gap work,
+  even without an epoch change; do not put per-chat decisions in the global slot/tag eligibility fingerprint.
+  `a_declined_generation_holds_automatic_adds_until_a_later_accept` owns that app/transport boundary. Kind475 invitation
+  pages flush on repeated
+  `(chat,item)` even for different generations and never truncate retained generations; ordinary full-broadcast and
+  withdrawal ownership re-owe them. Old V1 Welcome bytes are never upgraded to V2 on retry. The source/codec/atomicity
+  owners live in the existing engine private-KeyPackage, app small-state and sibling-Welcome modules; do not replay
+  comparison/codec checks at the host binding layer.
 - Keep outbound Welcomes on the engine's Welcome rows (mdk#2628 3.5a). The invite slot of
   `drive_unpublished_welcome_delivery` holds only Welcome ids, published through the runtime's
   `deliver_owed_welcomes_with_audit_context`; the founding slot keeps the create's `SessionEffects`, because a legacy

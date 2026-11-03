@@ -209,3 +209,5 @@ pub use app::attachment_acquisition::{
 };
 
 pub use base::open_progress::{StorageOpenPhase, StorageOpenProgress};
+
+pub use app::invitation_decisions::{InvitationDecision, InvitationDecisionWork};

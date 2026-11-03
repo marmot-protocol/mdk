@@ -33,6 +33,8 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_group_snapshots", Side::Protocol),
     ("cgka_group_state_checkpoints", Side::Protocol),
     ("cgka_groups", Side::Protocol),
+    ("cgka_invitation_admissions", Side::Protocol),
+    ("invitation_decisions", Side::App),
     ("cgka_ingress_dedup", Side::Protocol),
     ("cgka_key_package_lifecycle", Side::Protocol),
     ("cgka_leave_requests", Side::Protocol),

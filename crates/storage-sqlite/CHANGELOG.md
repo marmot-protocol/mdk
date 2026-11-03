@@ -439,6 +439,9 @@
 
 ### Added
 
+- Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
+  publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
+
 - Migration 0167 indexes active kind-7 reaction attachments from retained app
   events without creating timeline rows (mdk#2151), backfilling existing
   artwork and sharing normal acquisition, permission and retention behavior.

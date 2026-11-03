@@ -298,6 +298,614 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A real native metadata update is newer than the saved chat while its App
+/// checkpoint fails. Owed invitation work must not overwrite that queued write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invitation_work_preserves_a_pending_chat_projection() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _, MessageStorage as _};
+
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("old invitation profile", &[])
+        .await
+        .unwrap();
+    let key = published_key_package(&mut phone.client, &relay).await;
+    let effects = bob
+        .runtime
+        .send(SendIntent::Invite {
+            group_id: chat.clone(),
+            key_packages: vec![key],
+            initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+        })
+        .await
+        .unwrap();
+    bob.observe_drained_session_events(&effects).await.unwrap();
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    let error = phone.client.decline_group_invite(&chat).await.unwrap_err();
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+        ),
+        "{error}"
+    );
+    let chat_hex = hex::encode(chat.as_slice());
+    let store = phone.app.account_storage("alice").unwrap();
+    let generation = store
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(store.leave_request(&chat).unwrap().is_none());
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision.generation == generation && work.decline_owed)
+    );
+    assert_eq!(
+        phone
+            .app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "old invitation profile"
+    );
+
+    let cursor = relay.published_events.lock().unwrap().len();
+    bob.update_group_profile(&chat, Some("new native profile"), None)
+        .await
+        .unwrap();
+    // The real application following the Commit also leaves an actual native
+    // output acknowledgment pending at this same failed App checkpoint.
+    bob.send(&chat, b"checkpoint companion").await.unwrap();
+    let deliveries: Vec<_> = relay.published_events.lock().unwrap()[cursor..]
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .cloned()
+        .collect();
+    assert!(deliveries.len() >= 2);
+    let db = account_database(&phone.app);
+    db.execute_batch("CREATE TRIGGER reject_pending_profile BEFORE INSERT ON account_state BEGIN SELECT RAISE(FAIL, 'pending profile checkpoint held'); END;").unwrap();
+    for event in deliveries {
+        let error = phone
+            .client
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: MemberId::new(hex::decode(&alice).unwrap()),
+                group_id_hint: Some(chat.clone()),
+                message: event.to_transport_message().unwrap(),
+                received_at: cgka_traits::Timestamp(crate::unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::Group,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pending profile checkpoint held"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        phone.client.runtime.group_record(&chat).unwrap().name,
+        "new native profile"
+    );
+    assert_eq!(
+        phone.client.state_group_record(&chat).unwrap().profile.name,
+        "new native profile"
+    );
+    assert_eq!(
+        phone
+            .app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "old invitation profile"
+    );
+    assert!(
+        phone
+            .client
+            .pending_group_projection_updates
+            .contains(&chat_hex)
+    );
+    assert!(!phone.client.pending_application_event_acks.is_empty());
+    assert!(store.list_pending_application_events().unwrap().iter().any(|event| matches!(event, cgka_traits::GroupEvent::MessageReceived { group_id, .. } if group_id == &chat)));
+    assert!(phone.client.arm_failed_receive_projection_retry());
+
+    if let Err(error) = phone.client.run_due_maintenance().await {
+        assert!(
+            error
+                .to_string()
+                .contains("pending profile checkpoint held"),
+            "{error}"
+        );
+    }
+    let retained_profile = phone.client.state_group_record(&chat).unwrap().profile.name;
+    assert!(
+        phone
+            .client
+            .pending_group_projection_updates
+            .contains(&chat_hex)
+    );
+    assert!(store.leave_request(&chat).unwrap().is_none());
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision.generation == generation && work.decline_owed)
+    );
+    db.execute_batch("DROP TRIGGER reject_pending_profile")
+        .unwrap();
+    drop(db);
+    assert_eq!(
+        retained_profile, "new native profile",
+        "invitation maintenance must not replace an uncheckpointed native profile with the older saved row"
+    );
+
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        phone
+            .app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "new native profile"
+    );
+    assert!(
+        !phone
+            .client
+            .pending_group_projection_updates
+            .contains(&chat_hex)
+    );
+    assert!(phone.client.pending_application_event_acks.is_empty());
+    assert!(!store.list_pending_application_events().unwrap().iter().any(|event| matches!(event, cgka_traits::GroupEvent::MessageReceived { group_id, .. } if group_id == &chat)));
+    assert!(store.leave_request(&chat).unwrap().is_none());
+    drop(phone.client);
+    phone.client = phone.app.client("alice").await.unwrap();
+    assert_eq!(
+        phone.client.state_group_record(&chat).unwrap().profile.name,
+        "new native profile"
+    );
+
+    // A clean client's DB-only archive still needs the saved-row adoption.
+    assert!(
+        !phone
+            .client
+            .pending_group_projection_updates
+            .contains(&chat_hex)
+    );
+    assert!(!phone.client.state_group_record(&chat).unwrap().archived);
+    phone
+        .app
+        .set_group_archived("alice", &chat_hex, true)
+        .unwrap();
+    phone.client.drive_invitation_decisions().await;
+    assert!(phone.client.state_group_record(&chat).unwrap().archived);
+    assert!(
+        phone
+            .app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    assert!(store.leave_request(&chat).unwrap().is_none());
+}
+
+/// A real pending admin invitation can be declined while ordinary Leave is
+/// refused before a native request exists. Both automatic Add paths must hold
+/// it; a real sibling's later acceptance wakes only that generation's gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+    async fn exchange_decision(
+        relay: &ScriptedPushRelayClient,
+        source: &mut Device,
+        receiver: &mut Device,
+        group: &GroupId,
+        chat: &GroupId,
+        expected: ([u8; 32], u64, bool),
+    ) {
+        let (generation, version, declined) = expected;
+        // Direct clients have no worker to advance scheduled convergence.
+        // Await the real replicated value, not a fixed number of passes.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                source.client.drive_small_state().await;
+                converge_device_group(&mut source.client, relay, &mut source.cursor, group, 1)
+                    .await;
+                converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, group, 1)
+                    .await;
+                let held = receiver
+                    .app
+                    .account_storage("alice")
+                    .unwrap()
+                    .app_storage()
+                    .invitation_decision(&hex::encode(chat.as_slice()), &generation)
+                    .unwrap();
+                if held.is_some_and(|held| held.version == version && held.declined == declined) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the authenticated decision reaches its sibling");
+    }
+    let (relay, [first, second, mut laptop]) = alice_devices::<3>().await;
+    let (mut tablet, mut phone) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    let store = phone.app.account_storage("alice").unwrap();
+    let stock = store.app_storage();
+    let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    assert!(held_from(&phone, &laptop) > 0);
+    assert!(
+        stock
+            .private_key_package_need(&laptop.slot_hex())
+            .unwrap()
+            .is_none()
+    );
+
+    // The real external admin selects Phone and Tablet in ONE Add batch;
+    // Laptop remains missing. Promoting their account in that Add makes a
+    // pending invitation whose ordinary Leave is refused without busy state.
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut invitations = Vec::new();
+    for name in ["direct declined invitation", "gap declined invitation"] {
+        let chat = bob.create_group(name, &[]).await.unwrap();
+        let phone_key = published_key_package(&mut phone.client, &relay).await;
+        let tablet_key = published_key_package(&mut tablet.client, &relay).await;
+        let effects = bob
+            .runtime
+            .send(SendIntent::Invite {
+                group_id: chat.clone(),
+                key_packages: vec![phone_key, tablet_key],
+                initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+            })
+            .await
+            .unwrap();
+        bob.observe_drained_session_events(&effects).await.unwrap();
+        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+        phone.client.sync().await.unwrap();
+        deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+        tablet.client.sync().await.unwrap();
+        assert!(
+            phone
+                .client
+                .state_group_record(&chat)
+                .unwrap()
+                .pending_confirmation
+        );
+        assert!(!joined(&laptop, &chat));
+        assert_eq!(
+            phone
+                .client
+                .runtime
+                .chat_sibling_add_refusal(&chat)
+                .unwrap(),
+            None,
+            "the pending admin chat otherwise admits same-account Adds"
+        );
+        let error = phone.client.decline_group_invite(&chat).await.unwrap_err();
+        assert!(
+            matches!(
+                error.as_engine_error(),
+                Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+            ),
+            "{error}"
+        );
+        assert!(store.leave_request(&chat).unwrap().is_none());
+        assert!(phone.client.group_quiet(&chat).unwrap());
+        invitations.push(chat);
+    }
+    let [direct, gap] = <[_; 2]>::try_from(invitations).unwrap();
+    // Tablet has not learned the decline yet. Its real authenticated lower
+    // claim is advisory and must survive Phone's later semantic hold.
+    let claim = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        tablet.slot_hex(),
+        laptop.slot_hex(),
+        hex::encode(direct.as_slice())
+    );
+    assert!(
+        tablet
+            .client
+            .send_device_group_message(&group, 458, claim)
+            .await
+            .unwrap()
+    );
+    converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1).await;
+    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1).await;
+    for chat in [&direct, &gap] {
+        let generation = store
+            .invitation_admission(chat)
+            .unwrap()
+            .unwrap()
+            .generation;
+        exchange_decision(
+            &relay,
+            &mut phone,
+            &mut tablet,
+            &group,
+            chat,
+            (generation, 1, true),
+        )
+        .await;
+    }
+    phone.app.set_native_push_enabled("alice", true).unwrap();
+    phone
+        .app
+        .upsert_push_registration(
+            "alice",
+            crate::PushPlatform::Fcm,
+            "phone-token",
+            &::nostr::prelude::Keys::generate().public_key().to_hex(),
+            Some("wss://relay.example".to_owned()),
+        )
+        .unwrap();
+    phone.client.share_push_registration().await.unwrap();
+    let before = relay.published_event_ids().len();
+    for _ in 0..2 {
+        phone.client.drive_invitation_decisions().await;
+        assert_eq!(
+            relay.published_event_ids().len(),
+            before,
+            "an admin's owed decline must not remove and re-share its push token on retry"
+        );
+        for chat in [&direct, &gap] {
+            assert!(store.leave_request(chat).unwrap().is_none());
+            let generation = store
+                .invitation_admission(chat)
+                .unwrap()
+                .unwrap()
+                .generation;
+            assert!(
+                stock
+                    .invitation_decision(&hex::encode(chat.as_slice()), &generation)
+                    .unwrap()
+                    .unwrap()
+                    .declined
+            );
+            assert!(
+                stock
+                    .invitation_decision_work()
+                    .unwrap()
+                    .iter()
+                    .any(|work| { work.decision.generation == generation && work.decline_owed }),
+                "a refused native Leave keeps its exact decline work owed"
+            );
+        }
+    }
+    let held = held_from(&phone, &laptop);
+    let tablet_taken = taken_from(&phone, &tablet);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
+        .await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        0,
+        "known Decline must not spend private stock on a new automatic Add"
+    );
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 0);
+    assert_eq!(
+        relay.published_event_ids().len(),
+        before,
+        "no new Add or claim on the automatic Add paths"
+    );
+    assert_eq!(held_from(&phone, &laptop), held);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    // Exercise final preparation independently of candidate selection: it
+    // must still refuse before claiming the exact valid private package.
+    let candidate = stock
+        .received_private_key_packages_from(&laptop.slot_hex(), crate::unix_now_seconds())
+        .unwrap()
+        .remove(0);
+    phone
+        .client
+        .add_sibling_to_chat(&direct, &laptop_slot, candidate)
+        .await
+        .unwrap();
+    assert_eq!(
+        held_from(&phone, &laptop),
+        held,
+        "final preparation also holds its allocation"
+    );
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(relay.published_event_ids().len(), before);
+
+    tablet.client.accept_group_invite(&direct).unwrap();
+    let generation = store
+        .invitation_admission(&direct)
+        .unwrap()
+        .unwrap()
+        .generation;
+    exchange_decision(
+        &relay,
+        &mut tablet,
+        &mut phone,
+        &group,
+        &direct,
+        (generation, 2, false),
+    )
+    .await;
+    // An authenticated retained decision for a DIFFERENT generation does
+    // not block the current one. This is negative input, never a native seed.
+    let mut unrelated = stock
+        .invitation_decision(
+            &hex::encode(direct.as_slice()),
+            &store
+                .invitation_admission(&direct)
+                .unwrap()
+                .unwrap()
+                .generation,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!unrelated.declined, "the genuine higher Accept is current");
+    unrelated.generation[0] ^= 1;
+    unrelated.version = 9;
+    unrelated.declined = true;
+    let unrelated_generation = unrelated.generation;
+    let [(content, _)] =
+        <[_; 1]>::try_from(crate::small_state::encode_invitation_decision_updates(&[
+            unrelated,
+        ]))
+        .unwrap();
+    assert!(
+        tablet
+            .client
+            .send_device_group_message(&group, crate::small_state::KIND_SMALL_STATE_UPDATE, content)
+            .await
+            .unwrap()
+    );
+    exchange_decision(
+        &relay,
+        &mut tablet,
+        &mut phone,
+        &group,
+        &direct,
+        (unrelated_generation, 9, true),
+    )
+    .await;
+    phone.client.drive_invitation_decisions().await;
+    assert!(
+        phone.client.group_quiet(&direct).unwrap(),
+        "acceptance leaves no native Leave or held Commit"
+    );
+    assert!(
+        phone.client.group_quiet(&group).unwrap(),
+        "the device group is ready for an automatic Add"
+    );
+    let before = relay.published_event_ids().len();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
+        .await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        0,
+        "the original live lower claim still holds this gap after decline and accept"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        before,
+        "no renewed claim before its original expiry"
+    );
+    // The approver's independent direct flow does not use advisory gap claims.
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
+        .await;
+
+    // Both the global eligibility snapshot and the declined chat's due pass
+    // were consumed above. Only a winning app decision changes now: no chat
+    // epoch, device-group pin, stock hand-off or new claimant wakes this gap.
+    let pin = phone.client.runtime.epoch_pin(&group).unwrap();
+    let chat_pin = phone.client.runtime.epoch_pin(&gap).unwrap();
+    tablet.client.accept_group_invite(&gap).unwrap();
+    let generation = store
+        .invitation_admission(&gap)
+        .unwrap()
+        .unwrap()
+        .generation;
+    exchange_decision(
+        &relay,
+        &mut tablet,
+        &mut phone,
+        &group,
+        &gap,
+        (generation, 2, false),
+    )
+    .await;
+    phone.client.drive_invitation_decisions().await;
+    assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
+    assert_eq!(phone.client.runtime.epoch_pin(&gap).unwrap(), chat_pin);
+    assert!(store.leave_request(&gap).unwrap().is_none());
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
+        .await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        2,
+        "a higher Accept wakes the already permitted gap"
+    );
+    assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    assert!(
+        stock
+            .private_key_package_need(&tablet.slot_hex())
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// The direct post-link burst belongs to the approver. A different sibling
 /// can still fill the missing chats through the advisory claim flow while
 /// that approver is offline; the returning approver adds no duplicate.

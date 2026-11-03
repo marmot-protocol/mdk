@@ -63,6 +63,7 @@ pub mod group_lifecycle;
 pub mod group_state_changes;
 pub mod history_key;
 pub mod identity;
+mod invitation_admission;
 pub mod key_package;
 pub mod leaf_advertisement;
 mod link_device;

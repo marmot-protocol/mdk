@@ -92,6 +92,7 @@ pub(crate) mod history_imports;
 pub(crate) use backup_writer::BackupPassOutcome;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
+mod invitation_decisions;
 mod invite_recovery;
 pub(crate) mod linked_device_chats;
 mod private_key_packages;
@@ -1604,6 +1605,7 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
+        self.drive_invitation_decisions().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
@@ -3506,7 +3508,7 @@ impl AppClient {
                 Vec::new(),
                 Some(1),
             );
-            self.leave_group_with_audit_context(group_id, audit_context)
+            self.leave_group_with_audit_context(group_id, audit_context, None)
                 .await
         };
         observed
@@ -3883,8 +3885,14 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         audit_context: AuditEventContext,
+        invitation: Option<&storage_sqlite::InvitationDecision>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        if let Some(invitation) = invitation
+            && !self.invitation_decline_is_current(invitation)?
+        {
+            return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
+        }
 
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
@@ -3900,6 +3908,11 @@ impl AppClient {
         };
         let effects = match async {
             self.sync_runtime_groups_for_send("leave_group").await?;
+            if let Some(invitation) = invitation
+                && !self.invitation_decline_is_current(invitation)?
+            {
+                return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
+            }
             let effects = sign_out_step
                 .run(self.runtime.send_with_audit_context(
                     SendIntent::Leave {
@@ -4140,6 +4153,8 @@ impl AppClient {
             return Err(AppError::GroupInviteNotPending);
         }
 
+        self.record_local_invitation_decision(group_id, false)?;
+
         // Departure projection effects are persisted through `MarmotApp` and
         // can be newer than this worker's in-memory snapshot. Adopt that exact
         // authoritative row before confirming so validation and mutation stay
@@ -4175,6 +4190,7 @@ impl AppClient {
             "decline_invite",
             crate::ProductUnit::Action,
         );
+        let invitation = self.record_local_invitation_decision(group_id, true)?;
         let work = async move {
             let audit_context = Self::local_human_action_context(
                 "decline_group_invite",
@@ -4183,7 +4199,7 @@ impl AppClient {
                 Some(1),
             );
             let summary = self
-                .leave_group_with_audit_context(group_id, audit_context)
+                .leave_group_with_audit_context(group_id, audit_context, invitation.as_ref())
                 .await?;
             let group = self.set_group_invite_confirmation(group_id, false, true)?;
             Ok(GroupInviteDeclineResult { group, summary })
