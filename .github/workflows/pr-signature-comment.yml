@@ -1,0 +1,33 @@
+name: PR signature guidance
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-signature-comment-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    name: Explain PR signature blockers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # pull_request_target's github.sha is the trusted default-branch commit.
+      # Never check out a contributor ref here: this token can write comments.
+      - name: Check out trusted signature policy
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/check_pr_signatures.py
+          sparse-checkout-cone-mode: false
+      - name: Update signature guidance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_pr_signatures.py

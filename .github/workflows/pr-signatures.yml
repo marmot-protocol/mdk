@@ -1,0 +1,34 @@
+name: PR signature gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Verify PR commit signatures
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout: verify the immutable event's complete base..head range
+      # before any PR code runs. This saves CI resources; native signed-commit
+      # protection remains authoritative because PRs can edit their workflows.
+      - name: Verify every PR commit
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMMIT_COUNT: ${{ github.event.pull_request.commits }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA?per_page=100" |
+            jq --exit-status --arg head "$HEAD_SHA" --argjson expected "$COMMIT_COUNT" '
+              [.[].commits[]] as $commits |
+              $expected > 0 and ($commits | length) == $expected and
+              ([$commits[].sha] | unique | length) == $expected and
+              any($commits[]; .sha == $head) and
+              all($commits[]; .commit.verification.verified == true)'
