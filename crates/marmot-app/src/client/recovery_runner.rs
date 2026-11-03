@@ -256,13 +256,14 @@ pub(crate) trait RunnerHost: Send + Sync + 'static {
     /// installed subscriptions lag its routes, so its slice stays owed.
     async fn deliveries(&self, relay: &str, event: Event) -> Option<Vec<TransportDelivery>>;
 
-    /// Hand one staged delivery to the account's recovered-ingest path, as
-    /// one worker command. `None` once the worker is gone; an error is its
-    /// privacy-safe kind.
+    /// Hand one bounded batch to the account's recovered-ingest path in one
+    /// worker command. Return only the attempted prefix, stopping on a hold,
+    /// failure, self-removal or effects needing publication. `None` once the
+    /// worker is gone; an error is its privacy-safe kind.
     async fn admit_staged(
         &self,
-        delivery: TransportDelivery,
-    ) -> Option<Result<Admitted, &'static str>>;
+        deliveries: Vec<TransportDelivery>,
+    ) -> Option<Vec<Result<Admitted, &'static str>>>;
 
     /// Unix seconds.
     fn now_seconds(&self) -> u64;

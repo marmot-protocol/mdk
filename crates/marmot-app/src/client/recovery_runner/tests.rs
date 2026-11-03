@@ -1210,47 +1210,53 @@ impl RunnerHost for TestHost {
 
     async fn admit_staged(
         &self,
-        delivery: TransportDelivery,
-    ) -> Option<Result<Admitted, &'static str>> {
-        self.clock
-            .advance(self.ingest_seconds.load(Ordering::SeqCst));
-        let at = delivery.message.timestamp.0;
-        let event_id = delivery.message.id.as_slice().to_vec();
-        if self.no_trace.lock().unwrap().contains(&event_id) {
-            return Some(Ok(Admitted::NoTrace));
+        deliveries: Vec<TransportDelivery>,
+    ) -> Option<Vec<Result<Admitted, &'static str>>> {
+        let mut outcomes = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            self.clock
+                .advance(self.ingest_seconds.load(Ordering::SeqCst));
+            let at = delivery.message.timestamp.0;
+            let event_id = delivery.message.id.as_slice().to_vec();
+            if self.no_trace.lock().unwrap().contains(&event_id) {
+                outcomes.push(Ok(Admitted::NoTrace));
+                break;
+            }
+            if self.failing_ingests.lock().unwrap().contains(&event_id) {
+                outcomes.push(Err("storage"));
+                break;
+            }
+            if let Some(laggard) = self.laggard.lock().unwrap().as_ref() {
+                let now = self.clock.now();
+                let owed_until = self
+                    .tails
+                    .read()
+                    .owed_until(&laggard.route, &laggard.relay, now);
+                let owed = self
+                    .app
+                    .recovery_unit_debt(&laggard.route, &laggard.relay, owed_until)
+                    .unwrap()
+                    .first()
+                    .map(|range| range.since_seconds);
+                self.behind.lock().unwrap().push((at, owed));
+            }
+            self.app
+                .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                    &StoredAccountState {
+                        label: "runner".to_owned(),
+                        seen_events: vec![hex::encode(&event_id)],
+                        ..StoredAccountState::default()
+                    },
+                    100_000,
+                    0,
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            self.admitted.lock().unwrap().push((at, event_id));
+            outcomes.push(Ok(Admitted::Kept));
         }
-        if self.failing_ingests.lock().unwrap().contains(&event_id) {
-            return Some(Err("storage"));
-        }
-        if let Some(laggard) = self.laggard.lock().unwrap().as_ref() {
-            let now = self.clock.now();
-            let owed_until = self
-                .tails
-                .read()
-                .owed_until(&laggard.route, &laggard.relay, now);
-            let owed = self
-                .app
-                .recovery_unit_debt(&laggard.route, &laggard.relay, owed_until)
-                .unwrap()
-                .first()
-                .map(|range| range.since_seconds);
-            self.behind.lock().unwrap().push((at, owed));
-        }
-        self.app
-            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
-                &StoredAccountState {
-                    label: "runner".to_owned(),
-                    seen_events: vec![hex::encode(&event_id)],
-                    ..StoredAccountState::default()
-                },
-                100_000,
-                0,
-                &[],
-                &[],
-            )
-            .unwrap();
-        self.admitted.lock().unwrap().push((at, event_id));
-        Some(Ok(Admitted::Kept))
+        Some(outcomes)
     }
 
     fn now_seconds(&self) -> u64 {

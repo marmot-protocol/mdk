@@ -281,10 +281,27 @@ impl RunnerHost for AccountRunnerHost {
 
     async fn admit_staged(
         &self,
-        delivery: TransportDelivery,
-    ) -> Option<Result<Admitted, &'static str>> {
+        deliveries: Vec<TransportDelivery>,
+    ) -> Option<Vec<Result<Admitted, &'static str>>> {
         self.on_client(true, move |client| {
-            Box::pin(async move { Some(admit(client, &delivery).await) })
+            Box::pin(async move {
+                let mut outcomes = Vec::with_capacity(deliveries.len());
+                for delivery in deliveries {
+                    let outcome = admit(client, &delivery).await;
+                    let stopped = !matches!(outcome, Ok(Admitted::Kept));
+                    outcomes.push(outcome);
+                    // Same bounded batch as comparison admission. Publish any
+                    // effects or honor self-removal before another input; a
+                    // failed/untraced prefix never admits anything newer.
+                    if stopped
+                        || client.device_unlinked()
+                        || client.has_pending_effect_projections()
+                    {
+                        break;
+                    }
+                }
+                Some(outcomes)
+            })
         })
         .await
     }

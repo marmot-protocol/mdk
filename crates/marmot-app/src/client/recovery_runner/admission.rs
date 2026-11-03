@@ -36,8 +36,8 @@
 //!   durably, so the hold comes back after a restart, when the counts are
 //!   gone.
 //!
-//! Each admission turn ingests at most a few events, one worker command each,
-//! so the worker serves commands and live input between them. An event the
+//! Each admission turn ingests at most a few events in one worker command,
+//! so the worker serves commands and live input between bounded batches. An event the
 //! engine keeps no trace of (refused for resources) stays staged, and its
 //! group waits behind it on the local-failure backoff, stalled; other groups
 //! go on.
@@ -767,14 +767,23 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             }
             // In order; an event the engine kept no trace of, or a failure,
             // ends the turn, so nothing newer of its group goes ahead of it.
-            let mut tried = Vec::with_capacity(batch.events.len());
+            let (keys, deliveries): (Vec<_>, Vec<_>) = batch
+                .events
+                .into_iter()
+                .map(|(group, event)| {
+                    (
+                        (group, event.delivery.message.id.as_slice().to_vec()),
+                        event.delivery,
+                    )
+                })
+                .unzip();
+            let Some(outcomes) = self.host.admit_staged(deliveries).await else {
+                return Err(Step::Stopped);
+            };
+            let mut tried = Vec::with_capacity(outcomes.len());
             let mut failure = None;
-            for (group, event) in batch.events {
-                let event_id = event.delivery.message.id.as_slice().to_vec();
-                let Some(admitted) = self.host.admit_staged(event.delivery).await else {
-                    return Err(Step::Stopped);
-                };
-                tried.push((group, event_id));
+            for (key, admitted) in keys.into_iter().zip(outcomes) {
+                tried.push(key);
                 match admitted {
                     Ok(Admitted::Kept) => {}
                     Ok(Admitted::NoTrace) => break,

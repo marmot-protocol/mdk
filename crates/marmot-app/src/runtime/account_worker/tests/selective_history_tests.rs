@@ -165,6 +165,7 @@ async fn late_commit_published_after_gap_coverage_recovers() {
 }
 
 async fn late_commit_recovery(publish_after_cover: bool) {
+    use cgka_traits::storage::GroupStorage;
     use marmot_account::AccountHome;
     use nostr_relay_builder::prelude::{EventId as RelayEventId, Filter as RelayFilter};
     use nostr_sdk::prelude::Timestamp;
@@ -289,7 +290,14 @@ async fn late_commit_recovery(publish_after_cover: bool) {
     let outer = Keys::generate();
     let protocol_store = app.account_storage(&alice.label).unwrap();
     let storage = protocol_store.app_storage();
+    // A valid backdated Welcome boundary, pinned while Alice is offline:
+    // randomized NIP-59 timestamps must not let this proof omit the held
+    // history and accidentally avoid its >4 MiB admission workload.
+    let mut copy = protocol_store.get_group(&group).unwrap();
+    copy.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(base - 20_000));
+    protocol_store.put_group(&copy).unwrap();
     let mut retained_bytes = 0;
+    let mut retained_ids = Vec::new();
     for index in 0..1_024 {
         let retained = EventBuilder::new(old.kind, old.content.clone())
             .tags(old.tags.iter().cloned())
@@ -311,6 +319,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
                 },
             )))
             .unwrap();
+        retained_ids.push(retained.id.to_hex());
     }
     assert!(
         retained_bytes > 4 * 1024 * 1024,
@@ -420,7 +429,18 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         }
     })
     .await;
-    if recovered.is_err() {
+    let seen = storage
+        .load_account_projection_state(&alice.label, 10_000)
+        .unwrap()
+        .seen_events
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_admitted = retained_ids.iter().filter(|id| seen.contains(*id)).count();
+    let full_goal = storage
+        .recovery_coverage_goal(&storage_sqlite::TransportReconciliationRoute::Group(route))
+        .unwrap()
+        .is_some_and(|floor| floor <= base - 20_000);
+    if recovered.is_err() || retained_admitted != retained_ids.len() || !full_goal {
         // Preserve a private, closed capsule when a runner-only history proof
         // fails; generated test keys must never be posted with its log.
         let local_epoch = runtime
@@ -431,7 +451,7 @@ async fn late_commit_recovery(publish_after_cover: bool) {
         let capsule = dir.keep();
         runtime.shutdown_and_close().await.unwrap();
         panic!(
-            "late commit recovery failed: local_epoch={local_epoch}, target_epoch={epoch}; private capsule at {}",
+            "late commit recovery failed: local_epoch={local_epoch}, target_epoch={epoch}, retained_admitted={retained_admitted}, full_goal={full_goal}; private capsule at {}",
             capsule.display()
         );
     }
@@ -444,6 +464,10 @@ async fn late_commit_recovery(publish_after_cover: bool) {
             .unwrap()
             .epoch,
         proxy.counts.group_history_requests.lock().unwrap().len()
+    );
+    assert!(
+        retained_admitted == retained_ids.len() && full_goal,
+        "recovery must durably admit all 1,024 retained wrappers before the missing commit"
     );
     {
         let history = proxy.counts.group_history_requests.lock().unwrap();
