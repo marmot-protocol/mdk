@@ -10227,6 +10227,7 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
 // Investigation-only regression: metadata is split across discovery and the
 // identity's advertised outbox, with a third relay owning Welcome delivery.
 async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale_first_hop: bool) {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let publisher_dir = tempfile::tempdir().unwrap();
@@ -13865,6 +13866,7 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
 /// restart so a successful resume cannot clear the row before the poll.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn founding_welcome_resumes_exactly_once_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -13958,6 +13960,7 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
 /// death without staging another invite commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_invite_welcome_resumes_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let welcome_policy = RejectThenBlockGiftWraps::new();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(welcome_policy.clone()));
@@ -14120,6 +14123,7 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
 /// route, and a later process can use that route to deliver one Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(RelayBuilder::default());
     relay.run().await.unwrap();
@@ -14222,6 +14226,7 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
 /// third-relay route must survive restart and deliver one Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let dir = tempfile::tempdir().unwrap();
@@ -14384,6 +14389,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
 }
 
 async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool) {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let sender_dir = tempfile::tempdir().unwrap();
