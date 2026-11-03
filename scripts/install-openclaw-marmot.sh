@@ -46,7 +46,7 @@ MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-openclaw}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.openclaw}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 PLUGIN_PACKAGE="${PLUGIN_PACKAGE:-openclaw-marmot-plugin-${WN_AGENT_VERSION}.tgz}"
-MIN_OPENCLAW_VERSION="2026.7.1"
+MIN_OPENCLAW_VERSION="2026.10.10"
 
 ASSUME_YES=0
 CONFIGURE_OPENCLAW=1
@@ -105,7 +105,8 @@ Options:
   --no-start-wn-agent      Do not start wn-agent before bootstrap
   --no-configure-openclaw  Install assets but do not patch OpenClaw config
   --system                 Install wn-agent to /usr/local/bin instead of ~/.local/bin
-  --force                  Pass --force to openclaw plugins install when supported
+  --force                  Confirm the local plugin source and allow replacement
+                           (also implied by --yes for the verified release archive)
   --dry-run                Print actions without installing
   -h, --help               Show this help
 
@@ -186,8 +187,26 @@ version_at_least() {
             if (hv > nv) exit 0;
             if (hv < nv) exit 1;
         }
+        if (have ~ /-/ && have !~ /-[0-9]+$/) exit 1;
         exit 0;
     }'
+}
+
+require_node_version() {
+    local version
+    version="$(node --version 2>/dev/null)" || {
+        echo "error: could not determine Node version; Node 24.16+ (24.x) or 26.1+ is required" >&2
+        exit 1
+    }
+    if ! printf '%s\n' "$version" | awk -F '[v.]' '
+        /^v[0-9]+\.[0-9]+\.[0-9]+$/ {
+            if (($2 == 24 && $3 >= 16) || ($2 == 26 && $3 >= 1) || $2 > 26) ok = 1;
+        }
+        END { exit !ok }
+    '; then
+        echo "error: Node 24.16+ (24.x) or 26.1+ is required (found $version); upgrade Node separately, then rerun this installer" >&2
+        exit 1
+    fi
 }
 
 require_openclaw_version() {
@@ -197,7 +216,7 @@ require_openclaw_version() {
         exit 1
     }
     version="$(printf '%s\n' "$output" | awk '
-        match($0, /[0-9]+\.[0-9]+\.[0-9]+/) {
+        match($0, /[0-9]+\.[0-9]+\.[0-9]+(-[[:alnum:].]+)?/) {
             print substr($0, RSTART, RLENGTH)
             exit
         }
@@ -383,16 +402,19 @@ install_plugin() {
     download_asset "$PLUGIN_PACKAGE.sha256" "$checksum"
     verify_sha256 "$archive" "$checksum"
 
-    log "installing the plugin into OpenClaw"
+    log "installing the verified plugin into OpenClaw"
+    local install_args=(plugins install)
+    if [ "$FORCE" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
+        install_args+=(--force)
+    fi
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        install_args+=(--accept-capabilities)
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "would run: openclaw plugins install $archive"
+        log "would run: openclaw ${install_args[*]} $archive"
         return 0
     fi
-    if [ "$FORCE" -eq 1 ]; then
-        run openclaw plugins install --force "$archive" 2>/dev/null || run openclaw plugins install "$archive"
-    else
-        run openclaw plugins install "$archive"
-    fi
+    run openclaw "${install_args[@]}" "$archive"
 }
 
 enable_openclaw_plugin() {
@@ -931,12 +953,13 @@ validate_welcomer_inputs
 need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then
+    need_cmd node
+    require_node_version
     need_cmd openclaw
     require_openclaw_version
     need_cmd python3
-    if [ "$CONFIGURE_OPENCLAW" -eq 1 ]; then need_cmd node; fi
 else
-    log "would require openclaw on PATH"
+    log "would require OpenClaw $MIN_OPENCLAW_VERSION or newer and Node 24.16+ (24.x) or 26.1+ on PATH"
 fi
 
 platform="$(detect_platform)"

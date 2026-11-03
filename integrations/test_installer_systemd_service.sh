@@ -125,14 +125,28 @@ EOF
 
 cat >"$mock_bin/$host_command" <<'EOF'
 #!/usr/bin/env bash
+if [ "$(basename "$0")" = openclaw ] && [ "${1:-}" = plugins ] && [ "${2:-}" = install ]; then
+    # Current OpenClaw requires explicit confirmation for our verified local
+    # release archive. --yes on the Marmot installer must carry that consent.
+    [ "${3:-}" = --force ] && [ "${4:-}" = --accept-capabilities ] || exit 33
+fi
 if [ "${1:-}" = "--version" ]; then
     case "$(basename "$0")" in
         hermes) printf '%s\n' "Hermes 0.19.0" ;;
-        openclaw) printf '%s\n' "OpenClaw 2026.7.1" ;;
+        openclaw) printf '%s\n' "OpenClaw 2026.10.10" ;;
     esac
 fi
 exit 0
 EOF
+# The service fixture does not configure the gateway. Supply a supported Node
+# version so its service assertions do not depend on the runner's Node default.
+if [ "$flavor" = openclaw ]; then
+    cat >"$mock_bin/node" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || exit 2
+printf '%s\n' v24.16.0
+EOF
+fi
 chmod +x "$mock_bin"/*
 
 run_case() {

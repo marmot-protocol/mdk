@@ -187,8 +187,8 @@ if ! command -v openclaw >/dev/null 2>&1; then
     echo "error: openclaw launcher not found on PATH. Install OpenClaw before running the gateway helper." >&2
     exit 1
 fi
-openclaw plugins install --force "$OPENCLAW_PLUGIN_SRC" 2>/dev/null || openclaw plugins install "$OPENCLAW_PLUGIN_SRC"
-openclaw plugins enable marmot || true
+openclaw plugins install --force --accept-capabilities "$OPENCLAW_PLUGIN_SRC"
+openclaw plugins enable marmot
 exec openclaw gateway run "$@"
 SCRIPT
 

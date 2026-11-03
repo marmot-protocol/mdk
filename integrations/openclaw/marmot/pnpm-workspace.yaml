@@ -1,8 +1,9 @@
 packages:
   - '.'
-allowBuilds:
-  '@google/genai': true
-  esbuild: true
-  openclaw: true
-  protobufjs: true
-  tree-sitter-bash: true
+# pnpm 10.13 uses onlyBuiltDependencies; allowBuilds requires pnpm 10.26+.
+onlyBuiltDependencies:
+  - '@google/genai'
+  - esbuild
+  - openclaw
+  - protobufjs
+  - tree-sitter-bash

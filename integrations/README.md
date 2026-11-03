@@ -133,7 +133,7 @@ install_verified "$base_url/install-hermes-marmot.sh" \
 
 ### OpenClaw
 
-OpenClaw 2026.7.1 or newer and Node 22.19 or newer must already be installed.
+OpenClaw 2026.10.10 or newer and Node 24.16+ (24.x) or 26.1+ must already be installed.
 
 Run this example in the same shell where `install_verified` above was defined.
 

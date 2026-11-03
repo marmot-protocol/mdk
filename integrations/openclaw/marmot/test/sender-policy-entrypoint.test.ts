@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import * as openClawPluginLoader from "../node_modules/openclaw/dist/plugins/loader.js";
+import * as openClawPluginLoader from "./openclaw-loader.js";
 import { resolveMarmotAccount, type ResolvedMarmotAccount } from "../src/config.js";
 import type { OpenClawChannelRuntime } from "../src/dispatch.js";
 import { resetMarmotInboundAccountsForTests } from "../src/inbound-runtime.js";
@@ -213,11 +213,7 @@ function isolateOpenClawState(root: string): { restore: () => void } {
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
-  openClawPluginLoader.clearActivatedPluginRuntimeState();
   openClawPluginLoader.clearPluginRegistryLoadCache();
-  (
-    openClawPluginLoader as { clearPluginLoaderCache?: () => void }
-  ).clearPluginLoaderCache?.();
 });
 
 function loadRegisteredMarmotPlugin(cfg: Record<string, unknown>, workspaceDir: string) {

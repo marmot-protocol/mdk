@@ -93,8 +93,8 @@ fi
 # --force overwrites an already-installed copy. OPENCLAW_HOME lives on a
 # persisted volume, so without --force a rebuilt image's updated plugin dist is
 # ignored in favor of the stale copy left in the volume from a prior run.
-openclaw plugins install --force /work/mdk/integrations/openclaw/marmot || true
-openclaw plugins enable marmot || true
+openclaw plugins install --force --accept-capabilities /work/mdk/integrations/openclaw/marmot
+openclaw plugins enable marmot
 
 # Enabling the plugin loads its code but does not start a channel: OpenClaw only
 # starts channels configured under channels.<id>. `openclaw channels add

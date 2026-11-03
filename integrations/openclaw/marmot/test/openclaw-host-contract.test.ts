@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // Deliberate test-only internal import: OpenClaw exposes neither its plugin
 // loader nor generic message-action runner through a supported SDK subpath.
 // Re-verify this stable loader entry whenever the pinned SDK is bumped.
-import * as openClawPluginLoader from "../node_modules/openclaw/dist/plugins/loader.js";
+import * as openClawPluginLoader from "./openclaw-loader.js";
 
 import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
 import { createMarmotChannelPlugin } from "../src/channel.js";
@@ -59,7 +59,7 @@ type RunMessageAction = (input: {
 async function loadInstalledRunMessageAction(): Promise<RunMessageAction> {
   const distDir = join(import.meta.dirname, "..", "node_modules", "openclaw", "dist");
   const runnerFile = (await readdir(distDir)).find(
-    (entry) => entry.startsWith("message-action-runner-") && entry.endsWith(".js"),
+    (entry) => entry.startsWith("message-action-runner-") && /\.m?js$/.test(entry),
   );
   if (!runnerFile) {
     throw new Error("installed OpenClaw has no message-action runner chunk");
@@ -227,19 +227,12 @@ async function runPublicSend(
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
-  openClawPluginLoader.clearActivatedPluginRuntimeState();
   openClawPluginLoader.clearPluginRegistryLoadCache();
-  const clearPluginLoaderCache = (
-    openClawPluginLoader as typeof openClawPluginLoader & {
-      clearPluginLoaderCache?: () => void;
-    }
-  ).clearPluginLoaderCache;
-  clearPluginLoaderCache?.();
 });
 
 /**
  * Exercise Marmot's production adapters against the installed OpenClaw host.
- * This file is also run by openclaw-host-compat.sh against the supported beta.
+ * This file is also run by openclaw-host-compat.sh against the pinned beta host.
  */
 describe("installed OpenClaw inbound host contract", () => {
   it("sends an authorized workspace image through the public message action", async () => {
@@ -492,8 +485,7 @@ describe("installed OpenClaw inbound host contract", () => {
     }
   });
 
-  const betaContract = process.env.OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR === "1" ? it : it.skip;
-  betaContract("dispatches a debounced batch through beta's lifecycle contract", async () => {
+  it("dispatches a debounced batch through the host lifecycle contract", async () => {
     const events: AgentControlEvent[] = ["first", "second"].map((text, index) => ({
       type: "inbound_message",
       account_id_hex: HEX32("aa"),
@@ -547,7 +539,7 @@ describe("installed OpenClaw inbound host contract", () => {
     }
   });
 
-  betaContract("releases a debounce key when the group queue adopts the batch", async () => {
+  it("releases a debounce key when the group queue adopts the batch", async () => {
     const events: AgentControlEvent[] = Array.from({ length: 33 }, (_, index) => ({
       type: "inbound_message",
       account_id_hex: HEX32("aa"),

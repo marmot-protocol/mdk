@@ -14,7 +14,7 @@ import {
   runChannelInboundEvent,
   type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
+import { deliverInboundReplyWithMessageSendContext, deriveDurableFinalDeliveryRequirements } from "openclaw/plugin-sdk/channel-outbound";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 
@@ -620,6 +620,17 @@ export function createMarmotInboundDispatcher(
                     ctxPayload,
                     payload,
                     info,
+                    // The adapter requires the identity persisted by the host's
+                    // durable queue. Without this capability request the SDK
+                    // chooses best-effort delivery and supplies no queue id.
+                    requiredCapabilities: {
+                      ...deriveDurableFinalDeliveryRequirements({
+                        payload,
+                        replyToId: message.messageIdHex,
+                        threadId: ctxPayload.MessageThreadId,
+                      }),
+                      reconcileUnknownSend: true,
+                    },
                     // A normal response threads to the inbound message that
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.

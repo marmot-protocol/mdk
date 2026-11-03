@@ -497,6 +497,11 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
+      - name: Install OpenClaw Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.1"
+
       - name: Test supported OpenClaw beta host
         shell: bash
         run: |
@@ -518,6 +523,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
+
+      - name: Install OpenClaw Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.22.1"
 
       - name: Package OpenClaw Marmot plugin tarball
         shell: bash
