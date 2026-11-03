@@ -1035,3 +1035,95 @@ async fn runner_owned_history_releases_post_join_maintenance() {
         "a fetched copy in grace does not re-arm history on reopen"
     );
 }
+
+/// Retained-window coverage is valid evidence, but is not the whole range
+/// requested by an older Welcome. A raw boundary may start grace without
+/// turning that partial range into a fetched-history claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_post_join_retained_coverage_cannot_complete_an_older_welcome() {
+    use cgka_traits::Timestamp;
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use storage_sqlite::{
+        RecoveryCoverageProof, RecoveryCoverageSlice, TransportReconciliationRoute,
+    };
+    let fixture = crypto_fixture().await;
+    let app = fixture.receiver.app.clone();
+    let storage = app.account_storage("receiver").unwrap();
+    let now = unix_now_seconds();
+    let retained = now.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    let mut record = storage.get_group(&fixture.group).unwrap();
+    record.local_copy_welcome_created_at = Some(Timestamp(retained.saturating_sub(600)));
+    storage.put_group(&record).unwrap();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    receiver.sync().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let route = receiver
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| {
+            route.group_id.as_deref() == Some(fixture.group.as_slice())
+                && route.goal_until.is_none()
+        })
+        .unwrap();
+    assert!(matches!(
+        route.route,
+        TransportReconciliationRoute::Group(_)
+    ));
+    // Input to the completion owner: a real ledger certificate for exactly
+    // the retained range, with no certificate for the older requested prefix.
+    storage
+        .app_storage()
+        .record_recovery_coverage(
+            &[RecoveryCoverageSlice {
+                route: &route.route,
+                relay: &route.required[0],
+                since_seconds: retained,
+                until_seconds: unix_now_seconds(),
+                proof: RecoveryCoverageProof::SweepSlice,
+            }],
+            unix_now_seconds(),
+        )
+        .unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .is_none(),
+        "a retained-only proof must not certify the older Welcome's whole history"
+    );
+    let mut maintenance = storage.group_maintenance(&fixture.group).unwrap().unwrap();
+    maintenance.post_join_history.as_mut().unwrap().deadline_at =
+        Some(Timestamp(unix_now_seconds().saturating_sub(1)));
+    storage.put_group_maintenance(&maintenance).unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired),
+        "a raw partial boundary does not disable the unanswered whole-range deadline"
+    );
+}

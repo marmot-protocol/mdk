@@ -18,9 +18,12 @@ use crate::client::AppClient;
 pub(crate) struct Collection {
     copy: MessageId,
     pub(super) route: TransportReconciliationRoute,
+    // Original requested range, never truncated for a completion claim.
     since: u64,
     required: Vec<String>,
     boundary: bool,
+    // A complete-range certificate, distinct from the first raw boundary.
+    acquired: bool,
     pub(super) until: u64,
     pub(super) active: bool,
     pub(super) collecting: bool,
@@ -101,12 +104,12 @@ impl AppClient {
                 }
                 let since = self
                     .post_join_maintenance_since(&group_id)
-                    .map_or(0, |stamp| stamp.0)
-                    .max(now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS));
+                    .map_or(0, |stamp| stamp.0);
+                let floor = since.max(now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS));
                 // Earlier-copy coverage is not a query for this copy. The mark
                 // also prevents an already-running old quantum from re-crediting
                 // it. This creates debt without resetting any retry budget.
-                app.uncover_recovery_coverage(std::slice::from_ref(&route.route), since)?;
+                app.uncover_recovery_coverage(std::slice::from_ref(&route.route), floor)?;
                 self.runner_post_join.insert(
                     group_id,
                     Collection {
@@ -115,6 +118,7 @@ impl AppClient {
                         since,
                         required: route.required.clone(),
                         boundary: false,
+                        acquired: false,
                         until: now,
                         active: false,
                         collecting: true,
@@ -184,16 +188,25 @@ impl AppClient {
                                     && endpoint.live_count().is_some()
                             })
                     });
-                collection.boundary |= boundary;
-                let covered = collection.boundary
-                    && !staged.contains(&collection.route)
-                    && sources.iter().all(|source| source.placed())
+                // This owner cannot certify an older prefix merely because
+                // an earlier copy left certificates below the retained window.
+                let proven = collection.since
+                    >= now.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS)
                     && app.recovery_coverage_covers(
                         &collection.route,
                         &route.required,
                         collection.since,
                         collection.until,
                     )?;
+                // A raw EOSE may describe only a clamped page. It starts
+                // maintenance grace, but only the whole requested range ends
+                // the query deadline. Once acquired, processing may finish
+                // after that deadline; later loss still revokes Fetched.
+                collection.acquired |= proven;
+                collection.boundary |= boundary || proven;
+                let covered = proven
+                    && !staged.contains(&collection.route)
+                    && sources.iter().all(|source| source.placed());
                 let updates = if collection.boundary {
                     self.runtime.post_join_eose_updates(group_id)?
                 } else {
@@ -213,7 +226,7 @@ impl AppClient {
                         self.runtime
                             .finish_post_join_history_fetch(group_id, &collection.copy)?;
                         collection.collecting = false;
-                    } else if !collection.boundary
+                    } else if !collection.acquired
                         && self
                             .runtime
                             .expire_post_join_history_fetch(group_id, &collection.copy)?
