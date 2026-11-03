@@ -1,7 +1,8 @@
-mod support;
+use crate::support;
 
 use std::path::Path;
 
+use crate::support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
@@ -9,7 +10,6 @@ use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
 use marmot_session::{IngestEffects, PublishWork};
 use serde::Serialize;
-use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
 #[tokio::test]
@@ -578,6 +578,12 @@ impl ChaosRunState<'_> {
                     "step {step_index} duplicate valid delivery emitted payloads {payloads:?}"
                 ));
             }
+            if !ingest.effects.events.is_empty() {
+                self.failures.push(format!(
+                    "step {step_index} duplicate valid delivery emitted {} events",
+                    ingest.effects.events.len()
+                ));
+            }
             self.observations.push(DeliveryObservation {
                 step_index,
                 step,
@@ -654,6 +660,12 @@ impl ChaosRunState<'_> {
         if !payloads.is_empty() {
             self.failures.push(format!(
                 "step {step_index} replay for message {message_index} emitted payloads {payloads:?}"
+            ));
+        }
+        if !ingest.effects.events.is_empty() {
+            self.failures.push(format!(
+                "step {step_index} replay for message {message_index} emitted {} events",
+                ingest.effects.events.len()
             ));
         }
         self.observations.push(DeliveryObservation {

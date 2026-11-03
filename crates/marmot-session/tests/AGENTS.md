@@ -18,9 +18,12 @@ sockets replaced by an in-memory `NostrRelayClient`. Use it for production-shape
 publish ack/fail lifecycle, inbox and group subscription routing, NIP-59 Welcome delivery, kind `445` group delivery,
 and duplicate, dropped, or reordered relay deliveries.
 
-`nostr_stack_chaos.rs` is the seeded chaos runner. Keep reports reproducible by seed and write artifacts under
-`target/`, never into the repo. Lifecycle chaos stays at the adapter/session boundary: assert routed `IngestOutcome`s
-and emitted `GroupEvent`s, not internal engine state.
+`nostr_stack/chaos.rs` is the seeded chaos module in the `nostr_stack` integration binary and imports its `support`
+module. Keep reports reproducible by seed and write artifacts under `target/`, never into the repo. Lifecycle chaos
+stays at the adapter/session boundary: assert routed `IngestOutcome`s and emitted `GroupEvent`s, not internal engine
+state. Preserve all six delivery scripts and their default convergence settings when moving them. The separate
+`duplicate_group_relay_delivery_is_idempotent_at_session_boundary` case uses an explicit zero quiescence window and
+keeps that distinct contract.
 
 Never connect to real relays from these tests.
 

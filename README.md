@@ -143,7 +143,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
-| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages |
+| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages; [tests](crates/marmot-session/README.md#tests) |
 | | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |

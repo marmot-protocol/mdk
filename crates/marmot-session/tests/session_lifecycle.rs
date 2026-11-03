@@ -15,14 +15,21 @@ use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::KeyPackageBundleStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use marmot_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_traits::{
+    TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
+    TransportWireMetadata,
+};
+use marmot_forensics::{
+    AuditEvent, AuditEventKind, AuditTransportContext, AuditTransportWire, JsonlRecorder,
+};
+use marmot_session::{AccountDeviceSession, HydrationProgress, PublishWork, SessionConfig};
 use nostr::prelude::FinalizeEvent;
 use std::io::Write;
 use std::sync::Arc;
@@ -196,9 +203,14 @@ async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
     );
 
     storage.closer().close().unwrap();
+    let error = session.fresh_key_package().await.unwrap_err();
     assert!(
-        session.fresh_key_package().await.is_err(),
-        "the session must stop with the host's connection, not reopen storage"
+        matches!(
+            &error,
+            EngineError::Backend(detail)
+                if detail == "key_package build: StorageError"
+        ),
+        "fresh generation must report the host-closed OpenMLS store, got {error:?}"
     );
     assert!(storage.is_closed());
 }
@@ -489,6 +501,8 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
 
 #[tokio::test]
 async fn session_ingest_surfaces_join_and_app_message_events() {
+    use sha2::{Digest, Sha256};
+
     let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session app event key").unwrap();
     let mut alice =
@@ -517,6 +531,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
 
     let welcome_id = welcome.id.clone();
     let joined = bob.ingest(welcome).await.unwrap();
+    assert!(!joined.left_object_unpersisted);
     assert_eq!(
         joined.effects.events,
         vec![GroupEvent::GroupJoined {
@@ -539,8 +554,13 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
+    // MockPeeler carries these exact MLS bytes. The receive id binds those
+    // bytes, independently of the inner application event or outer wrapper id.
+    let expected_id = Sha256::digest(&app_msg.payload).to_vec();
     let received = bob.ingest(app_msg).await.unwrap();
+    assert!(!received.left_object_unpersisted);
     let message_id = only_received_message_id(&received.effects.events);
+    assert_eq!(message_id.as_slice(), expected_id.as_slice());
     assert_eq!(
         received.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -571,6 +591,28 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             encrypted_media_secret: None,
         }]
     );
+
+    let unknown = TransportMessage {
+        id: MessageId::new(vec![0x44; 32]),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("session-test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xff; 32],
+        },
+    };
+    for _ in 0..2 {
+        let ignored = bob.ingest(unknown.clone()).await.unwrap();
+        assert_eq!(
+            ignored.outcome,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup
+            }
+        );
+        assert!(ignored.left_object_unpersisted);
+        assert!(ignored.effects.events.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -694,7 +736,7 @@ async fn session_ingest_schedules_auto_publish_work() {
         other => panic!("expected proposal publish work, got {other:?}"),
     };
 
-    let ingested = alice.ingest(proposal).await.unwrap();
+    let ingested = alice.ingest(proposal.clone()).await.unwrap();
     assert_eq!(
         ingested.outcome,
         cgka_traits::ingest::IngestOutcome::Processed
@@ -712,7 +754,29 @@ async fn session_ingest_schedules_auto_publish_work() {
         "auto publish work should wait for the convergence timer, got {:?}",
         ingested.effects.publish
     );
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    assert_eq!(
+        ingested.valid_proposal_groups,
+        vec![created.group_id.clone()]
+    );
+    let replay = alice.ingest(proposal).await.unwrap();
+    assert_eq!(
+        replay.outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    );
+    assert!(replay.valid_proposal_groups.is_empty());
+    let delay = alice
+        .scheduled_self_remove_auto_commit_delay_ms(&created.group_id)
+        .unwrap()
+        .expect("accepted SelfRemove must keep its convergence wake armed");
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&created.group_id)
+            .unwrap(),
+        Some(0)
+    );
     let advanced = alice.advance_convergence(&created.group_id).await.unwrap();
     assert!(
         advanced
@@ -764,10 +828,13 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
         .await
         .unwrap();
     assert!(
-        leave
-            .publish
-            .iter()
-            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        leave.publish.iter().any(|work| matches!(
+            work,
+            PublishWork::Proposal {
+                queued_intent: None,
+                ..
+            }
+        )),
         "initial leave should publish a SelfRemove proposal"
     );
 
@@ -798,10 +865,13 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
     .expect("convergence policy accepted");
     let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
     assert!(
-        advanced
-            .publish
-            .iter()
-            .any(|work| matches!(work, PublishWork::Proposal { .. })),
+        advanced.publish.iter().any(|work| matches!(
+            work,
+            PublishWork::Proposal {
+                queued_intent: None,
+                ..
+            }
+        )),
         "expected auto SelfRemove re-proposal publish work, got {:?}",
         advanced.publish
     );
@@ -1251,7 +1321,16 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
     let foreign = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let original = foreign.get_group(&group).unwrap();
     let before = session
+        .group_authority_view()
         .with_group_authority_snapshot(&group, |storage, authority| -> Result<_, SessionError> {
+            // Probe before a foreign commit too: a stale read snapshot must
+            // not make an unrelated lock error satisfy the read-only check.
+            let readonly = storage.put_group(&original).unwrap_err();
+            assert!(
+                matches!(&readonly, cgka_traits::StorageError::Backend(detail)
+                    if detail == "attempt to write a readonly database"),
+                "host write must fail for read-only capture, got {readonly:?}"
+            );
             // Commit through a second connection after authority pinned the
             // snapshot. Both the callback store and nested engine capture must
             // retain the old record, which would fail with separate snapshots.
@@ -1264,9 +1343,11 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
             assert_eq!(record.members.len(), authority.facts.member_count);
             assert!(authority.facts.is_admin);
             assert!(!record.removed);
+            let readonly = storage.put_group(&changed).unwrap_err();
             assert!(
-                storage.put_group(&changed).is_err(),
-                "host writes must be rejected"
+                matches!(&readonly, cgka_traits::StorageError::Backend(detail)
+                    if detail == "attempt to write a readonly database"),
+                "host write must remain read-only after a foreign commit, got {readonly:?}"
             );
             Ok(authority)
         })
@@ -1693,5 +1774,494 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
     assert!(
         mismatched.is_empty(),
         "accessors that did not report the engine's closed-storage failure: {mismatched:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_hydration_obeys_order_and_budget_and_continues_after_quarantine() {
+    use cgka_traits::storage::GroupStorage;
+    use std::collections::HashSet;
+
+    let dir = relaxed_storage_dir().unwrap();
+    let path = dir.path().join("hydration.sqlite");
+    let key = SqlCipherKey::new("bounded session hydration key").unwrap();
+    let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
+    let first = create_confirmed_group(&mut session, "first").await;
+    let preferred = create_confirmed_group(&mut session, "preferred").await;
+    let fill = create_confirmed_group(&mut session, "fill").await;
+    drop(session);
+
+    // The same failed-hydration premise as the account-record liveness test:
+    // a stored Marmot row whose OpenMLS group is absent.
+    let corrupt = GroupId::new(b"hydration-without-openmls-state".to_vec());
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut record = storage.get_group(&first).unwrap();
+        record.id = corrupt.clone();
+        storage.put_group(&record).unwrap();
+    }
+    let mut session =
+        AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();
+    let fallback_first = session.unhydrated_group_ids().into_iter().next().unwrap();
+    let (preferred, fill) = if preferred == fallback_first {
+        (fill, preferred)
+    } else {
+        (preferred, fill)
+    };
+    assert_ne!(preferred, fallback_first);
+    let seeded = HashSet::from([
+        first.clone(),
+        preferred.clone(),
+        fill.clone(),
+        corrupt.clone(),
+    ]);
+    assert_eq!(
+        session
+            .unhydrated_group_ids()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        seeded
+    );
+    assert_eq!(
+        session
+            .hydrate_next_groups(std::slice::from_ref(&preferred), 0)
+            .unwrap(),
+        HydrationProgress {
+            hydrated: 0,
+            quarantined: 0,
+            remaining: 4
+        }
+    );
+    assert_eq!(
+        session
+            .unhydrated_group_ids()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        seeded
+    );
+
+    let stale = GroupId::new(b"not-a-stored-group".to_vec());
+    assert_eq!(
+        session
+            .hydrate_next_groups(&[stale, preferred.clone()], 1)
+            .unwrap(),
+        HydrationProgress {
+            hydrated: 1,
+            quarantined: 0,
+            remaining: 3
+        }
+    );
+    assert_eq!(
+        session.group_authority(&preferred).unwrap().facts.epoch,
+        EpochId(0)
+    );
+    assert!(matches!(
+        session.group_authority(&first),
+        Err(marmot_session::SessionError::Engine(EngineError::GroupNotHydrated(id)))
+            if id == first
+    ));
+    assert_eq!(
+        session
+            .hydrate_next_groups(&[corrupt.clone(), first.clone()], 2)
+            .unwrap(),
+        HydrationProgress {
+            hydrated: 1,
+            quarantined: 1,
+            remaining: 1
+        }
+    );
+    assert_eq!(session.unhydrated_group_ids(), vec![fill.clone()]);
+    assert_eq!(session.quarantined_group_count(), 1);
+    assert_eq!(
+        session
+            .quarantined_groups()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec![corrupt]
+    );
+    assert_eq!(
+        session.hydrate_next_groups(&[], 4).unwrap(),
+        HydrationProgress {
+            hydrated: 1,
+            quarantined: 0,
+            remaining: 0
+        }
+    );
+    assert!(session.unhydrated_group_ids().is_empty());
+    assert_eq!(session.quarantined_group_count(), 1);
+    assert_eq!(
+        session
+            .live_group_ids()
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        HashSet::from([first, preferred, fill])
+    );
+}
+
+#[tokio::test]
+async fn configured_recorder_preserves_delivery_source_and_open_health() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("session delivery audit key").unwrap();
+    let audit_path = dir.path().join("session-audit.jsonl");
+    let recorder = JsonlRecorder::open(&audit_path, "11".repeat(32)).unwrap();
+    let mut alice =
+        AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
+            .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(dir.path().join("bob.sqlite"), &key, b"bob").recorder(Box::new(recorder)),
+    )
+    .unwrap();
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "delivery audit".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected pending creation, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&alice, b"audited message"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let app = match &sent.publish[0] {
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
+        other => panic!("expected application work, got {other:?}"),
+    };
+    let unknown = TransportMessage {
+        id: MessageId::new(vec![0x55; 32]),
+        payload: vec![1, 2, 3],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("custom".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xff; 32],
+        },
+    };
+    let without_wire = TransportDeliverySource {
+        transport: TransportSource("custom".into()),
+        plane: TransportDeliveryPlane::Group,
+        endpoint: None,
+        subscription_id: None,
+        wire: None,
+    };
+    let cases = [
+        (
+            welcome,
+            TransportDeliverySource {
+                transport: TransportSource("nostr".into()),
+                plane: TransportDeliveryPlane::AccountInbox,
+                endpoint: Some(TransportEndpoint("wss://inbox.example".into())),
+                subscription_id: Some("welcome".into()),
+                wire: Some(TransportWireMetadata {
+                    wire_id: Some("aa".repeat(32)),
+                    wire_kind: Some(1059),
+                    wire_pubkey_hex: Some("bb".repeat(32)),
+                    gift_wrap_event_id: Some("aa".repeat(32)),
+                    ..Default::default()
+                }),
+            },
+            IngestOutcome::Processed,
+            false,
+        ),
+        (
+            app.clone(),
+            TransportDeliverySource {
+                transport: TransportSource("nostr".into()),
+                plane: TransportDeliveryPlane::Group,
+                endpoint: Some(TransportEndpoint("wss://group.example".into())),
+                subscription_id: Some("group".into()),
+                wire: Some(TransportWireMetadata {
+                    wire_id: Some("cc".repeat(32)),
+                    wire_kind: Some(445),
+                    wire_pubkey_hex: Some("dd".repeat(32)),
+                    transport_group_id: Some("ee".repeat(32)),
+                    ..Default::default()
+                }),
+            },
+            IngestOutcome::Processed,
+            false,
+        ),
+        (
+            app,
+            TransportDeliverySource {
+                transport: TransportSource("custom".into()),
+                plane: TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: Some(TransportWireMetadata {
+                    wire_id: Some("custom-wire-id".into()),
+                    wire_kind: Some(7),
+                    wire_pubkey_hex: Some("custom-signer".into()),
+                    transport_group_id: Some("custom-route".into()),
+                    ..Default::default()
+                }),
+            },
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            },
+            false,
+        ),
+        (
+            unknown.clone(),
+            without_wire.clone(),
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            },
+            true,
+        ),
+        (
+            unknown,
+            without_wire,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::UnknownGroup,
+            },
+            true,
+        ),
+    ];
+    for (message, source, outcome, unpersisted) in cases {
+        let ingested = bob
+            .ingest_delivery(&TransportDelivery {
+                account_id: bob.self_id(),
+                group_id_hint: None,
+                message,
+                received_at: Timestamp(10),
+                source,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ingested.outcome, outcome);
+        assert_eq!(ingested.left_object_unpersisted, unpersisted);
+    }
+    drop(bob);
+    let records = std::fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+        .collect::<Vec<_>>();
+    let first = records
+        .first()
+        .expect("configured recorder must receive session and engine rows");
+    assert!(first.recorder_session_id.is_some());
+    assert!(
+        records
+            .iter()
+            .all(|record| record.engine_id == first.engine_id
+                && record.recorder_session_id == first.recorder_session_id)
+    );
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                record.kind,
+                AuditEventKind::RecorderHealth {
+                    serialization_failures: 0,
+                    write_failures: 0,
+                    flush_failures: 0
+                }
+            ))
+            .count(),
+        1
+    );
+
+    let no_wire = AuditTransportContext {
+        transport_source: "custom".into(),
+        delivery_plane: Some("group".into()),
+        ..Default::default()
+    };
+    let expected = vec![
+        AuditTransportContext {
+            transport_source: "nostr".into(),
+            delivery_plane: Some("account_inbox".into()),
+            relay_url: Some("wss://inbox.example".into()),
+            subscription_id: Some("welcome".into()),
+            wire: Some(AuditTransportWire {
+                transport: Some("nostr".into()),
+                delivery_plane: Some("account_inbox".into()),
+                relay_url: Some("wss://inbox.example".into()),
+                subscription_id: Some("welcome".into()),
+                wire_id: Some("aa".repeat(32)),
+                wire_kind: Some("1059".into()),
+                wire_pubkey_hex: Some("bb".repeat(32)),
+                nostr_event_id: Some("aa".repeat(32)),
+                nostr_kind: Some(1059),
+                nostr_pubkey_hex: Some("bb".repeat(32)),
+                gift_wrap_event_id: Some("aa".repeat(32)),
+                ..Default::default()
+            }),
+        },
+        AuditTransportContext {
+            transport_source: "nostr".into(),
+            delivery_plane: Some("group".into()),
+            relay_url: Some("wss://group.example".into()),
+            subscription_id: Some("group".into()),
+            wire: Some(AuditTransportWire {
+                transport: Some("nostr".into()),
+                delivery_plane: Some("group".into()),
+                relay_url: Some("wss://group.example".into()),
+                subscription_id: Some("group".into()),
+                wire_id: Some("cc".repeat(32)),
+                wire_kind: Some("445".into()),
+                wire_pubkey_hex: Some("dd".repeat(32)),
+                transport_group_id: Some("ee".repeat(32)),
+                nostr_event_id: Some("cc".repeat(32)),
+                nostr_kind: Some(445),
+                nostr_pubkey_hex: Some("dd".repeat(32)),
+                ..Default::default()
+            }),
+        },
+        AuditTransportContext {
+            transport_source: "custom".into(),
+            delivery_plane: Some("group".into()),
+            wire: Some(AuditTransportWire {
+                transport: Some("custom".into()),
+                delivery_plane: Some("group".into()),
+                wire_id: Some("custom-wire-id".into()),
+                wire_kind: Some("7".into()),
+                wire_pubkey_hex: Some("custom-signer".into()),
+                transport_group_id: Some("custom-route".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        no_wire.clone(),
+        no_wire,
+    ];
+    let entries = records
+        .iter()
+        .filter(|record| matches!(record.kind, AuditEventKind::IngestEntry { .. }))
+        .map(|record| record.context.as_ref().unwrap().transport.clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, expected);
+    let wires = records
+        .iter()
+        .filter_map(|record| match &record.kind {
+            AuditEventKind::TransportReceived { transport, .. } => Some(transport.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wires,
+        expected
+            .into_iter()
+            .filter_map(|context| context.wire)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn regenerated_queued_proposal_keeps_its_original_intent() {
+    let dir = relaxed_storage_dir().unwrap();
+    let key = SqlCipherKey::new("session queued proposal key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(dir.path().join("alice.sqlite"), &key, b"alice")
+            .feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(dir.path().join("bob.sqlite"), &key, b"bob").feature_registry(selfremove_registry()),
+    )
+    .unwrap();
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "queued proposal".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected pending creation, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: created.group_id.clone(),
+            name: Some("renamed before leave".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match &rename.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected rename commit, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 3_600_000,
+        ..CanonicalizationPolicy::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        bob.ingest(route(commit, &created.group_id))
+            .await
+            .unwrap()
+            .outcome,
+        IngestOutcome::Buffered { .. }
+    ));
+    let queued = bob
+        .send(SendIntent::Leave {
+            group_id: created.group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let [original] = queued.queued.as_slice() else {
+        panic!("leave must queue behind retained convergence input: {queued:?}");
+    };
+    assert!(queued.publish.is_empty());
+    bob.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    })
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let advanced = bob.advance_convergence(&created.group_id).await.unwrap();
+        if !advanced.publish.is_empty() {
+            assert!(matches!(advanced.publish.as_slice(),
+                [PublishWork::Proposal { queued_intent: Some(regenerated), .. }]
+                    if regenerated == original));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queued leave did not regenerate"
+        );
+        assert!(advanced.pending_convergence.contains(&created.group_id));
+        tokio::task::yield_now().await;
+    }
+    bob.confirm_regenerated_queued_intent(original).unwrap();
+    assert!(!bob.has_queued_outbound_intents(&created.group_id).unwrap());
+    assert!(
+        bob.advance_convergence(&created.group_id)
+            .await
+            .unwrap()
+            .publish
+            .is_empty()
     );
 }
