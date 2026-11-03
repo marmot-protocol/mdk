@@ -2,7 +2,8 @@
 //!
 //! Reopening a retained goal lets the ordinary runner resume from its ledger
 //! cursor. A visit advances this separate durable backoff only after each source
-//! is covered or has failed off the admission frontier. Failure never certifies
+//! is covered or has failed off the admission frontier, at least one required
+//! source completed its sweep, and the group's releasable staging drained. Failure never certifies
 //! coverage; partial sweep progress cannot forgive the budget. Healthy periodic
 //! re-checks remain NIP-77-only.
 
@@ -69,28 +70,34 @@ pub(super) fn advance(
 
         if let Some(state) = state.filter(|state| state.in_progress) {
             let mut complete = true;
+            let mut answered = false;
             for route in &routes {
                 let since = app
                     .recovery_coverage_goal(&route.route)?
                     .unwrap_or(floor)
                     .max(floor);
                 for relay in &route.required {
-                    if !app.recovery_coverage_covers(
+                    let covered = app.recovery_coverage_covers(
                         &route.route,
                         std::slice::from_ref(relay),
                         since,
                         turn.owed_until(route, relay),
-                    )? && !admission.source_left_frontier(&route.route, relay)?
-                    {
+                    )?;
+                    answered |= covered;
+                    if !covered && !admission.source_left_frontier(&route.route, relay)? {
                         complete = false;
                     }
                 }
+                if admission.ready_for(route)? {
+                    complete = false;
+                }
             }
             // The host cleared genuinely resolved epochs before this turn.
-            // Remaining newer staging must not prevent a visit for an older
-            // missing commit. Normal admission holds and staging caps still
-            // govern every selected quantum.
-            if !complete {
+            // Only this group's releasable history postpones completion;
+            // unrelated staging cannot starve its next visit. Failed sources
+            // do not obstruct a healthy sweep, but an outage with no completed
+            // source leaves this visit in progress across backoff and restart.
+            if !complete || !answered {
                 continue;
             }
             let exhausted = state.visits >= u64::from(policy.unit.break_after_no_progress);

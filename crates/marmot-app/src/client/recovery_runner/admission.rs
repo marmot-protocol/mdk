@@ -532,6 +532,20 @@ impl<'t> Admission<'t> {
             }))
     }
 
+    /// Whether this group's already fetched prefix can still be admitted.
+    /// A return visit must hand off that prefix before spending another visit.
+    /// This excludes frontier-held history and leaves unrelated groups alone.
+    pub(super) fn ready_for(&mut self, route: &RunnerRoute) -> StorageResult<bool> {
+        let Some(key) = self.route_groups.get(&route.route).cloned() else {
+            return Ok(false);
+        };
+        let group = self.group(&key)?;
+        let before = group.frontier().unwrap_or(NO_FRONTIER);
+        let routes = group.routes.clone();
+        let read = self.turn.app.staged_recovery_events(&routes, before, 1)?;
+        Ok(!read.events.is_empty() || !read.undecodable.is_empty())
+    }
+
     /// Whether the relay's last answer was that it could not be reached, or
     /// it is cooling down: it leaves every frontier.
     fn relay_left(&mut self, relay: &'t str) -> StorageResult<bool> {

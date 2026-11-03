@@ -2,6 +2,137 @@
 
 use super::*;
 
+// Paused time tests local-drain pacing without waiting on wall time.
+#[tokio::test(start_paused = true)]
+async fn epoch_gap_visit_waits_for_its_releasable_history() {
+    let account = account();
+    account
+        .fault_connection()
+        .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+        .unwrap();
+    let clock = Clock::new();
+    let now = clock.now();
+    let route = group(1);
+    account.goal(&route, now - 100);
+    account
+        .app
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: "0a".into(),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+    let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+    account
+        .app
+        .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
+        .unwrap();
+    let events = every([1; 32], now - 16, now, 1);
+    account.swept(&route, RELAY, &events, now - 100, now - 1);
+    let mut owned = required(&route, &[RELAY]);
+    owned.group_id = Some(vec![0x0a]);
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .with_events(events.clone())
+        .build();
+    let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+    host.tails.stand(&route, RELAY, now);
+    host.ingest_seconds.store(5, Ordering::SeqCst);
+    let (mut owner, _) = runner(&host, test_policy());
+    owner.step().await;
+    assert!(
+        account
+            .app
+            .recovery_epoch_gap_retry(ticket)
+            .unwrap()
+            .unwrap()
+            .in_progress,
+        "a visit must not finish while its own fetched history is ready for admission"
+    );
+    for _ in 0..events.len() {
+        if account.admitted_events() == events.len() as u64 {
+            break;
+        }
+        owner.step().await;
+    }
+    assert_eq!(account.admitted_events(), events.len() as u64);
+    let state = account
+        .app
+        .recovery_epoch_gap_retry(ticket)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.visits, 1,
+        "local admission must not spend return visits"
+    );
+    assert!(!state.in_progress);
+    assert_eq!(
+        state.next_retry_at_seconds,
+        clock.now() + test_policy().unit.backoff_base_seconds
+    );
+}
+
+// Paused time covers an outage longer than the entire ordinary visit schedule.
+#[tokio::test(start_paused = true)]
+async fn epoch_gap_outage_does_not_spend_unanswered_visit_budget() {
+    let account = account();
+    account
+        .fault_connection()
+        .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+        .unwrap();
+    let clock = Clock::new();
+    let now = clock.now();
+    let route = group(1);
+    account.goal(&route, now - 100);
+    account
+        .app
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: "0a".into(),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+    let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+    let mut owned = required(&route, &[RELAY]);
+    owned.group_id = Some(vec![0x0a]);
+    let relay = ModelRelay::new(RELAY, caps(500, false))
+        .unreachable()
+        .build();
+    let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+    host.tails.stand(&route, RELAY, now);
+    let (mut owner, _) = runner(&host, test_policy());
+    assert_eq!(ran(owner.step().await).outcome, Outcome::Unreachable);
+    owner.step().await;
+    let state = account
+        .app
+        .recovery_epoch_gap_retry(ticket)
+        .unwrap()
+        .unwrap();
+    assert!(
+        state.in_progress,
+        "an unanswered visit is still in progress during an outage"
+    );
+    clock.advance(3600);
+    let (mut owner, handle) = runner(&host, test_policy());
+    owner.step().await;
+    let state = account
+        .app
+        .recovery_epoch_gap_retry(ticket)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.visits, 1);
+    assert!(!state.exhausted);
+    relay.set_reachable(true);
+    handle.relay_reconnected(RELAY);
+    // A reconnect need not waive the unit's ordinary unreachable backoff.
+    clock.advance_to(account.unit(&route, RELAY).next_attempt_at_seconds);
+    assert_eq!(ran(owner.step().await).outcome, Outcome::Advanced);
+    assert!(
+        account
+            .app
+            .recovery_coverage_covers(&route, &[RELAY.into()], now - 100, now - 1)
+            .unwrap(),
+        "a reachable source resumes the unfinished visit without explicit repair"
+    );
+}
+
 // Paused time makes a slow relay deterministic without a wall-clock wait.
 #[tokio::test(start_paused = true)]
 async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
@@ -133,14 +264,25 @@ async fn epoch_gap_retry_is_not_starved_by_a_large_staged_admission() {
         .app
         .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
         .unwrap();
-    let events = every([1; 32], now - 16, now, 1);
-    account.swept(&route, RELAY, &events, now - 100, now - 1);
+    // The gap's own ready prefix must drain before another visit. This
+    // separate group's backlog cannot postpone a due visit for the gap.
+    let other_route = group(2);
+    let events = every([2; 32], now - 16, now, 1);
+    account.goal(&other_route, now - 100);
+    account.swept(&route, RELAY, &[], now - 100, now - 1);
+    account.swept(&other_route, RELAY, &events, now - 100, now - 1);
     let mut owned = required(&route, &[RELAY]);
     owned.group_id = Some(vec![0x0a]);
     let relay = ModelRelay::new(RELAY, caps(500, false))
         .with_events(events.clone())
         .build();
-    let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![owned, required(&other_route, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&other_route, RELAY, now);
     host.tails.stand(&route, RELAY, now);
     host.ingest_seconds.store(5, Ordering::SeqCst);
     let policy = test_policy();
