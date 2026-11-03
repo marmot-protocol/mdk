@@ -698,7 +698,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
   With pending epoch-gap work, each runner step admits at most the configured batch before retry selection; an immediate next admission turn
   cannot make a due epoch-gap visit wait for the entire queue. Explicit passes continue these immediate steps
-  within their existing time bound. Send that bounded admission batch in one worker command, stopping its attempted
+  within their existing time bound. After retry selection refreshes the frontiers, continue releasable local admission
+  before waiting for another network quantum; merely nonempty or held staging does not defer needed fetches.
+  Send that bounded admission batch in one worker command, stopping its attempted
   prefix on the first NoTrace/error, pending effects or self-removal; never charge every input a separate worker handoff.
   Admission releases a group's staged events oldest first below its admission frontier, never past an event the
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or

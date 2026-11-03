@@ -2,6 +2,55 @@
 
 use super::*;
 
+// Paused time makes a slow relay deterministic without a wall-clock wait.
+#[tokio::test(start_paused = true)]
+async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
+    for gap_pending in [false, true] {
+        let account = account();
+        account
+            .fault_connection()
+            .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+            .unwrap();
+        let clock = Clock::new();
+        let now = clock.now();
+        let route = group(1);
+        account.goal(&route, now - 100);
+        if gap_pending {
+            account
+                .app
+                .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                    group_id_hex: "0a".into(),
+                    stalled_epoch: 1,
+                }])
+                .unwrap();
+            let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
+            account
+                .app
+                .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
+                .unwrap();
+        }
+        // Every staged event is below the required source's frontier. Only
+        // newer history still needs the network, so none of these deliveries
+        // needs to wait for that request to answer.
+        let events = every([1; 32], now - 100, now - 36, 1);
+        account.swept(&route, RELAY, &events, now - 100, now - 20);
+        let mut owned = required(&route, &[RELAY]);
+        owned.group_id = Some(vec![0x0a]);
+        let relay = ModelRelay::new(RELAY, caps(500, false))
+            .with_latency(Duration::from_secs(2))
+            .build();
+        let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
+        host.tails.stand(&route, RELAY, now);
+        let (mut owner, _) = runner(&host, test_policy());
+        owner.run_pass(Duration::from_secs(1)).await;
+        assert_eq!(
+            account.admitted_events(),
+            events.len() as u64,
+            "ready history must drain before waiting on newer network debt; gap_pending={gap_pending}"
+        );
+    }
+}
+
 // Paused time exercises relay backoff without waiting on wall time.
 #[tokio::test(start_paused = true)]
 async fn epoch_gap_revisits_a_healthy_source_while_another_is_unreachable() {

@@ -637,6 +637,18 @@ fn plan(
     admission.releasable(policy.admission_per_turn, held)
 }
 
+/// A bounded batch yielded to retry selection. After that selection has
+/// refreshed debt, use its current frontiers to decide whether local admission
+/// can continue before waiting for a network quantum. Staging alone is not
+/// enough: held events and events beyond a frontier still need network work.
+pub(super) fn ready(turn: &DebtTurn<'_>, stalled: &Stalled) -> StorageResult<bool> {
+    if stalled.all {
+        return Ok(false);
+    }
+    let batch = Admission::new(turn).releasable(1, &stalled.groups)?;
+    Ok(!batch.events.is_empty() || batch.discarded > 0)
+}
+
 /// How an admission pass ended: when admission next has something to retry,
 /// and what it could not drain. The step's survey takes this stall as it is,
 /// never re-reading it against a later clock, so a hold or wait that ran out
