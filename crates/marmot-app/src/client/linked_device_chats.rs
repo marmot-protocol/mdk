@@ -44,6 +44,7 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::SiblingKeyPackage;
+use cgka_traits::storage::GroupStorage;
 use storage_sqlite::{ChatListQuery, DeviceLinkOutcome, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
@@ -480,16 +481,22 @@ impl AppClient {
         let mut count = 0u32;
         let mut first_error = None;
         let unhydrated = self.runtime.unhydrated_group_ids();
-        // Include retained, unhydrated chats when classifying a known hold.
-        // They justify no burst until ready; healthy chats still contribute.
-        let chats: Vec<_> = self
+        let projected: std::collections::HashSet<_> = self
             .state
             .groups
             .iter()
             .filter_map(|group| hex::decode(&group.group_id_hex).ok().map(GroupId::new))
-            .filter(|chat| *chat != exchange.group_id)
             .collect();
+        // Raw retained IDs include hidden, left, quarantined and unhydrated
+        // copies. live_group_ids omits some of them and bulk record decoding
+        // would turn one unreadable chat into a barrier for every healthy one.
+        let mut chats = self.app.account_storage(&self.state.label)?.list_groups()?;
+        chats.extend(projected.iter().cloned());
+        let mut seen = std::collections::HashSet::new();
         for chat in chats {
+            if chat == exchange.group_id || !seen.insert(chat.clone()) {
+                continue;
+            }
             let result = self.is_device_group(&chat).and_then(|device_group| {
                 if device_group {
                     return Ok(false);
@@ -504,7 +511,11 @@ impl AppClient {
                             affected = true;
                             return Ok(false);
                         }
-                        if !eligible
+                        // Native-only copies provide negative/hold evidence,
+                        // never positive Add demand or a projected chat. Read
+                        // the current admission/decision before terminal flags.
+                        if !projected.contains(&chat)
+                            || !eligible
                             || super::group_is_terminal(&self.runtime, &chat)
                             || super::group_is_quarantined(&self.runtime, &chat)
                         {

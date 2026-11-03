@@ -203,15 +203,26 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
-/// A real Add pass owes three chats; two usable packages arrive afterward.
-/// A later matching decline removes that burst, while another slot's normal
-/// stock request still progresses. Already issued private material stays held.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
+/// Three real external admissions owe a three-chat burst before private stock
+/// arrives. The first may be non-admin so the native Leave owner can finish.
+struct ChatStockDemand {
+    relay: Arc<ScriptedPushRelayClient>,
+    devices: [Device; 3],
+    group: GroupId,
+    pending: Vec<GroupId>,
+    _bob_dir: tempfile::TempDir,
+    bob: AppClient,
+}
+
+async fn chat_stock_demand(first_admin: bool, usable: usize) -> ChatStockDemand {
     use base64::Engine as _;
-    use cgka_traits::storage::GroupStorage as _;
     use marmot_session::{KIND_PRIVATE_KEY_PACKAGE_HAND_OFF, PrivateKeyPackageHandOff};
-    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+    let (mut laptop, mut tablet) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     let mut choices = DeviceLinkChoices::new("Tablet");
     choices.add_to_all_chats = false;
@@ -219,8 +230,8 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
     laptop.client.set_device_tag_key().await.unwrap();
     tablet.client.set_device_tag_key().await.unwrap();
     converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 4).await;
-    let phone_slot = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
-    let laptop_slot = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let phone_slot: [u8; 32] = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
     let stock = phone.app.account_storage("alice").unwrap().app_storage();
     assert_eq!(held_from(&phone, &laptop), 0);
     let bob_dir = tempfile::tempdir().unwrap();
@@ -248,7 +259,11 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             .send(SendIntent::Invite {
                 group_id: chat.clone(),
                 key_packages: vec![key],
-                initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+                initial_admins: if first_admin || index > 0 {
+                    vec![MemberId::new(hex::decode(&alice).unwrap())]
+                } else {
+                    Vec::new()
+                },
             })
             .await
             .unwrap();
@@ -283,7 +298,7 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
     laptop
         .client
         .runtime
-        .issue_private_key_packages(&phone_slot, 2, None, crate::unix_now_seconds())
+        .issue_private_key_packages(&phone_slot, usable, None, crate::unix_now_seconds())
         .unwrap();
     let issued: Vec<_> = laptop
         .client
@@ -293,7 +308,7 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
         .into_iter()
         .filter(|record| record.recipient_slot == phone_slot)
         .collect();
-    assert_eq!(issued.len(), 2);
+    assert_eq!(issued.len(), usable);
     let hand_off = PrivateKeyPackageHandOff {
         from: laptop_slot,
         to: phone_slot,
@@ -325,7 +340,35 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             .unwrap()
     );
     converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 2).await;
-    assert_eq!(held_from(&phone, &laptop), 2);
+    assert_eq!(held_from(&phone, &laptop), usable);
+
+    ChatStockDemand {
+        relay,
+        devices: [phone, laptop, tablet],
+        group,
+        pending,
+        _bob_dir: bob_dir,
+        bob,
+    }
+}
+
+/// A real Add pass owes three chats; one usable package arrives afterward.
+/// A later matching decline removes that burst, while another slot's normal
+/// stock request still progresses. Already issued private material stays held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
+    use cgka_traits::storage::GroupStorage as _;
+    let ChatStockDemand {
+        relay,
+        devices: [mut phone, mut laptop, mut tablet],
+        group,
+        pending,
+        _bob_dir,
+        bob: _bob,
+    } = Box::pin(chat_stock_demand(true, 1)).await;
+    let phone_slot: [u8; 32] = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let stock = phone.app.account_storage("alice").unwrap().app_storage();
 
     for chat in &pending {
         let error = phone.client.decline_group_invite(chat).await.unwrap_err();
@@ -337,6 +380,28 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             "{error}"
         );
     }
+    // Fail the earlier issuer's actual scalar read. A later healthy slot's
+    // baseline still sends a real request; no read-trigger or retry seam.
+    assert!(laptop.slot_hex() < tablet.slot_hex());
+    let original_need = stock
+        .private_key_package_need(&laptop.slot_hex())
+        .unwrap()
+        .unwrap();
+    account_database(&phone.app).execute(
+        "UPDATE private_key_package_requests SET requested_at = 'unreadable' WHERE issuer_slot_hex = ?1",
+        [laptop.slot_hex()],
+    ).unwrap();
+    assert!(matches!(stock.private_key_package_need(&laptop.slot_hex()),
+        Err(cgka_traits::StorageError::Backend(message)) if message.contains("Invalid column type Text")));
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    let healthy_need = stock
+        .private_key_package_need(&tablet.slot_hex())
+        .unwrap()
+        .expect("an unreadable earlier issuer must not prevent the healthy slot's request");
+    assert_eq!(healthy_need.need, 1);
+    assert!(healthy_need.requested_at.is_some());
+    stock.put_private_key_package_need(&original_need).unwrap();
+    // Now the same declined demand is readable and must still send nothing.
     phone.client.sibling_key_package_upkeep(&[]).await;
     deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
     deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
@@ -356,7 +421,7 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
         .iter()
         .filter(|record| record.recipient_slot == phone_slot)
         .count();
-    assert_eq!(laptop_issued, 2, "no new request solely for declined chats");
+    assert_eq!(laptop_issued, 1, "no new request solely for declined chats");
     assert_eq!(
         tablet_issued, 10,
         "the independent healthy slot's baseline request proceeds"
@@ -370,7 +435,7 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             .need,
         1
     );
-    assert_eq!(held_from(&phone, &laptop), 2);
+    assert_eq!(held_from(&phone, &laptop), 1);
     assert_eq!(taken_from(&phone, &laptop), 0);
 
     // Tablet learns the actual original decisions, then carries later
@@ -378,6 +443,34 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
     // decline/reaccept must never erase its original hour-throttle clock.
     phone.client.drive_small_state().await;
     deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    let Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    } = phone;
+    drop(client);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    let mut phone = Device {
+        _dir,
+        app,
+        client,
+        cursor,
+    };
+    for ready in [&group, &pending[1], &pending[2]] {
+        phone.client.runtime.ensure_group_hydrated(ready).unwrap();
+    }
+    assert!(
+        phone
+            .client
+            .runtime
+            .unhydrated_group_ids()
+            .contains(&pending[0])
+    );
     let mut requested_at = None;
     for (version, declined) in [(2, false), (3, true), (4, false)] {
         let decisions: Vec<_> = pending
@@ -435,15 +528,58 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             );
         }
         // Same three actual missing-chat obligations, without admitting an
-        // Add here: stock remains two and this owner measures request clocks.
+        // Add here: stock remains one and this owner measures request clocks.
         if !declined {
             phone
                 .client
                 .want_private_key_packages(&laptop_slot, 3)
                 .unwrap();
         }
+        // Version2 has three matching Accepts, but one real deferred chat.
+        // Healthy chats independently justify a narrowed NEW request: cap2,
+        // raw3, usable1. A corrupt record for just the deferred chat must
+        // retain that healthy demand, reporting the per-chat read error.
+        let unreadable = if version == 2 {
+            assert!(
+                phone
+                    .client
+                    .runtime
+                    .unhydrated_group_ids()
+                    .contains(&pending[0])
+            );
+            let db = account_database(&phone.app);
+            let original: Vec<u8> = db
+                .query_row(
+                    "SELECT record FROM cgka_groups WHERE id = ?1",
+                    [pending[0].as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            db.execute(
+                "UPDATE cgka_groups SET record = x'00' WHERE id = ?1",
+                [pending[0].as_slice()],
+            )
+            .unwrap();
+            let account = phone.app.account_storage("alice").unwrap();
+            assert!(account.list_groups().unwrap().contains(&pending[0]));
+            assert!(matches!(
+                account.get_group(&pending[0]),
+                Err(cgka_traits::StorageError::Serialization(_))
+            ));
+            Some(original)
+        } else {
+            None
+        };
         let before = relay.published_event_ids().len();
         phone.client.sibling_key_package_upkeep(&[]).await;
+        if let Some(original) = unreadable {
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE cgka_groups SET record = ?1 WHERE id = ?2",
+                    rusqlite::params![original, pending[0].as_slice()],
+                )
+                .unwrap();
+        }
         let current = stock
             .private_key_package_need(&laptop.slot_hex())
             .unwrap()
@@ -465,10 +601,133 @@ async fn a_decline_narrows_chat_stock_without_hiding_another_slot() {
             );
         }
     }
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    assert_eq!(
+        laptop
+            .client
+            .runtime
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .count(),
+        11,
+        "the narrowed new request retains the ordinary ten-package refill floor"
+    );
     let narrowed_unrequested =
         narrowed_unrequested.expect("unmet raw need is retained even before a first request");
     assert_eq!(narrowed_unrequested.need, 3);
     assert!(narrowed_unrequested.requested_at.is_none());
+}
+
+/// Public deletion and a realized Leave retain admission authority without a
+/// projected chat. Its matching decline still narrows the old aggregate burst.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_departed_decline_still_narrows_private_stock() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+    let ChatStockDemand {
+        relay,
+        devices: [mut phone, mut laptop, mut tablet],
+        group,
+        pending,
+        _bob_dir,
+        mut bob,
+    } = Box::pin(chat_stock_demand(false, 2)).await;
+    let chat = &pending[0];
+    let chat_hex = hex::encode(chat.as_slice());
+    let account = phone.app.account_storage("alice").unwrap();
+    let admission = account.invitation_admission(chat).unwrap().unwrap();
+    phone.client.accept_group_invite(chat).unwrap();
+    phone.client.drive_small_state().await;
+    deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
+    assert!(phone.client.delete_group_local(chat).await.unwrap());
+    let decision = storage_sqlite::InvitationDecision {
+        group_id_hex: chat_hex.clone(),
+        generation: admission.generation,
+        version: 2,
+        declined: true,
+    };
+    let [(content, _)] = <[_; 1]>::try_from(
+        crate::small_state::encode_invitation_decision_updates(std::slice::from_ref(&decision)),
+    )
+    .unwrap();
+    assert!(tablet.client.send_device_group_message(
+        &group, crate::small_state::KIND_SMALL_STATE_UPDATE, content,
+    ).await.unwrap());
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    assert_eq!(
+        account
+            .app_storage()
+            .invitation_decision(&chat_hex, &admission.generation)
+            .unwrap(),
+        Some(decision)
+    );
+    phone.client.drive_invitation_decisions().await;
+    assert!(account.leave_request(chat).unwrap().is_some());
+    let mut bob_cursor = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !phone.client.runtime.group_record(chat).unwrap().removed {
+            deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+            bob.retry_group_convergence(chat).await.unwrap();
+            deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+            phone
+                .client
+                .advance_convergence_after_runtime_sync(chat)
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the native admin commits the actual SelfRemove");
+    let mut phone = reopen(phone).await;
+    assert!(phone.client.state_group_record(chat).is_none());
+    assert!(phone.app.group("alice", &chat_hex).unwrap().is_none());
+    assert!(account.get_group(chat).unwrap().removed);
+    assert!(account.list_groups().unwrap().contains(chat));
+    assert!(
+        !phone
+            .client
+            .runtime
+            .live_group_ids()
+            .unwrap()
+            .contains(chat)
+    );
+    assert_eq!(account.invitation_admission(chat).unwrap(), Some(admission));
+    let need = account
+        .app_storage()
+        .private_key_package_need(&laptop.slot_hex())
+        .unwrap()
+        .unwrap();
+    assert_eq!(need.need, 3);
+    assert!(need.requested_at.is_none());
+    assert_eq!(held_from(&phone, &laptop), 2);
+    let taken = taken_from(&phone, &laptop);
+    phone.client.sibling_key_package_upkeep(&[]).await;
+    deliver_new(&mut laptop.client, &relay, &mut laptop.cursor).await;
+    let phone_slot: [u8; 32] = hex::decode(phone.slot_hex()).unwrap().try_into().unwrap();
+    assert_eq!(
+        laptop
+            .client
+            .runtime
+            .issued_private_key_packages()
+            .unwrap()
+            .iter()
+            .filter(|record| record.recipient_slot == phone_slot)
+            .count(),
+        2,
+        "hidden retained decline must hold the stale three-chat request with two usable packages"
+    );
+    assert_eq!(taken_from(&phone, &laptop), taken);
+    assert_eq!(
+        account
+            .app_storage()
+            .private_key_package_need(&laptop.slot_hex())
+            .unwrap(),
+        Some(need)
+    );
+    assert!(phone.client.state_group_record(chat).is_none());
+    assert!(phone.app.group("alice", &chat_hex).unwrap().is_none());
 }
 
 /// A real pending admin invitation can be declined while ordinary Leave is
@@ -524,7 +783,7 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     phone.client.sibling_key_package_upkeep(&[]).await;
     let store = phone.app.account_storage("alice").unwrap();
     let stock = store.app_storage();
-    let laptop_slot = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
     assert!(held_from(&phone, &laptop) > 0);
     assert!(
         stock
