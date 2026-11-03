@@ -62,7 +62,41 @@ impl OfflineReplayRelay {
                 let upstream_url = upstream_url.clone();
                 let requests = captured.clone();
                 connections.spawn(async move {
-                    let client = accept_async(socket).await.unwrap();
+                    // NIP-11 discovery shares the relay endpoint with WS.
+                    // Advertise the same 500-event clamp enforced below.
+                    let mut socket = socket;
+                    let mut header = [0; 8192];
+                    let received = timeout(Duration::from_secs(5), async {
+                        loop {
+                            let n = socket.peek(&mut header).await.ok()?;
+                            if n == 0 || n == header.len() {
+                                return None;
+                            }
+                            if header[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                return Some(n);
+                            }
+                            sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await;
+                    let Ok(Some(received)) = received else { return };
+                    let information = String::from_utf8_lossy(&header[..received])
+                        .lines()
+                        .any(|line| line.split_once(':').is_some_and(|(name, value)| {
+                            name.eq_ignore_ascii_case("accept")
+                                && value.contains("application/nostr+json")
+                        }));
+                    if information {
+                        use tokio::io::AsyncWriteExt;
+                        let body = r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                    let Ok(client) = accept_async(socket).await else { return };
                     let (relay, _) = connect_async(&upstream_url).await.unwrap();
                     let (mut client_write, mut client_read) = client.split();
                     let (mut relay_write, mut relay_read) = relay.split();
@@ -272,6 +306,9 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         &relay.url,
         marmot_app::CursorPersistence::Advance,
     );
+    receiver_app
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let receiver_account = &accounts[senders];
     let route = receiver_app
         .group(receiver_account, &hex::encode(group.as_slice()))
@@ -326,13 +363,55 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         .into_iter()
         .map(|message| message.plaintext)
         .collect();
-    assert!(
-        complete.is_ok(),
-        "permanent consumer saw {} of {} texts; durable projection holds {}",
-        observed.len(),
-        expected.len(),
-        stored.len()
-    );
+    if complete.is_err() {
+        let evidence = tempfile::Builder::new()
+            .prefix("offline600-failure-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let request_evidence = {
+            let requests = relay.requests.lock().unwrap();
+            json!({
+                "filters": requests.filters.iter().map(|r| json!({"connection":r.connection,"filter":r.filter})).collect::<Vec<_>>(),
+                "completed_group_pages": requests.completed_group_pages,
+                "refused_comparisons": requests.refused_comparisons,
+            })
+        };
+        std::fs::write(
+            evidence.join("requests.json"),
+            serde_json::to_vec_pretty(&request_evidence).unwrap(),
+        )
+        .unwrap();
+        receiver.shutdown_and_close().await.unwrap();
+        for runtime in &runtimes {
+            runtime.shutdown_and_close().await.unwrap();
+        }
+        let kept_roots = roots
+            .into_iter()
+            .map(|root| root.keep())
+            .collect::<Vec<_>>();
+        std::fs::write(
+            evidence.join("accounts.json"),
+            serde_json::to_vec_pretty(&json!({"roots":kept_roots,"receiver_index":senders}))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.join("plaintexts.json"),
+            serde_json::to_vec_pretty(
+                &json!({"expected":expected,"observed":observed,"stored":stored}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        panic!(
+            "permanent consumer saw {} of {} texts; durable projection holds {}; closed evidence={}",
+            observed.len(),
+            expected.len(),
+            stored.len(),
+            evidence.display()
+        );
+    }
     assert_eq!(
         observed, expected,
         "every exact MLS plaintext reaches the permanent consumer"
