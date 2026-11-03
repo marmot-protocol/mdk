@@ -1166,15 +1166,17 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
-    let (_updates, watch) = watch::channel(());
     store.close().unwrap();
+    // Only bound a stuck read: the completed observation, not elapsed time,
+    // proves an unavailable store did not become a cancellation.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&store, &job, None),
+    )
+    .await
+    .expect("cancellation observation must complete");
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            cancelled(store, job, watch, None)
-        )
-        .await
-        .is_err(),
+        !observed,
         "an unobservable store must not masquerade as a durable cancel"
     );
 }
@@ -1483,14 +1485,17 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         .await
         .unwrap();
     assert!(!permission.allowed());
-    let (_, updates) = watch::channel(());
+    // Await the actual read and classification; a timer cannot prove that
+    // the promoted attempt was observed after automatic permission revoked.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&storage, &job, Some(&permission)),
+    )
+    .await
+    .expect("promoted attempt cancellation observation must complete");
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            cancelled(storage.clone(), job.clone(), updates, Some(permission))
-        )
-        .await
-        .is_err()
+        !observed,
+        "revoking automatic permission must not cancel an explicit attempt"
     );
     assert_eq!(
         app.attachment_acquisition_status(&asset)
@@ -1500,13 +1505,15 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         deadline
     );
     app.cancel_attachment_acquisition(&asset).unwrap();
-    let (_, updates) = watch::channel(());
+    let (_updates, updates) = watch::channel(());
+    // The full watcher must observe the durable cancellation; this is only
+    // a generous hang guard for its real storage read.
     tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         cancelled(storage, job, updates, None),
     )
     .await
-    .unwrap();
+    .expect("the watcher must observe explicit cancellation");
 }
 
 /// Keep the real incoming GET and verified local read independent of outgoing SQL failures.

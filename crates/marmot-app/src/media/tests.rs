@@ -437,6 +437,60 @@ async fn spawn_stalled_http_server() -> (String, tokio::task::JoinHandle<()>) {
     (url, server)
 }
 
+/// Observe a complete real HTTP request, then hold its response until released.
+async fn spawn_observed_http_response(
+    response: Vec<u8>,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (seen, request_seen) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "client closed before sending complete HTTP headers"
+            );
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        seen.send(()).unwrap();
+        if released.await.is_ok() {
+            stream.write_all(&response).await.unwrap();
+        }
+    });
+    (url, request_seen, release, server)
+}
+
+/// Poll real I/O without letting an idle paused runtime advance policy time.
+async fn drive_with_manual_time<F: std::future::Future>(future: F) -> F::Output {
+    let wall_started = Instant::now();
+    tokio::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(output) = futures::poll!(future.as_mut()) {
+            return output;
+        }
+        assert!(
+            wall_started.elapsed() < Duration::from_secs(10),
+            "real HTTP observations did not finish with virtual time held"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Stream a complete response in bounded intervals and count every accepted request.
 async fn spawn_progressing_http_server(
     body: Arc<Vec<u8>>,
@@ -2136,14 +2190,17 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
 }
 
 /// Stalled locators reserve time for the remaining fallback candidates.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
 
     let body = b"healthy ciphertext";
-    let (first_url, first_server) = spawn_stalled_http_server().await;
-    let (second_url, second_server) = spawn_stalled_http_server().await;
-    let healthy_url = spawn_http_response(http_ok_response(body));
+    let (first_url, first_seen, first_release, first_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
+    let (second_url, second_seen, second_release, second_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
+    let (healthy_url, healthy_seen, healthy_release, healthy_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
     let reference = blob_reference_for_servers(body, &[first_url, second_url, healthy_url]);
     let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
         true,
@@ -2152,20 +2209,34 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
         TRANSFER_DEADLINE,
     );
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
+    let download = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport);
+    let driver = async move {
+        first_seen.await.unwrap();
+        // The first startup allowance is 80 ms. One extra virtual millisecond
+        // covers timer tick rounding; real socket work advances no policy time.
+        tokio::time::advance(Duration::from_millis(81)).await;
+        second_seen.await.unwrap();
+        // Only 49 ms of the original budget remains. The second candidate must
+        // reserve half for the healthy locator, rather than start a fresh 130 ms.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        healthy_seen.await.unwrap();
+        healthy_release.send(()).unwrap();
+        healthy_server.await.unwrap();
+    };
 
+    let (downloaded, ()) = drive_with_manual_time(async { tokio::join!(download, driver) }).await;
     let downloaded =
-        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
-            .await
-            .expect("stalled candidates must leave time for the healthy locator");
+        downloaded.expect("stalled candidates must leave time for the healthy locator");
     first_server.abort();
     second_server.abort();
+    drop((first_release, second_release));
 
     assert_eq!(downloaded, body);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "two stalled candidates must share the configured end-to-end deadline"
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(106),
+        "HTTP scheduling must not consume the original 130 ms policy budget"
     );
 }
 
