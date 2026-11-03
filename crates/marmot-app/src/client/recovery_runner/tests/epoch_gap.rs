@@ -2,6 +2,57 @@
 
 use super::*;
 
+// Paused time exercises relay backoff without waiting on wall time.
+#[tokio::test(start_paused = true)]
+async fn epoch_gap_revisits_a_healthy_source_while_another_is_unreachable() {
+    let account = account();
+    account
+        .fault_connection()
+        .execute_batch("INSERT INTO cgka_groups (id,epoch,record) VALUES (x'0a',1,x'00');")
+        .unwrap();
+    let clock = Clock::new();
+    let now = clock.now();
+    let route = group(1);
+    account.goal(&route, now - 100);
+    let mut owned = required(&route, &[RELAY, OTHER_RELAY]);
+    owned.group_id = Some(vec![0x0a]);
+    let healthy = ModelRelay::new(RELAY, caps(500, false)).build();
+    let unavailable = ModelRelay::new(OTHER_RELAY, caps(500, false))
+        .unreachable()
+        .build();
+    let host = TestHost::new(&account, &clock, vec![owned], &[&healthy, &unavailable]);
+    host.tails.stand(&route, RELAY, now);
+    host.tails.stand(&route, OTHER_RELAY, now);
+    account
+        .app
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: "0a".into(),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+    let (mut owner, _) = runner(&host, test_policy());
+    for _ in 0..16 {
+        if healthy.requests.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        if let Step::Idle { next_due: Some(at) } = owner.step().await {
+            clock.advance_to(at);
+        }
+    }
+    assert!(unavailable.requests.load(Ordering::SeqCst) > 0);
+    assert!(
+        healthy.requests.load(Ordering::SeqCst) >= 2,
+        "an unavailable source must not block return visits to a healthy one"
+    );
+    assert!(
+        !account
+            .app
+            .recovery_coverage_covers(&route, &[OTHER_RELAY.into()], now - 100, now - 1)
+            .unwrap(),
+        "a failed source's debt must remain uncovered"
+    );
+}
+
 // Paused time makes admission cost observable without waiting on wall time.
 #[tokio::test(start_paused = true)]
 async fn epoch_gap_retry_is_not_starved_by_a_large_staged_admission() {

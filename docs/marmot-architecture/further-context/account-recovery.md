@@ -861,7 +861,9 @@ An unresolved durable epoch gap additionally authorizes bounded return visits to
 including on relays without NIP-77. This handles a commit published with an old timestamp after an earlier sweep.
 The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
 staging bounds and account budgets. A completed visit that leaves the epoch missing waits 30 seconds before the
-next, doubling the delay under the existing unit policy. After six unsuccessful complete visits the EpochGap
+next, doubling the delay under the existing unit policy. A visit ends when each source has covered its range
+or failed off the admission frontier; a failed source's range remains owed and its unit backoff still applies.
+Thus an unavailable relay cannot prevent return visits to healthy relays. After six unsuccessful visits the EpochGap
 obligation parks visibly. Partial sweep progress does not reset this visit budget. Its count, unfinished-visit
 state and next retry time survive restart, and revisions of a ticket at the same missing epoch preserve them.
 A higher stalled epoch or explicit repair starts a fresh budget. Actual local epoch advancement clears the gap;

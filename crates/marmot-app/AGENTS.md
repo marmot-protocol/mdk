@@ -662,6 +662,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
   unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
   epoch starts a new one. Before each debt turn, actual local epoch advancement clears resolved gaps.
+  A source that failed off the admission frontier cannot block a healthy source's next visit; its range
+  stays uncovered and its own unit backoff/breaker still applies. Partial progress alone ends no visit.
   Suspended groups receive no visits. Healthy periodic rechecks remain NIP-77-only. `host` is its only seat:
   the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
   admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still

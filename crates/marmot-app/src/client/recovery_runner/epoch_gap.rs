@@ -1,13 +1,15 @@
 //! Bounded return visits authorized by unresolved durable epoch-gap demand.
 //!
 //! Reopening a retained goal lets the ordinary runner resume from its ledger
-//! cursor. Only a complete visit advances this separate durable backoff; partial
-//! sweep progress cannot forgive it. Healthy periodic re-checks remain NIP-77-only.
+//! cursor. A visit advances this separate durable backoff only after each source
+//! is covered or has failed off the admission frontier. Failure never certifies
+//! coverage; partial sweep progress cannot forgive the budget. Healthy periodic
+//! re-checks remain NIP-77-only.
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATION_RETENTION_SECS};
 
-use super::admission::Stalled;
+use super::admission::{Admission, Stalled};
 use super::{DebtTurn, RecoveryRunnerPolicy, sooner};
 
 /// Prepare due return visits and report the earliest future one. This runs in
@@ -18,6 +20,7 @@ pub(super) fn advance(
     stalled: &Stalled,
 ) -> StorageResult<Option<u64>> {
     let app = turn.app;
+    let mut admission = Admission::new(turn);
     let mut next = None;
     let floor = turn
         .now
@@ -77,7 +80,8 @@ pub(super) fn advance(
                         std::slice::from_ref(relay),
                         since,
                         turn.owed_until(route, relay),
-                    )? {
+                    )? && !admission.source_left_frontier(&route.route, relay)?
+                    {
                         complete = false;
                     }
                 }

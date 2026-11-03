@@ -483,11 +483,7 @@ impl<'t> Admission<'t> {
                 let debt = turn
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
-                let unit = turn.app.recovery_unit(&route.route, relay)?;
-                let left = self.relay_left(relay)?
-                    || unit.as_ref().is_some_and(|unit| {
-                        unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
-                    });
+                let left = self.source_left_frontier(&route.route, relay)?;
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -520,6 +516,20 @@ impl<'t> Admission<'t> {
             routes: routes.iter().map(|route| route.route.clone()).collect(),
             members,
         })
+    }
+
+    /// A failed source stops holding up its peers. Its range stays owed;
+    /// leaving the frontier is never a coverage certificate.
+    pub(super) fn source_left_frontier(
+        &mut self,
+        route: &TransportReconciliationRoute,
+        relay: &'t str,
+    ) -> StorageResult<bool> {
+        let unit = self.turn.app.recovery_unit(route, relay)?;
+        Ok(self.relay_left(relay)?
+            || unit.as_ref().is_some_and(|unit| {
+                unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
+            }))
     }
 
     /// Whether the relay's last answer was that it could not be reached, or
