@@ -334,6 +334,10 @@ mod tests {
                 RewindSite::EncryptedMediaSource,
             ),
             (
+                "moderation-source-restore-a1b2c3d4e5f60718",
+                RewindSite::ModerationSource,
+            ),
+            (
                 "device-tag-source-restore-a1b2c3d4e5f60718",
                 RewindSite::DeviceTagSource,
             ),

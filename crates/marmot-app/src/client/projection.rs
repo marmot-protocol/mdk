@@ -193,6 +193,7 @@ impl AppClient {
         event: &cgka_traits::engine::GroupEvent,
         batch_start_frontier: Option<u64>,
     ) -> Result<Option<bool>, AppError> {
+        self.note_sibling_chat_gap_event(event);
         let Some(group_id) = event_group_id(event) else {
             return Ok(None);
         };
@@ -1468,6 +1469,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
+        AppError::GroupCreateAdminNotMember => "read_marker_failed:group_create_admin_not_member",
         AppError::GroupInviteIncludesInviter => "read_marker_failed:group_invite_includes_inviter",
         AppError::DeviceGroupRefused(_) => "read_marker_failed:device_group_refused",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",

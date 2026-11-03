@@ -17,6 +17,7 @@ use cgka_conformance_simulator::{
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
 
+use super::recovery_runner_proofs::history_summary;
 use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 
 const LARGE_GROUP_MEMBERS: usize = 51;
@@ -382,6 +383,9 @@ fn wire_totals(relay: &RelayTrafficV1) -> Value {
     let mut totals = serde_json::to_value(relay).unwrap_or_default();
     if let Some(fields) = totals.as_object_mut() {
         fields.remove("events");
+        fields.remove("history_requests");
+        fields.remove("connection_inboxes");
+        fields.remove("now_ms");
     }
     totals
 }
@@ -420,8 +424,24 @@ fn summarize(relay: &RelayTrafficV1, workload: &Workload) -> Value {
     summary
 }
 
+/// An account recovery status in counts, without group or notice ids, for
+/// printed and saved reports.
+pub(super) fn status_summary(status: &marmot_app::AccountRecoveryStatus) -> Value {
+    let mut notices = BTreeMap::<String, usize>::new();
+    for notice in &status.notices {
+        let cause = serde_json::to_value(notice.cause).ok();
+        let cause = cause.as_ref().and_then(Value::as_str).unwrap_or("unknown");
+        *notices.entry(cause.to_owned()).or_default() += 1;
+    }
+    json!({
+        "catching_up_groups": status.catching_up_group_ids_hex.len(),
+        "inbox_catching_up": status.inbox_catching_up,
+        "notices_by_cause": notices,
+    })
+}
+
 /// Nearest-rank percentiles of millisecond samples.
-fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
+pub(super) fn percentiles(samples: impl IntoIterator<Item = f64>) -> Value {
     let mut sorted = samples.into_iter().collect::<Vec<_>>();
     sorted.sort_by(f64::total_cmp);
     // Nearest rank: the smallest sample with at least p% of samples at or
@@ -586,6 +606,31 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
     tokio::time::sleep(IDLE_WINDOW).await;
     let idle_end = subject.relay_traffic(&mark, true).await?;
 
+    let mut labels = BTreeMap::new();
+    for (label, group) in &workload.groups {
+        if let Some(route) = bob.nostr_route(group).await? {
+            labels.insert(route, label.clone());
+        }
+    }
+    // Group labels collapse to their kind, so the report stays short.
+    let kinds = labels
+        .iter()
+        .map(|(route, label)| {
+            let kind = if label.starts_with("history-") {
+                "history-*"
+            } else {
+                label
+            };
+            (route.clone(), kind.to_owned())
+        })
+        .collect();
+    // Bob's own connections only: the others share both endpoints.
+    let bobs = subject.client_history_requests("bob", &mark).await?;
+    let history_requests = bobs
+        .iter()
+        .map(|requests| history_summary(requests, &kinds));
+    let history_requests = history_requests.collect::<Vec<_>>();
+    let account_status = bob.account_recovery_status().await;
     let (_, mut observed) = bob.chat_view(&gap, None).await?;
     let mut expected = (0..GAP_MESSAGES)
         .map(|i| format!("gap-{i:05}"))
@@ -633,6 +678,8 @@ async fn measure(subject: &mut AppRuntimeHarness, workload: &Workload) -> TestRe
         "live_visibility_ms": live_visibility,
         "relays": measured.iter().map(|relay| summarize(relay, workload)).collect::<Vec<_>>(),
         "events_delivered_by_both_relays": both.count(),
+        "history_requests": history_requests,
+        "account_recovery_status_at_end": account_status.as_ref().map(status_summary).map_err(|error| &error.message),
         "idle_window": {"seconds": IDLE_WINDOW.as_secs(), "relays": idle.collect::<Vec<_>>()},
         "telemetry": {"before": telemetry_before, "after": telemetry_after},
     }))
@@ -724,6 +771,7 @@ fn telemetry_deltas(before: &Value, after: &Value) -> Value {
 
 fn print_table(report: &Value) {
     println!("\nlarge-account recovery scorecard (report only; production policy)");
+    println!("history owner: {}", report["workload"]["history_owner"]);
     println!(
         "{:<34}{:>9}{:>9}{:>9}{:>7}{:>8}",
         "latency of successful calls (ms)", "p50", "p95", "max", "ok", "failed"
@@ -754,6 +802,8 @@ fn print_table(report: &Value) {
         "final_state",
         "events_delivered_by_both_relays",
         "idle_window",
+        "history_requests",
+        "account_recovery_status_at_end",
     ] {
         println!("{key}: {}", report[key]);
     }
@@ -783,6 +833,15 @@ fn print_table(report: &Value) {
 }
 
 pub(super) async fn run() {
+    run_with(false).await;
+}
+
+/// The same workload with bob's recovery runner owning history debt.
+pub(super) async fn run_runner_owning_debt() {
+    run_with(true).await;
+}
+
+async fn run_with(runner_owns_debt: bool) {
     // Opt-in tracing for the in-process subject, for example
     // `MDK_SCORECARD_TRACE=marmot_app::relay_plane=warn`. Other participants
     // run in their own processes and are not traced.
@@ -793,11 +852,22 @@ pub(super) async fn run() {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    let artifacts = journey_artifacts("scorecard");
+    let (label, owner) = if runner_owns_debt {
+        (
+            "scorecard-runner",
+            "recovery runner (with the earlier owner beside it until 5g)",
+        )
+    } else {
+        ("scorecard", "earlier recovery owner")
+    };
+    let artifacts = journey_artifacts(label);
     let clients = clients();
-    let mut subject = AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2])
-        .await
-        .expect("scorecard harness setup");
+    let subject = if runner_owns_debt {
+        AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
+    } else {
+        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+    };
+    let mut subject = subject.expect("scorecard harness setup");
     save(
         artifacts.path(),
         "execution-layout.json",
@@ -813,6 +883,7 @@ pub(super) async fn run() {
         report["workload"]["relays"] =
             json!("two endpoints of one relay process over one retained store");
         report["workload"]["source_commit"] = json!(std::env::var("GITHUB_SHA").ok());
+        report["workload"]["history_owner"] = json!(owner);
         let (before, after) = (
             &report["telemetry"]["before"],
             &report["telemetry"]["after"],

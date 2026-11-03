@@ -119,9 +119,9 @@ pub use transport::{
 };
 pub use transport_adapter::{
     FanoutMlsState, FanoutPendingKind, FanoutTargetStatus, OutboundApplicationMessage,
-    OutboundFanout, OutboundFanoutOutcome, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
+    OutboundFanout, OutboundFanoutOutcome, PublicationObservation, TransportAccountActivation,
+    TransportAdapter, TransportAdapterError, TransportDelivery, TransportDeliveryPlane,
+    TransportDeliverySource, TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
     TransportGroupSubscription, TransportGroupSync, TransportPublishFailure,
     TransportPublishReport, TransportPublishRequest, TransportPublishTarget, TransportWireMetadata,

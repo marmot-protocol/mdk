@@ -1380,3 +1380,72 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
         }
     })
 }
+
+use crate::types::backups::MarmotBackupRestoreStatus;
+use marmot_uniffi::subscriptions::BackupRestoreSubscription;
+// All raw pointers refer exclusively to this item's owned allocations.
+unsafe impl Send for MarmotBackupRestoreStatus {}
+c_subscription! {
+    /// Observer only. Free/clear stops observation, never cancels restore.
+    MarmotBackupRestoreSubscription(BackupRestoreSubscription),
+    item MarmotBackupRestoreStatus from marmot_uniffi::conversions::BackupRestoreStatusFfi,
+    item_free "marmot_backup_restore_status_free",
+    callback MarmotBackupRestoreCallback,
+    read next,
+    next marmot_backup_restore_subscription_next,
+    set_callback marmot_backup_restore_subscription_set_callback,
+    clear_callback marmot_backup_restore_subscription_clear_callback,
+    free marmot_backup_restore_subscription_free
+}
+/// Observe restore progress. Free the subscription before its client;
+/// explicit cancel is a separate operation-token command.
+///
+/// # Safety
+/// client and account_ref must be valid; out_sub must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_watch_backup_restore(
+    client: *const MarmotClient,
+    account_ref: *const std::ffi::c_char,
+    out_sub: *mut *mut MarmotBackupRestoreSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.block_on(client.marmot.watch_backup_restore(account_ref)) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotBackupRestoreSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+/// Initial status exactly once; subsequent calls return OK with NULL.
+/// Free a non-NULL result with marmot_backup_restore_status_free.
+///
+/// # Safety
+/// sub must be live and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_backup_restore_subscription_snapshot(
+    sub: *const MarmotBackupRestoreSubscription,
+    out: *mut *mut MarmotBackupRestoreStatus,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let value = sub
+            .inner
+            .snapshot()
+            .map_or(std::ptr::null_mut(), |v| boxed(v.into()));
+        match unsafe { write_out(out, value) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}

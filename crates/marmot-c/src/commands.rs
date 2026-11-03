@@ -38,6 +38,10 @@ use crate::types::audit::{
     MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerConfigV4, MarmotAuditLogTrackerUpdateResult,
     MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
+use crate::types::backups::{
+    MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus, MarmotBackupSettings,
+    MarmotRecoveryWords,
+};
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
     MarmotExistingDirectConversation,
@@ -286,6 +290,7 @@ pub(crate) unsafe fn deliver_bytes(
 /// Arg kinds: `str` (required string), `opt_str` (nullable string),
 /// `str_arr` (string array + length pair), `val: T` (scalar by value),
 /// `flag` (boolean as `uint8_t` — see [`crate::memory::c_bool`]),
+/// `has_f/f: opt_flag` (optional boolean as two `uint8_t` flags),
 /// `f/f_len: opt_num_arr T` (nullable scalar array + length pair; NULL
 /// with length 0 means unset).
 /// Return kinds: `unit`, `scalar(T)`, `string`, `bytes`, `rec(Mirror)`,
@@ -513,6 +518,13 @@ macro_rules! c_cmd {
         c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
             {$($p)* $f: u8,}
             {$($r)* let $f = crate::memory::c_bool($f);}
+            {$($a)* $f,}
+            $($($rest)*)?);
+    };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, ($($ret:tt)+), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*} $hf:ident/$f:ident: opt_flag $(, $($rest:tt)*)?) => {
+        c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
+            {$($p)* $hf: u8, $f: u8,}
+            {$($r)* let $f = crate::memory::c_optional_bool($hf, $f);}
             {$($a)* $f,}
             $($($rest)*)?);
     };
@@ -801,6 +813,33 @@ c_cmd! {
     /// `marmot_chat_history_import_list_free`.
     async fn marmot_chat_history_imports(account_ref: str) -> rec(MarmotChatHistoryImportList) = chat_history_imports;
 
+    /// Generate shown-once words. Never log/persist; free with marmot_recovery_words_free.
+    async fn marmot_begin_recovery_words(account_ref: str) -> rec(MarmotRecoveryWords) = begin_recovery_words;
+    /// Confirm the two words at MDK's positions, in order. Inputs borrowed;
+    /// clear host copies. Errors keep the core confirmation flow retryable.
+    async fn marmot_confirm_recovery_words(account_ref: str, answers/answers_len: str_arr) -> unit = confirm_recovery_words;
+    /// Forget pending words, without changing active account backup settings.
+    async fn marmot_cancel_recovery_words(account_ref: str) -> unit = cancel_recovery_words;
+    /// Turn off future backups; previously written archives remain.
+    async fn marmot_turn_off_backups(account_ref: str) -> unit = turn_off_backups;
+    /// Current account settings; free with marmot_backup_settings_free.
+    async fn marmot_backup_settings(account_ref: str) -> rec(MarmotBackupSettings) = backup_settings;
+    /// Report Wi-Fi/charging on worker start and changes; both are required
+    /// for new background passes. A replacement worker defaults closed.
+    /// Admitted work settles after false; manual restoration is unaffected.
+    async fn marmot_set_backup_background_conditions(account_ref: str, wifi: flag, charging: flag) -> unit = set_backup_background_conditions;
+    /// Begin manual history-only restore. Words borrowed, never retained by
+    /// C; clear host copies. Free status with marmot_backup_restore_status_free.
+    async fn marmot_begin_backup_restore(account_ref: str, words: str) -> rec(MarmotBackupRestoreStatus) = begin_backup_restore;
+    /// Cancel only this operation; stale valid tokens return false,
+    /// malformed tokens INVALID_HEX. Committed history remains.
+    async fn marmot_cancel_backup_restore(account_ref: str, operation: str) -> scalar(bool) = cancel_backup_restore;
+    /// Aggregate progress; free with marmot_backup_restore_status_free.
+    async fn marmot_backup_restore_status(account_ref: str) -> rec(MarmotBackupRestoreStatus) = backup_restore_status;
+    /// Private availability hints for this CURRENT chat; no implicit join.
+    /// Free with marmot_backup_history_availability_list_free.
+    async fn marmot_backup_history_availability(account_ref: str, group_id_hex: str) -> rec(MarmotBackupHistoryAvailabilityList) = backup_history_availability;
+
     /// Whether this device's KeyPackage refresh is overdue because its device
     /// group can't take the announcement that must come first; warn the user
     /// while it is. Always false until this device trusts a device group,
@@ -813,9 +852,21 @@ c_cmd! {
     /// string clears it. Fails while device groups are off, for an unknown
     /// device, or while the device group has an earlier change in flight
     /// (retry later). A rename whose commit loses a fork is made again later,
-    /// unless another rename of that device won. Re-read on the
+    /// unless another user edit of that device won. Re-read on the
     /// `LinkedDevicesChanged` event.
     async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
+
+    /// Patch a linked device's settings off the UI thread. Each `has_` flag
+    /// selects its value; zero leaves it unchanged, nonzero means supplied.
+    /// Values also use zero=false, nonzero=true. Earlier lost edits recover
+    /// first; retry `device_group_busy` while they settle. Disabling add-to-all
+    /// does not leave chats; enabling history does not backfill joined chats.
+    /// Keep does not cancel explicit removal. Refused with nothing sent while
+    /// device groups are off (`roster_unsupported`), without a trusted device
+    /// group (`no_device_group`), for an unknown slot (`unknown_device`), or
+    /// while its roster cannot be read (`roster_unavailable`). Re-read on
+    /// LinkedDevicesChanged.
+    async fn marmot_update_linked_device_settings(account_ref: str, slot_id_hex: str, has_add_to_all_chats/add_to_all_chats: opt_flag, has_bring_history/bring_history: opt_flag, has_keep_while_inactive/keep_while_inactive: opt_flag) -> unit = update_linked_device_settings;
     /// Remove another of this account's devices, by its `slot_id_hex` from
     /// `marmot_linked_devices`, from the device group and every chat, and
     /// delete its KeyPackage slot. The removal is recorded at once and

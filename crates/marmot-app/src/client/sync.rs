@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -2562,12 +2562,15 @@ impl AppClient {
         received_at: u64,
         drained: bool,
     ) {
+        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
+            tracing::warn!(target: "marmot_app::client::sync", method = "retain_effect_projection",
+                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
+        }
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
         self.note_device_group_sent_ids(effects);
         self.note_device_group_removal(effects);
-        self.settle_sibling_welcome_carriers(effects);
         self.note_superseded_intent_reports(effects);
         self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
@@ -2637,6 +2640,7 @@ impl AppClient {
         pending: &mut PendingAppliedEffects,
     ) -> Result<(), AppError> {
         if !pending.bookkeeping_started {
+            self.settle_sibling_welcome_carriers(&pending.effects)?;
             self.transport_receipts()?;
             self.observe_recovery_health(&pending.effects)?;
             // This helper transfers unfinished source finalization back to its
@@ -2791,6 +2795,19 @@ impl AppClient {
                     return Err(error);
                 }
             };
+            for event in &projected_effects.events {
+                use cgka_traits::engine::GroupEvent;
+                if matches!(
+                    event,
+                    GroupEvent::GroupJoined { .. }
+                        | GroupEvent::LocalGroupCopyTerminated { .. }
+                        | GroupEvent::LocalGroupCopyRestored { .. }
+                        | GroupEvent::GroupHydrationRecovered { .. }
+                        | GroupEvent::GroupUnrecoverable { .. }
+                ) {
+                    self.backup_restore.availability_changed = true;
+                }
+            }
             // Only post-engine-success batches own this pin. Projection has
             // settled; release before any checkpoint can seal a newer cursor.
             if let Some(id) = &pending.source_delivery_id {
@@ -6594,8 +6611,13 @@ impl AppClient {
             }
             return Ok(());
         }
-        let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
+        let retains_encrypted_media = matches!(
+            message.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && media_imeta_tags_are_valid(
+            &message.tags,
+            self.app.allow_loopback_blob_endpoints(),
+        );
         if let Err(error) = self
             .app
             .directory()
@@ -8259,6 +8281,7 @@ mod runtime_group_subscription_refresh_tests {
                 let effects = marmot_session::AccountDeviceEffects {
                     events: vec![event.clone()],
                     published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                        publication_observation: None,
                         group_id: group.clone(),
                         app_event_id: "published-before-tail".into(),
                         message_id: cgka_traits::MessageId::new(vec![0x77; 32]),
@@ -8897,6 +8920,125 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// #2151: the projection must preserve the source key carried by an
+    /// authenticated reaction after retention retired the previous cached key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_reaction_preserves_its_carried_media_source_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://reaction-projection.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("reaction key", &[]).await.unwrap();
+        let (source, secret) = client.encrypted_media_secret(&group).unwrap();
+        let carried = cgka_traits::EncryptedMediaSecret::new(secret);
+        let reference = crate::MediaAttachmentReference {
+            locators: vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: "https://media.example/party".into(),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "party.png".into(),
+            media_type: "image/png".into(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: source,
+            source_epoch_identity: None,
+            dim: None,
+            thumbhash: None,
+        };
+        let storage = app.account_storage("alice").unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // Retention can retire the current epoch's cached key before another
+        // attachment arrives in that same epoch. Use the real storage sweep to
+        // reach that state rather than inventing a future source epoch.
+        storage
+            .app_storage()
+            .record_app_event_with_retention(
+                &storage_sqlite::StoredAppEvent {
+                    group_id_hex: group_hex.clone(),
+                    message_id_hex: "51".repeat(32),
+                    source_message_id_hex: Some("52".repeat(32)),
+                    source_epoch: Some(source),
+                    direction: "received".into(),
+                    sender: account.account_id_hex.clone(),
+                    plaintext: String::new(),
+                    kind: 9,
+                    tags: vec![reference.imeta_tag()],
+                    recorded_at: 1,
+                    received_at: 1,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+                Some(cgka_traits::app_event::AppMessageRetentionDecision {
+                    retention_seconds: 1,
+                    expires_at: Some(2),
+                }),
+            )
+            .unwrap();
+        storage
+            .app_storage()
+            .secure_prune_expired_app_events(&group_hex, 2, &account.account_id_hex, &|_, _| false)
+            .unwrap();
+        assert!(
+            storage
+                .app_storage()
+                .encrypted_media_epoch_secret(
+                    &hex::encode(group.as_slice()),
+                    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source
+                )
+                .unwrap()
+                .is_none()
+        );
+        client
+            .project_received_message(
+                crate::ReceivedMessage {
+                    authority: None,
+                    message_id_hex: "41".repeat(32),
+                    source_message_id_hex: "42".repeat(32),
+                    sender: account.account_id_hex,
+                    sender_display_name: None,
+                    group_id: group.clone(),
+                    source_epoch: source,
+                    retention: None,
+                    plaintext: ":party:".into(),
+                    kind: 7,
+                    tags: vec![
+                        vec!["e".into(), "43".repeat(32)],
+                        vec![
+                            "emoji".into(),
+                            "party".into(),
+                            "https://media.example/party".into(),
+                        ],
+                        reference.imeta_tag(),
+                    ],
+                    recorded_at: 1,
+                    received_at: 1,
+                },
+                None,
+                Some(&carried),
+                None,
+                &mut SyncSummary::default(),
+            )
+            .unwrap();
+        let remembered = storage
+            .app_storage()
+            .encrypted_media_epoch_secret(
+                &hex::encode(group.as_slice()),
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source,
+            )
+            .unwrap();
+        assert!(
+            remembered.as_deref() == Some(carried.as_bytes()),
+            "reaction-only media must retain the authenticated source key"
+        );
+    }
 
     /// Contract fixture: provide exhaustive, durably admitted endpoint proof.
     /// Scripted SDK EOSE is deliberately insufficient to produce this proof.

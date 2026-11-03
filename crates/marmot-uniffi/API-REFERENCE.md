@@ -707,6 +707,20 @@ Observe initial transfer state and complete replacements for bounded source slot
 <details>
 <summary>commands/attachment_history.rs</summary>
 
+### `Marmot::reaction_attachment`
+
+**Current.**
+
+```rust
+pub async fn reaction_attachment( &self, account_ref: String, group_id_hex: String, reaction_message_id_hex: String, ) -> Result<Option<AttachmentEntryFfi>, MarmotKitError>
+```
+
+Bounded local lookup for one active custom-emoji reaction, keyed by its `reactionMessageIdHex` within the account and chat. Returns the validated image attachment matching that reaction's shortcode, with its original message/source IDs and attachment index, or `None` when unavailable or unmatched. Starts no download. Use the target with ordinary automatic or explicit attachment acquisition and opaque local reads; re-resolve when the earliest active reaction ID changes. Never fetch an emoji tag URL directly. See [reaction artwork](ATTACHMENT-HISTORY.md#reaction-artwork).
+
+The reaction ID must contain exactly 64 hexadecimal characters; malformed IDs return `InvalidMediaReference`. The lookup considers original `imeta` indices 0–99 only, source tag JSON and each candidate slot up to 16 KiB, and reaction content up to 64 UTF-8 bytes including colons. Oversized metadata, artwork outside those indices, or no eligible match returns `None`. The first well-formed definition of the exact content shortcode wins; later duplicates cannot replace an unmatched first definition.
+
+[Source](src/commands/attachment_history.rs#L15)
+
 ### `Marmot::attachment_history_page`
 
 **Current.**
@@ -717,7 +731,7 @@ pub async fn attachment_history_page( &self, account_ref: String, group_id_hex: 
 
 Read 1..=100 attachment slots in canonical newest-first order. Rejected slots consume the limit. Filter categories within returned pages; an empty filtered page is not exhaustion while has_more is true. No downloads are started. Keep cursors/versions in memory only and restart after runtime reconstruction.
 
-[Source](src/commands/attachment_history.rs#L15)
+[Source](src/commands/attachment_history.rs#L33)
 
 ### `Marmot::attachment_history_version`
 
@@ -729,7 +743,7 @@ pub async fn attachment_history_version( &self, account_ref: String, group_id_he
 
 Cheap local refresh signal, including for a fully loaded or empty library. Compare against the baseline version captured when the current collection began: replacing that baseline with a newer page can hide a destructive change to earlier rows.
 
-[Source](src/commands/attachment_history.rs#L37)
+[Source](src/commands/attachment_history.rs#L55)
 
 </details>
 
@@ -2447,9 +2461,22 @@ Whether this device's device group has held its KeyPackage refresh back for a we
 pub async fn rename_linked_device( &self, account_ref: String, slot_id_hex: String, label: String, ) -> Result<(), MarmotKitError>
 ```
 
-Rename one of this account's devices, this one included, by its `slot_id_hex` from `linked_devices`: one roster commit in the device group that sets only that device's label. The label is at most 64 bytes of UTF-8, and an empty label clears it. It is refused with `DeviceGroupRefused` and nothing sent in release builds until the roster's spec lands (`roster_unsupported`), for a label that is too long (`label_too_long`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), and while the device group has an earlier change of this device's in flight (`device_group_busy`, retry later). A rename whose commit loses a fork is made again on a later maintenance pass, unless another rename of that device won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`. Runs on the account worker.
+Rename one of this account's devices, this one included, by its `slot_id_hex` from `linked_devices`: one roster commit in the device group that sets only that device's label. The label is at most 64 bytes of UTF-8, and an empty label clears it. It is refused with `DeviceGroupRefused` and nothing sent in release builds until the roster's spec lands (`roster_unsupported`), for a label that is too long (`label_too_long`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), and while the device group has an earlier change of this device's in flight (`device_group_busy`, retry later). A rename whose commit loses a fork is made again on a later maintenance pass, unless another user edit of that device won; that one stands. Show the label `linked_devices` returns after `LinkedDevicesChanged`. Runs on the account worker.
 
 [Source](src/commands/linked_device.rs#L55)
+
+### `Marmot::update_linked_device_settings`
+
+**Current.**
+
+```rust
+pub async fn update_linked_device_settings( &self, account_ref: String, slot_id_hex: String, add_to_all_chats: Option<bool>, bring_history: Option<bool>, keep_while_inactive: Option<bool>, ) -> Result<(), MarmotKitError>
+```
+
+Patch the supplied settings of any linked device, this one included; `None` preserves the value from the current account-worker roster. Earlier lost label/settings edits recover first; a patch that still matches afterwards sends no new edit. Retry `device_group_busy` while one remains unsettled. Other refusals are `roster_unsupported`, `no_device_group`, `unknown_device` and `roster_unavailable`. A competing user edit wins as a whole; re-read `linked_devices` on `LinkedDevicesChanged`. Add-to-all permits the available linked-device Add flow and off never leaves joined chats. History affects future sibling Adds and remaining transfers owed, without retroactive backfill; keep is stored for inactivity removal and does not cancel explicit removal or sign-out. See the [shared contract](README.md#linked-devices).
+
+[Source](src/commands/linked_device.rs#L75)
+
 
 ### `Marmot::remove_linked_device`
 
@@ -2461,7 +2488,7 @@ pub async fn remove_linked_device( &self, account_ref: String, slot_id_hex: Stri
 
 Remove another of this account's devices, by its `slot_id_hex` from `linked_devices`: from the device group and from every chat, and delete its KeyPackage slot so inviters stop adding it. The decision is recorded at once and carried out as the device group allows, so a busy device group only delays it; `linked_devices` lists the device with `removal_pending` until the device group takes the removal, then no longer lists it. Chats that can't take a same-account removal keep the device; `removed_device_leftover_chats` counts them. It is refused with `DeviceGroupRefused` and nothing recorded in release builds until the roster's spec lands (`roster_unsupported`), without a device group (`no_device_group`), for a slot the roster doesn't list (`unknown_device`), for this device (`this_device`: sign out instead), and for a device whose link may still fail (`device_link_pending`). Refresh on `LinkedDevicesChanged`. Runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L77)
+[Source](src/commands/linked_device.rs#L105)
 
 ### `Marmot::removed_device_leftover_chats`
 
@@ -2473,7 +2500,7 @@ pub async fn removed_device_leftover_chats( &self, account_ref: String, ) -> Res
 
 How many chats this device is in still hold a device this account no longer has, because the chat does not take a same-account removal. That device is one this account removed, or one its device group stopped listing, as after a failed link. A chat admin can remove it; show the count beside the device list so the user knows to ask. Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L95)
+[Source](src/commands/linked_device.rs#L123)
 
 ### `Marmot::chats_closed_to_linked_devices`
 
@@ -2485,7 +2512,7 @@ pub async fn chats_closed_to_linked_devices( &self, account_ref: String, ) -> Re
 
 How many chats this device is in can't take any device of this account: they don't require `marmot.group.account-devices.v1`, name no relays a sibling Welcome can carry, or already hold this account's limit of 20 leaves. Once a link this device approved is made, MDK adds the new device to this device's other chats by itself when its "add to all my chats" setting is on, for a week after the link; these chats are passed over, and so, uncounted, is a chat that can take this account's devices but whose requirements the new device's KeyPackages don't meet, so zero does not mean the new device reaches every chat. A chat admin can turn the component on; removing a device frees its leaves. Show the count beside the device list, as "N chats can't add your other devices". Zero until this device trusts a device group, and always zero in release builds until the device group's spec lands. It is not evented: read it when showing the device list. Runs on the account worker.
 
-[Source](src/commands/linked_device.rs#L119)
+[Source](src/commands/linked_device.rs#L147)
 
 </details>
 
@@ -2759,7 +2786,7 @@ Edit `target_message_id` by publishing a kind-1009 event that references it and 
 pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String, kind: u64, tags: Vec<Vec<String>>, content: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 459, 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
+Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token, device group: 457, 458, 459, 460, 461, 473, 475, 476) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
 [Source](src/commands/message.rs#L232)
 
@@ -5171,5 +5198,140 @@ pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi
 White Noise's deployment: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, moderation label namespace and keychain service `com.marmot.whitenoise`. White Noise apps pass it to every constructor. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
 
 [Source](src/deployment.rs#L90)
+
+</details>
+
+<details>
+<summary>Backup recovery and observation</summary>
+
+### `BackupRestoreSubscription::next`
+
+```rust
+pub async fn next(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
+```
+
+Wait for the next aggregate progress or availability revision; `None` means the worker closed. This receive is cancellation-safe. Closing the observer does not cancel restore; use the named operation command.
+
+[Source](src/subscriptions.rs#L534)
+
+### `BackupRestoreSubscription::snapshot`
+
+```rust
+pub fn snapshot(&self) -> Option<crate::conversions::BackupRestoreStatusFfi>
+```
+
+Take the initial status exactly once; later calls return `None`. Use `next` for changes or `backupRestoreStatus` for a fresh read. This observer owns neither recovery words nor the operation.
+
+[Source](src/subscriptions.rs#L530)
+
+### `Marmot::backup_history_availability`
+
+```rust
+pub async fn backup_history_availability( &self, account_ref: String, group_id_hex: String, ) -> Result<Vec<BackupHistoryAvailabilityFfi>, MarmotKitError>
+```
+
+Read private words-again hints for a currently joined chat, using its variable-length MLS group id. A hint does not prove downloadable content or create membership. Re-read after a restore-watch revision or real join.
+
+[Source](src/commands/backups.rs#L122)
+
+### `Marmot::backup_restore_status`
+
+```rust
+pub async fn backup_restore_status( &self, account_ref: String, ) -> Result<BackupRestoreStatusFfi, MarmotKitError>
+```
+
+Read aggregate status without changing the operation. `Complete` means eligible work settled, not global completeness or proof that a pointer existed. Counts retain committed prefixes after cancellation.
+
+[Source](src/commands/backups.rs#L101)
+
+### `Marmot::backup_settings`
+
+```rust
+pub async fn backup_settings( &self, account_ref: String, ) -> Result<BackupSettingsFfi, MarmotKitError>
+```
+
+Read the selected account backup settings, including whether this device writes. Use this authoritative read after setup or a concurrent setting change; submitting a change is not proof it remains selected.
+
+[Source](src/commands/backups.rs#L48)
+
+### `Marmot::begin_backup_restore`
+
+```rust
+pub async fn begin_backup_restore( &self, account_ref: String, words: String, ) -> Result<BackupRestoreStatusFfi, MarmotKitError>
+```
+
+Start one ephemeral manual history-only restore per account from old recovery words. Only current own-leaf member chats can receive history; current keys and archived preferences stay unchanged. Keep the returned opaque operation token for cancellation. Clear host-owned word copies promptly; generated strings are not secure buffers.
+
+[Source](src/commands/backups.rs#L72)
+
+### `Marmot::begin_recovery_words`
+
+```rust
+pub async fn begin_recovery_words( &self, account_ref: String, ) -> Result<RecoveryWordsFfi, MarmotKitError>
+```
+
+Generate twelve new words for backup setup and two 1-based confirmation positions. Show once and confirm answers in that order. Never persist or log the words; this is separate from restoring with existing words.
+
+[Source](src/commands/backups.rs#L17)
+
+### `Marmot::cancel_backup_restore`
+
+```rust
+pub async fn cancel_backup_restore( &self, account_ref: String, operation: String, ) -> Result<bool, MarmotKitError>
+```
+
+Cancel only the named account-scoped operation. A stale valid token returns false; a malformed token is rejected. Committed history remains. Retry requires words again; dropping a watch does not call this command.
+
+[Source](src/commands/backups.rs#L86)
+
+### `Marmot::cancel_recovery_words`
+
+```rust
+pub async fn cancel_recovery_words(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Forget a pending recovery-word confirmation without changing existing account backups. Clear host-managed display/input copies separately.
+
+[Source](src/commands/backups.rs#L40)
+
+### `Marmot::confirm_recovery_words`
+
+```rust
+pub async fn confirm_recovery_words( &self, account_ref: String, answers: Vec<String>, ) -> Result<(), MarmotKitError>
+```
+
+Confirm the two requested words in position order. Busy or error results keep the core setup for another try. MDK guards its owned queued answers; caller/generated copies still need host handling. Read backup settings again to render the selected outcome.
+
+[Source](src/commands/backups.rs#L29)
+
+### `Marmot::set_backup_background_conditions`
+
+```rust
+pub async fn set_backup_background_conditions( &self, account_ref: String, wifi: bool, charging: bool, ) -> Result<(), MarmotKitError>
+```
+
+Report Wi-Fi and charging facts on worker start and changes. Both are required before the next background writer pass; replacement workers default closed. An admitted whole pass settles after false. This wakes existing due/backoff/resource checks, never forces a backup, and does not gate manual restore.
+
+[Source](src/commands/backups.rs#L58)
+
+### `Marmot::turn_off_backups`
+
+```rust
+pub async fn turn_off_backups(&self, account_ref: String) -> Result<(), MarmotKitError>
+```
+
+Disable future account backups through the selected account setting. Existing archives remain; this is not archive deletion or cancellation of an already admitted pass.
+
+[Source](src/commands/backups.rs#L44)
+
+### `Marmot::watch_backup_restore`
+
+```rust
+pub async fn watch_backup_restore( &self, account_ref: String, ) -> Result<Arc<BackupRestoreSubscription>, MarmotKitError>
+```
+
+Observe one initial snapshot and later progress/availability revisions. Closing the watch stops observation only. Keep its account context and cancel explicitly with the operation token when desired.
+
+[Source](src/commands/backups.rs#L113)
 
 </details>

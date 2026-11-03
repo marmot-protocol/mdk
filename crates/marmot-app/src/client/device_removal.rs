@@ -520,6 +520,16 @@ impl AppClient {
         Ok(gone)
     }
 
+    /// The existing authoritative gone classification, shared with retained
+    /// Welcome repair. Readable absence alone is not evidence of removal.
+    pub(super) fn gone_device_slots(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> Result<BTreeSet<DeviceSlotId>, AppError> {
+        Ok(self.gone_devices(group_id, roster)?.slots)
+    }
+
     /// The tag signature keys rosters of `group_id` this device applied
     /// listed in the last 30 days (mdk#2761): by slot, and within a slot the
     /// most recently seen first. The engine records them.
@@ -645,7 +655,7 @@ impl AppClient {
                 .leave_in_progress(group_id)
                 .map_err(marmot_session::SessionError::from)?
             || self.runtime.disbanding_in_progress(group_id)?
-            || self.epoch_gap_held_groups()?.contains(group_id)
+            || self.epoch_gap_holds_group(group_id, super::recovery::wall_now_ms()?)?
             || self.runtime.has_pending_convergence_inputs(group_id)?
             || self.runtime.has_queued_outbound_intents(group_id)?
         {

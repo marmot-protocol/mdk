@@ -9,8 +9,9 @@ mod edits;
 mod opening;
 mod presentation;
 pub use chat_history::{
-    AppEventImport, HistoryExportEvent, HistoryExportRow, HistoryImportSource, ImportedAppEvent,
-    ImportedFileKey, LatestHistoryImport,
+    AppEventImport, BackupHistorySource, HistoryExportEvent, HistoryExportRow,
+    HistoryImportProvenance, HistoryImportSource, ImportedAppEvent, ImportedFileKey,
+    LatestHistoryImport,
 };
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
@@ -22,11 +23,10 @@ pub use presentation::ConversationPresentationPage;
 
 use crate::app::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;
 
-/// The slot of the device a timeline row was imported from, or NULL for a
-/// row that arrived live.
-use chat_history::TIMELINE_IMPORT_LABEL_SQL;
-const TIMELINE_IMPORT_SOURCE_SQL: &str = "(SELECT imported.source_slot FROM app_event_imports imported WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
 use crate::base::connection::CachedSql;
+use chat_history::{
+    TIMELINE_IMPORT_LABEL_SQL, TIMELINE_IMPORT_PROVENANCE_SQL, history_import_provenance_from_row,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
@@ -287,10 +287,15 @@ pub struct TimelineMessageRecord {
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
     /// The device this row came from in a chat history it sent (mdk#2628
-    /// 4.2d); `None` for a row that arrived live. A host draws "Imported
-    /// from" where rows change from imported to live.
+    /// 4.2d). This legacy sibling-only field is `None` for live or backup
+    /// rows; `app_event_import_provenance` identifies the complete source.
     #[serde(default)]
     pub imported_from: Option<HistoryImportSource>,
+    /// Complete import source, carried by incremental updates and batched
+    /// timeline/conversation reads. Backup identity proves neither a device
+    /// writer nor historical authorship. Live rows have none.
+    #[serde(default)]
+    pub history_import_provenance: Option<HistoryImportProvenance>,
 }
 
 impl std::fmt::Debug for TimelineMessageRecord {
@@ -1725,6 +1730,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
     }
+    crate::app::attachment_history::refresh_reaction_attachment_sources_tx(tx, group_id_hex, None)?;
     crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
         tx,
         group_id_hex,
@@ -1826,8 +1832,10 @@ fn secure_prune_selected_app_events_tx(
         } else {
             !encrypted_media_component_ids(&event.tags).is_empty()
         };
-        if event.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && carries_encrypted_media
+        if matches!(
+            event.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && carries_encrypted_media
             && let Some(source_epoch) = event.source_epoch
         {
             retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
@@ -1877,6 +1885,15 @@ fn secure_prune_selected_app_events_tx(
     )?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    // Reactions have no timeline row themselves. Losing a target must still
+    // revoke their slots, even when retention omits that target from reprojection.
+    for message_id in &pruned_message_ids {
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id),
+        )?;
+    }
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
     for message_id in affected_message_ids {
         upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
@@ -2153,6 +2170,11 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         )
         .storage()?;
         reports::refresh(tx, group_id_hex, message_id_hex)?;
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
         crate::app::attachment_acquisition::reconcile_attachment_acquisition_tx(
             tx,
             group_id_hex,
@@ -2161,8 +2183,21 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         return Ok(());
     };
 
+    let was_live: bool = tx.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM message_timeline WHERE group_id_hex=?1 AND message_id_hex=?2 AND deleted=0 AND invalidation_status IS NULL)",
+        params![group_id_hex, message_id_hex], |r| r.get(0),
+    ).storage()?;
     upsert_message_timeline_row_tx(tx, &row)?;
     reports::refresh(tx, group_id_hex, message_id_hex)?;
+    // Reaction additions change the tally, not the target's source liveness.
+    // Refresh dependent artwork only when that liveness actually changes.
+    if was_live != (!row.deleted && row.invalidation_status.is_none()) {
+        crate::app::attachment_history::refresh_reaction_attachment_sources_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
+    }
     if let Some(stream_start) = stream_start {
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
@@ -2320,7 +2355,9 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
     let deleted_reaction_ids =
         deleted_reaction_ids_for_target_tx(tx, &row.group_id_hex, &reactions)?;
     for reaction in reactions {
-        if deleted_reaction_ids.contains(&reaction.message_id_hex) {
+        if deleted_reaction_ids.contains(&reaction.message_id_hex)
+            || tag_value(&reaction.tags, EVENT_REF_TAG) != Some(row.message_id_hex.as_str())
+        {
             continue;
         }
         row.reactions.user_reactions.push(TimelineUserReaction {
@@ -3141,7 +3178,10 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
             reply_preview_targets.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_REACTION => {
-            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+            // There is no timeline row, but the event owns an artwork source
+            // whose delivery, withdrawal or retargeting must still reproject.
+            ids.insert(message_id_hex.to_owned());
+            ids.extend(tag_value(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
         MARMOT_APP_EVENT_KIND_POLL_RESPONSE => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
@@ -3552,12 +3592,15 @@ fn timeline_records_by_ids_tx(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              WHERE timeline.group_id_hex = ?
                AND timeline.message_id_hex IN ({placeholders})"
         );
@@ -3816,12 +3859,15 @@ fn timeline_query_sql(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              {where_sql}
              {order_sql}
              LIMIT ?"
@@ -4239,12 +4285,15 @@ fn visible_timeline_record(
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
-                    {TIMELINE_IMPORT_SOURCE_SQL} AS imported_source_slot,
+                    {TIMELINE_IMPORT_PROVENANCE_SQL},
                     {TIMELINE_IMPORT_LABEL_SQL} AS imported_source_label
              FROM visible_message_timeline AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex
+             LEFT JOIN app_event_imports AS imported
+               ON imported.group_id_hex = timeline.group_id_hex
+              AND imported.message_id_hex = timeline.message_id_hex
              WHERE timeline.group_id_hex = ?1
                AND timeline.message_id_hex = ?2
              LIMIT 1"),
@@ -4331,6 +4380,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
                     Box::new(e),
                 )
             })?,
+        history_import_provenance: history_import_provenance_from_row(row)?,
         imported_from: row
             .get::<_, Option<Vec<u8>>>("imported_source_slot")?
             .map(|slot| -> rusqlite::Result<_> {

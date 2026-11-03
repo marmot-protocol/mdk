@@ -358,6 +358,51 @@ mod tests {
     fn the_label_separates_history_from_other_mls_encryption() {
         let crypto = RustCrypto::default();
         let pair = key_pair(&crypto);
+        // Independently literal EncryptContext: two one-byte-length vectors.
+        // Round-tripping through our two helpers cannot pin their shared label.
+        let history_info = b"\x16MLS 1.0 Marmot History\x15chat, slots and offer";
+        let sealed = seal_history(
+            &crypto,
+            DEFAULT_CIPHERSUITE,
+            &pair.public,
+            CONTEXT,
+            b"bundle",
+        )
+        .unwrap();
+        let ciphertext = HpkeCiphertext::tls_deserialize_exact(&sealed).unwrap();
+        assert_eq!(
+            crypto
+                .hpke_open(
+                    DEFAULT_CIPHERSUITE.hpke_config(),
+                    &ciphertext,
+                    &pair.private,
+                    history_info,
+                    &[],
+                )
+                .ok(),
+            Some(b"bundle".to_vec()),
+        );
+        let independently_sealed = crypto
+            .hpke_seal(
+                DEFAULT_CIPHERSUITE.hpke_config(),
+                &pair.public,
+                history_info,
+                &[],
+                b"independent history",
+            )
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            open_history(
+                &crypto,
+                DEFAULT_CIPHERSUITE,
+                &pair.private,
+                CONTEXT,
+                &independently_sealed,
+            ),
+            Some(b"independent history".to_vec()),
+        );
         // The same key and context under MLS's own Welcome label.
         let welcome_info = encode_component_vectors(&[b"MLS 1.0 Welcome", CONTEXT]);
         let sealed = crypto

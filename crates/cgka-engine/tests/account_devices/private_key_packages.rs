@@ -20,6 +20,7 @@ use cgka_engine::private_key_packages::{
 use cgka_traits::app_components::{DeviceEntryV1, DeviceRosterV1};
 use cgka_traits::storage::{GroupStorage as _, KeyPackageBundleStorage as _};
 use cgka_traits::welcome::SiblingWelcomeJoin::{self, Settled};
+use tls_codec::VLBytes;
 
 const NOW: u64 = 1_000;
 const SLOT: [u8; 32] = [7; 32];
@@ -37,6 +38,233 @@ fn private_key_packages(device: &Device) -> Vec<KeyPackage> {
 
 fn current(bytes: Vec<u8>) -> KeyPackage {
     KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Current)
+}
+
+fn private_durable_rows(
+    connection: &rusqlite::Connection,
+) -> (
+    Vec<Vec<rusqlite::types::Value>>,
+    Vec<Vec<rusqlite::types::Value>>,
+) {
+    let query = |sql: &str, columns: usize| {
+        let mut statement = connection.prepare(sql).unwrap();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()
+            .unwrap()
+    };
+    (
+        query(
+            "SELECT provider_version, label, storage_key, group_key, value FROM openmls_values ORDER BY provider_version, label, storage_key, group_key",
+            5,
+        ),
+        query(
+            "SELECT key_package_ref, issued_at, record FROM cgka_private_key_packages ORDER BY key_package_ref",
+            3,
+        ),
+    )
+}
+
+/// A real failed second insertion must undo earlier stock changes, the first
+/// new record and both new private bundles, through encrypted file reopens.
+#[tokio::test]
+async fn failed_private_issuance_preserves_keys_and_stock_through_reopen_and_retry() {
+    use cgka_traits::storage::StorageError;
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("private-packages.sqlite");
+    let key = SqlCipherKey::raw([0x73; 32]);
+    let open_observer = || {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        connection
+    };
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut phone = build_device(
+        storage,
+        b"alice",
+        &[ACCOUNT_DEVICES_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+        None,
+    );
+    let public = phone.engine.fresh_key_package().await.unwrap();
+    assert_eq!(
+        phone
+            .engine
+            .issue_private_key_packages(&SLOT, 2, None, NOW)
+            .unwrap(),
+        2
+    );
+    let before_issued = phone.engine.issued_private_key_packages().unwrap();
+    assert_eq!(before_issued.len(), 2);
+    let references = before_issued
+        .iter()
+        .map(|record| record.key_package_ref.clone())
+        .collect::<Vec<_>>();
+    phone
+        .engine
+        .set_private_key_package_hand_offs_queued(&references, true)
+        .unwrap();
+    let before_issued = phone.engine.issued_private_key_packages().unwrap();
+    assert!(
+        before_issued
+            .iter()
+            .all(|record| record.counted && record.hand_off_queued)
+    );
+    assert_eq!(private_key_package_stock(&before_issued, &SLOT, NOW), 2);
+    assert_eq!(
+        durably_owned_key_packages(&phone.storage, ProtocolProfile::Current).unwrap(),
+        vec![public.clone()]
+    );
+    let observer = open_observer();
+    let before = private_durable_rows(&observer);
+    assert_eq!(before.1.len(), 2);
+    assert_eq!(phone.storage.stored_key_package_bundles().unwrap().len(), 3);
+    // These predicates establish the actual failure position inside the
+    // transaction: two old records uncounted, one new row, and two new bundles.
+    observer.execute_batch(
+        "CREATE TRIGGER fail_second_private_issue BEFORE INSERT ON cgka_private_key_packages
+         WHEN (SELECT COUNT(*) FROM cgka_private_key_packages) = 3
+          AND (SELECT COUNT(*) FROM cgka_private_key_packages WHERE json_extract(record, '$.counted') = 0) = 2
+          AND (SELECT COUNT(*) FROM openmls_values WHERE label = X'4b65795061636b616765') = 5
+         BEGIN SELECT RAISE(ABORT, 'second-private-issue-fault'); END;"
+    ).unwrap();
+    let request = MessageId::new(vec![0x71; 32]);
+    let error = phone
+        .engine
+        .issue_private_key_packages(&SLOT, 2, Some(&request), NOW + 1)
+        .unwrap_err();
+    assert!(
+        matches!(&error, EngineError::Storage(StorageError::Backend(message)) if message.contains("second-private-issue-fault")),
+        "{error:?}"
+    );
+    assert!(
+        private_durable_rows(&observer) == before,
+        "failed issuance must restore every issued and OpenMLS row"
+    );
+    assert_eq!(
+        phone.engine.issued_private_key_packages().unwrap(),
+        before_issued
+    );
+    assert_eq!(
+        private_key_package_stock(
+            &phone.engine.issued_private_key_packages().unwrap(),
+            &SLOT,
+            NOW + 1
+        ),
+        2
+    );
+    assert_eq!(
+        durably_owned_key_packages(&phone.storage, ProtocolProfile::Current).unwrap(),
+        vec![public.clone()]
+    );
+
+    let Device { engine, storage } = phone;
+    drop(engine);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let observer = open_observer();
+    assert!(
+        private_durable_rows(&observer) == before,
+        "failed issuance must remain rolled back after a physical reopen"
+    );
+    let mut phone = build_device(
+        storage,
+        b"alice",
+        &[ACCOUNT_DEVICES_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+        None,
+    );
+    assert_eq!(
+        phone.engine.issued_private_key_packages().unwrap(),
+        before_issued
+    );
+    assert_eq!(
+        durably_owned_key_packages(&phone.storage, ProtocolProfile::Current).unwrap(),
+        vec![public.clone()]
+    );
+    observer
+        .execute_batch("DROP TRIGGER fail_second_private_issue")
+        .unwrap();
+    assert_eq!(
+        phone
+            .engine
+            .issue_private_key_packages(&SLOT, 2, Some(&request), NOW + 1)
+            .unwrap(),
+        2
+    );
+    let answered = phone.engine.issued_private_key_packages().unwrap();
+    assert_eq!(answered.len(), 4);
+    for record in &before_issued {
+        let mut expected = record.clone();
+        expected.counted = false;
+        assert!(
+            answered.contains(&expected),
+            "retry retains every earlier key and its other metadata"
+        );
+    }
+    let new = answered
+        .iter()
+        .filter(|record| record.request_id.as_ref() == Some(&request))
+        .collect::<Vec<_>>();
+    assert_eq!(new.len(), 2);
+    assert!(
+        new.iter().all(|record| record.recipient_slot == SLOT
+            && record.counted
+            && !record.hand_off_queued)
+    );
+    assert_eq!(private_key_package_stock(&answered, &SLOT, NOW + 1), 2);
+    assert_eq!(phone.storage.stored_key_package_bundles().unwrap().len(), 5);
+    assert_eq!(
+        durably_owned_key_packages(&phone.storage, ProtocolProfile::Current).unwrap(),
+        vec![public.clone()]
+    );
+    let after = private_durable_rows(&observer);
+
+    let Device { engine, storage } = phone;
+    drop(engine);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let observer = open_observer();
+    assert!(
+        private_durable_rows(&observer) == after,
+        "the healed retry persists every key and record together"
+    );
+    let mut phone = build_device(
+        storage,
+        b"alice",
+        &[ACCOUNT_DEVICES_COMPONENT_ID],
+        Box::<MockPeeler>::default(),
+        None,
+    );
+    assert_eq!(
+        phone.engine.issued_private_key_packages().unwrap(),
+        answered
+    );
+    assert_eq!(
+        phone
+            .engine
+            .issue_private_key_packages(&SLOT, 2, Some(&request), NOW + 1)
+            .unwrap(),
+        0
+    );
+    assert!(
+        private_durable_rows(&observer) == after,
+        "the completed request stays single-use after reopen"
+    );
+    assert_eq!(
+        durably_owned_key_packages(&phone.storage, ProtocolProfile::Current).unwrap(),
+        vec![public]
+    );
+    let Device { engine, storage } = phone;
+    drop(engine);
+    drop(observer);
+    storage.close().unwrap();
 }
 
 #[tokio::test]
@@ -771,35 +999,113 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
     let mut version = bytes.clone();
     version[0] = 2;
     for refused in [&bytes[..bytes.len() - 1], &trailing, &version, &bytes[..65]] {
-        assert!(SiblingWelcome::decode(refused).is_err());
+        assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
+    }
+    let not_welcome = not_a_welcome(&mut laptop).await;
+    for (refused, reason) in [
+        (
+            SiblingWelcome {
+                key_package_ref: vec![],
+                ..sibling.clone()
+            },
+            "sibling Welcome: a KeyPackageRef is 1 to 64 bytes",
+        ),
+        (
+            SiblingWelcome {
+                key_package_ref: vec![1; 65],
+                ..sibling.clone()
+            },
+            "sibling Welcome: a KeyPackageRef is 1 to 64 bytes",
+        ),
+        (
+            SiblingWelcome {
+                welcome: [sibling.welcome.as_slice(), &[0]].concat(),
+                ..sibling.clone()
+            },
+            "sibling Welcome: not one mls_welcome MLSMessage",
+        ),
+        (
+            SiblingWelcome {
+                welcome: not_welcome.clone(),
+                ..sibling.clone()
+            },
+            "sibling Welcome: not one mls_welcome MLSMessage",
+        ),
+        (
+            SiblingWelcome {
+                relays: vec![String::new()],
+                ..sibling.clone()
+            },
+            "sibling Welcome: a relay URL is 1 to 512 bytes",
+        ),
+        (
+            SiblingWelcome {
+                relays: vec!["w".repeat(513)],
+                ..sibling.clone()
+            },
+            "sibling Welcome: a relay URL is 1 to 512 bytes",
+        ),
+    ] {
+        assert_serialize_error(refused.encode(), reason);
+    }
+
+    // Build framing independently of the bounded encoder, using actual MLS
+    // messages. An encoder refusal cannot stand in for an untrusted decoder.
+    let wire = |reference: &[u8], message: &[u8], relays: &[Vec<u8>]| {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&sibling.from);
+        bytes.extend_from_slice(&sibling.to);
+        VLBytes::new(reference.to_vec())
+            .tls_serialize(&mut bytes)
+            .unwrap();
+        bytes.extend_from_slice(message);
+        let mut list = Vec::new();
+        for relay in relays {
+            VLBytes::new(relay.clone())
+                .tls_serialize(&mut list)
+                .unwrap();
+        }
+        VLBytes::new(list).tls_serialize(&mut bytes).unwrap();
+        bytes
+    };
+    let relays: Vec<_> = sibling
+        .relays
+        .iter()
+        .map(|r| r.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        bytes,
+        wire(&sibling.key_package_ref, &sibling.welcome, &relays)
+    );
+    for (reference_len, relay_len) in [(1, 1), (64, 512)] {
+        let boundary = SiblingWelcome {
+            key_package_ref: vec![1; reference_len],
+            relays: vec!["w".repeat(relay_len)],
+            ..sibling.clone()
+        };
+        assert_eq!(
+            SiblingWelcome::decode(&wire(
+                &boundary.key_package_ref,
+                &boundary.welcome,
+                &[boundary.relays[0].as_bytes().to_vec()],
+            ))
+            .unwrap(),
+            boundary
+        );
     }
     for refused in [
-        SiblingWelcome {
-            key_package_ref: vec![],
-            ..sibling.clone()
-        },
-        SiblingWelcome {
-            key_package_ref: vec![1; 65],
-            ..sibling.clone()
-        },
-        SiblingWelcome {
-            welcome: [sibling.welcome.as_slice(), &[0]].concat(),
-            ..sibling.clone()
-        },
-        SiblingWelcome {
-            welcome: not_a_welcome(&mut laptop).await,
-            ..sibling.clone()
-        },
-        SiblingWelcome {
-            relays: vec![String::new()],
-            ..sibling.clone()
-        },
-        SiblingWelcome {
-            relays: vec!["w".repeat(513)],
-            ..sibling.clone()
-        },
+        wire(&[], &sibling.welcome, &relays),
+        wire(&[1; 65], &sibling.welcome, &relays),
+        wire(&sibling.key_package_ref, &not_welcome, &relays),
+        wire(&sibling.key_package_ref, &sibling.welcome, &[vec![]]),
+        wire(
+            &sibling.key_package_ref,
+            &sibling.welcome,
+            &[vec![b'w'; 513]],
+        ),
+        wire(&sibling.key_package_ref, &sibling.welcome, &[vec![0xff]]),
     ] {
-        assert!(refused.encode().is_err());
+        assert_serialize_error(SiblingWelcome::decode(&refused), "invalid sibling Welcome");
     }
 }
 
@@ -817,7 +1123,7 @@ async fn not_a_welcome(device: &mut Device) -> Vec<u8> {
 #[tokio::test]
 async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
     let mut phone = device(b"alice", true);
-    let bob = device(b"bob", true);
+    let mut bob = device(b"bob", true);
     let phone_public = phone.engine.fresh_key_package().await.unwrap();
     phone
         .engine
@@ -835,7 +1141,7 @@ async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
         key_packages: vec![key_packages[0].clone(); 21],
         ..hand_off.clone()
     };
-    assert!(too_many.encode().is_err());
+    assert_serialize_error(too_many.encode(), "a hand-off carries 1 to 20 KeyPackages");
 
     // A device with no device group to tag in builds untagged KeyPackages,
     // so none reads as the sender's.
@@ -847,15 +1153,19 @@ async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
     };
     for key_package in decoded.key_packages.iter().chain([&phone_public]) {
         for account in [&alice, &bob.engine.self_id()] {
-            assert!(
+            assert_other_error(
                 validate_received_private_key_package(
                     key_package,
                     account,
                     &roster,
                     &OTHER_SLOT,
-                    NOW
-                )
-                .is_err()
+                    NOW,
+                ),
+                if account == &alice {
+                    "private KeyPackage refused: not tagged as the sender's"
+                } else {
+                    "private KeyPackage refused: another account"
+                },
             );
         }
     }
@@ -868,6 +1178,41 @@ async fn a_hand_off_round_trips_and_takes_no_untagged_key_package() {
     assert_eq!(
         PrivateKeyPackageRequest::decode(&request.encode()).unwrap(),
         request
+    );
+    let wire = |messages: &[u8]| {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&OTHER_SLOT);
+        bytes.extend_from_slice(&SLOT);
+        VLBytes::new(messages.to_vec())
+            .tls_serialize(&mut bytes)
+            .unwrap();
+        bytes
+    };
+    let twenty = vec![key_packages[0].clone(); 20];
+    let twenty_bytes = twenty
+        .iter()
+        .flat_map(|k| k.bytes().iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        PrivateKeyPackageHandOff::decode(&wire(&twenty_bytes)).unwrap(),
+        PrivateKeyPackageHandOff {
+            from: OTHER_SLOT,
+            to: SLOT,
+            key_packages: twenty
+        }
+    );
+    let twenty_one = vec![key_packages[0].bytes(); 21].concat();
+    assert_serialize_error(
+        PrivateKeyPackageHandOff::decode(&wire(&twenty_one)),
+        "invalid private KeyPackage hand-off",
+    );
+    let bob_key_package = bob.engine.fresh_key_package().await.unwrap();
+    let (_, welcomes) = create(&mut phone, vec![bob_key_package], vec![])
+        .await
+        .unwrap();
+    assert_serialize_error(
+        PrivateKeyPackageHandOff::decode(&wire(&welcomes[0].payload)),
+        "invalid private KeyPackage hand-off",
     );
 }
 
@@ -900,19 +1245,34 @@ async fn a_hand_off_takes_key_packages_tagged_as_its_sender() {
         let metadata =
             validate_received_private_key_package(&key_package, &alice, &roster, &slot(2), NOW)
                 .unwrap();
-        for (account, from, now) in [
-            (&alice, slot(1), NOW),
-            (&bob, slot(2), NOW),
-            (&alice, slot(2), metadata.not_after),
+        for (account, from, now, reason) in [
+            (
+                &alice,
+                slot(1),
+                NOW,
+                "private KeyPackage refused: not tagged as the sender's",
+            ),
+            (
+                &bob,
+                slot(2),
+                NOW,
+                "private KeyPackage refused: another account",
+            ),
+            (
+                &alice,
+                slot(2),
+                metadata.not_after,
+                "private KeyPackage refused: expired",
+            ),
         ] {
-            assert!(
-                validate_received_private_key_package(&key_package, account, &roster, &from, now)
-                    .is_err()
+            assert_other_error(
+                validate_received_private_key_package(&key_package, account, &roster, &from, now),
+                reason,
             );
         }
     }
-    assert!(
-        validate_received_private_key_package(&laptop_public, &alice, &roster, &slot(2), NOW)
-            .is_err()
+    assert_other_error(
+        validate_received_private_key_package(&laptop_public, &alice, &roster, &slot(2), NOW),
+        "private KeyPackage refused: last resort",
     );
 }

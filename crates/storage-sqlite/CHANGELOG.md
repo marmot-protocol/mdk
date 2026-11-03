@@ -4,6 +4,8 @@
 
 ### Breaking changes
 
+- Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
+
 - Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
   D81). Migration 0165 drops the unused `cgka_announced_key_packages` table
   and its age index; migration 0144 stays unchanged. Device rosters and the
@@ -436,6 +438,13 @@
   and every copy shared one store epoch and skipped incremental auto-vacuum.
 
 ### Added
+
+- Migration 0167 indexes active kind-7 reaction attachments from retained app
+  events without creating timeline rows (mdk#2151), backfilling existing
+  artwork and sharing normal acquisition, permission and retention behavior.
+  `reaction_attachment_candidates` provides bounded message-scoped source
+  discovery. Incremental projection and rebuilds preserve unchanged slots;
+  authenticated reaction retractions and withdrawals revoke changed sources.
 
 - `dismiss_recovery_route_park_on` dismisses a route's broken units on the
   given relays and its remainder, checking the revision against them only;

@@ -75,6 +75,7 @@ impl AgentConnector {
         account_id_hex: &str,
         name: String,
         members: Vec<String>,
+        admins: Vec<String>,
         description: Option<String>,
         relays: Option<Vec<String>>,
     ) -> Result<AgentControlResponse, ConnectorError> {
@@ -90,6 +91,7 @@ impl AgentConnector {
                 marmot_app::AppCreateGroupOptions {
                     description: description.unwrap_or_default(),
                     relays,
+                    initial_admins: admins,
                     ..Default::default()
                 },
             )

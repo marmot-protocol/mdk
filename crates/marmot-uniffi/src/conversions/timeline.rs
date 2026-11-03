@@ -385,6 +385,9 @@ pub struct TimelineMessageRecordFfi {
     /// a row that arrived live. Draw "Imported from <device>" where rows
     /// change from imported to live.
     pub imported_from: Option<HistoryImportSourceFfi>,
+    /// Complete typed source; None for live rows. The legacy imported_from
+    /// field remains sibling-only, so None there alone does not mean live.
+    pub history_import_provenance: Option<super::HistoryImportProvenanceFfi>,
 }
 
 impl std::fmt::Debug for TimelineMessageRecordFfi {
@@ -434,6 +437,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
             invalidation_status: value.invalidation_status,
             imported_from: value.imported_from.map(Into::into),
+            history_import_provenance: value.history_import_provenance.map(Into::into),
         }
     }
 }
@@ -831,6 +835,7 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         }
     }
 

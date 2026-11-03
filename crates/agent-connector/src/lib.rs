@@ -3,6 +3,9 @@
 mod account;
 mod agent_created_groups;
 mod allowlist;
+mod attachments;
+#[cfg(test)]
+mod attachments_tests;
 mod bootstrap;
 mod connection;
 mod diagnostics;

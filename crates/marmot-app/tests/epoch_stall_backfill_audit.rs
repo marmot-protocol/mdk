@@ -120,6 +120,8 @@ fn open_store_with_config(
     relay_url: &str,
     config: MarmotAppConfig,
 ) -> MarmotApp {
+    // Keep encrypted files and reopens without paying production allocator/fsync costs.
+    storage_sqlite::relax_storage_for_test_process();
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),

@@ -137,9 +137,11 @@ fn dirty_same_subject_display_survives_until_maintenance_and_new_titles_notify_o
 
 #[test]
 fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities() {
+    // This fixture can run before an app constructor. SQLCipher's allocator opt-in is sticky.
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("account.db");
-    let key = storage_sqlite::SqlCipherKey::new("presentation test key").unwrap();
+    let key = storage_sqlite::SqlCipherKey::raw([0x42; 32]);
     let account = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Original"));

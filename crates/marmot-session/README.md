@@ -69,6 +69,16 @@ The session does **not** do account key derivation, recovery, or key rotation; r
 transport adaptation; or UI projection and application databases. Network publish is the runtime's job; the rest lives
 in [`marmot-account`](../marmot-account/) and [`marmot-app`](../marmot-app/).
 
+## Device-roster edits
+
+`AccountDeviceRuntime::edit_device_roster_entry` applies an edit to the current entry and publishes it only while
+the device group can take a commit. Label or settings changes must supply a present, fresh `rename_id` distinct from
+the current one. The runtime preserves that exact id so a caller can retain it before publication for recovery.
+Other edits, such as announcements and platform changes, must preserve the id. Invalid marker changes fail before
+staging or publishing. Custom settings writers from the earlier development draft must adopt this rule first.
+Host applications use the shared label/settings commands in [`marmot-app`](../marmot-app/README.md#linked-devices), which own
+that recovery record and retries.
+
 ## Routing model
 
 `TransportRoutingPolicy` is the transport-generic boundary. It answers:

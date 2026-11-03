@@ -111,6 +111,96 @@ Setup sends retry a `transport_closed` refusal, which happens while the sender's
 when the sender's own timeline lacks the message. The report counts those retries. The measured phase never retries:
 it counts failed status, send and live-send calls.
 
+`public_app_large_account_recovery_scorecard_runner_owns_debt` runs the same workload with bob's recovery runner
+owning history debt (`AppRuntimeHarness::new_with_relay_pair_owning_debt`). Its `scorecard.json` names the history
+owner. Both forms also record bob's history requests on each endpoint (`REQ` filters with `until`, and `NEG-OPEN`s,
+over his own connections, by verb and group kind, with history windows asked more than once) and bob's
+`account_recovery_status` at the end.
+
+## Recovery-runner proofs
+
+`tests/support/recovery_runner_proofs.rs` holds the recovery runner's proofs (mdk#2660), ignored journeys run in release
+with production policy. Bob runs in this process with the runner owning debt; alice and three senders run in their
+own processes. Both relay endpoints publish the White Noise relays' NIP-11 shape (NIP-77, `max_limit` 500), which the
+relay proxy serves itself, and the proxy logs every history request. The proofs count only bob's: requests over
+connections whose `REQ`s named his inbox and nobody else's (`client_history_requests`), since the others share the
+endpoints and reconnect with him after a relay cut. The runner's own attempts come from its `quantum` and `recheck`
+debug events, captured in process; they carry aggregate fields only. A live message counts only when its send
+succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
+seconds after the last send to arrive.
+
+Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner. Either can contribute to
+startup recovery, so the wire bounds count both of bob's owners, and the runner's own numbers are recorded:
+its attempts, those that asked a relay and ended without progress (a re-check that finishes is an answer), and when
+it reported the account caught up. The runner is held only to what it does beside the earlier owner. 5g adds the
+runner-alone bounds, a positive control for live fences and the upgrade journey, where they can run against the
+switch-over.
+
+- `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
+  1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
+  seconds for 16 minutes. It asserts that bob recovers the backlog exactly from endpoint 0, that every live message
+  arrives, and that the stalled endpoint, attempted in the first half of the window, sees at most one burst of
+  history requests every two minutes in the second, and requests in at most four of its eight minutes (requests
+  that never pause make one long burst). On 0.14.0 an attempt came about every 30 seconds for as long as
+  the app ran. Every member's forensic audit is on for the run. The report says, as counts, how each send
+  completed, which request shape the relay delivered each event to bob by (event ids, a window, a paged window, a
+  maintenance or a live subscription), and, for any message bob lacks, which other members show it, whether bob
+  holds it only invalidated, whether the relay holds its event, and bob's audited outcome for it. It also tallies
+  bob's inbound outcomes and each member's refused queued intents. The evidence directory keeps each member's audit
+  and a per-send delivery list keyed by audit refs (hashes), for reading a miss offline.
+  The original loop entry now forces bob behind: after all public epochs agree, bob closes, s1 schedules a manual
+  own-leaf update through the public maintenance API, and the online peers apply it before publishing the backlog.
+  `public_app_runner_stalled_relay_does_not_loop_bob_current` uses the same journey and every assertion, with all
+  members at one epoch when bob closes. Neither case changes `settle_maintenance` or production timing. Both must
+  recover exactly. `epoch-case.json` and the report name the requested case, epochs before close and at reconnect,
+  and the audited epoch-stall arm count (null if audit collection failed). The fixture takes a fresh public snapshot
+  before closing bob, so the cached offline projection carries the current MLS epoch. Bob's last observation during
+  close is separate from the first live epoch read after reopening and its elapsed time; the latter may already
+  reflect recovery, or be null if unavailable. The report also records bounded by-id group
+  requests separately from aggregate runner traces; traces alone do not identify a route. Both loops are selected
+  by the manual command below, or run either exact test name separately for alternating gate-on/control series.
+- `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
+  is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
+  restart alice sends a live message to the busy group every three seconds. It asserts:
+  - both timelines are exact within 30 minutes;
+  - every live message arrives;
+  - during restart recovery, no history window (a `REQ` without ids, or a `NEG-OPEN`) is asked twice on one endpoint;
+  - each endpoint sees at most four bursts of history requests;
+  - both groups' routes are asked on both endpoints;
+  - a message to the quiet group arrives within a minute, while the busy group is still owed.
+
+  Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
+  lookback, every route's new live count there is empty. The journey asserts that both routes are asked again on
+  endpoint 0, that the runner's aggregate advancing quanta after the reconnect newly cover at least the outage's span, that the account
+  reports caught up within five minutes (nothing catching up and no notice, read after a runner attempt since the
+  reconnect: until a runner surveys, the status lists nothing, and across a reconnect it keeps its last answer), and
+  that a quiet-group message sent after the reconnect arrives. The aggregate includes inbox comparisons; it does
+  not prove the runner itself re-swept each group, since the route requests count both owners. Reconnect repeated
+  windows and idle-window requests are recorded, not asserted absent. Runner-only group attribution remains a 5g
+  obligation. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
+  bounds no live message's wait.
+
+Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
+`runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids:
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
+  public_app_runner -- --ignored --test-threads=1 --nocapture
+```
+
+Run these trace-capturing proofs with this filter or one exact test name per invocation, or use nextest's separate
+test processes. Do not combine them with other ignored tests in one cargo test process: another test may install
+the process-wide tracing subscriber first.
+
+The runner-enabled report-only large-account scorecard has its own command:
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
+  public_app_large_account_recovery_scorecard_runner_owns_debt -- --exact --ignored --test-threads=1 --nocapture
+```
+
 ## First basic public journeys
 
 These tests use `AppRuntimeHarness`, which invokes `MarmotAppRuntime` over a real loopback Nostr relay and separate

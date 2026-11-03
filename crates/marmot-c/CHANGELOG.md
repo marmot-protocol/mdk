@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- Expose recovery-word setup/settings, manual backup restore controls/status/watch/current-chat hints and background
+  Wi-Fi/charging reports, with matching deep frees. `MarmotTimelineMessageRecord` adds nullable tagged
+  `history_import_provenance` (Device or Backup), changing its layout and embedding records. The legacy
+  `imported_from` stays sibling-only. Recompile consumers with the matching generated header and native library.
+  Closing a watch does not cancel restore; returned words and borrowed host inputs need explicit secret handling.
+  Background writer work defaults closed on each worker start until the host reports both Wi-Fi and charging.
+  Already admitted passes settle after conditions change; manual restore remains independent.
+
 - `MarmotMediaAttachmentReference` adds nullable `source_epoch_identity`
   (mdk#2840), changing its layout and every record embedding it. Preserve this
   local upload metadata when sending a returned reference. A missing identity
@@ -69,6 +77,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Drop the call and use matching regenerated headers and libraries.
 
 ### Added
+
+- Add `marmot_update_linked_device_settings`, using presence/value `uint8_t` pairs for optional booleans. It blocks on the account worker and returns no allocation (mdk#2628 D86).
+
+- `marmot_reaction_attachment` resolves one active custom-emoji reaction to an
+  owned nullable `MarmotAttachmentEntry`, freed with
+  `marmot_attachment_entry_free` (mdk#2151). Acquisition and local reads use its
+  original source slot. NULL with `MARMOT_STATUS_OK` means unavailable. Existing
+  record layouts are unchanged; use matching headers and libraries.
 
 - `marmot_account_recovery_status` writes an owned
   `MarmotAccountRecoveryStatus`: the groups whose history is still being
@@ -179,8 +195,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   of a device the account's device group stopped listing without a removal,
   such as after a failed link (mdk#2761). Release builds hold no device
   group, so it stays zero there.
-- `marmot_send_custom_event` refuses the device-group kinds 457, 459, 460,
-  461, 473, 475 and 476 as reserved, and one received in a chat makes no
+- `marmot_send_custom_event` refuses the device-group kinds 457, 458, 459,
+  460, 461, 473, 475 and 476 as reserved, and one received in a chat makes no
   timeline row, message or notification (mdk#2628). They are read only in
   the account's device group.
 - Creating a group or inviting adds every device of each recipient account

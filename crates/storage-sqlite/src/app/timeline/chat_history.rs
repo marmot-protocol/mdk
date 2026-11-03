@@ -33,9 +33,68 @@ impl HistoryImportSource {
     }
 }
 
+/// Public archive identity for imported history. It describes the archive
+/// that supplied the bytes, not verified writer or historical authorship.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupHistorySource {
+    pub recovery_public_key: [u8; 32],
+    pub backup_id: [u8; 16],
+    pub head_sha256: [u8; 32],
+    pub written_at: u64,
+}
+
+/// The complete source of an imported event. A backup is never attributed
+/// to a roster slot; legacy sibling-only queries remain available.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryImportProvenance {
+    Device(DeviceSlotId),
+    Backup(BackupHistorySource),
+}
+
 /// The name of an imported row's source, or NULL for a row that arrived
 /// live or a source no name was given for. Reads `timeline`.
-pub(crate) const TIMELINE_IMPORT_LABEL_SQL: &str = "(SELECT label.label FROM app_event_imports imported JOIN temp.device_labels label ON label.slot = imported.source_slot WHERE imported.group_id_hex=timeline.group_id_hex AND imported.message_id_hex=timeline.message_id_hex)";
+pub(crate) const TIMELINE_IMPORT_LABEL_SQL: &str =
+    "(SELECT label.label FROM temp.device_labels label WHERE label.slot = imported.source_slot)";
+
+pub(super) const TIMELINE_IMPORT_PROVENANCE_SQL: &str = "imported.source_slot AS imported_source_slot,
+    imported.backup_recovery_key AS imported_backup_key, imported.backup_id AS imported_backup_id,
+    imported.backup_head_sha256 AS imported_backup_head, imported.backup_written_at AS imported_backup_at";
+
+pub(super) fn history_import_provenance_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<HistoryImportProvenance>> {
+    let invalid = || {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid history import provenance",
+            )),
+        )
+    };
+    match (
+        row.get::<_, Option<Vec<u8>>>("imported_source_slot")?,
+        row.get::<_, Option<Vec<u8>>>("imported_backup_key")?,
+        row.get::<_, Option<Vec<u8>>>("imported_backup_id")?,
+        row.get::<_, Option<Vec<u8>>>("imported_backup_head")?,
+        row.get::<_, Option<i64>>("imported_backup_at")?,
+    ) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(slot), None, None, None, None) => Ok(Some(HistoryImportProvenance::Device(
+            slot.try_into().map_err(|_| invalid())?,
+        ))),
+        (None, Some(key), Some(id), Some(head), Some(at)) => {
+            Ok(Some(HistoryImportProvenance::Backup(BackupHistorySource {
+                recovery_public_key: key.try_into().map_err(|_| invalid())?,
+                backup_id: id.try_into().map_err(|_| invalid())?,
+                head_sha256: head.try_into().map_err(|_| invalid())?,
+                written_at: at.try_into().map_err(|_| invalid())?,
+            })))
+        }
+        _ => Err(invalid()),
+    }
+}
 
 /// The per-connection counter [`SqliteAppStorage::watch_history_imports`]
 /// keeps: every row added to or removed from `app_event_imports` (a cascade
@@ -150,6 +209,36 @@ impl SqliteAppStorage {
         events: &[ImportedAppEvent],
         now: u64,
     ) -> StorageResult<AppEventImport> {
+        self.import_app_events_with_provenance(
+            group_id_hex,
+            &HistoryImportProvenance::Device(*source_slot),
+            events,
+            now,
+        )
+    }
+
+    /// Insert-only history import with its honest device or backup source.
+    /// Content, provenance and attachment keys commit together; neither
+    /// imported source grants MLS membership or causes unread counts.
+    pub fn import_app_events_with_provenance(
+        &self,
+        group_id_hex: &str,
+        source: &HistoryImportProvenance,
+        events: &[ImportedAppEvent],
+        now: u64,
+    ) -> StorageResult<AppEventImport> {
+        let (slot, recovery_key, backup_id, head, written_at) = match source {
+            HistoryImportProvenance::Device(slot) => {
+                (Some(slot.as_slice()), None, None, None, None)
+            }
+            HistoryImportProvenance::Backup(backup) => (
+                None,
+                Some(backup.recovery_public_key.as_slice()),
+                Some(backup.backup_id.as_slice()),
+                Some(backup.head_sha256.as_slice()),
+                Some(u64_to_i64(backup.written_at)?),
+            ),
+        };
         self.connection.with_transaction(|| {
             let mut imported = 0;
             let mut changed = BTreeSet::new();
@@ -191,16 +280,21 @@ impl SqliteAppStorage {
                 // it gets no mark either.
                 let marked = conn
                     .execute_cached(
-                        "INSERT INTO app_event_imports (group_id_hex, message_id_hex, source_slot, imported_at)
-                         SELECT ?1, ?2, ?3, ?4
+                        "INSERT INTO app_event_imports (group_id_hex, message_id_hex, source_slot, imported_at,
+                             backup_recovery_key, backup_id, backup_head_sha256, backup_written_at)
+                         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
                          WHERE EXISTS (
                              SELECT 1 FROM app_events WHERE group_id_hex = ?1 AND message_id_hex = ?2
                          )",
                         params![
                             group_id_hex,
                             event.message_id_hex,
-                            source_slot.as_slice(),
+                            slot,
                             u64_to_i64(now)?,
+                            recovery_key,
+                            backup_id,
+                            head,
+                            written_at,
                         ],
                     )
                     .storage()?;
@@ -448,7 +542,7 @@ impl SqliteAppStorage {
                               ROW_NUMBER() OVER (PARTITION BY group_id_hex
                                                  ORDER BY imported_at DESC, source_slot DESC)
                                   AS rank
-                       FROM app_event_imports) latest
+                       FROM app_event_imports WHERE source_slot IS NOT NULL) latest
                  LEFT JOIN temp.device_labels label ON label.slot = latest.source_slot
                  WHERE latest.rank = 1
                  ORDER BY latest.group_id_hex",
@@ -477,8 +571,8 @@ impl SqliteAppStorage {
             .collect()
     }
 
-    /// The roster slot of the device an app event was imported from, or none
-    /// for a row that arrived live.
+    /// Legacy sibling-only source query. None for live rows or a backup
+    /// import; use `app_event_import_provenance` for the complete source.
     pub fn app_event_import_source(
         &self,
         group_id_hex: &str,
@@ -488,7 +582,7 @@ impl SqliteAppStorage {
             .lock()?
             .query_row_cached(
                 "SELECT source_slot FROM app_event_imports
-                 WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND source_slot IS NOT NULL",
                 params![group_id_hex, message_id_hex],
                 |row| row.get::<_, Vec<u8>>(0),
             )
@@ -500,6 +594,27 @@ impl SqliteAppStorage {
             })
         })
         .transpose()
+    }
+
+    /// The actual import source, or none for a live/unheld event. Backup
+    /// identity is provenance only and proves neither writer nor membership.
+    pub fn app_event_import_provenance(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<HistoryImportProvenance>> {
+        self.lock()?
+            .query_row_cached(
+                &format!(
+                    "SELECT {TIMELINE_IMPORT_PROVENANCE_SQL} FROM app_event_imports AS imported
+             WHERE imported.group_id_hex=?1 AND imported.message_id_hex=?2"
+                ),
+                params![group_id_hex, message_id_hex],
+                history_import_provenance_from_row,
+            )
+            .optional()
+            .storage()
+            .map(Option::flatten)
     }
 
     /// The key a sibling sent with the imported chat message `message_id_hex`
@@ -855,6 +970,113 @@ mod tests {
             ciphertext_sha256: hex::encode([ciphertext; 32]),
             key: Zeroizing::new([key; 32]),
         }
+    }
+
+    /// Backup identity, content and carried keys are one insert-only unit.
+    /// An actual key-write abort must not leave a transcript or source mark.
+    #[test]
+    fn a_backup_import_commits_its_provenance_and_keys_atomically() {
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let event = chat(1, 1, 11, "restored");
+        let source = HistoryImportProvenance::Backup(BackupHistorySource {
+            recovery_public_key: [2; 32],
+            backup_id: [3; 16],
+            head_sha256: [4; 32],
+            written_at: 50,
+        });
+        let events = [imported(&event, vec![file_key(0xbb, 2)])];
+        s.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_backup_key AFTER INSERT ON imported_media_file_keys
+             BEGIN SELECT RAISE(ABORT,'backup_atomic_abort'); END;",
+            )
+            .unwrap();
+        let error = s
+            .import_app_events_with_provenance(GROUP, &source, &events, NOW)
+            .unwrap_err();
+        assert!(
+            matches!(error, StorageError::Backend(ref text) if text.contains("backup_atomic_abort"))
+        );
+        assert!(
+            s.timeline_message(GROUP, &event.message_id_hex)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.app_event_import_provenance(GROUP, &event.message_id_hex)
+                .unwrap(),
+            None
+        );
+        assert!(
+            s.imported_media_file_keys(GROUP, &event.message_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+        s.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER abort_backup_key")
+            .unwrap();
+        let outcome = s
+            .import_app_events_with_provenance(GROUP, &source, &events, NOW)
+            .unwrap();
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(
+            outcome.update.messages[0].history_import_provenance,
+            Some(source.clone())
+        );
+        assert_eq!(
+            s.app_event_import_provenance(GROUP, &event.message_id_hex)
+                .unwrap(),
+            Some(source.clone())
+        );
+        assert_eq!(
+            s.app_event_import_source(GROUP, &event.message_id_hex)
+                .unwrap(),
+            None
+        );
+        assert!(
+            s.latest_history_imports().unwrap().is_empty(),
+            "no invented sibling source"
+        );
+        let row = s
+            .timeline_message(GROUP, &event.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.plaintext, "restored");
+        assert_eq!(row.imported_from, None);
+        assert_eq!(row.history_import_provenance, Some(source.clone()));
+        let page = s
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some(GROUP.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.messages[0].history_import_provenance,
+            Some(source.clone())
+        );
+        s.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES (?1,'',0)",
+                [GROUP],
+            )
+            .unwrap();
+        s.refresh_chat_list_row("aa", GROUP, &|_, _| false).unwrap();
+        let opened = s
+            .conversation_open(GROUP, crate::ConversationOpenQuery::default())
+            .unwrap();
+        assert_eq!(
+            opened.page.messages[0].history_import_provenance,
+            Some(source)
+        );
+        assert_eq!(row.source_message_id_hex, None);
+        assert_eq!(
+            s.imported_media_file_keys(GROUP, &event.message_id_hex)
+                .unwrap(),
+            vec![file_key(0xbb, 2)]
+        );
     }
 
     // mdk#2628 4.2a: a key is stored only with a row the import adds, and it

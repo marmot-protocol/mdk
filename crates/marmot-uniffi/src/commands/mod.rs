@@ -10,6 +10,7 @@
 mod account;
 mod agent_stream;
 mod audit;
+mod backups;
 mod chat_list;
 mod compromise_warning;
 mod device_link;

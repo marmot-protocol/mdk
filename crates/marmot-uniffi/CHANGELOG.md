@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Expose recovery-word setup/settings, manual backup restore begin/cancel/status/watch/current-chat hints, and
+  account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
+  rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.
+  Generated host strings remain caller-managed; do not persist or log recovery words.
+  Background writer work defaults closed on every worker start; hosts must report both Wi-Fi and charging to admit
+  new passes. Already admitted passes settle after conditions change; manual restore remains independent.
+
 - `MediaAttachmentReferenceFfi` adds optional `source_epoch_identity` (mdk#2840).
   Preserve it when saving an upload reference and sending it back, including
   custom emoji reactions. Outbound sends refuse a missing identity or a changed
@@ -120,6 +127,18 @@
 
 ### Added
 
+- Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
+- `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
+  resolves one active custom-emoji reaction's matching encrypted image to its
+  original attachment source slot (mdk#2151). Use ordinary host-managed
+  acquisition and opaque local reads; no group-wide `list_media` scan or
+  `download_media` fallback is required. The additive source migration backfills
+  retained eligible reactions. See `ATTACHMENT-HISTORY.md` for adoption and
+  reaction replacement/removal behavior.
+
 - `account_recovery_status(account_ref)` returns an `AccountRecoveryStatusFfi`:
   the groups whose history is still being fetched (`catching_up_group_ids_hex`),
   whether the inbox's is (`inbox_catching_up`), and every notice as
@@ -204,7 +223,7 @@
   device the account's device group stopped listing without a removal, such
   as after a failed link (mdk#2761). Release builds hold no device group, so
   it stays zero there.
-- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
+- `send_custom_event` refuses the device-group kinds 457, 458, 459, 460, 461, 473,
   475 and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's
   device group.

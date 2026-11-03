@@ -4,6 +4,17 @@ import Foundation
 struct ChatProjectionsSmoke {
     /// Exercise generated record layout and enum discriminants, including presentation roles.
     static func main() throws {
+        // The generated host ABI must preserve typed backup identity and optional operation tokens.
+        let backupSource = BackupHistorySourceFfi(recoveryPublicKeyHex: "recovery", backupIdHex: "archive", headSha256Hex: "head", writtenAt: UInt64.max)
+        for provenance in [HistoryImportProvenanceFfi.device(deviceSlotIdHex: "slot"), .backup(source: backupSource)] {
+            let copy = try FfiConverterTypeHistoryImportProvenanceFfi.lift(FfiConverterTypeHistoryImportProvenanceFfi.lower(provenance))
+            precondition(copy == provenance)
+        }
+        for phase in [BackupRestorePhaseFfi.idle, .discovering, .restoring, .complete, .partial, .unavailable, .cancelled] {
+            let status = BackupRestoreStatusFfi(operation: phase == .idle ? nil : "opaque", phase: phase, importedBundles: 1, importedEvents: UInt64.max, failedArchives: 2, failedBundles: 3, skippedBundles: 4, revision: 5)
+            let copy = try FfiConverterTypeBackupRestoreStatusFfi.lift(FfiConverterTypeBackupRestoreStatusFfi.lower(status))
+            precondition(copy == status)
+        }
         for query in [
             AccountAttachmentQueryFfi(groups: [], senders: [], minTimelineAt: nil, maxTimelineAt: nil),
             AccountAttachmentQueryFfi(groups: ["aa"], senders: ["sender"], minTimelineAt: 0, maxTimelineAt: UInt64.max),
@@ -64,7 +75,7 @@ struct ChatProjectionsSmoke {
                 systemType: "member_added", text: "Member added", actorAccountIdHex: "actor", subjectAccountIdHex: "subject",
                 name: nil, oldName: nil, oldRetentionSeconds: nil, newRetentionSeconds: nil)
             let preview = ChatListMessagePreviewFfi(groupSystem: event, messageIdHex: "selected", sender: "actor", senderDisplayName: nil,
-                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, timelineAt: 50,
+                plaintext: "raw", contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 1210, sticker: nil, timelineAt: 50,
                 retentionSeconds: nil, retentionExpiresAt: nil, deleted: false, deletionSource: .unknown,
                 attachmentKind: nil, attachmentCount: 0, deliveryState: .notApplicable)
             let copy = try FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
@@ -80,7 +91,7 @@ struct ChatProjectionsSmoke {
         }
         for source in [DeletionSourceFfi.author, .admin, .unknown] {
             let preview = TimelineReplyPreviewFfi(messageIdHex: "deleted", sender: "author", plaintext: "",
-                contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 9,
+                contentTokens: MarkdownDocumentFfi(blocks: [], truncated: false, blankLinesBefore: Data()), kind: 9, sticker: nil,
                 mediaJson: nil, media: [], agentTextStreamJson: nil, deleted: true, deletionSource: source, invalidationStatus: nil)
             let copy = try FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
             precondition(copy == preview && copy.deletionSource == source)
@@ -259,4 +270,20 @@ func compileAttachmentControls(_ marmot: Marmot, account: String, group: String,
     let stream = try await marmot.subscribeAttachmentTransfers(accountRef: account, groupIdHex: group, targets: [target])
     _ = try await stream.next()
     stream.cancel()
+}
+
+func compileBackupCommands(_ marmot: Marmot, account: String, group: String, words: String) async throws {
+    let setup = try await marmot.beginRecoveryWords(accountRef: account)
+    try await marmot.confirmRecoveryWords(accountRef: account, answers: setup.confirmPositions.map { setup.words[Int($0) - 1] })
+    try await marmot.cancelRecoveryWords(accountRef: account)
+    _ = try await marmot.backupSettings(accountRef: account)
+    try await marmot.setBackupBackgroundConditions(accountRef: account, wifi: true, charging: false)
+    let begun = try await marmot.beginBackupRestore(accountRef: account, words: words)
+    let observer = try await marmot.watchBackupRestore(accountRef: account)
+    _ = observer.snapshot()
+    _ = await observer.next()
+    _ = try await marmot.backupRestoreStatus(accountRef: account)
+    _ = try await marmot.backupHistoryAvailability(accountRef: account, groupIdHex: group)
+    if let token = begun.operation { _ = try await marmot.cancelBackupRestore(accountRef: account, operation: token) }
+    try await marmot.turnOffBackups(accountRef: account)
 }

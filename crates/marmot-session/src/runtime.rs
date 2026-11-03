@@ -180,27 +180,6 @@ impl Default for MaintenanceTiming {
     }
 }
 
-/// Run independent async work with fixed fan-out while returning results in
-/// input order. Completion order therefore cannot reorder reports or select a
-/// different caller-visible error.
-#[cfg(test)]
-async fn collect_bounded_ordered<I, F, T, E>(work: I, limit: usize) -> Result<Vec<T>, E>
-where
-    I: IntoIterator<Item = F>,
-    I::IntoIter: Send,
-    F: std::future::Future<Output = Result<T, E>> + Send,
-    T: Send,
-    E: Send,
-{
-    let mut results = futures::stream::iter(work.into_iter().enumerate())
-        .map(|(index, future)| async move { (index, future.await) })
-        .buffer_unordered(limit.max(1))
-        .collect::<Vec<_>>()
-        .await;
-    results.sort_unstable_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, result)| result).collect()
-}
-
 fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -827,6 +806,30 @@ where
     /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
     /// its own retained anchor. `None` when `epoch` is neither current nor
     /// retained, or no leaf sat at that index. See
+    /// Recover immutable accepted source proof without changing its first observation.
+    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> AccountResult<()> {
+        Ok(self
+            .session
+            .recover_pending_device_group_sources(group_id)?)
+    }
+
+    /// Attribute accepted native DG sources under the current trusted roster.
+    pub fn pending_device_group_activity(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<
+        Vec<(
+            cgka_traits::MessageId,
+            EpochId,
+            Option<cgka_traits::app_components::DeviceSlotId>,
+        )>,
+    > {
+        Ok(self
+            .session
+            .pending_device_group_activity(group_id, roster)?)
+    }
+
     /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
@@ -5561,7 +5564,8 @@ where
                     }
                     None => pass_accepted.push(endpoints[index].0.clone()),
                 }
-                self.session.put_outbound_fanout(&fanout)?;
+                self.session
+                    .put_observed_outbound_fanout(&mut fanout, self.wall_clock.now_ms())?;
             }
             if !attempts.is_empty() {
                 // Cancelled publishes may have reached a relay. Back off their
@@ -6573,6 +6577,7 @@ fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut Acc
             group_id: application.group_id.clone(),
             app_event_id: application.app_event_id.clone(),
             message_id,
+            publication_observation: fanout.first_acceptance_observation(),
             source_epoch: application.source_epoch,
             retention: application.retention,
             authority: application.authority,
@@ -6953,6 +6958,8 @@ pub struct AccountDeviceEffects {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedApplicationMessage {
+    /// Immutable first durable acceptance observation; unavailable for legacy fanouts.
+    pub publication_observation: Option<cgka_traits::PublicationObservation>,
     pub group_id: GroupId,
     pub app_event_id: String,
     pub message_id: cgka_traits::MessageId,
@@ -7218,6 +7225,7 @@ mod tests {
 
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {
+            publication_observation: None,
             authority: None,
             group_id: GroupId::new(vec![id]),
             app_event_id: format!("event-{id}"),
@@ -7231,16 +7239,36 @@ mod tests {
     fn extending_effects_preserves_published_application_messages() {
         let first = published_message(1);
         let second = published_message(2);
+        let first_superseded = SupersededIntentReport {
+            group_id: GroupId::new(vec![3]),
+            commit_id: cgka_traits::MessageId::new(vec![4]),
+            kind: cgka_traits::engine::SupersededIntentKind::GroupProfile,
+            outcome: cgka_traits::engine::SupersededIntentOutcome::Conflict,
+            reason: "profile_changed",
+        };
+        let second_superseded = SupersededIntentReport {
+            group_id: GroupId::new(vec![5]),
+            commit_id: cgka_traits::MessageId::new(vec![6]),
+            kind: cgka_traits::engine::SupersededIntentKind::Invite,
+            outcome: cgka_traits::engine::SupersededIntentOutcome::ReinviteRequired,
+            reason: "key_packages_consumed",
+        };
         let mut combined = AccountDeviceEffects {
             published_app_messages: vec![first.clone()],
+            superseded_intents: vec![first_superseded.clone()],
             ..AccountDeviceEffects::default()
         };
         combined.extend(AccountDeviceEffects {
             published_app_messages: vec![second.clone()],
+            superseded_intents: vec![second_superseded.clone()],
             ..AccountDeviceEffects::default()
         });
 
         assert_eq!(combined.published_app_messages, vec![first, second]);
+        assert_eq!(
+            combined.superseded_intents,
+            vec![first_superseded, second_superseded]
+        );
     }
 
     #[test]
@@ -7283,52 +7311,5 @@ mod tests {
                 members: Vec::new(),
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn welcome_publish_work_is_bounded_concurrent_and_ordered() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Semaphore;
-        use tokio::time::{Duration, timeout};
-
-        for item_count in [1, 5, 20] {
-            let active = Arc::new(AtomicUsize::new(0));
-            let max_active = Arc::new(AtomicUsize::new(0));
-            let release = Arc::new(Semaphore::new(0));
-            let work_active = active.clone();
-            let work_max_active = max_active.clone();
-            let work_release = release.clone();
-            let work = (0..item_count).map(move |index| {
-                let active = work_active.clone();
-                let max_active = work_max_active.clone();
-                let release = work_release.clone();
-                async move {
-                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_active.fetch_max(now_active, Ordering::SeqCst);
-                    let permit = release.acquire().await.unwrap();
-                    permit.forget();
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, &'static str>(index)
-                }
-            });
-
-            let expected_parallelism = item_count.min(WELCOME_PUBLISH_CONCURRENCY);
-            let task = tokio::spawn(collect_bounded_ordered(work, WELCOME_PUBLISH_CONCURRENCY));
-            timeout(Duration::from_secs(1), async {
-                while max_active.load(Ordering::SeqCst) < expected_parallelism {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("bounded collector should start the available parallel work");
-            assert_eq!(max_active.load(Ordering::SeqCst), expected_parallelism);
-            release.add_permits(item_count);
-
-            assert_eq!(
-                task.await.unwrap().unwrap(),
-                (0..item_count).collect::<Vec<_>>()
-            );
-        }
     }
 }

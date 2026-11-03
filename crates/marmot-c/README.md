@@ -18,6 +18,7 @@ per feature.
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
+  [custom reaction artwork](#custom-reaction-artwork),
   [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
@@ -26,6 +27,7 @@ per feature.
   [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
+  [backup recovery](#backup-recovery),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
 - [Smoke test and example](#smoke-test-and-example)
@@ -243,6 +245,16 @@ window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
 `CleanedBySetting`. Page cursors are borrowed from their page: keep the page alive
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
+
+## Custom reaction artwork
+
+`marmot_reaction_attachment` performs a bounded local lookup using the exact
+reaction event ID. It blocks off the UI thread and writes a standalone owned
+`MarmotAttachmentEntry`, or NULL with `MARMOT_STATUS_OK` when unavailable. Free
+the standalone result with `marmot_attachment_entry_free`; never use that free
+for an entry borrowed from a page. Use its original source target with ordinary
+attachment acquisition and local reads. See the
+[shared reaction contract](../marmot-uniffi/ATTACHMENT-HISTORY.md#reaction-artwork).
 
 ## File-backed media upload
 
@@ -466,6 +478,11 @@ it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` block
 device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
 [shared contract](../marmot-uniffi/README.md#linked-devices).
 
+`marmot_update_linked_device_settings` blocks on the account worker and patches any linked device's settings.
+Each `has_<setting>`/`<setting>` pair uses `uint8_t`: zero presence leaves the setting unchanged; nonzero presence
+supplies a value, with zero false and nonzero true. No structs or returned allocations are involved. Re-read the
+list on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`; see the [shared settings and recovery contract](../marmot-uniffi/README.md#linked-devices).
+
 `marmot_chat_history_imports` blocks on the account worker and writes an owned `MarmotChatHistoryImportList`; free it
 with `marmot_chat_history_import_list_free`. Each entry's tagged `state` is `Receiving` or `Imported`. Imported
 `MarmotTimelineMessageRecord`s name their source in the nullable `imported_from`. Re-read on
@@ -611,6 +628,29 @@ system `hardware_model`, platform and app version. Free its returned config with
 `marmot_audit_log_tracker_config_v4_free`. Never pass a device name, hostname or serial number as the model.
 The legacy config/setter retains its binary layout, ignores `device_label`, and returns that field as NULL;
 it never reinterprets an old device name as a hardware model. Both setters use the same v4-only upload gate.
+
+## Backup recovery
+
+See [backup recovery and background conditions](../marmot-uniffi/README.md#backup-recovery-and-background-conditions)
+for the shared setup, current-membership restore, background eligibility and secret-handling contract. The C functions
+use the same names with the `marmot_` prefix and snake case; Wi-Fi and charging inputs are `uint8_t` booleans.
+All operations block according to the usual ABI rules.
+
+Free recovery-word output with `marmot_recovery_words_free` after clearing displayed and caller-owned copies.
+The free releases MDK's returned C allocations; it does not promise to erase host copies or C string storage.
+Confirmation answers and restore phrases are borrowed inputs. Keep them valid for the call, then clear the host's
+buffers; MDK never retains the caller's pointer. Do not print words or entire recovery output records.
+
+`marmot_watch_backup_restore` returns an observer handle. Its snapshot is available once; subsequent `next` calls use
+the standard timeout/closed statuses or callback interface. Freeing or clearing this observer never cancels the
+operation: call `marmot_cancel_backup_restore` with its exact account-scoped operation token. Snapshot and `next`
+outputs are owned and must be freed; callback output is borrowed for the callback's duration. Free status and
+availability-list outputs with their matching generated free functions.
+
+`MarmotTimelineMessageRecord.history_import_provenance` is a nullable tagged union. Device and Backup payloads are
+embedded allocations released by the timeline record's deep-free; do not free them separately. Preserve the legacy
+sibling-only `imported_from` field when supporting older rendering paths. The additional timeline field changes its
+layout, including records that embed it.
 
 ## Smoke test and example
 

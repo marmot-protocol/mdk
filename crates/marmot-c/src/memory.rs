@@ -195,6 +195,11 @@ pub(crate) fn c_bool(value: u8) -> bool {
     value != 0
 }
 
+/// Read an optional C boolean without constructing an invalid Rust bool.
+pub(crate) fn c_optional_bool(present: u8, value: u8) -> Option<bool> {
+    c_bool(present).then_some(c_bool(value))
+}
+
 /// Read a borrowed C string argument into an owned Rust `String`.
 ///
 /// # Safety
@@ -274,6 +279,20 @@ pub(crate) unsafe fn opt_num_array<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_c_boolean_keeps_absent_false_and_true_distinct() {
+        for (present, value, expected) in [
+            (0, 0, None),
+            (0, 255, None),
+            (1, 0, Some(false)),
+            (255, 0, Some(false)),
+            (1, 1, Some(true)),
+            (1, 255, Some(true)),
+        ] {
+            assert_eq!(c_optional_bool(present, value), expected);
+        }
+    }
 
     #[test]
     fn string_roundtrip_strips_interior_nul() {

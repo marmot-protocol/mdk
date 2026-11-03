@@ -659,6 +659,25 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(epochs, vec![8]);
+        store
+            .app_storage()
+            .remember_encrypted_media_epoch_secret("aa", 0x8008, 8, &[1, 2, 3])
+            .unwrap();
+        let swept = store
+            .app_storage()
+            .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
+            .unwrap();
+        assert_eq!(
+            swept.pruned_media_epoch_secrets, 1,
+            "the last reaction reference retires its source key"
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .encrypted_media_epoch_secret("aa", 0x8008, 8)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
