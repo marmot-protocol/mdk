@@ -5972,6 +5972,11 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         adapter.clone(),
         policy.clone(),
         RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(42_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(1)),
     );
 
     let payload = app_payload_for(&alice_hex, b"typed metadata");
@@ -5990,6 +5995,10 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         "test adapter must exercise transport id replacement"
     );
     let expected_publication = PublishedApplicationMessage {
+        publication_observation: Some(cgka_traits::PublicationObservation {
+            order: 1,
+            at_ms: 42_000_000,
+        }),
         authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),

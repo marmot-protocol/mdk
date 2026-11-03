@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded
+  downloads, ephemeral recovery words, explicit cancellation, partial results, later-join availability hints and
+  typed core backup provenance. Archived preferences and automatic membership recovery remain outside this flow.
+
 ### Breaking changes
 
 - The shared runtime roster-write path rejects label/settings changes without a fresh `rename_id` and rejects
@@ -112,6 +116,14 @@
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
 
+- A published sibling Welcome lost before joining is repaired after the
+  target's first newly observed authenticated device-group message and a
+  fixed ten-minute wait (mdk#2628 D70/D89–91). Repair reuses its exact Welcome
+  and private KeyPackage, creates no Add or history offer, and stops on
+  matching device participation, expiry or terminal origin. Each successful
+  generation needs fresh activity; legacy unknown timing stays held. Only
+  behind `dev_device_groups`.
+
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
   ten-minute advisory claim to reduce competing Adds; the selected tree is
@@ -123,7 +135,7 @@
   Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
-  duplicate cleanup and delivered-Welcome resend remain deferred. Only
+  duplicate cleanup remains deferred. Only
   behind `dev_device_groups`.
 
 - Custom emoji reaction artwork is available through the bounded local

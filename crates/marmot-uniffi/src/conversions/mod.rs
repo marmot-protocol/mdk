@@ -436,6 +436,7 @@ mod tests {
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         };
 
         let page = TimelinePageFfi::from(TimelinePage {
@@ -548,6 +549,7 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);
@@ -601,6 +603,7 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         };
 
         let ffi = TimelineMessageRecordFfi::from(record);

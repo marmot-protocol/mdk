@@ -91,6 +91,11 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     ambiguous send failure (3.5f); already-handed-off fanout finishes under the ordinary transport contract.
     Carried-row settlement is separate from Ready-filtered new-send eligibility, so exact carrier outcomes settle
     even while the originating chat is unhydrated, deferred, or settling.
+    Delivered-Welcome repair reserves the actual generated carrier timestamp/id and attaches its engine association
+    through the named storage cross transaction on this session's own connection, never under the app cache's SQL
+    lock. A failed reservation or readiness callback commits neither owner. Already accepted, unprojected fanouts
+    and outstanding targets keep their association; new repair cannot bypass them. First accepted publication is
+    durably observed with its fanout before projection; an old accepted row with unknown timing stays unknown.
     The request and hand-off checks read device tags through `member_device_tag_claim_at`.
 - `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only

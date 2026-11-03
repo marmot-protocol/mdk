@@ -561,6 +561,29 @@ pub(crate) enum AccountWorkerCommand {
     TurnOffBackups {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    BeginBackupRestore {
+        words: crate::BackupRestoreWords,
+        respond: oneshot::Sender<Result<crate::BackupRestoreStatus, AppError>>,
+    },
+    CancelBackupRestore {
+        operation: crate::BackupRestoreId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    BackupRestoreStatus {
+        respond: oneshot::Sender<Result<crate::BackupRestoreStatus, AppError>>,
+    },
+    WatchBackupRestore {
+        respond: oneshot::Sender<Result<crate::BackupRestoreWatch, AppError>>,
+    },
+    HistoryImportProvenance {
+        group_id: GroupId,
+        event_id: String,
+        respond: oneshot::Sender<Result<Option<crate::HistoryImportProvenance>, AppError>>,
+    },
+    BackupHistoryAvailability {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<Vec<crate::BackupHistoryAvailability>, AppError>>,
+    },
     BackupSettings {
         respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
     },
@@ -890,6 +913,13 @@ impl AccountWorkerCommand {
                 | Self::GroupCommitDelivery { .. }
                 | Self::GroupPushDebugInfo { .. }
                 | Self::AccountDevicesActivation { .. }
+                // These read/cancel only ephemeral restore state or catalog
+                // evidence. They change no repair grant/protocol ordering.
+                | Self::CancelBackupRestore { .. }
+                | Self::BackupRestoreStatus { .. }
+                | Self::WatchBackupRestore { .. }
+                | Self::BackupHistoryAvailability { .. }
+                | Self::HistoryImportProvenance { .. }
         )
     }
 
@@ -2441,6 +2471,9 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // Ordinary transfers return the same credits used by
+                        // restore; resume only after completion released one.
+                        dispatch_backup_restore(&mut client, &media_http);
                         // A fetched history imports messages; show them, and
                         // the chat's history state, now, not at the next
                         // maintenance pass.
@@ -4464,6 +4497,7 @@ struct HistoryBlobFlights {
     upload: std::sync::atomic::AtomicBool,
     fetch: std::sync::atomic::AtomicBool,
     backup: std::sync::atomic::AtomicBool,
+    restore: std::sync::atomic::AtomicBool,
 }
 
 /// Starts the next due history upload, history fetch and backup pass on the
@@ -4545,6 +4579,44 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
                 tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
                 "backup pass deferred")
             }
+        }
+    }
+    dispatch_backup_restore(client, media_http);
+}
+
+/// Manual restoration never drives a writer pass, deletes or publication.
+/// Share the existing media credits and retain one for foreground commands.
+fn dispatch_backup_restore(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    if media_http.history_blobs.restore.load(Ordering::Relaxed)
+        || media_http.permits.available_permits() <= 1
+    {
+        return;
+    }
+    let Ok(permit) = media_http.permits.clone().try_acquire_owned() else {
+        return;
+    };
+    match client.prepare_backup_restore() {
+        Ok(Some(work)) => {
+            media_http
+                .history_blobs
+                .restore
+                .store(true, Ordering::Relaxed);
+            spawn_media_http(
+                media_http,
+                permit,
+                work.run(),
+                MediaHttpCompletion::BackupRestore,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "dispatch_backup_restore",
+                error_kind = error.privacy_safe_kind(),
+                "backup restore preparation failed"
+            )
         }
     }
 }
@@ -4650,6 +4722,7 @@ enum MediaHttpCompletion {
     HistoryUpload(crate::client::HistoryUploadOutcome),
     HistoryFetch(crate::client::HistoryFetchOutcome),
     BackupPass(crate::client::BackupPassOutcome),
+    BackupRestore(crate::client::backup_restore::BackupRestoreOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4859,6 +4932,16 @@ async fn complete_media_http(
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
+            return;
+        }
+        MediaHttpCompletion::BackupRestore(outcome) => {
+            client.finish_backup_restore(outcome);
+            drop(permit);
+            media_http
+                .history_blobs
+                .restore
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            dispatch_backup_restore(client, media_http);
             return;
         }
         MediaHttpCompletion::BackupPass(outcome) => {
@@ -6358,6 +6441,48 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::BeginBackupRestore { words, respond } => Box::pin(async move {
+            if !respond.is_closed() {
+                let result = client.begin_backup_restore(words);
+                let operation = result.as_ref().ok().and_then(|status| status.operation);
+                let delivered = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                if delivered.is_ok() && operation.is_some() {
+                    dispatch_backup_restore(client, media_http);
+                } else if let Some(operation) = operation {
+                    client.cancel_backup_restore(operation);
+                }
+            }
+            true
+        }),
+        AccountWorkerCommand::CancelBackupRestore { operation, respond } => Box::pin(async move {
+            let result = client.cancel_backup_restore(operation);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(result));
+            true
+        }),
+        AccountWorkerCommand::BackupRestoreStatus { respond } => Box::pin(async move {
+            let _ = respond.send(Ok(client.backup_restore_status()));
+            true
+        }),
+        AccountWorkerCommand::WatchBackupRestore { respond } => Box::pin(async move {
+            let _ = respond.send(Ok(client.watch_backup_restore()));
+            true
+        }),
+        AccountWorkerCommand::HistoryImportProvenance {
+            group_id,
+            event_id,
+            respond,
+        } => Box::pin(async move {
+            let result = client.history_import_provenance(&group_id, &event_id);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupHistoryAvailability { group_id, respond } => {
+            Box::pin(async move {
+                let result = client.backup_history_availability(&group_id);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
         AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
@@ -8590,6 +8715,7 @@ fn publish_device_group_changes(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    client.publish_backup_restore_availability();
     if client.take_linked_devices_changed() {
         client.refresh_device_labels();
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {

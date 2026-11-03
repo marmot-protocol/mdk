@@ -827,6 +827,30 @@ where
     /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
     /// its own retained anchor. `None` when `epoch` is neither current nor
     /// retained, or no leaf sat at that index. See
+    /// Recover immutable accepted source proof without changing its first observation.
+    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> AccountResult<()> {
+        Ok(self
+            .session
+            .recover_pending_device_group_sources(group_id)?)
+    }
+
+    /// Attribute accepted native DG sources under the current trusted roster.
+    pub fn pending_device_group_activity(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> AccountResult<
+        Vec<(
+            cgka_traits::MessageId,
+            EpochId,
+            Option<cgka_traits::app_components::DeviceSlotId>,
+        )>,
+    > {
+        Ok(self
+            .session
+            .pending_device_group_activity(group_id, roster)?)
+    }
+
     /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
@@ -5561,7 +5585,8 @@ where
                     }
                     None => pass_accepted.push(endpoints[index].0.clone()),
                 }
-                self.session.put_outbound_fanout(&fanout)?;
+                self.session
+                    .put_observed_outbound_fanout(&mut fanout, self.wall_clock.now_ms())?;
             }
             if !attempts.is_empty() {
                 // Cancelled publishes may have reached a relay. Back off their
@@ -6573,6 +6598,7 @@ fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut Acc
             group_id: application.group_id.clone(),
             app_event_id: application.app_event_id.clone(),
             message_id,
+            publication_observation: fanout.first_acceptance_observation(),
             source_epoch: application.source_epoch,
             retention: application.retention,
             authority: application.authority,
@@ -6953,6 +6979,8 @@ pub struct AccountDeviceEffects {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedApplicationMessage {
+    /// Immutable first durable acceptance observation; unavailable for legacy fanouts.
+    pub publication_observation: Option<cgka_traits::PublicationObservation>,
     pub group_id: GroupId,
     pub app_event_id: String,
     pub message_id: cgka_traits::MessageId,
@@ -7218,6 +7246,7 @@ mod tests {
 
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {
+            publication_observation: None,
             authority: None,
             group_id: GroupId::new(vec![id]),
             app_event_id: format!("event-{id}"),

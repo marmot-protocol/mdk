@@ -101,3 +101,42 @@ fn an_authority_backfill_is_queued_once_and_only_for_a_message_the_engine_holds(
         .unwrap();
     assert_eq!(queued, [(vec![0xaa], vec![0x01], b"first".to_vec())]);
 }
+
+/// Both the retained chat and a device-group association are private group
+/// data, even when a terminal local delete keeps the disband tombstone.
+#[test]
+fn terminal_local_delete_removes_sibling_welcome_timing_associations() {
+    let store = SqliteAccountStorage::in_memory_for_test().unwrap();
+    store.lock().unwrap().execute_batch(
+        "INSERT INTO cgka_groups(id, epoch, record) VALUES(x'aa', 1, x'00');
+         INSERT INTO cgka_disband_tombstones(group_id, record) VALUES(x'aa', x'00');
+         INSERT INTO account_groups(group_id_hex, endpoint, updated_at) VALUES('aa', '', 0);
+         INSERT INTO sibling_welcome_resends(welcome_id, chat_id, device_group_id, target_slot, carrier, prepared_carrier, last_carrier_created_at)
+         VALUES(x'01', x'aa', x'bb', zeroblob(32), x'11', x'11', 1),
+               (x'02', x'bb', x'aa', zeroblob(32), x'12', x'12', 1),
+               (x'03', x'bb', x'cc', zeroblob(32), x'13', x'13', 1);"
+    ).unwrap();
+    store.delete_local_group_data("aa").unwrap();
+    assert_eq!(
+        count(&store, "SELECT count(*) FROM sibling_welcome_resends"),
+        1
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM sibling_welcome_resends WHERE welcome_id=x'03'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(&store, "SELECT count(*) FROM cgka_groups WHERE id=x'aa'"),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM cgka_disband_tombstones WHERE group_id=x'aa'"
+        ),
+        1
+    );
+}

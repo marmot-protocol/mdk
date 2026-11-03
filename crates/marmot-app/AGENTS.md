@@ -146,6 +146,20 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and only blobs condemned under the pass's own key; forget other keys' rows on a due pass. Re-check the writer and key on the worker before signing
   the pointer. Take over only through `edit_roster_account_entry` over the entry read, never resent from here (D75).
   The archive key lives only in the pass: never store or log it, the words or a blob's contents.
+- Manual backup restore (`src/client/backup_restore.rs`, mdk#2628 4.4c, D93) owns one ephemeral account-worker job.
+  Never drive `BackupPass` from its manual dispatcher: that pass deletes and publishes. Use the shared read-only
+  pointer discovery and bounded media credits; retain the credit through serialized completion. Check the actual
+  selected own signature-key member at content preparation and application, fail closed on unreadable/removed/DG
+  state, and create no group/route/membership from catalog metadata. Hydrate only existing indexed candidates, never
+  an account-wide barrier. Preserve global archive ordinals before membership/expiry filtering. Incomplete pointer
+  discovery never prunes the private catalog; a positive partial view stays Partial and absence stays Unavailable.
+  Dispatch waiting restore work after the shared media completion returns its permit.
+  Import through the shared plaintext-history validator and its atomic content/key/provenance/projection boundary;
+  `HistoryImportProvenance::Backup` never invents a roster slot. Keep the optional small-state archive unused. Words,
+  entropy and archive keys stay zeroizing and job-local, drop on cancel/close/terminal completion, and never persist
+  for automatic retry. The restore watch carries only aggregate status and availability wakeups after retained
+  projection; a real later join can expose a cached hint, never an automatic join. Core timeline provenance is batched;
+  legacy `imported_from` stays sibling-only and foreign backup DTOs/controls are separate 4.4d adoption.
 - New sign-ins (`src/client/sign_ins.rs`, mdk#2628 3.2) count only what `read_account_key_package_slots` keeps under the
   inviter's rules; a live KeyPackage from the directory subscription, or a Welcome delivery the engine finds
   `NotAddressedToThisDevice` (`ingest_delivery` in `src/client/sync.rs`; also a sibling's delivery of a Welcome this
@@ -262,8 +276,23 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
-  delivered one again in these paths. Post-publication resend remains an unimplemented 3.5e follow-on under D70;
-  the current gap-filling flow does not resend a delivered Welcome. The Add spends
+  delivered one again before D70's fixed wait. `sibling_welcome_resends` owns one indexed timing row per original
+  Welcome: the first durable accepted-publication observation, then the first newly observed target-device DG
+  activity and a fixed 600-second deadline. Application, accepted member Commit and Proposal traffic qualify through immutable
+  authenticated source-epoch leaf proof and current roster keys. Native acceptance owns first local time/order in the
+  existing processed-wrapper ledger outside snapshots; app attribution never allocates or changes a stamp. Missing
+  source proof is recovered from exact ciphertext under a retained anchor, never a later occupant at the same index.
+  Empty-effect batches and ordinary maintenance project bounded proof-present work independently of unavailable proof. Replay, rewrap and later traffic never rearm or slide the wait. Each
+  successful new carrier needs fresh later activity. Persist the current roster tag key actually used to verify the
+  source leaf key with its slot: this verified DG device principal coalesces valid-app aliases across MLS leaf rekeys,
+  while a different tag-key incarnation or another device with the same inner event id remains independent. Unknown
+  earlier source proof holds only aliases of that event; current-key-unready hints never grant attribution. D91 freezes the existing local DG's epoch at upgrade; only
+  later-epoch traffic qualifies, while new local groups qualify immediately and initial delivery is unchanged.
+  Due work reuses the engine-owned Welcome/ref/expiry/origin, consumes no KeyPackage and makes no Add or history offer.
+  A current matching Update/Commit target leaf suppresses repair; the Add's tagged KeyPackage leaf alone does not.
+  Reserve the actual generated carrier timestamp and engine carrier association together before handoff, using the
+  row's prepared-carrier high-water; a backward clock holds new preparation, while an unexposed exact retry remains
+  safe. Settlement runs before accepted-fanout projection ACK, so storage failure stays replayable. The Add spends
   its handed KeyPackage whatever happens to it: a refused or failed Add, or a queued one the drain refuses, never hands
   it back.
 - Add a newly linked device to chats (mdk#2628 3.5c, D70, `src/client/linked_device_chats.rs`) only from the device that
@@ -997,6 +1026,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `media-benchmarks`: internal surface for the media transport benchmarks.
 - `test-support`: exposes `error_kind_table` to the host crates' tests and turns on `marmot-observability/test-support`
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
+
+Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
+current own-leaf admission before GET and serialized apply, cold indexed-chat hydration without loading unrelated chats,
+incomplete pointer/catalog preservation, catalog reopen/later real join, partial prefix/manual retry,
+and public worker media-capacity resumption/cancel/shutdown with real held HTTP responses. The ordinal/filter and redacted parser owners live in
+`client/backup_restore.rs`; SQLite owns atomic import/key/provenance rollback and batched timeline/conversation source
+hydration. Reuse existing archive-crypto, deletion/retention, unread, attachment and shared media-credit owners rather
+than replaying those matrices here.
 
 ## Verification
 
