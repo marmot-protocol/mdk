@@ -9,13 +9,20 @@ use std::time::Duration;
 
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
+#[cfg(feature = "test-support")]
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
 };
 use nostr_relay_builder::MockRelay;
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::TestRelay;
+#[cfg(feature = "test-support")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "test-support")]
 use tokio::net::TcpListener;
+#[cfg(feature = "test-support")]
 use tokio::sync::oneshot;
 
 fn open_store(
@@ -71,18 +78,38 @@ async fn wait_for_event<F>(
 }
 
 struct PendingMessageBatch {
-    _relay: MockRelay,
+    _relay: TestRelay,
     bob_dir: tempfile::TempDir,
     _alice_dir: tempfile::TempDir,
     relay_url: String,
+    #[cfg(feature = "test-support")]
     bob_id: String,
     group_id: GroupId,
     alice: AppClient,
+    pending_messages: Vec<String>,
 }
 
 impl PendingMessageBatch {
     fn bob_app(&self, fail_sync_before_delivery: Option<u64>) -> MarmotApp {
         open_store(&self.bob_dir, &self.relay_url, fail_sync_before_delivery)
+    }
+
+    async fn publish_pending_messages(&mut self) {
+        for message in std::mem::take(&mut self.pending_messages) {
+            self.alice
+                .send(&self.group_id, message.as_bytes())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn activate_then_publish(&mut self, bob: &mut AppClient) {
+        // These faults belong to ordinary native ingress, which remains
+        // supported with both backward pagers disabled. Establish its live
+        // subscription before publishing; cold replay may instead be admitted
+        // by the recovery runner and cannot witness native-drain faults.
+        assert!(bob.sync().await.unwrap().messages.is_empty());
+        self.publish_pending_messages().await;
     }
 }
 
@@ -95,8 +122,9 @@ async fn pending_two_message_batch() -> PendingMessageBatch {
 }
 
 async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
+    // A truthful cap lets the current-second replay reach the injected
+    // ingestion/projection fault; unknown-cap fencing is a separate contract.
+    let (relay, relay_url) = limited_relay::mock_relay().await;
 
     let bob_dir = tempfile::tempdir().unwrap();
     let home_bob = AccountHome::open(bob_dir.path());
@@ -108,8 +136,8 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     home_alice.create_account("alice").unwrap();
     let app_alice = open_store(&alice_dir, &relay_url, None);
 
-    // Boot bob once so the welcome is consumed before the failing batch. The
-    // cold second boot then drains exactly the application messages below.
+    // Consume the Welcome before preparing the failing application batch.
+    // Each test chooses live ingress or the explicit old startup-drain control.
     let app_bob_boot1 = open_store(&bob_dir, &relay_url, None);
     app_bob_boot1
         .set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -140,21 +168,20 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     .await;
     runtime_bob_boot1.shutdown().await;
 
-    for message in messages {
-        alice.send(&group_id, message.as_bytes()).await.unwrap();
-    }
-
     PendingMessageBatch {
         _relay: relay,
         bob_dir,
         _alice_dir: alice_dir,
         relay_url,
+        #[cfg(feature = "test-support")]
         bob_id,
         group_id,
         alice,
+        pending_messages: messages,
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::Sender<()>) {
     let (mut stream, _) = listener.accept().await.expect("audit tracker request");
     let mut request = [0_u8; 4096];
@@ -168,9 +195,10 @@ async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_sync_failure_returns_applied_prefix() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = batch.bob_app(Some(1));
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -211,9 +239,11 @@ async fn direct_sync_failure_returns_applied_prefix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_after_application_event_ack_replays_summary_exactly_once() {
-    let batch = pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
+    let mut batch =
+        pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
     let app_bob = open_store_with_post_ack_failure(&batch.bob_dir, &batch.relay_url);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -247,9 +277,10 @@ async fn failure_after_application_event_ack_replays_summary_exactly_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_prefix_survives_error() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -285,9 +316,10 @@ async fn native_prefix_survives_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_prefix_reports_once() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -437,9 +469,14 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     assert!(expected_groups.contains(&resumed.joined_groups[0]));
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
     let mut batch = pending_two_message_batch().await;
+    batch.publish_pending_messages().await;
+    // This fault specifically targets the old native startup drain. The new
+    // runner can admit cold history without crossing that checkpoint; default
+    // owner live-ingress and projection-prefix proofs above stay default on.
     let app_bob_boot2 = MarmotApp::try_with_relays_and_account_home_and_config(
         batch.bob_dir.path(),
         vec![batch.relay_url.clone()],
@@ -448,7 +485,8 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_fail_sync_before_delivery(1),
     )
-    .unwrap();
+    .unwrap()
+    .with_recovery_runner_ownership_for_test(false);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2);
     let mut events_bob_boot2 = runtime_bob_boot2.subscribe();
     let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

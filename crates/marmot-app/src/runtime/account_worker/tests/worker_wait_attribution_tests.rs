@@ -76,6 +76,9 @@ impl QueryPolicy for HeldBroadRequest {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::disallowed_methods)]
 async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadRequest::default();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(gate.clone()));
@@ -89,7 +92,8 @@ async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.publish_key_package(&account.label).await.unwrap();

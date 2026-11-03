@@ -118,6 +118,9 @@ async fn receive_selected_comparison_shutdown_reaps_held_request() {
 }
 
 async fn run_receive_selected_comparison(shutdown_while_held: bool) {
+    // This fixture owns the retained comparison owner contract, independently
+    // of the runner-owned production default.
+
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldExact::default();
     let _release_on_drop = ReleaseOnDrop(gate.clone());
@@ -148,7 +151,8 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_settlement_quiescence_ms(100)
         .with_dev_epoch_backfill_retry_backoff_ms(100);
-    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone())
+        .with_recovery_runner_ownership_for_test(false);
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -214,7 +218,8 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     drop(runtime);
     drop(app);
 
-    let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url, config)
+        .with_recovery_runner_ownership_for_test(false);
     // Both clients resume a trusted tail: the one-shot sender must not warm
     // the shared SDK cache with the receiver's comparison-only candidate.
     for label in [&alice.label, &bob.label] {

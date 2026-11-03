@@ -9237,6 +9237,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-policy-overrides")]
     async fn due_convergence_interleaves_with_a_backlog_of_worker_commands() {
+        // This fixture owns the retained comparison owner contract, independently
+        // of the runner-owned production default.
+
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let alice = home.create_account("alice").unwrap();
@@ -9250,6 +9253,7 @@ mod tests {
                 .with_dev_scheduled_convergence_delay_ms(60_000)
                 .with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());

@@ -1084,8 +1084,9 @@ than replaying those matrices here.
 
 ```sh
 cargo test -p marmot-app
-# Retained comparison-owner cursor characterization (existing test-support selector):
-cargo nextest run -p marmot-app --test since_floor --features test-support,test-policy-overrides
+# Retained comparison-owner cursor and native startup-prefix characterizations:
+# Other partial-summary cases use the production default, including live ingress.
+cargo nextest run -p marmot-app --test since_floor --test partial_sync_summary --features test-support,test-policy-overrides
 # Accelerated recovery/retry scenarios (also enabled by workspace CI):
 cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):
