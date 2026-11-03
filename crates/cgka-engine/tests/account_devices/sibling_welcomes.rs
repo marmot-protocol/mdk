@@ -498,6 +498,10 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
         &gid,
     )
     .await;
+    // A real other account follows the original selected Remove branch.
+    // It will later author the longer branch that contains no returning leaf.
+    assert_accepted(&mut alice, &ordinary, &gid).await;
+    assert_accepted(&mut alice, &child, &gid).await;
     let SendResult::Proposal { msg } = laptop
         .engine
         .send(SendIntent::Leave {
@@ -585,6 +589,24 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
             .unwrap(),
         None
     );
+    let before_return_epoch = phone.engine.epoch(&gid).unwrap();
+    assert_eq!(before_return_epoch, alice.engine.epoch(&gid).unwrap());
+    let without_return = send_commit(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    let without_return_child = send_commit(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
     let added = send_commit(
         &mut tablet,
         add_own_devices(&gid, vec![tablet_replacement]),
@@ -611,6 +633,37 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
             .unwrap()
             .self_removed_sibling_slots
             .is_empty()
+    );
+    // The selected return above has ended the current-membership hold.
+    // A longer real fork starts before it and removes that leaf from the
+    // selected tree, but contains no newly applied SelfRemove.
+    phone.engine.ingest(without_return).await.unwrap();
+    phone.engine.ingest(without_return_child).await.unwrap();
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        alice.engine.epoch(&gid).unwrap(),
+        "the longer branch must really be selected"
+    );
+    assert_eq!(
+        load_group(&phone, &gid).epoch_authenticator().as_slice(),
+        load_group(&alice, &gid).epoch_authenticator().as_slice(),
+        "matching epochs alone do not prove matching selected trees"
+    );
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        None,
+        "a historical anchor must not revive a hold ended by a selected return"
     );
 }
 

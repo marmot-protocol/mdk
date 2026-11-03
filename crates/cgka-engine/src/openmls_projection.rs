@@ -3169,7 +3169,6 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
             profile_policy,
             Some(acceptance),
         )?;
-        update_group_record_from_replay(storage, group_id, &output)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
         Ok(OpenMlsApplyOutput {
             observations: output.observations,
@@ -3264,12 +3263,15 @@ fn update_group_record_from_replay<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     output: &OpenMlsReplayOutput,
+    current_departures: &BTreeSet<cgka_traits::app_components::DeviceSlotId>,
+    final_context: Option<&crate::membership_effects::SiblingSelfRemovalContext>,
 ) -> Result<(), OpenMlsProjectionError> {
-    let mut group = match storage.get_group(group_id) {
-        Ok(group) => group,
-        Err(StorageError::NotFound) => return Ok(()),
-        Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
-    };
+    let mut group = storage.get_group(group_id)?;
+    // A restored anchor or checkpoint cannot revive current-membership
+    // knowledge that a later selected return already ended.
+    group
+        .self_removed_sibling_slots
+        .clone_from(current_departures);
     group.epoch = EpochId(output.final_epoch);
     group.members = output.final_members.clone();
 
@@ -3286,6 +3288,13 @@ fn update_group_record_from_replay<S: StorageProvider>(
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
+        // Intermediate retained anchors keep the accumulator intact; only the
+        // final selected tree may end a departure hold.
+        if !group.self_removed_sibling_slots.is_empty()
+            && let Some(context) = final_context
+        {
+            context.clear_present(&mls_group, &mut group);
+        }
         crate::capability_manager::check_own_leaf_of_group(&mls_group).map_err(|e| {
             OpenMlsProjectionError::Replay(format!("check post-replay own leaf: {e}"))
         })?;
@@ -3855,18 +3864,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             {
                 return Err(OpenMlsProjectionError::CheckpointStateMismatch);
             }
-            if retain_replayed_anchors.is_some()
-                && (sibling_context.is_some() || !self_removed_slots.is_empty())
-            {
-                self_removed_slots.extend(storage.get_group(group_id)?.self_removed_sibling_slots);
-                if !self_removed_slots.is_empty() {
-                    let mut record = storage.get_group(group_id)?;
-                    record
-                        .self_removed_sibling_slots
-                        .extend(self_removed_slots.iter().copied());
-                    storage.put_group(&record)?;
-                }
-            }
             epoch_authenticators.insert(mls_group.epoch().as_u64(), actual_authenticator);
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,
@@ -3888,7 +3885,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     epoch_authenticators: BTreeMap::new(),
                     roster_tag_keys: Vec::new(),
                 };
-                update_group_record_from_replay(storage, group_id, &intermediate)?;
+                update_group_record_from_replay(
+                    storage,
+                    group_id,
+                    &intermediate,
+                    &self_removed_slots,
+                    None,
+                )?;
                 retain_current_group_epoch_snapshot(storage, group_id, max_rewind)?;
             }
             continue;
@@ -4222,14 +4225,13 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         epoch_authenticators: BTreeMap::new(),
                         roster_tag_keys: Vec::new(),
                     };
-                    if !self_removed_slots.is_empty() {
-                        let mut record = storage.get_group(group_id)?;
-                        record
-                            .self_removed_sibling_slots
-                            .extend(self_removed_slots.iter().copied());
-                        storage.put_group(&record)?;
-                    }
-                    update_group_record_from_replay(storage, group_id, &intermediate)?;
+                    update_group_record_from_replay(
+                        storage,
+                        group_id,
+                        &intermediate,
+                        &self_removed_slots,
+                        None,
+                    )?;
                     retain_current_group_epoch_snapshot(
                         storage,
                         group_id,
@@ -4338,22 +4340,24 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
         }
     }
-    if retain_replayed_anchors.is_some() && !self_removed_slots.is_empty() {
-        let mut record = storage.get_group(group_id)?;
-        record.self_removed_sibling_slots.extend(self_removed_slots);
-        if let Some(context) = sibling_context {
-            context.clear_present(&mls_group, &mut record);
-        }
-        storage.put_group(&record)?;
-    }
-    Ok(OpenMlsReplayOutput {
+    let output = OpenMlsReplayOutput {
         observations,
         group_changes,
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
         epoch_authenticators,
         roster_tag_keys,
-    })
+    };
+    if retain_replayed_anchors.is_some() {
+        update_group_record_from_replay(
+            storage,
+            group_id,
+            &output,
+            &self_removed_slots,
+            sibling_context,
+        )?;
+    }
+    Ok(output)
 }
 
 fn marmot_members(group: &MlsGroup) -> Vec<Member> {
