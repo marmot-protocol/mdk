@@ -10487,6 +10487,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(AuditLogSettings { enabled: true })
             .unwrap();
@@ -11203,6 +11204,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_a = client.create_group("demand a", &[]).await.unwrap();

@@ -2129,6 +2129,7 @@ fn failed_epoch_backfill_attempt_retains_one_correlated_retry() {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
             .unwrap();
@@ -2279,6 +2280,7 @@ async fn armed_epoch_backfill(
         .unwrap();
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
@@ -2747,11 +2749,12 @@ fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_owner(
             &dir,
             &relay,
             bounded_epoch_backfill_config(),
             filled_through,
+            Some(false),
         )
         .await;
         let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
@@ -2829,11 +2832,12 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_owner(
             &dir,
             &relay,
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(60_000),
             filled_through,
+            Some(false),
         )
         .await;
         client
@@ -2932,11 +2936,12 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         // inside this test.
         let config =
             MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_owner(
             &dir,
             &relay,
             config,
             filled_through,
+            Some(false),
         )
         .await;
 
@@ -3055,11 +3060,12 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
         // inside this test.
         let config =
             MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
-        let (_app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+        let (_app, mut client, route) = group_at_the_undecryptable_retention_cap_with_owner(
             &dir,
             &relay,
             config,
             filled_through,
+            Some(false),
         )
         .await;
 
@@ -3182,11 +3188,12 @@ fn capacity_pressure_is_scoped_to_the_refused_group() {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_owner(
             &dir,
             &relay,
             bounded_epoch_backfill_config(),
             filled_through,
+            Some(false),
         )
         .await;
         let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
@@ -3263,8 +3270,13 @@ fn qualified_local_evidence_survives_reopen_without_replaying_or_reporting_twice
 async fn verify_qualified_local_escalation(reopen: bool, qualified: bool) {
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let (app, mut client, route) =
-        undecryptable_probe_route(&dir, &relay, bounded_epoch_backfill_config()).await;
+    let (app, mut client, route) = undecryptable_probe_route_with_owner(
+        &dir,
+        &relay,
+        bounded_epoch_backfill_config(),
+        Some(false),
+    )
+    .await;
     let epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
     for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
@@ -3356,7 +3368,8 @@ fn recovery_reopen_preserves_pending_debt_and_the_retry_deadline() {
         let config = bounded_epoch_backfill_config()
             .with_dev_epoch_backfill_retry_backoff_ms(60_000)
             .with_dev_epoch_stall_wedge_rearm_interval_ms(10 * 60 * 1_000);
-        let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        let (app, mut client, route) =
+            undecryptable_probe_route_with_owner(&dir, &relay, config, Some(false)).await;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let probe_base = crate::unix_now_seconds() - 1_000;
 
@@ -13774,13 +13787,14 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
 
 #[test]
 fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
-    run_composed_app_runtime_test("delivery-overflow-cursor-fence", || async {
+    async fn case(owns: bool) {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(owns)
             .with_test_relay_client(relay.clone());
         app.relay_plane =
             MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
@@ -13961,20 +13975,58 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             .await
             .unwrap();
         drop(grant);
-        assert!(
+        assert_eq!(
             storage
                 .account_delivery_recovery("alice")
                 .unwrap()
-                .is_some()
+                .is_some(),
+            !owns,
+            "only the old owner creates its legacy recovery-demand pointer"
         );
+        let owes_omission = || {
+            let route = storage_sqlite::TransportReconciliationRoute::Group(
+                hex::decode(&nostr_group_id_hex)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
+            storage
+                .recovery_coverage_debt(&route, &["wss://relay.example".into()], unix_now_seconds())
+                .unwrap()
+                .iter()
+                .any(|range| {
+                    range.since_seconds <= omitted_timestamp
+                        && omitted_timestamp <= range.until_seconds
+                })
+        };
+        if owns {
+            assert!(
+                owes_omission(),
+                "the runner must persist debt for the omitted timestamp without a legacy demand"
+            );
+        }
         assert_eq!(
             app.load_state("alice").unwrap().last_transport_timestamp,
             Some(cursor_before)
         );
         drop(client);
         let reopened = client_on_app_relay_plane(&app, "alice").await;
-        assert!(reopened.delivery_overflow_recovery_pending);
+        assert!(
+            reopened.delivery_overflow_recovery_pending,
+            "queued loss still holds the local guard until its serialized handoff settles"
+        );
         assert_eq!(reopened.state.last_transport_timestamp, Some(cursor_before));
+        if owns {
+            assert!(
+                owes_omission(),
+                "unfetched loss remains durable ledger debt across reopen"
+            );
+        }
+    }
+    run_composed_app_runtime_test("delivery-overflow-cursor-fence", || async {
+        for owns in [false, true] {
+            case(owns).await;
+        }
     });
 }
 
@@ -21537,7 +21589,19 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
     config: MarmotAppConfig,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
-    let (app, mut client, route) = undecryptable_probe_route(dir, relay, config).await;
+    group_at_the_undecryptable_retention_cap_with_owner(dir, relay, config, filled_through, None)
+        .await
+}
+
+async fn group_at_the_undecryptable_retention_cap_with_owner(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+    filled_through: u64,
+    owner: Option<bool>,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let (app, mut client, route) =
+        undecryptable_probe_route_with_owner(dir, relay, config, owner).await;
     for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
         client
             .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))

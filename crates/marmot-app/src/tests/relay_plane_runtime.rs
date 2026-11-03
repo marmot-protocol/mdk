@@ -520,7 +520,8 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
         dir.path(),
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
+    )
+    .with_recovery_runner_ownership_for_test(false);
     let storage = app.account_storage(&alice.label).unwrap();
     // Other live REQs have a settled floor newer than the Welcome below.
     let mut state = app.load_state(&alice.label).unwrap();
@@ -711,7 +712,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
 
     // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
     {
-        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
         let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
         client.publish_key_package().await.unwrap();
         client.sync().await.unwrap();
@@ -721,7 +723,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
 
     // Alice invites Bob, then renames the group before he is back.
     let alice_app =
-        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
     let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
     let group = alice
         .create_group_with_options(
@@ -748,7 +751,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     while crate::unix_now_seconds() < resume_at + 1 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config())
+        .with_recovery_runner_ownership_for_test(false);
     bob_app.relay_plane =
         MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
     let mut state = bob_app.load_state("bob").unwrap();
@@ -878,7 +882,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
 
     // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
     {
-        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
+        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
         let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
         client.publish_key_package().await.unwrap();
         client.sync().await.unwrap();
@@ -888,7 +893,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
 
     // Alice invites Bob, then writes to the group before he is back.
     let alice_app =
-        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
+        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config())
+            .with_recovery_runner_ownership_for_test(false);
     let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
     let group = alice
         .create_group_with_options(
@@ -913,7 +919,8 @@ async fn a_commit_before_the_post_join_req_still_delivers_the_joiners_history() 
     while crate::unix_now_seconds() < resume_at + 1 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
+    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config())
+        .with_recovery_runner_ownership_for_test(false);
     bob_app.relay_plane =
         MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
     let mut state = bob_app.load_state("bob").unwrap();
