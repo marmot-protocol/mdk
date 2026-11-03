@@ -10743,7 +10743,10 @@ mod retired_loss_observation_tests {
         crate::AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
+        // This case rearms the old obligation's cursor fence; the runner
+        // imports loss as ledger debt and releases that raw handoff instead.
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
