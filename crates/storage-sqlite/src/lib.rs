@@ -108,6 +108,9 @@ pub use app::chat_presentation::{
     PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
     PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
+pub use app::device_group_moves::{
+    DeviceGroupMovePhase, DeviceGroupMoveRecord, MoveCarryOutcome, MoveRejectedSlot, MoveSibling,
+};
 pub use app::device_groups::{DeviceGroupRecord, DeviceGroupTrust};
 pub use app::device_links::{DeviceLinkOutcome, DeviceLinkRecord};
 pub use app::device_removals::DeviceRemovalRecord;

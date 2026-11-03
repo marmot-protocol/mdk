@@ -393,3 +393,147 @@ async fn a_device_signs_every_leaf_with_its_one_signature_key() {
         assert_eq!(node.signature_key, device.engine.own_signature_key());
     }
 }
+
+/// The actual authenticated encrypted join and expectation/Joined write are
+/// one native transaction. Join alone never changes the trusted namespace.
+#[tokio::test]
+async fn a_move_welcome_joins_without_cutting_original_trust() {
+    use storage_sqlite::{
+        DeviceGroupMovePhase, DeviceGroupRecord, DeviceGroupTrust, FirstTrustedRoster, SqlCipherKey,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("move.db");
+    let key = SqlCipherKey::raw([0x76; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut moving = super::device_roster::roster_device_on(storage, b"alice");
+    let mut original_creator = roster_device(b"alice");
+    let mut destination_creator = roster_device(b"alice");
+    let original = GroupId::new(vec![0x41; 17]);
+    let original_package = moving.engine.fresh_key_package().await.unwrap();
+    let original_ref = hex::encode(key_package_ref(&original_package));
+    expect_link_welcome(&mut moving, &original, &original_creator, &original_package);
+    let (_, created) = create_under(
+        &mut original_creator,
+        &roster(&[(1, "Original"), (2, "Moving")]),
+        vec![original_package],
+        &original,
+    )
+    .await
+    .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("founding Welcome")
+    };
+    assert_joins(&mut moving, &welcomes[0], &original, &original_creator).await;
+    let app = moving.storage.app_storage();
+    let original_hex = hex::encode(original.as_slice());
+    app.insert_device_group(&DeviceGroupRecord {
+        group_id_hex: original_hex.clone(),
+        trust: DeviceGroupTrust::AwaitingWelcome,
+        key_package_ref_hex: Some(original_ref.clone()),
+        recorded_at: 10,
+    })
+    .unwrap();
+    app.trust_device_group(
+        &original_hex,
+        DeviceGroupTrust::AwaitingWelcome,
+        DeviceGroupTrust::Linked,
+        None,
+        11,
+        &FirstTrustedRoster {
+            own: &[],
+            roster: &[],
+            now: 11,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let destination_package = moving.engine.fresh_key_package().await.unwrap();
+    expect_link_welcome(
+        &mut moving,
+        &chosen(),
+        &destination_creator,
+        &destination_package,
+    );
+    let mut expected = expectation_of(&moving).unwrap();
+    expected.expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    moving
+        .engine
+        .expect_device_group_welcome(&expected)
+        .unwrap();
+    assert!(
+        app.prepare_device_group_move(&expected, &slot(2), 12)
+            .unwrap()
+    );
+    let welcome = found_under_chosen(&mut destination_creator, destination_package).await;
+    let fault = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &fault,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    fault.execute_batch("CREATE TRIGGER fail_move_join BEFORE UPDATE OF phase ON device_group_moves WHEN NEW.phase = 1 BEGIN SELECT RAISE(ABORT, 'native move joined checkpoint failed'); END;").unwrap();
+    let failed = moving.engine.ingest(welcome.clone()).await;
+    assert!(
+        matches!(failed, Err(EngineError::Storage(cgka_traits::storage::StorageError::Backend(ref message))) if message.contains("native move joined checkpoint failed")),
+        "{failed:?}"
+    );
+    assert!(!holds(&moving, &chosen()));
+    assert!(holds(&moving, &original));
+    assert_eq!(expectation_of(&moving), Some(expected));
+    assert_eq!(
+        app.device_group_move(&chosen()).unwrap().unwrap().phase,
+        DeviceGroupMovePhase::Waiting
+    );
+    assert_eq!(
+        app.device_group(&original_hex).unwrap().unwrap().trust,
+        DeviceGroupTrust::Linked
+    );
+    fault.execute_batch("DROP TRIGGER fail_move_join").unwrap();
+    assert_joins(&mut moving, &welcome, &chosen(), &destination_creator).await;
+    let movement = app.device_group_move(&chosen()).unwrap().unwrap();
+    assert_eq!(movement.phase, DeviceGroupMovePhase::Joined);
+    assert_eq!(movement.original_key_package_ref_hex, original_ref);
+    assert!(expectation_of(&moving).is_none());
+    assert_eq!(
+        app.device_group(&hex::encode(chosen().as_slice()))
+            .unwrap()
+            .unwrap()
+            .trust,
+        DeviceGroupTrust::AwaitingWelcome
+    );
+    assert_eq!(
+        app.device_groups()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.trust.is_trusted())
+            .map(|row| row.group_id_hex)
+            .collect::<Vec<_>>(),
+        vec![original_hex.clone()]
+    );
+    drop(app);
+    drop(moving);
+    drop(fault);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut reopened = super::device_roster::roster_device_on(storage, b"alice");
+    reopened.engine.hydrate_all_stored_groups().unwrap();
+    assert!(holds(&reopened, &original));
+    assert!(holds(&reopened, &chosen()));
+    let app = reopened.storage.app_storage();
+    assert_eq!(app.device_group_move(&chosen()).unwrap().unwrap(), movement);
+    assert_eq!(
+        app.device_group(&original_hex).unwrap().unwrap().trust,
+        DeviceGroupTrust::Linked
+    );
+    assert_eq!(
+        app.device_group(&hex::encode(chosen().as_slice()))
+            .unwrap()
+            .unwrap()
+            .trust,
+        DeviceGroupTrust::AwaitingWelcome
+    );
+}
