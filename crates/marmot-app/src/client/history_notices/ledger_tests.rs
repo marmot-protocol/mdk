@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use cgka_traits::GroupId;
 use storage_sqlite::{
-    RecoveryCause, RecoveryConversionInput, RecoveryConversionRoute, RecoveryDemandTicket,
-    RecoveryUnitOutcome, RecoveryUnitState, SqliteAppStorage, TransportReconciliationRoute,
+    RecoveryCause, RecoveryDemandTicket, RecoveryUnitOutcome, RecoveryUnitState, SqliteAppStorage,
+    TransportReconciliationRoute,
 };
 
 use super::park_recovery_for_test;
@@ -31,11 +31,7 @@ fn app(dir: &tempfile::TempDir, gate: bool) -> MarmotApp {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), RELAY)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    if gate {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    }
+    app.with_recovery_runner_ownership_for_test(gate)
 }
 
 /// One account with one group, its client opened directly, and the group's
@@ -592,7 +588,7 @@ async fn the_status_reports_what_the_runner_catches_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_conversion_that_changed_the_notices_is_announced_once() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut client, app, group, route) = fixture(&dir, true).await;
+    let (mut client, app, group, route) = fixture(&dir, false).await;
     client.take_history_notice_changes();
     park(&app, &route);
     app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
@@ -607,26 +603,21 @@ async fn a_conversion_that_changed_the_notices_is_announced_once() {
     park_recovery_for_test(&client.app.account_storage("alice").unwrap(), loss);
     assert_eq!(
         client.take_history_notice_changes(),
-        Some(vec![group.clone()])
+        Some(Vec::new()),
+        "the old owner's account-wide loss is not yet a ledger group notice"
     );
 
-    let now = crate::unix_now_seconds();
-    let routes = client
-        .recovery_runner_routes()
-        .into_iter()
-        .map(|route| RecoveryConversionRoute {
-            route: route.route,
-            required_relays: route.required,
-            standing_floor_seconds: now - DAY,
-        })
-        .collect::<Vec<_>>();
-    app.convert_recovery_obligations(&RecoveryConversionInput {
-        routes: &routes,
-        canonical_relay: &|relay| relay.to_owned(),
-        retention_floor_seconds: now - DAY,
-        now_seconds: now,
-    })
-    .unwrap();
+    // Stage the old owner's parked loss before the production open-time
+    // conversion. An already-owned fixture has converted on its first open.
+    let owner = client.app.clone();
+    owner
+        .relay_plane
+        .deactivate_account_context(client.adapter.account_id())
+        .await
+        .unwrap();
+    drop(client);
+    let owner = owner.with_recovery_runner_ownership_for_test(true);
+    let mut client = client_on_app_relay_plane(&owner, "alice").await;
     assert!(!app.recovery_conversion_pending().unwrap());
     assert!(app.recovery_conversion_notices_changed().unwrap());
     let notices = client.history_notices().unwrap();

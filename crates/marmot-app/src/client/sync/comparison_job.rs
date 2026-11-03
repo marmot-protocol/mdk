@@ -2069,7 +2069,9 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // This module retains the legacy grant executor's contract until removal.
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         if audited {
             app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })

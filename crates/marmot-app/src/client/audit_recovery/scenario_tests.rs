@@ -33,7 +33,9 @@ async fn fixture() -> Fixture {
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
+    // These rows describe the legacy authorization/inline-executor contract.
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();

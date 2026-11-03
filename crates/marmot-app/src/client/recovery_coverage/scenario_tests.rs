@@ -77,11 +77,7 @@ pub(in crate::client) async fn fixture_on(
         relay.clone(),
         app.config.allow_loopback_relay_endpoints,
     );
-    let app = if runner_owns_debt {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    };
+    let app = app.with_recovery_runner_ownership_for_test(runner_owns_debt);
     *relay.stored_before_eose.lock().unwrap() = stored;
     let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
