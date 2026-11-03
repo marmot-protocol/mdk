@@ -96,7 +96,12 @@ impl<S: StorageProvider> Engine<S> {
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        let sibling_context = self.sibling_self_removal_context(&group_id)?;
+        let has_pending_commit = mls_group.pending_commit().is_some();
+        let sibling_context = if has_pending_commit {
+            self.sibling_self_removal_context(&group_id)?
+        } else {
+            None
+        };
         let self_removed_slots = mls_group
             .pending_commit()
             .map(|staged| {
@@ -106,7 +111,6 @@ impl<S: StorageProvider> Engine<S> {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        let has_pending_commit = mls_group.pending_commit().is_some();
         let previous_membership = self.canonical_membership_snapshot(&group_id)?;
         let activity_before =
             crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(&mls_group);
