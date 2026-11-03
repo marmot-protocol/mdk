@@ -445,6 +445,11 @@ async fn directory_ingress_authenticates_before_writing_either_store() {
         );
         let mut tampered = newer.clone();
         tampered.id = initial.id.clone();
+        tampered.sig = initial.sig.clone();
+        let parsed =
+            nostr::event::Event::from_json(serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(!parsed.verify_id());
+        assert!(parsed.verify_signature());
         let mut invalid_signature = newer.clone();
         invalid_signature.sig = Some("00".repeat(64));
         for invalid in [tampered, invalid_signature] {

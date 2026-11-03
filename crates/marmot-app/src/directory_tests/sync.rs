@@ -301,6 +301,9 @@ async fn live_directory_forgery_cannot_change_persisted_metadata() {
             for (old, valid) in initial.iter().zip(&newer) {
                 let mut tampered = valid.clone();
                 tampered.id = old.id;
+                tampered.sig = old.sig;
+                assert!(!tampered.verify_id());
+                assert!(tampered.verify_signature());
                 batch.push(tampered);
                 let mut invalid_signature = valid.clone();
                 invalid_signature.sig = nostr::event::Signature::from_byte_array([0; 64]);
