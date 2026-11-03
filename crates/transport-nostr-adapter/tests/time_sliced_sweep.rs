@@ -232,6 +232,90 @@ async fn sweep_pages_a_strfry_relay_and_resolves_a_saturated_second() {
     assert_eq!(fixture.limit.stats().max_req_limit_seen, 500);
 }
 
+/// A relay's full raw page can lose an event at SDK validation. Its 499
+/// accepted events are not a below-cap certificate: every one of the 1,200
+/// valid historical events must still be swept and admitted exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filtered_full_page_still_owes_all_valid_history() {
+    let fixture = Fixture::new().await;
+    let keys = Keys::generate();
+    let events = (0..1_200)
+        .map(|n| group_event(&keys, GROUP, T0 + n as u64 * DAY / 1_200, n))
+        .collect::<Vec<_>>();
+    let wanted = events.iter().map(|event| event.id).collect::<HashSet<_>>();
+    fixture.store(&events).await;
+    let mut invalid = group_event(&keys, GROUP, T0 + DAY - 1, 1_200);
+    invalid.sig = group_event(&keys, GROUP, T0 + DAY - 2, 1_201).sig;
+    assert!(
+        invalid.verify().is_err(),
+        "the fixture must be filtered by SDK validation"
+    );
+    // The database fixture bypasses publish-time validation, as a relay may
+    // return malformed historical data to an otherwise valid query.
+    fixture.store(&[invalid]).await;
+    let relay = fixture.relay();
+    let reply = relay
+        .fetch_slice(SliceQuery {
+            route: SweepRoute::Group {
+                nostr_group_id: GROUP,
+            },
+            since: T0,
+            until: T0 + DAY - 1,
+            limit: Some(500),
+        })
+        .await;
+    match reply {
+        SliceReply::Answered {
+            events,
+            received,
+            more,
+        } => {
+            assert_eq!(received, 500, "raw page fullness survives validation");
+            assert_eq!(events.len(), 499, "exactly one raw event was filtered");
+            assert!(!more, "strfry supplies no more hint to rescue the proof");
+        }
+        other => panic!("expected a filtered full reply, got {other:?}"),
+    }
+    let store = MemoryStore::default();
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(range()),
+        &relay,
+        &mut sink,
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
+    assert!(
+        report.stats.halvings > 0,
+        "a full page cannot certify the entire window"
+    );
+    assert_once_in_order(&sink, &wanted);
+    assert_eq!(report.covered.first().unwrap().since, T0);
+    assert_eq!(report.covered.last().unwrap().until, T0 + DAY - 1);
+    for pair in report.covered.windows(2) {
+        assert_eq!(
+            pair[0].until + 1,
+            pair[1].since,
+            "coverage has no missing strip"
+        );
+    }
+    let again = run_sweep(
+        request(range()),
+        &relay,
+        &mut Sink::default(),
+        &store,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(again.end, SweepEnd::Finished);
+    assert_eq!(
+        again.stats.requests, 0,
+        "completed cursor never refetches the range"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sweep_resumes_over_the_wire_without_refetching() {
     let fixture = Fixture::new().await;
