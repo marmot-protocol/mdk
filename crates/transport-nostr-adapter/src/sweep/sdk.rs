@@ -410,19 +410,49 @@ mod tests {
         }
         for (input, expected) in [
             (AcquisitionEnd::Completed, End::Complete),
-            (AcquisitionEnd::Rejected("restricted: private diagnostic".into()), End::Closed(Some(Category::Restricted))),
-            (AcquisitionEnd::RelayClosed("private diagnostic".into()), End::Closed(None)),
-            (AcquisitionEnd::AuthenticationFailed, End::Closed(Some(Category::AuthRequired))),
+            (
+                AcquisitionEnd::Rejected("restricted: private diagnostic".into()),
+                End::Closed(Some(Category::Restricted)),
+            ),
+            (
+                AcquisitionEnd::RelayClosed("private diagnostic".into()),
+                End::Closed(None),
+            ),
+            (
+                AcquisitionEnd::AuthenticationFailed,
+                End::Closed(Some(Category::AuthRequired)),
+            ),
             (AcquisitionEnd::ItemBudgetExceeded, End::Cut),
             (AcquisitionEnd::ByteBudgetExceeded, End::Cut),
             (AcquisitionEnd::ExitLimitReached, End::Cut),
-            (AcquisitionEnd::TimedOut, End::Unreachable(UnreachableKind::TimedOut)),
-            (AcquisitionEnd::Disconnected, End::Unreachable(UnreachableKind::Disconnected)),
-            (AcquisitionEnd::Cancelled, End::Unreachable(UnreachableKind::Disconnected)),
-            (AcquisitionEnd::ReceiveLoss(7), End::Unreachable(UnreachableKind::Disconnected)),
-            (AcquisitionEnd::InvalidMessage, End::Unreachable(UnreachableKind::Disconnected)),
-            (AcquisitionEnd::ReceiverClosed, End::Unreachable(UnreachableKind::Disconnected)),
-            (AcquisitionEnd::Failed(nostr_sdk::error::Error::other("private diagnostic")), End::Unreachable(UnreachableKind::Disconnected)),
+            (
+                AcquisitionEnd::TimedOut,
+                End::Unreachable(UnreachableKind::TimedOut),
+            ),
+            (
+                AcquisitionEnd::Disconnected,
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
+            (
+                AcquisitionEnd::Cancelled,
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
+            (
+                AcquisitionEnd::ReceiveLoss(7),
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
+            (
+                AcquisitionEnd::InvalidMessage,
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
+            (
+                AcquisitionEnd::ReceiverClosed,
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
+            (
+                AcquisitionEnd::Failed(nostr_sdk::error::Error::other("private diagnostic")),
+                End::Unreachable(UnreachableKind::Disconnected),
+            ),
         ] {
             let actual = match failed_end(input) {
                 Ok(()) => End::Complete,
@@ -439,14 +469,27 @@ mod tests {
     async fn an_endpoint_missing_from_the_pool_stays_unreachable() {
         let sdk = NostrSdkRelayClient::from_builder(Client::builder());
         let relay = SdkSweepRelay::new(
-            &sdk, RelayUrl::parse("wss://missing.example.com").unwrap(),
-            RelayCaps { max_limit: Some(500), negentropy: true }, Duration::from_secs(1),
+            &sdk,
+            RelayUrl::parse("wss://missing.example.com").unwrap(),
+            RelayCaps {
+                max_limit: Some(500),
+                negentropy: true,
+            },
+            Duration::from_secs(1),
         );
         assert!(sdk.client().relays().all().await.is_empty());
-        let route = SweepRoute::Group { nostr_group_id: [7; 32] };
+        let route = SweepRoute::Group {
+            nostr_group_id: [7; 32],
+        };
         let range = SweepRange { since: 1, until: 2 };
-        assert!(matches!(CompareRelay::compare(&relay, route, range, &[], 5).await, CompareReply::Unreachable(UnreachableKind::Disconnected)));
-        assert!(matches!(relay.fetch_second(route, 1, Some(500)).await, SecondReply::Unreachable(UnreachableKind::Disconnected)));
+        assert!(matches!(
+            CompareRelay::compare(&relay, route, range, &[], 5).await,
+            CompareReply::Unreachable(UnreachableKind::Disconnected)
+        ));
+        assert!(matches!(
+            relay.fetch_second(route, 1, Some(500)).await,
+            SecondReply::Unreachable(UnreachableKind::Disconnected)
+        ));
         assert!(sdk.client().relays().all().await.is_empty());
         sdk.shutdown().await;
     }
