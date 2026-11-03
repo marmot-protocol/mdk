@@ -138,11 +138,7 @@ impl GatedWorker {
                 crate::unix_now_seconds() - HOUR,
             )
             .unwrap();
-        let app = if gate {
-            app.with_recovery_runner_owning_debt()
-        } else {
-            app
-        };
+        let app = app.with_recovery_runner_ownership_for_test(gate);
         let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
         let credits = runtime
             .shared_services()

@@ -2669,7 +2669,8 @@ mod tests {
             fixture._dir.path(),
             url,
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
         fixture.client.test_comparison_results = None;
         fixture.client.request_bounded_comparison().unwrap();
@@ -3049,7 +3050,8 @@ mod tests {
             fixture._dir.path(),
             proxy.url.clone(),
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
         fixture.client.test_comparison_results = None;
         assert!(
@@ -3425,7 +3427,8 @@ mod tests {
             fixture._dir.path(),
             proxy.url.clone(),
             crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-        );
+        )
+        .with_recovery_runner_ownership_for_test(false);
         // Persist the actual inbox before opening Alice: a saved kind-10050
         // declaration takes precedence over the app's constructor default.
         real_app

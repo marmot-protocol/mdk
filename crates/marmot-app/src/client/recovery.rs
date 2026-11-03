@@ -3813,6 +3813,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("maintenance", &[]).await.unwrap();
@@ -4205,6 +4206,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("maintenance", &[]).await.unwrap();
@@ -4694,6 +4696,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("retirement", &[]).await.unwrap();
@@ -4837,6 +4840,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
@@ -4997,6 +5001,7 @@ mod tests {
             crate::MarmotAppConfig::white_noise()
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5069,6 +5074,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5162,6 +5168,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5373,6 +5380,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -5516,6 +5524,7 @@ mod tests {
             crate::tests::bounded_epoch_backfill_config()
                 .with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let pump = crate::tests::scripted_eose_pump(
             app.relay_plane.clone(),
@@ -6055,6 +6064,7 @@ mod tests {
                 .unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_recovery_runner_ownership_for_test(false)
                 .with_test_relay_client(relay.clone());
             if owns_debt {
                 app = app.with_recovery_runner_owning_debt();
@@ -6136,6 +6146,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -6289,6 +6300,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap();
@@ -6388,6 +6400,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap().app_storage();
@@ -6602,6 +6615,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let storage = app.account_storage("alice").unwrap().app_storage();
@@ -6939,6 +6953,7 @@ mod tests {
             endpoints,
             crate::MarmotAppConfig::white_noise(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         // A checkpointed cursor: the account opens without an unbounded
@@ -7344,6 +7359,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7393,6 +7409,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
             Some(Duration::from_secs(120)),
@@ -7497,6 +7514,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7669,6 +7687,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7794,6 +7813,7 @@ mod tests {
                 .with_open_ranking_provider(None, Vec::new())
                 .with_recovery_operated_relays(vec![OPERATED.into()]),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -7913,6 +7933,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -8051,6 +8072,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.request_bounded_comparison().unwrap();
@@ -8110,6 +8132,7 @@ mod tests {
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;

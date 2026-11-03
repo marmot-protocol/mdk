@@ -95,11 +95,7 @@ async fn client(
         relay.url().await.to_string(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
-    let app = if gate {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    };
+    let app = app.with_recovery_runner_ownership_for_test(gate);
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("repair", &[]).await.unwrap();
     let route = client

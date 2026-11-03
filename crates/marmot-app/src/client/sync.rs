@@ -9175,6 +9175,7 @@ mod tests {
             "wss://relay.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client.create_group("evidence policy", &[]).await.unwrap();
@@ -9513,6 +9514,7 @@ mod tests {
             "wss://backfill.example",
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let first = client.create_group("first demand", &[]).await.unwrap();
@@ -9683,6 +9685,7 @@ mod tests {
                 "wss://backfill.example",
                 bounded_epoch_backfill_config(),
             )
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = client_on_app_relay_plane(&app, "alice").await;
             let group = client
@@ -9772,6 +9775,7 @@ mod tests {
             "wss://backfill.example",
             bounded_epoch_backfill_config(),
         )
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let changed = client
@@ -9860,6 +9864,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let live = client.create_group("still a member", &[]).await.unwrap();
@@ -9975,6 +9980,7 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let departed = client.create_group("departed", &[]).await.unwrap();

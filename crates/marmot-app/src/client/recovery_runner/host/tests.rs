@@ -51,11 +51,7 @@ async fn direct_client_on(
         url,
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
-    let app = if gate {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    };
+    let app = app.with_recovery_runner_ownership_for_test(gate);
     let client = app.client("alice").await.unwrap();
     (dir, app, client)
 }
