@@ -4,14 +4,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-// Deliberate test-only internal import: openclaw@2026.7.1-2 exposes no supported
-// plugin-loader subpath. Re-verify this path whenever the pinned SDK is bumped.
+// The test helper exercises the installed host loader facade without relying
+// on private declarations or removed cache-reset exports.
 import {
-  clearActivatedPluginRuntimeState,
-  clearPluginLoaderCache,
   clearPluginRegistryLoadCache,
   loadOpenClawPlugins,
-} from "../node_modules/openclaw/dist/plugins/loader.js";
+} from "./openclaw-loader.js";
 
 import { MarmotAgentControlClient } from "../src/client.js";
 import {
@@ -97,9 +95,7 @@ async function recordedFinals(
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
-  clearActivatedPluginRuntimeState();
   clearPluginRegistryLoadCache();
-  clearPluginLoaderCache();
 });
 
 maybeDescribe("OpenClaw Marmot connector E2E", () => {

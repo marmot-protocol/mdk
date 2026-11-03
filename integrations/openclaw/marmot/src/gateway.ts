@@ -5,7 +5,7 @@
 import {
   createAccountStatusSink,
   runPassiveAccountLifecycle,
-} from "openclaw/plugin-sdk/channel-lifecycle";
+} from "openclaw/plugin-sdk/channel-outbound";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";

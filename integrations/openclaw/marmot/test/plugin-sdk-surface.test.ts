@@ -19,13 +19,12 @@ const RUNTIME_IMPORTS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["openclaw/plugin-sdk/channel-core", ["defineChannelPluginEntry", "defineSetupPluginEntry"]],
   ["openclaw/plugin-sdk/channel-inbound", ["buildChannelInboundEventContext", "runChannelInboundEvent"]],
   ["openclaw/plugin-sdk/channel-inbound-debounce", ["createInboundDebouncer"]],
-  ["openclaw/plugin-sdk/channel-lifecycle", ["createAccountStatusSink", "runPassiveAccountLifecycle"]],
   [
     "openclaw/plugin-sdk/channel-outbound",
-    ["defineChannelMessageAdapter", "deliverInboundReplyWithMessageSendContext"],
+    ["defineChannelMessageAdapter", "deliverInboundReplyWithMessageSendContext", "deriveDurableFinalDeliveryRequirements", "createAccountStatusSink", "runPassiveAccountLifecycle"],
   ],
   ["openclaw/plugin-sdk/core", ["createChatChannelPlugin", "jsonResult", "KeyedAsyncQueue"]],
-  ["openclaw/plugin-sdk/infra-runtime", ["readLocalFileFromRoots"]],
+  ["openclaw/plugin-sdk/file-access-runtime", ["readLocalFileFromRoots"]],
   ["openclaw/plugin-sdk/media-runtime", ["extractOriginalFilename", "getMediaDir"]],
   ["openclaw/plugin-sdk/media-store", ["saveMediaBuffer"]],
   [

@@ -1,4 +1,4 @@
-import { getEventListeners } from "node:events";
+import { EventEmitter, getEventListeners, once } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -1405,9 +1405,10 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
     };
   }
 
-  it("invalidates on rename, clears on resync, and does not start a turn from the event", async () => {
+  it("invalidates on rename, clears on resync, and does not start a turn from the event", async ({ signal }) => {
     const { client, groupInfoCalls } = countingGroupInfo();
     const turns: string[] = [];
+    const progress = new EventEmitter();
     const dispatch = createMarmotInboundDispatcher({
       cfg: {},
       runtimeChannel: {
@@ -1415,6 +1416,7 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: async () => {
             turns.push("turn");
+            progress.emit("turn");
           },
         },
       },
@@ -1472,6 +1474,8 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
                 releaseNext = resolve;
               });
               yield event;
+              if (event.type === "group_state_changed") progress.emit("renamed");
+              if (event.type === "resync_required") progress.emit("resynced");
             }
           },
         }) as unknown as MarmotAgentControlClient,
@@ -1479,23 +1483,32 @@ describe("startMarmotInbound with the real dispatcher cache", () => {
       clearGroupActivationCache: dispatch.clearGroupActivationCache,
     });
 
-    releaseNext();
-    await waitFor(() => turns.length >= 1);
-    expect(groupInfoCalls()).toBe(1);
-    const afterFirst = turns.length;
-    releaseNext();
-    await waitFor(() => turns.length === afterFirst);
-    expect(groupInfoCalls()).toBe(1);
-    releaseNext();
-    await waitFor(() => turns.length >= 2);
-    expect(groupInfoCalls()).toBe(2);
-    releaseNext();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    releaseNext();
-    await waitFor(() => turns.length >= 3);
-    stop();
-    expect(turns).toHaveLength(3);
-    expect(groupInfoCalls()).toBe(3);
+    try {
+      const firstTurn = once(progress, "turn", { signal });
+      releaseNext();
+      await firstTurn;
+      expect(groupInfoCalls()).toBe(1);
+      const afterFirst = turns.length;
+      const renamed = once(progress, "renamed", { signal });
+      releaseNext();
+      await renamed;
+      expect(turns).toHaveLength(afterFirst);
+      expect(groupInfoCalls()).toBe(1);
+      const secondTurn = once(progress, "turn", { signal });
+      releaseNext();
+      await secondTurn;
+      expect(groupInfoCalls()).toBe(2);
+      const resynced = once(progress, "resynced", { signal });
+      releaseNext();
+      await resynced;
+      const thirdTurn = once(progress, "turn", { signal });
+      releaseNext();
+      await thirdTurn;
+      expect(turns).toHaveLength(3);
+      expect(groupInfoCalls()).toBe(3);
+    } finally {
+      stop();
+    }
   });
 
   it("refreshes group facts after a failed reconnect when wired to the real dispatcher", async () => {
