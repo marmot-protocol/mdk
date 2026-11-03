@@ -1151,7 +1151,8 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the watch-loop proof freeze time after real database setup.
+#[tokio::test(flavor = "current_thread")]
 async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_dir, _client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -1179,6 +1180,44 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
         !observed,
         "an unobservable store must not masquerade as a durable cancel"
     );
+
+    // A closed read fails before the explicit-request lookup, so each failed
+    // connection attempt comes from a fresh observation of this isolated store.
+    let (observations, mut reads) = mpsc::unbounded_channel();
+    store.set_timing_observer(Some(Arc::new(move |operation, _, success| {
+        if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait && !success {
+            let _ = observations.send(());
+        }
+    })));
+    let (wake, updates) = watch::channel(());
+    tokio::time::pause();
+    let frozen_at = tokio::time::Instant::now();
+    crate::media::tests::drive_with_manual_time(async {
+        let watcher = cancelled(store.clone(), job, updates, None);
+        tokio::pin!(watcher);
+        let reobserved = async {
+            reads
+                .recv()
+                .await
+                .expect("the watcher must attempt its first read");
+            wake.send(()).expect("the watcher must remain subscribed");
+            reads.recv().await.expect("a wake must recheck storage");
+        };
+        // The second real read proves a wake did not finish the watcher.
+        // Frozen time excludes the one-second recheck as an alternative cause.
+        tokio::select! {
+            biased;
+            _ = &mut watcher => panic!("a wake without durable cancellation must keep watching"),
+            _ = reobserved => {},
+        }
+    })
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now(),
+        frozen_at,
+        "the notification, not the periodic timer, must cause the second read"
+    );
+    store.set_timing_observer(None);
 }
 
 fn automatic_target() -> crate::AttachmentLocalTarget {

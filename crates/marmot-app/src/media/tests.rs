@@ -476,7 +476,7 @@ async fn spawn_observed_http_response(
 }
 
 /// Poll real I/O without letting an idle paused runtime advance policy time.
-async fn drive_with_manual_time<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) async fn drive_with_manual_time<F: std::future::Future>(future: F) -> F::Output {
     let wall_started = Instant::now();
     tokio::pin!(future);
     loop {
@@ -485,7 +485,7 @@ async fn drive_with_manual_time<F: std::future::Future>(future: F) -> F::Output 
         }
         assert!(
             wall_started.elapsed() < Duration::from_secs(10),
-            "real HTTP observations did not finish with virtual time held"
+            "real I/O observations did not finish with virtual time held"
         );
         tokio::task::yield_now().await;
     }
