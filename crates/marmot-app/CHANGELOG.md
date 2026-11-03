@@ -12,6 +12,12 @@
 
 ### Breaking changes
 
+- `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
+  Add the field to exhaustive struct literals, or use `..Default::default()`
+  to retain creator-only admin defaults.
+- `AppError` adds `GroupCreateAdminNotMember` for founding admin references
+  outside the founding membership. Update exhaustive error matches.
+
 - The shared runtime roster-write path rejects label/settings changes without a fresh `rename_id` and rejects
   marker-only non-user changes before staging. It preserves caller-supplied ids for write-ahead recovery;
   custom lower-level settings writers from the earlier draft must update first (mdk#2628 D86).
