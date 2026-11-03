@@ -1458,6 +1458,69 @@ async fn recovery_runner_never_charges_an_idle_connected_account_for_its_real_ta
     );
 }
 
+/// A user-directed repair must revisit history inside a healthy live tail:
+/// an event restored by the relay need not be delivered again on the open REQ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_explicit_repair_revisits_a_healthy_live_tail() {
+    use crate::client::recovery_coverage::scenario_tests::{Fixture, fixture, relay, routes};
+    let Fixture {
+        _dir,
+        _pump,
+        client,
+        storage,
+        ..
+    } = fixture().await;
+    let app = storage.app_storage();
+    let url: &'static str = Box::leak(relay().into_boxed_str());
+    let route = routes(&client)
+        .into_iter()
+        .find(|route| matches!(route, Route::Group(_)))
+        .unwrap();
+    let Route::Group(group_key) = route.clone() else {
+        unreachable!()
+    };
+    let clock = Clock::new();
+    let now = clock.now();
+    app.widen_recovery_coverage_goals(std::slice::from_ref(&route), now - DAY)
+        .unwrap();
+    let model = ModelRelay::new(url, caps(500, true))
+        .with_events(vec![event(group_key, now)])
+        .build();
+    let host = TestHost::on_client(
+        app,
+        client,
+        &clock,
+        vec![required(&route, &[url])],
+        &[&model],
+    );
+    let (mut runner, _handle) = runner(&host, test_policy());
+    assert_eq!(idle(runner.step().await), None);
+    assert!(
+        model.queries().is_empty(),
+        "ordinary idle recovery honors the live tail"
+    );
+    let end = runner
+        .repair(&super::PassBound::within(Duration::from_secs(5)))
+        .await;
+    assert!(matches!(
+        end,
+        super::RepairEnd::Covered | super::RepairEnd::Unproven
+    ));
+    assert_eq!(
+        host.admitted.lock().unwrap().len(),
+        1,
+        "explicit repair must fetch and admit the event inside the healthy tail"
+    );
+    let queries = model.queries().len();
+    clock.advance(60);
+    assert!(matches!(runner.step().await, Step::Idle { .. }));
+    assert_eq!(
+        model.queries().len(),
+        queries,
+        "an explicit request must not destroy the healthy tail for later idle recovery"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_owes_a_broken_generation_tail_until_a_reconnect_or_a_proof() {
     let account = account();
@@ -4415,7 +4478,11 @@ async fn recovery_runner_repair_never_covers_a_route_with_no_required_relay() {
         .repair(&super::PassBound::within(Duration::from_secs(60)))
         .await;
     assert!(matches!(end, super::RepairEnd::Unproven));
-    assert_eq!(account.covered_through(&served, RELAY), t0 - 1);
+    assert_eq!(
+        account.covered_through(&served, RELAY),
+        t0,
+        "explicit repair includes its start second even inside a healthy tail",
+    );
 }
 
 /// A retained route whose goal ended below the retention floor has nothing

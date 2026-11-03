@@ -178,6 +178,7 @@ pub(crate) struct WorkerTurn<'a> {
 
 /// What a turn that reads debt sees: the account's current routes, and the
 /// live tails and live counts read for this turn alone.
+#[derive(Clone, Copy)]
 pub(crate) struct DebtTurn<'a> {
     pub(crate) app: &'a SqliteAppStorage,
     /// The account's current routes, as of this turn.
@@ -380,6 +381,9 @@ impl Connections {
 pub(crate) struct PassBound {
     pub(crate) deadline: Instant,
     pub(crate) stop: CancellationToken,
+    /// An explicit repair checks through its request time even inside a live
+    /// tail. Ordinary passes keep the account's healthy-tail authority.
+    repair_until: Option<u64>,
 }
 
 impl PassBound {
@@ -388,6 +392,7 @@ impl PassBound {
         Self {
             deadline: Instant::now() + budget,
             stop: CancellationToken::new(),
+            repair_until: None,
         }
     }
 
@@ -635,6 +640,30 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         }
     }
 
+    /// Read ordinary debt, except that an explicit repair's bounded request
+    /// also visits the historical part of a healthy live subscription. Its
+    /// authority returns unchanged as soon as that request ends or is dropped.
+    async fn debt_turn<T, F>(&self, pass: Option<&PassBound>, run: F) -> Option<StorageResult<T>>
+    where
+        F: FnOnce(&DebtTurn<'_>) -> StorageResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let until = pass.and_then(|bound| bound.repair_until);
+        self.host
+            .debt_turn(move |turn| {
+                if let Some(until) = until {
+                    let tails = repair::RepairTails(until);
+                    run(&DebtTurn {
+                        tails: &tails,
+                        ..*turn
+                    })
+                } else {
+                    run(turn)
+                }
+            })
+            .await
+    }
+
     /// One step: admit, then select, credit, begin, quantum, stage, settle.
     pub(crate) async fn step(&mut self) -> Step {
         self.step_within(None, true).await
@@ -689,8 +718,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let policy = self.policy;
         let (mut survey, epoch_gap_due) = match self
-            .host
-            .debt_turn(move |turn| {
+            .debt_turn(pass, move |turn| {
                 let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
                 Ok((select::survey(turn, &policy, &stalled)?, due))
             })
@@ -760,8 +788,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let compares = self.memory.compares(&key.relay);
         let open = self.open.clone();
         let plan = match self
-            .host
-            .debt_turn(move |turn| {
+            .debt_turn(pass, move |turn| {
                 let plan = select::begin(turn, &key, best_effort, caps, compares, &policy);
                 // A best-effort relay is charged nothing.
                 if let Ok(Some(plan)) = &plan
@@ -888,8 +915,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let key = candidate.key.clone();
         let open = self.open.clone();
         let plan = match self
-            .host
-            .debt_turn(move |turn| {
+            .debt_turn(pass, move |turn| {
                 let plan = recheck::begin(turn, &key, caps, &policy);
                 if let Ok(Some(plan)) = &plan {
                     open.begun(&plan.compare.key, AttemptKind::Recheck);

@@ -805,8 +805,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             let planned = held.clone();
             let policy = self.policy;
             let batch = match self
-                .host
-                .debt_turn(move |turn| plan(turn, &policy, &planned))
+                .debt_turn(pass, move |turn| plan(turn, &policy, &planned))
                 .await
             {
                 None => return Err(Step::Stopped),

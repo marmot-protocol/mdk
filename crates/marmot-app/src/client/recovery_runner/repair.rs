@@ -134,6 +134,22 @@ impl AppClient {
     }
 }
 
+/// The live stream does not redeliver restored historical events. An explicit
+/// request therefore proves the window through its own start, independently
+/// of live tails, while keeping later live traffic outside that bounded task.
+pub(super) struct RepairTails(pub(super) u64);
+
+impl super::tails::LiveTailRead for RepairTails {
+    fn owed_until(
+        &self,
+        _route: &storage_sqlite::TransportReconciliationRoute,
+        _relay: &str,
+        now: u64,
+    ) -> u64 {
+        self.0.min(now)
+    }
+}
+
 impl<H: RunnerHost> RecoveryRunner<H> {
     /// Serve one explicit repair at this step boundary: re-arm, then passes
     /// until the ledger shows the window repaired, a pass serves nothing, or
@@ -153,21 +169,24 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Some(Ok(requested)) => requested,
         };
         self.memory.rearmed();
+        let bound = PassBound {
+            repair_until: Some(requested),
+            ..bound.clone()
+        };
         loop {
-            let report = self.run_pass_within(bound).await;
+            let report = self.run_pass_within(&bound).await;
             if self.cancel.is_cancelled() {
                 return RepairEnd::Stopped;
             }
             let covered = match self
-                .host
-                .debt_turn(move |turn| repaired(turn, requested))
+                .debt_turn(Some(&bound), move |turn| repaired(turn, requested))
                 .await
             {
                 None => return RepairEnd::Stopped,
                 Some(Err(error)) => return RepairEnd::Failed(error),
                 Some(Ok(covered)) => covered,
             };
-            if let Some(end) = verdict_end(bound, covered, report.quanta > 0) {
+            if let Some(end) = verdict_end(&bound, covered, report.quanta > 0) {
                 return end;
             }
         }

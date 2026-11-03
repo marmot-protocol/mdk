@@ -722,7 +722,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
   comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
-  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
+  waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight.
+  Explicit repair includes history through its request time inside a healthy live tail: a relay may restore stored
+  events without redelivering them on the open live REQ. Its request-local `PassBound::repair_until` changes debt
+  reads only for that repair, including admission and the verdict; cancellation/drop leaves normal tail authority
+  unchanged. Ordinary passes still subtract healthy live tails. The
   worker spawns its runner after initial startup catch-up and before replaying deferred commands, and hands its
   `SpawnedRunner` through the command context. A later successful paced preparation retry seats it at a loop boundary.
   Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
