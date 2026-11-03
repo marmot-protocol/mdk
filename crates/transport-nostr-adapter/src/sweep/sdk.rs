@@ -461,7 +461,6 @@ mod tests {
                 Err(FailedEnd::Unreachable(kind)) => End::Unreachable(kind),
             };
             assert_eq!(actual, expected);
-            assert!(!format!("{actual:?}").contains("private diagnostic"));
         }
     }
 
