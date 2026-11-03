@@ -92,8 +92,15 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
+  signatures:
+    name: PR signatures
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-signatures.yml
+
   changes:
     name: Classify binary build changes
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

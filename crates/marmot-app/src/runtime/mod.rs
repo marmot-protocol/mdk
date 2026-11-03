@@ -2699,7 +2699,7 @@ impl MarmotAppRuntime {
     /// `roster_unavailable`, or `device_group_busy` while the device group
     /// has an earlier change in flight (retry later). A rename whose commit
     /// loses a fork is made again on a later maintenance pass, unless another
-    /// rename of that device won; refresh on `LinkedDevicesChanged`.
+    /// user edit of that device won; refresh on `LinkedDevicesChanged`.
     pub async fn rename_linked_device(
         &self,
         account_ref: &str,
@@ -2708,6 +2708,34 @@ impl MarmotAppRuntime {
     ) -> Result<(), AppError> {
         self.accounts
             .rename_linked_device(account_ref, slot_id_hex, label)
+            .await
+    }
+
+    /// Change the supplied settings of any linked device, this one included.
+    /// None leaves a setting unchanged; values are read on the account worker.
+    /// Add-to-all permits the available linked-device Add flow; disabling it
+    /// leaves joined chats alone. History applies to future sibling Adds and
+    /// transfers still owed, without retroactive backfill. Keep-while-inactive
+    /// prevents automatic inactivity removal, not explicit removal or sign-out.
+    /// Earlier lost user edits recover first; retry `device_group_busy` while
+    /// one remains unsettled. Other refusals match `rename_linked_device`,
+    /// except label validation. Refresh on `LinkedDevicesChanged`.
+    pub async fn update_linked_device_settings(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .update_linked_device_settings(
+                account_ref,
+                slot_id_hex,
+                add_to_all_chats,
+                bring_history,
+                keep_while_inactive,
+            )
             .await
     }
 
@@ -2811,6 +2839,84 @@ impl MarmotAppRuntime {
     /// later) or `roster_unavailable`.
     pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
         self.accounts.turn_off_backups(account_ref).await
+    }
+
+    /// Report the host's current Wi-Fi and charging facts for background
+    /// backup admission. Both must be true. Default closed on each worker
+    /// start/replacement: report on start and changes; no environment is kept
+    /// across restart. Existing role/due/backoff/media-credit checks still apply.
+    /// An already-admitted pass settles even after false; subsequent passes
+    /// (including retry/cleanup) wait. Manual restore is unaffected.
+    pub async fn set_backup_background_conditions(
+        &self,
+        account_ref: &str,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .set_backup_background_conditions(account_ref, wifi, charging)
+            .await
+    }
+
+    /// Begin an ephemeral, history-only restore with user-supplied words.
+    /// Completion is observed through the status/watch APIs; secrets are never
+    /// persisted or resumed after reconnect/close. Backups/settings are unchanged.
+    pub async fn begin_backup_restore(
+        &self,
+        account_ref: &str,
+        words: crate::BackupRestoreWords,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.begin_backup_restore(account_ref, words).await
+    }
+
+    /// Stop this operation, dropping its secrets; committed history stays.
+    pub async fn cancel_backup_restore(
+        &self,
+        account_ref: &str,
+        operation: crate::BackupRestoreId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .cancel_backup_restore(account_ref, operation)
+            .await
+    }
+
+    pub async fn backup_restore_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.backup_restore_status(account_ref).await
+    }
+
+    /// Progress and payload-free availability changes, including actual joins.
+    /// Query availability only for the current chat; metadata never joins one.
+    pub async fn watch_backup_restore(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreWatch, AppError> {
+        self.accounts.watch_backup_restore(account_ref).await
+    }
+
+    /// The complete source for an application's content-derived event id,
+    /// not its transport id. A backup source never asserts device authorship.
+    pub async fn history_import_provenance(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        event_id: &str,
+    ) -> Result<Option<crate::HistoryImportProvenance>, AppError> {
+        self.accounts
+            .history_import_provenance(account_ref, group_id, event_id)
+            .await
+    }
+
+    pub async fn backup_history_availability(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::BackupHistoryAvailability>, AppError> {
+        self.accounts
+            .backup_history_availability(account_ref, group_id)
+            .await
     }
 
     /// Where the account's backups stand: whether they are on and whether

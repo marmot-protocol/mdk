@@ -2,7 +2,25 @@
 
 ## Unreleased
 
+- Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
+  writer work, with replacement workers closed by default. Admitted passes settle after conditions change; manual
+  restore stays independent. Add an opaque restore-operation host codec and zeroizing queued confirmation answers.
+
+- Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded
+  downloads, ephemeral recovery words, explicit cancellation, partial results, later-join availability hints and
+  typed core backup provenance. Archived preferences and automatic membership recovery remain outside this flow.
+
 ### Breaking changes
+
+- `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
+  Add the field to exhaustive struct literals, or use `..Default::default()`
+  to retain creator-only admin defaults.
+- `AppError` adds `GroupCreateAdminNotMember` for founding admin references
+  outside the founding membership. Update exhaustive error matches.
+
+- The shared runtime roster-write path rejects label/settings changes without a fresh `rename_id` and rejects
+  marker-only non-user changes before staging. It preserves caller-supplied ids for write-ahead recovery;
+  custom lower-level settings writers from the earlier draft must update first (mdk#2628 D86).
 
 - Uploaded media references carry local `source_epoch_identity` provenance.
   Preserve it through host storage and reference round trips. Media and custom
@@ -104,6 +122,32 @@
 
 ### Added
 
+- Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
+- A published sibling Welcome lost before joining is repaired after the
+  target's first newly observed authenticated device-group message and a
+  fixed ten-minute wait (mdk#2628 D70/D89–91). Repair reuses its exact Welcome
+  and private KeyPackage, creates no Add or history offer, and stops on
+  matching device participation, expiry or terminal origin. Each successful
+  generation needs fresh activity; legacy unknown timing stays held. Only
+  behind `dev_device_groups`.
+
+- Linked devices fill missing sibling chat memberships with private
+  KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
+  ten-minute advisory claim to reduce competing Adds; the selected tree is
+  checked again when an Add stages. Claims use byte-exact canonical content;
+  leaving claimants stop participating and no longer hold other devices back.
+  A live own claim also delays another local attempt after a terminal failure
+  until its existing expiry. Routine device-group commits do not rescan all
+  chats; recovered quarantined chats are checked again.
+  Gap filling requires the sibling's
+  "add to all my chats" setting and shares the existing per-pass Add cap.
+  Missed invitations with that setting off await a re-invite. Automatic
+  duplicate cleanup remains deferred. Only
+  behind `dev_device_groups`.
+
 - Custom emoji reaction artwork is available through the bounded local
   `MarmotAppRuntime::reaction_attachment` lookup (mdk#2151). Pass its original
   message/source/slot to host-managed acquisition and opaque local reads.
@@ -113,8 +157,9 @@
 - A device adds a sibling to a chat with a private KeyPackage that sibling
   handed it, and sends the sibling Welcome in the device group as a 461 once
   the Add's Commit is published (mdk#2628 3.5b-2). A 461 that reached no
-  relay is sent again by the next maintenance pass. Only behind
-  `dev_device_groups`; nothing outside tests adds a sibling yet.
+  relay is sent again by the next maintenance pass. When the device group
+  is ready, other chats awaiting hydration do not delay an initial Welcome.
+  Only behind `dev_device_groups`.
 - The backup writer writes the account's backup once a day (mdk#2628 item
   4.4b, D71, D79): each chat's newest 16 history bundles and the small state,
   as blobs on the deployment's Blossom servers under a fresh archive key, and
@@ -685,8 +730,8 @@
   refused with nothing written. Each used to fail after writing its commit or
   group record, and the record stayed. Every Add path now wraps each Welcome
   before its first write.
-- Kinds sent only in a device group (heartbeat 457, private KeyPackage
-  request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
+- Kinds sent only in a device group (heartbeat 457, gap-fill claim 458,
+  private KeyPackage request 459 and hand-off 460, sibling Welcome 461, history delivery 473,
   small-state update 475 and broadcast request 476) are ignored in any other
   group (mdk#2628). One received in a chat makes no timeline row, host
   message or notification, and `send_custom_event` refuses each as reserved

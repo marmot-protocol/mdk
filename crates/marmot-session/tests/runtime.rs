@@ -1,3 +1,8 @@
+#[path = "support/storage_fixture.rs"]
+mod storage_fixture;
+
+use storage_fixture::relaxed_storage_dir;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -684,6 +689,55 @@ impl TransportAdapter for RecordingAdapter {
     }
 }
 
+/// Keep one actual publish pending while observing another adapter result.
+/// This controls transport completion only; the runtime owns row settlement.
+#[derive(Clone)]
+struct OutOfOrderWelcomeAdapter {
+    inner: RecordingAdapter,
+    held: Arc<Mutex<Option<MessageId>>>,
+    release: Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::mpsc::UnboundedSender<MessageId>,
+}
+
+#[async_trait]
+impl TransportAdapter for OutOfOrderWelcomeAdapter {
+    async fn activate_account(
+        &self,
+        activation: TransportAccountActivation,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.activate_account(activation).await
+    }
+
+    async fn sync_account_groups(
+        &self,
+        sync: TransportGroupSync,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.sync_account_groups(sync).await
+    }
+
+    async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
+        self.inner.deactivate_account(account_id).await
+    }
+
+    async fn publish(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        let held = self.held.lock().unwrap().as_ref() == Some(&request.message.id);
+        if held {
+            self.release.acquire().await.unwrap().forget();
+        }
+        let message_id = request.message.id.clone();
+        let result = self.inner.publish(request).await;
+        self.completed.send(message_id).unwrap();
+        result
+    }
+
+    async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
+        self.inner.receive().await
+    }
+}
+
 #[derive(Clone)]
 struct MismatchedPendingGroupRouting {
     wrong_group_id: GroupId,
@@ -1007,7 +1061,7 @@ fn test_key_package_slot(account_id: &MemberId) -> String {
 
 #[tokio::test]
 async fn activate_transport_uses_session_identity_and_policy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot account activation key").unwrap();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let adapter = RecordingAdapter::default();
@@ -1038,7 +1092,7 @@ async fn activate_transport_uses_session_identity_and_policy() {
 /// when the open fails: building it can register the account's delivery route.
 #[tokio::test]
 async fn open_builds_the_transport_only_after_the_session_opens() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let path = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot account open key").unwrap();
     let config = || {
@@ -1091,7 +1145,7 @@ async fn open_builds_the_transport_only_after_the_session_opens() {
 
 #[tokio::test]
 async fn publish_fresh_key_package_uses_directory_boundary() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot key package key").unwrap();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let publisher = RecordingKeyPackages::default();
@@ -1124,7 +1178,7 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
 
 #[tokio::test]
 async fn automatic_maintenance_publication_preserves_private_material_ownership() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot automatic kp ownership key").unwrap();
     let publisher = RecordingKeyPackages::default();
     let mut runtime = AccountDeviceRuntime::new(
@@ -1158,7 +1212,7 @@ async fn automatic_maintenance_publication_preserves_private_material_ownership(
 
 #[tokio::test]
 async fn publication_without_durable_slot_authority_fails_before_bundle_generation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot missing slot key").unwrap();
     let session = session(database.clone(), &key, b"alice");
@@ -1188,7 +1242,7 @@ async fn publish_fresh_key_package_retries_the_same_durable_replacement() {
     // A prepared replacement is a durable publication obligation. A failed
     // attempt retains both the exact artifact and its private init key so a
     // retry cannot create a different externally visible package.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp cleanup key").unwrap();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     // Fail the first attempt, succeed thereafter.
@@ -1231,7 +1285,7 @@ async fn publish_fresh_key_package_retries_the_same_durable_replacement() {
 
 #[tokio::test]
 async fn unsigned_key_package_replacement_recovers_after_restart_without_changing_authorship() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot kp unsigned crash key").unwrap();
     let failing = PrepareFailsKeyPackages::default();
@@ -1305,7 +1359,7 @@ async fn unsigned_key_package_replacement_recovers_after_restart_without_changin
 
 #[tokio::test]
 async fn missing_or_corrupt_private_bundle_is_not_reported_as_owned() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot missing private bundle key").unwrap();
     let mut runtime = AccountDeviceRuntime::new(
@@ -1391,7 +1445,7 @@ async fn missing_or_corrupt_private_bundle_is_not_reported_as_owned() {
 
 #[tokio::test]
 async fn key_package_rotation_reuses_stable_slot_and_monotonically_advances_created_at() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp stable slot key").unwrap();
     let publisher = RecordingKeyPackages::default();
     let wall = Arc::new(TestWallClock::new(20_000));
@@ -1429,7 +1483,7 @@ async fn key_package_rotation_reuses_stable_slot_and_monotonically_advances_crea
 
 #[tokio::test]
 async fn an_unannounced_key_package_never_reaches_the_slot() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp announcement gate key").unwrap();
     let publisher = RecordingKeyPackages::default();
     let mut runtime = AccountDeviceRuntime::new(
@@ -1463,7 +1517,7 @@ async fn an_unannounced_key_package_never_reaches_the_slot() {
 
 #[tokio::test]
 async fn key_package_first_ack_promotes_then_paused_maintenance_finishes_exact_fanout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp independent fanout key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let publisher = PartialFanoutKeyPackages::default();
@@ -1545,7 +1599,7 @@ async fn key_package_first_ack_promotes_then_paused_maintenance_finishes_exact_f
 
 #[tokio::test]
 async fn republish_key_package_resends_exact_authored_event_and_finishes_partial_fanout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp republish key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let publisher = PartialFanoutKeyPackages::default();
@@ -1678,7 +1732,7 @@ async fn republish_key_package_resends_exact_authored_event_and_finishes_partial
 
 #[tokio::test]
 async fn republish_key_package_rejects_pending_replacement_without_publishing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot kp pending republish key").unwrap();
     let policy = StaticTransportRouting::new(vec![])
@@ -1728,7 +1782,7 @@ async fn republish_key_package_rejects_pending_replacement_without_publishing() 
 
 #[tokio::test]
 async fn republish_key_package_falls_back_when_no_current_artifact_exists() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot kp no artifact republish key").unwrap();
     let publisher = RecordingKeyPackages::default();
@@ -1774,7 +1828,7 @@ async fn republish_key_package_falls_back_when_no_current_artifact_exists() {
 
 #[tokio::test]
 async fn republish_key_package_reuses_current_artifact_when_refresh_is_due() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp refresh due republish key").unwrap();
     let publisher = RecordingKeyPackages::default();
     // The KeyPackage's lifetime comes from the system clock.
@@ -1827,7 +1881,7 @@ async fn republish_key_package_reuses_current_artifact_when_refresh_is_due() {
 
 #[tokio::test]
 async fn republish_key_package_falls_back_when_current_ref_is_consumed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp consumed republish key").unwrap();
     let publisher = RecordingKeyPackages::default();
     let wall = Arc::new(TestWallClock::new(90_000));
@@ -1875,7 +1929,7 @@ async fn republish_key_package_falls_back_when_current_ref_is_consumed() {
 
 #[tokio::test]
 async fn republish_key_package_reconciles_authoritative_targets_across_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp routing reconcile key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let publisher = PartialFanoutKeyPackages::default();
@@ -1953,7 +2007,7 @@ async fn republish_key_package_reconciles_authoritative_targets_across_restart()
 
 #[tokio::test]
 async fn republish_key_package_reauthorizes_previously_removed_endpoint() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp routing reauthorize key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let publisher = RecordingKeyPackages::default();
@@ -2038,7 +2092,7 @@ async fn republish_key_package_reauthorizes_previously_removed_endpoint() {
 
 #[tokio::test]
 async fn republish_key_package_persists_policy_removal_when_no_targets_remain() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp empty routing republish key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let publisher = RecordingKeyPackages::default();
@@ -2094,7 +2148,7 @@ async fn republish_key_package_persists_policy_removal_when_no_targets_remain() 
 
 #[tokio::test]
 async fn key_package_expiry_sweep_deletes_private_material_while_network_maintenance_is_paused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp paused expiry key").unwrap();
     let wall = Arc::new(TestWallClock::new(80_000));
     let mut runtime = AccountDeviceRuntime::new(
@@ -2137,7 +2191,7 @@ async fn key_package_expiry_sweep_deletes_private_material_while_network_mainten
 
 #[tokio::test]
 async fn key_package_rotation_blocks_when_clock_rollback_exceeds_future_skew_allowance() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp rollback key").unwrap();
     let publisher = RecordingKeyPackages::default();
     let wall = Arc::new(TestWallClock::new(50_000));
@@ -2172,7 +2226,7 @@ async fn key_package_rotation_blocks_when_clock_rollback_exceeds_future_skew_all
 
 #[tokio::test]
 async fn consumed_last_resort_private_material_outlives_replacement_for_retention_window() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot consumed kp lifecycle key").unwrap();
     let initial_publisher = RecordingKeyPackages::default();
@@ -2338,7 +2392,7 @@ fn retained_entry(
 
 #[tokio::test]
 async fn delayed_welcome_for_replaced_key_package_keeps_current_consumption() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp delayed retained welcome key").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -2406,7 +2460,7 @@ async fn delayed_welcome_for_replaced_key_package_keeps_current_consumption() {
 
 #[tokio::test]
 async fn publish_migrates_a_legacy_retained_consumption_marker_before_clearing_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp legacy marker key").unwrap();
     let now = unix_now();
     let mut runtime = AccountDeviceRuntime::new(
@@ -2448,7 +2502,7 @@ async fn publish_migrates_a_legacy_retained_consumption_marker_before_clearing_i
 
 #[tokio::test]
 async fn welcome_for_current_package_migrates_a_legacy_retained_marker_first() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp legacy marker ingest key").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -2505,7 +2559,7 @@ async fn welcome_for_current_package_migrates_a_legacy_retained_marker_first() {
 
 #[tokio::test]
 async fn pending_replacement_consumed_before_acknowledgement_is_due_after_promotion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot kp consumed pending key").unwrap();
     let policy = StaticTransportRouting::new(vec![])
@@ -2577,7 +2631,7 @@ async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_expos
     // a peer builds a real group + Welcome against the just-generated KeyPackage,
     // and the account successfully joins it — which is only possible if the
     // private bundle survived in storage.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot kp exposed retain key").unwrap();
     let publisher = ExposedThenFailsKeyPackages::default();
     let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
@@ -2662,7 +2716,7 @@ async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_expos
 
 #[tokio::test]
 async fn post_join_rotation_does_not_block_application_send_and_returns_disposition() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot post join send key").unwrap();
     let mut alice = session(alice_database.clone(), &key, b"alice");
@@ -2796,7 +2850,7 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
 /// set has passed.
 #[tokio::test]
 async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot post join history key").unwrap();
     let mut alice = session(alice_database.clone(), &key, b"alice");
@@ -2942,7 +2996,7 @@ async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
 
 #[tokio::test]
 async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot create group key").unwrap();
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
     let bob_kp = bob_session.fresh_key_package().await.unwrap();
@@ -3003,7 +3057,7 @@ async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
 /// that group and keep sweeping.
 #[tokio::test]
 async fn unhydrated_group_does_not_abort_periodic_maintenance_for_other_groups() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated sweep key").unwrap();
     let mut initial = AccountDeviceRuntime::new(
@@ -3071,7 +3125,7 @@ async fn unhydrated_group_does_not_abort_periodic_maintenance_for_other_groups()
 /// obligation sorted behind it.
 #[tokio::test]
 async fn unhydrated_group_obligation_does_not_abort_the_sweep_for_other_groups() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated obligation key").unwrap();
     let mut initial = AccountDeviceRuntime::new(
@@ -3313,7 +3367,7 @@ async fn maintenance_reconciles_restored_copy_from_final_canonical_membership() 
 /// nothing may mint a fresh one.
 #[tokio::test]
 async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot removed obligation key").unwrap();
     let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-removed-obl");
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-removed-obl");
@@ -3429,10 +3483,16 @@ async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
         obligation.attempt_count, 0,
         "the refusal must precede the send, not count as an attempt"
     );
-    assert!(
-        bob_runtime.schedule_manual_self_update(&group_id).is_err(),
-        "a manual rotation on a terminal copy must be refused, not persisted"
-    );
+    let error = bob_runtime
+        .schedule_manual_self_update(&group_id)
+        .expect_err("a manual rotation on a terminal copy must be refused, not persisted");
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::InvalidTransition(transition))
+            if transition.from == "Removed"
+                && transition.to == "SelfUpdate"
+                && transition.reason == "terminal local group copy has no leaf to rotate"
+    ));
 }
 
 /// A pending leave gates every send but the leave itself, and the record stays
@@ -3443,7 +3503,7 @@ async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
 /// obligation untouched until the departure resolves either way.
 #[tokio::test]
 async fn maintenance_waits_on_an_obligation_while_a_leave_is_pending() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot leaving obligation key").unwrap();
     let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-leaving-obl");
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-leaving-obl");
@@ -3526,7 +3586,7 @@ async fn maintenance_waits_on_an_obligation_while_a_leave_is_pending() {
 /// tick or fail a rotation the group may still owe.
 #[tokio::test]
 async fn maintenance_waits_on_an_obligation_while_a_disband_is_in_progress() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot disbanding obligation key").unwrap();
     let mut runtime = AccountDeviceRuntime::new(
         current_session(dir.path().join("alice.sqlite"), &key, b"alice-disband-obl"),
@@ -3623,7 +3683,7 @@ fn v5_audit_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
 /// durable frozen fanout as every other commit, auditing each retry pass.
 #[tokio::test]
 async fn manual_self_update_confirms_on_first_ack_and_retries_unacked_relays_audibly() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("alice-audit.jsonl");
     let key = SqlCipherKey::new("marmot manual maintenance key").unwrap();
@@ -3847,7 +3907,7 @@ async fn manual_self_update_confirms_on_first_ack_and_retries_unacked_relays_aud
 /// holds the next automatic rotation for at most an hour while retries run.
 #[tokio::test]
 async fn undelivered_commit_is_reported_and_holds_the_next_self_update_for_an_hour() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot undelivered commit key").unwrap();
     let mut initial = current_session(database.clone(), &key, b"alice");
@@ -3959,7 +4019,7 @@ async fn undelivered_commit_is_reported_and_holds_the_next_self_update_for_an_ho
 /// for its first acknowledgement still gives the other relays their retry.
 #[tokio::test]
 async fn undelivered_commit_is_measured_from_its_first_acknowledgement() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot late first ack key").unwrap();
     let mut initial = current_session(database.clone(), &key, b"alice");
@@ -4044,7 +4104,7 @@ async fn undelivered_commit_is_measured_from_its_first_acknowledgement() {
 /// has not hydrated yet instead of failing with `GroupNotHydrated`.
 #[tokio::test]
 async fn undelivered_commit_answers_for_an_unhydrated_group() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated delivery key").unwrap();
     let mut initial = current_session(database.clone(), &key, b"alice-unhydrated-delivery");
@@ -4079,7 +4139,7 @@ async fn undelivered_commit_answers_for_an_unhydrated_group() {
 async fn withdrawn_commit_is_not_reported_as_undelivered() {
     use cgka_traits::MessageStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot withdrawn owed commit key").unwrap();
     let mut initial = current_session(database.clone(), &key, b"alice");
@@ -4146,7 +4206,7 @@ async fn withdrawn_commit_is_not_reported_as_undelivered() {
 /// audited) instead of waiting out the 24 h retention window.
 #[tokio::test]
 async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("alice-audit.jsonl");
     let key = SqlCipherKey::new("marmot legacy marker key").unwrap();
@@ -4296,7 +4356,7 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
 /// fanout (mdk#2255), which records per-relay causes in its own outcome rows.
 #[tokio::test]
 async fn adapter_publish_failure_records_per_relay_causes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
     let audit_path = dir.path().join("audit.jsonl");
     let mut bob_session = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
@@ -4412,7 +4472,7 @@ async fn adapter_publish_failure_records_per_relay_causes() {
 
 #[tokio::test]
 async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_backoff() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot ambiguous self update key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let mut initial = current_session(database.clone(), &key, b"alice");
@@ -4565,7 +4625,7 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
 /// exact commit is retried.
 #[tokio::test]
 async fn frozen_self_update_publish_failure_records_per_relay_causes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot frozen failure cause key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("audit.jsonl");
@@ -4790,7 +4850,7 @@ async fn frozen_self_update_publish_failure_records_per_relay_causes() {
 
 #[tokio::test]
 async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot rollback key").unwrap();
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
     let bob_kp = bob_session.fresh_key_package().await.unwrap();
@@ -4834,7 +4894,7 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
 // epoch/membership past a welcome that reached no relay (#375).
 #[tokio::test]
 async fn create_group_with_best_effort_acks_rolls_back_when_nothing_accepted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot best effort key").unwrap();
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
     let bob_kp = bob_session.fresh_key_package().await.unwrap();
@@ -4883,7 +4943,7 @@ async fn create_group_with_best_effort_acks_rolls_back_when_nothing_accepted() {
 
 #[tokio::test]
 async fn create_group_stops_welcome_publish_after_unexposed_failure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot create stop key").unwrap();
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
     let mut carol_session = session(dir.path().join("carol.sqlite"), &key, b"carol");
@@ -4939,7 +4999,7 @@ async fn create_group_stops_welcome_publish_after_unexposed_failure() {
 #[tokio::test]
 async fn current_founding_welcomes_publish_with_bounded_concurrency() {
     for recipient_count in [1usize, 5, 20] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new(format!("bounded Welcome key {recipient_count}")).unwrap();
         let mut members = Vec::with_capacity(recipient_count);
         let mut policy = StaticTransportRouting::new(vec![TransportEndpoint(
@@ -5006,7 +5066,7 @@ async fn current_founding_welcomes_publish_with_bounded_concurrency() {
 
 #[tokio::test]
 async fn current_founding_welcomes_survive_restart_before_publication() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot current founding prepare crash key").unwrap();
     let mut bob_session =
         current_session(dir.path().join("bob-prepare.sqlite"), &key, b"bob-prepare");
@@ -5076,7 +5136,7 @@ async fn current_founding_welcomes_survive_restart_before_publication() {
 
 #[tokio::test]
 async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot current founding delivery key").unwrap();
     let mut bob_session = current_session(dir.path().join("bob.sqlite"), &key, b"bob-current");
     let mut carol_session =
@@ -5214,7 +5274,7 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
 
 #[tokio::test]
 async fn current_founding_welcome_finish_failure_still_reconciles_later_recipients() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot current founding finish failure key").unwrap();
     let mut bob_session =
         current_session(dir.path().join("bob-finish.sqlite"), &key, b"bob-finish");
@@ -5230,6 +5290,15 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
     let alice_path = dir.path().join("alice-finish.sqlite");
     let session = current_session(&alice_path, &key, b"alice-finish");
     let adapter = RecordingAdapter::default();
+    let held = Arc::new(Mutex::new(None));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (completed, mut completion_order) = tokio::sync::mpsc::unbounded_channel();
+    let controlled_adapter = OutOfOrderWelcomeAdapter {
+        inner: adapter.clone(),
+        held: held.clone(),
+        release: release.clone(),
+        completed,
+    };
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_inbox_route(
@@ -5242,7 +5311,7 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
             );
     let mut runtime = AccountDeviceRuntime::new(
         session,
-        adapter.clone(),
+        controlled_adapter,
         policy.clone(),
         RecordingKeyPackages::default(),
     );
@@ -5285,10 +5354,25 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
     // bookkeeping fails as if the durable fanout persist lost the database
     // lock. Carol's identical work must still be reconciled.
     runtime.arm_finish_stage_failure(bob_welcome_id.clone());
-    let error = runtime
-        .publish_session_effects(prepared.effects)
+    *held.lock().unwrap() = Some(welcomes[0].id.clone());
+    let error = {
+        let publication = runtime.publish_session_effects(prepared.effects);
+        tokio::pin!(publication);
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut publication => panic!("publish finished while the first Welcome was held"),
+                completed = completion_order.recv() => completed.expect("second publish completed"),
+            }
+        })
         .await
-        .expect_err("the armed finish-stage failure must surface");
+        .expect("the other Welcome must publish while the first is held");
+        assert_eq!(completed, welcomes[1].id);
+        release.add_permits(1);
+        publication
+            .await
+            .expect_err("the armed finish-stage failure must surface")
+    };
+    assert_eq!(completion_order.try_recv().unwrap(), welcomes[0].id);
     assert!(
         matches!(error, AccountError::Session(_)),
         "expected the injected session failure, got {error:?}"
@@ -5343,7 +5427,7 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
 
 #[tokio::test]
 async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot partial create key").unwrap();
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
     let bob_kp = bob_session.fresh_key_package().await.unwrap();
@@ -5414,7 +5498,7 @@ async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
 
 #[tokio::test]
 async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot evolution partial publish key").unwrap();
     let mut alice_session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
@@ -5534,7 +5618,12 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
 
     // A non-welcome message id is rejected without publishing anything.
     let commit_id = publishes[0].message.id.clone();
-    assert!(runtime.redeliver_welcome(&commit_id).await.is_err());
+    let error = runtime.redeliver_welcome(&commit_id).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Backend(reason))
+            if reason == "stored message is not an outbound sent record"
+    ));
     assert_eq!(adapter.publishes().len(), 3);
 }
 
@@ -5545,7 +5634,7 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
 // publish the invite welcome.
 #[tokio::test]
 async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot evolution partial commit key").unwrap();
     let mut alice_session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
@@ -5669,7 +5758,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
     use cgka_traits::{GroupCapabilities, GroupStorage};
     use storage_sqlite::SqliteAccountStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot drain quarantine key").unwrap();
     let db_path = dir.path().join("alice.sqlite");
 
@@ -5759,7 +5848,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
 // the `PublishWork::AutoPublish` path through `publish_pending`.
 #[tokio::test]
 async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot auto publish partial key").unwrap();
 
     // Build alice (admin) and bob with the MIP-03 self-remove feature so a
@@ -5905,7 +5994,7 @@ fn app_payload_for(sender_hex: &str, payload: impl AsRef<[u8]>) -> Vec<u8> {
 
 #[tokio::test]
 async fn published_app_messages_carry_exact_source_state_and_adapter_identity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot published app metadata key").unwrap();
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
@@ -5967,6 +6056,11 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         adapter.clone(),
         policy.clone(),
         RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(42_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(1)),
     );
 
     let payload = app_payload_for(&alice_hex, b"typed metadata");
@@ -5985,6 +6079,10 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         "test adapter must exercise transport id replacement"
     );
     let expected_publication = PublishedApplicationMessage {
+        publication_observation: Some(cgka_traits::PublicationObservation {
+            order: 1,
+            at_ms: 42_000_000,
+        }),
         authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),
@@ -6077,7 +6175,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
 
 #[tokio::test]
 async fn fanout_staging_failure_rolls_back_pending_mls_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot fanout staging rollback key").unwrap();
     let mut alice = session(
         dir.path().join("alice-stage-rollback.sqlite"),
@@ -6168,7 +6266,7 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     // `ambiguous_self_update_exposure_survives_restart_and_respects_retry_backoff`:
     // when the adapter *errors*, a relay may hold the event, so the same staged
     // commit deliberately keeps its obligation instead of risking a fork.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot rejected self update key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let mut initial = current_session(database.clone(), &key, b"alice");
@@ -6401,7 +6499,7 @@ async fn maintenance_supersedes_an_evolution_whose_withdrawal_announcement_was_l
     use cgka_traits::maintenance::GroupEvolutionPhase;
     use storage_sqlite::SqliteAccountStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot crash-lost withdrawal key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let adapter = RecordingAdapter::default();
@@ -6517,7 +6615,7 @@ async fn maintenance_supersedes_an_evolution_whose_withdrawal_announcement_was_l
 async fn maintenance_leaves_an_evolution_alone_while_its_commit_is_still_live() {
     use cgka_traits::maintenance::GroupEvolutionPhase;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot live commit evolution key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let adapter = RecordingAdapter::default();
@@ -6576,7 +6674,7 @@ async fn maintenance_supersedes_an_in_flight_evolution_whose_commit_reads_parked
     use cgka_traits::maintenance::GroupEvolutionPhase;
     use storage_sqlite::SqliteAccountStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot in-flight withdrawal key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let adapter = RecordingAdapter::default();
@@ -6659,7 +6757,7 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     use cgka_traits::maintenance::GroupEvolutionPhase;
     use storage_sqlite::SqliteAccountStorage;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot failed obligation key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let adapter = RecordingAdapter::default();
@@ -6784,7 +6882,7 @@ async fn manual_only_group_runtime(
     cgka_traits::GroupId,
     cgka_traits::EpochId,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot maintenance timing group key").unwrap();
     let mut initial_runtime = AccountDeviceRuntime::new(

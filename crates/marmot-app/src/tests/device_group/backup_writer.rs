@@ -858,6 +858,10 @@ async fn the_runtime_writes_a_due_backup() {
         ..
     } = devices;
     drop(phone);
+    let ledger = storage(&phone_app);
+    let old_run = [0xe1; 16];
+    ledger.begin_backup_run(&old_run, &[0xf2; 32], 1).unwrap();
+    let before = ledger.backup_runs().unwrap();
     let _eose = scripted_eose_pump(
         phone_app.relay_plane.clone(),
         relay.clone(),
@@ -865,19 +869,91 @@ async fn the_runtime_writes_a_due_backup() {
     );
     let runtime = MarmotAppRuntime::new(phone_app.clone());
     runtime.reconcile_accounts().await.unwrap();
-    let ledger = storage(&phone_app);
+    // prepare_backup_pass forgets foreign-key ledger work synchronously.
+    // This genuine durable witness catches even a background pass whose
+    // HTTP future has not yet been polled: false must gate BEFORE prepare.
+    runtime.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(ledger.backup_runs().unwrap(), before);
+    for (wifi, charging) in [(true, false), (false, true)] {
+        runtime
+            .set_backup_background_conditions("alice", wifi, charging)
+            .await
+            .unwrap();
+        runtime.run_due_maintenance("alice").await.unwrap();
+        assert_eq!(
+            ledger.backup_runs().unwrap(),
+            before,
+            "both platform facts are required"
+        );
+    }
+    assert_eq!(pointers_published(&relay), 0);
+    let mut upload = blossom.hold_upload();
+    runtime
+        .set_backup_background_conditions("alice", true, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), upload.entered())
+        .await
+        .unwrap();
+    assert!(
+        !ledger
+            .backup_runs()
+            .unwrap()
+            .iter()
+            .any(|run| run.backup_id == old_run)
+    );
+    runtime
+        .set_backup_background_conditions("alice", false, false)
+        .await
+        .unwrap();
+    upload.release();
     tokio::time::timeout(Duration::from_secs(30), async {
         while ledger.backup_schedule().unwrap().next_pass_at == 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the worker settles a backup pass");
+    .expect("an admitted pass settles after the reported conditions close");
     let listed = pointer(&relay, &words.public);
     assert_eq!(listed.len(), 1);
     assert_eq!(
         ledger.backup_schedule().unwrap().next_pass_at,
         listed[0].written_at + DAY
     );
+    let next_run = [0xe3; 16];
+    ledger.begin_backup_run(&next_run, &[0xf4; 32], 2).unwrap();
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    runtime.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(
+        ledger.backup_runs().unwrap()[0].backup_id,
+        next_run,
+        "false blocks later passes, including cleanup"
+    );
+    // Report eligible facts on this worker without a due pass, then replace
+    // it. The next worker must not inherit facts from the previous lifetime.
+    ledger
+        .schedule_backup_pass(BackupSchedule {
+            next_pass_at: ANY_TIME,
+            failed_passes: 0,
+        })
+        .unwrap();
+    runtime
+        .set_backup_background_conditions("alice", true, true)
+        .await
+        .unwrap();
     runtime.shutdown().await;
+    let replacement = MarmotAppRuntime::new(phone_app.clone());
+    replacement.reconcile_accounts().await.unwrap();
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    replacement.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(ledger.backup_runs().unwrap()[0].backup_id, next_run);
+    assert_eq!(pointers_published(&relay), 1);
+    replacement.shutdown().await;
 }
+
+#[path = "backup_restore.rs"]
+mod restore;

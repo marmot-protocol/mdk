@@ -43,6 +43,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
   callback vtable), `src/publisher.rs` (agent publisher handles) and `src/attachment_{access,controls,history}.rs`
   hold hand-written surfaces outside `commands.rs`. `src/subscriptions/` holds the chat-window,
   conversation-window and attachment-control handles.
+- `src/types/backups.rs` owns allocation-audited backup output deep frees, including the embedded Device/Backup
+  provenance union. Reuse generic command/subscription preflight owners and the core restore lifecycle owners.
 - `tests/` covers out-pointer preflight, publisher, secret-store client and identity/pseudonym behavior;
   `examples/smoke.c` is the C-side smoke driven by `c-smoke.sh`.
 

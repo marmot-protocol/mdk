@@ -5,7 +5,7 @@
 /// the next open.
 #[tokio::test]
 async fn maintenance_retry_that_lands_settles_the_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,

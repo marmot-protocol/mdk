@@ -1,4 +1,3 @@
-
 #[derive(Clone, Default)]
 struct CrashDuringFanoutPublishAdapter {
     publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
@@ -55,7 +54,7 @@ async fn assert_frozen_fanout_case(
     error_kind: Option<TransportEndpointFailureKind>,
     expect_unresolved: bool,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot fanout matrix key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -219,13 +218,10 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 
 #[tokio::test]
 async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal app fanout key").unwrap();
-    let mut alice = session(
-        dir.path().join("alice.sqlite"),
-        &key,
-        b"alice-terminal-app-fanout",
-    );
+    let database = dir.path().join("alice.sqlite");
+    let mut alice = session(&database, &key, b"alice-terminal-app-fanout");
     let created = alice
         .create_group(CreateGroupRequest {
             name: "terminal app fanout".into(),
@@ -273,7 +269,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     .unwrap();
     fanout
         .set_application_message(OutboundApplicationMessage {
- authority: None,
+            authority: None,
             group_id: group_id.clone(),
             app_event_id: "terminal-app-event".into(),
             source_epoch: EpochId(1),
@@ -294,6 +290,9 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
         .unwrap();
     assert!(fanout.outcome().fanout_complete);
     alice.put_outbound_fanout(&fanout).unwrap();
+    drop(alice);
+    let alice = session(&database, &key, b"alice-terminal-app-fanout");
+    assert_eq!(alice.outbound_fanouts().unwrap(), vec![fanout]);
 
     let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
         group_id.clone(),
@@ -334,7 +333,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
 
 #[tokio::test]
 async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot terminal queued app key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -405,7 +404,7 @@ async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
 
 #[tokio::test]
 async fn queued_app_message_with_missing_route_remains_retryable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot queued app missing route key").unwrap();
     let mut alice = session(
         dir.path().join("alice.sqlite"),
@@ -457,9 +456,13 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
 
 #[tokio::test]
 async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
-    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-ordered-fanout",
+    );
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
     let bob_key_package = bob.fresh_key_package().await.unwrap();
     let created = alice
@@ -612,23 +615,26 @@ async fn met_quorum_tail_does_not_hide_newer_unmet_quorum_fanout() {
 
 /// Exercise both replication-only debt and an unsafe publication hidden behind it.
 async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot met quorum ordered fanout key").unwrap();
     let alice_path = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("application-audit.jsonl");
     let open_alice = || {
         let session = session(&alice_path, &key, b"alice-met-quorum-order");
-        session.audit_recorder().swap(Box::new(marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
-            &audit_path,
-            "11".repeat(16),
-            Some("22".repeat(16)),
-            marmot_forensics::v5::Producer {
-                mdk_revision: None,
-                build_profile: marmot_forensics::v5::BuildProfile::Debug,
-                platform: marmot_forensics::v5::Platform::Other,
-                host_build: None,
-            },
-        ).unwrap()));
+        session.audit_recorder().swap(Box::new(
+            marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+                &audit_path,
+                "11".repeat(16),
+                Some("22".repeat(16)),
+                marmot_forensics::v5::Producer {
+                    mdk_revision: None,
+                    build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                    platform: marmot_forensics::v5::Platform::Other,
+                    host_build: None,
+                },
+            )
+            .unwrap(),
+        ));
         session
     };
     let mut alice = open_alice();
@@ -732,12 +738,17 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         newer.mark_attempt_started_at(0, 100_000).unwrap();
         newer.mark_target_accepted(0).unwrap();
         newer.mark_attempt_started_at(1, 100_000).unwrap();
-        newer.record_target_failure(1, TransportEndpointFailure {
-            endpoint: secondary.clone(),
-            reason: "second required acknowledgement unknown".into(),
-            kind: TransportEndpointFailureKind::PossiblyExposed,
-            rejection_category: None,
-        }).unwrap();
+        newer
+            .record_target_failure(
+                1,
+                TransportEndpointFailure {
+                    endpoint: secondary.clone(),
+                    reason: "second required acknowledgement unknown".into(),
+                    kind: TransportEndpointFailureKind::PossiblyExposed,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
         alice.put_outbound_fanout(&newer).unwrap();
     }
     let convergence_delay = alice
@@ -770,22 +781,58 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
 
     tokio::time::sleep(Duration::from_millis(convergence_delay.saturating_add(1))).await;
     let held = runtime.advance_convergence(&group_id).await.unwrap();
-    assert_eq!(held.published_app_messages.len(), usize::from(!newer_below_quorum));
-    let early_app_id = held.published_app_messages.first().map(|message| message.message_id.clone());
+    assert_eq!(
+        held.published_app_messages.len(),
+        usize::from(!newer_below_quorum)
+    );
+    let early_app_id = held
+        .published_app_messages
+        .first()
+        .map(|message| message.message_id.clone());
     let early_publishes = adapter.publishes();
-    assert_eq!(early_publishes.len(), if newer_below_quorum { 0 } else { 2 });
+    assert_eq!(
+        early_publishes.len(),
+        if newer_below_quorum { 0 } else { 2 }
+    );
     if let Some(app_id) = &early_app_id {
-        assert!(early_publishes.iter().all(|publish| &publish.message.id == app_id));
-        assert!(early_publishes.iter().any(|publish| publish.target.endpoints() == [healthy.clone()]));
-        assert!(early_publishes.iter().any(|publish| publish.target.endpoints() == [secondary.clone()]));
+        assert!(
+            early_publishes
+                .iter()
+                .all(|publish| &publish.message.id == app_id)
+        );
+        assert!(
+            early_publishes
+                .iter()
+                .any(|publish| publish.target.endpoints() == [healthy.clone()])
+        );
+        assert!(
+            early_publishes
+                .iter()
+                .any(|publish| publish.target.endpoints() == [secondary.clone()])
+        );
     }
     assert!(!runtime.has_pending_convergence_inputs(&group_id).unwrap());
-    assert_eq!(runtime.has_queued_outbound_intents(&group_id).unwrap(), newer_below_quorum);
-    let retained = runtime.session().outbound_fanouts_for_group(&group_id).unwrap();
-    let retained_old = retained.iter().find(|fanout| fanout.message_id() == &older_id).unwrap();
+    assert_eq!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        newer_below_quorum
+    );
+    let retained = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap();
+    let retained_old = retained
+        .iter()
+        .find(|fanout| fanout.message_id() == &older_id)
+        .unwrap();
     assert_eq!(retained_old.request(), older.request());
-    assert_eq!(retained_old.target_status(0), Some(FanoutTargetStatus::Accepted));
-    assert_eq!(retained_old.target_status(1), Some(FanoutTargetStatus::PossiblyExposed));
+    assert_eq!(
+        retained_old.target_status(0),
+        Some(FanoutTargetStatus::Accepted)
+    );
+    assert_eq!(
+        retained_old.target_status(1),
+        Some(FanoutTargetStatus::PossiblyExposed)
+    );
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
         Some(30_000),
@@ -803,13 +850,21 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
         Arc::new(TestMonotonicClock::default()),
         Arc::new(TestRandom::new(0)),
     );
-    assert_eq!(runtime.has_queued_outbound_intents(&group_id).unwrap(), newer_below_quorum);
+    assert_eq!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        newer_below_quorum
+    );
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
         Some(30_000),
     );
     let deferred = runtime.resume_outbound_fanouts().await.unwrap();
-    assert!(deferred.published_app_messages.iter().all(|published| Some(&published.message_id) == early_app_id.as_ref()));
+    assert!(
+        deferred
+            .published_app_messages
+            .iter()
+            .all(|published| Some(&published.message_id) == early_app_id.as_ref())
+    );
     assert_eq!(adapter.publishes().len(), early_publishes.len());
 
     adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
@@ -818,19 +873,41 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     let publishes = adapter.publishes();
     assert_eq!(released.published_app_messages.len(), 1);
     let app_id = released.published_app_messages[0].message_id.clone();
-    assert_eq!(publishes.len(), early_publishes.len() + if newer_below_quorum { 4 } else { 2 });
+    assert_eq!(
+        publishes.len(),
+        early_publishes.len() + if newer_below_quorum { 4 } else { 2 }
+    );
     assert_eq!(publishes[early_publishes.len()].message.id, older_id);
-    assert_eq!(publishes[early_publishes.len()].message.payload, older.request().message.payload);
-    assert_eq!(publishes[early_publishes.len()].target.endpoints(), std::slice::from_ref(&secondary));
+    assert_eq!(
+        publishes[early_publishes.len()].message.payload,
+        older.request().message.payload
+    );
+    assert_eq!(
+        publishes[early_publishes.len()].target.endpoints(),
+        std::slice::from_ref(&secondary)
+    );
     if newer_below_quorum {
         assert_eq!(publishes[1].message.id, newer_id);
-        assert_eq!(publishes[1].target.endpoints(), std::slice::from_ref(&secondary));
-        assert!(publishes[2..].iter().all(|publish| publish.message.id == app_id));
+        assert_eq!(
+            publishes[1].target.endpoints(),
+            std::slice::from_ref(&secondary)
+        );
+        assert!(
+            publishes[2..]
+                .iter()
+                .all(|publish| publish.message.id == app_id)
+        );
     } else {
         assert_eq!(early_app_id.as_ref(), Some(&app_id));
         assert_eq!(publishes[early_publishes.len() + 1].message.id, app_id);
-        assert_eq!(publishes[early_publishes.len() + 1].message.payload, early_publishes[0].message.payload);
-        assert_eq!(publishes[early_publishes.len() + 1].target.endpoints(), &[secondary]);
+        assert_eq!(
+            publishes[early_publishes.len() + 1].message.payload,
+            early_publishes[0].message.payload
+        );
+        assert_eq!(
+            publishes[early_publishes.len() + 1].target.endpoints(),
+            &[secondary]
+        );
     }
     assert!(!runtime.has_queued_outbound_intents(&group_id).unwrap());
     runtime
@@ -845,26 +922,47 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     assert!(!audit.contains("queued behind met quorum"));
     assert!(!audit.contains("wss://"));
     assert!(!audit.contains(&hex::encode(group_id.as_slice())));
-    let rows = audit.lines().map(|line| {
-        marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
-        serde_json::from_str::<serde_json::Value>(line).unwrap()
-    }).collect::<Vec<_>>();
-    let queued = rows.iter().find(|row| row["event"]["type"] == "send_outcome"
-        && row["event"]["result_kind"] == "queued").expect("queued admission audit");
-    let operation = queued["event"]["record_context"]["operation_ref"].as_str().unwrap();
-    let correlated = rows.iter().filter(|row|
-        row["event"]["record_context"]["operation_ref"].as_str() == Some(operation)
-    ).collect::<Vec<_>>();
-    assert_eq!(correlated.iter().filter(|row| row["event"]["type"] == "send_outcome"
-        && row["event"]["result_kind"] == "application_message").count(), 1);
-    assert_eq!(correlated.iter().filter(|row| row["event"]["type"] == "publish_outcome").count(),
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let queued = rows
+        .iter()
+        .find(|row| {
+            row["event"]["type"] == "send_outcome" && row["event"]["result_kind"] == "queued"
+        })
+        .expect("queued admission audit");
+    let operation = queued["event"]["record_context"]["operation_ref"]
+        .as_str()
+        .unwrap();
+    let correlated = rows
+        .iter()
+        .filter(|row| row["event"]["record_context"]["operation_ref"].as_str() == Some(operation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        correlated
+            .iter()
+            .filter(|row| row["event"]["type"] == "send_outcome"
+                && row["event"]["result_kind"] == "application_message")
+            .count(),
+        1
+    );
+    assert_eq!(
+        correlated
+            .iter()
+            .filter(|row| row["event"]["type"] == "publish_outcome")
+            .count(),
         if newer_below_quorum { 1 } else { 2 },
-        "queue admission, preparation, first publication and retained retry must share one operation");
+        "queue admission, preparation, first publication and retained retry must share one operation"
+    );
 }
 
 #[tokio::test]
 async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-unknown-retry.sqlite");
     let key_text = "marmot unknown retry key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -991,7 +1089,7 @@ async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance
 
 #[tokio::test]
 async fn ambiguous_application_publish_is_retained_without_definite_failure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot unknown app message key").unwrap();
     let mut alice = session(
         dir.path().join("alice-unknown-app.sqlite"),
@@ -1039,12 +1137,8 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
         group_id.as_slice().to_vec(),
         vec![endpoint],
     );
-    let mut runtime = AccountDeviceRuntime::new(
-        alice,
-        adapter,
-        policy,
-        RecordingKeyPackages::default(),
-    );
+    let mut runtime =
+        AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default());
     let payload = app_payload_for(&alice_hex, b"only one semantic message");
     let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
 
@@ -1061,7 +1155,10 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     assert!(effects.published_app_messages.is_empty());
     assert_eq!(effects.unresolved_app_messages.len(), 1);
     assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
-    assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
+    assert_eq!(
+        effects.unresolved_app_messages[0].app_event_id,
+        app_event_id
+    );
     assert_eq!(
         effects.unresolved_app_messages[0].message_id,
         transport_event_id
@@ -1075,7 +1172,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
 
 #[tokio::test]
 async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-create-unknown.sqlite");
     let key_text = "marmot unknown create key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1166,7 +1263,7 @@ async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry
 
 #[tokio::test]
 async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-invite-unknown.sqlite");
     let key_text = "marmot unknown invite key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1266,7 +1363,11 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
         [PendingResolution::Confirmed { .. }]
     ));
     let attempts = adapter.publishes();
-    assert_eq!(attempts.len(), 3, "commit retry must release the frozen Welcome");
+    assert_eq!(
+        attempts.len(),
+        3,
+        "commit retry must release the frozen Welcome"
+    );
     assert_eq!(attempts[1].message, original_commit);
     let recovered_welcome = attempts
         .iter()
@@ -1280,7 +1381,7 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
 
 #[tokio::test]
 async fn ambiguous_disband_recovery_preserves_terminal_pending_kind() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-disband-unknown.sqlite");
     let key_text = "marmot unknown disband key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1403,7 +1504,7 @@ async fn assert_frozen_fanout_restart_edge(
     send_before_ack_persist: bool,
     resume_via_deferred_advance: bool,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-restart-edge.sqlite");
     let key_text = "marmot fanout restart edge key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1559,7 +1660,7 @@ async fn scheduled_advance_hydrates_before_resuming_frozen_fanout() {
 
 #[tokio::test]
 async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-frozen-fanout.sqlite");
     let key_text = "marmot frozen fanout key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -1817,7 +1918,7 @@ async fn wait_for_publish_count<F: std::future::Future>(
 #[tokio::test]
 async fn invite_quorum_survives_restart() {
     for required_acks in [0, 1, 2] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new("invite quorum test key").unwrap();
         let alice_path = dir.path().join("alice.sqlite");
         let mut alice = session(&alice_path, &key, b"invite-quorum-alice");
@@ -2003,7 +2104,7 @@ async fn invite_quorum_survives_restart() {
 #[tokio::test]
 async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
     for required_acks in [1, 2] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let key = SqlCipherKey::new("secondary retry yield key").unwrap();
         let path = dir.path().join("alice.sqlite");
         let mut alice = session(&path, &key, b"secondary-yield-alice");

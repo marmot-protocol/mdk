@@ -14,7 +14,7 @@ fn without_key_package_generation_revision(
 #[tokio::test]
 async fn key_package_generation_upgrade_retries_across_restart_and_rotates_only_once() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("generation upgrade key").unwrap();
     let policy = StaticTransportRouting::new(vec![])
@@ -152,7 +152,7 @@ async fn key_package_generation_upgrade_retries_across_restart_and_rotates_only_
 async fn key_package_generation_upgrade_supersedes_old_pending_bundles_without_deleting_them() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
     for signed in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = relaxed_storage_dir().unwrap();
         let database = dir.path().join("alice.sqlite");
         let key = SqlCipherKey::new("pending generation upgrade key").unwrap();
         let policy = StaticTransportRouting::new(vec![])
@@ -308,7 +308,7 @@ impl KeyPackagePublisher for UpgradeAckKeyPackages {
 #[tokio::test]
 async fn key_package_generation_upgrade_requires_ack_and_resumes_remaining_fanout() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("generation upgrade ack key").unwrap();
     let policy = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![

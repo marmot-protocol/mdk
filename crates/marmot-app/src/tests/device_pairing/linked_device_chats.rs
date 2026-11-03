@@ -1,9 +1,9 @@
-//! Adding a newly linked device to chats (mdk#2628 3.5c, D70): once a link
-//! is made, the device that approved it, and only that device, adds the new
-//! device to each of its chats that takes a same-account Add, with one of the
-//! new device's private KeyPackages and a sibling Welcome, when the new
-//! device's "add to all my chats" is on. A chat that takes no same-account
-//! Add is counted and takes no KeyPackage.
+//! Private sibling chat Adds (mdk#2628 3.5c/3.5e, D70, D82–D84). The
+//! approver's initial burst and another holder's claim-based gap filling
+//! compose private stock, a real Add, and sibling Welcome delivery. The
+//! shared cap, old-chat toggle, current removal state, and chat readiness
+//! govern spending; a lower claim holds only its own chat. Engine tests own
+//! the authoritative duplicate-presence check at actual Add preparation.
 
 use super::*;
 use crate::AppCreateGroupOptions;
@@ -35,6 +35,101 @@ async fn passes(relay: &ScriptedPushRelayClient, devices: &mut [&mut Device], ro
             device.client.run_due_maintenance().await.unwrap();
         }
     }
+}
+
+/// Lose a real opt-out to a sibling's longer non-user branch. Its retained
+/// intention must wait for D37 recovery or a covered user cancellation.
+async fn lose_gap_opt_out(
+    relay: &ScriptedPushRelayClient,
+    editor: &mut Device,
+    target: &mut Device,
+    group: &GroupId,
+) {
+    for device in [&mut *editor, &mut *target] {
+        converge_device_group(&mut device.client, relay, &mut device.cursor, group, 8).await;
+    }
+    let slot_hex = target.slot_hex();
+    let slot = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+    editor
+        .client
+        .update_linked_device_settings(&slot_hex, Some(false), None, None)
+        .await
+        .unwrap();
+    for platform in ["held-claim-fork-a", "held-claim-fork-b"] {
+        let edit = target
+            .client
+            .runtime
+            .edit_device_roster_entry(group, &slot, &[], |entry| {
+                entry.platform = platform.to_owned();
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            edit,
+            marmot_session::DeviceRosterEdit::Committed(_)
+        ));
+    }
+    for device in [&mut *editor, &mut *target] {
+        converge_device_group(&mut device.client, relay, &mut device.cursor, group, 8).await;
+    }
+    assert!(
+        editor.roster(group).devices[&slot]
+            .settings
+            .add_to_all_chats
+    );
+}
+
+/// Keep the device group genuinely busy so ordinary maintenance cannot
+/// replay the lost opt-out before the gap pass examines its claims.
+async fn hold_gap_edit_recovery(
+    editor: &mut Device,
+    group: &GroupId,
+) -> marmot_session::PreparedSessionCommit {
+    let marmot_session::PreparedSessionSend::Commit(staged) = editor
+        .client
+        .runtime
+        .confirm_commit_without_publish_with_audit_context(
+            SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            },
+            marmot_forensics::AuditEventContext::default(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the device group stages its hold");
+    };
+    staged
+}
+
+async fn release_and_cancel_gap_opt_out(
+    relay: &ScriptedPushRelayClient,
+    editor: &mut Device,
+    target: &Device,
+    group: &GroupId,
+    staged: marmot_session::PreparedSessionCommit,
+) {
+    let effects = editor
+        .client
+        .runtime
+        .rollback_prepared_session_commit(staged)
+        .await
+        .unwrap();
+    editor
+        .client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    converge_device_group(&mut editor.client, relay, &mut editor.cursor, group, 8).await;
+    let pin = editor.client.runtime.epoch_pin(group).unwrap();
+    // Cancel before the next maintenance pass can replay. A cancellation
+    // while the Commit was still held would correctly be refused as Busy.
+    editor
+        .client
+        .update_linked_device_settings(&target.slot_hex(), Some(true), None, None)
+        .await
+        .unwrap();
+    assert_eq!(editor.client.runtime.epoch_pin(group).unwrap(), pin);
 }
 
 /// How many leaves `new` holds in `chat`, as `device` reads it.
@@ -203,12 +298,11 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
-/// Only the device that approved a link adds the new device to chats. The
-/// laptop, linked earlier and in the phone's chats, holds the tablet's
-/// KeyPackages but adds it to none; the phone, which approved the tablet,
-/// adds it.
+/// The direct post-link burst belongs to the approver. A different sibling
+/// can still fill the missing chats through the advisory claim flow while
+/// that approver is offline; the returning approver adds no duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn only_the_device_that_approved_a_link_adds_the_new_device() {
+async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
     let chats = chats(&mut phone, 2).await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
@@ -216,16 +310,440 @@ async fn only_the_device_that_approved_a_link_adds_the_new_device() {
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
 
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    passes(&relay, &mut [&mut laptop, &mut tablet], 4).await;
+    hold_key_packages(&relay, &mut laptop, &mut tablet).await;
+    laptop
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
     assert!(held_from(&laptop, &tablet) > 0);
     assert_eq!(taken_from(&laptop, &tablet), 0);
     assert!(!chats.iter().any(|chat| joined(&tablet, chat)));
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !chats.iter().all(|chat| joined(&tablet, chat)) {
+            passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
+            for client in [&mut laptop.client, &mut tablet.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the online sibling fills both missing chats");
+    assert_eq!(taken_from(&laptop, &tablet), chats.len());
 
     passes(&relay, &mut [&mut phone, &mut tablet, &mut laptop], 3).await;
     for chat in &chats {
         assert!(joined(&tablet, chat));
         assert_eq!(leaves_of(&phone, &tablet, chat, &group), 1);
     }
+    assert_eq!(taken_from(&phone, &tablet), 0);
+}
+
+/// A live claim from a lower slot holds just that chat's Add. Another chat
+/// still fills through a real private-package Add and sibling Welcome. A
+/// leaving claimant neither sends a new claim nor holds the first chat back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lower_sibling_claim_holds_only_its_chat() {
+    let (relay, [first, second, mut target]) = alice_devices::<3>().await;
+    let (mut low, mut high) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chats = chats(&mut low, 2).await;
+    let group = link(&relay, &mut low, &mut high, "Other device").await;
+    passes(&relay, &mut [&mut low, &mut high], 4).await;
+    assert!(chats.iter().all(|chat| joined(&high, chat)));
+    link(&relay, &mut low, &mut target, "New device").await;
+    let target_slot: [u8; 32] = hex::decode(target.slot_hex()).unwrap().try_into().unwrap();
+    // Observe the completed link without running this holder's maintenance:
+    // it has no private stock yet. Gap filling must request it, then a
+    // hand-off must wake the waiting chat even with no membership change.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            converge_device_group(&mut high.client, &relay, &mut high.cursor, &group, 1).await;
+            if high
+                .roster(&group)
+                .devices
+                .get(&target_slot)
+                .is_some_and(|entry| entry.tag_signature_key.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the holder observes the target's first tagged Commit");
+    assert_eq!(held_from(&high, &target), 0);
+    assert!(!chats.iter().any(|chat| joined(&target, chat)));
+    lose_gap_opt_out(&relay, &mut high, &mut target, &group).await;
+    converge_device_group(&mut low.client, &relay, &mut low.cursor, &group, 8).await;
+    let staged = hold_gap_edit_recovery(&mut high, &group).await;
+    let content = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        low.slot_hex(),
+        target.slot_hex(),
+        hex::encode(chats[0].as_slice())
+    );
+    assert!(
+        low.client
+            .send_device_group_message(&group, 458, content)
+            .await
+            .unwrap()
+    );
+    // This valid lower claim arrives while local settings recovery is held.
+    // It must survive both receipt and ordinary maintenance bookkeeping.
+    deliver_new(&mut high.client, &relay, &mut high.cursor).await;
+    high.client.run_due_maintenance().await.unwrap();
+    assert!(
+        high.roster(&group).devices[&target_slot]
+            .settings
+            .add_to_all_chats
+    );
+    release_and_cancel_gap_opt_out(&relay, &mut high, &target, &group, staged).await;
+    // The target cannot impersonate that lower claimant to hold another
+    // chat: authenticating `from` uses the MLS sender's actual device tag.
+    let forged = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        low.slot_hex(),
+        target.slot_hex(),
+        hex::encode(chats[1].as_slice())
+    );
+    assert!(
+        target
+            .client
+            .send_device_group_message(&group, 458, forged)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&target, &chats[1]) {
+            passes(&relay, &mut [&mut high, &mut target], 1).await;
+            for client in [&mut high.client, &mut target.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a claim for the first chat never blocks the second chat");
+    assert!(!joined(&target, &chats[0]));
+    assert_eq!(taken_from(&high, &target), 1);
+    assert_eq!(leaves_of(&high, &target, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&high, &target, &chats[1], &group), 1);
+
+    // A claimant that starts leaving no longer holds this chat back. Give
+    // it usable stock first so its own no-claim assertion is not vacuous.
+    hold_key_packages(&relay, &mut low, &mut target).await;
+    let low_slot: [u8; 32] = hex::decode(low.slot_hex()).unwrap().try_into().unwrap();
+    let marmot_session::DeviceRosterEdit::Committed(effects) = low
+        .client
+        .runtime
+        .edit_device_roster_entry(&group, &low_slot, &[], |entry| {
+            entry.status = cgka_traits::app_components::DeviceStatusV1::Leaving;
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the claimant commits its leaving status")
+    };
+    low.client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    let before = relay.published_events.lock().unwrap().len();
+    let stock = held_from(&low, &target);
+    assert!(stock > 0);
+    low.client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(relay.published_events.lock().unwrap().len(), before);
+    assert_eq!(held_from(&low, &target), stock);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&target, &chats[0]) {
+            converge_device_group(&mut high.client, &relay, &mut high.cursor, &group, 1).await;
+            // Run the actual gap/Welcome paths without the separate removal
+            // driver: the assertion must hold while the claimant is Leaving,
+            // before its ordinary removal could also invalidate the claim.
+            high.client
+                .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS, &mut Default::default())
+                .await;
+            deliver_new(&mut target.client, &relay, &mut target.cursor).await;
+            target.client.join_stashed_sibling_welcomes().await;
+            for client in [&mut high.client, &mut target.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a claimant that is leaving no longer suppresses its chat");
+    assert_eq!(
+        high.roster(&group).devices[&low_slot].status,
+        cgka_traits::app_components::DeviceStatusV1::Leaving
+    );
+    assert_eq!(taken_from(&high, &target), 2);
+    assert_eq!(leaves_of(&high, &target, &chats[0], &group), 1);
+}
+
+/// A terminally rejected Add rolls back to a quiet chat, but the live own
+/// claim still prevents another stock spend. An independent chat progresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let mut chats = chats(&mut phone, 2).await;
+    chats.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert!(
+        chats
+            .iter()
+            .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 0)
+    );
+
+    // Accept the claim, then definitively reject the first chat's Commit.
+    // The fixture gates actual publishes; it supplies no retry decision.
+    let blocked = relay
+        .blocked_publish_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    relay.block_next_publishes(2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut selection = Default::default();
+        tokio::join!(
+            phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
+            async {
+                relay.wait_for_blocked_publishes(blocked + 1).await;
+                relay.release_publish();
+                relay.wait_for_blocked_publishes(blocked + 2).await;
+                relay.reject_next_publish();
+                relay.release_publish();
+            }
+        );
+    })
+    .await
+    .expect("the claim and terminally rejected Commit complete");
+    assert!(phone.client.group_quiet(&chats[0]).unwrap());
+    assert_eq!(leaves_of(&phone, &laptop, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &chats[1], &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), 2);
+    let published = relay.published_event_ids();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+        .await;
+    assert_eq!(
+        relay.published_event_ids(),
+        published,
+        "no fresh claim or Add"
+    );
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        2,
+        "no fresh private stock spend"
+    );
+    lose_gap_opt_out(&relay, &mut phone, &mut laptop, &group).await;
+    let staged = hold_gap_edit_recovery(&mut phone, &group).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    assert!(
+        phone.roster(&group).devices[&laptop_slot]
+            .settings
+            .add_to_all_chats
+    );
+    release_and_cancel_gap_opt_out(&relay, &mut phone, &laptop, &group, staged).await;
+    let published = relay.published_event_ids();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+        .await;
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published.len(),
+        "a transient settings hold keeps the original live claim"
+    );
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        2,
+        "cancelling the hold cannot spend before the original claim expires"
+    );
+    assert_eq!(leaves_of(&phone, &laptop, &chats[0], &group), 0);
+}
+
+/// An unreadable target row cannot prevent a healthy later sibling from
+/// filling the same chat. Both stock and settings readiness fail locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_target_state_does_not_starve_another_sibling_in_the_same_chat() {
+    for corrupt_settings in [false, true] {
+        let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+        let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let chat = chats(&mut phone, 1).await.remove(0);
+        let group = link(&relay, &mut phone, &mut first, "First").await;
+        hold_key_packages(&relay, &mut phone, &mut first).await;
+        link(&relay, &mut phone, &mut second, "Second").await;
+        hold_key_packages(&relay, &mut phone, &mut second).await;
+        assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
+        assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
+        if corrupt_settings {
+            for device in [&mut phone, &mut first, &mut second] {
+                converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8)
+                    .await;
+            }
+            phone
+                .client
+                .rename_linked_device(&first.slot_hex(), "Unreadable settings")
+                .await
+                .unwrap();
+            // Corrupt a row written by the real host command, not a synthetic
+            // intention that supplies the standing this owner should derive.
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE device_renames SET label = x'00' WHERE slot_id_hex = ?1",
+                    [first.slot_hex()],
+                )
+                .unwrap();
+        } else {
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE private_key_packages_received
+                 SET not_before = 'unreadable', not_after = 'unreadable'
+                 WHERE issuer_slot_hex = ?1",
+                    [first.slot_hex()],
+                )
+                .unwrap();
+        }
+        phone
+            .client
+            .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+            .await;
+        assert_eq!(taken_from(&phone, &first), 0);
+        assert_eq!(
+            taken_from(&phone, &second),
+            1,
+            "the healthy target progresses, settings row corrupt: {corrupt_settings}"
+        );
+        assert_eq!(leaves_of(&phone, &second, &chat, &group), 1);
+    }
+}
+
+/// A successful send call may retain an unconfirmed Commit. The next
+/// sibling must not publish a claim for this already-busy chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_gap_add_does_not_claim_the_next_sibling() {
+    let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+    let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut first, "First").await;
+    hold_key_packages(&relay, &mut phone, &mut first).await;
+    link(&relay, &mut phone, &mut second, "Second").await;
+    hold_key_packages(&relay, &mut phone, &mut second).await;
+    assert_eq!(leaves_of(&phone, &first, &chat, &group), 0);
+    assert_eq!(leaves_of(&phone, &second, &chat, &group), 0);
+    assert!(phone.client.group_quiet(&chat).unwrap());
+    let before = relay.published_event_ids().len();
+    let blocked = relay
+        .blocked_publish_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    relay.block_next_publishes(2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut selection = Default::default();
+        tokio::join!(
+            phone.client.fill_sibling_chat_gaps(&[], 2, &mut selection),
+            async {
+                relay.wait_for_blocked_publishes(blocked + 1).await;
+                relay.release_publish();
+                relay.wait_for_blocked_publishes(blocked + 2).await;
+                relay.zero_ack_next_publish();
+                relay.release_publish();
+            }
+        );
+    })
+    .await
+    .expect("the claim is accepted but the Commit is unconfirmed");
+    assert!(!phone.client.group_quiet(&chat).unwrap());
+    assert_eq!(taken_from(&phone, &first), 1);
+    assert_eq!(taken_from(&phone, &second), 0);
+    assert_eq!(
+        relay.published_event_ids().len(),
+        before + 1,
+        "only the first sibling's claim was published"
+    );
+}
+
+/// Recovering a quarantined chat wakes its missing-membership work without
+/// a device-group or chat epoch change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovering_a_quarantined_chat_wakes_gap_filling() {
+    use cgka_traits::storage::GroupStorage;
+
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    let storage = phone.app.account_storage("alice").unwrap();
+    let original = storage.get_group(&chat).unwrap();
+    let mut damaged = original.clone();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    let mut phone = reopen(phone).await;
+    assert_eq!(phone.client.quarantined_groups().len(), 1);
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    let pin = phone.client.runtime.epoch_pin(&group).unwrap();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), 0);
+
+    storage.put_group(&original).unwrap();
+    assert!(phone.client.retry_hydrate_quarantined_group(&chat).unwrap());
+    phone.client.drain_pending_session_events().await.unwrap();
+    assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,
@@ -409,7 +927,7 @@ async fn a_chat_that_already_holds_the_new_device_gets_no_add() {
 /// The phone adds the new device to its chats for a week after the link is
 /// made; gap filling covers a link older than that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_made_over_a_week_ago_adds_the_new_device_to_no_chat() {
+async fn gap_filling_covers_a_link_older_than_the_approvers_burst() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     let chats = chats(&mut phone, 1).await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
@@ -420,11 +938,217 @@ async fn a_link_made_over_a_week_ago_adds_the_new_device_to_no_chat() {
             [week],
         )
         .unwrap();
-    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
-
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    assert_eq!(
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut Default::default())
+            .await,
+        0
+    );
     assert!(held_from(&phone, &laptop) > 0);
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert!(!joined(&laptop, &chats[0]));
+
+    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
+    assert!(joined(&laptop, &chats[0]));
+    assert_eq!(taken_from(&phone, &laptop), 1);
+}
+
+/// Both automatic Add paths leave private stock untouched while a local
+/// opt-out still needs replay. Once the user enables the settled setting,
+/// either path can proceed; retaining the applied edit never blocks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_adds_wait_for_a_lost_local_old_chat_toggle() {
+    for resume_with_gap in [false, true] {
+        let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+        let chat = chats(&mut phone, 1).await.remove(0);
+        let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+        hold_key_packages(&relay, &mut phone, &mut laptop).await;
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        let slot_hex = laptop.slot_hex();
+        let slot: [u8; 32] = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+        phone
+            .client
+            .update_linked_device_settings(&slot_hex, Some(false), None, None)
+            .await
+            .unwrap();
+        for platform in ["fork-a", "fork-b"] {
+            let edit = laptop
+                .client
+                .runtime
+                .edit_device_roster_entry(&group, &slot, &[], |entry| {
+                    entry.platform = platform.to_owned();
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                edit,
+                marmot_session::DeviceRosterEdit::Committed(_)
+            ));
+        }
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        assert!(
+            phone.roster(&group).devices[&slot]
+                .settings
+                .add_to_all_chats,
+            "the opt-out lost to the longer non-user branch"
+        );
+        assert!(held_from(&phone, &laptop) > 0);
+        assert_eq!(
+            phone
+                .client
+                .add_linked_devices_to_chats(&[], &mut Default::default())
+                .await,
+            0
+        );
+        phone
+            .client
+            .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+            .await;
+        assert_eq!(
+            taken_from(&phone, &laptop),
+            0,
+            "neither path spends stock for a pending opt-out"
+        );
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+
+        phone.client.try_device_rename_upkeep().await.unwrap();
+        for device in [&mut phone, &mut laptop] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        assert!(
+            !phone.roster(&group).devices[&slot]
+                .settings
+                .add_to_all_chats
+        );
+        phone
+            .client
+            .update_linked_device_settings(&slot_hex, Some(true), None, None)
+            .await
+            .unwrap();
+        if resume_with_gap {
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE device_links SET decided_at = decided_at - ?1",
+                    [i64::try_from(LINK_CHAT_ADD_SECS).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                phone
+                    .client
+                    .add_linked_devices_to_chats(&[], &mut Default::default())
+                    .await,
+                0
+            );
+            phone
+                .client
+                .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+                .await;
+        } else {
+            assert_eq!(
+                phone
+                    .client
+                    .add_linked_devices_to_chats(&[], &mut Default::default())
+                    .await,
+                1
+            );
+        }
+        assert_eq!(taken_from(&phone, &laptop), 1);
+        assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    }
+}
+
+/// Cancelling a pending opt-out changes only local intention state. With a
+/// second eligible sibling keeping sender readiness true, the effective target
+/// set must wake the missing sibling even though the DG pin never changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_lost_toggle_wakes_gap_targets_without_a_roster_change() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let chat = chats(&mut phone, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    passes(&relay, &mut [&mut phone, &mut tablet], 4).await;
+    assert!(joined(&tablet, &chat));
+    assert_eq!(leaves_of(&phone, &tablet, &chat, &group), 1);
+    assert_eq!(link(&relay, &mut phone, &mut laptop, "Laptop").await, group);
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    for device in [&mut phone, &mut laptop, &mut tablet] {
+        converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+    }
+    let slot_hex = laptop.slot_hex();
+    let slot: [u8; 32] = hex::decode(&slot_hex).unwrap().try_into().unwrap();
+    phone
+        .client
+        .update_linked_device_settings(&slot_hex, Some(false), None, None)
+        .await
+        .unwrap();
+    for platform in ["fork-a", "fork-b"] {
+        let edit = laptop
+            .client
+            .runtime
+            .edit_device_roster_entry(&group, &slot, &[], |entry| {
+                entry.platform = platform.to_owned();
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            edit,
+            marmot_session::DeviceRosterEdit::Committed(_)
+        ));
+    }
+    for device in [&mut phone, &mut laptop, &mut tablet] {
+        converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+    }
+    assert!(
+        phone.roster(&group).devices[&slot]
+            .settings
+            .add_to_all_chats
+    );
+    assert!(held_from(&phone, &laptop) > 0);
+    let pin = phone.client.runtime.epoch_pin(&group).unwrap();
+    let tablet_taken = taken_from(&phone, &tablet);
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    let published = relay.published_event_ids();
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(
+        relay.published_event_ids(),
+        published,
+        "pending work starts no claim or Add"
+    );
+    assert_eq!(taken_from(&phone, &laptop), 0);
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 0);
+
+    // This covered no-op cancels the lost disable before recovery can replay
+    // it. The other eligible target and claimant set remain exactly the same.
+    phone
+        .client
+        .update_linked_device_settings(&slot_hex, Some(true), None, None)
+        .await
+        .unwrap();
+    assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
+    phone
+        .client
+        .fill_sibling_chat_gaps(&[], 1, &mut Default::default())
+        .await;
+    assert_eq!(
+        taken_from(&phone, &laptop),
+        1,
+        "local target eligibility wakes the chat without a DG epoch event"
+    );
+    assert_eq!(taken_from(&phone, &tablet), tablet_taken);
+    assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    assert_eq!(leaves_of(&phone, &tablet, &chat, &group), 1);
 }
 
 /// A chat with a commit of the phone's own still staged takes no Add and no
@@ -583,8 +1307,49 @@ async fn a_new_chat_founds_with_its_linked_sibling_even_with_old_chats_off() {
         .await
         .unwrap();
     assert_eq!(phone.client.runtime.device_tag_group(), Some(&group));
+    assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
+    assert!(
+        phone.client.group_quiet(&group).unwrap(),
+        "unrelated unhydrated chats do not hide the quiet device group"
+    );
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
     assert_eq!(taken_from(&phone, &laptop), before + 1);
+    assert_eq!(
+        phone
+            .client
+            .runtime
+            .owed_sibling_welcomes(Timestamp(crate::unix_now_seconds()))
+            .unwrap()
+            .iter()
+            .filter(|welcome| welcome.group_id == chat)
+            .count(),
+        1,
+        "the deferred device-group route is not installed yet; the Welcome stays durable"
+    );
+
+    // The foreground creation above hydrated/tagged the device group. Use
+    // its existing route installer, as the post-hydration reconcile does,
+    // while leaving the unrelated old chat unhydrated. Initial delivery for
+    // the next creation must not depend on that old chat's readiness.
+    assert!(phone.client.ensure_device_group_route(&group).unwrap());
+    let ready = phone
+        .client
+        .create_group("ready device group", &[])
+        .await
+        .unwrap();
+    assert!(!phone.client.runtime.unhydrated_group_ids().is_empty());
+    assert_eq!(leaves_of(&phone, &laptop, &ready, &group), 1);
+    assert_eq!(taken_from(&phone, &laptop), before + 2);
+    assert!(
+        phone
+            .client
+            .runtime
+            .owed_sibling_welcomes(Timestamp(crate::unix_now_seconds()))
+            .unwrap()
+            .iter()
+            .all(|welcome| welcome.group_id != ready && welcome.group_id != chat),
+        "the ready device group carries both the new and retained initial Welcomes"
+    );
 }
 
 /// Missing private stock never falls back to the sibling's public slot or

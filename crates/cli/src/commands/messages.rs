@@ -1080,6 +1080,7 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         };
         let mut display_name_for_account = |account_id: &str| {
             if account_id == actor {

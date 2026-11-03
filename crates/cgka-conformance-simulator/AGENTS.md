@@ -105,7 +105,11 @@ command matrix beside durable evidence.
 - **`src/relay_control.rs`** — Simulator-owned retained-relay recording and reversible query visibility, outside
   production transport code.
 - **`src/relay_fault_proxy.rs`** — Real socket interruption in front of the harness-owned loopback relay; every
-  advertised relay URL goes through it, and it taps aggregate frame counts.
+  advertised relay URL goes through it, and it taps aggregate frame counts. It answers NIP-11 fetches itself with a
+  production-shaped document (no relay session), logs every client history filter (a `REQ` filter with `until`, or
+  a `NEG-OPEN`) with its connection and each connection's `#p` values (so a test can count one account's requests:
+  `AppRuntimeHarness::client_history_requests`), and can withhold history requests while live traffic flows. It
+  forwards every byte unchanged otherwise.
 - **`src/audit_capture.rs`** — In-memory forensic capture so decisions the engine never surfaces as a `GroupEvent`
   (notably `convergence_decision`) are observable.
 

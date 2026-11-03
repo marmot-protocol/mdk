@@ -77,16 +77,21 @@ struct NewDevice {
 }
 
 impl AppClient {
-    /// One pass; a failure waits for the next one.
+    /// One pass; a failure waits for the next one. Return how many Add
+    /// attempts used the per-pass budget, so gap filling shares its remainder.
     pub(crate) async fn add_linked_devices_to_chats(
         &mut self,
         held: &[GroupId],
         selection: &mut PrivateKeyPackageSelection,
-    ) {
+    ) -> usize {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
-            return;
+            return 0;
         }
-        if let Err(error) = self.try_add_linked_devices_to_chats(held, selection).await {
+        let mut budget = LINK_CHAT_ADDS_PER_PASS;
+        if let Err(error) = self
+            .try_add_linked_devices_to_chats(held, &mut budget, selection)
+            .await
+        {
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "add_linked_devices_to_chats",
@@ -94,6 +99,7 @@ impl AppClient {
                 "could not add linked devices to chats"
             );
         }
+        LINK_CHAT_ADDS_PER_PASS - budget
     }
 
     /// Each device and each chat is handled on its own: one that fails never
@@ -101,6 +107,7 @@ impl AppClient {
     async fn try_add_linked_devices_to_chats(
         &mut self,
         held: &[GroupId],
+        budget: &mut usize,
         selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
         let Some(exchange) = self.device_group_exchange()? else {
@@ -114,9 +121,13 @@ impl AppClient {
             return Ok(());
         }
         let chats = self.sibling_commit_chats_in_list_order()?;
-        let mut budget = LINK_CHAT_ADDS_PER_PASS;
         let mut first_error: Option<AppError> = None;
         'devices: for device in new_devices {
+            if !self.device_setting_ready(&exchange, &device.slot, |settings| {
+                settings.add_to_all_chats
+            })? {
+                continue;
+            }
             let mut owed = Vec::new();
             for chat in &chats {
                 match self.chat_owed_to(&exchange.roster, &device, chat) {
@@ -137,7 +148,7 @@ impl AppClient {
                 first_error.get_or_insert(error);
             }
             for chat in owed {
-                if budget == 0 {
+                if *budget == 0 {
                     break 'devices;
                 }
                 match self.group_quiet(&chat) {
@@ -162,7 +173,7 @@ impl AppClient {
                             continue;
                         }
                     };
-                budget -= 1;
+                *budget -= 1;
                 selection.record_attempt(&device.slot, &candidate.key_package_ref_hex);
                 if let Err(error) = self
                     .add_sibling_to_chat(&chat, &device.slot, candidate)

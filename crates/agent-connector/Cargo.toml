@@ -33,6 +33,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+storage-sqlite.workspace = true
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
 

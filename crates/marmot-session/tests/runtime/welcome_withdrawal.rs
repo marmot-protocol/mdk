@@ -38,18 +38,17 @@ async fn owed_invite_welcome(dir: &std::path::Path) -> OwedInviteWelcome {
     let adapter = RecordingAdapter::default();
     adapter.accept_next(1);
     adapter.accept_next(0);
-    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
-        "wss://alice-inbox.example".into(),
-    )])
-    .with_group_route(
-        group_id.clone(),
-        group_id.as_slice().to_vec(),
-        vec![TransportEndpoint("wss://group.example".into())],
-    )
-    .with_inbox_route(
-        carol_id,
-        vec![TransportEndpoint("wss://carol-inbox.example".into())],
-    );
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                carol_id,
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,
@@ -111,7 +110,7 @@ fn welcome_publishes(adapter: &RecordingAdapter) -> Vec<TransportMessage> {
 /// the startup retry, maintenance, or explicit redelivery.
 #[tokio::test]
 async fn withdrawn_welcome_is_not_published_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -168,7 +167,12 @@ async fn withdrawn_welcome_is_not_published_again() {
     assert!(task.message_ids().is_empty(), "no detached relay attempt");
     wall.set(300_100);
     runtime.run_due_maintenance().await.unwrap();
-    assert!(runtime.redeliver_welcome(&welcome.id).await.is_err());
+    let error = runtime.redeliver_welcome(&welcome.id).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Backend(reason))
+            if reason == "stored message is not an outbound sent record"
+    ));
 
     assert_eq!(welcome_publishes(&adapter).len(), tried);
     assert_eq!(
@@ -182,7 +186,7 @@ async fn withdrawn_welcome_is_not_published_again() {
 /// detached startup publish holds it, is dropped by maintenance unpublished.
 #[tokio::test]
 async fn maintenance_drops_the_retry_record_of_a_withdrawn_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -218,7 +222,7 @@ async fn maintenance_drops_the_retry_record_of_a_withdrawn_welcome() {
 /// published, even after the commit confirms on a restart.
 #[tokio::test]
 async fn withdrawn_staged_welcome_stays_unpublished_after_its_commit_confirms() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-staged-withdrawal.sqlite");
     let key_text = "marmot staged withdrawal key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -337,14 +341,19 @@ async fn withdrawn_staged_welcome_stays_unpublished_after_its_commit_confirms() 
         welcome_publishes(&adapter).is_empty(),
         "the withdrawn Welcome is not released when its commit confirms"
     );
-    assert!(restarted.outstanding_welcome_deliveries().unwrap().is_empty());
+    assert!(
+        restarted
+            .outstanding_welcome_deliveries()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Withdrawal reports a Welcome that already went out, and refuses an id
 /// that is not an outbound Welcome.
 #[tokio::test]
 async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -374,14 +383,19 @@ async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
         .expect("the invite published its commit")
         .message
         .id;
-    assert!(runtime.withdraw_welcome(&commit_id).is_err());
+    let error = runtime.withdraw_welcome(&commit_id).unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Backend(reason))
+            if reason == "stored message is not a delivery-aware outbound Welcome"
+    ));
 }
 
 /// A Welcome withdrawn after a detached startup retry was prepared, but
 /// before the task runs, never reaches the relay.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -428,7 +442,7 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
 /// is still queued behind the concurrency limit; the started ones finish.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot queued withdrawal key").unwrap();
     let mut members = Vec::new();
     let mut policy =
@@ -442,7 +456,9 @@ async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs()
         members.push(recipient.fresh_key_package().await.unwrap());
         policy = policy.with_inbox_route(
             recipient.self_id(),
-            vec![TransportEndpoint(format!("wss://recipient-{index}.example"))],
+            vec![TransportEndpoint(format!(
+                "wss://recipient-{index}.example"
+            ))],
         );
     }
     let adapter = RecordingAdapter::default();
@@ -527,7 +543,7 @@ async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs()
 /// Welcome is left as it was.
 #[tokio::test]
 async fn legacy_create_welcome_cannot_be_withdrawn() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot legacy withdrawal key").unwrap();
     let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-legacy");
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-legacy");
@@ -553,7 +569,12 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
         RecordingKeyPackages::default(),
     );
 
-    assert!(runtime.withdraw_welcome(&welcome_id).is_err());
+    let error = runtime.withdraw_welcome(&welcome_id).unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Backend(reason))
+            if reason == "stored message is not a delivery-aware outbound Welcome"
+    ));
     assert!(
         !runtime
             .session()
@@ -566,7 +587,7 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
 /// group is hydrated, and nothing publishes it afterwards, hydrated or not.
 #[tokio::test]
 async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated withdrawal key").unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-unhydrated");
@@ -614,7 +635,10 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
         &key,
         b"alice-unhydrated",
     ));
-    assert_eq!(runtime.session().unhydrated_group_ids(), vec![group_id.clone()]);
+    assert_eq!(
+        runtime.session().unhydrated_group_ids(),
+        vec![group_id.clone()]
+    );
     assert_eq!(
         runtime.withdraw_welcome(&welcome.id).unwrap(),
         WelcomeWithdrawal::Withdrawn
@@ -663,7 +687,7 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
 /// nothing reports a delivery failure.
 #[tokio::test]
 async fn a_link_welcome_is_never_published_from_its_deadline_on() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot link welcome deadline key").unwrap();
     let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-deadline");
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-deadline");
@@ -693,18 +717,17 @@ async fn a_link_welcome_is_never_published_from_its_deadline_on() {
 
     let adapter = RecordingAdapter::default();
     adapter.accept_only_endpoints(vec![TransportEndpoint("wss://bob-inbox.example".into())]);
-    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
-        "wss://alice-inbox.example".into(),
-    )])
-    .with_group_route(
-        chosen.clone(),
-        chosen.as_slice().to_vec(),
-        vec![TransportEndpoint("wss://group.example".into())],
-    )
-    .with_inbox_route(
-        bob_id,
-        vec![TransportEndpoint("wss://bob-inbox.example".into())],
-    );
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                chosen.clone(),
+                chosen.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            )
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
     let wall = Arc::new(TestWallClock::new(300_000));
     let mut runtime = AccountDeviceRuntime::new(
         alice,

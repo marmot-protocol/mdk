@@ -567,6 +567,13 @@ pub(crate) enum AccountWorkerCommand {
         label: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    UpdateLinkedDeviceSettings {
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     RemoveLinkedDevice {
         slot_id_hex: String,
         respond: oneshot::Sender<Result<(), AppError>>,
@@ -584,7 +591,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<crate::RecoveryWords, AppError>>,
     },
     ConfirmRecoveryWords {
-        answers: Vec<String>,
+        answers: Zeroizing<Vec<String>>,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
     CancelRecoveryWords {
@@ -592,6 +599,34 @@ pub(crate) enum AccountWorkerCommand {
     },
     TurnOffBackups {
         respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    SetBackupBackgroundConditions {
+        wifi: bool,
+        charging: bool,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
+    BeginBackupRestore {
+        words: crate::BackupRestoreWords,
+        respond: oneshot::Sender<Result<crate::BackupRestoreStatus, AppError>>,
+    },
+    CancelBackupRestore {
+        operation: crate::BackupRestoreId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    BackupRestoreStatus {
+        respond: oneshot::Sender<Result<crate::BackupRestoreStatus, AppError>>,
+    },
+    WatchBackupRestore {
+        respond: oneshot::Sender<Result<crate::BackupRestoreWatch, AppError>>,
+    },
+    HistoryImportProvenance {
+        group_id: GroupId,
+        event_id: String,
+        respond: oneshot::Sender<Result<Option<crate::HistoryImportProvenance>, AppError>>,
+    },
+    BackupHistoryAvailability {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<Vec<crate::BackupHistoryAvailability>, AppError>>,
     },
     BackupSettings {
         respond: oneshot::Sender<Result<crate::BackupSettings, AppError>>,
@@ -922,6 +957,13 @@ impl AccountWorkerCommand {
                 | Self::GroupCommitDelivery { .. }
                 | Self::GroupPushDebugInfo { .. }
                 | Self::AccountDevicesActivation { .. }
+                // These read/cancel only ephemeral restore state or catalog
+                // evidence. They change no repair grant/protocol ordering.
+                | Self::CancelBackupRestore { .. }
+                | Self::BackupRestoreStatus { .. }
+                | Self::WatchBackupRestore { .. }
+                | Self::BackupHistoryAvailability { .. }
+                | Self::HistoryImportProvenance { .. }
         )
     }
 
@@ -1977,6 +2019,7 @@ async fn run_app_runtime_account_worker(
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
         history_blobs: HistoryBlobFlights::default(),
+        backup_background_allowed: Default::default(),
         worker_lifetime: media_http_worker_lifetime,
     };
     // Only with the internal `runner_owns_debt` gate on (mdk#2660 phase 4).
@@ -2482,6 +2525,10 @@ async fn run_app_runtime_account_worker(
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // Ordinary transfers return the same credits used by
+                        // restore; resume only after completion released one.
+                        dispatch_backup_restore(&mut client, &media_http);
+                        dispatch_backup_pass(&mut client, &media_http);
                         // A fetched history imports messages; show them, and
                         // the chat's history state, now, not at the next
                         // maintenance pass.
@@ -4513,6 +4560,9 @@ struct MediaHttpContext {
     prepared_group_image_uploads: Arc<Mutex<HashSet<String>>>,
     /// The history upload and fetch running, at most one of each.
     history_blobs: HistoryBlobFlights,
+    /// Reported platform facts, never persisted. A replacement worker starts
+    /// closed; admitted passes retain their existing settlement contract.
+    backup_background_allowed: std::sync::atomic::AtomicBool,
     /// Never sends a value. Dropping the worker-owned sender closes every
     /// receiver and cancels active HTTP futures on every worker exit path.
     worker_lifetime: watch::Sender<()>,
@@ -4526,6 +4576,7 @@ struct HistoryBlobFlights {
     upload: std::sync::atomic::AtomicBool,
     fetch: std::sync::atomic::AtomicBool,
     backup: std::sync::atomic::AtomicBool,
+    restore: std::sync::atomic::AtomicBool,
 }
 
 /// Starts the next due history upload, history fetch and backup pass on the
@@ -4586,6 +4637,22 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
             }
         }
     }
+    dispatch_backup_pass(client, media_http);
+    dispatch_backup_restore(client, media_http);
+}
+
+/// Admit new background backup work only under currently reported host
+/// facts. Once admitted, the whole pass and its settlement finish unchanged.
+fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    if !media_http.backup_background_allowed.load(Ordering::Relaxed) {
+        return;
+    }
+    let permit = || {
+        (media_http.permits.available_permits() > 1)
+            .then(|| media_http.permits.clone().try_acquire_owned().ok())
+            .flatten()
+    };
     if !media_http.history_blobs.backup.load(Ordering::Relaxed)
         && let Some(permit) = permit()
     {
@@ -4607,6 +4674,43 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
                 tracing::warn!(target: "marmot_app::runtime", method = "dispatch_history_blobs",
                 "backup pass deferred")
             }
+        }
+    }
+}
+
+/// Manual restoration never drives a writer pass, deletes or publication.
+/// Share the existing media credits and retain one for foreground commands.
+fn dispatch_backup_restore(client: &mut AppClient, media_http: &MediaHttpContext) {
+    use std::sync::atomic::Ordering;
+    if media_http.history_blobs.restore.load(Ordering::Relaxed)
+        || media_http.permits.available_permits() <= 1
+    {
+        return;
+    }
+    let Ok(permit) = media_http.permits.clone().try_acquire_owned() else {
+        return;
+    };
+    match client.prepare_backup_restore() {
+        Ok(Some(work)) => {
+            media_http
+                .history_blobs
+                .restore
+                .store(true, Ordering::Relaxed);
+            spawn_media_http(
+                media_http,
+                permit,
+                work.run(),
+                MediaHttpCompletion::BackupRestore,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "dispatch_backup_restore",
+                error_kind = error.privacy_safe_kind(),
+                "backup restore preparation failed"
+            )
         }
     }
 }
@@ -4712,6 +4816,7 @@ enum MediaHttpCompletion {
     HistoryUpload(crate::client::HistoryUploadOutcome),
     HistoryFetch(crate::client::HistoryFetchOutcome),
     BackupPass(crate::client::BackupPassOutcome),
+    BackupRestore(crate::client::backup_restore::BackupRestoreOutcome),
 }
 
 fn schedule_avatar_acquisition(
@@ -4921,6 +5026,16 @@ async fn complete_media_http(
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
+            return;
+        }
+        MediaHttpCompletion::BackupRestore(outcome) => {
+            client.finish_backup_restore(outcome);
+            drop(permit);
+            media_http
+                .history_blobs
+                .restore
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            dispatch_backup_restore(client, media_http);
             return;
         }
         MediaHttpCompletion::BackupPass(outcome) => {
@@ -6483,6 +6598,24 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::UpdateLinkedDeviceSettings {
+            slot_id_hex,
+            add_to_all_chats,
+            bring_history,
+            keep_while_inactive,
+            respond,
+        } => Box::pin(async move {
+            let result = client
+                .update_linked_device_settings(
+                    &slot_id_hex,
+                    add_to_all_chats,
+                    bring_history,
+                    keep_while_inactive,
+                )
+                .await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
         AccountWorkerCommand::RemoveLinkedDevice {
             slot_id_hex,
             respond,
@@ -6538,6 +6671,62 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::SetBackupBackgroundConditions {
+            wifi,
+            charging,
+            respond,
+        } => Box::pin(async move {
+            media_http
+                .backup_background_allowed
+                .store(wifi && charging, std::sync::atomic::Ordering::Relaxed);
+            if wifi && charging {
+                dispatch_history_blobs(client, media_http);
+            }
+            let _ = respond.send(Ok(()));
+            true
+        }),
+        AccountWorkerCommand::BeginBackupRestore { words, respond } => Box::pin(async move {
+            if !respond.is_closed() {
+                let result = client.begin_backup_restore(words);
+                let operation = result.as_ref().ok().and_then(|status| status.operation);
+                let delivered = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                if delivered.is_ok() && operation.is_some() {
+                    dispatch_backup_restore(client, media_http);
+                } else if let Some(operation) = operation {
+                    client.cancel_backup_restore(operation);
+                }
+            }
+            true
+        }),
+        AccountWorkerCommand::CancelBackupRestore { operation, respond } => Box::pin(async move {
+            let result = client.cancel_backup_restore(operation);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Ok(result));
+            true
+        }),
+        AccountWorkerCommand::BackupRestoreStatus { respond } => Box::pin(async move {
+            let _ = respond.send(Ok(client.backup_restore_status()));
+            true
+        }),
+        AccountWorkerCommand::WatchBackupRestore { respond } => Box::pin(async move {
+            let _ = respond.send(Ok(client.watch_backup_restore()));
+            true
+        }),
+        AccountWorkerCommand::HistoryImportProvenance {
+            group_id,
+            event_id,
+            respond,
+        } => Box::pin(async move {
+            let result = client.history_import_provenance(&group_id, &event_id);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::BackupHistoryAvailability { group_id, respond } => {
+            Box::pin(async move {
+                let result = client.backup_history_availability(&group_id);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
         AccountWorkerCommand::BackupSettings { respond } => Box::pin(async move {
             let _ = respond_diagnosed(
                 shared,
@@ -8770,6 +8959,7 @@ fn publish_device_group_changes(
     account_id_hex: &str,
     account_label: &str,
 ) {
+    client.publish_backup_restore_availability();
     if client.take_linked_devices_changed() {
         client.refresh_device_labels();
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
@@ -9734,6 +9924,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime,
             },
             rx,
@@ -10975,6 +11166,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime: media_http_worker_lifetime,
             };
             let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
@@ -12023,6 +12215,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
                 history_blobs: HistoryBlobFlights::default(),
+                backup_background_allowed: Default::default(),
                 worker_lifetime,
             };
             let (command_tx, mut commands) = mpsc::channel(4);

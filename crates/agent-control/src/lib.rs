@@ -2,6 +2,29 @@
 
 mod diagnostics;
 
+#[cfg(test)]
+mod attachment_wire_tests {
+    use super::*;
+
+    #[test]
+    fn historical_attachment_requests_are_additive_and_slot_scoped() {
+        for operation in ["attachment_get", "download_attachment"] {
+            let value = serde_json::json!({
+                "type": operation,
+                "account_id_hex": "aa".repeat(32),
+                "group_id_hex": "bb".repeat(16),
+                "message_id_hex": "cc".repeat(32),
+                "attachment_index": 3
+            });
+            let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = serde_json::json!({"type": "release_attachment", "lease": "aa".repeat(16)});
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+}
+
 pub use diagnostics::{
     AgentControlAccountSelection, AgentControlDiagnosticHome, AgentControlDiagnosticKeyPackage,
     AgentControlDiagnosticRelays, AgentControlDiagnosticReplay, AgentControlDiagnosticStatus,
@@ -461,6 +484,22 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relays: Option<Vec<String>>,
     },
+    /// Read creation support before submitting a non-idempotent create.
+    GroupCreateCapabilities,
+    /// Create with selected invitees as founding admins; older connectors must refuse.
+    GroupCreateWithAdmins {
+        account_id_hex: String,
+        name: String,
+        /// Invited local account or public-key references, as in legacy creation.
+        members: Vec<String>,
+        /// Founding admin references; the creator is already an admin.
+        /// Each reference must resolve to an entry in `members` or the creator.
+        admins: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relays: Option<Vec<String>>,
+    },
     /// Leave a group using the account runtime; returns Ack after success.
     GroupLeave {
         account_id_hex: String,
@@ -554,6 +593,25 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
         media: AgentControlMediaRef,
+    },
+    /// Inspect one current historical source slot without starting acquisition.
+    AttachmentGet {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Request native acquisition. Returns status immediately if not retained;
+    /// repeat to obtain a private handoff once ready. Does not reset retries.
+    DownloadAttachment {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Release a private plaintext handoff; already released leases are accepted.
+    ReleaseAttachment {
+        lease: String,
     },
 }
 
@@ -670,6 +728,9 @@ pub enum AgentControlResponse {
     DiagnosticStatus {
         report: AgentControlDiagnosticStatus,
     },
+    GroupCreateCapabilities {
+        initial_admins: bool,
+    },
     GroupCreated {
         group_id_hex: String,
         /// Whether this account's connector recorded creating the group. Defaults
@@ -746,6 +807,60 @@ pub enum AgentControlResponse {
         file_name: String,
         size_bytes: u64,
     },
+    /// None means the current source or slot is unavailable, not a successful
+    /// download. Reference identity is not proof that anyone downloaded bytes.
+    Attachment {
+        attachment: Option<AgentControlAttachment>,
+    },
+    AttachmentReleased,
+}
+
+/// Bounded authenticated identity and native acquisition status for one slot.
+/// No locators, keys, peer size hints or opaque native asset handles are exported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachment {
+    pub source_message_id_hex: String,
+    pub attachment_index: u32,
+    pub source_epoch: u64,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
+    pub state: AgentControlAttachmentState,
+    /// Advisory retained-asset availability; each handoff revalidates it.
+    pub locally_available: bool,
+    pub retry_at: Option<u64>,
+    pub failure_hint: Option<String>,
+    /// Present only after a verified, source-revalidated native copy succeeds.
+    pub handoff: Option<AgentControlAttachmentHandoff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachmentHandoff {
+    pub lease: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlAttachmentState {
+    NotRequested,
+    Queued,
+    Downloading,
+    VerifyingCiphertext,
+    Decrypting,
+    VerifyingPlaintext,
+    Ready,
+    RetryScheduled,
+    Failed,
+    Cancelled,
+    Paused,
+    Removed,
+    PolicyBlocked,
+    PreviouslyAcquiredUnavailable,
+    CompletedUnretained,
+    RetryExhausted,
+    StorageBlocked,
+    CleanedBySetting,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1287,6 +1402,44 @@ mod tests {
         assert_eq!(json["relay_lists"]["inbox"]["created_at"], 0);
         assert_eq!(
             decode_frame::<AgentControlResponse>(&encoded).unwrap(),
+            response
+        );
+    }
+
+    /// Pin the wire shapes of founding-admin creation and its capability probe.
+    #[test]
+    fn founding_admin_creation_round_trips() {
+        let value = serde_json::json!({
+            "type": "group_create_with_admins", "account_id_hex": "11".repeat(32),
+            "name": "Team", "members": ["22".repeat(32)], "admins": ["22".repeat(32)]
+        });
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        let encoded = encode_frame(&AgentControlEnvelope::request(
+            Some("create".into()),
+            request,
+        ))
+        .unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        for key in ["type", "members", "admins"] {
+            assert_eq!(decoded[key], value[key]);
+        }
+        let capabilities: AgentControlRequest =
+            serde_json::from_value(serde_json::json!({"type": "group_create_capabilities"}))
+                .unwrap();
+        assert!(matches!(
+            capabilities,
+            AgentControlRequest::GroupCreateCapabilities
+        ));
+        let response = AgentControlResponse::GroupCreateCapabilities {
+            initial_admins: true,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "group_create_capabilities", "initial_admins": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentControlResponse>(value).unwrap(),
             response
         );
     }

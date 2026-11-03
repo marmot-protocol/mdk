@@ -16,7 +16,9 @@ pub use cgka_engine::account_identity_proof::{
 pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub(crate) use cgka_engine::engine::{OutboundWelcomeStatus, OutboundWelcomeWork};
-pub use cgka_engine::engine::{OwedSiblingWelcome, WelcomeDeliveryIndex, WelcomeWithdrawal};
+pub use cgka_engine::engine::{
+    OwedSiblingWelcome, SiblingWelcomeResendOutcome, WelcomeDeliveryIndex, WelcomeWithdrawal,
+};
 pub use cgka_engine::feature_registry::FeatureRegistry;
 pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
 pub use cgka_engine::key_package::{
@@ -1040,6 +1042,28 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
+    /// Recover immutable accepted source proof without changing its first observation.
+    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> SessionResult<()> {
+        Ok(self.engine.recover_pending_device_group_sources(group_id)?)
+    }
+
+    /// Attribute accepted native DG sources under the current trusted roster.
+    pub fn pending_device_group_activity(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<
+        Vec<(
+            MessageId,
+            EpochId,
+            Option<cgka_traits::app_components::DeviceSlotId>,
+        )>,
+    > {
+        Ok(self
+            .engine
+            .pending_device_group_activity(group_id, roster)?)
+    }
+
     /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
@@ -1427,14 +1451,71 @@ impl AccountDeviceSession {
         Ok(outcome)
     }
 
+    pub(crate) fn put_observed_outbound_fanout(
+        &self,
+        fanout: &mut cgka_traits::OutboundFanout,
+        now_ms: u64,
+    ) -> SessionResult<()> {
+        if let Some(group_id) = fanout.group_id() {
+            self.engine.check_group_live(group_id)?;
+        }
+        Ok(self.storage.put_observed_outbound_fanout(fanout, now_ms)?)
+    }
+
     /// See [`cgka_engine::Engine::owed_sibling_welcomes`].
     pub fn owed_sibling_welcomes(&self, now: Timestamp) -> SessionResult<Vec<OwedSiblingWelcome>> {
         Ok(self.engine.owed_sibling_welcomes(now)?)
     }
 
+    /// See [`cgka_engine::Engine::rearm_sibling_welcome`]. Frozen targets of
+    /// the old carrier must settle before another carrier can be prepared.
+    pub fn rearm_sibling_welcome(
+        &self,
+        id: &MessageId,
+        carrier: &[u8],
+        now: Timestamp,
+        roster: &DeviceRosterV1,
+    ) -> SessionResult<cgka_engine::SiblingWelcomeResendOutcome> {
+        if self.sibling_welcome_carrier_in_flight(carrier)? {
+            return Ok(cgka_engine::SiblingWelcomeResendOutcome::Held);
+        }
+        Ok(self
+            .engine
+            .rearm_sibling_welcome(id, carrier, now, roster)?)
+    }
+
+    /// Inspect terminal/expired retained repair work without preparing a carrier.
+    pub fn sibling_welcome_resend_has_ended(
+        &self,
+        id: &MessageId,
+        now: Timestamp,
+    ) -> SessionResult<bool> {
+        Ok(self.engine.sibling_welcome_resend_has_ended(id, now)?)
+    }
+
     /// See [`cgka_engine::Engine::carried_sibling_welcomes`].
     pub fn carried_sibling_welcomes(&self) -> SessionResult<Vec<(MessageId, Vec<u8>)>> {
         Ok(self.engine.carried_sibling_welcomes()?)
+    }
+
+    /// Reserve a generated carrier's actual timestamp and attach its engine
+    /// association on the session connection, before external publication.
+    pub fn reserve_sibling_welcome_carrier(
+        &self,
+        id: &MessageId,
+        device_group: &GroupId,
+        target: &cgka_traits::app_components::DeviceSlotId,
+        carrier: &[u8],
+        created_at: u64,
+    ) -> SessionResult<bool> {
+        self.storage.reserve_sibling_welcome_carrier(
+            id,
+            device_group,
+            target,
+            carrier,
+            created_at,
+            || Ok(self.engine.carry_sibling_welcome(id, carrier)?),
+        )
     }
 
     /// See [`cgka_engine::Engine::carry_sibling_welcome`].
@@ -1460,7 +1541,7 @@ impl AccountDeviceSession {
     /// account-owned fanout records directly rather than the live-group view.
     pub(crate) fn sibling_welcome_carrier_in_flight(&self, carrier: &[u8]) -> SessionResult<bool> {
         Ok(self.storage.list_outbound_fanouts()?.iter().any(|fanout| {
-            fanout.outcome().outstanding_targets > 0
+            (fanout.outcome().outstanding_targets > 0 || fanout.outcome().accepted_targets > 0)
                 && fanout.application_message().is_some_and(|application| {
                     hex::decode(&application.app_event_id).is_ok_and(|id| id == carrier)
                 })

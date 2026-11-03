@@ -3,6 +3,11 @@ use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};
 
 use super::*;
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../marmot-app/tests/support/identity_reference_vectors.rs"
+));
+
 fn signed(keys: &Keys, kind: u16, created_at: u64, content: &str, tags: Vec<Tag>) -> Event {
     EventBuilder::new(Kind::from(kind), content)
         .tags(tags)
@@ -495,4 +500,17 @@ fn a_cache_full_of_deletion_markers_still_admits_new_previews() {
         })
         .unwrap();
     assert_eq!(count, MAX_ENTRIES);
+}
+
+#[test]
+fn shared_identity_corpus_matches_preview_baseline() {
+    for case in cases() {
+        let actual = parse_reference(&case.reference).map(|parsed| parsed.target.cache_key());
+        assert_eq!(
+            actual.as_deref(),
+            case.previews_target,
+            "case {}",
+            case.name
+        );
+    }
 }

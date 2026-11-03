@@ -31,8 +31,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  signatures:
+    name: PR signatures
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-signatures.yml
+
   image:
     name: Build broker image
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 45
 

@@ -58,7 +58,7 @@ impl MaintenanceRandom for DayStepRandom {
 #[tokio::test]
 async fn an_upgrade_replaces_the_published_key_package_with_one_advertising_account_devices() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot account-devices upgrade").unwrap();
     let database = dir.path().join("alice.sqlite");
     // KeyPackage lifetimes come from the system clock.
@@ -125,7 +125,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
     const WINDOW_5_DAYS: u64 = 5 * 24 * 60 * 60;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("leaf refresh account-devices upgrade").unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     // Bob is already on the new build; Alice made both groups before she was.
@@ -191,7 +191,8 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     let mut order: Vec<_> = groups
         .iter()
         .map(|group_id| {
-            let at = refresh_due_at(&runtime, group_id).expect("each stale leaf schedules a refresh");
+            let at =
+                refresh_due_at(&runtime, group_id).expect("each stale leaf schedules a refresh");
             assert!(at.0 >= start && at.0 <= start + WINDOW_5_DAYS);
             (at, group_id.clone())
         })
@@ -206,7 +207,10 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     // At the earlier time only that group's leaf is refreshed.
     wall.set(early_at.0);
     refresh_leaf(&mut runtime, &wall, early).await;
-    assert!(leaf_is_stale(&runtime, late), "the other group waits for its own time");
+    assert!(
+        leaf_is_stale(&runtime, late),
+        "the other group waits for its own time"
+    );
     assert_eq!(refresh_due_at(&runtime, late), Some(*late_at));
     assert!(
         runtime
@@ -273,7 +277,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
 #[tokio::test]
 async fn a_device_that_does_not_advertise_account_devices_still_joins() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("account-devices mixed join").unwrap();
     let mut alice = account_devices_session(dir.path().join("alice.sqlite"), &key, b"alice", true);
     let mut carol = account_devices_session(dir.path().join("carol.sqlite"), &key, b"carol", false);
@@ -371,7 +375,7 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
     use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("account-devices activation").unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let mut bob = account_devices_session(dir.path().join("bob.sqlite"), &key, b"bob", true);
@@ -401,7 +405,9 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
         Some(Refusal::NotAdmin)
     );
     assert_eq!(
-        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        runtime
+            .account_devices_activation_refusal(&group_id)
+            .unwrap(),
         Some(Refusal::UnsupportedLeaves)
     );
     let epoch = runtime.session().epoch(&group_id).unwrap();
@@ -410,7 +416,14 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
             group_id: group_id.clone(),
         })
         .await;
-    assert!(refused.is_err(), "{refused:?}");
+    let error = refused.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::AccountDevicesActivationRefused {
+            group_id: refused_group,
+            reason: Refusal::UnsupportedLeaves,
+        }) if refused_group == &group_id
+    ));
     assert_eq!(runtime.session().epoch(&group_id).unwrap(), epoch);
     assert!(adapter.publishes().is_empty());
 
@@ -421,7 +434,9 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
         .await
         .unwrap();
     assert_eq!(
-        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        runtime
+            .account_devices_activation_refusal(&group_id)
+            .unwrap(),
         None
     );
     runtime
@@ -432,7 +447,9 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
         .unwrap();
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, epoch.0 + 2);
     assert_eq!(
-        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        runtime
+            .account_devices_activation_refusal(&group_id)
+            .unwrap(),
         Some(Refusal::AlreadyRequired)
     );
 

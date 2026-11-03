@@ -126,3 +126,48 @@ mod tests {
         assert_eq!(audit::live_allocations(), before);
     }
 }
+
+crate::macros::c_mirror! {
+    /// Backup identity only, never verified historical writer/authorship.
+    MarmotBackupHistorySource from marmot_uniffi::conversions::BackupHistorySourceFfi {
+        str recovery_public_key_hex,
+        str backup_id_hex,
+        str head_sha256_hex,
+        copy written_at: u64,
+    }
+}
+/// Complete row provenance. Backup never fabricates a device slot or label.
+#[repr(C)]
+pub enum MarmotHistoryImportProvenance {
+    Device {
+        device_slot_id_hex: *mut std::ffi::c_char,
+    },
+    Backup {
+        source: MarmotBackupHistorySource,
+    },
+}
+impl From<marmot_uniffi::conversions::HistoryImportProvenanceFfi>
+    for MarmotHistoryImportProvenance
+{
+    fn from(value: marmot_uniffi::conversions::HistoryImportProvenanceFfi) -> Self {
+        use marmot_uniffi::conversions::HistoryImportProvenanceFfi;
+        match value {
+            HistoryImportProvenanceFfi::Device { device_slot_id_hex } => Self::Device {
+                device_slot_id_hex: crate::memory::owned_c_string(device_slot_id_hex),
+            },
+            HistoryImportProvenanceFfi::Backup { source } => Self::Backup {
+                source: source.into(),
+            },
+        }
+    }
+}
+impl CFree for MarmotHistoryImportProvenance {
+    unsafe fn free_in_place(&mut self) {
+        match self {
+            Self::Device { device_slot_id_hex } => unsafe {
+                crate::memory::free_c_string(*device_slot_id_hex)
+            },
+            Self::Backup { source } => unsafe { source.free_in_place() },
+        }
+    }
+}

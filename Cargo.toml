@@ -120,7 +120,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
 # Recovery words for backups (mdk#2628 4.4): 12 BIP-39 English words. Already
 # in the lockfile through nostr's NIP-06 support.
-bip39 = { version = "2.2.2", default-features = false, features = ["std"] }
+bip39 = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
@@ -129,9 +129,9 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # same anchors relay WebSockets and HTTP use (via tokio-tungstenite/reqwest).
 # The OS verifier needs JNI setup on Android that MarmotKit hosts never run.
 webpki-roots = "1.0"
-nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
-nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786", features = ["local-relay"] }
-nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786" }
+nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "a8efab6d23846d044746def3dc2766fd1a7e227c", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
+nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "a8efab6d23846d044746def3dc2766fd1a7e227c", features = ["local-relay"] }
+nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "a8efab6d23846d044746def3dc2766fd1a7e227c" }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
 # relay telemetry straight to the OTLP protobuf and POST it over the existing

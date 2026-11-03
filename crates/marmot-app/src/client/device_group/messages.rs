@@ -44,6 +44,7 @@ use marmot_session::{
 use super::device_slot;
 use crate::client::AppClient;
 use crate::client::private_key_packages::SiblingWelcomeAdmission;
+use crate::client::sibling_chat_gaps::KIND_GAP_FILL_CLAIM;
 use crate::history_delivery::KIND_HISTORY_DELIVERY;
 use crate::small_state::{KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE};
 use crate::{AppError, unix_now_seconds};
@@ -62,6 +63,7 @@ pub(crate) fn is_device_group_kind(kind: u64) -> bool {
     matches!(
         kind,
         KIND_DEVICE_HEARTBEAT
+            | KIND_GAP_FILL_CLAIM
             | KIND_PRIVATE_KEY_PACKAGE_REQUEST
             | KIND_PRIVATE_KEY_PACKAGE_HAND_OFF
             | KIND_SIBLING_WELCOME
@@ -182,6 +184,20 @@ impl AppClient {
             KIND_PRIVATE_KEY_PACKAGE_REQUEST => {
                 self.receive_key_package_request(group_id, message_id, sender, &message.content)
             }
+            KIND_GAP_FILL_CLAIM => {
+                if message.tags.is_empty() {
+                    self.receive_gap_fill_claim(
+                        group_id,
+                        sender,
+                        message.created_at,
+                        &message.content,
+                    )
+                } else {
+                    Err(AppError::InvalidAppMessagePayload(
+                        "gap-fill claim tags".into(),
+                    ))
+                }
+            }
             KIND_PRIVATE_KEY_PACKAGE_HAND_OFF => {
                 self.receive_key_package_hand_off(group_id, sender, &message.content)
             }
@@ -237,6 +253,43 @@ impl AppClient {
                 "a device-group message was refused"
             );
         }
+        Ok(())
+    }
+
+    /// Project bounded native accepted facts, including Commit/Proposal batches
+    /// with no application effects. Attribution reuses the native stamp; errors
+    /// leave the durable work pending for ordinary maintenance/restart.
+    pub(crate) fn observe_pending_sibling_welcome_activity(&mut self) -> Result<(), AppError> {
+        let Some(exchange) = self.device_group_exchange()? else {
+            return Ok(());
+        };
+        if self.epoch_gap_holds_group(&exchange.group_id, super::super::recovery::wall_now_ms()?)? {
+            return Ok(());
+        }
+        let sources = self
+            .runtime
+            .pending_device_group_activity(&exchange.group_id, &exchange.roster)?;
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        for (id, _epoch, slot) in sources {
+            if let Some(slot) = slot.filter(|slot| exchange.is_sibling(slot)) {
+                let Some(key) = exchange
+                    .roster
+                    .devices
+                    .get(&slot)
+                    .and_then(|entry| entry.tag_signature_key.as_deref())
+                else {
+                    continue;
+                };
+                storage.qualify_sibling_welcome_activity(&exchange.group_id, &id, &slot, key)?;
+            } else {
+                storage.ignore_sibling_welcome_activity(&exchange.group_id, &id)?;
+            }
+        }
+        // Healthy proof-present traffic is projected even if an older partial
+        // source cannot currently be reauthenticated. Newly recovered proof is
+        // picked up by the next ordinary pass with its original stamp.
+        self.runtime
+            .recover_pending_device_group_sources(&exchange.group_id)?;
         Ok(())
     }
 

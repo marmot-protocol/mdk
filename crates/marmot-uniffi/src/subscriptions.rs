@@ -510,3 +510,30 @@ pub use conversation_window::ConversationWindowSubscription;
 
 mod chat_selection;
 pub use chat_selection::ChatSelection;
+/// Observer only: closing it never cancels a restore or owns its secrets.
+#[derive(uniffi::Object)]
+pub struct BackupRestoreSubscription {
+    snapshot: StdMutex<Option<crate::conversions::BackupRestoreStatusFfi>>,
+    inner: Mutex<marmot_app::BackupRestoreWatch>,
+}
+impl BackupRestoreSubscription {
+    pub(crate) fn new(inner: marmot_app::BackupRestoreWatch) -> Arc<Self> {
+        let snapshot = inner.snapshot().into();
+        Arc::new(Self {
+            snapshot: StdMutex::new(Some(snapshot)),
+            inner: Mutex::new(inner),
+        })
+    }
+}
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
+impl BackupRestoreSubscription {
+    /// Initial snapshot exactly once. Query status after an uncertain RPC.
+    pub fn snapshot(&self) -> Option<crate::conversions::BackupRestoreStatusFfi> {
+        take_snapshot(&self.snapshot)
+    }
+    #[marmot_uniffi_macros::receive]
+    pub async fn next(&self) -> Option<crate::conversions::BackupRestoreStatusFfi> {
+        self.inner.lock().await.changed().await.ok().map(Into::into)
+    }
+}

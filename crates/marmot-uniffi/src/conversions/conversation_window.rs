@@ -467,6 +467,7 @@ fn presented_timeline_with_tokens(
         deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
         invalidation_status: row.invalidation_status.clone(),
         imported_from: row.imported_from.clone().map(Into::into),
+        history_import_provenance: row.history_import_provenance.clone().map(Into::into),
     }
 }
 impl From<app::ConversationWindowSnapshot> for ConversationWindowSnapshotFfi {
@@ -617,6 +618,7 @@ impl ConversationConversionCache {
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
             imported_from: row.imported_from.clone(),
+            history_import_provenance: row.history_import_provenance.clone(),
         };
         let tokens = match cached.filter(|cached| {
             cached.source.kind == row.kind && cached.source.plaintext == row.plaintext
@@ -681,6 +683,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         deletion_source,
         invalidation_status,
         imported_from,
+        history_import_provenance,
     } = row;
     (
         (
@@ -715,6 +718,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             if trusted { group_system.as_ref() } else { None },
             poll,
             imported_from,
+            history_import_provenance,
         ),
     )
 }
@@ -864,6 +868,7 @@ mod tests {
             deleted_by_message_id_hex: None,
             invalidation_status: None,
             imported_from: None,
+            history_import_provenance: None,
         };
 
         record

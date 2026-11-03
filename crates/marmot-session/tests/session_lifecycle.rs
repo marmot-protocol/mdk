@@ -1,3 +1,8 @@
+#[path = "support/storage_fixture.rs"]
+mod storage_fixture;
+
+use storage_fixture::relaxed_storage_dir;
+
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
@@ -163,7 +168,7 @@ fn config(
 /// known instant. The session then fails closed rather than reopening.
 #[tokio::test]
 async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let path = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("host-opened session key").unwrap();
     let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -230,7 +235,7 @@ fn selfremove_registry() -> FeatureRegistry {
 
 #[tokio::test]
 async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = relaxed_storage_dir().unwrap();
     let database_path = directory.path().join("cutover.sqlite");
     let key = SqlCipherKey::new("strict cutover key").unwrap();
     let identity = b"strict-cutover";
@@ -324,7 +329,7 @@ fn only_received_message_id(events: &[GroupEvent]) -> MessageId {
 
 #[tokio::test]
 async fn session_reopens_encrypted_sqlite_group_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice.sqlite");
     let bob_path = dir.path().join("bob.sqlite");
     let key = SqlCipherKey::new("session lifecycle key").unwrap();
@@ -382,7 +387,7 @@ async fn session_reopens_encrypted_sqlite_group_state() {
 
 #[tokio::test]
 async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut fixture = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
     fixture.write_all(SESSION_PROMOTION_FIXTURE).unwrap();
     fixture.flush().unwrap();
@@ -412,7 +417,7 @@ async fn session_facade_promotes_one_bounded_legacy_row_without_semantic_change(
 
 #[tokio::test]
 async fn current_founding_creation_is_immediately_stable_and_survives_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-current.sqlite");
     let bob_path = dir.path().join("bob-current.sqlite");
     let key = SqlCipherKey::new("session current founding key").unwrap();
@@ -509,7 +514,7 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
 
 #[tokio::test]
 async fn session_ingest_surfaces_join_and_app_message_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session app event key").unwrap();
     let mut alice =
         AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
@@ -595,7 +600,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
 
 #[tokio::test]
 async fn reopened_creator_can_send_valid_group_messages() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice.sqlite");
     let bob_path = dir.path().join("bob.sqlite");
     let key = SqlCipherKey::new("session reopened signer key").unwrap();
@@ -672,7 +677,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
 
 #[tokio::test]
 async fn session_ingest_schedules_auto_publish_work() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session auto publish key").unwrap();
     let mut alice = AccountDeviceSession::open(
         config(dir.path().join("alice.sqlite"), &key, b"alice")
@@ -746,7 +751,7 @@ async fn session_ingest_schedules_auto_publish_work() {
 
 #[tokio::test]
 async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session selfremove reproposal key").unwrap();
     let mut alice = AccountDeviceSession::open(
         config(dir.path().join("alice.sqlite"), &key, b"alice")
@@ -846,7 +851,7 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
 
 #[tokio::test]
 async fn session_advance_convergence_releases_queued_outbound_work() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session convergence key").unwrap();
     let mut alice =
         AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
@@ -1004,7 +1009,7 @@ fn admin_policy(admins: &[MemberId]) -> Vec<u8> {
 /// stays queued (mdk#2694).
 #[tokio::test]
 async fn session_advance_convergence_announces_a_refused_queued_intent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("session refused queued key").unwrap();
     let mut alice =
         AccountDeviceSession::open(config(dir.path().join("alice.sqlite"), &key, b"alice"))
@@ -1129,7 +1134,7 @@ fn open_rejects_invalid_convergence_policy_before_storage_open() {
     // mdk#970 / PR review: policy must fail closed before durable open work.
     // A mismatched app window is rejected in every build; use a path that does
     // not exist so a late failure would be a storage error rather than policy.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let missing = dir.path().join("never-created.sqlite");
     assert!(!missing.exists(), "fixture path must not exist before open");
     let key = SqlCipherKey::new("policy reject key").unwrap();
@@ -1169,7 +1174,7 @@ fn open_rejects_invalid_convergence_policy_before_storage_open() {
 /// gate decision at that seam gets made deliberately rather than by omission.
 #[tokio::test]
 async fn a_disband_request_carries_no_publish_work() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-disband.sqlite");
     let key = SqlCipherKey::new("session disband request key").unwrap();
     let mut alice = AccountDeviceSession::open(
@@ -1244,7 +1249,7 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::{GroupLifecycleState, StorageProvider};
     use marmot_session::SessionError;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let path = dir.path().join("authority.sqlite");
     let key = SqlCipherKey::new("authority session fixture").unwrap();
     let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
@@ -1439,7 +1444,7 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
         }
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let path = dir.path().join("account-records.sqlite");
     let key = SqlCipherKey::new("account records liveness key").unwrap();
     let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
@@ -1558,7 +1563,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
     use cgka_traits::{TransportEndpoint, TransportPublishTarget};
     use marmot_session::{SessionError, SessionResult};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let path = dir.path().join("closed-records.sqlite");
     let key = SqlCipherKey::new("closed account records key").unwrap();
     let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();

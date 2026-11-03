@@ -326,6 +326,9 @@ impl AppClient {
             if owed.blossom_due_at.is_some() {
                 continue;
             }
+            if !self.history_settings_ready(&exchange, &owed)? {
+                continue;
+            }
             let events = match self.inline_history_deliveries(&exchange, &owed) {
                 Ok(Some(events)) => events,
                 Ok(None) => {
@@ -370,6 +373,23 @@ impl AppClient {
             );
         }
         Ok(())
+    }
+
+    /// Readiness is checked before D76's terminal destination checks: a local
+    /// settings edit still awaiting recovery neither sends nor forgets debt.
+    /// Invalid destinations still reach the ordinary terminal check below.
+    fn history_settings_ready(
+        &mut self,
+        exchange: &Exchange,
+        owed: &OwedHistoryDelivery,
+    ) -> Result<bool, AppError> {
+        let Some(slot) = hex::decode(&owed.receiver_slot_hex)
+            .ok()
+            .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
+        else {
+            return Ok(true);
+        };
+        self.device_setting_ready(exchange, &slot, |settings| settings.bring_history)
     }
 
     /// Who `owed` goes to and for which chat: the receiver, while it is a
@@ -539,6 +559,9 @@ impl AppClient {
             storage.defer_blossom_history_delivery(owed, retry_at)
         };
         for owed in storage.due_blossom_history_deliveries(unix_now_seconds())? {
+            if !self.history_settings_ready(&exchange, &owed)? {
+                continue;
+            }
             let prepared = self
                 .history_destination(&exchange, &owed)
                 .and_then(|(_, chat)| Ok((self.history_blossom_servers(&chat)?, chat)));
@@ -590,8 +613,8 @@ impl AppClient {
     /// Send the deliveries of a history whose blobs were uploaded, each
     /// naming the server that holds its blob, and mark it sent. An upload or
     /// send that failed tries again later; a history that can no longer be
-    /// sent is forgotten. Returns whether the history was settled, so the
-    /// next one may start at once.
+    /// sent is forgotten. Returns whether completion was handled without an
+    /// error, so another ready history may start at once.
     pub(crate) async fn finish_history_upload(&mut self, outcome: HistoryUploadOutcome) -> bool {
         let HistoryUploadOutcome { owed, result } = outcome;
         let Err(error) = self.send_uploaded_history(&owed, result).await else {
@@ -638,6 +661,11 @@ impl AppClient {
         else {
             return Err(AppError::DeviceGroupRefused("not_trusted_device_group"));
         };
+        if !self.history_settings_ready(&exchange, owed)? {
+            // The upload completed, but its new carrier can wait. Keep the
+            // ordinary debt and retry/expiry policy; no sent outcome is held.
+            return Ok(());
+        }
         let (receiver, chat) = match self.history_destination(&exchange, owed) {
             Ok(destination) => destination,
             Err(AppError::DeviceGroupRefused(reason)) => return Ok(forget(&storage, reason)?),

@@ -168,6 +168,8 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
         AgentControlRequest::DiagnosticStatus { .. } => "diagnostic_status",
         AgentControlRequest::GroupCreate { .. } => "group_create",
+        AgentControlRequest::GroupCreateCapabilities => "group_create_capabilities",
+        AgentControlRequest::GroupCreateWithAdmins { .. } => "group_create_with_admins",
         AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::GroupProfileUpdate { .. } => "group_profile_update",
         AgentControlRequest::GroupLeave { .. } => "group_leave",
@@ -190,6 +192,9 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
         AgentControlRequest::SendMedia { .. } => "send_media",
         AgentControlRequest::DownloadMedia { .. } => "download_media",
+        AgentControlRequest::AttachmentGet { .. } => "attachment_get",
+        AgentControlRequest::DownloadAttachment { .. } => "download_attachment",
+        AgentControlRequest::ReleaseAttachment { .. } => "release_attachment",
     }
 }
 

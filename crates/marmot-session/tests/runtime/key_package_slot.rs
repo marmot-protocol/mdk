@@ -54,7 +54,7 @@ fn advertised_components(key_package: &cgka_traits::engine::KeyPackage) -> Vec<u
 
 #[tokio::test]
 async fn the_slot_is_republished_weekly_with_a_thirty_day_lifetime() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot weekly refresh").unwrap();
     // KeyPackage lifetimes come from the system clock.
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -120,7 +120,7 @@ async fn the_slot_is_republished_weekly_with_a_thirty_day_lifetime() {
 
 #[tokio::test]
 async fn a_refresh_scheduled_under_the_old_lifetime_is_due_a_week_after_publication() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot legacy refresh schedule").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let mut runtime = slot_runtime(
@@ -152,7 +152,7 @@ async fn a_refresh_scheduled_under_the_old_lifetime_is_due_a_week_after_publicat
 #[tokio::test]
 async fn a_change_in_supported_components_republishes_the_slot() {
     use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot capability change").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -198,7 +198,7 @@ async fn a_change_in_supported_components_republishes_the_slot() {
 
 #[tokio::test]
 async fn a_welcome_that_consumes_the_current_key_package_republishes_the_slot() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot consumed welcome").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RecordingKeyPackages::default();
@@ -229,7 +229,7 @@ async fn a_welcome_that_consumes_the_current_key_package_republishes_the_slot() 
 
 #[tokio::test]
 async fn a_welcome_built_before_a_refresh_opens_for_a_day_after_the_replacement_is_confirmed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot superseded welcome").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let mut alice = slot_runtime(
@@ -295,7 +295,7 @@ async fn a_welcome_built_before_a_refresh_opens_for_a_day_after_the_replacement_
 
 #[tokio::test]
 async fn a_consumed_replacement_superseded_before_confirmation_keeps_its_day() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot consumed superseded").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -340,7 +340,7 @@ async fn a_consumed_replacement_superseded_before_confirmation_keeps_its_day() {
 
 #[tokio::test]
 async fn a_restart_during_a_refresh_keeps_one_slot_and_every_key() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot restart refresh").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -493,7 +493,7 @@ impl KeyPackagePublisher for RefusingKeyPackages {
 
 #[tokio::test]
 async fn a_replacement_the_publisher_can_no_longer_send_is_resigned() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot unusable pending").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -543,7 +543,7 @@ async fn a_replacement_the_publisher_can_no_longer_send_is_resigned() {
 
 #[tokio::test]
 async fn a_publisher_that_refuses_its_own_artifacts_gets_one_resigned_replacement() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot refusing publisher").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -583,7 +583,7 @@ async fn a_publisher_that_refuses_its_own_artifacts_gets_one_resigned_replacemen
 
 #[tokio::test]
 async fn paused_maintenance_leaves_an_unusable_replacement_for_resume() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot unusable while paused").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -626,7 +626,7 @@ async fn paused_maintenance_leaves_an_unusable_replacement_for_resume() {
 
 #[tokio::test]
 async fn a_restart_while_sending_the_resigned_replacement_does_not_resign_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot resign restart").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
@@ -679,7 +679,7 @@ async fn a_restart_while_sending_the_resigned_replacement_does_not_resign_again(
 
 #[tokio::test]
 async fn a_later_build_replaces_an_artifact_an_earlier_build_could_not_send() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot later build").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -722,7 +722,7 @@ async fn a_later_build_replaces_an_artifact_an_earlier_build_could_not_send() {
 
 #[tokio::test]
 async fn a_superseded_replacement_recorded_by_an_earlier_build_waits_for_a_confirmed_one() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot legacy superseded").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();
@@ -771,7 +771,7 @@ async fn a_superseded_replacement_recorded_by_an_earlier_build_waits_for_a_confi
 
 #[tokio::test]
 async fn a_current_key_package_the_publisher_can_no_longer_send_is_replaced() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot unusable current").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = RefusingKeyPackages::default();

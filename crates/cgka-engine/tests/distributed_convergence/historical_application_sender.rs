@@ -132,7 +132,12 @@ async fn check_historical_sender(
         Delivery::Direct => {
             let result = alice.ingest(message.clone()).await.unwrap();
             if forge_replacement_author {
-                assert!(matches!(result, IngestOutcome::Ignored { .. }));
+                assert_eq!(
+                    result,
+                    IngestOutcome::Ignored {
+                        category: cgka_traits::ingest::InputRejectionCategory::InvalidEncoding,
+                    }
+                );
             } else {
                 assert!(matches!(result, IngestOutcome::Processed));
             }
@@ -159,10 +164,11 @@ async fn check_historical_sender(
     let state = storage.get_message(&content_id(&message)).unwrap().state;
     if forge_replacement_author {
         assert!(received.is_empty(), "{delivery:?}: forged author escaped");
-        assert!(matches!(
-            state,
-            MessageState::Failed | MessageState::EpochInvalidated
-        ));
+        let expected = match delivery {
+            Delivery::Direct => MessageState::Failed,
+            Delivery::BufferedAfterRestart => MessageState::EpochInvalidated,
+        };
+        assert_eq!(state, expected, "{delivery:?}: forged author disposition");
         assert!(
             storage
                 .list_pending_application_events()

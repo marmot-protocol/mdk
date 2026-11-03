@@ -240,40 +240,45 @@ impl<S: StorageProvider> Engine<S> {
             // Ratchet consumption, disposition and durable app output share
             // one commit. A kill before commit leaves the input retryable;
             // a kill afterwards leaves the pending projection recoverable.
-            let (events, invalidated) = self
-                .storage
-                .with_transaction(|storage| {
-                    let observations = if horizon_reason.is_none() {
-                        process_current_openmls_application(storage, group_id, &message, profile)?
-                    } else {
-                        Vec::new()
-                    };
-                    let events = Self::application_replay_events(group_id, &observations)?;
-                    let invalidated =
-                        if events.is_empty() {
+            let (events, invalidated) =
+                self.storage
+                    .with_transaction(|storage| {
+                        let observations = if horizon_reason.is_none() {
+                            process_current_openmls_application(
+                                storage,
+                                group_id,
+                                &message,
+                                profile,
+                                self.wall_clock.as_ref(),
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        let events = Self::application_replay_events(group_id, &observations)?;
+                        let invalidated = if events.is_empty() {
                             Some(horizon_reason.unwrap_or(
                                 AppMessageInvalidationReason::UndecryptableInCanonicalState,
                             ))
                         } else {
                             None
                         };
-                    storage.update_message_state(
-                        &message.id,
-                        if invalidated.is_some() {
-                            MessageState::EpochInvalidated
-                        } else {
-                            MessageState::Processed
-                        },
-                    )?;
-                    for event in &events {
-                        storage.put_pending_application_event(event)?;
-                    }
-                    crate::test_crash_hooks::pause_if_requested(
-                        "canonical-application-before-commit",
-                    );
-                    Ok::<_, OpenMlsProjectionError>((events, invalidated))
-                })
-                .map_err(replay_error)?;
+                        storage.update_message_state(
+                            &message.id,
+                            if invalidated.is_some() {
+                                MessageState::EpochInvalidated
+                            } else {
+                                MessageState::Processed
+                            },
+                        )?;
+                        for event in &events {
+                            storage.put_pending_application_event(event)?;
+                        }
+                        crate::test_crash_hooks::pause_if_requested(
+                            "canonical-application-before-commit",
+                        );
+                        Ok::<_, OpenMlsProjectionError>((events, invalidated))
+                    })
+                    .map_err(replay_error)?;
             crate::test_crash_hooks::pause_if_requested("canonical-application-completed-durable");
             if invalidated.is_none() {
                 self.seen_message_ids.insert(message.id.clone());
