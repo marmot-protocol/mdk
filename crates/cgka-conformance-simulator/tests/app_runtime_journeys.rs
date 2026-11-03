@@ -730,3 +730,15 @@ async fn public_app_runner_stalled_relay_does_not_loop_bob_current() {
 async fn public_app_runner_finishes_tens_of_thousands_of_owed_events() {
     recovery_runner_proofs::owed_history().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow upgrade-conversion recovery proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_owns_debt_after_the_upgrade_conversion() {
+    recovery_runner_proofs::upgrade().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow per-REQ live fence control; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_fences_nonempty_reqs_but_not_empty_ones() {
+    recovery_runner_proofs::fence_control().await;
+}

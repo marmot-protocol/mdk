@@ -1208,10 +1208,11 @@ sender's own-leaf maintenance commit while bob is stopped; `public_app_runner_st
 forces all members to agree on the epoch before bob stops. Both preserve the same exact-timeline, live-delivery and
 attempt bounds, and save the case/epochs and whether the epoch-stall arm fired. In the owed-history journey, 20,000
 owed events and a quiet group must finish exactly after a restart, with no history window asked twice during that
-restart recovery. After a reconnect it checks route requests, aggregate runner coverage progress, caught-up status
-and quiet-group delivery; repeated windows are recorded only. Aggregate progress can include inbox comparisons,
-so it does not attribute each group's re-proof to the runner alone. Until the switch-over (mdk#2660 PR 5g) the earlier owner runs beside the runner, so the wire bounds
-count both of bob's owners.
+restart recovery. Reconnect re-proof also rejects repeated windows. Positive runner work and zero native paging
+requests establish runner-only attribution. The upgrade journey additionally requires nonzero conversion before the
+first attempt. The per-REQ fence journey uses two restarts with both groups packed together: counted raw reply then
+empty raw reply, a12-second history stall and a30-second release bound. These remain explicit slow manual proofs.
+
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 

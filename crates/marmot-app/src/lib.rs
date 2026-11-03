@@ -1628,6 +1628,15 @@ impl MarmotApp {
         self
     }
 
+    /// Select the existing internal recovery owner for an upgrade/control
+    /// fixture. Only changes the value the production ownership paths read.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_recovery_runner_ownership_for_test(mut self, owns: bool) -> Self {
+        self.recovery_runner_owns_debt = owns;
+        self
+    }
+
     /// The internal `runner_owns_debt` gate: whether the recovery runner runs
     /// for this app's accounts.
     pub(crate) fn recovery_runner_owns_debt(&self) -> bool {

@@ -700,7 +700,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the
   waiting caller serves, until a verdict turn or the bound's stop or deadline, which settles the quantum in flight. The
-  worker spawns its runner before the startup drain and hands its `SpawnedRunner` through the command context.
+  worker spawns its runner after initial startup catch-up and before replaying deferred commands, and hands its
+  `SpawnedRunner` through the command context. A later successful paced preparation retry seats it at a loop boundary.
   Only the caller's cancel trips the bound's stop, which only preempts: the caller decides `Cancelled` first, as
   today (`serve_repair`). Verdicts are today's, never `Ok`, leave a suspended group's routes out, and need something
   judged: no covered window without a non-suspended route, each with a required relay. A verdict waits for a re-check

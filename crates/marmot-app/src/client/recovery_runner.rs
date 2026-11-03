@@ -783,6 +783,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let deadline = Instant::now() + policy.quantum;
         let ranges = plan.ranges.len();
+        tracing::debug!(target: TARGET, method = "attempt_started",
+            recheck = false, best_effort, ranges);
+
         // The pass's end preempts the quantum as shutdown does. The sweep's
         // own deadline stays the quantum's, so a cut pass reads as a
         // preemption, never as the relay's verdict.
@@ -905,6 +908,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         };
         let deadline = Instant::now() + policy.quantum;
         let ranges = plan.compare.ranges.len();
+        tracing::debug!(target: TARGET, method = "attempt_started",
+            recheck = true, best_effort = false, ranges);
+
         let preempt = self.cancel.child_token();
         let (report, facts) = {
             let run = compare::run(&*self.host, &plan.compare, deadline, &preempt, &policy);

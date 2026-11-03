@@ -51,6 +51,10 @@ pub struct RelayTrafficV1 {
     /// Client history requests by proxy clock, when events are requested.
     #[serde(default)]
     pub history_requests: Vec<HistoryRequestV1>,
+    /// Completed live group REQs, before client validation, when events are requested.
+    #[serde(default)]
+    pub live_group_replies: Vec<LiveGroupReplyV1>,
+
     /// Each connection's `#p` values across every `REQ` it sent, live ones
     /// included, when events are requested. An account's connections name
     /// its inbox, so this tells whose connection a history request came over.
@@ -60,6 +64,21 @@ pub struct RelayTrafficV1 {
     /// [`HistoryRequestV1::at_ms`].
     #[serde(default)]
     pub now_ms: u64,
+}
+
+/// One packed live group's raw reply through its EOSE, from wire frames.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveGroupReplyV1 {
+    pub at_ms: u64,
+    pub connection: u64,
+    pub routes: Vec<String>,
+    pub raw_events: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingLiveGroupReply {
+    routes: Vec<String>,
+    raw_events: u64,
 }
 
 /// One history filter a client sent: a `REQ` filter with an `until`, or a
@@ -97,6 +116,9 @@ pub(crate) struct RelayTrafficSessionV1 {
     /// Each open subscription's `REQ`, by subscription id.
     subscriptions: BTreeMap<String, RelayDeliveryPath>,
     history_requests: Vec<HistoryRequestV1>,
+    live_group_pending: BTreeMap<String, PendingLiveGroupReply>,
+    live_group_replies: Vec<LiveGroupReplyV1>,
+
     inboxes: BTreeSet<String>,
     undecoded_frames: u64,
     first_eof: Option<&'static str>,
@@ -324,6 +346,47 @@ fn record_message(
     {
         let asked = RelayDeliveryPath::of(&items);
         session.subscriptions.insert(subscription.to_owned(), asked);
+        session.live_group_pending.remove(subscription);
+        if asked == RelayDeliveryPath::Live {
+            let routes = items
+                .iter()
+                .skip(2)
+                .filter_map(|filter| filter["#h"].as_array())
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !routes.is_empty() {
+                session.live_group_pending.insert(
+                    subscription.to_owned(),
+                    PendingLiveGroupReply {
+                        routes,
+                        raw_events: 0,
+                    },
+                );
+            }
+        }
+    }
+    if let Some(subscription) = subscription {
+        if upstream && verb == "CLOSE" {
+            session.live_group_pending.remove(subscription);
+        } else if !upstream && verb == "EVENT" {
+            if let Some(reply) = session.live_group_pending.get_mut(subscription) {
+                reply.raw_events += 1;
+            }
+        } else if !upstream
+            && verb == "EOSE"
+            && let Some(reply) = session.live_group_pending.remove(subscription)
+        {
+            session.live_group_replies.push(LiveGroupReplyV1 {
+                at_ms,
+                connection: 0,
+                routes: reply.routes,
+                raw_events: reply.raw_events,
+            });
+        }
     }
     if !upstream
         && verb == "EVENT"
@@ -824,6 +887,12 @@ impl RelayFaultProxy {
                     .extend(session.history_requests.iter().cloned());
                 let connection = (first + offset) as u64;
                 total
+                    .live_group_replies
+                    .extend(session.live_group_replies.iter().cloned().map(|mut reply| {
+                        reply.connection = connection;
+                        reply
+                    }));
+                total
                     .connection_inboxes
                     .insert(connection, session.inboxes.clone());
             }
@@ -1167,6 +1236,53 @@ mod tests {
         assert_eq!(merged["ab"].first, Some((RelayDeliveryPath::Live, 30)));
         let later = proxy.traffic_since(1, true).events;
         assert_eq!(later["ab"].first, Some((RelayDeliveryPath::Ids, 1)));
+    }
+
+    #[test]
+    fn live_group_eose_counts_packed_raw_replies_and_resets_on_replacement() {
+        let mut session = RelayTrafficSessionV1::default();
+        let req = br##"["REQ","packed",{"#h":["counted","quiet"],"since":10}]"##;
+        record_message(&mut session, req, true, 1);
+        for id in ["aa", "bb"] {
+            record_message(
+                &mut session,
+                format!(r#"["EVENT","packed",{{"id":"{id}"}}]"#).as_bytes(),
+                false,
+                2,
+            );
+        }
+        record_message(&mut session, br#"["EOSE","packed"]"#, false, 3);
+        record_message(&mut session, br#"["EVENT","packed",{"id":"cc"}]"#, false, 4);
+        record_message(&mut session, req, true, 5);
+        record_message(&mut session, br#"["EOSE","packed"]"#, false, 6);
+        record_message(
+            &mut session,
+            br##"["REQ","history",{"#h":["counted"],"until":10}]"##,
+            true,
+            7,
+        );
+        record_message(&mut session, br#"["EOSE","history"]"#, false, 8);
+        record_message(&mut session, req, true, 9);
+        record_message(&mut session, br#"["CLOSE","packed"]"#, true, 10);
+        record_message(&mut session, br#"["EOSE","packed"]"#, false, 11);
+        assert_eq!(
+            session.live_group_replies,
+            vec![
+                LiveGroupReplyV1 {
+                    at_ms: 3,
+                    connection: 0,
+                    routes: vec!["counted".into(), "quiet".into()],
+                    raw_events: 2
+                },
+                LiveGroupReplyV1 {
+                    at_ms: 6,
+                    connection: 0,
+                    routes: vec!["counted".into(), "quiet".into()],
+                    raw_events: 0
+                },
+            ]
+        );
+        assert!(session.live_group_pending.is_empty());
     }
 
     fn masked(payload: &str) -> Vec<u8> {

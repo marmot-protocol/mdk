@@ -129,12 +129,11 @@ debug events, captured in process; they carry aggregate fields only. A live mess
 succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
 seconds after the last send to arrive.
 
-Until the switch-over (mdk#2660 PR 5g) the earlier owner still runs beside the runner. Either can contribute to
-startup recovery, so the wire bounds count both of bob's owners, and the runner's own numbers are recorded:
-its attempts, those that asked a relay and ended without progress (a re-check that finishes is an answer), and when
-it reported the account caught up. The runner is held only to what it does beside the earlier owner. 5g adds the
-runner-alone bounds, a positive control for live fences and the upgrade journey, where they can run against the
-switch-over.
+The runner-enabled proofs require both native backward-paging entry points off. Gate-off builds retain them
+as alternating controls. Bob's bounded window/by-id requests and aggregate runner work together witness the
+replacement: both native pager paths issue unlimited history-window REQs, which every runner-enabled proof
+rejects. Live REQs have no `until`; runner slices and by-id fetches have limits with the published cap. The wire tap
+also records packed live group REQs through EOSE, including raw counts, so the fence proof waits for actual replies.
 
 - `public_app_runner_stalled_relay_does_not_loop` reproduces the 0.14.0 loop's shape. Bob owes 3,000 events. Endpoint
   1 stays connected but never answers history (`stall_relay_history`), while alice sends a live message every two
@@ -175,10 +174,17 @@ switch-over.
   reports caught up within five minutes (nothing catching up and no notice, read after a runner attempt since the
   reconnect: until a runner surveys, the status lists nothing, and across a reconnect it keeps its last answer), and
   that a quiet-group message sent after the reconnect arrives. The aggregate includes inbox comparisons; it does
-  not prove the runner itself re-swept each group, since the route requests count both owners. Reconnect repeated
-  windows and idle-window requests are recorded, not asserted absent. Runner-only group attribution remains a 5g
-  obligation. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
-  bounds no live message's wait.
+  proves group re-proof by route-specific wire requests with native paging excluded. Reconnect windows may not
+  repeat. The restart requires at least two advancing runner attempts, at most four wasted attempts, a fresh
+  caught-up survey and at most 60 seconds' live visibility. Idle traffic remains measured separately.
+- `public_app_runner_owns_debt_after_the_upgrade_conversion` starts Bob under the old owner with 2,000 owed events
+  and unanswered history, then reopens the same nightly-shaped account under the runner. It requires nonzero
+  per-cause conversion counts before the first pre-network `attempt_started` event, exact/live/caught-up results, and no native pages.
+  Storage owns the actual released0.14 schema116 fixtures; this journey owns real runtime upgrade integration.
+- `public_app_runner_fences_nonempty_reqs_but_not_empty_ones` has two restarts: a packed REQ containing both groups
+  first returns at least30 raw events, then, after the real rebuild-window age, returns zero. Bob's own EOSE wire
+  replies establish the precondition. During a12-second history stall both groups must be held in the first phase
+  and both must arrive in the second. Every hold must end within30seconds and both timelines must be exact.
 
 Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
 `runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids:

@@ -30,8 +30,8 @@ mod process_server;
 #[cfg(test)]
 mod strfry_process_scale;
 pub use crate::relay_fault_proxy::{
-    HistoryRequestV1, PRODUCTION_RELAY_INFORMATION, RelayDeliveryPath, RelayEventDeliveryV1,
-    RelayTrafficV1,
+    HistoryRequestV1, LiveGroupReplyV1, PRODUCTION_RELAY_INFORMATION, RelayDeliveryPath,
+    RelayEventDeliveryV1, RelayTrafficV1,
 };
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
@@ -538,6 +538,12 @@ impl AppRuntimeHarness {
             runner_owns_debt: false,
         };
         Self::new_with_execution(clients, None, None, true, topology).await
+    }
+
+    /// Set the existing internal owner for in-process seats from their next
+    /// open, so an upgrade can reopen the same account under the new owner.
+    pub fn set_runner_owns_debt(&mut self, owns: bool) {
+        self.runner_owns_debt = owns;
     }
 
     /// [`Self::new_with_relay_pair`] with the in-process participants' history
@@ -2776,11 +2782,7 @@ fn app_for_root(
         config = config.with_dev_maintenance_timing(timing);
     }
     let app = MarmotApp::with_relays_and_config(root, relay_urls.to_vec(), config);
-    if runner_owns_debt {
-        app.with_recovery_runner_owning_debt()
-    } else {
-        app
-    }
+    app.with_recovery_runner_ownership_for_test(runner_owns_debt)
 }
 
 pub(crate) fn public_protocol_projection(
