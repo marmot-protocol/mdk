@@ -866,7 +866,7 @@ async fn run_with(runner_owns_debt: bool) {
     let subject = if runner_owns_debt {
         AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
     } else {
-        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+        AppRuntimeHarness::new_with_relay_pair_owner_mode(&clients, &clients[1..2], false).await
     };
     let mut subject = subject.expect("scorecard harness setup");
     save(

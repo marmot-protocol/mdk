@@ -649,8 +649,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
   `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
-  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, off; proofs turn it on with the hidden
-  `MarmotApp::with_recovery_runner_owning_debt`), never a host setting or cargo feature, until the switch-over flips it.
+  `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Controlled comparison fixtures can select
+  the old owner through the value-only `test-support` builder; this is never a host setting or cargo feature.
   With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
   the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
   admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still

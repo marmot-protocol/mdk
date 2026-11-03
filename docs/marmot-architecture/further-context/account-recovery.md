@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-11-02
+updated: 2026-11-03
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -760,12 +760,16 @@ refetches nothing: the events are durable and the ledger-derived cursor is past 
 Staging is not admission; a row leaves once its event is in the seen index, or, if it no
 longer decodes, by un-covering its second so it is fetched again.
 
-### 9. The recovery runner (behind its gate)
+### 9. The recovery runner
 
 `client/recovery_runner.rs` is phase 4's runner: one task per account that schedules history
-fetches over the ledger and the retry state above. It runs only behind the internal
-`runner_owns_debt` gate, off until the switch-over turns it on, so the comparison job keeps
-every behavior until then. With the gate on (`recovery_runner/host.rs`), the account worker
+fetches over the ledger and the retry state above. The internal `runner_owns_debt` gate defaults
+on; the old owner remains available for controlled comparisons during retirement. Before any
+subscription activates, ownership preparation converts retained obligations and imports loss as
+ledger debt. Both owner-granted native capture and autonomous clamp continuation are disabled
+for app-owned accounts; ordinary native input, count facts and bounded fences remain. Supported
+lower-level adapter/session callers still retain the native pager pending its replacement.
+With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
 `sync()` and from `next_event()` when it meets delivery loss. Sweeps go over the account's own
@@ -851,6 +855,11 @@ late input and counted, and a retired span it proves becomes coverage. A failed 
 pass un-covers nothing and resumes from its position after the unit backoff's doubling. A
 re-check charges the account budget and the relay's streak like any quantum, never the unit's
 own retry state. These values are decision A20.
+
+Coverage and retention do not imply decryptability. The ledger can prove a range and retain its events while
+an event remains held as undecryptable protocol input. It must not report that as a visible chat message.
+The runner's end-to-end proofs therefore require exact user-visible timelines in addition to durable coverage
+and retention. Exposing this held-versus-visible distinction in recovery status remains tracked by #2237.
 
 Each step first admits from staging. A group's staged events, across its current and retained
 routes, go to the recovered-ingest path oldest first by `(created_at, id)`, below the group's

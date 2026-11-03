@@ -2528,7 +2528,10 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        // This fixture owns the legacy native-replay contract through its
+        // retirement, independently of the application default.
         let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_recovery_runner_ownership_for_test(false)
             .with_test_relay_client(relay.clone());
         app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
             Some(Duration::from_secs(120)),
@@ -2653,6 +2656,86 @@ mod tests {
             !client.adapter.account_subscription_eose().await.complete(),
             "the quiet peer did not manufacture an EOSE"
         );
+    }
+
+    /// #2793: old inbox scopes must not broaden a newly current group's live
+    /// REQ after conversion. The old-path control keeps the same over-fetch;
+    /// the runner preserves the inbox debt without inheriting its query floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runner_owned_inbox_debt_does_not_lower_a_new_groups_live_req() {
+        use cgka_traits::transport::Timestamp;
+        use transport_nostr_adapter::NostrSubscription;
+        for owns in [false, true] {
+            let (_dir, app, relay, mut old) = native_fixture().await;
+            old.synchronize_native_replay().await.unwrap();
+            let ledger = app.account_storage("alice").unwrap().app_storage();
+            assert!(ledger.pending_recovery_demands().unwrap().iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay));
+            assert!(
+                old.subscription_rebuild_since().unwrap().is_none(),
+                "the production old owner created an unresolved unfloored inbox scope"
+            );
+            // A nightly-shaped durable input: a newer saved cursor beside an
+            // earlier owner's still-unadmitted native scope. No raw scope SQL.
+            let cursor = unix_now_seconds().saturating_sub(60);
+            old.state.last_transport_timestamp = Some(cursor);
+            app.save_state(&old.state).unwrap();
+            app.relay_plane
+                .deactivate_account_context(old.adapter.account_id())
+                .await
+                .unwrap();
+            drop(old);
+            let target = app.clone().with_recovery_runner_ownership_for_test(owns);
+            let mut client = crate::tests::client_on_app_relay_plane(&target, "alice").await;
+            let before = relay.accepted_subscriptions().len();
+            let group = client
+                .create_group("new route while inbox owes", &[])
+                .await
+                .unwrap();
+            let live_since = relay
+                .accepted_subscriptions()
+                .into_iter()
+                .skip(before)
+                .filter_map(|subscription| match subscription {
+                    NostrSubscription::Group {
+                        group_id, since, ..
+                    } if group_id == group => Some(since),
+                    NostrSubscription::GroupBatch { routes, since, .. }
+                        if routes.iter().any(|route| route.group_id == group) =>
+                    {
+                        Some(since)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !live_since.is_empty(),
+                "a real live group REQ must have been issued"
+            );
+            let expected = owns.then_some(Timestamp(cursor.saturating_sub(120)));
+            assert!(
+                live_since.iter().all(|since| *since == expected),
+                "owns={owns}: new group's live REQs {live_since:?}, expected {expected:?}"
+            );
+            if owns {
+                let inbox = storage_sqlite::TransportReconciliationRoute::Inbox;
+                assert!(!ledger.recovery_conversion_pending().unwrap());
+                assert!(
+                    ledger.recovery_coverage_goal(&inbox).unwrap().unwrap() < cursor - 120,
+                    "conversion keeps older inbox debt beyond the new group's live range"
+                );
+                assert!(
+                    ledger
+                        .recovery_coverage_ranges(&inbox, "wss://relay.example")
+                        .unwrap()
+                        .is_empty(),
+                    "the inbox has not answered or proved coverage"
+                );
+                assert!(ledger.pending_recovery_demands().unwrap().iter().all(
+                    |demand| demand.cause != storage_sqlite::RecoveryCause::SubscriptionReplay
+                ));
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

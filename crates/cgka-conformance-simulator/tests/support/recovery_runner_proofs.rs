@@ -1201,7 +1201,7 @@ where
     let mut subject = if owns {
         AppRuntimeHarness::new_with_relay_pair_owning_debt(&clients, &clients[1..2]).await
     } else {
-        AppRuntimeHarness::new_with_relay_pair(&clients, &clients[1..2]).await
+        AppRuntimeHarness::new_with_relay_pair_owner_mode(&clients, &clients[1..2], false).await
     }
     .expect("runner proof harness setup");
     let outcome = tokio::time::timeout(WATCHDOG, journey(&mut subject, artifacts.path()))

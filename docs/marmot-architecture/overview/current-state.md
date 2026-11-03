@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-11-02
+updated: 2026-11-03
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -19,16 +19,16 @@ status: overview
 
 # Current State — Implementations & Spec
 
-On master, one durable recovery owner (#1946) authorizes account-history acquisition for startup, receive,
-maintenance, convergence and explicit repair; its coalesced demand and retry pacing survive reopen, and EOSE alone never
-counts as coverage. NIP-77 route comparison keeps a durable per-route replay cursor and fetches missing IDs under fixed
-budgets. Eligible comparisons for startup, maintenance, scheduled convergence, ordinary receive and a selected online
-EpochGap run their SDK request off the account worker under two process-wide credits; the worker keeps activation,
-admission and settlement. Runtime catch-ups only drain live input; explicit `sync()`, full-history repair and
-account-wide overflow still wait inline. The exact-ID worker path over
-the [bounded acquisition interface](nostr-bounded-acquisition-interface.md) stays behind a private switch that defaults
-off. A v2 redesign is in progress: a durable overflow spill, one execution path for every cause and tiered completion.
-See [account history recovery](../further-context/account-recovery.md).
+App account-history recovery uses one coverage-ledger runner (#2660) for startup, receive, maintenance,
+convergence and explicit repair. Before subscriptions activate, it converts retained recovery obligations and
+records loss as durable debt; a worker runs bounded acquisition off its command loop, while a directly owned
+client runs a pass from its event/sync calls. Ordinary native subscription input still enters through the ordered
+admission path, but both owner-granted backward capture and autonomous clamp continuation are disabled for these
+accounts. Nonempty live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
+Coverage, durable retention and visible/decryptable chat history are separate claims. Lower-level adapter/session
+embedders still retain the native pager, whose raw-page accounting and retirement remain tracked by #2885.
+See [account history recovery](../further-context/account-recovery.md) and the
+[bounded acquisition interface](nostr-bounded-acquisition-interface.md).
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
