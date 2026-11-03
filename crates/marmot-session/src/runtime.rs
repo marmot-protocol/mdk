@@ -942,6 +942,26 @@ where
         self.session.own_signature_key()
     }
 
+    /// Pin original trust and destination expectation before a move Confirm.
+    pub fn prepare_device_group_move(
+        &mut self,
+        expectation: &cgka_traits::storage::DeviceGroupWelcomeExpectation,
+        own_slot: [u8; 32],
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session
+            .prepare_device_group_move(expectation, own_slot, now)
+    }
+
+    /// Apply the present selected Made cut on the session's own connection.
+    pub fn record_device_group_move_made(
+        &mut self,
+        destination: &GroupId,
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session.record_device_group_move_made(destination, now)
+    }
+
     /// See `CgkaEngine::expect_device_group_welcome`.
     pub fn expect_device_group_welcome(
         &mut self,

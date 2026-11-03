@@ -13,7 +13,7 @@ the list only shrinks.
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
 | `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, un-covering their seconds in the coverage ledger, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
 | `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer; the observer's type, its slot on the account handle and its setter, which `marmot-session` calls on the engine's storage | `protocol/storage/outbound.rs` |
-| `device_group_moves.rs` | Exact authenticated native Welcome consumption records Joined while original trust stays unchanged | protocol Welcome admission; finite session move owner |
+| `device_group_moves.rs` | Exact authenticated Welcome consumption records Joined; selected Made cuts trust with capture, old-debt retirement and bootstrap | protocol Welcome admission; finite session move owner |
 | `sibling_welcome_resends.rs` | Immutable first accepted-publication time in the fanout receipt transaction, carrier reservation/attachment, and group-lifetime cleanup | `marmot-session` receipt persistence and `marmot-app` DG/publication projection |
 | `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |

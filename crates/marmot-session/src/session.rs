@@ -67,6 +67,8 @@ use storage_sqlite::{
     MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
 };
 
+mod device_group_moves;
+
 const TRACE_TARGET: &str = "marmot_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;

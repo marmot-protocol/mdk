@@ -409,12 +409,15 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     let mut original_creator = roster_device(b"alice");
     let mut destination_creator = roster_device(b"alice");
     let original = GroupId::new(vec![0x41; 17]);
+    super::device_tag::hold_slot(&moving, slot(2));
     let original_package = moving.engine.fresh_key_package().await.unwrap();
     let original_ref = hex::encode(key_package_ref(&original_package));
     expect_link_welcome(&mut moving, &original, &original_creator, &original_package);
+    let mut original_roster = roster(&[(1, "Original"), (2, "Moving")]);
+    original_roster.leaf_tag_key = [0x31; 32];
     let (_, created) = create_under(
         &mut original_creator,
-        &roster(&[(1, "Original"), (2, "Moving")]),
+        &original_roster,
         vec![original_package],
         &original,
     )
@@ -424,6 +427,18 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
         panic!("founding Welcome")
     };
     assert_joins(&mut moving, &welcomes[0], &original, &original_creator).await;
+    moving
+        .engine
+        .set_device_tag_group(Some(original.clone()))
+        .unwrap();
+    super::device_tag::set_own_key(
+        &mut moving,
+        slot(2),
+        &original,
+        &mut [&mut original_creator],
+    )
+    .await;
+    let original_roster = super::device_roster::roster_of(&moving, &original);
     let app = moving.storage.app_storage();
     let original_hex = hex::encode(original.as_slice());
     app.insert_device_group(&DeviceGroupRecord {
@@ -514,6 +529,66 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
             .map(|row| row.group_id_hex)
             .collect::<Vec<_>>(),
         vec![original_hex.clone()]
+    );
+    // The destination's first own key Commit uses that roster for its own
+    // UpdatePath, while ordinary fresh KeyPackages still use the old trust.
+    let before_first = super::device_roster::roster_of(&moving, &chosen());
+    assert!(
+        !moving
+            .engine
+            .own_device_tag_commit_landed(&chosen(), &before_first, &slot(2))
+            .unwrap()
+    );
+    let expected_entry = before_first.devices[&slot(2)].clone();
+    let mut own_entry = expected_entry.clone();
+    own_entry.tag_signature_key = Some(moving.engine.own_signature_key());
+    let commit = send_commit(
+        &mut moving,
+        SendIntent::ReplaceDeviceEntry {
+            group_id: chosen(),
+            slot: slot(2),
+            expected: Box::new(expected_entry),
+            entry: Box::new(own_entry),
+        },
+        &chosen(),
+    )
+    .await;
+    assert_accepted(&mut destination_creator, &commit, &chosen()).await;
+    let destination_roster = super::device_roster::roster_of(&moving, &chosen());
+    assert!(
+        moving
+            .engine
+            .own_device_tag_commit_landed(&chosen(), &destination_roster, &slot(2))
+            .unwrap()
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &chosen()).own_leaf_node().unwrap(),
+            &destination_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2)),
+        "first own destination Commit must tag from its own post-roster"
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &original).own_leaf_node().unwrap(),
+            &original_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2))
+    );
+    let still_original = moving.engine.fresh_key_package().await.unwrap();
+    let key_package = parse_key_package(&still_original);
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(key_package.leaf_node(), &original_roster),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2))
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(key_package.leaf_node(), &destination_roster),
+        cgka_traits::app_components::DeviceTagClaim::Unclaimed
+    );
+    assert_eq!(
+        app.device_group(&original_hex).unwrap().unwrap().trust,
+        DeviceGroupTrust::Linked
     );
     drop(app);
     drop(moving);

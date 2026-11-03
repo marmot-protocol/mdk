@@ -496,8 +496,17 @@ impl<S: StorageProvider> Engine<S> {
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        // A first own destination key must describe exactly its post-roster:
+        // another member's pending proposals cannot change that first tag.
+        let consume_pending = self.first_own_roster_tag(mls_group, &proposals).is_none();
         self.stage_app_data_commit(
-            mls_group, provider, removals, adds, proposals, true, context,
+            mls_group,
+            provider,
+            removals,
+            adds,
+            proposals,
+            consume_pending,
+            context,
         )
     }
 

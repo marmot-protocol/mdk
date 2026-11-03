@@ -629,6 +629,30 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
+    /// End new delivery of the sibling Welcomes retained in the current
+    /// namespace when the host cuts device-group trust. The immutable body,
+    /// carrier and admitted native fanout remain intact for ordinary settlement.
+    /// The caller composes this with its trust/debt transaction.
+    pub fn retire_sibling_welcome_deliveries(&self) -> Result<(), EngineError> {
+        self.storage.with_transaction(|store| {
+            for group in store.list_groups()? {
+                for record in store.list_messages_in_states(
+                    &group,
+                    &[MessageState::Sent, MessageState::Processed],
+                    EpochId(0),
+                )? {
+                    if matches!(
+                        StoredMessagePayload::decode(&record.payload),
+                        Ok(StoredMessagePayload::OutboundSiblingWelcome { .. })
+                    ) {
+                        store.update_message_state(&record.id, MessageState::Failed)?;
+                    }
+                }
+            }
+            Ok::<_, EngineError>(())
+        })
+    }
+
     /// Re-owe an already published sibling Welcome after the host's durable
     /// post-publication activity wait. This reuses the exact Welcome and
     /// private KeyPackage; the host must first settle outstanding transport
