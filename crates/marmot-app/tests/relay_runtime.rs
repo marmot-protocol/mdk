@@ -553,6 +553,9 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    // Opt in at ordinary app fixtures; shared relay/setup helpers also serve
+    // ignored diagnostics and nightly replay, which keep their original settings.
+    storage_sqlite::relax_storage_for_test_process();
     let (relay, url) = mock_relay().await;
     // The test harness exercises encrypted-media upload/download against a
     // loopback MockBlossom server, which is exactly the dev/test scenario the
@@ -583,6 +586,7 @@ async fn sync_to_epoch(client: &mut marmot_app::AppClient, group: &GroupId, epoc
 }
 
 async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::try_with_relays_and_account_home_and_config(
         dir.path(),
@@ -654,6 +658,7 @@ async fn group_message_blocking_app(
     dir: &tempfile::TempDir,
     gate: BlockNextGroupMessages,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -913,6 +918,7 @@ async fn gift_wrap_blocking_app_with_config(
     gate: BlockNextGiftWraps,
     config: MarmotAppConfig,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -975,6 +981,7 @@ async fn gift_wrap_counting_app(
     dir: &tempfile::TempDir,
     gate: CountGiftWraps,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1063,6 +1070,7 @@ impl WritePolicy for BlockKeyPackagesWhileArmed {
 }
 
 async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(RejectDeletionEvents));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();

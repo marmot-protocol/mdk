@@ -2,6 +2,15 @@ package dev.ipf.marmotkit
 
 /** Exercise generated record layout and enum discriminants, including presentation roles. */
 fun main() {
+    // Generated host ABI ownership: typed source payloads and optional ephemeral operation tokens.
+    val backupSource = BackupHistorySourceFfi("recovery", "archive", "head", ULong.MAX_VALUE)
+    for (provenance in listOf(HistoryImportProvenanceFfi.Device("slot"), HistoryImportProvenanceFfi.Backup(backupSource))) {
+        check(FfiConverterTypeHistoryImportProvenanceFfi.lift(FfiConverterTypeHistoryImportProvenanceFfi.lower(provenance)) == provenance)
+    }
+    for (phase in BackupRestorePhaseFfi.entries) {
+        val status = BackupRestoreStatusFfi(if (phase == BackupRestorePhaseFfi.IDLE) null else "opaque", phase, 1uL, ULong.MAX_VALUE, 2uL, 3uL, 4uL, 5uL)
+        check(FfiConverterTypeBackupRestoreStatusFfi.lift(FfiConverterTypeBackupRestoreStatusFfi.lower(status)) == status)
+    }
     for (query in listOf(
         AccountAttachmentQueryFfi(emptyList(), emptyList(), null, null),
         AccountAttachmentQueryFfi(listOf("aa"), listOf("sender"), 0uL, ULong.MAX_VALUE),
@@ -62,7 +71,7 @@ fun main() {
     for (provenance in GroupSystemEventProvenanceFfi.entries) {
         val event = GroupSystemEventFfi(provenance, "Actor", "Subject", "member_added", "Member added", "actor", "subject", null, null, null, null)
         val preview = ChatListMessagePreviewFfi(event, "selected", "actor", null, "raw", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            1210u, 50u, null, null, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
+            1210u, null, 50u, null, null, false, DeletionSourceFfi.UNKNOWN, null, 0u, ChatListMessageDeliveryStateFfi.NOT_APPLICABLE)
         val copy = FfiConverterTypeChatListMessagePreviewFfi.lift(FfiConverterTypeChatListMessagePreviewFfi.lower(preview))
         // Kotlin ByteArray equality is referential; compare the nested bytes by content.
         check(copy.contentTokens.blankLinesBefore.contentEquals(preview.contentTokens.blankLinesBefore))
@@ -76,7 +85,7 @@ fun main() {
     }
     for (source in DeletionSourceFfi.entries) {
         val preview = TimelineReplyPreviewFfi("deleted", "author", "", MarkdownDocumentFfi(emptyList(), false, byteArrayOf()),
-            9u, null, emptyList(), null, true, source, null)
+            9u, null, null, emptyList(), null, true, source, null)
         val copy = FfiConverterTypeTimelineReplyPreviewFfi.lift(FfiConverterTypeTimelineReplyPreviewFfi.lower(preview))
         check(copy.deletionSource == source && copy.deleted && copy.plaintext.isEmpty())
     }
@@ -240,4 +249,21 @@ suspend fun compileAutomaticAttachment(marmot: Marmot, account: String, group: S
         val result = marmot.requestAutomaticAttachment(account, group, target)
         check(!result.newlyQueued || result.status.state == AttachmentTransferStateFfi.QUEUED)
     }
+}
+
+suspend fun compileBackupCommands(marmot: Marmot, account: String, group: String, words: String) {
+    val setup = marmot.beginRecoveryWords(account)
+    marmot.confirmRecoveryWords(account, setup.confirmPositions.map { setup.words[it.toInt() - 1] })
+    marmot.cancelRecoveryWords(account)
+    marmot.backupSettings(account)
+    marmot.setBackupBackgroundConditions(account, true, false)
+    val begun = marmot.beginBackupRestore(account, words)
+    marmot.watchBackupRestore(account).use { observer ->
+        observer.snapshot()
+        observer.next()
+    }
+    marmot.backupRestoreStatus(account)
+    marmot.backupHistoryAvailability(account, group)
+    begun.operation?.let { marmot.cancelBackupRestore(account, it) }
+    marmot.turnOffBackups(account)
 }

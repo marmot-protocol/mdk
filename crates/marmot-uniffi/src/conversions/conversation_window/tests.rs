@@ -171,6 +171,42 @@ fn prepared_conversion_reuses_rows_and_text_but_keeps_all_visible_changes() {
             );
         }
         assert_eq!(cache.conversions, size + 5);
+        // Provenance changes independently of content and sibling labels.
+        // Prime the live row first, so an ignored source key cannot pass by
+        // incidentally invalidating on another field's change.
+        rows[0].imported_from = None;
+        cache.row(&rows[0], false);
+        for written_at in [41, 42] {
+            rows[0].history_import_provenance = Some(app::HistoryImportProvenance::Backup(
+                app::BackupHistorySource {
+                    recovery_public_key: [2; 32],
+                    backup_id: [3; 16],
+                    head_sha256: [4; 32],
+                    written_at,
+                },
+            ));
+            let prepared = cache.row(&rows[0], false);
+            assert!(prepared.imported_from.is_none());
+            assert!(matches!(&prepared.history_import_provenance,
+                Some(super::super::HistoryImportProvenanceFfi::Backup { source })
+                if source.recovery_public_key_hex == "02".repeat(32)
+                    && source.backup_id_hex == "03".repeat(16)
+                    && source.head_sha256_hex == "04".repeat(32)
+                    && source.written_at == written_at));
+            let direct = TimelineMessageRecordFfi::from(rows[0].clone());
+            assert_eq!(
+                prepared.history_import_provenance,
+                direct.history_import_provenance
+            );
+            assert_eq!(wire(prepared), wire(presented_timeline(&rows[0], false)));
+        }
+        rows[0].history_import_provenance = None;
+        assert!(
+            cache
+                .row(&rows[0], false)
+                .history_import_provenance
+                .is_none()
+        );
         cache.close();
         assert!(cache.rows.is_empty());
     }

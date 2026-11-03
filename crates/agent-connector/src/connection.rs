@@ -125,8 +125,11 @@ impl AgentConnector {
             Ok(response) => response,
             Err(err) => self.error_response("handle_connection", &err),
         };
+        let mut lease =
+            crate::attachments::AttachmentReplyLease::new(self.runtime.clone(), &response);
         let response = AgentControlEnvelope::new(request.id, response);
         write_control_frame(&mut write_half, &response).await?;
+        lease.delivered();
         Ok(())
     }
 
@@ -182,6 +185,7 @@ impl AgentConnector {
             AgentControlRequest::AccountList
             | AgentControlRequest::TimelineMessageGet { .. }
             | AgentControlRequest::TimelineList { .. }
+            | AgentControlRequest::AttachmentGet { .. }
             | AgentControlRequest::AccountProfileLookup { .. }
             | AgentControlRequest::AccountRelayLists { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
@@ -207,6 +211,8 @@ impl AgentConnector {
             | AgentControlRequest::GroupProfileUpdate { .. }
             | AgentControlRequest::SendMedia { .. }
             | AgentControlRequest::DownloadMedia { .. }
+            | AgentControlRequest::DownloadAttachment { .. }
+            | AgentControlRequest::ReleaseAttachment { .. }
             | AgentControlRequest::MaintenanceScheduleSelfUpdate { .. }
             | AgentControlRequest::MaintenanceSetPolicy { .. }
             | AgentControlRequest::MaintenancePause { .. }
@@ -710,6 +716,57 @@ impl AgentConnector {
             } => {
                 self.download_media_response(&account_id_hex, &group_id_hex, media)
                     .await
+            }
+            AgentControlRequest::AttachmentGet {
+                account_id_hex,
+                group_id_hex,
+                message_id_hex,
+                attachment_index,
+            } => {
+                with_control_operation_timeout(
+                    "attachment_get",
+                    self.attachment_response(
+                        &account_id_hex,
+                        &group_id_hex,
+                        &message_id_hex,
+                        attachment_index,
+                        false,
+                    ),
+                )
+                .await?
+            }
+            AgentControlRequest::DownloadAttachment {
+                account_id_hex,
+                group_id_hex,
+                message_id_hex,
+                attachment_index,
+            } => {
+                with_control_operation_timeout(
+                    "download_attachment",
+                    self.attachment_response(
+                        &account_id_hex,
+                        &group_id_hex,
+                        &message_id_hex,
+                        attachment_index,
+                        true,
+                    ),
+                )
+                .await?
+            }
+            AgentControlRequest::ReleaseAttachment { lease } => {
+                with_control_operation_timeout(
+                    "release_attachment",
+                    self.runtime.release_attachment_handoff(&lease),
+                )
+                .await
+                .map_err(|_| ConnectorError::AttachmentReleaseFailed)?
+                .map_err(|error| match error {
+                    marmot_app::AppError::Io(_) | marmot_app::AppError::BlockingTask(_) => {
+                        ConnectorError::AttachmentReleaseFailed
+                    }
+                    other => ConnectorError::App(other),
+                })?;
+                Ok(AgentControlResponse::AttachmentReleased)
             }
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),

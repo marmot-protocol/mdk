@@ -27,6 +27,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
   [turning on account devices](#turning-on-account-devices),
+  [backup recovery and background conditions](#backup-recovery-and-background-conditions),
   [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
@@ -1179,6 +1180,49 @@ land:
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
   which carries no device, session or group identities. It also fires once each time the account's worker opens or
   reconnects, which ends any link in progress.
+
+## Backup recovery and background conditions
+
+These experimental commands require `devDeviceGroups`, which is off by default, and a build with experimental
+device-group support. MDK owns backup selection, due work, download limits, import validation and membership checks;
+the host supplies platform facts, renders status and obtains recovery words from the user.
+
+Use `beginRecoveryWords(accountRef)` to generate 12 new words for backup setup. Display them once, then ask for the
+words at the two returned **1-based** `confirmPositions`, in order, and pass those answers to `confirmRecoveryWords`.
+`cancelRecoveryWords` forgets the pending setup; `backupSettings` reads selected account settings.
+`turnOffBackups` disables future account backups without deleting existing archives. A busy or failed confirmation
+keeps the core setup available for another try. Read settings again rather than treating a submitted choice as settled.
+
+Report `setBackupBackgroundConditions(accountRef, wifi, charging)` when an account worker starts and whenever either
+fact changes. Background writer work requires **both Wi-Fi and charging**; each replacement worker starts closed until
+the host reports eligible conditions. An admitted backup pass finishes and settles even if either fact becomes false;
+false blocks the next pass, including pointer checks, retries and cleanup. The report wakes MDK's existing dispatcher,
+not a forced backup or a publication receipt. MDK still applies writer, due-time, backoff and resource checks. The host
+owns OS execution opportunities; it need not implement another backup scheduler. Manual restore is independent of these facts.
+
+`beginBackupRestore(accountRef, words)` starts one manual history-only operation per account and returns its status.
+Old words remain usable independently of the current backup key; restore never enables backups or changes that key.
+Only chats whose current selected MLS tree contains this device's own leaf can receive history. Unknown chats retain
+private availability metadata, without creating or joining a chat. After a real join, `backupHistoryAvailability`
+returns words-again hints for that current chat. Archived preferences and invitation decisions are not applied.
+
+Use `backupRestoreStatus` or `watchBackupRestore` for aggregate progress. A watch offers its initial snapshot once and
+then `next` updates; closing it does **not** cancel work. `Complete` means eligible work settled, not that all history
+was found or that a backup pointer existed. `Partial` retains committed history; `Unavailable` can require a later
+manual retry. Availability revisions wake the same watch; read the current chat's hints again. Operation tokens are
+opaque, ephemeral, account-scoped strings: return the exact token to `cancelBackupRestore`. A stale valid token returns
+false and cannot cancel a newer operation; malformed tokens are rejected. Cancellation and shutdown release owned
+secrets and leave committed history intact. Retry explicitly with the words again; there is no durable secret-backed resume.
+
+Timeline pages and prepared conversation rows expose `historyImportProvenance`: `Device` carries a device slot,
+`Backup` carries an archive identity. Render backup rows as restored from backup, never as an unnamed device. The
+archive identity does not prove original writer, historical authorship or historical membership. The legacy
+`importedFrom` field remains sibling-only; its absence alone does not identify live rows.
+
+Never persist, log or include recovery words in diagnostics. Clear host-owned input and displayed copies promptly.
+MDK guards its owned queued phrases and confirmation answers and zeroizes managed secret buffers on release; generated
+Swift/Kotlin strings, caller copies and upstream parser/hash/compiler scratch are outside that guarantee. Dropping a
+managed string does not promise erasure. Do not log whole DTOs even when a particular Rust Debug implementation redacts them.
 
 ## History may be incomplete notices
 
