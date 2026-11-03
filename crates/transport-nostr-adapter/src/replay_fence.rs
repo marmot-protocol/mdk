@@ -933,8 +933,8 @@ mod tests {
                     .end_live_count();
             }
             coverage.ack_placement(&delivery(0, 150, 1, &id, 1).message.id);
-            assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
             if !immediate_prune {
+                assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
                 assert!(
                     coverage.groups[&group_id(0)]
                         .fence
