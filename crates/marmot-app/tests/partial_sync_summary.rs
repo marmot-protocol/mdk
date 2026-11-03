@@ -23,6 +23,8 @@ fn open_store(
     relay_url: &str,
     fail_sync_before_delivery: Option<u64>,
 ) -> MarmotApp {
+    // These faults prove committed state and replay, not power-loss durability.
+    storage_sqlite::relax_storage_for_test_process();
     let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(deliveries) = fail_sync_before_delivery {
         config = config.with_dev_fail_sync_before_delivery(deliveries);
@@ -35,6 +37,7 @@ fn open_store_with_boundary_failure(
     relay_url: &str,
     completed_deliveries: u64,
 ) -> MarmotApp {
+    storage_sqlite::relax_storage_for_test_process();
     let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_sync_before_boundary_save(completed_deliveries);
@@ -42,6 +45,7 @@ fn open_store_with_boundary_failure(
 }
 
 fn open_store_with_post_ack_failure(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
+    storage_sqlite::relax_storage_for_test_process();
     let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_ingest_after_application_event_ack();
