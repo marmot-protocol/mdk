@@ -103,7 +103,7 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
 
 Tests: `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator upgrade, component migration,
 multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome delivery), and the session's
-`tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and `tests/nostr_stack_chaos.rs`.
+`tests/session_lifecycle.rs` and `tests/nostr_stack.rs` (including `tests/nostr_stack/chaos.rs`).
 
 ## Rules
 

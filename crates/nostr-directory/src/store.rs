@@ -276,11 +276,18 @@ impl<R: DirectoryResources> Directory<R> {
         })
     }
 
+    /// Ingest authenticated directory data. Invalid or future-dated events
+    /// are ignored before either directory store is changed.
     pub fn ingest_directory_relay_event(
         &self,
         record: RelayEventRecord,
     ) -> Result<(), DirectoryError> {
         if !self.directory_freshness().accepts(&record) {
+            return Ok(());
+        }
+        // This public DTO ingress also serves producers outside the live SDK
+        // forwarder. Verify its bytes independently before any durable write.
+        if record.event.to_verified_nostr_event().is_err() {
             return Ok(());
         }
         let account_id_hex = parse_account_id_hex(&record.event.pubkey)?;

@@ -50,8 +50,15 @@ env:
   WORKSPACE_FILTER: not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))
 
 jobs:
+  signatures:
+    name: PR signatures
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-signatures.yml
+
   changes:
     name: Classify CI changes
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -132,6 +139,7 @@ jobs:
 
   rust-format:
     name: Rust format
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -211,6 +219,7 @@ jobs:
 
   rust-audit:
     name: Rust audit
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -1642,6 +1651,7 @@ jobs:
     # merge-group-fail-fast cancels the run.
     if: always()
     needs:
+      - signatures
       - changes
       - rust-format
       - rust-audit
@@ -1686,4 +1696,4 @@ jobs:
           fi
           accepted='["success", "skipped"]'
           if [[ "$CI_MODE" == full ]]; then accepted='["success"]'; fi
-          jq --exit-status --argjson accepted "$accepted" 'all(.[]; .result | IN($accepted[]))' <<<"$NEEDS"
+          jq --exit-status --argjson accepted "$accepted" '.signatures.result == "success" and all(.[]; .result | IN($accepted[]))' <<<"$NEEDS"

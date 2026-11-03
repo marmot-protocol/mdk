@@ -37,6 +37,9 @@ process-orchestrator = { max-threads = 1 }
 # and then waits on real settlement windows. Two at a time keeps the smoke lane
 # moving without letting eleven of them starve each other's relay admission.
 app-runtime-journeys = { max-threads = 2 }
+# These session delivery scripts retain real adapter/peeler flows and convergence
+# waits over encrypted SQLCipher sessions. Keep at most two active.
+session-chaos = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'package(wn-cli) & binary(cli)'
@@ -49,6 +52,10 @@ test-group = 'process-orchestrator'
 [[profile.default.overrides]]
 filter = 'package(cgka-conformance-simulator) & (binary(app_runtime_journeys) | binary(app_runtime_interaction_journeys))'
 test-group = 'app-runtime-journeys'
+
+[[profile.default.overrides]]
+filter = 'package(marmot-session) & binary(nostr_stack) & test(chaos::)'
+test-group = 'session-chaos'
 
 # These cross-process recovery cases each launch several runtimes and local
 # relays. Reserve the full nextest worker budget so CPU pressure cannot turn a

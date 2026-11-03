@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import nightly_release  # noqa: E402
 import ci_runner  # noqa: E402
+import check_pr_signatures as signatures  # noqa: E402
 from check_install_example_sha256 import documented_release_version  # noqa: E402
 
 
@@ -37,6 +38,185 @@ def workflow_step(filename: str, name: str) -> str:
             break
         lines.append(line)
     return textwrap.dedent("\n".join(lines))
+
+
+class SignaturePolicyTests(unittest.TestCase):
+    def pr(self, head="head", count=2):
+        return {"head": {"sha": head}, "base": {"sha": "base"}, "commits": count, "state": "open"}
+
+    def commit(self, sha, verified):
+        return {"sha": sha, "commit": {"verification": {"verified": verified}}}
+
+    def test_checks_the_entire_paginated_fork_range_including_unsigned_ancestors(self):
+        # More than 250 commits must use the comparison API rather than the
+        # truncated PR-commits endpoint; the signed tip cannot hide an ancestor.
+        commits = [self.commit(f"commit-{i}", i != 1) for i in range(300)]
+        commits[-1]["sha"] = "head"
+        pages = [{"commits": commits[i:i+100]} for i in range(0, 300, 100)]
+        with unittest.mock.patch.object(signatures, "api", side_effect=[self.pr(count=300), pages,
+                                                                      self.pr(count=300)]) as api:
+            self.assertEqual(signatures.inspect_signatures("base/repo", 7, "head"), ["commit-1"])
+        self.assertEqual(api.call_args_list[1], unittest.mock.call(
+            "repos/base/repo/compare/base...head?per_page=100", paginate=True))
+
+    def test_accepts_only_explicit_github_verification(self):
+        for verified, expected in [(True, []), (False, ["head"]), (None, ["head"]),
+                                   ("true", ["head"])]:
+            with self.subTest(verified=verified), unittest.mock.patch.object(
+                signatures, "api", side_effect=[self.pr(count=1),
+                    [{"commits": [self.commit("head", verified)]}], self.pr(count=1)]):
+                self.assertEqual(signatures.inspect_signatures("o/r", 7, "head"), expected)
+
+    def test_accepts_clock_skewed_commit_order_but_rejects_duplicate_pages(self):
+        for commits, expected in [([self.commit("head", True), self.commit("old", True)], []),
+                                   ([self.commit("head", True), self.commit("head", True)], None)]:
+            with unittest.mock.patch.object(signatures, "api", side_effect=[self.pr(),
+                    [{"commits": commits}], self.pr()]):
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "complete current PR commit list"):
+                        signatures.inspect_signatures("o/r", 7, "head")
+                else:
+                    self.assertEqual(signatures.inspect_signatures("o/r", 7, "head"), expected)
+
+    def test_build_gate_checks_metadata_before_any_checkout_and_needs_no_pr_permission(self):
+        script = workflow_step("pr-signatures.yml", "Verify every PR commit")
+        good = self.commit("head", True)
+        for pages, count, expected in [
+            ([{"commits": [good]}], 1, True),
+            ([{"commits": [self.commit("old", False)]}, {"commits": [good]}], 2, False),
+            ([{"commits": [good]}, {"commits": [self.commit("old", True)]}], 2, True),
+            ([{"commits": [good, good]}], 2, False),
+            ([{"commits": [good]}], 2, False),
+            ([{"commits": []}], 0, False),
+            ([{"commits": [self.commit("other", True)]}], 1, False),
+        ]:
+            with self.subTest(pages=pages, count=count):
+                result = subprocess.run(["bash", "-c", 'gh() { printf "%s" "$RESPONSE"; }\n' + script],
+                    capture_output=True, timeout=10, env={**os.environ, "RESPONSE": json.dumps(pages),
+                        "REPO": "o/r", "BASE_SHA": "base", "HEAD_SHA": "head", "COMMIT_COUNT": str(count)})
+                self.assertEqual(result.returncode == 0, expected)
+        failed = subprocess.run(["bash", "-c", 'gh() { return 1; }\n' + script],
+            capture_output=True, timeout=10, env={**os.environ, "REPO": "o/r", "BASE_SHA": "base",
+                                                "HEAD_SHA": "head", "COMMIT_COUNT": "1"})
+        self.assertNotEqual(failed.returncode, 0)
+        gate = (ROOT / ".github/workflows/pr-signatures.yml").read_text()
+        self.assertNotIn("actions/checkout", gate)
+        self.assertNotIn("scripts/", gate)
+        self.assertNotIn("pull-requests:", gate)
+
+    def test_truncated_empty_or_moving_snapshots_fail_closed(self):
+        complete = [{"commits": [self.commit("old", True), self.commit("head", True)]}]
+        for before, pages, after in [
+            (self.pr(), [{"commits": [self.commit("head", True)]}], self.pr()),
+            (self.pr(count=0), [{"commits": []}], self.pr(count=0)),
+            (self.pr(), complete, self.pr("replacement")),
+            (self.pr(), complete, {**self.pr(), "base": {"sha": "new-base"}}),
+            (self.pr(), complete, self.pr(count=3)),
+        ]:
+            with self.subTest(before=before, pages=pages, after=after), unittest.mock.patch.object(
+                signatures, "api", side_effect=[before, pages, after]):
+                with self.assertRaisesRegex(ValueError, "complete current PR commit list"):
+                    signatures.inspect_signatures("o/r", 7, "head")
+        with unittest.mock.patch.object(signatures, "api", return_value=self.pr("replacement")):
+            with self.assertRaisesRegex(ValueError, "head changed"):
+                signatures.inspect_signatures("o/r", 7, "head")
+
+    def test_api_errors_never_admit_a_build(self):
+        with unittest.mock.patch.object(signatures, "api", side_effect=subprocess.CalledProcessError(1, "gh")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                signatures.inspect_signatures("o/r", 7, "head")
+
+    def test_comment_is_reused_and_resolves_after_signing_without_touching_human_comments(self):
+        human = {"id": 1, "user": {"login": "contributor"}, "body": signatures.COMMENT_MARKER}
+        bot = {"id": 2, "user": {"login": "github-actions[bot]"},
+               "body": signatures.COMMENT_MARKER + "\nold blocker"}
+        for pages, unsigned, endpoint, method, expected in [
+            ([[human]], ["head"], "repos/o/r/issues/7/comments", "POST", "remains open"),
+            ([[human], [bot]], ["head"], "repos/o/r/issues/comments/2", "PATCH", "remains open"),
+            ([[human], [bot]], [], "repos/o/r/issues/comments/2", "PATCH", "blocker is resolved"),
+        ]:
+            with self.subTest(unsigned=unsigned, pages=pages), unittest.mock.patch.object(
+                signatures, "api", side_effect=[pages, self.pr(), {}]) as api:
+                signatures.update_comment("o/r", 7, "head", unsigned)
+            write = api.call_args_list[-1]
+            self.assertEqual(write.args, (endpoint,))
+            self.assertEqual(write.kwargs["method"], method)
+            self.assertIn(expected, write.kwargs["body"]["body"])
+            self.assertNotIn("state", write.kwargs["body"])
+        with unittest.mock.patch.object(signatures, "api", return_value=[[human]]) as api:
+            signatures.update_comment("o/r", 7, "head", [])
+        self.assertEqual(api.call_count, 1)  # No success comment on an unaffected PR.
+
+    def test_stale_comment_runs_do_not_overwrite_a_replacement_head(self):
+        with unittest.mock.patch.object(signatures, "api", side_effect=[[], self.pr("replacement")]) as api:
+            with self.assertRaisesRegex(ValueError, "PR changed"):
+                signatures.update_comment("o/r", 7, "head", ["head"])
+        self.assertTrue(all(call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list))
+
+    def test_comment_cli_reads_paginated_signatures_and_posts_guidance_without_closing_pr(self):
+        # Exercise the actual CLI and gh boundary, including pagination flags,
+        # JSON decoding, and the only write: the explanatory comment.
+        with tempfile.TemporaryDirectory() as tmp:
+            event = Path(tmp) / "event.json"
+            event.write_text(json.dumps({"number": 7, "pull_request": self.pr()}))
+            comparison = [{"commits": [self.commit("old", False), self.commit("head", True)]}]
+            responses = [self.pr(), comparison, self.pr(), [], self.pr(), {}]
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event),
+                    "GITHUB_REPOSITORY": "o/r", "GITHUB_EVENT_NAME": "pull_request_target"}), \
+                 unittest.mock.patch.object(subprocess, "run", side_effect=[
+                     subprocess.CompletedProcess([], 0, json.dumps(value)) for value in responses]) as run, \
+                 unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(signatures.main(), 1)
+                self.assertIn("must be signed", stderr.getvalue())
+            self.assertIn("--paginate", run.call_args_list[1].args[0])
+            self.assertIn("--slurp", run.call_args_list[1].args[0])
+            write = run.call_args_list[-1]
+            self.assertEqual(write.args[0][:5], ["gh", "api", "repos/o/r/issues/7/comments", "--method", "POST"])
+            self.assertEqual(set(json.loads(write.kwargs["input"])), {"body"})
+
+    def test_read_only_pr_context_cannot_request_comment_writes(self):
+        with unittest.mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}), \
+             unittest.mock.patch.object(signatures, "api") as api:
+            with self.assertRaisesRegex(ValueError, "Only the trusted pull_request_target"):
+                signatures.main()
+        api.assert_not_called()
+
+    def test_every_pr_build_workflow_depends_on_the_read_only_gate(self):
+        for path in (ROOT / ".github/workflows").glob("*.y*ml"):
+            text = path.read_text()
+            if not re.search(r"^  pull_request:", text, re.M):
+                continue
+            with self.subTest(path=path):
+                jobs = {match[1]: match[2] for match in re.finditer(
+                    r"^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)",
+                    text.split("\njobs:\n", 1)[1], re.M | re.S)}
+                self.assertIn("uses: ./.github/workflows/pr-signatures.yml", jobs["signatures"])
+                self.assertNotIn("write", jobs["signatures"])
+                def gated(job, visited=frozenset()):
+                    if job == "signatures":
+                        return True
+                    if job in visited:
+                        return False
+                    needs = re.search(r"^    needs:(.*(?:\n      - [a-z0-9-]+)*)", jobs[job], re.M)
+                    return bool(needs) and any(gated(parent, visited | {job}) for parent in
+                        re.findall(r"[a-z0-9][a-z0-9-]*", needs[1]))
+                for job, body in jobs.items():
+                    if job not in {"required-ci", "candidate-validation", "merge-group-fail-fast"}:
+                        self.assertTrue(gated(job), f"{path.name}:{job} can run before signatures")
+                        self.assertNotRegex(body, r"(?m)^    if:.*(?:always|failure|cancelled)\(")
+
+    def test_comment_workflow_only_executes_trusted_default_branch_code(self):
+        comment = (ROOT / ".github/workflows/pr-signature-comment.yml").read_text()
+        self.assertIn("  pull_request_target:", comment)
+        self.assertIn("ref: ${{ github.sha }}", comment)
+        self.assertNotIn("github.event.pull_request.head", comment)
+        self.assertNotIn("secrets.", comment)
+        self.assertIn("persist-credentials: false", comment)
+        self.assertIn("run: python3 scripts/check_pr_signatures.py", comment)
+        gate = (ROOT / ".github/workflows/pr-signatures.yml").read_text()
+        self.assertNotIn("write", gate)
+        self.assertNotIn("--comment", gate)
+        self.assertIn("if: github.event_name == 'pull_request'", gate)
 
 
 class PackagingPolicyTests(unittest.TestCase):
@@ -114,13 +294,16 @@ class MergeGatePolicyTests(unittest.TestCase):
 
     def test_required_ci_rejects_skipped_jobs_in_full_runs(self):
         script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
-        passed = {"changes": {"result": "success"}, "rust-test": {"result": "success"}}
+        passed = {"signatures": {"result": "success"}, "changes": {"result": "success"},
+                  "rust-test": {"result": "success"}}
         skipped = {**passed, "rust-test": {"result": "skipped"}}
         failed = {**passed, "rust-test": {"result": "failure"}}
         cancelled = {**passed, "rust-test": {"result": "cancelled"}}
         for event, mode, needs, expected in [
             ("pull_request", "precheck", skipped, True),
             ("pull_request", "precheck", failed, False),
+            ("pull_request", "precheck", {**passed, "signatures": {"result": "skipped"}}, False),
+            ("pull_request", "precheck", {**passed, "signatures": {"result": "failure"}}, False),
             ("pull_request", "precheck", cancelled, False),
             ("pull_request", "full", skipped, False),
             ("merge_group", "full", passed, True),

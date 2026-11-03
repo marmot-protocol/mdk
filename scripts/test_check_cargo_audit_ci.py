@@ -76,15 +76,15 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
 
     def test_rejects_error_masking(self) -> None:
         self.assert_mutation_rejected(
-            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n\n    steps:",
-            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    continue-on-error: true\n\n    steps:",
+            "  rust-audit:\n",
+            "  rust-audit:\n    continue-on-error: true\n",
             "continue-on-error",
         )
 
     def test_rejects_job_level_condition(self) -> None:
         self.assert_mutation_rejected(
-            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n\n    steps:",
-            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    if: ${{ false }}\n\n    steps:",
+            "  rust-audit:\n",
+            "  rust-audit:\n    if: ${{ false }}\n",
             "must not have an if condition",
         )
 
@@ -97,8 +97,8 @@ class CargoAuditCiPolicyTests(unittest.TestCase):
 
     def test_rejects_quoted_condition_key(self) -> None:
         self.assert_mutation_rejected(
-            "  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n",
-            '  rust-audit:\n    name: Rust audit\n    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    "if": ${{ false }}\n',
+            "  rust-audit:\n",
+            '  rust-audit:\n    "if": ${{ false }}\n',
             "must not have an if condition",
         )
 

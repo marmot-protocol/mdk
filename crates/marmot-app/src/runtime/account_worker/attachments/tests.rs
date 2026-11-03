@@ -1151,7 +1151,8 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the watch-loop proof freeze time after real database setup.
+#[tokio::test(flavor = "current_thread")]
 async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_dir, _client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -1166,17 +1167,57 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
-    let (_updates, watch) = watch::channel(());
     store.close().unwrap();
+    // Only bound a stuck read: the completed observation, not elapsed time,
+    // proves an unavailable store did not become a cancellation.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&store, &job, None),
+    )
+    .await
+    .expect("cancellation observation must complete");
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            cancelled(store, job, watch, None)
-        )
-        .await
-        .is_err(),
+        !observed,
         "an unobservable store must not masquerade as a durable cancel"
     );
+
+    // A closed read fails before the explicit-request lookup, so each failed
+    // connection attempt comes from a fresh observation of this isolated store.
+    let (observations, mut reads) = mpsc::unbounded_channel();
+    store.set_timing_observer(Some(Arc::new(move |operation, _, success| {
+        if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait && !success {
+            let _ = observations.send(());
+        }
+    })));
+    let (wake, updates) = watch::channel(());
+    tokio::time::pause();
+    let frozen_at = tokio::time::Instant::now();
+    crate::media::tests::drive_with_manual_time(async {
+        let watcher = cancelled(store.clone(), job, updates, None);
+        tokio::pin!(watcher);
+        let reobserved = async {
+            reads
+                .recv()
+                .await
+                .expect("the watcher must attempt its first read");
+            wake.send(()).expect("the watcher must remain subscribed");
+            reads.recv().await.expect("a wake must recheck storage");
+        };
+        // The second real read proves a wake did not finish the watcher.
+        // Frozen time excludes the one-second recheck as an alternative cause.
+        tokio::select! {
+            biased;
+            _ = &mut watcher => panic!("a wake without durable cancellation must keep watching"),
+            _ = reobserved => {},
+        }
+    })
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now(),
+        frozen_at,
+        "the notification, not the periodic timer, must cause the second read"
+    );
+    store.set_timing_observer(None);
 }
 
 fn automatic_target() -> crate::AttachmentLocalTarget {
@@ -1405,7 +1446,8 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
 
 /// Explicit promotion detaches automatic permission while retaining the same
 /// transport lease; later deliberate cancellation still stops that attempt.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the watcher proof freeze time after real database setup.
+#[tokio::test(flavor = "current_thread")]
 async fn promoted_attempt_survives_automatic_revocation_without_extending_lease() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1483,30 +1525,64 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         .await
         .unwrap();
     assert!(!permission.allowed());
-    let (_, updates) = watch::channel(());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            cancelled(storage.clone(), job.clone(), updates, Some(permission))
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(
-        app.attachment_acquisition_status(&asset)
-            .unwrap()
-            .unwrap()
-            .due,
-        deadline
-    );
-    app.cancel_attachment_acquisition(&asset).unwrap();
-    let (_, updates) = watch::channel(());
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        cancelled(storage, job, updates, None),
+    // Await the actual read and classification; a timer cannot prove that
+    // the promoted attempt was observed after automatic permission revoked.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&storage, &job, Some(&permission)),
     )
     .await
-    .unwrap();
+    .expect("promoted attempt cancellation observation must complete");
+    assert!(
+        !observed,
+        "revoking automatic permission must not cancel an explicit attempt"
+    );
+
+    let (observations, mut reads) = mpsc::unbounded_channel();
+    storage.set_timing_observer(Some(Arc::new(move |operation, _, success| {
+        if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait && success {
+            let _ = observations.send(());
+        }
+    })));
+    let (wake, updates) = watch::channel(());
+    tokio::time::pause();
+    let frozen_at = tokio::time::Instant::now();
+    crate::media::tests::drive_with_manual_time(async {
+        // Keep the original revoked lease on this same watcher through the
+        // spurious notification, lease check, and final durable cancellation.
+        let watcher = cancelled(storage.clone(), job, updates, Some(permission));
+        tokio::pin!(watcher);
+        let reobserved = async {
+            // Each successful observation locks once for active state and once
+            // for explicit demand. A third lock must follow the watch wake.
+            reads.recv().await.expect("the watcher must read active state");
+            reads.recv().await.expect("the watcher must read explicit demand");
+            wake.send(()).expect("the promoted watcher must remain subscribed");
+            reads.recv().await.expect("a wake must recheck the promoted attempt");
+        };
+        tokio::select! {
+            biased;
+            _ = &mut watcher => panic!("revoked automatic permission must not end the promoted watcher"),
+            _ = reobserved => {},
+        }
+        storage.set_timing_observer(None);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            frozen_at,
+            "the watch wake, not the periodic timer, must cause the third read"
+        );
+        assert_eq!(
+            app.attachment_acquisition_status(&asset)
+                .unwrap()
+                .unwrap()
+                .due,
+            deadline
+        );
+        app.cancel_attachment_acquisition(&asset).unwrap();
+        wake.send(()).expect("durable cancellation must wake the same watcher");
+        watcher.await;
+    })
+    .await;
 }
 
 /// Keep the real incoming GET and verified local read independent of outgoing SQL failures.
