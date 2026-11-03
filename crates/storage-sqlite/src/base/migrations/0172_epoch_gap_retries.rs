@@ -7,7 +7,7 @@ use crate::SqliteResultExt;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
-        "CREATE TABLE account_recovery_epoch_gap_retries (
+        "CREATE TABLE IF NOT EXISTS account_recovery_epoch_gap_retries (
             obligation_id BLOB PRIMARY KEY NOT NULL
                 REFERENCES account_recovery_obligations(id) ON DELETE CASCADE,
             stalled_epoch INTEGER NOT NULL CHECK (stalled_epoch >= 0),
