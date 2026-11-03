@@ -84,6 +84,9 @@ use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
 
+// Original Welcome record ID and its current carrier ID.
+type SiblingWelcomeCarrierIds = (Vec<u8>, Vec<u8>);
+
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
 const REQUEST_INTERVAL_SECS: u64 = 60 * 60;
@@ -930,7 +933,7 @@ impl AppClient {
 
     fn retire_ended_sibling_welcome_resends(
         &mut self,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AppError> {
+    ) -> Result<Vec<SiblingWelcomeCarrierIds>, AppError> {
         // Retirement prepares/sends nothing and remains possible while DG
         // readiness holds new carriers. The engine durably terminalizes expiry
         // before we forget timing/high-water state.
