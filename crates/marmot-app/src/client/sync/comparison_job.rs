@@ -4133,9 +4133,36 @@ mod tests {
         );
     }
 
+    // These two comparison-only turn tests require the scripted startup's
+    // empty native prefix to have ended. Pending native input correctly holds
+    // comparison admission, regardless of how many comparison slots remain.
+    async fn wait_for_empty_native_frontier(fixture: &mut Fixture) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                fixture.client.synchronize_native_replay().await.unwrap();
+                match fixture
+                    .client
+                    .take_native_batch(Some(&fixture.group_id))
+                    .await
+                {
+                    super::super::native_ingress::NativeFrontier::Empty => break,
+                    super::super::native_ingress::NativeFrontier::Pending => {
+                        tokio::task::yield_now().await
+                    }
+                    super::super::native_ingress::NativeFrontier::Ready => {
+                        panic!("comparison-only fixture unexpectedly has native frames")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the scripted empty native prefix reaches EOSE");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_admission_runs_in_bounded_turns() {
         let mut fixture = fixture().await;
+        wait_for_empty_native_frontier(&mut fixture).await;
         let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
         let events = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
             .map(|_| candidate_for_route(group_route))
@@ -4175,6 +4202,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn already_held_events_do_not_spend_a_turns_admission_slots() {
         let mut fixture = fixture().await;
+        wait_for_empty_native_frontier(&mut fixture).await;
         let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
         let held = (0..MAX_COMPARISON_ADMISSION_PER_TURN)
             .map(|_| candidate_for_route(group_route))
