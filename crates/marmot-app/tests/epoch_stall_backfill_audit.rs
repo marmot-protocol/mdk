@@ -42,7 +42,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{AuditLogSettings, CursorPersistence, MarmotApp, MarmotAppConfig};
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -105,10 +105,77 @@ const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// of taking whichever one the feature resolution hands it.
 const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
+/// A relay with an advertised/enforced cap. Eight tied messages must not
+/// accidentally exercise the unrelated unknown-cap saturated-second fence.
+/// That fence's bounded expiry is covered by replay_fence's paused-clock tests.
+struct TestRelay {
+    _relay: LocalRelay,
+    proxy: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestRelay {
+    fn drop(&mut self) {
+        self.proxy.abort();
+    }
+}
+
+async fn mock_relay() -> (TestRelay, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    let relay = LocalRelay::new(RelayBuilder::default().max_filter_limit(500));
+    relay.run().await.unwrap();
+    let upstream = relay.url().await.to_string();
+    let upstream = upstream
+        .trim_start_matches("ws://")
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let proxy = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut client, _) = accepted.unwrap();
+                    let upstream = upstream.clone();
+                    connections.spawn(async move {
+                        let mut header = Vec::new();
+                        let read_header = async {
+                            while !header.windows(4).any(|w| w == b"\r\n\r\n") {
+                                let mut bytes = [0; 1024];
+                                let n = client.read(&mut bytes).await.ok()?;
+                                if n == 0 || header.len() + n > 8192 { return None; }
+                                header.extend_from_slice(&bytes[..n]);
+                            }
+                            Some(())
+                        };
+                        if timeout(Duration::from_secs(5), read_header).await != Ok(Some(())) { return; }
+                        let info = String::from_utf8_lossy(&header).lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)|
+                                name.eq_ignore_ascii_case("accept") && value.contains("application/nostr+json"))
+                        });
+                        if info {
+                            let body = r#"{"supported_nips":[],"limitation":{"max_limit":500}}"#;
+                            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let _ = client.write_all(reply.as_bytes()).await;
+                        } else if let Ok(mut server) = TcpStream::connect(&upstream).await
+                            && server.write_all(&header).await.is_ok()
+                        {
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                        }
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    (
+        TestRelay {
+            _relay: relay,
+            proxy,
+        },
+        url,
+    )
 }
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
@@ -240,7 +307,7 @@ fn ingested_message_ids(rows: &[serde_json::Value]) -> Vec<String> {
 /// their own store, plus the handles the tests drive them through.
 struct StalledGroup {
     /// Kept bound so the mock relay outlives the clients.
-    _relay: MockRelay,
+    _relay: TestRelay,
     app_bob: MarmotApp,
     bob: marmot_app::AppClient,
     /// Alice advances the group epoch so bob can stall again at a new one.
@@ -604,7 +671,7 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
         .await;
     }
     let mut frozen_rows = Vec::new();
-    timeout(NEXT_EVENT_DEADLINE, async {
+    let collected = timeout(NEXT_EVENT_DEADLINE, async {
         loop {
             frozen.sync().await.expect("frozen admission succeeds");
             frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
@@ -613,8 +680,23 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
             }
         }
     })
-    .await
-    .expect("the Frozen wake retains the whole burst within the existing deadline");
+    .await;
+    if collected.is_err() {
+        frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
+        let retained = ingested_message_ids(&frozen_rows).len();
+        let kept = dir_bob.keep();
+        std::fs::write(
+            kept.join("frozen-deadline-audit.json"),
+            serde_json::to_vec_pretty(&frozen_rows).unwrap(),
+        )
+        .unwrap();
+        drop(frozen);
+        drop(app_frozen);
+        panic!(
+            "the Frozen wake retains the whole burst within the existing deadline: retained={retained}, evidence={}",
+            kept.display()
+        );
+    }
     assert!(
         rows_of_kind(&frozen_rows, "epoch_stall_backfill_armed").is_empty(),
         "a Frozen wake tracks no stalls: {frozen_rows:?}"
