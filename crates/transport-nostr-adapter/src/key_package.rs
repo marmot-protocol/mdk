@@ -541,7 +541,8 @@ mod tests {
 
     #[test]
     fn key_package_publication_rejects_each_missing_required_field() {
-        let invalid: [(fn(&mut NostrKeyPackagePublication), &str); 8] = [
+        type InvalidatePublication = fn(&mut NostrKeyPackagePublication);
+        let invalid: [(InvalidatePublication, &str); 8] = [
             (
                 |p| p.account_id = MemberId::new(vec![0; 31]),
                 "account id must be a 32-byte Nostr pubkey",
