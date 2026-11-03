@@ -26,6 +26,18 @@ Never connect to real relays from these tests.
 
 ## Fixtures
 
+`support/storage_fixture.rs` opts runnable runtime and lifecycle fixtures into storage's existing test-process
+relaxation, then delegates to `tempfile::tempdir`. Those binaries route this module directly with `#[path]`. The Nostr
+harness opts in at the start of `NostrStackHarness::new`. Keep original keys, option arguments, private directories,
+encrypted files, independent handles and every open/drop/reopen and assertion. The opt-in skips allocator enablement
+and uses `synchronous=NORMAL`; it does not establish production `FULL` or power-loss guarantees.
+
+Keep the ignored `send_skips_slow_relay` body and its native `tempfile::tempdir` path unchanged. Required nextest runs
+isolate each test; a fresh process selecting only that diagnostic retains dependent storage defaults. A mixed run
+passing `--include-ignored` to the Rust test harness shares settings with relaxed cases and cannot guarantee those defaults.
+Do not use test-name sniffing, resets or startup hooks to conceal that limit. Production-setting and physical-crash
+proof owners keep their own default storage paths.
+
 `../fixtures/session-promotion-v1.bin` backs the promotion-facade regression; see
 [`../fixtures/README.md`](../fixtures/README.md) before regenerating or replacing it.
 
