@@ -3639,12 +3639,11 @@ impl AppClient {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
                         Ok(result) => return result,
-                        // Settled, not complete: a relay that refused a REQ for
-                        // good will never report EOSE, so waiting longer brings
-                        // nothing. Ending the drain early ends it exactly as a
-                        // timeout would, checkpoint included; live promotion
-                        // and activation reuse still require EOSE.
-                        Err(_) if self.adapter.account_subscription_eose().await.settled() => {
+                        // Current input, not complete-query coverage: a full
+                        // delegated reply has ended too. Refused REQs bring no
+                        // further input. Ending the wait changes no checkpoint
+                        // or cursor-qualification guard.
+                        Err(_) if self.adapter.account_subscription_input().await.settled => {
                             return Ok(None);
                         }
                         Err(_) => {}

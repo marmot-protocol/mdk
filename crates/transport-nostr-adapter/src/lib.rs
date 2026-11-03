@@ -622,6 +622,20 @@ pub struct NostrRelayEvent {
     pub event: NostrTransportEvent,
 }
 
+/// Readiness of the current replies, including clamped input delegated to the
+/// recovery owner. These facts never certify the complete original query.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountSubscriptionInput {
+    /// Every issued endpoint's current reply ended and passed native placement.
+    pub complete: bool,
+    /// Every endpoint answered or was refused; waiting brings no more input.
+    pub settled: bool,
+    /// At least one current reply ended and passed native placement.
+    pub any: bool,
+}
+
 /// End-of-stored-events progress across one account's live inbox and batch REQs,
 /// from [`NostrTransportAdapter::account_subscription_eose`].
 ///
@@ -1630,6 +1644,19 @@ impl NostrTransportAdapter {
             .read()
             .await
             .account_subscription_eose(account_id)
+    }
+
+    /// Current-reply readiness, separately from complete-query coverage. This
+    /// read neither consumes loss nor grants cursor or history certificates.
+    #[doc(hidden)]
+    pub async fn account_subscription_input(
+        &self,
+        account_id: &MemberId,
+    ) -> AccountSubscriptionInput {
+        self.state
+            .read()
+            .await
+            .account_subscription_input(account_id)
     }
 
     /// Drain replay loss into the caller's cursor/recovery fence. Import a
@@ -5631,6 +5658,19 @@ impl AccountReplayCoverage {
     }
 
     fn snapshot(&self) -> AccountSubscriptionEose {
+        self.snapshot_with(|replay| replay == RelayReplay::Eose)
+    }
+
+    fn input_snapshot(&self) -> AccountSubscriptionInput {
+        let progress = self.snapshot_with(RelayReplay::input_ended);
+        AccountSubscriptionInput {
+            complete: progress.complete(),
+            settled: progress.settled(),
+            any: progress.any(),
+        }
+    }
+
+    fn snapshot_with(&self, ended: impl Fn(RelayReplay) -> bool) -> AccountSubscriptionEose {
         let mut progress = AccountSubscriptionEose {
             subscriptions: self.subscriptions.len() - self.maintenance.len(),
             ..AccountSubscriptionEose::default()
@@ -5642,7 +5682,7 @@ impl AccountReplayCoverage {
             let eose = relays
                 .iter()
                 .filter(|(relay, replay)| {
-                    **replay == RelayReplay::Eose && self.request_admitted(id, Some(**relay))
+                    ended(**replay) && self.request_admitted(id, Some(**relay))
                 })
                 .count();
             let refused = relays
@@ -7006,6 +7046,13 @@ impl AdapterState {
             .unwrap_or_default()
     }
 
+    fn account_subscription_input(&self, account_id: &MemberId) -> AccountSubscriptionInput {
+        self.account_replay_coverage
+            .get(account_id)
+            .map(AccountReplayCoverage::input_snapshot)
+            .unwrap_or_default()
+    }
+
     fn record_subscription_first_event(
         &mut self,
         subscription_id: &str,
@@ -7832,6 +7879,11 @@ mod batch_tests {
                     .observe_relay_event(&id, &endpoint, Some(&token.request), 100 + index)
                     .await;
             }
+            let input = adapter.account_subscription_input(&account).await;
+            assert!(
+                !input.complete && !input.settled && !input.any,
+                "a full count without physical EOSE is still waiting"
+            );
             adapter
                 .handle_relay_eose(endpoint, token.request.to_string())
                 .await;
@@ -7852,6 +7904,11 @@ mod batch_tests {
                     .relay_subscription_attempts_with_eose,
                 0,
                 "a full reply never certifies the whole query",
+            );
+            let input = adapter.account_subscription_input(&account).await;
+            assert!(
+                input.complete && input.settled && input.any,
+                "current input ended even though the original query remains unproved"
             );
             let credit = Arc::new(
                 Arc::new(tokio::sync::Semaphore::new(1))

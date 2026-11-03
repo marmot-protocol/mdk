@@ -335,7 +335,7 @@ impl AppClient {
 
     /// Whether this device can fetch its groups' messages now: a relay is
     /// connected, and this client's catch-up has run. That is every endpoint
-    /// of its live subscriptions serving its stored history, or, once the
+    /// of its live subscriptions finishing its current reply, or, once the
     /// catch-up timeout has passed since the client opened, any subscription
     /// served by one: a subscription whose relays never answer cannot hold
     /// back every announce in the account.
@@ -344,9 +344,9 @@ impl AppClient {
         if let Some(can_fetch) = self.test_push_device_can_fetch {
             return can_fetch;
         }
-        let eose = self.adapter.account_subscription_eose().await;
-        let caught_up = eose.complete()
-            || (eose.with_eose > 0
+        let input = self.adapter.account_subscription_input().await;
+        let caught_up = input.complete
+            || (input.any
                 && notifications::unix_now_ms().saturating_sub(self.push_fetch_clock.opened_at_ms)
                     >= millis(self.push_announce_timing.catch_up_timeout));
         caught_up && self.relay_plane.relay_health().await.connected > 0

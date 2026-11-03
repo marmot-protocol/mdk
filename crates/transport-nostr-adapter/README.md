@@ -114,6 +114,12 @@ Account, endpoint-safety, and envelope validation stay outside this accounting b
 
 ## Ordered subscription replay
 
+For accounts delegated to the recovery runner, `account_subscription_input` reports whether the current replies
+ended and passed native placement. A full reply can settle a wait or let an unchanged activation reuse its REQs
+while older history remains owed. `account_subscription_eose` keeps the complete-original-query meaning: a
+clamped delegated reply never certifies history or authorizes a cursor. Loss, placement and cursor guards remain
+independent of input readiness.
+
 Initial activation, group-subscription sync, and recovery maintenance stage group deliveries through stored
 replay and any backward pages, then release each group's batch in `(created_at, event id)` order. Live
 arrivals during release queue behind that batch. Each REQ/relay/route owns its historical claims and admission

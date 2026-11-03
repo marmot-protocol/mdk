@@ -217,8 +217,12 @@ for reconnect/backoff and relay status mechanics.
   the SDK registry when the queued notification is handled, since a later re-send may have changed it. An unknown
   authenticator keeps `auth-required:` pending. The forwarder test pins the table against the SDK registry. Treat a
   staged group-sync REQ as live. A dropped refusal before EOSE settles that relay's replay coverage but never
-  completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may gate live cursor promotion or
-  activation reuse. Ending a drain early on `settled` must leave its checkpoint exactly as the drain's timeout would. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
+  completes it. Keep original-query `AccountSubscriptionEose` separate from `AccountSubscriptionInput`: delegated
+  full replies end current input, so activation reuse, announce readiness and drain waits use the latter. Neither its `complete`
+  nor `settled` qualifies history or promotes a cursor. Native placement and the plane's loss barrier still guard
+  readiness; cursor qualification keeps its independent guarded seal. Repack floor selection still requires
+  original-query completion: current-input readiness must not discard an unresolved original floor. Ending a drain early on settled input must
+  leave its checkpoint exactly as the drain's timeout would. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep the time-sliced sweep (`src/sweep/`) a mechanism: it covers what one call can of one (route, relay, range)

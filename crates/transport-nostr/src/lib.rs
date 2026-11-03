@@ -26,12 +26,12 @@ use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at};
 use transport_nostr_adapter::{
-    AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
-    NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossBounds,
-    NostrNotificationLossFloor, NostrPublishOutcome, NostrReconciliationItem,
-    NostrReconciliationSummary, NostrRelayClient, NostrSdkNotification, NostrSdkRelayClient,
-    NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter, RelayExportConsent,
-    RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
+    AccountSubscriptionEose, AccountSubscriptionInput, NostrAcquisitionCancellation,
+    NostrAcquisitionError, NostrAcquisitionRequest, NostrAcquisitionResult,
+    NostrNotificationLossBounds, NostrNotificationLossFloor, NostrPublishOutcome,
+    NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient, NostrSdkNotification,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
+    RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
 pub use transport_nostr_adapter::{
@@ -3692,6 +3692,25 @@ impl MarmotRelayPlaneAccountAdapter {
         eose
     }
 
+    /// Current replies may finish even when the recovery owner still owes the
+    /// original query's history. Use only for waits and subscription lifecycle;
+    /// cursor and coverage qualification retain their independent guards.
+    #[doc(hidden)]
+    pub async fn account_subscription_input(&self) -> AccountSubscriptionInput {
+        let mut input = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_input(&self.account_id)
+            .await;
+        if self.delivery_overflow.blocks_ordinary_eose() {
+            input.complete = false;
+            input.any = false;
+        }
+        input
+    }
+
     #[doc(hidden)]
     pub async fn receive_account_delivery(
         &self,
@@ -4170,7 +4189,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         let mut previous = self.incremental_activation.lock().await;
         let reuse = incremental.is_some()
             && *previous == incremental
-            && self.account_subscription_eose().await.complete();
+            && self.account_subscription_input().await.complete;
         // Cancellation or failure must force the next call through activation's
         // unconditional orphan-REQ cleanup. None always requests full history.
         *previous = None;
