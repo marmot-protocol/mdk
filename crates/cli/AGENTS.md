@@ -61,10 +61,15 @@ behavior and JSON fields are documented in the README; the rules below are the o
 - Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `stream`, `debug`,
   `usage-diagnostics`, `tui`.
 - `devices` exists only with `dev-device-groups`: list and start/status/confirm-match/approve/cancel use the
-  existing daemon-owned runtime. Never create one-shot pairing state or add a CLI pairing store. Both user confirmations
-  remain separate. Core owns authentication, roster state and validation; commands only render it.
+  existing daemon-owned runtime and refuse local execution. Do not add a CLI pairing store. Other dev account commands
+  retain one-shot worker behavior; the documented dev-testing limit requires a persistent matching daemon and explicit
+  `--socket`/`WN_SOCKET` selection to prevent fallback. A one-shot worker can answer a pending request and lose its
+  unconfirmed session on exit. Both user confirmations remain separate. Core owns authentication, roster state and
+  validation; commands only render it. Existing-device Not now is not exposed; cancel is requester-only.
   The real daemon/CLI owner in `tests/cli.rs` is selected in CI with `dev-device-groups` and no policy overrides;
-  local two-process coverage is not D66 VM/device acceptance.
+  local two-process coverage is not D66 VM/device acceptance. That owner covers default/opt-out settings and
+  actual plain list/comparison output. The private formatter unit in `commands/devices.rs` owns untrusted
+  AddedElsewhere labels and actionable CannotLink details without a three-device fixture.
 
 ## Daemon Guidance
 

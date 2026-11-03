@@ -220,3 +220,67 @@ fn append_details(lines: &mut Vec<String>, state: &Value) {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_app::DeviceLinkPrompt;
+
+    /// CLI display marshals real typed prompt states, retaining actionable
+    /// capability details while treating sibling-provided labels as untrusted.
+    #[test]
+    fn plain_prompt_details_keep_capability_names_and_sanitize_device_labels() {
+        let device_label = "Tablet\x1b[2J\u{202e}\nrow";
+        let added_by_label = "Phone\x1b]0;title\x07";
+        let json = snapshot_json(DeviceLinkSnapshot {
+            new_device: None,
+            prompts: vec![
+                DeviceLinkPrompt {
+                    prompt_id: "01".repeat(16),
+                    slot_id_hex: None,
+                    requested_at: 1,
+                    state: DeviceLinkPromptState::AddedElsewhere {
+                        device_label: device_label.to_owned(),
+                        added_by_label: added_by_label.to_owned(),
+                    },
+                },
+                DeviceLinkPrompt {
+                    prompt_id: "02".repeat(16),
+                    slot_id_hex: None,
+                    requested_at: 1,
+                    state: DeviceLinkPromptState::CannotLink {
+                        // Exact names produced by the core missing-capability reader.
+                        missing: vec![
+                            "app_component:0x800e".to_owned(),
+                            "app_component:0x8004".to_owned(),
+                        ],
+                    },
+                },
+            ],
+        });
+        assert!(
+            json["prompts"][0]["device_label"] == device_label,
+            "JSON should preserve the device label"
+        );
+        assert!(
+            json["prompts"][0]["added_by_label"] == added_by_label,
+            "JSON should preserve the approver label"
+        );
+        let plain = snapshot_plain(&json);
+        assert_eq!(
+            plain.lines().count(),
+            4,
+            "one header/detail pair per prompt"
+        );
+        assert!(plain.contains("Tablet[2Jrow was added by Phone]0;title"));
+        assert!(
+            !plain
+                .chars()
+                .any(|ch| matches!(ch, '\x1b' | '\x07' | '\u{202e}')),
+            "untrusted label controls must not reach the terminal"
+        );
+        assert!(plain.contains(": added_elsewhere"));
+        assert!(plain.contains(": cannot_link"));
+        assert!(plain.contains("missing: app_component:0x800e, app_component:0x8004"));
+    }
+}

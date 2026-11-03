@@ -625,8 +625,12 @@ and should not need it.
 Build matching `wn` and `wnd` with the explicit default-off capability:
 
 ```sh
+export RUST_MIN_STACK=4194304
 cargo build -p wn-cli --bins --features dev-device-groups --locked
 ```
+
+The export retains the repository's existing [debug-binary stack requirement](../../README.md#development)
+when running `wn`/`wnd` directly; it is not a timing override.
 
 This enables device groups in that dev CLI/daemon and keeps production settlement/retry timing. It does **not**
 enable `test-policy-overrides`; leave `WN_DEV_SETTLEMENT_QUIESCENCE_MS` and other policy-test overrides unset.
@@ -635,7 +639,7 @@ Ordinary release builds do not expose `devices` or enable the capability. App-bi
 Use a dedicated account and home for dogfooding. Sign in to that same account on both devices using the existing
 `login --nsec-stdin` flow; never put an nsec in argv. Run a persistent daemon on each device with its selected home,
 secret store, discovery relays and account relays, using the matching dev `wn`/`wnd` binaries. For example, with
-`WN_HOME` and the intended real relay lists configured:
+`WN_HOME` and `WN_SOCKET` exported and the intended real relay lists configured:
 
 ```sh
 wn daemon start --discovery-relays "$DISCOVERY_RELAYS" --default-account-relays "$ACCOUNT_RELAYS"
@@ -664,11 +668,21 @@ their own distinct slots. `devices link cancel` cancels on the new device. Appro
 adding to existing chats and bringing history; `--no-add-to-all-chats` and `--no-bring-history` opt out individually.
 No command creates or authenticates a device by its account key alone.
 
-Every `devices` command requires the daemon; there is no one-shot linking runtime. Without an auto-discovered daemon,
-the JSON error is `daemon_required` with a startup hint. An explicitly selected unavailable socket retains the existing
-`daemon_unavailable` diagnostic. Comparison sessions and prompt ids are in memory: a daemon/worker restart
-loses them. Restart an unconfirmed exchange; already committed links and owed Welcomes retain their existing durable
+For this dev-testing build, run **all account commands through a persistent matching daemon**. Select it explicitly
+with `--socket` or exported `WN_SOCKET`, so connection failure is reported instead of falling back to local execution.
+The `devices` commands themselves refuse local execution: without an auto-discovered daemon, their JSON error is
+`daemon_required` with a startup hint; an explicitly selected unavailable socket reports `daemon_unavailable`.
+
+Other existing dev account commands can still start one-shot live workers. Such a worker can answer a pending link,
+then exit and lose the unconfirmed comparison session. Comparison sessions and prompt ids are also lost on a
+daemon/worker restart. If an unconfirmed exchange is interrupted, start both daemons, cancel on the new device and
+start a fresh link with a fresh comparison. Already committed links and owed Welcomes retain their existing durable
 behavior, so inspect `devices list` before retrying. Restarting does not roll back an approved link.
+
+This dogfood CLI does not expose the existing-device **Not now** action. Do not approve an unwanted request or
+mismatching codes; cancel from the requesting/new device or let the exchange expire. `devices link cancel` applies
+only to the requesting/new device; it does not dismiss an existing-device prompt.
+
 `--json` returns the existing state without terminal escaping: `devices list` has `devices[]` with public slot,
 label/status, own-device flag and settings; `link` responses have nullable `new_device` and `prompts[]` with flat
 `state` strings. Comparing states include `code[]` objects with `emoji`/`description`; prompts include their opaque
@@ -676,8 +690,8 @@ label/status, own-device flag and settings; `link` responses have nullable `new_
 
 Local CLI regression tests are not the D66 two-device/VM-and-real-relay acceptance test. Use fresh dedicated test
 identities for that separate exercise; VM/device provisioning is manual, not a CLI function. `logout` currently discards
-the local account; it is not the shared-runtime sibling sign-out/wipe protocol and must not be used as evidence that other devices removed it. No new storage
-migration or background scheduler is introduced by these commands.
+the local account; it is not the shared-runtime sibling sign-out/wipe protocol and must not be used as evidence that
+other devices removed it. No new storage migration or background scheduler is introduced by these commands.
 
 ## Daemon
 
