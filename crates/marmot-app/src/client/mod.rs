@@ -76,6 +76,7 @@ mod chat_history;
 pub use chat_history::DevSealedHistoryBundle;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use chat_history::newest_bundles_start;
+pub(crate) mod backup_restore;
 pub(crate) mod backup_writer;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;
@@ -877,6 +878,7 @@ pub struct AppClient {
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
+    pub(crate) backup_restore: backup_restore::BackupRestore,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -1085,6 +1087,7 @@ pub struct AppClient {
     /// settles. A carrier the engine holds that is not here was in flight
     /// when the app last stopped, so its Welcome is owed again.
     pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
+    pub(crate) sibling_welcome_retirement_cursor: Option<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1603,10 +1606,10 @@ impl AppClient {
         self.drive_sign_ins().await;
         self.drive_small_state().await;
         self.drive_invitation_decisions().await;
-        self.drive_history_deliveries().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
+        self.drive_history_deliveries().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;

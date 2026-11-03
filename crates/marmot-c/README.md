@@ -486,6 +486,11 @@ it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` block
 device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
 [shared contract](../marmot-uniffi/README.md#linked-devices).
 
+`marmot_update_linked_device_settings` blocks on the account worker and patches any linked device's settings.
+Each `has_<setting>`/`<setting>` pair uses `uint8_t`: zero presence leaves the setting unchanged; nonzero presence
+supplies a value, with zero false and nonzero true. No structs or returned allocations are involved. Re-read the
+list on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`; see the [shared settings and recovery contract](../marmot-uniffi/README.md#linked-devices).
+
 `marmot_chat_history_imports` blocks on the account worker and writes an owned `MarmotChatHistoryImportList`; free it
 with `marmot_chat_history_import_list_free`. Each entry's tagged `state` is `Receiving` or `Imported`. Imported
 `MarmotTimelineMessageRecord`s name their source in the nullable `imported_from`. Re-read on

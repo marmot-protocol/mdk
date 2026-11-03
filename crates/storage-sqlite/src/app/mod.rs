@@ -7,6 +7,7 @@ pub(crate) mod attachment_history;
 pub(crate) mod avatar_cache;
 pub(crate) mod backup_ledger;
 pub(crate) mod backup_recovery_key;
+pub(crate) mod backup_restore;
 pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;
 pub(crate) mod compromise_warning;
@@ -36,3 +37,5 @@ pub(crate) mod stickers;
 pub(crate) mod storage_compaction;
 pub(crate) mod timeline;
 pub(crate) mod transport;
+
+pub(crate) mod sibling_welcome_resends;

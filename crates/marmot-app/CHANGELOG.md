@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+- Add experimental on-demand history-only backup restore for chats this device currently belongs to, with bounded
+  downloads, ephemeral recovery words, explicit cancellation, partial results, later-join availability hints and
+  typed core backup provenance. Archived preferences and automatic membership recovery remain outside this flow.
+
 ### Breaking changes
+
+- The shared runtime roster-write path rejects label/settings changes without a fresh `rename_id` and rejects
+  marker-only non-user changes before staging. It preserves caller-supplied ids for write-ahead recovery;
+  custom lower-level settings writers from the earlier draft must update first (mdk#2628 D86).
 
 - Uploaded media references carry local `source_epoch_identity` provenance.
   Preserve it through host storage and reference round trips. Media and custom
@@ -104,6 +112,18 @@
 
 ### Added
 
+- Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
+- A published sibling Welcome lost before joining is repaired after the
+  target's first newly observed authenticated device-group message and a
+  fixed ten-minute wait (mdk#2628 D70/D89–91). Repair reuses its exact Welcome
+  and private KeyPackage, creates no Add or history offer, and stops on
+  matching device participation, expiry or terminal origin. Each successful
+  generation needs fresh activity; legacy unknown timing stays held. Only
+  behind `dev_device_groups`.
+
 - Experimental device groups synchronize invitation decisions for one validated admission generation and its
   inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline
   wins; no automatic join/rejoin or cancellation of an already-requested Leave. Existing host APIs and release
@@ -122,7 +142,7 @@
   Gap filling requires the sibling's
   "add to all my chats" setting and shares the existing per-pass Add cap.
   Missed invitations with that setting off await a re-invite. Automatic
-  duplicate cleanup and delivered-Welcome resend remain deferred. Only
+  duplicate cleanup remains deferred. Only
   behind `dev_device_groups`.
 
 - Custom emoji reaction artwork is available through the bounded local

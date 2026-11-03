@@ -118,6 +118,168 @@ async fn any_device_renames_any_device() {
     assert!(cleared.is_some() && cleared != phone_rename);
 }
 
+/// Optional settings are resolved from the current roster, on either device,
+/// rather than a stale host snapshot. Unrelated entry fields stay byte-for-byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_patch_preserves_omitted_and_unrelated_fields() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let slot = own_slot(&laptop);
+    let slot_bytes = <[u8; 32]>::try_from(hex::decode(&slot).unwrap()).unwrap();
+    let start = published_count(&relay);
+    let mut cursors = (start, start);
+    let before = phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot_bytes].clone();
+    phone
+        .update_linked_device_settings(&slot, Some(false), Some(false), Some(true))
+        .await
+        .unwrap();
+    let after = phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot_bytes].clone();
+    let mut expected = before;
+    expected.settings = DeviceSettingsV1 {
+        add_to_all_chats: false,
+        bring_history: false,
+        keep_while_inactive: true,
+    };
+    expected.rename_id = after.rename_id;
+    assert_eq!(after, expected);
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+
+    // Self edits use the same command. Omitted flags preserve another device's edit.
+    laptop
+        .update_linked_device_settings(&slot, None, Some(true), None)
+        .await
+        .unwrap();
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    let latest = &phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot_bytes];
+    assert_eq!(
+        latest.settings,
+        DeviceSettingsV1 {
+            add_to_all_chats: false,
+            bring_history: true,
+            keep_while_inactive: true
+        }
+    );
+    let kept = renames(&laptop);
+    let sent = published_count(&relay);
+    laptop
+        .update_linked_device_settings(&slot, None, Some(true), None)
+        .await
+        .unwrap();
+    laptop
+        .update_linked_device_settings(&slot, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        published_count(&relay),
+        sent,
+        "an unchanged patch sends nothing"
+    );
+    assert_eq!(
+        renames(&laptop),
+        kept,
+        "an applied edit remains recoverable"
+    );
+}
+
+/// A command first uses D37 to recover an unrelated lost edit, then resolves
+/// its patch on that result. A no-op rename cannot erase lost settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_edit_recovers_the_previous_lost_user_edit_first() {
+    for previous_is_rename in [true, false] {
+        let (
+            Devices {
+                _dirs,
+                relay,
+                mut phone,
+                mut laptop,
+                ..
+            },
+            group,
+        ) = linked_devices().await;
+        let slot = own_slot(&laptop);
+        let slot_bytes = <[u8; 32]>::try_from(hex::decode(&slot).unwrap()).unwrap();
+        let start = published_count(&relay);
+        let mut cursors = (start, start);
+        if previous_is_rename {
+            phone.rename_linked_device(&slot, "Laptop").await.unwrap();
+        } else {
+            phone
+                .update_linked_device_settings(&slot, None, Some(true), None)
+                .await
+                .unwrap();
+        }
+        edit_own_entry(&mut laptop, &group, &["a", "b"]).await;
+        exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+        let lost = phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot_bytes].clone();
+        assert_eq!(lost.label, "");
+        assert!(!lost.settings.bring_history);
+        if previous_is_rename {
+            phone
+                .update_linked_device_settings(&slot, None, Some(true), None)
+                .await
+                .unwrap();
+        } else {
+            // The requested label is already shown, but its no-op cannot
+            // discard the pending opposite history setting.
+            phone.rename_linked_device(&slot, "").await.unwrap();
+        }
+        exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+        for device in [&mut phone, &mut laptop] {
+            let entry = &device.trusted_device_roster().unwrap().unwrap().1.devices[&slot_bytes];
+            assert_eq!(entry.label, if previous_is_rename { "Laptop" } else { "" });
+            assert!(entry.settings.bring_history);
+            assert_eq!(entry.platform, "b", "the winning non-user update stays");
+        }
+    }
+}
+
+/// A fork can restore an earlier own id whose values already match the
+/// latest intention. That retained Lost record is settled, not permanently busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_edit_already_matching_the_roster_allows_the_next_edit() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let slot = own_slot(&laptop);
+    let start = published_count(&relay);
+    let mut cursors = (start, start);
+    phone.rename_linked_device(&slot, "Laptop").await.unwrap();
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    let earlier = rename_id_of(&mut phone, &slot);
+    for label in ["Work", "Laptop"] {
+        phone.rename_linked_device(&slot, label).await.unwrap();
+    }
+    edit_own_entry(&mut laptop, &group, &["a", "b", "c"]).await;
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    assert_eq!(rename_id_of(&mut phone, &slot), earlier);
+    assert_eq!(label_of(&mut phone, &slot), "Laptop");
+    assert!(!renames(&phone)[0].written.contains(&earlier.unwrap()));
+    phone
+        .update_linked_device_settings(&slot, None, Some(true), None)
+        .await
+        .unwrap();
+    let slot: [u8; 32] = hex::decode(slot).unwrap().try_into().unwrap();
+    let entry = &phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot];
+    assert_eq!(entry.label, "Laptop");
+    assert!(entry.settings.bring_history);
+    assert_eq!(entry.platform, "c");
+}
+
 /// A rename is refused, and nothing is sent, for a label over 64 bytes and
 /// for a slot the roster doesn't list. A rename whose publish is rejected is
 /// refused too, and the roster keeps the label it had.
@@ -267,6 +429,16 @@ async fn a_rename_while_a_commit_is_in_flight_is_refused() {
         ),
         "device_group_busy"
     );
+    assert_eq!(
+        refusal(
+            phone
+                .update_linked_device_settings(&laptop_slot, Some(true), None, None)
+                .await
+                .unwrap_err()
+        ),
+        "device_group_busy"
+    );
+    assert!(renames(&phone).is_empty());
     assert_eq!(published_count(&relay), before);
     assert_eq!(label_of(&mut phone, &laptop_slot), "");
 }
@@ -354,6 +526,43 @@ async fn another_rename_of_the_same_device_stands() {
         assert_eq!(label_of(device, &laptop_slot), winner);
         assert!(renames(device).iter().all(|rename| rename.label == winner));
     }
+}
+
+/// A settings edit advances the same provenance as a rename. A competing
+/// settings winner therefore prevents a lost rename from overwriting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_winning_settings_edit_retires_a_lost_rename() {
+    let (
+        Devices {
+            _dirs,
+            relay,
+            mut phone,
+            mut laptop,
+            ..
+        },
+        group,
+    ) = linked_devices().await;
+    let slot = own_slot(&laptop);
+    let start = published_count(&relay);
+    let mut cursors = (start, start);
+    phone.rename_linked_device(&slot, "Laptop").await.unwrap();
+    laptop
+        .update_linked_device_settings(&slot, None, None, Some(true))
+        .await
+        .unwrap();
+    edit_own_entry(&mut laptop, &group, &["winner"]).await;
+    exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
+    let sent = published_count(&relay);
+    phone.try_device_rename_upkeep().await.unwrap();
+    assert_eq!(published_count(&relay), sent);
+    assert!(renames(&phone).is_empty());
+    assert_eq!(label_of(&mut phone, &slot), "");
+    let slot: [u8; 32] = hex::decode(slot).unwrap().try_into().unwrap();
+    assert!(
+        phone.trusted_device_roster().unwrap().unwrap().1.devices[&slot]
+            .settings
+            .keep_while_inactive
+    );
 }
 
 /// `device` changes its own roster entry once per platform, each its own
@@ -636,7 +845,11 @@ async fn a_lost_rename_is_made_again_after_a_restart() {
         .rename_linked_device(&laptop_slot, "Laptop")
         .await
         .unwrap();
-    edit_own_entry(&mut laptop, &group, &["a", "b"]).await;
+    phone
+        .update_linked_device_settings(&laptop_slot, None, Some(false), Some(true))
+        .await
+        .unwrap();
+    edit_own_entry(&mut laptop, &group, &["a", "b", "c"]).await;
     exchange(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
     assert_eq!(
         label_of(&mut phone, &laptop_slot),
@@ -652,6 +865,10 @@ async fn a_lost_rename_is_made_again_after_a_restart() {
     settle_renames(&mut phone, &mut laptop, &relay, &group, &mut cursors).await;
     for device in [&mut phone, &mut laptop] {
         assert_eq!(label_of(device, &laptop_slot), "Laptop");
+        let slot = <[u8; 32]>::try_from(hex::decode(&laptop_slot).unwrap()).unwrap();
+        let settings = device.trusted_device_roster().unwrap().unwrap().1.devices[&slot].settings;
+        assert!(!settings.bring_history);
+        assert!(settings.keep_while_inactive);
     }
 }
 
@@ -740,6 +957,19 @@ async fn the_runtime_renames_a_device_and_announces_it() {
         .find(|device| device.slot_id_hex == laptop_slot)
         .unwrap();
     assert_eq!(laptop.label, "Laptop");
+    runtime
+        .update_linked_device_settings("alice", laptop_slot.clone(), None, Some(false), Some(true))
+        .await
+        .unwrap();
+    next_linked_devices_changed(&mut events, &account_id_hex).await;
+    let devices = runtime.linked_devices("alice").await.unwrap();
+    let laptop = devices
+        .iter()
+        .find(|device| device.slot_id_hex == laptop_slot)
+        .unwrap();
+    assert_eq!(laptop.label, "Laptop");
+    assert!(!laptop.bring_history);
+    assert!(laptop.keep_while_inactive);
     runtime.shutdown().await;
 }
 

@@ -79,6 +79,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         deleted_by_message_id_hex: None,
         invalidation_status: None,
         imported_from: None,
+        history_import_provenance: None,
     }
 }
 fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {

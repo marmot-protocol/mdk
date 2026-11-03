@@ -313,6 +313,19 @@ async fn own_account_intents_refuse_what_is_not_same_account() {
     let mut m = members(true).await;
     let gid = m.gid.clone();
     let before = Untouched::of(&m.bob, &gid);
+    for (intent, reason) in [
+        (
+            add_own_devices(&gid, vec![]),
+            "adding own account devices requires at least one KeyPackage",
+        ),
+        (
+            remove_own_devices(&gid, vec![]),
+            "removing own account devices requires at least one device",
+        ),
+    ] {
+        assert_other_error(m.bob.engine.send(intent).await, reason);
+        assert_eq!(Untouched::of(&m.bob, &gid), before);
+    }
     let dave_kp = device(b"dave", true)
         .engine
         .fresh_key_package()

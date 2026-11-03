@@ -84,7 +84,7 @@ fn foreign(byte: u8, created_at: u64) -> ForeignSlotPublication {
 
 #[tokio::test]
 async fn a_foreign_slot_publication_is_replaced_by_a_newer_one() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp foreign slot publication").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -134,7 +134,7 @@ async fn a_foreign_slot_publication_is_replaced_by_a_newer_one() {
 
 #[tokio::test]
 async fn a_foreign_publication_too_far_ahead_is_deleted_by_id_and_never_blocks_refreshes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp foreign slot future").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -213,7 +213,7 @@ async fn a_foreign_publication_too_far_ahead_is_deleted_by_id_and_never_blocks_r
 
 #[tokio::test]
 async fn a_foreign_publication_this_device_can_no_longer_outrank_is_dropped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp foreign slot clock back").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -247,7 +247,7 @@ async fn a_foreign_publication_this_device_can_no_longer_outrank_is_dropped() {
 
 #[tokio::test]
 async fn paused_or_withdrawn_slots_ignore_foreign_publications() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp foreign slot paused").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));
@@ -282,7 +282,7 @@ async fn paused_or_withdrawn_slots_ignore_foreign_publications() {
 
 #[tokio::test]
 async fn an_emptied_slot_is_refilled_at_most_once_a_day() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp emptied slot").unwrap();
     let now = unix_now();
     let wall = Arc::new(TestWallClock::new(now));

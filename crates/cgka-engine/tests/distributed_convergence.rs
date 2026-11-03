@@ -24,8 +24,8 @@ use cgka_traits::ingest::{DeferralLineage, IngestOutcome, PeeledContent, PeeledM
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, ConvergencePassStorage, GroupStorage, MessageStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
+    AccountDeviceSignerStorage, ConvergencePassStorage, ConvergencePolicyStorage, GroupStorage,
+    MessageStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -4257,7 +4257,10 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 2_000)
         .expect("late bob commit buffered");
 
-    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+    assert!(
+        committer_wins(&bob.self_id(), &alice.self_id()),
+        "fixed identities make Bob the winning committer"
+    );
 
     let result = carol
         .converge_stored_openmls_messages_at(&group_id, 3_000_000)
@@ -4272,22 +4275,12 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
         MessageState::Created,
         "late commit should be resolved once the retained anchor is available"
     );
-    if bob_wins {
-        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
-        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
-    } else {
-        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
-        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
-    }
+    assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+
     let members = carol.members(&group_id).unwrap();
-    assert_eq!(
-        members.iter().any(|member| member.id == eve.self_id()),
-        bob_wins
-    );
-    assert_eq!(
-        members.iter().any(|member| member.id == david.self_id()),
-        !bob_wins
-    );
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
 
 #[tokio::test]
@@ -4363,7 +4356,10 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
         .unwrap();
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
-    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+    assert!(
+        committer_wins(&bob.self_id(), &alice.self_id()),
+        "fixed identities make Bob the winning committer"
+    );
 
     let outcome = carol.ingest(bob_commit.clone()).await.unwrap();
     assert!(
@@ -4377,22 +4373,12 @@ async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
         .expect("late same-epoch commit ingested through the inline path converges");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    if bob_wins {
-        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
-        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
-    } else {
-        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
-        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
-    }
+    assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+
     let members = carol.members(&group_id).unwrap();
-    assert_eq!(
-        members.iter().any(|member| member.id == eve.self_id()),
-        bob_wins
-    );
-    assert_eq!(
-        members.iter().any(|member| member.id == david.self_id()),
-        !bob_wins
-    );
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
 
 #[tokio::test]
@@ -4487,7 +4473,10 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
 
-    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+    assert!(
+        committer_wins(&bob.self_id(), &alice.self_id()),
+        "fixed identities make Bob the winning committer"
+    );
 
     carol
         .buffer_openmls_convergence_message_at(&group_id, bob_commit.clone(), 3_100)
@@ -4502,38 +4491,29 @@ async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
         after_late_commit.settles, 2,
         "the second applied settle is counted"
     );
-    if bob_wins {
-        // The selection flipped to a different branch that forks below the
-        // previously-applied tip (epoch 2): a post-settle reorg.
-        assert_eq!(after_late_commit.post_settle_reorgs, 1);
-        assert_eq!(after_late_commit.observed_reorg_rate(), Some(0.5));
-        // Rewind depth = previous_applied_tip (2) - new_fork_epoch (1) = 1.
-        assert_eq!(after_late_commit.reorg_rewind_depth.sample_count(), 1);
-        let depth_one = after_late_commit
-            .reorg_rewind_depth
-            .buckets
-            .iter()
-            .find(|bucket| bucket.upper_bound == 1)
-            .expect("depth-1 bucket");
-        assert_eq!(depth_one.count, 1);
-        // Lateness = reorg time (4_500) - superseded settle time (3_000) =
-        // 1_500ms.
-        assert_eq!(after_late_commit.reorg_lateness_ms.sample_count(), 1);
-        let lateness = after_late_commit
-            .reorg_lateness_ms
-            .buckets
-            .iter()
-            .find(|bucket| bucket.upper_bound == 1_500)
-            .expect("1500ms bucket");
-        assert_eq!(lateness.count, 1);
-    } else {
-        // Alice's branch wins again: re-selecting the same branch is a settle
-        // but not a reorg.
-        assert_eq!(after_late_commit.post_settle_reorgs, 0);
-        assert_eq!(after_late_commit.observed_reorg_rate(), Some(0.0));
-        assert_eq!(after_late_commit.reorg_rewind_depth.sample_count(), 0);
-        assert_eq!(after_late_commit.reorg_lateness_ms.sample_count(), 0);
-    }
+    // The selection flipped to a different branch that forks below the
+    // previously-applied tip (epoch 2): a post-settle reorg.
+    assert_eq!(after_late_commit.post_settle_reorgs, 1);
+    assert_eq!(after_late_commit.observed_reorg_rate(), Some(0.5));
+    // Rewind depth = previous_applied_tip (2) - new_fork_epoch (1) = 1.
+    assert_eq!(after_late_commit.reorg_rewind_depth.sample_count(), 1);
+    let depth_one = after_late_commit
+        .reorg_rewind_depth
+        .buckets
+        .iter()
+        .find(|bucket| bucket.upper_bound == 1)
+        .expect("depth-1 bucket");
+    assert_eq!(depth_one.count, 1);
+    // Lateness = reorg time (4_500) - superseded settle time (3_000) =
+    // 1_500ms.
+    assert_eq!(after_late_commit.reorg_lateness_ms.sample_count(), 1);
+    let lateness = after_late_commit
+        .reorg_lateness_ms
+        .buckets
+        .iter()
+        .find(|bucket| bucket.upper_bound == 1_500)
+        .expect("1500ms bucket");
+    assert_eq!(lateness.count, 1);
 }
 
 #[tokio::test]
@@ -4614,7 +4594,10 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         .unwrap();
     let (bob_commit, _bob_pending) = evolution(bob_invite);
     let bob_commit = route(bob_commit, &group_id);
-    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+    assert!(
+        committer_wins(&bob.self_id(), &alice.self_id()),
+        "fixed identities make Bob the winning committer"
+    );
 
     let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
     carol
@@ -4633,39 +4616,20 @@ async fn rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor() {
         MessageState::Created,
         "late commit should be resolved after engine rebuild"
     );
-    if bob_wins {
-        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
-    } else {
-        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
-    }
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+
     let members = carol.members(&group_id).unwrap();
-    assert_eq!(
-        members.iter().any(|member| member.id == eve.self_id()),
-        bob_wins
-    );
-    assert_eq!(
-        members.iter().any(|member| member.id == david.self_id()),
-        !bob_wins
-    );
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
 
-/// U6 resolution (option-c plan): the historical-rewind route and the
-/// no-rewind route agree — a within-horizon losing commit is deferred as
-/// `ConvergenceDeferred` / `NonSelectedEligibleBranch` on BOTH, so a later
-/// pass can reconsider it. There is no third terminality asymmetry.
+/// A within-horizon losing commit stays `ConvergenceDeferred` with
+/// `NonSelectedEligibleBranch` on both historical-rewind and no-rewind routes,
+/// allowing reconsideration in a later pass.
 ///
-/// The three rewind tests above
-/// (`engine_replays_late_same_epoch_commit_from_retained_anchor`,
-/// `engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon`,
-/// `rebuilt_engine_replays_late_same_epoch_commit_from_retained_anchor`)
-/// *appear* to pin `EpochInvalidated` for the same shape, but their
-/// `bob_wins == false` arms are dead: `committer_wins(&bob, &alice)` is
-/// deterministically true for the label-derived identities, so the late
-/// commit always WINS there and the terminal expectation never executes
-/// (verified empirically by tracing every `EpochInvalidated` write site —
-/// none fires during those tests). This test exercises the mirrored,
-/// previously uncovered arm: the deterministic tiebreak WINNER is applied
-/// first, and the LOSER arrives late within the rewind horizon.
+/// The four fixed-identity rewind fixtures above exercise Bob's late winning
+/// commit. This test owns the mirrored direction on both routes: apply the
+/// winner first, then admit the loser within the rewind horizon.
 #[tokio::test]
 async fn rewind_and_no_rewind_routes_agree_on_losing_commit_disposition() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -4898,20 +4862,8 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
     assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
 
-    // Inbound ingest is halted too: a fresh inbound group message is retained
-    // (buffered), not applied, until a verified repair path.
-    let outcome = carol
-        .ingest(bob_commit.clone())
-        .await
-        .expect("ingest does not error on an unrecoverable group");
-    assert!(
-        matches!(
-            outcome,
-            IngestOutcome::Buffered { .. } | IngestOutcome::Stale { .. }
-        ),
-        "inbound must not be applied while Unrecoverable; got {outcome:?}"
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    // Fresh inbound halting is owned by
+    // `unrecoverable_halt_survives_engine_restart_until_verified_repair`.
 }
 
 #[tokio::test]
@@ -5104,8 +5056,25 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
             .any(|member| member.id == eve.self_id())
     );
 
+    // Bob's id is already durably admitted by the public buffer call, so its
+    // duplicate outcome cannot exercise inbound halting. Use genuinely fresh
+    // authenticated application data from the selected epoch instead.
+    let mut fresh = send_app(&mut alice, &group_id, b"fresh input while halted".to_vec()).await;
+    fresh.id = MessageId::new(Sha256::digest(b"fresh unrecoverable wrapper").to_vec());
+    let fresh_content_id = content_id(&fresh);
+    assert_ne!(fresh.id, fresh_content_id);
+    for id in [&fresh.id, &fresh_content_id] {
+        assert!(matches!(
+            carol_storage.get_message(id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ));
+        assert!(!carol_storage.has_processed_transport_id(id).unwrap());
+        assert!(!carol_storage.has_ingress_dedup_marker(id).unwrap());
+    }
+    let members_before = restarted.members(&group_id).unwrap();
+    restarted.drain_events();
     let outcome = restarted
-        .ingest(bob_commit.clone())
+        .ingest(fresh.clone())
         .await
         .expect("ingest does not error on a restarted unrecoverable group");
     assert!(
@@ -5116,6 +5085,29 @@ async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
         "inbound must stay halted after restart; got {outcome:?}"
     );
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(restarted.members(&group_id).unwrap(), members_before);
+    assert!(carol_storage.get_group(&group_id).unwrap().unrecoverable);
+    assert!(matches!(
+        restarted.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Unrecoverable(_))
+    ));
+    assert_eq!(
+        carol_storage.get_message(&fresh.id).unwrap().state,
+        MessageState::Retryable,
+        "fresh raw input stays retained without opening its MLS application"
+    );
+    assert!(matches!(
+        carol_storage.get_message(&fresh_content_id),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+    assert!(
+        !restarted
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::MessageReceived { .. })),
+        "halted fresh input must not produce an application delivery"
+    );
 
     let send_err = restarted
         .send(SendIntent::AppMessage {
@@ -7820,9 +7812,14 @@ async fn rebuilt_engine_parks_losing_branch_app_for_revival_after_convergence() 
 
 #[tokio::test]
 async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
-    let (mut alice, alice_storage) = build_client(b"alice");
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut alice =
+        build_client_with_storage_and_clock(b"alice", alice_storage.clone(), clock.clone());
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
+    let carol_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -7869,7 +7866,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         carol.drain_auto_publish().is_empty(),
         "carol should schedule before staging the SelfRemove-only commit"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(1_000);
     let advanced = carol.advance_convergence(&group_id).await.unwrap();
     assert!(advanced.is_empty());
     let mut carol_auto = carol.drain_auto_publish();
@@ -7890,7 +7887,7 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
         alice_outcome,
         cgka_traits::ingest::IngestOutcome::Processed
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(1_000);
     let advanced = alice.advance_convergence(&group_id).await.unwrap();
     assert!(advanced.is_empty());
     let auto_commit = alice
@@ -9031,9 +9028,15 @@ async fn malformed_convergence_input_does_not_reset_quiescence() {
 
     let mut malformed = commit.clone();
     malformed.payload = b"not an OpenMLS message".to_vec();
-    carol
+    let before = carol_storage.convergence_pass(&group_id).unwrap();
+    let error = carol
         .buffer_openmls_convergence_message_at(&group_id, malformed, 1_900)
         .expect_err("malformed input must fail before touching quiescence");
+    assert!(
+        matches!(error, OpenMlsProjectionError::Decode(_)),
+        "{error:?}"
+    );
+    assert_eq!(carol_storage.convergence_pass(&group_id).unwrap(), before);
 
     let result = carol
         .converge_stored_openmls_messages_at(&group_id, 2_000)
@@ -10564,10 +10567,31 @@ fn convergence_policy_rejects_witness_override_exceeding_rewind_horizon() {
     );
 }
 
-#[test]
-fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
-    let (mut alice, _storage) = build_client(b"alice");
-    let group_id = GroupId::new(vec![0u8; 32]);
+#[tokio::test]
+async fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
+    let (mut alice, storage) = build_client(b"alice");
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "policy".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice
+        .set_group_convergence_policy(&group_id, CanonicalizationPolicy::default())
+        .unwrap();
+    let before = storage
+        .convergence_policy(&group_id)
+        .unwrap()
+        .expect("valid policy persists");
     let bad_policy = CanonicalizationPolicy {
         convergence: ConvergencePolicy {
             max_rewind_commits: 5,
@@ -10576,29 +10600,78 @@ fn set_group_convergence_policy_rejects_witness_override_exceeding_rewind() {
         },
         ..CanonicalizationPolicy::default()
     };
-
+    let expected = ConvergencePolicyError::WitnessOverrideExceedsRewind {
+        max_witness_override_depth: 1000,
+        max_rewind_commits: 5,
+    }
+    .to_string();
     let err = alice
-        .set_group_convergence_policy(&group_id, bad_policy)
-        .expect_err("policy violating the witness-override bound must be rejected");
+        .set_group_convergence_policy(&group_id, bad_policy.clone())
+        .unwrap_err();
     assert!(
-        matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
-        "expected InvalidPolicy, got {err:?}"
+        matches!(err, OpenMlsProjectionError::InvalidPolicy(ref reason) if reason == &expected),
+        "{err:?}"
     );
+    assert_eq!(storage.convergence_policy(&group_id).unwrap(), Some(before));
+    // Retain the original unknown-group boundary as well as the real-group
+    // validation-before-write check above.
+    let unknown = GroupId::new(vec![0; 32]);
+    let unknown_error = alice
+        .set_group_convergence_policy(&unknown, bad_policy)
+        .unwrap_err();
+    assert!(
+        matches!(unknown_error, OpenMlsProjectionError::InvalidPolicy(ref reason) if reason == &expected),
+        "{unknown_error:?}"
+    );
+    assert!(storage.convergence_policy(&unknown).unwrap().is_none());
 }
 
-#[test]
-fn set_convergence_policy_rejects_app_window_mismatch() {
+#[tokio::test]
+async fn set_convergence_policy_rejects_app_window_mismatch() {
     let (mut alice, _storage) = build_client(b"alice");
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "default policy".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let before = alice
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap();
     let err = alice
         .set_convergence_policy(CanonicalizationPolicy {
             app_message_past_epoch_limit: 1,
             ..CanonicalizationPolicy::default()
         })
         .expect_err("app window must match engine max_past_epochs");
+    let expected = cgka_engine::canonicalization::CanonicalizationPolicyError::AppWindowMismatch {
+        app_message_past_epoch_limit: 1,
+        max_past_epochs: 5,
+    }
+    .to_string();
     assert!(
-        matches!(err, OpenMlsProjectionError::InvalidPolicy(_)),
-        "expected InvalidPolicy, got {err:?}"
+        matches!(err, OpenMlsProjectionError::InvalidPolicy(ref reason) if reason == &expected),
+        "{err:?}"
     );
+    assert_eq!(
+        alice
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        before,
+        "rejecting a policy leaves the real group's default usable"
+    );
+    alice
+        .set_convergence_policy(CanonicalizationPolicy::default())
+        .unwrap();
 }
 
 #[test]
@@ -11073,8 +11146,12 @@ async fn join_epoch_is_anchored_so_a_rival_forking_there_adjudicates() {
 /// `ProposalRef`, and the pass finds no candidate at all: the device keeps
 /// whichever branch arrived first and reports `Settled`.
 async fn assert_by_reference_rival_adjudicates(first_label: &[u8], second_label: &[u8]) {
-    let (mut first, _first_storage) = build_client(first_label);
-    let (mut second, _second_storage) = build_client(second_label);
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let first_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let second_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut first = build_client_with_storage_and_clock(first_label, first_storage, clock.clone());
+    let mut second =
+        build_client_with_storage_and_clock(second_label, second_storage, clock.clone());
     let (mut leaver, _leaver_storage) = build_client(b"bob");
     let (mut observer, observer_storage) = build_client(b"dave");
 
@@ -11124,7 +11201,7 @@ async fn assert_by_reference_rival_adjudicates(first_label: &[u8], second_label:
     );
     first.ingest(leave.clone()).await.unwrap();
     second.ingest(leave.clone()).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    clock.advance_ms(1_000);
     first.advance_convergence(&group_id).await.unwrap();
     second.advance_convergence(&group_id).await.unwrap();
     let first_auto = first
@@ -11551,15 +11628,29 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
-    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let mut offer_authors: Vec<_> = [
+        "offer-author-a",
+        "offer-author-b",
+        "offer-author-c",
+        "offer-author-d",
+    ]
+    .into_iter()
+    .map(|label| (label, build_client(label.as_bytes()).0))
+    .collect();
+    let mut founding_members = vec![bob.fresh_key_package().await.unwrap()];
+    let mut founding_admins = vec![bob.self_id()];
+    for (_, author) in &mut offer_authors {
+        founding_members.push(author.fresh_key_package().await.unwrap());
+        founding_admins.push(author.self_id());
+    }
     let (group_id, created) = alice
         .create_group(CreateGroupRequest {
             name: "before".into(),
             description: String::new(),
-            members: vec![bob_kp],
+            members: founding_members,
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![bob.self_id()],
+            initial_admins: founding_admins,
         })
         .await
         .unwrap();
@@ -11570,6 +11661,12 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     bob.join_welcome(welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
+    for (label, author) in &mut offer_authors {
+        author
+            .join_welcome(welcome_for(&welcomes, label.as_bytes()))
+            .await
+            .unwrap();
+    }
     let (inviter, storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
         (&mut bob, &bob_storage, &mut alice)
     } else {
@@ -11656,10 +11753,20 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     else {
         unreachable!()
     };
+    let recovery_before = storage.own_commit_intent(&invite_commit.id).unwrap();
+    assert!(matches!(
+        inviter.reissue_invite_with_key_packages(&invite_commit.id, old_packages),
+        Err(cgka_traits::EngineError::InvalidWelcome)
+    ));
+    assert_eq!(
+        storage.own_commit_intent(&invite_commit.id).unwrap(),
+        recovery_before
+    );
     assert!(
-        inviter
-            .reissue_invite_with_key_packages(&invite_commit.id, old_packages)
-            .is_err()
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
     );
     assert!(
         storage
@@ -11713,27 +11820,54 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         .unwrap();
     let replacement = welcome_for(&welcomes, b"carol");
     let stale_record = carol_storage.get_group(&group_id).unwrap();
-    // A full offer inbox retires its oldest offer without pinning the account
-    // cursor or consuming the replacement KeyPackage before consent.
+    // Independent admins publish real sibling invitations from the same
+    // canonical source. Their authenticated offers fill Carol's inbox without
+    // replacing her active losing-branch copy or consuming fresh KeyPackages.
     use cgka_traits::storage::WelcomeStorage;
     let mut filler_ids = Vec::new();
-    for n in 0..4u8 {
-        let id = cgka_traits::MessageId::new(vec![0xc0 + n; 32]);
-        carol_storage
-            .put_welcome(&cgka_traits::welcome::PendingWelcome {
-                message_id: id.clone(),
-                group_id: group_id.clone(),
-                welcome_bytes: vec![],
-                rejoin: Some(cgka_traits::welcome::RejoinWelcome {
-                    epoch: stale_record.epoch,
-                    content_id: cgka_traits::MessageId::new(vec![0xd0 + n; 32]),
-                    welcomer: inviter.self_id(),
-                    local_state_token: vec![0; 32],
-                }),
-            })
+    let mut filler_content_ids = Vec::new();
+    for (_, author) in &mut offer_authors {
+        author
+            .buffer_openmls_convergence_message_at(&group_id, route(rename.clone(), &group_id), 500)
             .unwrap();
-        filler_ids.push(id);
+        let selected = author
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert_eq!(selected.convergence_status, ConvergenceStatus::Settled);
+        assert_eq!(author.epoch(&group_id).unwrap(), EpochId(2));
+        let SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } = author
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![carol.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("real sibling invite")
+        };
+        author.confirm_published(pending).await.unwrap();
+        let offer = welcome_for(&welcomes, b"carol");
+        assert!(matches!(
+            carol.ingest(offer.clone()).await.unwrap(),
+            IngestOutcome::LocalState {
+                state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
+            }
+        ));
+        assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
+        let pending = carol_storage
+            .list_welcomes()
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.message_id == offer.id)
+            .expect("genuine offer persisted");
+        assert!(!pending.welcome_bytes.is_empty());
+        filler_ids.push(offer.id);
+        filler_content_ids.push(pending.rejoin.expect("rejoin offer").content_id);
     }
+    assert_eq!(carol_storage.list_welcomes().unwrap().len(), 4);
     assert!(matches!(
         carol.ingest(replacement.clone()).await.unwrap(),
         IngestOutcome::LocalState {
@@ -11749,14 +11883,20 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     );
     assert!(
         !carol_storage
-            .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0; 32]))
+            .has_ingress_dedup_marker(&filler_content_ids[0])
             .unwrap(),
         "capacity eviction must leave authenticated content retryable under another wrapper"
     );
     assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
     assert!(matches!(
         carol.join_welcome(replacement.clone()).await,
-        Err(cgka_traits::EngineError::InvalidTransition(_))
+        Err(cgka_traits::EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "ActiveMember",
+                to: "JoinWelcome",
+                reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
+            }
+        ))
     ));
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap(),
@@ -11776,12 +11916,16 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         .find(|offer| offer.message_id == replacement.id)
         .unwrap();
     let token = offer.rejoin.unwrap().local_state_token;
-    assert!(
-        carol
-            .confirm_group_rejoin(&replacement.id, &[0; 32])
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        carol.confirm_group_rejoin(&replacement.id, &[0; 32]).await,
+        Err(cgka_traits::EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "ActiveMember",
+                to: "JoinWelcome",
+                reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
+            }
+        ))
+    ));
     assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
     // A consent screen must be refreshed if the local branch changes, even
     // when that fork advances to the same epoch as the incoming Welcome.
@@ -11794,12 +11938,16 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             .unwrap(),
     );
     carol.confirm_published(pending).await.unwrap();
-    assert!(
-        carol
-            .confirm_group_rejoin(&replacement.id, &token)
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        carol.confirm_group_rejoin(&replacement.id, &token).await,
+        Err(cgka_traits::EngineError::InvalidTransition(
+            cgka_traits::engine_state::InvalidTransition {
+                from: "ActiveMember",
+                to: "JoinWelcome",
+                reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
+            }
+        ))
+    ));
     let token = carol
         .pending_group_rejoins_for(Some(&group_id))
         .unwrap()
@@ -11833,11 +11981,9 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
             "confirmation terminally retires sibling offers as well as the selected one"
         );
     }
-    for n in 1..4u8 {
+    for content_id in &filler_content_ids[1..] {
         assert!(
-            carol_storage
-                .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0 + n; 32]))
-                .unwrap(),
+            carol_storage.has_ingress_dedup_marker(content_id).unwrap(),
             "confirmation, unlike eviction, terminally retires sibling content"
         );
     }
@@ -11948,10 +12094,17 @@ async fn superseded_invite_reissues_with_every_device_of_the_invited_account() {
     );
     let phone = carol.fresh_key_package().await.unwrap();
     let laptop = carol_laptop.fresh_key_package().await.unwrap();
-    assert!(
-        inviter
-            .reissue_invite_with_key_packages(&invite_commit.id, vec![phone.clone(), phone.clone()])
-            .is_err()
+    let recovery_before = storage.own_commit_intent(&invite_commit.id).unwrap();
+    assert!(matches!(
+        inviter.reissue_invite_with_key_packages(
+            &invite_commit.id,
+            vec![phone.clone(), phone.clone()]
+        ),
+        Err(cgka_traits::EngineError::InvalidWelcome)
+    ));
+    assert_eq!(
+        storage.own_commit_intent(&invite_commit.id).unwrap(),
+        recovery_before
     );
     assert!(
         storage
@@ -12137,129 +12290,246 @@ async fn reissue_without_every_lost_device_is_reported_as_a_conflict() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn reinvite_lookup_budget_and_pacing_survive_restart() {
-    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
-    let (mut client, storage) = build_client(b"reinvite-budget");
-    let (group_id, created) = client
+/// Real own invitation retained after an authenticated same-epoch loss.
+struct LostInviteRecovery {
+    inviter: Engine<SqliteAccountStorage>,
+    storage: SqliteAccountStorage,
+    label: &'static [u8],
+    group_id: GroupId,
+    commit_id: MessageId,
+    missing: Option<Engine<SqliteAccountStorage>>,
+}
+
+async fn lost_invite_recovery(
+    mixed: bool,
+    winner_adds_target: bool,
+    already_admin: bool,
+) -> LostInviteRecovery {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut peer, peer_storage) = build_client(b"recovery-admin");
+    let (mut bob, _) = build_client(b"bob");
+    let mut carol = mixed.then(|| build_client(b"carol").0);
+    let (group_id, created) = alice
         .create_group(CreateGroupRequest {
-            name: "retry budget".into(),
+            name: "before".into(),
             description: String::new(),
-            members: vec![],
+            members: vec![peer.fresh_key_package().await.unwrap()],
             required_features: vec![],
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins: vec![peer.self_id()],
         })
         .await
         .unwrap();
-    if let SendResult::GroupCreated { pending, .. } = created {
-        client.confirm_published(pending).await.unwrap();
-    }
-    let commit_id = cgka_traits::MessageId::new(vec![0xa1; 32]);
-    storage
-        .put_own_commit_intent(&OwnCommitIntent {
-            commit_id: commit_id.clone(),
-            group_id: group_id.clone(),
-            source_epoch: EpochId(0),
-            intent: SendIntent::Invite {
-                group_id,
-                key_packages: vec![],
-                initial_admins: vec![],
-            },
-            baseline: OwnCommitBaseline::None,
-            reissue_attempts: 0,
-            created_at_ms: 0,
-            reinvite: Some(ReinviteRetry::default()),
-        })
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    peer.join_welcome(welcome_for(&welcomes, b"recovery-admin"))
+        .await
         .unwrap();
+    let alice_loses = !committer_wins(&alice.self_id(), &peer.self_id());
+    let (inviter, storage, winner) = if alice_loses {
+        (&mut alice, &alice_storage, &mut peer)
+    } else {
+        (&mut peer, &peer_storage, &mut alice)
+    };
+    let mut packages = vec![bob.fresh_key_package().await.unwrap()];
+    let mut requested_admins = if winner_adds_target {
+        vec![bob.self_id()]
+    } else {
+        vec![]
+    };
+    if let Some(carol) = carol.as_mut() {
+        packages.push(carol.fresh_key_package().await.unwrap());
+        requested_admins.push(carol.self_id());
+    }
+    let invite = SendIntent::Invite {
+        group_id: group_id.clone(),
+        key_packages: packages,
+        initial_admins: requested_admins,
+    };
+    let SendResult::GroupEvolution {
+        msg: lost,
+        pending,
+        welcomes,
+    } = inviter.send(invite.clone()).await.unwrap()
+    else {
+        panic!("real invite")
+    };
+    assert_eq!(
+        storage.own_commit_intent(&lost.id).unwrap().unwrap().intent,
+        invite
+    );
+    inviter.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    if let Some(carol) = carol.as_mut() {
+        carol
+            .join_welcome(welcome_for(&welcomes, b"carol"))
+            .await
+            .unwrap();
+    }
+    let winning_intent = if winner_adds_target {
+        SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob.fresh_key_package().await.unwrap()],
+            initial_admins: if already_admin {
+                vec![bob.self_id()]
+            } else {
+                vec![]
+            },
+        }
+    } else {
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("canonical".into()),
+            description: None,
+        }
+    };
+    let (winning, pending) = evolution(winner.send(winning_intent).await.unwrap());
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut *inviter, &winning), (&mut *winner, &lost)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        assert_eq!(
+            engine
+                .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+                .unwrap()
+                .convergence_status,
+            ConvergenceStatus::Settled
+        );
+    }
+    assert_eq!(
+        inviter
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == bob.self_id()),
+        winner_adds_target
+    );
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].commit_id, lost.id);
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    assert_eq!(
+        storage.own_commit_intent(&lost.id).unwrap().unwrap().intent,
+        invite
+    );
+    assert!(
+        storage
+            .own_commit_intent(&lost.id)
+            .unwrap()
+            .unwrap()
+            .reinvite
+            .is_some()
+    );
+    let (inviter, storage, label) = if alice_loses {
+        (alice, alice_storage, b"alice".as_slice())
+    } else {
+        (peer, peer_storage, b"recovery-admin".as_slice())
+    };
+    LostInviteRecovery {
+        inviter,
+        storage,
+        label,
+        group_id,
+        commit_id: lost.id,
+        missing: carol,
+    }
+}
+
+#[tokio::test]
+async fn reinvite_lookup_budget_and_pacing_survive_restart() {
+    let LostInviteRecovery {
+        mut inviter,
+        storage,
+        label,
+        commit_id,
+        ..
+    } = lost_invite_recovery(false, false, false).await;
     let mut now = 0;
-    for attempt in 1..=8 {
-        assert!(client.reserve_reinvite_lookup(&commit_id, now).unwrap());
-        assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
-        drop(client);
-        client = build_client_with_storage(b"reinvite-budget", storage.clone());
-        let record = client.pending_reinvites().unwrap().remove(0);
+    for (index, delay) in [
+        5_000, 30_000, 120_000, 600_000, 3_600_000, 21_600_000, 86_400_000, 86_400_000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(inviter.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        assert!(!inviter.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        drop(inviter);
+        inviter = build_client_with_storage(label, storage.clone());
+        let record = inviter.pending_reinvites().unwrap().remove(0);
         let retry = record.reinvite.unwrap();
-        assert_eq!(retry.lookup_attempts, attempt);
-        assert!(retry.next_attempt_at_ms > now);
+        assert_eq!(retry.lookup_attempts, index as u32 + 1);
+        assert_eq!(retry.next_attempt_at_ms, now + delay);
+        assert!(
+            !inviter
+                .reserve_reinvite_lookup(&commit_id, retry.next_attempt_at_ms - 1)
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .own_commit_intent(&commit_id)
+                .unwrap()
+                .unwrap()
+                .reinvite
+                .as_ref(),
+            Some(&retry)
+        );
         now = retry.next_attempt_at_ms;
     }
     assert!(
         now > 48 * 60 * 60 * 1_000,
-        "eight attempts must leave sleeping recipients more than two days to replenish material"
+        "eight attempts leave sleeping recipients more than two days to replenish material"
     );
-    assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
-    drop(client);
-    let mut client = build_client_with_storage(b"reinvite-budget", storage);
-    assert!(client.pending_reinvites().unwrap().is_empty());
+    assert!(!inviter.reserve_reinvite_lookup(&commit_id, now).unwrap());
+    drop(inviter);
+    let mut inviter = build_client_with_storage(label, storage);
+    assert!(inviter.pending_reinvites().unwrap().is_empty());
+    let abandoned = inviter
+        .reinvite_recovery_records()
+        .unwrap()
+        .remove(0)
+        .reinvite
+        .unwrap();
+    assert!(abandoned.abandoned);
+    assert_eq!(abandoned.lookup_attempts, 9);
+    let record_before = inviter.reinvite_recovery_records().unwrap();
     assert!(
-        client.reinvite_recovery_records().unwrap()[0]
-            .reinvite
-            .as_ref()
-            .unwrap()
-            .abandoned
-    );
-    assert!(
-        !client
+        !inviter
             .reserve_reinvite_lookup(&commit_id, u64::MAX)
             .unwrap()
+    );
+    assert_eq!(
+        inviter.reinvite_recovery_records().unwrap(),
+        record_before,
+        "an abandoned lookup does not spend another durable attempt"
     );
 }
 
 #[tokio::test]
 async fn reinvite_reports_unapplied_admin_grants_without_losing_missing_recipients() {
-    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
     for mixed in [false, true] {
         for already_admin in [false, true] {
-            let (mut alice, storage) = build_client(b"alice");
-            let (mut bob, _) = build_client(b"bob");
-            let (mut carol, _) = build_client(b"carol");
-            let bob_kp = bob.fresh_key_package().await.unwrap();
-            let (group_id, created) = alice
-                .create_group(CreateGroupRequest {
-                    name: "canonical group".into(),
-                    description: String::new(),
-                    members: vec![bob_kp.clone()],
-                    required_features: vec![],
-                    app_components: vec![],
-                    initial_admins: if already_admin {
-                        vec![bob.self_id()]
-                    } else {
-                        vec![]
-                    },
-                })
-                .await
-                .unwrap();
-            if let SendResult::GroupCreated { pending, .. } = created {
-                alice.confirm_published(pending).await.unwrap();
-            }
-            let commit_id = MessageId::new(vec![0xa1; 16]);
-            let mut old_packages = vec![bob_kp];
-            let mut requested_admins = vec![bob.self_id()];
-            let fresh = if mixed {
-                old_packages.push(carol.fresh_key_package().await.unwrap());
-                requested_admins.push(carol.self_id());
+            let LostInviteRecovery {
+                mut inviter,
+                storage,
+                group_id,
+                commit_id,
+                mut missing,
+                ..
+            } = lost_invite_recovery(mixed, true, already_admin).await;
+            let fresh = if let Some(carol) = missing.as_mut() {
                 vec![carol.fresh_key_package().await.unwrap()]
             } else {
                 vec![]
             };
-            storage
-                .put_own_commit_intent(&OwnCommitIntent {
-                    commit_id: commit_id.clone(),
-                    group_id: group_id.clone(),
-                    source_epoch: EpochId(0),
-                    intent: SendIntent::Invite {
-                        group_id: group_id.clone(),
-                        key_packages: old_packages,
-                        initial_admins: requested_admins,
-                    },
-                    baseline: OwnCommitBaseline::None,
-                    reissue_attempts: 0,
-                    created_at_ms: 0,
-                    reinvite: Some(ReinviteRetry::default()),
-                })
-                .unwrap();
-            let report = alice
+            let report = inviter
                 .reissue_invite_with_key_packages(&commit_id, fresh.clone())
                 .unwrap()
                 .unwrap();
@@ -12286,10 +12556,10 @@ async fn reinvite_reports_unapplied_admin_grants_without_losing_missing_recipien
                     ..
                 } = &queued[0].intent
                 else {
-                    panic!("missing recipient invitation must remain queued");
+                    panic!("missing recipient invitation remains queued")
                 };
                 assert_eq!(key_packages, &fresh);
-                assert_eq!(initial_admins, &[carol.self_id()]);
+                assert_eq!(initial_admins, &[missing.as_ref().unwrap().self_id()]);
             }
         }
     }
@@ -12705,4 +12975,283 @@ async fn canonical_application_backlog_survives_an_epoch_advancing_send() {
         carol.prepare_convergence_cutoff_delay_ms(&group).unwrap(),
         None
     );
+}
+
+/// A real lost removal is reconciled against the selected membership, rather
+/// than replaying targets that another admin already removed.
+#[tokio::test]
+async fn superseded_removal_reissues_only_members_left_by_the_winner() {
+    for all_satisfied in [false, true] {
+        let (mut alice, alice_storage) = build_client(b"alice");
+        let (mut bob, bob_storage) = build_client(b"bob");
+        let (mut carol, _) = build_client(b"carol");
+        let (mut dave, _) = build_client(b"dave");
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "removal race".into(),
+                description: String::new(),
+                members: vec![
+                    bob.fresh_key_package().await.unwrap(),
+                    carol.fresh_key_package().await.unwrap(),
+                    dave.fresh_key_package().await.unwrap(),
+                ],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![bob.self_id()],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, welcomes } = created else {
+            panic!("creation")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        for (member, label) in [
+            (&mut bob, b"bob".as_slice()),
+            (&mut carol, b"carol".as_slice()),
+            (&mut dave, b"dave".as_slice()),
+        ] {
+            member
+                .join_welcome(welcome_for(&welcomes, label))
+                .await
+                .unwrap();
+        }
+        let (loser, loser_storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+            (&mut bob, &bob_storage, &mut alice)
+        } else {
+            (&mut alice, &alice_storage, &mut bob)
+        };
+        let requested = vec![carol.self_id(), dave.self_id()];
+        let intent = SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: requested.clone(),
+        };
+        let (lost, pending) = evolution(loser.send(intent.clone()).await.unwrap());
+        loser.confirm_published(pending).await.unwrap();
+        let retained = loser_storage
+            .own_commit_intent(&lost.id)
+            .unwrap()
+            .expect("send recorded the real removal");
+        assert_eq!(retained.intent, intent);
+        assert_eq!(retained.source_epoch, EpochId(1));
+        assert_eq!(retained.reissue_attempts, 0);
+        let (winning, pending) = evolution(
+            winner
+                .send(SendIntent::RemoveMembers {
+                    group_id: group_id.clone(),
+                    members: if all_satisfied {
+                        requested
+                    } else {
+                        vec![carol.self_id()]
+                    },
+                })
+                .await
+                .unwrap(),
+        );
+        winner.confirm_published(pending).await.unwrap();
+        for (engine, rival) in [(&mut *loser, &winning), (&mut *winner, &lost)] {
+            engine
+                .buffer_openmls_convergence_message_at(
+                    &group_id,
+                    route(rival.clone(), &group_id),
+                    500,
+                )
+                .unwrap();
+            let result = engine
+                .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+                .unwrap();
+            assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+        }
+        assert_eq!(
+            loser.members(&group_id).unwrap(),
+            winner.members(&group_id).unwrap()
+        );
+        let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].group_id, group_id);
+        assert_eq!(reports[0].commit_id, lost.id);
+        assert_eq!(reports[0].kind, SupersededIntentKind::RemoveMembers);
+        assert_eq!(
+            reports[0].outcome,
+            if all_satisfied {
+                SupersededIntentOutcome::AlreadySatisfied
+            } else {
+                SupersededIntentOutcome::Reissued
+            }
+        );
+        assert!(loser_storage.own_commit_intent(&lost.id).unwrap().is_none());
+        assert!(
+            loser
+                .reissue_superseded_own_commits_from_state()
+                .unwrap()
+                .is_empty(),
+            "a lost intent is decided once"
+        );
+        let queued = loser_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap();
+        assert_eq!(queued.len(), usize::from(!all_satisfied));
+        if all_satisfied {
+            assert!(
+                loser
+                    .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(queued[0].reissue_attempts, 1);
+            let SendIntent::RemoveMembers {
+                group_id: queued_group,
+                members,
+            } = &queued[0].intent
+            else {
+                panic!("removal is retained")
+            };
+            assert_eq!(queued_group, &group_id);
+            assert_eq!(members, &[dave.self_id()]);
+            let mut drained = loser
+                .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+                .await
+                .unwrap();
+            assert_eq!(drained.len(), 1);
+            let (reissued, pending) = evolution(drained.remove(0));
+            loser.confirm_published(pending).await.unwrap();
+            winner
+                .buffer_openmls_convergence_message_at(
+                    &group_id,
+                    route(reissued, &group_id),
+                    3_000_000,
+                )
+                .unwrap();
+            assert_eq!(
+                winner
+                    .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+                    .unwrap()
+                    .convergence_status,
+                ConvergenceStatus::Settled
+            );
+        }
+        for engine in [&*loser, &*winner] {
+            let members = engine.members(&group_id).unwrap();
+            assert_eq!(members.len(), 2);
+            assert!(
+                !members
+                    .iter()
+                    .any(|m| m.id == carol.self_id() || m.id == dave.self_id())
+            );
+        }
+    }
+}
+
+/// Byte integrity alone is insufficient: the durable admission role and source
+/// epoch must still describe the authentic commit when public advance freezes it.
+#[tokio::test]
+async fn frozen_pass_metadata_mismatch_fails_closed_without_applying() {
+    use cgka_traits::convergence_pass::{ConvergencePassMemberRole, ConvergencePassPhase};
+    for wrong_role in [true, false] {
+        let (mut alice, _) = build_client(b"alice");
+        let clock = ManualConvergenceClock::new(1_000, 10_000);
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let mut carol =
+            build_client_with_storage_and_clock(b"carol", storage.clone(), clock.clone());
+        let (mut dave, _) = build_client(b"dave");
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "authentic metadata".into(),
+                description: String::new(),
+                members: vec![carol.fresh_key_package().await.unwrap()],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, welcomes } = created else {
+            panic!("creation")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        carol
+            .join_welcome(welcome_for(&welcomes, b"carol"))
+            .await
+            .unwrap();
+        carol.drain_events();
+        let (commit, pending) = evolution(
+            alice
+                .send(SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages: vec![dave.fresh_key_package().await.unwrap()],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap(),
+        );
+        alice.confirm_published(pending).await.unwrap();
+        let commit = route(commit, &group_id);
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .unwrap();
+        let before_group = storage.get_group(&group_id).unwrap();
+        let before_message = storage.get_message(&content_id(&commit)).unwrap();
+        let mut pass = storage
+            .convergence_pass(&group_id)
+            .unwrap()
+            .expect("real admission opened a pass");
+        assert_eq!(pass.phase, ConvergencePassPhase::Collecting);
+        assert_eq!(pass.members.len(), 1);
+        assert_eq!(pass.members[0].message_id, content_id(&commit));
+        assert_eq!(pass.members[0].role, ConvergencePassMemberRole::CommitEdge);
+        assert_eq!(pass.members[0].source_epoch, 1);
+        let digest = pass.members[0].payload_digest;
+        if wrong_role {
+            pass.members[0].role = ConvergencePassMemberRole::ProposalDependency;
+        } else {
+            pass.members[0].source_epoch += 1;
+        }
+        storage.put_convergence_pass(&pass).unwrap();
+        assert_eq!(
+            storage.get_message(&content_id(&commit)).unwrap(),
+            before_message
+        );
+        assert_eq!(
+            storage
+                .convergence_pass(&group_id)
+                .unwrap()
+                .unwrap()
+                .members[0]
+                .payload_digest,
+            digest
+        );
+        clock.advance_ms(1_000);
+        assert!(
+            carol
+                .advance_convergence(&group_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut halted = before_group.clone();
+        halted.unrecoverable = true;
+        assert_eq!(
+            storage.get_group(&group_id).unwrap(),
+            halted,
+            "only the durable halt may change canonical data"
+        );
+        assert_eq!(carol.epoch(&group_id).unwrap(), before_group.epoch);
+        assert_eq!(
+            storage.get_message(&content_id(&commit)).unwrap(),
+            before_message
+        );
+        let events = carol.drain_events();
+        assert_eq!(events.iter().filter(|event| matches!(event, GroupEvent::GroupUnrecoverable { group_id: halted } if halted == &group_id)).count(), 1);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GroupEvent::MessageReceived { .. }
+                    | GroupEvent::GroupStateChanged { .. }
+                    | GroupEvent::EpochChanged { .. }
+            )),
+            "integrity halt must not announce an apply: {events:?}"
+        );
+        assert!(carol.drain_auto_publish().is_empty());
+    }
 }

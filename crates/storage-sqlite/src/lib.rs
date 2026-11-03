@@ -88,6 +88,7 @@ pub use app::avatar_cache::{
     MAX_AVATAR_DIMENSION,
 };
 pub use app::backup_ledger::{BackupRun, BackupRunHead, BackupSchedule, CondemnedBackupBlob};
+pub use app::backup_restore::BackupRestoreArchive;
 pub use app::chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
     ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
@@ -142,17 +143,18 @@ pub use app::stickers::{
     StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
 };
 pub use app::timeline::{
-    AppEventImport, BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
-    ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
-    ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
-    ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
-    ConversationWindowQuery, DeletionSource, HistoryExportEvent, HistoryExportRow,
-    HistoryImportSource, ImportedAppEvent, ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON,
-    LatestHistoryImport, MAX_TIMELINE_LIMIT, SecurePruneAppEventsResult, StoredAppEvent,
-    TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion, TimelineMessageChange,
-    TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget, TimelinePage,
-    TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
-    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
+    AppEventImport, BRANCH_SELECTION_WITHDRAWAL_REASON, BackupHistorySource,
+    BranchSelectionWithdrawalDivergence, ConversationAccountSnapshot, ConversationAnchor,
+    ConversationOpenAnchorOutcome, ConversationOpenError, ConversationOpenQuery,
+    ConversationOpenReadState, ConversationOpenSnapshot, ConversationOpenTarget,
+    ConversationPresentationPage, ConversationWindowQuery, DeletionSource, HistoryExportEvent,
+    HistoryExportRow, HistoryImportProvenance, HistoryImportSource, ImportedAppEvent,
+    ImportedFileKey, LOCAL_PUBLISH_FAILED_REASON, LatestHistoryImport, MAX_TIMELINE_LIMIT,
+    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
+    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
+    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
+    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
+    TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,

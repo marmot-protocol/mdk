@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
+use cgka_engine::openmls_projection::OpenMlsProjectionError;
 use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
@@ -920,7 +921,7 @@ fn build_fault_selfremove_client(
     id: &[u8],
     fault: PutGroupFault,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
-    build_counted_fault_selfremove_client(id, fault, ApplySnapshotCounter::default())
+    build_counted_fault_selfremove_client(id, fault, ApplySnapshotCounter::default(), None)
 }
 
 /// [`build_fault_selfremove_client`] that also reports full pre-apply
@@ -929,10 +930,11 @@ fn build_counted_fault_selfremove_client(
     id: &[u8],
     fault: PutGroupFault,
     apply_snapshots: ApplySnapshotCounter,
+    clock: Option<Arc<dyn cgka_engine::ConvergenceClock>>,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
     let inner = SqliteAccountStorage::in_memory_for_test().unwrap();
     let handle = inner.clone();
-    let engine = EngineBuilder::new(FaultStorage {
+    let builder = EngineBuilder::new(FaultStorage {
         inner,
         fault,
         leave_write_fault: LeaveWriteFault::default(),
@@ -949,7 +951,11 @@ fn build_counted_fault_selfremove_client(
     .identity(pad32(id))
     .account_identity_proof_signer(proof_signer(id))
     .feature_registry(selfremove_registry())
-    .peeler(Box::new(MockPeeler))
+    .peeler(Box::new(MockPeeler));
+    let engine = match clock {
+        Some(clock) => builder.convergence_clock(clock),
+        None => builder,
+    }
     .build()
     .unwrap();
     (engine, handle)
@@ -1101,7 +1107,11 @@ async fn a_failed_ring_insert_rolls_back_the_room_it_made() {
     insert_fault.arm_on_write(1);
     let result = bob.ingest(overflow).await;
     assert!(
-        result.is_err(),
+        matches!(
+            &result,
+            Err(EngineError::Storage(StorageError::Busy(detail)))
+                if detail == "injected leave-persistence write failure"
+        ),
         "a storage failure is an ingest error, as everywhere else; got {result:?}"
     );
     assert_eq!(
@@ -1680,7 +1690,13 @@ async fn welcome_record_failure_restores_key_package_for_retry() {
 #[tokio::test]
 async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let fault = PutGroupFault::default();
-    let (mut alice, handle) = build_fault_selfremove_client(b"alice-aca", fault.clone());
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000_000, 1_700_000_000_000);
+    let (mut alice, handle) = build_counted_fault_selfremove_client(
+        b"alice-aca",
+        fault.clone(),
+        ApplySnapshotCounter::default(),
+        Some(Arc::new(clock.clone())),
+    );
     let mut bob = build_selfremove_client(b"bob-aca");
     let mut carol = build_selfremove_client(b"carol-aca");
     let bob_member_id = bob.self_id();
@@ -1733,7 +1749,7 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
     assert!(alice.drain_auto_publish().is_empty());
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    clock.advance_ms(75);
 
     let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
 
@@ -1743,7 +1759,11 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     fault.arm(1);
     let staged = alice.advance_convergence(&group_id).await;
     assert!(
-        staged.is_err(),
+        matches!(
+            &staged,
+            Err(EngineError::Storage(StorageError::Busy(detail)))
+                if detail == "injected put_group failure"
+        ),
         "injected put_group failure must surface, got {staged:?}"
     );
 
@@ -1813,11 +1833,13 @@ async fn concurrent_invite_fork(label: &str) -> ConcurrentInviteFork {
         format!("alice-{label}").as_bytes(),
         alice_fault.clone(),
         alice_snapshots.clone(),
+        None,
     );
     let (mut bob, bob_handle) = build_counted_fault_selfremove_client(
         format!("bob-{label}").as_bytes(),
         bob_fault.clone(),
         bob_snapshots.clone(),
+        None,
     );
     let mut david = build_selfremove_client(format!("david-{label}").as_bytes());
     let mut eve = build_selfremove_client(format!("eve-{label}").as_bytes());
@@ -1957,7 +1979,11 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     loser_fault.arm(1);
     let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
     assert!(
-        faulted.is_err(),
+        matches!(
+            &faulted,
+            Err(OpenMlsProjectionError::Storage(detail))
+                if detail.contains("injected put_group failure")
+        ),
         "the storage fault must surface from the settling pass, got {faulted:?}"
     );
 
@@ -2052,7 +2078,11 @@ async fn failed_canonical_apply_rolls_back_inside_a_committing_caller_without_a_
         .with_transaction(|storage| {
             let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
             assert!(
-                faulted.is_err(),
+                matches!(
+                    &faulted,
+                    Err(OpenMlsProjectionError::Storage(detail))
+                        if detail.contains("injected put_group failure")
+                ),
                 "the storage fault must surface from the settling pass, got {faulted:?}"
             );
             storage.put_ingress_dedup_marker(&caller_write)
@@ -2234,6 +2264,121 @@ async fn a_failed_generic_rewind_keeps_pending_app_output() {
     .await;
 }
 
+/// The generic rewind must put back the complete pending app output when a
+/// legacy full snapshot removes its source row. Native SQLite produces the
+/// output before the delegating provider exists, and this call has no outer
+/// probe or transaction that could undo or conceal its committed result.
+#[tokio::test]
+async fn generic_rewind_puts_back_complete_pending_application_output() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+
+    let (mut alice, _) = sqlite_reorg_side(b"alice-generic-pending-output");
+    let (mut bob, handle) = sqlite_reorg_side(b"bob-generic-pending-output");
+    let sender = alice.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "generic pending output".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("expected GroupCreated");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    bob.drain_events();
+
+    let snapshot = "test-generic-pending-output-anchor";
+    handle.create_group_snapshot(&group_id, snapshot).unwrap();
+    let payload = MarmotAppEvent::new(
+        hex::encode(sender.as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "after the full snapshot",
+    )
+    .encode()
+    .unwrap();
+    let chat = send_chat(&mut alice, &group_id, "after the full snapshot").await;
+    let message_id = MessageId::new(hex::decode(content_hex(&chat)).unwrap());
+    assert!(matches!(
+        bob.ingest(chat).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let expected_output = bob
+        .drain_events()
+        .into_iter()
+        .find(|event| {
+            matches!(event, GroupEvent::MessageReceived { message_id: id, .. } if id == &message_id)
+        })
+        .expect("the public native producer emits the application output");
+    assert!(matches!(
+        &expected_output,
+        GroupEvent::MessageReceived {
+            group_id: id,
+            message_id: received,
+            sender: author,
+            epoch: EpochId(1),
+            payload: received_payload,
+            ..
+        } if id == &group_id && received == &message_id && author == &sender && received_payload == &payload
+    ));
+    let sorted_records = || {
+        let mut records = handle.list_messages(&group_id, EpochId(0)).unwrap();
+        records.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+        records
+    };
+    let records_before = sorted_records();
+    let pending_key = |event: &GroupEvent| match event {
+        GroupEvent::MessageReceived { message_id, .. } => message_id.as_slice().to_vec(),
+        GroupEvent::GroupJoined { via_welcome, .. } => via_welcome.as_slice().to_vec(),
+        _ => panic!("pending output must be MessageReceived or GroupJoined"),
+    };
+    let mut pending_before = handle.list_pending_application_events().unwrap();
+    pending_before.sort_by_key(pending_key);
+    assert!(pending_before.iter().any(|event| event == &expected_output));
+    drop(bob);
+
+    let generic = FaultStorage {
+        inner: handle.clone(),
+        fault: PutGroupFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+    };
+    generic
+        .rollback_group_state_keeping_live_records(&group_id, snapshot)
+        .unwrap();
+
+    let mut pending_after = handle.list_pending_application_events().unwrap();
+    pending_after.sort_by_key(pending_key);
+    assert!(pending_after.iter().any(|event| {
+        matches!(event, GroupEvent::MessageReceived { message_id: id, .. } if id == &message_id)
+    }));
+    assert!(
+        pending_after.iter().any(|event| event == &expected_output),
+        "the generic rewind must restore the complete pending output from the public native producer"
+    );
+    assert!(pending_after == pending_before);
+    assert!(sorted_records() == records_before);
+}
+
 /// Fork two co-admins at epoch 1 and reorg the loser onto a legacy full
 /// anchor of epoch 1. With `fault_first_put`, the loser's first convergence
 /// attempt fails at its first `put_message` and the retry settles.
@@ -2370,12 +2515,51 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         rows.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
         rows
     };
+    let sorted_records = || {
+        let mut records = handle.list_messages(&group_id, EpochId(0)).unwrap();
+        records.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+        records
+    };
+    let sorted_pending_events = || {
+        let mut events = handle
+            .list_pending_application_events()
+            .unwrap()
+            .into_iter()
+            .map(|event| {
+                let id = match &event {
+                    GroupEvent::MessageReceived { message_id, .. } => message_id,
+                    GroupEvent::GroupJoined { via_welcome, .. } => via_welcome,
+                    _ => panic!("pending output must be MessageReceived or GroupJoined"),
+                };
+                (id.as_slice().to_vec(), event)
+            })
+            .collect::<Vec<_>>();
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+        events
+    };
+    let records_before = sorted_records();
+    let pending_events_before = sorted_pending_events();
+    let late_record_before = handle.get_message(&late_app).unwrap();
+    let late_event_before = pending_events_before
+        .iter()
+        .find(|(_, event)| {
+            matches!(event, GroupEvent::MessageReceived { message_id, .. } if message_id == &late_app)
+        })
+        .expect("the late application has a complete pending output")
+        .1
+        .clone();
+    let winning_message_id = MessageId::new(hex::decode(content_hex(&routed_winner)).unwrap());
+    let winning_record_before = handle.get_message(&winning_message_id).unwrap();
 
     if let Some(fault) = fault_first_put {
         fault.arm_on_write(1);
         let failed = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
         assert!(
-            failed.is_err(),
+            matches!(
+                &failed,
+                Err(OpenMlsProjectionError::Snapshot(detail))
+                    if detail.contains("injected leave-persistence write failure")
+            ),
             "{label}: the injected write failure must surface, got {failed:?}"
         );
         assert_eq!(fault.remaining(), 0, "{label}: the fault never fired");
@@ -2385,6 +2569,14 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
             "{label}: a failed rewind dropped pending app output"
         );
         assert_eq!(sorted_rows(), rows_before, "{label}");
+        assert!(
+            sorted_records() == records_before,
+            "{label}: a failed rewind changed complete message records"
+        );
+        assert!(
+            sorted_pending_events() == pending_events_before,
+            "{label}: a failed rewind changed complete pending output"
+        );
         assert_eq!(
             handle.list_queued_outbound_intents(&group_id).unwrap(),
             queued_before,
@@ -2392,13 +2584,20 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         );
         // A restart seeds app output from the durable pending events.
         let mut reopened = build_selfremove_client_on_storage(loser_id.as_bytes(), handle.clone());
+        let rebuilt_events = reopened.drain_events();
         assert!(
-            reopened.drain_events().iter().any(|event| matches!(
+            rebuilt_events.iter().any(|event| matches!(
                 event,
                 cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }
                     if *message_id == late_app
             )),
             "{label}: a reopened engine must still surface the late application"
+        );
+        assert!(
+            rebuilt_events
+                .iter()
+                .any(|event| event == &late_event_before),
+            "{label}: the rebuilt engine must surface the complete original application output"
         );
     }
 
@@ -2433,6 +2632,33 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         queued_before,
         "{label}: the rewind must not restore a dequeued intent"
     );
+    assert!(
+        sorted_pending_events() == pending_events_before,
+        "{label}: the reorg must preserve complete pending application outputs"
+    );
+    assert!(
+        handle.get_message(&late_app).unwrap() == late_record_before,
+        "{label}: the already-processed application must retain its complete record"
+    );
+    let mut expected_winning_record = winning_record_before;
+    expected_winning_record.state = MessageState::Processed;
+    assert!(
+        handle.get_message(&winning_message_id).unwrap() == expected_winning_record,
+        "{label}: the selected commit must become Processed without changing its record data"
+    );
+    // A reorg changes commit dispositions. Independently of those transitions,
+    // every retained row must keep all of its original non-disposition data.
+    for before in &records_before {
+        let after = handle.get_message(&before.id).unwrap();
+        assert!(
+            after.id == before.id
+                && after.group_id == before.group_id
+                && after.epoch == before.epoch
+                && after.payload == before.payload
+                && after.deferred_peel == before.deferred_peel,
+            "{label}: the reorg changed retained message data"
+        );
+    }
 }
 
 /// A profile projection failure occurs after the MLS commit is staged. It must
@@ -2469,7 +2695,14 @@ async fn update_group_data_record_write_failure_leaves_group_stable() {
             description: None,
         })
         .await;
-    assert!(failed.is_err(), "injected projection failure must surface");
+    assert!(
+        matches!(
+            &failed,
+            Err(EngineError::Storage(StorageError::Busy(detail)))
+                if detail == "injected put_group failure"
+        ),
+        "injected projection failure must surface, got {failed:?}"
+    );
 
     let record = handle.get_group(&group_id).unwrap();
     assert_eq!(record.name, "original");

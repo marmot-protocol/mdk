@@ -50,7 +50,7 @@ impl Marmot {
     /// `no_device_group`, `unknown_device`, `roster_unavailable`, or
     /// `device_group_busy` while the device group has an earlier change in
     /// flight (retry later). A rename whose commit loses a fork is made again
-    /// on a later maintenance pass, unless another rename of that device won;
+    /// on a later maintenance pass, unless another user edit of that device won;
     /// refresh on `LinkedDevicesChanged`.
     pub async fn rename_linked_device(
         &self,
@@ -61,6 +61,34 @@ impl Marmot {
         Ok(self
             .runtime
             .rename_linked_device(&account_ref, slot_id_hex, label)
+            .await?)
+    }
+
+    /// Patch a linked device's settings, including this device. None keeps a
+    /// value from the current roster. Add-to-all permits the linked-device Add flow;
+    /// off does not leave chats. History affects future sibling Adds and
+    /// transfers still owed, without backfill of chats already joined. Keep
+    /// prevents automatic inactivity removal, not explicit removal or sign-out.
+    /// Earlier lost edits recover first; `device_group_busy` asks for a retry
+    /// while they settle. Other refusals match `rename_linked_device` without
+    /// label validation. Refresh on `LinkedDevicesChanged`.
+    pub async fn update_linked_device_settings(
+        &self,
+        account_ref: String,
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .update_linked_device_settings(
+                &account_ref,
+                slot_id_hex,
+                add_to_all_chats,
+                bring_history,
+                keep_while_inactive,
+            )
             .await?)
     }
 

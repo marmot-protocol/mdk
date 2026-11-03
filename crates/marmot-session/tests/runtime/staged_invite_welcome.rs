@@ -208,7 +208,7 @@ impl RetainedInvite {
 /// owed and goes out.
 #[tokio::test]
 async fn staged_invite_welcome_waits_for_its_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let runtime = &mut invite.runtime;
     let welcome = invite.welcome.clone();
@@ -273,7 +273,7 @@ async fn staged_invite_welcome_waits_for_its_commit() {
 /// the Welcome is staged, then delivers from it once the commit confirms.
 #[tokio::test]
 async fn maintenance_holds_a_stored_fanout_of_a_staged_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome = invite.welcome.clone();
     // The record the old path wrote before its relay attempt.
@@ -331,7 +331,7 @@ async fn maintenance_holds_a_stored_fanout_of_a_staged_welcome() {
 /// restart and no caller holding it.
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_once_its_commit_confirms() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
 
@@ -359,7 +359,7 @@ async fn staged_invite_welcome_goes_out_once_its_commit_confirms() {
 /// maintenance passes follow.
 #[tokio::test]
 async fn staged_invite_welcome_never_goes_out_when_its_commit_rolls_back() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite_failing(dir.path(), |adapter, group_relay| {
         adapter.fail_endpoints_as(
             vec![group_relay],
@@ -405,7 +405,7 @@ enum FirstRead {
 /// reads the store; without one, the first maintenance pass does, whether the
 /// commit confirmed before it or not.
 async fn staged_invite_welcome_goes_out_after_a_restart(first_read: FirstRead) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
     invite.restart(dir.path());
@@ -459,7 +459,7 @@ async fn staged_invite_welcome_goes_out_when_its_commit_confirms_before_the_firs
 /// group is hydrated and its commit confirms between two passes.
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_once_its_group_is_hydrated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
     invite.restart_unhydrated(dir.path());
@@ -483,7 +483,7 @@ async fn staged_invite_welcome_goes_out_once_its_group_is_hydrated() {
 /// the Welcome watched, so the next pass sends it once a route exists.
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
     invite.route_carol(false);
@@ -526,7 +526,7 @@ async fn staged_invite_welcome_goes_out_after_a_send_that_found_no_route() {
 /// as the startup pass would at the next open.
 #[tokio::test]
 async fn staged_invite_welcome_goes_out_again_after_its_fanout_expires() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let welcome_id = invite.welcome.id.clone();
     invite.confirm_commit().await;
@@ -569,7 +569,7 @@ async fn staged_invite_welcome_goes_out_again_after_its_fanout_expires() {
 /// commit waits, an owed one goes out, and once delivered it is skipped.
 #[tokio::test]
 async fn welcomes_named_by_id_go_out_only_while_owed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let ids = [invite.welcome.id.clone()];
 
@@ -616,7 +616,7 @@ async fn welcomes_named_by_id_go_out_only_while_owed() {
 /// A Welcome withdrawn while owed is skipped when a host names it by id.
 #[tokio::test]
 async fn a_withdrawn_welcome_named_by_id_stays_unsent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let mut invite = retained_invite(dir.path()).await;
     let ids = [invite.welcome.id.clone()];
     invite.confirm_commit().await;

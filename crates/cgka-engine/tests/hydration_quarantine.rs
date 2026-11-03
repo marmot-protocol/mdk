@@ -30,8 +30,8 @@ use cgka_traits::{
     Backend, OutboundFanout, TransportEndpoint, TransportPublishRequest, TransportPublishTarget,
 };
 use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -388,6 +388,18 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 
 // ── Re-hydration retry (mdk#426) ─────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotOperation {
+    Restore,
+    Release,
+}
+
+struct SnapshotRefusal {
+    operation: SnapshotOperation,
+    name: String,
+    observed: bool,
+}
+
 /// Storage wrapper that delegates everything to an inner
 /// [`SqliteAccountStorage`] but can be told to fail `get_group` once, to
 /// simulate a transiently-unreadable Marmot record at session open that later
@@ -402,6 +414,7 @@ struct FlakyGroupRecordStorage {
     fail_mark_disband_tombstone_announced: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
     fail_disband_request: Arc<AtomicBool>,
+    snapshot_refusal: Arc<Mutex<Option<SnapshotRefusal>>>,
 }
 
 impl FlakyGroupRecordStorage {
@@ -413,6 +426,7 @@ impl FlakyGroupRecordStorage {
             fail_mark_disband_tombstone_announced: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
             fail_disband_request: Arc::new(AtomicBool::new(false)),
+            snapshot_refusal: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -438,6 +452,48 @@ impl FlakyGroupRecordStorage {
     fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
         self.fail_list_queued_outbound_intents
             .store(fail, Ordering::SeqCst);
+    }
+
+    fn refuse_snapshot(&self, operation: SnapshotOperation, name: &str) {
+        *self.snapshot_refusal.lock().unwrap() = Some(SnapshotRefusal {
+            operation,
+            name: name.to_owned(),
+            observed: false,
+        });
+    }
+
+    fn clear_snapshot_refusal(&self) {
+        *self.snapshot_refusal.lock().unwrap() = None;
+    }
+
+    fn snapshot_refusal_observed(&self) -> bool {
+        self.snapshot_refusal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|refusal| refusal.observed)
+    }
+
+    fn check_snapshot_operation(
+        &self,
+        operation: SnapshotOperation,
+        name: &str,
+    ) -> StorageResult<()> {
+        let mut selected = self.snapshot_refusal.lock().unwrap();
+        if let Some(refusal) = selected.as_mut()
+            && refusal.operation == operation
+            && refusal.name == name
+        {
+            refusal.observed = true;
+            return Err(StorageError::Backend(
+                match operation {
+                    SnapshotOperation::Restore => "test provider refused snapshot restoration",
+                    SnapshotOperation::Release => "test provider refused snapshot release",
+                }
+                .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -550,9 +606,11 @@ impl MessageStorage for FlakyGroupRecordStorage {
         self.inner.list_group_snapshots(group_id)
     }
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.check_snapshot_operation(SnapshotOperation::Restore, name)?;
         self.inner.rollback_group_to_snapshot(group_id, name)
     }
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.check_snapshot_operation(SnapshotOperation::Release, name)?;
         self.inner.release_group_snapshot(group_id, name)
     }
     fn create_group_state_checkpoint(
@@ -909,6 +967,173 @@ fn build_flaky_engine(storage: FlakyGroupRecordStorage) -> Engine<FlakyGroupReco
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build flaky engine")
+}
+
+#[derive(PartialEq, Eq)]
+struct RecoveryObservation {
+    group: Group,
+    native_epoch: u64,
+    native_authenticator: Vec<u8>,
+    native_members: usize,
+    messages: Vec<MessageRecord>,
+    queued: Vec<QueuedOutboundIntent>,
+    pending: Vec<GroupEvent>,
+}
+
+fn recovery_observation(storage: &SqliteAccountStorage, group_id: &GroupId) -> RecoveryObservation {
+    let native = openmls::group::MlsGroup::load(
+        storage.mls_storage(),
+        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+    )
+    .expect("load actual native group")
+    .expect("native group exists");
+    let mut messages = storage.list_messages(group_id, EpochId(0)).unwrap();
+    messages.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    let mut queued = storage.list_queued_outbound_intents(group_id).unwrap();
+    queued.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    RecoveryObservation {
+        group: storage.get_group(group_id).unwrap(),
+        native_epoch: native.epoch().as_u64(),
+        native_authenticator: native.epoch_authenticator().as_slice().to_vec(),
+        native_members: native.members().count(),
+        messages,
+        queued,
+        pending: storage.list_pending_application_events().unwrap(),
+    }
+}
+
+async fn assert_reader_recovers_after_refusal(operation: SnapshotOperation) {
+    const HISTORICAL: &str = "test-reader-historical-anchor";
+    const OUTER: &str = "openmls-branch-probe-reader-refusal";
+    const INNER: &str = "openmls-probe-reader-refusal";
+
+    let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let historical = recovery_observation(&storage, &group_id);
+    storage
+        .create_group_snapshot(&group_id, HISTORICAL)
+        .unwrap();
+
+    let changed = initial
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("live reader state".into()),
+            description: None,
+        })
+        .await
+        .expect("prepare a real native epoch advance");
+    let SendResult::GroupEvolution { pending, .. } = changed else {
+        panic!("expected group evolution")
+    };
+    initial.confirm_published(pending).await.unwrap();
+    let (message, queued) = seed_probe_work_rows(&storage, &group_id, 8);
+    let live = recovery_observation(&storage, &group_id);
+    assert_eq!(live.group.name, "live reader state");
+    assert_ne!(live.group.name, historical.group.name);
+    assert!(live.native_epoch > historical.native_epoch);
+    assert!(live.native_authenticator != historical.native_authenticator);
+
+    if operation == SnapshotOperation::Restore {
+        storage.create_group_snapshot(&group_id, OUTER).unwrap();
+    } else {
+        storage
+            .create_group_state_snapshot(&group_id, OUTER)
+            .unwrap();
+    }
+    storage
+        .rollback_group_state_to_snapshot(&group_id, HISTORICAL)
+        .unwrap();
+    let refused_name = if operation == SnapshotOperation::Release {
+        storage
+            .create_group_state_snapshot(&group_id, INNER)
+            .unwrap();
+        INNER
+    } else {
+        OUTER
+    };
+    let names = if operation == SnapshotOperation::Release {
+        vec![OUTER, INNER]
+    } else {
+        vec![OUTER]
+    };
+    let images = names
+        .iter()
+        .map(|name| {
+            let fingerprint = storage.group_snapshot_fingerprint(&group_id, name).unwrap();
+            assert!(fingerprint.is_some(), "the recovery image must exist");
+            (*name, fingerprint)
+        })
+        .collect::<Vec<_>>();
+    let snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
+    let stranded = recovery_observation(&storage, &group_id);
+    assert_eq!(stranded.native_epoch, historical.native_epoch);
+    assert!(stranded.native_authenticator == historical.native_authenticator);
+    assert!(stranded.messages == live.messages && stranded.queued == live.queued);
+    assert!(!stranded.messages.is_empty() && !stranded.queued.is_empty());
+    drop(initial);
+
+    let flaky = FlakyGroupRecordStorage::new(storage.clone());
+    flaky.refuse_snapshot(operation, refused_name);
+    let mut reopened = build_flaky_engine(flaky.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("account hydration quarantines only the refused group");
+    assert!(flaky.snapshot_refusal_observed());
+    assert!(
+        recovery_observation(&storage, &group_id) == stranded,
+        "a refused recovery must preserve complete canonical and live work state"
+    );
+    assert!(
+        images.iter().all(|(name, fingerprint)| {
+            storage.group_snapshot_fingerprint(&group_id, name).unwrap() == *fingerprint
+        }),
+        "a refused recovery must retain each complete recovery image"
+    );
+    assert_eq!(
+        storage.list_group_snapshots(&group_id).unwrap(),
+        snapshots_before
+    );
+    assert!(matches!(
+        reopened.quarantined_groups().as_slice(),
+        [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+    ));
+    assert!(
+        matches!(reopened.epoch(&group_id), Err(EngineError::UnknownGroup(id)) if id == group_id)
+    );
+    assert!(
+        matches!(reopened.group_context(&group_id), Err(EngineError::UnknownGroup(id)) if id == group_id)
+    );
+
+    flaky.clear_snapshot_refusal();
+    assert!(reopened.retry_hydrate_quarantined_group(&group_id).unwrap());
+    assert!(reopened.quarantined_groups().is_empty());
+    assert_eq!(
+        reopened.epoch(&group_id).unwrap(),
+        EpochId(live.native_epoch)
+    );
+    assert!(
+        recovery_observation(&storage, &group_id) == live,
+        "the public retry must recover the captured live native state and complete work"
+    );
+    assert_probe_work_rows(&storage, &message, &queued);
+    assert!(names.iter().all(|name| {
+        !storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .iter()
+            .any(|stored| stored == name)
+    }));
+
+    // This is a same-storage engine rebuild, not an encrypted-file reopen.
+    drop(reopened);
+    let mut rebuilt = build_engine(storage.clone());
+    rebuilt.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        rebuilt.epoch(&group_id).unwrap(),
+        EpochId(live.native_epoch)
+    );
+    assert!(recovery_observation(&storage, &group_id) == live);
 }
 
 fn build_current_flaky_engine(
@@ -2297,6 +2522,7 @@ async fn hydration_recovers_interrupted_candidate_branch_probe() {
             .any(|name| name.starts_with("openmls-branch-probe-")),
         "recovered probe snapshot must be released"
     );
+    assert_reader_recovers_after_refusal(SnapshotOperation::Restore).await;
 }
 
 // The past-peel rewind is the third shape: the deferred-peel sweep rewinds the
@@ -2453,6 +2679,7 @@ async fn hydration_recovers_the_outermost_of_two_nested_interrupted_guards() {
                 && !name.starts_with("openmls-probe-")),
         "both interrupted guard snapshots must be released"
     );
+    assert_reader_recovers_after_refusal(SnapshotOperation::Release).await;
 }
 
 // Candidate replay also runs on its own, outside any pass or sweep window. A

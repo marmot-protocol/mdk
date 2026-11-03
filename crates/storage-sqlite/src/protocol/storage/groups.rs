@@ -201,6 +201,7 @@ impl GroupStorage for SqliteAccountStorage {
 /// marker's and app wipe's.
 pub(crate) fn delete_group_tx(tx: &rusqlite::Connection, id: &GroupId) -> StorageResult<usize> {
     let mls_group_key = mls_group_key(id)?;
+    crate::cross::sibling_welcome_resends::delete_group_resends(tx, id)?;
     crate::cross::routes::delete_route_app_state(
         tx,
         "IN (SELECT transport_group_id FROM cgka_transport_group_routes WHERE group_id = ?1)",

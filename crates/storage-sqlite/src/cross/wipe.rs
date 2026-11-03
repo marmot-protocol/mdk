@@ -170,6 +170,10 @@ impl SqliteAccountStorage {
                     .storage()?;
                 }
                 if terminal && !forget {
+                    super::sibling_welcome_resends::delete_group_resends(
+                        &tx,
+                        &cgka_traits::GroupId::new(group_id.clone()),
+                    )?;
                     tx.execute_cached(
                         "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
                         params![hex::encode(&group_id)],

@@ -681,6 +681,7 @@ impl<S: StorageProvider> Engine<S> {
         now: ConvergenceTime,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), OpenMlsProjectionError> {
+        let transport_id = processed_transport_id.unwrap_or(&message.id).clone();
         // Key the convergence store on the content-derived dedup id (SHA-256 of
         // the recovered MLS bytes), not the outer transport id (#238). This
         // keeps the buffered-record identity consistent whether the message
@@ -691,11 +692,9 @@ impl<S: StorageProvider> Engine<S> {
         match self.storage.get_message(&content_id) {
             Ok(record) if record.state == MessageState::PeelDeferred => {}
             Ok(_) => {
-                if let Some(transport_id) = processed_transport_id {
-                    self.storage
-                        .put_processed_transport_id(group_id, transport_id)
-                        .map_err(storage_projection_error)?;
-                }
+                self.storage
+                    .put_processed_transport_content(group_id, &transport_id, &content_id)
+                    .map_err(storage_projection_error)?;
                 return Ok(());
             }
             Err(StorageError::NotFound) => {}
@@ -738,9 +737,7 @@ impl<S: StorageProvider> Engine<S> {
         // intentionally blocked by an unstable local mutation owner.
         let (admission, opened) = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
-            if let Some(transport_id) = processed_transport_id {
-                storage.put_processed_transport_id(group_id, transport_id)?;
-            }
+            storage.put_processed_transport_content(group_id, &transport_id, &content_id)?;
             let (admission, opened) =
                 self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {
@@ -2378,6 +2375,7 @@ impl<S: StorageProvider> Engine<S> {
                     &result,
                     max_retained_anchor_rewind,
                     replay_profile_policy,
+                    self.wall_clock.as_ref(),
                 )?;
                 // Membership cleanup belongs to canonical apply: a failed queue or
                 // leave-request write must roll back MLS and the completed pass too.

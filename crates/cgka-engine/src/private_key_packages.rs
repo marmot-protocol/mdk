@@ -665,6 +665,42 @@ impl<S: StorageProvider> Engine<S> {
 mod tests {
     use super::*;
 
+    fn assert_serialize_error<T: std::fmt::Debug>(result: Result<T, EngineError>, expected: &str) {
+        let error = result.expect_err("the wire value is refused");
+        assert!(
+            matches!(&error, EngineError::Serialize(message) if message == expected),
+            "{error:?}"
+        );
+    }
+
+    // The framing decoder accepts MLS KeyPackages before the separate Marmot
+    // admission check. Real OpenMLS builds this syntactically valid message.
+    fn one_key_package() -> KeyPackage {
+        use openmls::prelude::{
+            BasicCredential, CredentialWithKey, KeyPackage as MlsKeyPackage, MlsMessageOut,
+        };
+        let suite = crate::engine::DEFAULT_CIPHERSUITE;
+        let signer =
+            openmls_basic_credential::SignatureKeyPair::new(suite.signature_algorithm()).unwrap();
+        let bundle = MlsKeyPackage::builder()
+            .build(
+                suite,
+                &openmls_rust_crypto::OpenMlsRustCrypto::default(),
+                &signer,
+                CredentialWithKey {
+                    credential: BasicCredential::new(vec![7; 32]).into(),
+                    signature_key: signer.public().into(),
+                },
+            )
+            .unwrap();
+        KeyPackage::new(
+            MlsMessageOut::from(bundle.key_package().clone())
+                .tls_serialize_detached()
+                .unwrap(),
+        )
+        .with_protocol_profile(ProtocolProfile::Current)
+    }
+
     #[test]
     fn a_request_is_canonical_json() {
         let request = PrivateKeyPackageRequest {
@@ -682,6 +718,16 @@ mod tests {
             )
         );
         assert_eq!(PrivateKeyPackageRequest::decode(&content).unwrap(), request);
+        for want in [1, 100] {
+            let boundary = PrivateKeyPackageRequest {
+                want,
+                ..request.clone()
+            };
+            assert_eq!(
+                PrivateKeyPackageRequest::decode(&boundary.encode()).unwrap(),
+                boundary
+            );
+        }
         for refused in [
             content.replace(r#""want":10"#, r#""want":0"#),
             content.replace(r#""want":10"#, r#""want":101"#),
@@ -691,9 +737,9 @@ mod tests {
             content.replace('}', r#","extra":1}"#),
             content.replace(&"01".repeat(32), &"01".repeat(31)),
         ] {
-            assert!(
-                PrivateKeyPackageRequest::decode(&refused).is_err(),
-                "{refused}"
+            assert_serialize_error(
+                PrivateKeyPackageRequest::decode(&refused),
+                "invalid private KeyPackage request",
             );
         }
     }
@@ -705,15 +751,44 @@ mod tests {
             to: [2; 32],
             key_packages: Vec::new(),
         };
-        assert!(empty.encode().is_err());
+        assert_serialize_error(empty.encode(), "a hand-off carries 1 to 20 KeyPackages");
         let mut bytes = vec![HAND_OFF_VERSION];
         bytes.extend_from_slice(&[1; 32]);
         bytes.extend_from_slice(&[2; 32]);
         VLBytes::new(Vec::new()).tls_serialize(&mut bytes).unwrap();
-        assert!(PrivateKeyPackageHandOff::decode(&bytes).is_err());
+        assert_serialize_error(
+            PrivateKeyPackageHandOff::decode(&bytes),
+            "invalid private KeyPackage hand-off",
+        );
         bytes.push(0);
-        assert!(PrivateKeyPackageHandOff::decode(&bytes).is_err());
+        assert_serialize_error(
+            PrivateKeyPackageHandOff::decode(&bytes),
+            "invalid private KeyPackage hand-off",
+        );
         bytes[0] = 2;
-        assert!(PrivateKeyPackageHandOff::decode(&bytes).is_err());
+        assert_serialize_error(
+            PrivateKeyPackageHandOff::decode(&bytes),
+            "invalid private KeyPackage hand-off",
+        );
+        // Each framing guard also gets a nonempty valid control, so another
+        // guard cannot supply the refusal when the intended one regresses.
+        let valid = PrivateKeyPackageHandOff {
+            key_packages: vec![one_key_package()],
+            ..empty
+        };
+        let bytes = valid.encode().unwrap();
+        assert_eq!(PrivateKeyPackageHandOff::decode(&bytes).unwrap(), valid);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_serialize_error(
+            PrivateKeyPackageHandOff::decode(&trailing),
+            "invalid private KeyPackage hand-off",
+        );
+        let mut wrong_version = bytes;
+        wrong_version[0] = 2;
+        assert_serialize_error(
+            PrivateKeyPackageHandOff::decode(&wrong_version),
+            "invalid private KeyPackage hand-off",
+        );
     }
 }

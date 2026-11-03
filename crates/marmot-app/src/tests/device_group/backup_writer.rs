@@ -881,3 +881,6 @@ async fn the_runtime_writes_a_due_backup() {
     );
     runtime.shutdown().await;
 }
+
+#[path = "backup_restore.rs"]
+mod restore;
