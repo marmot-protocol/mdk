@@ -56,7 +56,9 @@
 //!   before the send, so one Welcome is never carried twice at once. The
 //!   Welcome is delivered once a drain reports that 461 published, and owed
 //!   again once it reached no one, for the next pass to send in a new 461.
-//!   Delivered means one relay took it; nothing sends it again (3.5e).
+//!   Delivered means one relay took the initial carrier, completing initial
+//!   delivery. Under D100, a qualifying later heartbeat can repair the same
+//!   retained Welcome, without another Add or KeyPackage.
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
