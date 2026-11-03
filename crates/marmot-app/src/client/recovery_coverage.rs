@@ -265,17 +265,15 @@ struct LiveCountFact {
 #[cfg_attr(not(test), allow(dead_code))]
 impl LiveCountFact {
     /// The count as the runner's fence reads it. Only a non-empty count
-    /// leaves capture debt below its oldest event; one its relay cut at the
-    /// page limit fences nothing, since the adapter pages the rest itself.
+    /// leaves capture debt below its oldest event. Once native paging is
+    /// delegated, a full admitted reply leaves that debt too; admission is
+    /// not proof that the original query was complete.
     fn live_count(&self) -> LiveCount {
         LiveCount {
             routes: self.routes.clone(),
             relay: self.key.1.clone(),
             since: self.since,
-            oldest_seen: self
-                .count
-                .oldest
-                .filter(|_| self.count.events > 0 && !self.count.clamped()),
+            oldest_seen: self.count.oldest.filter(|_| self.count.events > 0),
         }
     }
 }

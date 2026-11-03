@@ -231,7 +231,7 @@ fn the_tail_starts_past_released_seconds() {
 
 /// The runner's fence reads a count's emptiness and its oldest event: only a
 /// non-empty count leaves capture debt below that event. A count its relay
-/// cut at the page limit fences nothing, since the adapter pages the rest.
+/// cut at the page limit still leaves capture debt when the ledger owns it.
 #[test]
 fn a_count_fences_below_its_oldest_event_only_when_it_counted_one() {
     let groups = vec![TransportReconciliationRoute::Group([1; 32])];
@@ -249,7 +249,7 @@ fn a_count_fences_below_its_oldest_event_only_when_it_counted_one() {
         );
     }
     let cut = count(RELAY_REPLAY_PAGE_LIMIT, Some(150));
-    assert_eq!(fact(groups, cut, false).live_count().oldest_seen, None);
+    assert_eq!(fact(groups, cut, false).live_count().oldest_seen, Some(150));
 }
 
 /// The adapter's hold is per group route: a fence names each of its group's

@@ -194,15 +194,24 @@ impl RunnerHost for AccountRunnerHost {
                 if inbox.is_none() {
                     routes.retain(|route| route.route != TransportReconciliationRoute::Inbox);
                 }
-                // The live counts and the fences they raise come with PR 5c.
-                Some(turn(&DebtTurn {
+                let live = client.recovery_runner_live_counts().await;
+                let debt = DebtTurn {
                     app: &app,
                     routes: &routes,
                     now,
                     tails: &*tails,
-                    live_counts: &[],
+                    live_counts: &live.counts,
                     inbox: inbox.unwrap_or_default(),
-                }))
+                };
+                let result = turn(&debt);
+                if result.is_ok() {
+                    let fences = match super::admission::live_fences(&debt) {
+                        Ok(fences) => fences,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    client.fence_live_frames(live.ticket, &fences).await;
+                }
+                Some(result)
             })
         })
         .await
