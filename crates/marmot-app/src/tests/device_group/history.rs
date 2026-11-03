@@ -237,12 +237,19 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
         "said",
     );
     forged.content = "rewritten".to_owned();
+    let device_group_control = MarmotAppEvent::new(
+        bob_account.account_id_hex.clone(),
+        3,
+        crate::small_state::KIND_SMALL_STATE_UPDATE,
+        Vec::new(),
+        r#"{"v":1,"items":[]}"#,
+    );
     let mut bundle = HistoryBundle::new(
         chat.as_slice(),
         ChatPosition::of(&honest, 0),
-        ChatPosition::of(&forged, 0),
+        ChatPosition::of(&device_group_control, 0),
     );
-    bundle.events = [&honest, &forged]
+    bundle.events = [&honest, &forged, &device_group_control]
         .map(|event| BundledEvent {
             event: event.clone(),
             epoch: 0,
@@ -277,6 +284,19 @@ async fn a_member_who_joined_later_imports_the_history_it_missed() {
             .timeline_message(&chat_hex, &forged.id)
             .unwrap()
             .is_none()
+    );
+    assert!(
+        storage
+            .timeline_message(&chat_hex, &device_group_control.id)
+            .unwrap()
+            .is_none(),
+        "history never projects a device-group control as a chat event"
+    );
+    assert_eq!(
+        storage
+            .app_event_import_provenance(&chat_hex, &device_group_control.id)
+            .unwrap(),
+        None
     );
 }
 

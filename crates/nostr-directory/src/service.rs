@@ -32,6 +32,9 @@ pub struct Directory<R> {
 /// [`Directory`] built from one state sees the same values.
 #[derive(Clone, Default)]
 pub struct DirectoryState {
+    /// Serialize record read/modify/write across this host's directory values.
+    /// No network work or host callback runs while this lane is held.
+    pub(super) entry_updates: Arc<Mutex<()>>,
     /// When each `(account label, cache key)` public event refresh last
     /// finished; see `previews`.
     pub(super) public_event_refreshes: Arc<Mutex<HashMap<String, Instant>>>,

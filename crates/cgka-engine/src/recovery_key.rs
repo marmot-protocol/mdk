@@ -136,6 +136,8 @@ mod tests {
     use super::*;
     use crate::history_key::{generate_history_key_pair, seal_history};
     use openmls_rust_crypto::RustCrypto;
+    use openmls_traits::types::HpkeCiphertext;
+    use tls_codec::{Deserialize as _, Serialize as _};
 
     const CONTEXT: &[u8] = b"backup id and index hash";
 
@@ -222,6 +224,37 @@ mod tests {
         let crypto = RustCrypto::default();
         let entropy = [5; RECOVERY_ENTROPY_LEN];
         let public = derive_recovery_key_pair(&crypto, &entropy).unwrap().public;
+        let pair = derive_recovery_key_pair(&crypto, &entropy).unwrap();
+        let backup_info = b"\x15MLS 1.0 Marmot Backup\x18backup id and index hash";
+        let sealed = seal_to_recovery_key(&crypto, &public, CONTEXT, b"archive key").unwrap();
+        let ciphertext = HpkeCiphertext::tls_deserialize_exact(&sealed).unwrap();
+        assert_eq!(
+            crypto
+                .hpke_open(
+                    RECOVERY_CIPHERSUITE.hpke_config(),
+                    &ciphertext,
+                    &pair.private,
+                    backup_info,
+                    &[],
+                )
+                .ok(),
+            Some(b"archive key".to_vec()),
+        );
+        let independently_sealed = crypto
+            .hpke_seal(
+                RECOVERY_CIPHERSUITE.hpke_config(),
+                &public,
+                backup_info,
+                &[],
+                b"independent backup",
+            )
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+        assert_eq!(
+            open_with_recovery_key(&crypto, &entropy, CONTEXT, &independently_sealed).unwrap(),
+            Some(b"independent backup".to_vec()),
+        );
         let as_history = seal_history(
             &crypto,
             RECOVERY_CIPHERSUITE,

@@ -253,6 +253,67 @@ mod tagged_siblings {
         );
     }
 
+    /// The one roster write path requires user-edit provenance before any
+    /// publication, preserves the journal's supplied id, and leaves non-user
+    /// metadata writes on that same id.
+    #[tokio::test]
+    async fn roster_user_edits_require_fresh_ids_and_non_user_edits_preserve_them() {
+        use cgka_traits::EngineError;
+        use cgka_traits::app_components::decode_device_roster_v1;
+        use marmot_session::DeviceRosterEdit;
+
+        fn read(device: &Device, group: &GroupId, slot: &DeviceSlotId) -> DeviceEntryV1 {
+            let bytes = device.runtime.app_component(group, DEVICE_ROSTER_COMPONENT_ID).unwrap().unwrap();
+            decode_device_roster_v1(&bytes).unwrap().devices[slot].clone()
+        }
+
+        let dir = relaxed_storage_dir().unwrap();
+        let (mut phone, _laptop, group) = tagged_phone_and_laptop(&dir).await;
+        let slot = own_slot(&phone);
+        let fresh = [0x71; 16];
+        let edit = phone.runtime.edit_device_roster_entry(&group, &slot, &[], |entry| {
+            entry.label = "Kitchen".into();
+            entry.rename_id = Some(fresh);
+        }).await.unwrap();
+        assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
+        let current = read(&phone, &group, &slot);
+        assert_eq!(current.label, "Kitchen");
+        assert_eq!(current.rename_id, Some(fresh));
+        let published = group_messages(&phone).len();
+
+        for invalid in 0..3 {
+            let error = phone.runtime.edit_device_roster_entry(&group, &slot, &[], |entry| {
+                match invalid {
+                    0 => entry.label = "Stale id".into(),
+                    1 => {
+                        entry.settings.bring_history = !entry.settings.bring_history;
+                        entry.rename_id = None;
+                    }
+                    _ => entry.rename_id = Some([0x72; 16]),
+                }
+            }).await.unwrap_err();
+            let expected = if invalid == 2 { "non-user device edit must preserve rename id" }
+                else { "device label or settings edit needs a fresh rename id" };
+            assert!(matches!(error.as_engine_error(), Some(EngineError::Serialize(reason)) if reason == expected));
+            assert_eq!(group_messages(&phone).len(), published);
+            assert_eq!(read(&phone, &group, &slot), current);
+        }
+
+        phone.runtime.edit_device_roster_entry(&group, &slot, &[], |entry| {
+            entry.platform = "desktop".into();
+        }).await.unwrap();
+        let metadata = read(&phone, &group, &slot);
+        assert_eq!(metadata.platform, "desktop");
+        assert_eq!(metadata.rename_id, Some(fresh));
+        phone.runtime.edit_device_roster_entry(&group, &slot, &[], |entry| {
+            entry.settings.bring_history = !entry.settings.bring_history;
+            entry.rename_id = Some([0x73; 16]);
+        }).await.unwrap();
+        let settings = read(&phone, &group, &slot);
+        assert_eq!(settings.rename_id, Some([0x73; 16]));
+        assert_ne!(settings.settings.bring_history, metadata.settings.bring_history);
+    }
+
     /// Bob's chat, with `phone` as a member who is not an admin. Bob
     /// advertises account-devices, so the chat requires it from its founding
     /// (mdk#2628 item 2.3), and the phone joins with a fresh KeyPackage, which

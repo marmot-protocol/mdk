@@ -120,6 +120,10 @@
 
 ### Added
 
+- Add `update_linked_device_settings` with three optional booleans. Omitted values stay current; refresh on `LinkedDevicesChanged`. Earlier lost user edits recover before the command proceeds (mdk#2628 D86).
+  This development transition requires custom post-link settings writers to rotate the user-edit marker;
+  earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
+
 - `reaction_attachment(account_ref, group_id_hex, reaction_message_id_hex)`
   resolves one active custom-emoji reaction's matching encrypted image to its
   original attachment source slot (mdk#2151). Use ordinary host-managed
@@ -212,7 +216,7 @@
   device the account's device group stopped listing without a removal, such
   as after a failed link (mdk#2761). Release builds hold no device group, so
   it stays zero there.
-- `send_custom_event` refuses the device-group kinds 457, 459, 460, 461, 473,
+- `send_custom_event` refuses the device-group kinds 457, 458, 459, 460, 461, 473,
   475 and 476 as reserved, and one received in a chat makes no timeline row,
   message or notification (mdk#2628). They are read only in the account's
   device group.

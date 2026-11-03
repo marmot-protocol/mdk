@@ -1093,7 +1093,7 @@ impl<S: StorageProvider> Engine<S> {
             // Remember the exact wrapper outside the bounded hostile-input
             // marker pool so a later restart can short-circuit before peel.
             self.storage
-                .put_processed_transport_id(&group_id, &raw_msg_id)?;
+                .put_processed_transport_content(&group_id, &raw_msg_id, &content_id)?;
             // This wrapper is one of the arbitrarily many re-wraps a member can
             // mint for the same MLS bytes, and the content record already
             // stands for them. See AGENTS.md, "a `Buffered` outcome never lets
@@ -1705,6 +1705,8 @@ impl<S: StorageProvider> Engine<S> {
         processed: ProcessedMessage,
         context: DirectApplicationContext<'_>,
     ) -> Result<DirectMessageContent, EngineError> {
+        let mut source =
+            crate::device_tag::authenticated_source(mls_group, &processed, &context.msg.id)?;
         let sender_id = member_id_of_processed_message(&processed, mls_group);
         let sender_leaf_index = match processed.sender() {
             Sender::Member(leaf) => Some(leaf.u32()),
@@ -1713,6 +1715,33 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => bytes,
             ProcessedMessageContent::ProposalMessage(queued) => {
+                let admitted_profile = match self.strict_cutover_rejects_legacy_group_addition(
+                    context.group_id,
+                    matches!(queued.proposal(), Proposal::Add(_)),
+                ) {
+                    Ok(()) => true,
+                    // The outer proposal handler keeps the existing terminal
+                    // rejection behavior. Backend failures instead roll back
+                    // this receive transaction, including its source facts.
+                    Err(EngineError::InvalidTransition(_)) => false,
+                    Err(error) => return Err(error),
+                };
+                if admitted_profile
+                    && crate::app_components::authorize_standalone_proposal(mls_group, &queued)
+                        .is_ok()
+                    && let Some(source) = source.as_mut()
+                {
+                    crate::device_tag::bind_proposal_source_identity(
+                        source,
+                        queued.proposal_reference_ref().as_slice(),
+                    );
+                    self.storage.observe_authenticated_device_group_source(
+                        context.group_id,
+                        &context.msg.id,
+                        source,
+                        self.wall_clock.now_ms(),
+                    )?;
+                }
                 return Ok(DirectMessageContent::Proposal(queued));
             }
             ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
@@ -1731,6 +1760,15 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(DirectMessageContent::UnattributableApplication);
         };
         let payload = bytes.into_bytes();
+        if let Some(source) = source.as_mut() {
+            crate::device_tag::bind_application_source_identity(source, &payload);
+            self.storage.observe_authenticated_device_group_source(
+                context.group_id,
+                &context.msg.id,
+                source,
+                self.wall_clock.now_ms(),
+            )?;
+        }
         let app_event = match crate::app_payload::validate_app_payload_for_sender(&payload, &sender)
         {
             Ok(event) => event,

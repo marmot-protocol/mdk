@@ -286,6 +286,7 @@ pub(crate) unsafe fn deliver_bytes(
 /// Arg kinds: `str` (required string), `opt_str` (nullable string),
 /// `str_arr` (string array + length pair), `val: T` (scalar by value),
 /// `flag` (boolean as `uint8_t` — see [`crate::memory::c_bool`]),
+/// `has_f/f: opt_flag` (optional boolean as two `uint8_t` flags),
 /// `f/f_len: opt_num_arr T` (nullable scalar array + length pair; NULL
 /// with length 0 means unset).
 /// Return kinds: `unit`, `scalar(T)`, `string`, `bytes`, `rec(Mirror)`,
@@ -513,6 +514,13 @@ macro_rules! c_cmd {
         c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
             {$($p)* $f: u8,}
             {$($r)* let $f = crate::memory::c_bool($f);}
+            {$($a)* $f,}
+            $($($rest)*)?);
+    };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, ($($ret:tt)+), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*} $hf:ident/$f:ident: opt_flag $(, $($rest:tt)*)?) => {
+        c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
+            {$($p)* $hf: u8, $f: u8,}
+            {$($r)* let $f = crate::memory::c_optional_bool($hf, $f);}
             {$($a)* $f,}
             $($($rest)*)?);
     };
@@ -813,9 +821,21 @@ c_cmd! {
     /// string clears it. Fails while device groups are off, for an unknown
     /// device, or while the device group has an earlier change in flight
     /// (retry later). A rename whose commit loses a fork is made again later,
-    /// unless another rename of that device won. Re-read on the
+    /// unless another user edit of that device won. Re-read on the
     /// `LinkedDevicesChanged` event.
     async fn marmot_rename_linked_device(account_ref: str, slot_id_hex: str, label: str) -> unit = rename_linked_device;
+
+    /// Patch a linked device's settings off the UI thread. Each `has_` flag
+    /// selects its value; zero leaves it unchanged, nonzero means supplied.
+    /// Values also use zero=false, nonzero=true. Earlier lost edits recover
+    /// first; retry `device_group_busy` while they settle. Disabling add-to-all
+    /// does not leave chats; enabling history does not backfill joined chats.
+    /// Keep does not cancel explicit removal. Refused with nothing sent while
+    /// device groups are off (`roster_unsupported`), without a trusted device
+    /// group (`no_device_group`), for an unknown slot (`unknown_device`), or
+    /// while its roster cannot be read (`roster_unavailable`). Re-read on
+    /// LinkedDevicesChanged.
+    async fn marmot_update_linked_device_settings(account_ref: str, slot_id_hex: str, has_add_to_all_chats/add_to_all_chats: opt_flag, has_bring_history/bring_history: opt_flag, has_keep_while_inactive/keep_while_inactive: opt_flag) -> unit = update_linked_device_settings;
     /// Remove another of this account's devices, by its `slot_id_hex` from
     /// `marmot_linked_devices`, from the device group and every chat, and
     /// delete its KeyPackage slot. The removal is recorded at once and

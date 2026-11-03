@@ -289,11 +289,10 @@ async fn failing_catch_up_with(label: &str, frank_leaves: Option<FrankLeaves>) -
 
 impl FailingCatchUp {
     /// One scheduler-shaped attempt at the installed clock's time.
-    fn attempt(&mut self) -> Result<CanonicalizationResult, String> {
+    fn attempt(&mut self) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
         let now = self.clock.now().monotonic_ms;
         self.carol
             .converge_stored_openmls_messages_at(&self.group_id, now)
-            .map_err(|error| format!("{error:?}"))
     }
 
     fn retry(&self) -> Option<ConvergencePassRetry> {
@@ -380,7 +379,15 @@ async fn a_failing_convergence_pass_backs_off_then_parks_after_its_budget() {
 
     let mut expected_delay = CONVERGENCE_PASS_RETRY_BASE_MS;
     for failed_attempts in 1..=CONVERGENCE_PASS_PARK_AFTER_FAILURES {
-        assert!(case.attempt().is_err(), "attempt {failed_attempts} fails");
+        let failed = case.attempt();
+        assert!(
+            matches!(
+                &failed,
+                Err(OpenMlsProjectionError::Storage(detail))
+                    if detail.contains("injected put_group failure")
+            ),
+            "attempt {failed_attempts} must report the injected projection failure, got {failed:?}"
+        );
         assert_eq!(
             ALWAYS - case.fault.remaining(),
             failed_attempts as usize,
@@ -727,7 +734,11 @@ async fn an_unvalidated_group_reports_no_park_and_takes_no_retry() {
             .retry_failed_convergence_pass(&case.group_id)
             .unwrap()
     );
-    assert!(case.carol.check_group_live(&case.group_id).is_err());
+    let liveness = case.carol.check_group_live(&case.group_id);
+    assert!(
+        matches!(&liveness, Err(EngineError::UnknownGroup(id)) if id == &case.group_id),
+        "the quarantined group must report UnknownGroup, got {liveness:?}"
+    );
     assert!(!case.carol.convergence_pass_parked(&case.group_id).unwrap());
     assert_eq!(case.retry(), parked, "the stored pass is left as it was");
 }

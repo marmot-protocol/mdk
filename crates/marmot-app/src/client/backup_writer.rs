@@ -104,6 +104,83 @@ fn backup_error(reason: &'static str) -> AppError {
     AppError::DeviceGroupRefused(reason)
 }
 
+/// Read-only discovery evidence. A partial relay view may supply a usable
+/// pointer, but cannot prove absence or authorize catalog pruning.
+pub(super) struct BackupPointerDiscovery {
+    pub entries: Vec<PointerEntry>,
+    pub created_at: Option<u64>,
+    pub complete: bool,
+    any_complete: bool,
+}
+
+/// The writer retains its existing requirement that at least one relay
+/// answered in full before it can use this pass's pointer for deletion.
+pub(super) async fn read_backup_pointer(
+    relay_plane: &crate::MarmotRelayPlane,
+    endpoints: &[TransportEndpoint],
+    account_id_hex: &str,
+    key: &[u8],
+) -> Result<(Vec<PointerEntry>, u64), AppError> {
+    let discovery =
+        read_backup_pointer_discovery(relay_plane, endpoints, account_id_hex, key).await?;
+    if !discovery.any_complete {
+        return Err(backup_error("backup_pointer_unavailable"));
+    }
+    Ok((discovery.entries, discovery.created_at.unwrap_or(0)))
+}
+
+/// No ledger, deletion, publication, writer or recovery-setting action occurs.
+pub(super) async fn read_backup_pointer_discovery(
+    relay_plane: &crate::MarmotRelayPlane,
+    endpoints: &[TransportEndpoint],
+    account_id_hex: &str,
+    key: &[u8],
+) -> Result<BackupPointerDiscovery, AppError> {
+    let address = backup_address(key);
+    let query = DirectoryEventQuery::address(
+        KIND_BACKUP_POINTER,
+        account_id_hex,
+        address.clone(),
+        POINTER_FETCH_LIMIT,
+    );
+    let outcome = relay_plane
+        .fetch_directory_events_with_completion(endpoints.to_vec(), vec![query])
+        .await
+        .map_err(|_| backup_error("backup_pointer_unavailable"))?;
+    let any_complete = !outcome.complete_endpoints.is_empty();
+    // An empty request is never evidence that no pointer exists. Require
+    // completion from at least one endpoint that was actually requested.
+    let complete = outcome.complete
+        && outcome
+            .complete_endpoints
+            .iter()
+            .any(|endpoint| endpoints.contains(endpoint));
+    // Of two versions, the newer stands; on a tie, the lower id (NIP-01).
+    let newest = outcome
+        .records
+        .into_iter()
+        .map(|record| record.event)
+        .filter(|event| {
+            event.kind == KIND_BACKUP_POINTER
+                && event.pubkey == account_id_hex
+                && event.tag_values("d").contains(&address.as_str())
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
+    let (entries, created_at) = match newest {
+        Some(event) => (
+            BackupPointer::open(&event.content, key)?.backups,
+            Some(event.created_at),
+        ),
+        None => (Vec::new(), None),
+    };
+    Ok(BackupPointerDiscovery {
+        entries,
+        created_at,
+        complete,
+        any_complete,
+    })
+}
+
 /// Run `f` on the blocking pool: SQLite, AEAD and hashing on a runtime
 /// thread would stall every account's tasks.
 async fn blocking<T: Send + 'static>(
@@ -262,38 +339,13 @@ impl BackupPass {
     /// from no answer would drop every backup, and when the newest pointer
     /// does not open.
     async fn fetch_pointer(&self) -> Result<(Vec<PointerEntry>, u64), AppError> {
-        let address = backup_address(&self.key);
-        let query = DirectoryEventQuery::address(
-            KIND_BACKUP_POINTER,
+        read_backup_pointer(
+            &self.app.relay_plane,
+            &self.endpoints,
             &self.account_id_hex,
-            address.clone(),
-            POINTER_FETCH_LIMIT,
-        );
-        let outcome = self
-            .app
-            .relay_plane
-            .fetch_directory_events_with_completion(self.endpoints.clone(), vec![query])
-            .await
-            .map_err(|_| backup_error("backup_pointer_unavailable"))?;
-        if outcome.complete_endpoints.is_empty() {
-            return Err(backup_error("backup_pointer_unavailable"));
-        }
-        // Of two versions, the newer stands; on a tie, the lower id (NIP-01).
-        let newest = outcome
-            .records
-            .into_iter()
-            .map(|record| record.event)
-            .filter(|event| {
-                event.kind == KIND_BACKUP_POINTER
-                    && event.pubkey == self.account_id_hex
-                    && event.tag_values("d").contains(&address.as_str())
-            })
-            .max_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
-        let Some(event) = newest else {
-            return Ok((Vec::new(), 0));
-        };
-        let backups = BackupPointer::open(&event.content, &self.key)?.backups;
-        Ok((backups, event.created_at))
+            &self.key,
+        )
+        .await
     }
 
     /// Delete each condemned blob whose delete is due, unless `listed`
@@ -618,7 +670,7 @@ impl BackupPass {
 impl MarmotApp {
     /// The relays the account's backup pointer goes to and is read from:
     /// its NIP-65 write relays, else the directory's.
-    fn backup_pointer_endpoints(&self, account_id_hex: &str) -> Vec<TransportEndpoint> {
+    pub(super) fn backup_pointer_endpoints(&self, account_id_hex: &str) -> Vec<TransportEndpoint> {
         self.outbox_endpoints(
             account_id_hex,
             self.directory().directory_source_relays(&[]),

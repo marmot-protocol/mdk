@@ -15748,10 +15748,11 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
-        // Device-group kinds: heartbeat, private KeyPackage request and
+        // Device-group kinds: heartbeat, gap claim, private KeyPackage request and
         // hand-off, sibling Welcome, history delivery, small-state update and
         // broadcast request.
         457,
+        458,
         459,
         460,
         461,
@@ -20148,6 +20149,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_session::AccountDeviceEffects {
         published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+            publication_observation: None,
             authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
@@ -20767,6 +20769,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
         marmot_session::AccountDeviceEffects {
             published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                publication_observation: None,
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),

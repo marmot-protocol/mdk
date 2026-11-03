@@ -76,6 +76,7 @@ mod chat_history;
 pub use chat_history::DevSealedHistoryBundle;
 #[cfg(all(test, feature = "test-policy-overrides"))]
 pub(crate) use chat_history::newest_bundles_start;
+pub(crate) mod backup_restore;
 pub(crate) mod backup_writer;
 pub(crate) mod backups;
 pub(crate) mod compromise_warning;
@@ -101,6 +102,7 @@ pub(crate) mod recovery;
 mod recovery_coverage;
 pub(crate) mod recovery_runner;
 mod retention;
+pub(crate) mod sibling_chat_gaps;
 pub(crate) mod sign_ins;
 pub(crate) mod sign_out;
 mod small_state;
@@ -869,9 +871,13 @@ pub struct AppClient {
     /// The siblings this client found `leaving`, by slot, and when it
     /// decides to remove each: after its own random delay (mdk#2628 D67).
     pub(crate) leaving_siblings: HashMap<cgka_traits::app_components::DeviceSlotId, u64>,
+    /// Advisory claims and only the chats whose sibling membership needs a
+    /// check (mdk#2628 3.5e). Transient: a restart checks known chats anew.
+    pub(crate) sibling_chat_gaps: sibling_chat_gaps::SiblingChatGaps,
     /// Recovery words shown and not yet confirmed (mdk#2628 4.4a): in memory
     /// only, until they are confirmed or cancelled, or the client closes.
     pub(crate) pending_recovery_words: Option<backups::PendingRecoveryWords>,
+    pub(crate) backup_restore: backup_restore::BackupRestore,
     /// The last overdue-refresh answer a maintenance pass computed, and
     /// whether hosts owe a `KeyPackageRefreshOverdueChanged`. The flag starts
     /// set, since a fresh client cannot know what hosts last read.
@@ -1080,6 +1086,7 @@ pub struct AppClient {
     /// settles. A carrier the engine holds that is not here was in flight
     /// when the app last stopped, so its Welcome is owed again.
     pub(crate) sibling_welcome_carriers: HashSet<Vec<u8>>,
+    pub(crate) sibling_welcome_retirement_cursor: Option<Vec<u8>>,
     /// Durable failure level from the last successful maintenance summary read.
     pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
@@ -1597,18 +1604,25 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
-        self.drive_history_deliveries().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
+        self.drive_history_deliveries().await;
         let held = self.epoch_gap_held_groups()?;
         self.sync_key_package_announcement_group()?;
         self.sync_device_tag_group()?;
         self.join_stashed_sibling_welcomes().await;
         self.send_owed_sibling_welcomes(&held).await;
         let mut private_stock = private_key_packages::PrivateKeyPackageSelection::default();
-        self.add_linked_devices_to_chats(&held, &mut private_stock)
+        let sibling_add_attempts = self
+            .add_linked_devices_to_chats(&held, &mut private_stock)
             .await;
+        self.fill_sibling_chat_gaps(
+            &held,
+            linked_device_chats::LINK_CHAT_ADDS_PER_PASS.saturating_sub(sibling_add_attempts),
+            &mut private_stock,
+        )
+        .await;
         self.sibling_key_package_upkeep(&held).await;
         self.device_heartbeat_upkeep(&held).await;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
@@ -2771,15 +2785,9 @@ impl AppClient {
         // sibling delivery now, as for a later Add; any optional device-group
         // read or delivery failure leaves it owed for maintenance.
         if has_founding_siblings {
-            match self.epoch_gap_held_groups() {
-                Ok(held) => self.send_owed_sibling_welcomes(&held).await,
-                Err(error) => tracing::warn!(
-                    target: "marmot_app::client",
-                    method = "create_group",
-                    error_kind = error.privacy_safe_kind(),
-                    "initial sibling Welcome waits for device-group state"
-                ),
-            }
+            // The shared sender checks its device group's hold directly;
+            // unrelated chats may still be awaiting deferred hydration.
+            self.send_owed_sibling_welcomes(&[]).await;
         }
         Ok(CanonicalCreatedGroup {
             group_id,
