@@ -111,11 +111,11 @@ pub(super) fn advance(
                 next = sooner(next, Some(turn.now.saturating_add(delay)));
             }
         } else {
-            if let Some(state) = state {
-                if state.next_retry_at_seconds > turn.now {
-                    next = sooner(next, Some(state.next_retry_at_seconds));
-                    continue;
-                }
+            if let Some(state) = state
+                && state.next_retry_at_seconds > turn.now
+            {
+                next = sooner(next, Some(state.next_retry_at_seconds));
+                continue;
             }
             app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
         }
