@@ -387,6 +387,7 @@ struct FakeRelayClient {
     active_acquisitions: Arc<AtomicUsize>,
     acquisition_delays: Mutex<VecDeque<Duration>>,
     acquisition_holds: Mutex<VecDeque<(TransportEndpoint, Arc<AcquisitionHold>)>>,
+    panic_acquisition: Mutex<Option<(TransportEndpoint, Arc<Notify>)>>,
     hold_acquisition: AtomicBool,
     release_acquisition: Notify,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -459,6 +460,15 @@ impl NostrRelayClient for FakeRelayClient {
         let _active = ActiveAcquisition(self.active_acquisitions.clone());
         let endpoint = request.endpoints[0].clone();
         self.acquisitions.lock().unwrap().push(request.clone());
+        let panic_release = {
+            self.panic_acquisition.lock().unwrap().as_ref()
+                .filter(|(source, _)| same_relay(source, &endpoint))
+                .map(|(_, release)| release.clone())
+        };
+        if let Some(release) = panic_release {
+            release.notified().await;
+            panic!("scripted replay executor failure");
+        }
         let delay = self.acquisition_delays.lock().unwrap().pop_front();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -788,13 +798,15 @@ impl NostrRelayClient for BlockingUnsubscribeRelayClient {
     }
 }
 
-/// Records the maximum number of `unsubscribe` calls observed in flight at
-/// once. Each `unsubscribe` yields several times so that, absent serialization,
-/// a concurrent lifecycle op's `unsubscribe` would be seen overlapping.
+/// Holds the first unsubscribe while another lifecycle future is polled.
+/// An omitted lifecycle lock then reaches a second unsubscribe immediately.
 #[derive(Default)]
 struct UnsubscribeOverlapProbeRelayClient {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    calls: AtomicUsize,
+    entered: Notify,
+    release: Notify,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
 }
 
@@ -814,8 +826,9 @@ impl NostrRelayClient for UnsubscribeOverlapProbeRelayClient {
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(())
@@ -886,7 +899,6 @@ async fn concurrent_group_syncs_do_not_overlap_relay_unsubscribes() {
 
     // Each sync drops its account's only group, so each drains one unsubscribe.
     let adapter_a = Arc::clone(&adapter);
-    let adapter_b = Arc::clone(&adapter);
     let sync_a = tokio::spawn(async move {
         adapter_a
             .sync_account_groups(TransportGroupSync {
@@ -896,17 +908,19 @@ async fn concurrent_group_syncs_do_not_overlap_relay_unsubscribes() {
             })
             .await
     });
-    let sync_b = tokio::spawn(async move {
-        adapter_b
-            .sync_account_groups(TransportGroupSync {
-                account_id: bob,
-                group_subscriptions: vec![],
-                since: None,
-            })
-            .await
+    relay.entered.notified().await;
+    let sync_b = adapter.sync_account_groups(TransportGroupSync {
+        account_id: bob,
+        group_subscriptions: vec![],
+        since: None,
     });
+    tokio::pin!(sync_b);
+    assert!(poll_fn(|cx| Poll::Ready(sync_b.as_mut().poll(cx))).await.is_pending(),
+        "the second lifecycle operation waits while the first CLOSE is held");
+    assert_eq!(relay.calls.load(Ordering::SeqCst), 1);
+    relay.release.notify_one();
     sync_a.await.unwrap().expect("alice sync succeeds");
-    sync_b.await.unwrap().expect("bob sync succeeds");
+    sync_b.await.expect("bob sync succeeds");
 
     assert_eq!(
         relay.max_in_flight.load(Ordering::SeqCst),
@@ -987,7 +1001,7 @@ async fn group_replay_fans_out() {
     assert_ne!(first.received_at, first.message.timestamp);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconciled_group_event_routes_only_to_the_compared_account() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
@@ -1149,7 +1163,7 @@ async fn sync_account_groups_issues_added_group_subscriptions_concurrently() {
     assert_eq!(relay.subscriptions.lock().unwrap().len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn subscribed_group_event_becomes_account_scoped_delivery() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -1470,7 +1484,7 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
     let relay = Arc::new(FlakySubscribeRelayClient::default());
     relay.fail_subscribes.store(false, Ordering::SeqCst);
@@ -2175,7 +2189,7 @@ async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
     assert_eq!(adapter.subscription_synced("nope").await, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn synced_group_subscriptions_replace_old_routes() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -2258,7 +2272,7 @@ async fn synced_group_subscriptions_replace_old_routes() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -3105,7 +3119,7 @@ async fn a_repacked_family_counts_the_replay_inside_its_subscribe_window() {
 // Regression for mdk#337: a failed relay unsubscribe must not fail the sync or
 // leave the routing index serving the old group set. The removal takes effect
 // in routing state immediately; the relay-side teardown is queued for retry.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sync_with_failed_unsubscribe_returns_ok_and_routes_reflect_intent() {
     let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -3254,7 +3268,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
 // Regression for mdk#1389: cancelling `sync_account_groups` during the
 // post-commit unsubscribe drain must retain confirmed progress and requeue only
 // unresolved relay teardowns.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
     let relay = Arc::new(BlockingUnsubscribeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -3428,7 +3442,7 @@ async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
 }
 
 #[tokio::test]
-async fn pending_unsubscribe_for_readded_group_is_discarded_not_replayed() {
+async fn pending_unsubscribe_closes_only_the_replaced_batch() {
     let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
     let account_id = MemberId::new(vec![0xA1; 32]);
@@ -3690,7 +3704,7 @@ async fn group_sync_treats_endpoint_order_as_the_same_subscription() {
     assert_eq!(metrics.subscriptions_removed, 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn activating_existing_account_replaces_old_relay_state() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -3953,7 +3967,7 @@ async fn inbox_subscription_since_saturates_at_zero() {
 // `==` silently dropped events that differed only by a trailing slash (or host
 // case / default port). Here the group endpoint is stored slash-less while the
 // event arrives with the trailing slash a parsed `RelayUrl` carries.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn group_event_routes_despite_trailing_slash_mismatch() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -4287,7 +4301,7 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
 /// no longer frozen across a changed sync: the repack of a family moves each
 /// wanted route's obligation, on all of its relays, onto the batch that now
 /// carries it. The name is kept for grep-ability.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
@@ -6968,7 +6982,7 @@ async fn cancelled_group_sync_closes_the_reqs_it_installed() {
 /// straggler closes only its own abandoned REQ, and the retry's batch stays
 /// open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
+async fn retired_subscribe_closes_only_its_abandoned_batch() {
     let relay = Arc::new(ReleasableSubscribeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
     let account_id = MemberId::new(vec![0xA2; 32]);
@@ -7012,7 +7026,7 @@ async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
     adapter
         .sync_account_groups(TransportGroupSync {
             account_id: account_id.clone(),
-            group_subscriptions: vec![kept, added.clone()],
+            group_subscriptions: vec![kept.clone(), added.clone()],
             since: None,
         })
         .await
@@ -7031,7 +7045,14 @@ async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
         closes_of_added() == 2
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The observed CLOSE is produced while the straggler holds the lifecycle
+    // lock. A subsequent public lifecycle operation returns only after that
+    // producer released the lock; no settling sleep is needed.
+    adapter.sync_account_groups(TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![kept, added],
+        since: None,
+    }).await.expect("the straggler has finished its lifecycle work");
     assert_eq!(closes_of(&live_id), 0, "the live route's REQ stays open");
 }
 
@@ -7122,6 +7143,149 @@ async fn capture_ignores_refused_peer() {
     assert_replay_idle(&adapter, &account).await;
 }
 
+fn retained_delivery(
+    account: &MemberId,
+    group: &TransportGroupSubscription,
+    event: &NostrTransportEvent,
+) -> cgka_traits::TransportDelivery {
+    cgka_traits::TransportDelivery {
+        account_id: account.clone(),
+        group_id_hint: Some(group.group_id.clone()),
+        message: event.to_transport_message().unwrap(),
+        received_at: Timestamp(event.created_at + 1),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".into()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: Some(group.endpoints[0].clone()),
+            subscription_id: Some("durable-spill".into()),
+            wire: None,
+        },
+    }
+}
+
+#[tokio::test]
+async fn executor_failure_records_loss_cancels_io_and_preserves_retained_input() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xE1; 32]);
+    let mut group = sync_fixture_group(0xE2);
+    group.endpoints.push(TransportEndpoint("wss://sibling.example".into()));
+    let floor = 1_700_000_000;
+    let retained = group_event_at("durable supplement", &group, floor + 1);
+    let mut ingress = adapter.open_replay_ingress(&account,
+        vec![retained_delivery(&account, &group, &retained)]).await.unwrap();
+    adapter.activate_account(TransportAccountActivation {
+        account_id: account.clone(), inbox_endpoints: vec![],
+        group_subscriptions: vec![group.clone()], since: Some(Timestamp(floor)),
+    }).await.unwrap();
+    let id = group_subscription_id(&adapter, &account, &group).await;
+    let remote = group_event_at("unplaced remote history", &group, floor + 2);
+    route_group_copy(&adapter, &group, &id, &remote).await;
+    let panic_release = Arc::new(Notify::new());
+    *relay.panic_acquisition.lock().unwrap() = Some((group.endpoints[0].clone(), panic_release.clone()));
+    relay.hold_acquisition.store(true, Ordering::SeqCst);
+    *relay.retained.lock().unwrap() = Some(vec![]);
+    let credits = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut plan = capture_plan(&adapter, &account, 1).await;
+    assert_eq!(plan.sources.len(), 2);
+    plan.credit = Arc::new(credits.clone().acquire_owned().await.unwrap());
+    let capture = spawn_capture(&adapter, &account, plan);
+    wait_until("both real replay children entered acquisition", ||
+        relay.active_acquisitions.load(Ordering::SeqCst) == 2).await;
+    assert_eq!(credits.available_permits(), 0);
+    panic_release.notify_one();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), capture).await
+        .expect("executor failure settles its capture").unwrap(), ReplayCaptureOutcome::Incomplete);
+    // Account-wide execution loss uses the lowest issued query floor,
+    // including the inbox's NIP-59 timestamp allowance.
+    assert_eq!(replay_loss(&adapter, &account).await, NostrNotificationLossFloor::Since(floor - 172_800));
+    wait_until("all failed replay IO is destroyed before credit is free", ||
+        relay.active_acquisitions.load(Ordering::SeqCst) == 0 && credits.available_permits() == 1).await;
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
+    assert!(!adapter.account_subscription_eose(&account).await.complete());
+    {
+        let status = adapter.take_replay_status(&account).await;
+        assert!(status.sources().all(|source| !source.admitted()));
+    }
+    let transport_nostr_adapter::ReplayBatchTake::Ready(mut batch) = ingress.take_batch(Some(&group.group_id)).await else {
+        panic!("the durable supplement stays owned after executor failure");
+    };
+    assert_eq!(batch.delivery().unwrap().message, retained.to_transport_message().unwrap());
+    batch.acknowledge().await;
+    assert!(batch.delivery().is_none(), "the discarded remote body must not leak as a newer suffix");
+    batch.acknowledge().await;
+    drop(batch);
+    assert!(matches!(ingress.take_batch(None).await, transport_nostr_adapter::ReplayBatchTake::Empty));
+    assert_replay_idle(&adapter, &account).await;
+    assert_no_delivery(&adapter).await;
+}
+
+#[tokio::test]
+async fn local_publish_joins_native_history_and_fans_out_once_per_account_route() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let native = MemberId::new(vec![0xE3; 32]);
+    let legacy = MemberId::new(vec![0xE4; 32]);
+    let mut group = sync_fixture_group(0xE5);
+    group.endpoints.push(TransportEndpoint("wss://overlapping.example".into()));
+    let floor = 1_700_000_000;
+    let retained = group_event_at("retained prefix", &group, floor + 1);
+    let mut ingress = adapter.open_replay_ingress(&native,
+        vec![retained_delivery(&native, &group, &retained)]).await.unwrap();
+    assert!(!ingress.is_closed());
+    for account in [&native, &legacy] {
+        adapter.activate_account(TransportAccountActivation {
+            account_id: account.clone(), inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()], since: Some(Timestamp(floor)),
+        }).await.unwrap();
+    }
+    let id = group_subscription_id(&adapter, &native, &group).await;
+    let historical = group_event_at("remote history", &group, floor + 2);
+    let copy = NostrRelayEvent { endpoint: group.endpoints[0].clone(), subscription_id: Some(id.clone()), event: historical.clone() };
+    observe_copy(&adapter, &copy).await;
+    adapter.handle_group_relay_copy(copy, Some(&native)).await.unwrap();
+    let local = group_event_at("new local publication", &group, floor + 3);
+    let message = local.to_transport_message().unwrap();
+    let endpoints = vec![group.endpoints[0].clone(), group.endpoints[1].clone(), group.endpoints[0].clone()];
+    assert_eq!(adapter.deliver_local_publish(&message, &endpoints).await.unwrap(), 2);
+    let ordinary = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(ordinary.account_id, legacy);
+    assert_eq!(ordinary.group_id_hint, Some(group.group_id.clone()));
+    assert_eq!(ordinary.message, message);
+    assert_eq!(ordinary.source.subscription_id.as_deref(), Some("local-publish"));
+    assert_eq!(ordinary.source.endpoint.as_ref(), Some(&group.endpoints[0]));
+    assert_eq!(ordinary.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(ordinary.source.transport.0, "nostr");
+    assert!(ordinary.source.wire.is_none());
+    assert!(!adapter.account_subscription_eose(&native).await.complete(), "local fanout is no relay boundary");
+    assert!(matches!(ingress.take_batch(Some(&group.group_id)).await, transport_nostr_adapter::ReplayBatchTake::Pending));
+    for endpoint in &group.endpoints {
+        adapter.handle_relay_eose(endpoint.clone(), id.clone()).await;
+    }
+    let transport_nostr_adapter::ReplayBatchTake::Ready(mut batch) = ingress.take_batch(Some(&group.group_id)).await else {
+        panic!("EOSE admits the complete native range");
+    };
+    for event in [&retained, &historical, &local] {
+        let delivery = batch.delivery().expect("the entire original range precedes its local tail");
+        assert_eq!(delivery.account_id, native);
+        assert_eq!(delivery.message, event.to_transport_message().unwrap());
+        if event.id == local.id {
+            assert_eq!(delivery.source.subscription_id.as_deref(), Some("local-publish"));
+            assert!(delivery.source.wire.is_none());
+        }
+        batch.acknowledge().await;
+    }
+    assert!(batch.delivery().is_none());
+    batch.acknowledge().await;
+    drop(batch);
+    assert!(matches!(ingress.take_batch(None).await, transport_nostr_adapter::ReplayBatchTake::Empty));
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &native).await;
+    adapter.deactivate_account(&native).await.unwrap();
+    assert!(ingress.is_closed());
+    assert!(matches!(ingress.take_batch(None).await, transport_nostr_adapter::ReplayBatchTake::Empty));
+}
+
 /// A comparison deadline cuts the owner capture between pages. The page it
 /// already fetched is the obligation's own re-fetch: the cut mints no loss
 /// (which would restart the obligation), the source stays unadmitted, and the
@@ -7198,15 +7362,8 @@ async fn cut_capture_mints_no_loss() {
     let plan = capture_plan(&adapter, &account, 2).await;
     assert!(!plan.sources.is_empty());
     let capture = spawn_capture(&adapter, &account, plan);
-    for _ in 0..events.len() {
-        let delivery = tokio::time::timeout(Duration::from_secs(5), adapter.receive())
-            .await
-            .expect("the next grant re-fetches the cut window")
-            .unwrap()
-            .unwrap();
-        adapter
-            .ack_replay_delivery(&account, &delivery.message.id)
-            .await;
+    for event in &events {
+        assert_group_delivery(&adapter, &account, event).await;
     }
     assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Complete);
     assert_replay_idle(&adapter, &account).await;
@@ -9194,7 +9351,7 @@ async fn failed_peer_keeps_loss() {
 /// A replay that delivered a full page may have been clamped by the relay. A
 /// backend that cannot page backwards cannot prove the older history was
 /// served, so that relay's EOSE must not complete the coverage (#2263).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone() as Arc<dyn NostrRelayClient>);
@@ -9382,22 +9539,17 @@ async fn retired_straggler_close_cannot_interleave_with_a_retry() {
         relay.unsubscribes_held.load(Ordering::SeqCst) == 1
     })
     .await;
-    let retry = tokio::spawn({
-        let adapter = adapter.clone();
-        let sync = TransportGroupSync {
-            account_id: account_id.clone(),
-            group_subscriptions: vec![kept, added.clone()],
-            since: None,
-        };
-        async move { adapter.sync_account_groups(sync).await }
+    let retry = adapter.sync_account_groups(TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![kept, added.clone()],
+        since: None,
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::pin!(retry);
+    assert!(poll_fn(|cx| Poll::Ready(retry.as_mut().poll(cx))).await.is_pending(),
+        "the retry reaches the held straggler's lifecycle lock");
     relay.hold_unsubscribes.store(false, Ordering::SeqCst);
     relay.release_unsubscribes.notify_waiters();
-    retry
-        .await
-        .unwrap()
-        .expect("the retry makes the group live");
+    retry.await.expect("the retry makes the group live");
     // The straggler is detached: wait for its CLOSE to land as well.
     wait_until("the straggler's CLOSE lands", || {
         relay

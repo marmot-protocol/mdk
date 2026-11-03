@@ -894,6 +894,7 @@ mod tests {
     /// no arming of that count a fact, so the next prune drops it.
     #[tokio::test]
     async fn an_ended_count_admitted_later_is_no_fact() {
+        for immediate_prune in [true, false] {
         let (mut coverage, id, _) = fenced_coverage(true);
         let (tx, _rx) = mpsc::channel(8);
         replay(&mut coverage, &id, &[(0, 150)], &tx);
@@ -917,26 +918,30 @@ mod tests {
             .unwrap();
         coverage.record_eose(&id, RelayIndex(1), 0);
         assert_eq!(held_from(&coverage, 0), Some(SINCE));
-        // The count ends with nothing pruning at once.
-        coverage
-            .endpoint_deadlines
-            .get_mut(&id)
-            .unwrap()
-            .get_mut(&RelayIndex(1))
-            .unwrap()
-            .end_live_count();
+        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
+        if immediate_prune {
+            coverage.end_relay_live_counts(RelayIndex(1));
+            assert_eq!(held_from(&coverage, 0), None);
+        } else {
+            // End the count without pruning: ACK must not admit its stale arming.
+            coverage.endpoint_deadlines.get_mut(&id).unwrap()
+                .get_mut(&RelayIndex(1)).unwrap().end_live_count();
+        }
         coverage.ack_placement(&delivery(0, 150, 1, &id, 1).message.id);
         assert!(coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
-        assert!(
-            coverage.groups[&group_id(0)]
-                .fence
-                .as_ref()
-                .is_some_and(|fence| fence.armed.iter().all(|arming| arming.answerable.is_none())),
-            "the ended count is no fact"
-        );
+        if !immediate_prune {
+            assert!(
+                coverage.groups[&group_id(0)]
+                    .fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.armed.iter().all(|arming| arming.answerable.is_none())),
+                "the ended count is no fact"
+            );
+        }
         coverage.prune_fence_armings();
         assert_eq!(held_from(&coverage, 0), None);
         assert_eq!(released(&mut coverage), vec![(0, 160)]);
+            }
     }
 
     /// A clamped reply is paged backwards natively, so it fences nothing.

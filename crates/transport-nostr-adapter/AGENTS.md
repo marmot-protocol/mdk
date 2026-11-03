@@ -34,7 +34,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
-| `tests/publish_accounting.rs` | `sdk`-gated direct-adapter publish admission, classification, and cancellation tests. |
+| `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
 | `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp, NIP-77 saturated second, resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
@@ -315,7 +315,18 @@ Script only replies supported producers can deliver: optional SDK filter verific
 acquisition set already deduplicates identical events. A proxy's outbound FIFO marker does not prove the SDK processed
 inbound bytes, so it cannot replace the third-chunk cancellation test's receipt premise.
 
+Keep the native ingress public-registration and local-publication tests at the adapter boundary; the app's real-MLS
+local-publication journey separately owns plaintext and durable message preservation. Pausing an in-process fixture's
+Tokio clock must preserve its production replay leases and bounds. The signature/delivery proofs at the 32k replay
+bound run in nextest's `adapter-replay-bounds` group; do not reduce those bounds to cut their CPU cost.
+
 ```sh
 cargo test -p transport-nostr-adapter
 cargo test -p transport-nostr-adapter --features sdk
+```
+
+Run the ignored unchanged-subscription latency diagnostic manually, outside the ordinary suite:
+
+```sh
+cargo test -p transport-nostr-adapter --locked --test inbound_routing unchanged_sync_latency -- --ignored --exact --nocapture
 ```
