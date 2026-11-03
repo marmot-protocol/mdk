@@ -14,8 +14,15 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
-- Pinned OpenClaw development SDK: **`openclaw@2026.7.1-2`**.
-- Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
+- Pinned OpenClaw development SDK: **`openclaw@2026.10.10`**.
+- Toolchain: TypeScript, pnpm 10.13.1, Node 24.22.1+ (24.x) or 26.12.1+, Vitest.
+
+The installed host supplies the SDK as a peer dependency. The optional-peer
+marker prevents package managers from installing a second host; OpenClaw itself
+enforces the declared host/API minimum when loading the plugin. The Node floor
+also satisfies the host’s SQLite WAL-safety requirement for durable reply queues.
+Source entries are paired with explicit built JavaScript runtime entries in
+`package.json`.
 
 ## Contents
 
@@ -194,9 +201,11 @@ GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH
 
 Prerequisites:
 
-- OpenClaw host **2026.7.1 or newer**. The installer validates the existing
-  host and never installs or upgrades OpenClaw.
-- Node ≥ 22.19
+- OpenClaw host **2026.10.10 or newer**. The installer validates the existing
+  host and never installs or upgrades OpenClaw. The SDK and current beta
+  compatibility lane are both pinned to `2026.10.10`; the minimum is an API
+  floor, not a promise that every future host release is compatible.
+- Node 24.22.1+ (24.x) or 26.12.1+
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 - The plugin and `wn-agent` are released as one cohort. Install both from the
   same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
@@ -269,6 +278,11 @@ OpenClaw keeps its isolated default connector home. Reusing the same identity in
 another connector home, such as Hermes's, requires a separate explicit import;
 the installers never opt into shared home/socket state silently.
 
+For the SHA256-verified release archive, `--yes` also supplies OpenClaw's
+required source and capability consent (`plugins install --force
+--accept-capabilities`). OpenClaw installation-policy blocks still stop
+installation.
+
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically.
 
@@ -320,7 +334,7 @@ preserves an existing `senderPolicy`.
 
 ```sh
 just openclaw-dev-test                 # pnpm install + typecheck + vitest
-just openclaw-host-compat-test         # build + focused runtime tests on supported beta
+just openclaw-host-compat-test         # build + packaged runtime tests on pinned beta
 # The script installs into a throwaway tree and sets isolated OPENCLAW_HOME /
 # OPENCLAW_STATE_DIR so host registry state cannot leak from the operator home.
 # Beta send_final uses OpenClaw's SQLite delivery queue. On Node whose embedded
@@ -391,6 +405,14 @@ inbound runtime, and verifies the deterministic reply is sent back through
 relay, phone, or OpenClaw gateway.
 
 ## Docker phone test
+
+The image runs OpenClaw and the plugin SDK from the same frozen dependency graph,
+including its security overrides. Its Node image is pinned to `24.22.1` and its
+OpenClaw default is `2026.10.10`. The `OPENCLAW_VERSION` build argument must match
+the development SDK pin and committed lockfiles; update them together. The
+image packs the built plugin once and installs that archive at startup, using
+the same peer-linking path as a release install.
+
 
 A Compose profile builds a container with `wn-agent`, OpenClaw, this plugin, and
 `qrencode`. It starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1`

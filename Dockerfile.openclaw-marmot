@@ -1,36 +1,41 @@
-FROM rust:1.91-bookworm
+FROM rust:1.97.1-bookworm AS rust-toolchain
 
-ARG OPENCLAW_VERSION=2026.6.8
+FROM node:24.22.1-bookworm AS openclaw-runtime
+
+ARG OPENCLAW_VERSION=2026.10.10
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        libssl-dev \
-        pkg-config \
-        qrencode \
-        tini \
-        xxd \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+        ca-certificates curl git libssl-dev pkg-config qrencode tini xxd \
     && rm -rf /var/lib/apt/lists/* \
     && corepack enable \
-    && npm install -g "openclaw@${OPENCLAW_VERSION}"
+    && corepack prepare pnpm@10.13.1 --activate
 
-# Pin pnpm to match the committed pnpm-lock.yaml (lockfileVersion 9.0, generated
-# by pnpm 10.x). Without this, corepack downloads an unpinned pnpm on every
-# build; `.npmrc` (manage-package-manager-versions=false) keeps this pin from
-# being hijacked by openclaw's own packageManager field.
-RUN corepack prepare pnpm@10.13.1 --activate
+# Run the host and plugin SDK from one audited, frozen dependency graph. A
+# separate global npm install would bypass the security overrides and could
+# resolve a different SDK instance from the one the plugin was tested against.
+WORKDIR /work/mdk/integrations/openclaw/marmot
+COPY integrations/openclaw/marmot/package.json integrations/openclaw/marmot/pnpm-lock.yaml integrations/openclaw/marmot/pnpm-workspace.yaml integrations/openclaw/marmot/.npmrc ./
+RUN node -e 'const expected = process.argv[1]; const actual = require("./package.json").devDependencies.openclaw; if (expected !== actual) { console.error("OPENCLAW_VERSION must match the committed SDK pin and lockfile"); process.exit(1); }' "$OPENCLAW_VERSION" \
+    && pnpm install --frozen-lockfile \
+    && ln -s /work/mdk/integrations/openclaw/marmot/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw
+
+FROM openclaw-runtime AS openclaw-marmot
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
 
 WORKDIR /work/mdk
 COPY . .
 
-RUN cargo build --locked --release -p agent-connector --bin wn-agent \
+# Keep compiler output out of the image and reuse it when only plugin code changes.
+RUN --mount=type=cache,id=mdk-openclaw-target,target=/work/mdk/target,sharing=locked \
+    cargo build --locked --release -p agent-connector --bin wn-agent \
     && install -m 0755 target/release/wn-agent /usr/local/bin/wn-agent \
     && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
-    && ( cd integrations/openclaw/marmot && pnpm install && pnpm build )
+    && mkdir -p /opt/marmot-plugin \
+    && ( cd integrations/openclaw/marmot && pnpm build && pnpm pack --pack-destination /opt/marmot-plugin )
 
 # Development phone-test image only. Do not copy the permissive invite/debug
 # controls below into a production image; use an explicit invite allowlist and

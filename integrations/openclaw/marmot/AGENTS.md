@@ -43,7 +43,9 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
 - `src/security.ts` — OpenClaw `dm.allowFrom` → `wn-agent` welcomer allowlist sync.
 - `src/sender-policy.ts` — account-global inbound sender ACL (distinct from welcomers).
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
-- `index.ts` / `setup-entry.ts` — plugin runtime + setup entries.
+- `index.ts` / `setup-entry.ts` — source entries; package metadata pairs them with built `dist/` runtime entries.
+- `src/openclaw-file-access.d.ts` — narrow declarations for the SDK’s public, untyped file-access runtime export.
+- `test/openclaw-loader.ts` — typed test facade over the host’s private loader; no production imports.
 - `scripts/wn-agent-smoketest.ts` — standalone control-plane smoke test (not built or type-checked).
 - `test/` — Vitest unit and connector tests; `test/readme-version.test.ts` requires README.md to state the pinned SDK
   and host minimum derived from `package.json` (keep those README sentences verbatim when editing).
@@ -53,7 +55,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` and `
 - Keep the `openclaw` dependency pinned; before bumping, verify the
   `openclaw/plugin-sdk/*` subpath exports against the new version's types, and
   re-verify the deliberate test-only `dist/plugins/loader.js` import used by the
-  connector E2E (the pinned SDK exposes no supported plugin-loader subpath).
+  connector E2E through `test/openclaw-loader.ts` (the SDK exposes no supported typed plugin-loader subpath).
 - Keep `test/plugin-sdk-surface.test.ts` in sync when adding or removing a
   runtime (non-type) `openclaw/plugin-sdk/*` import. A named import the host SDK
   no longer exports is an ESM link error that fails the *whole* plugin load, not
