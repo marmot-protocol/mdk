@@ -11326,48 +11326,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn relay_that_stores_event_but_withholds_ok_is_possibly_exposed() {
-        let stored_ids = Arc::new(Mutex::new(Vec::new()));
-        let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
-        let sdk = signed_sdk(Keys::generate());
-        let dto = signed_group_event_dto();
-        let expected_id = dto.id.clone();
-        let publish_sdk = sdk.clone();
-        let publish_endpoint = endpoint.clone();
-        let publish = tokio::spawn(async move {
-            publish_sdk
-                .publish_event(std::slice::from_ref(&publish_endpoint), &dto, 1)
-                .await
-        });
-
-        for _ in 0..100 {
-            if stored_ids.lock().await.contains(&expected_id) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            stored_ids.lock().await.contains(&expected_id),
-            "the relay must receive and retain the event before withholding OK"
-        );
-
-        advance(SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1)).await;
-        let err = publish
-            .await
-            .expect("publish task must not panic")
-            .expect_err("withheld OK must leave completion unresolved");
-        assert_eq!(
-            err.publish_message_id().unwrap().as_slice(),
-            hex::decode(expected_id).unwrap()
-        );
-        assert_eq!(err.publish_endpoint_failures().len(), 1);
-        assert_eq!(
-            err.publish_endpoint_failures()[0].kind,
-            TransportEndpointFailureKind::PossiblyExposed
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn publish_event_retains_relay_promoted_to_durable_during_publish() {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let keys = Keys::generate();

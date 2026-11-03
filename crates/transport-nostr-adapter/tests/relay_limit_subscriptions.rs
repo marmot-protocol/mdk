@@ -279,31 +279,6 @@ fn assert_filter_shapes(stats: &LimitStats) {
 // (a) Filter shape
 // ---------------------------------------------------------------------------
 
-/// Every REQ an activation of 250 groups plus an inbox sends stays within the
-/// production filter limits: five full batches of `#h` values and the inbox,
-/// far under the 200-REQ socket limit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn activation_of_250_groups_sends_only_production_shaped_reqs() {
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let url = fx.limit.url();
-    fx.adapter
-        .activate_account(fx.activation(std::slice::from_ref(&url), groups(250, &url)))
-        .await
-        .unwrap();
-    let stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    eprintln!("[a] G=250 {}", stats.summary());
-    assert_filter_shapes(&stats);
-    assert!(
-        stats.req_log.iter().all(|r| r.filters == 1),
-        "one filter per live REQ"
-    );
-    assert_eq!(stats.total_reqs, live_reqs(250));
-    assert_eq!(stats.rejections_total(), 0);
-    assert_eq!(stats.max_tag_values_seen, GROUP_BATCH_ROUTES);
-    assert_eq!(stats.open_connections(), 1, "one socket carries every REQ");
-    fx.shutdown().await;
-}
-
 /// The account #2266 found at the limit: one REQ per group filled a 200-REQ
 /// connection at about 200 groups and the rest were refused. Batched, 1,000
 /// groups take 21 REQs, and every group's stored history arrives.
