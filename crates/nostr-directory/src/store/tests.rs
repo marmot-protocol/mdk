@@ -351,3 +351,149 @@ async fn change_callback_observes_full_write_and_preserves_a_reentrant_update() 
     plane.shutdown().await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_ingress_authenticates_before_writing_either_store() {
+    use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
+    use transport_nostr_peeler::NostrTransportEvent;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("directory.sqlite3");
+    let key = storage_sqlite::SqlCipherKey::raw([0x25; 32]);
+    let cache = DirectoryCache::open(path.clone(), &key).unwrap();
+    let shared = SqliteSharedStorage::in_memory().unwrap();
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
+    let resources = Resources {
+        account: DirectoryAccount {
+            account_id_hex: author.clone(),
+            label: "fixture".into(),
+            local_signing: true,
+            active_signing: true,
+        },
+        cache: cache.clone(),
+        shared: shared.clone(),
+        changed: None,
+    };
+    let plane = MarmotRelayPlane::full_history();
+    let directory = Directory::new(
+        resources,
+        DirectoryConfig {
+            directory_relays: vec![],
+            default_relays: vec![],
+            max_future_skew: Duration::from_secs(60),
+            open_ranking: None,
+            fallback_seeds: vec![],
+            http_builder: Ok,
+            test_clock: None,
+        },
+        plane.clone(),
+        DirectoryState::default(),
+    );
+    let record = |event| RelayEventRecord {
+        endpoints: vec![cgka_traits::TransportEndpoint(
+            "wss://source.example".into(),
+        )],
+        event,
+    };
+    for (kind, tag_name) in [(0, "p"), (3, "p"), (10002, "r"), (10050, "relay")] {
+        let signed = |created_at, value: &str| {
+            let event = EventBuilder::new(Kind::from(kind), format!(r#"{{"name":"{value}"}}"#))
+                .tags([Tag::parse([tag_name, value]).unwrap()])
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .unwrap();
+            NostrTransportEvent::from_nostr_event(&event).unwrap()
+        };
+        let first_follow = Keys::generate().public_key().to_hex();
+        let second_follow = Keys::generate().public_key().to_hex();
+        let initial = signed(
+            100,
+            if kind == 3 {
+                &first_follow
+            } else {
+                "wss://initial.example"
+            },
+        );
+        let newer = signed(
+            200,
+            if kind == 3 {
+                &second_follow
+            } else {
+                "wss://newer.example"
+            },
+        );
+        let before = shared.public_directory_user(&author).unwrap();
+        let mut unsigned = newer.clone();
+        unsigned.sig = None;
+        directory
+            .ingest_directory_relay_event(record(unsigned))
+            .unwrap();
+        assert_eq!(
+            shared.public_directory_user(&author).unwrap(),
+            before,
+            "an unsigned event must not create or change a directory row"
+        );
+        directory
+            .ingest_directory_relay_event(record(initial.clone()))
+            .unwrap();
+        let stored = cache.entry(&author).unwrap();
+        let published = shared.public_directory_user(&author).unwrap();
+        assert!(
+            stored.is_some(),
+            "the signed control must actually be stored"
+        );
+        let mut tampered = newer.clone();
+        tampered.id = initial.id.clone();
+        let mut invalid_signature = newer.clone();
+        invalid_signature.sig = Some("00".repeat(64));
+        for invalid in [tampered, invalid_signature] {
+            directory
+                .ingest_directory_relay_event(record(invalid))
+                .unwrap();
+            assert_eq!(
+                cache.entry(&author).unwrap(),
+                stored,
+                "kind {kind}: cache changed"
+            );
+            assert_eq!(
+                shared.public_directory_user(&author).unwrap(),
+                published,
+                "kind {kind}: shared row changed"
+            );
+        }
+        directory
+            .ingest_directory_relay_event(record(newer.clone()))
+            .unwrap();
+        assert_ne!(
+            cache.entry(&author).unwrap(),
+            stored,
+            "a valid newer event must win"
+        );
+        let latest = cache.entry(&author).unwrap();
+        // Follow edges do not retain a timestamp; only profiles and relay
+        // lists have stale-event ordering at this ingress.
+        let replays = if kind == 3 {
+            vec![newer]
+        } else {
+            vec![newer, initial]
+        };
+        for duplicate_or_stale in replays {
+            directory
+                .ingest_directory_relay_event(record(duplicate_or_stale))
+                .unwrap();
+            assert_eq!(
+                cache.entry(&author).unwrap(),
+                latest,
+                "duplicate and stale authenticated events preserve freshness"
+            );
+        }
+    }
+    let expected = cache.entry(&author).unwrap();
+    cache.close().unwrap();
+    let reopened = DirectoryCache::open(path, &key).unwrap();
+    assert_eq!(reopened.entry(&author).unwrap(), expected);
+    reopened.close().unwrap();
+    shared.close().unwrap();
+    plane.shutdown().await;
+}

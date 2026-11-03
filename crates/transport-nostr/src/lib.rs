@@ -2796,6 +2796,11 @@ fn spawn_directory_notification_forwarder(
                     subscription_id,
                     event,
                 })) => {
+                    // SDK admission and seen-state are not authentication at
+                    // MDK's directory boundary (mdk#2521).
+                    if event.verify().is_err() {
+                        continue;
+                    }
                     let subscription_id = subscription_id.to_string();
                     if let Ok(event) = NostrTransportEvent::from_nostr_event(&event)
                         && directory
