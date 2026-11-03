@@ -2462,11 +2462,11 @@ async fn neg_waits_cancel_and_isolate() {
         ));
         assert!(
             futures::poll!(queued.as_mut()).is_pending(),
-            "the actual call waits behind the eight observed NEG owners"
+            "the queued reconciliation is actually polled to Pending"
         );
         assert!(owners.iter().all(|owner| !owner.is_finished()));
         assert_eq!(fx.limit.stats().neg_active_now(), 8);
-        // Drop the polled production future while its permit is unavailable.
+        // Drop this polled future before releasing the eight active NEG owners.
     }
     assert_eq!(fx.limit.stats().neg_opens, 8);
     for owner in &owners {
