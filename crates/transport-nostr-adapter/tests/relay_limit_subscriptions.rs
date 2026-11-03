@@ -28,8 +28,9 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client, ClientMessage, ClientNotification, EventBuilder, FinalizeEvent, Keys, Kind,
-    NotificationUpdate, RelayMessage, RelayOptions, SubscriptionId, Tag,
+    Client, ClientMessage, ClientNotification, ErrorKind as SdkErrorKind, EventBuilder, Filter,
+    FinalizeEvent, Keys, Kind, NotificationUpdate, RelayMessage, RelayOptions, RelayStatus,
+    SubscriptionId, SyncOptions, Tag,
 };
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
@@ -326,8 +327,14 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
         stats.summary()
     );
     assert_filter_shapes(&stats);
+    assert!(
+        stats.req_log.iter().all(|request| request.filters == 1),
+        "one filter per live REQ"
+    );
     assert_eq!(stats.total_reqs, live_reqs(G));
     assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(stats.max_tag_values_seen, GROUP_BATCH_ROUTES);
+    assert_eq!(stats.open_connections(), 1, "one socket carries every REQ");
     assert_eq!(
         delivered.len(),
         G,
@@ -1731,9 +1738,23 @@ async fn dead_relay(sdk: &NostrSdkRelayClient) -> String {
         .await
         .unwrap();
     sdk.client().connect().await;
-    // `ensure_operational` needs >1 failed attempt and the connect timeout
-    // elapsed since wake-up, measured in whole seconds.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let relay = sdk.client().relay(url.as_str()).await.unwrap().unwrap();
+    // Status and attempt counters alone are insufficient: the SDK also checks
+    // a private whole-second wake stamp. Observe the actual sync preflight
+    // guard rather than assuming that a readiness sleep has elapsed it.
+    tokio::time::timeout(SETTLE_TIMEOUT, async {
+        loop {
+            let probe = relay.sync(Filter::new().kind(Kind::MlsGroupMessage))
+                .items(std::iter::empty())
+                .opts(SyncOptions::new().initial_timeout(Duration::from_millis(1)).dry_run())
+                .with_outcomes().await;
+            if matches!(probe, Err(ref error)
+                if error.kind() == SdkErrorKind::State && error.to_string() == "relay not connected") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the SDK must observe the endpoint as non-operational");
     url
 }
 
@@ -1867,10 +1888,9 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_activation_futures_leave_no_untracked_reqs() {
     const G: usize = 150;
-    const DROPS: u32 = 60;
+    const DROPS: usize = 60;
     let fx = Fixture::new(LimitConfig::default(), true).await;
     let url = fx.limit.url();
-    // Calibrate one full activation, then cancel at fractions of it.
     let started = Instant::now();
     fx.adapter
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url)))
@@ -1878,9 +1898,12 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
         .unwrap();
     let full = started.elapsed();
     fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    // Preserve the earlier timing sweep's opportunities to cut the old REQ
+    // teardown as well as registration. Its fractions alone are not proof
+    // that any cancellation reached registration, so add that observed stage.
     let mut completed = 0;
     for step in 0..DROPS {
-        let fraction = f64::from(step % 15 + 1) / 16.0;
+        let fraction = (step % 15 + 1) as f64 / 16.0;
         let budget = full.mul_f64(fraction).max(Duration::from_micros(100));
         let outcome = tokio::time::timeout(
             budget,
@@ -1888,12 +1911,87 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
                 .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url))),
         )
         .await;
-        completed += usize::from(outcome.is_ok());
+        if let Ok(result) = outcome {
+            result.unwrap();
+            completed += 1;
+        }
+    }
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url)))
+        .await
+        .unwrap();
+    let mut cancelled_after_req = 0;
+    for _ in 0..DROPS {
+        let attempt = fx
+            .adapter
+            .account_subscription_attempt(&fx.account)
+            .await
+            .unwrap()
+            .next();
+        let inbox_id = NostrSubscription::AccountInbox {
+            account_id: fx.account.clone(),
+            endpoints: vec![TransportEndpoint(url.clone())],
+            since: None,
+            attempt,
+        }
+        .subscription_id();
+        let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
+        let mut activation = Box::pin(
+            fx.adapter
+                .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url))),
+        );
+        let mut polled_pending = false;
+        tokio::time::timeout(SETTLE_TIMEOUT, async {
+            loop {
+                if polled_pending
+                    && relay
+                        .subscription(&SubscriptionId::new(&inbox_id))
+                        .await
+                        .is_some()
+                {
+                    assert!(
+                        fx.limit
+                            .wait_for(SETTLE_TIMEOUT, |stats| stats
+                                .req_log
+                                .iter()
+                                .any(|req| req.subscription_id == inbox_id))
+                            .await,
+                        "the cancelled attempt's own registered inbox reaches the wire"
+                    );
+                    cancelled_after_req += 1;
+                    break;
+                }
+                match futures::poll!(activation.as_mut()) {
+                    std::task::Poll::Ready(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    std::task::Poll::Pending => polled_pending = true,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("activation reaches a real registered REQ or completes");
+        drop(activation);
+        // Settle the detached siblings through the real lifecycle boundary,
+        // then obtain the next attempt from this completed activation.
+        fx.adapter
+            .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url)))
+            .await
+            .unwrap();
+        if cancelled_after_req != 0 {
+            break;
+        }
     }
     eprintln!(
-        "[d] full_activation_ms={} dropped={}/{DROPS}",
+        "[d] full_activation_ms={} timed_drops={}/{DROPS} cancelled_after_wire_req={cancelled_after_req}",
         full.as_millis(),
-        DROPS as usize - completed
+        DROPS - completed
+    );
+    assert!(
+        cancelled_after_req > 0,
+        "the test must actually cancel registered activations"
     );
     let check = leak_check(&fx, G, "after dropped activations").await;
     assert_eq!(check.active_after_activation, live_reqs(G), "{check:?}");
@@ -2074,14 +2172,8 @@ fn route_on(endpoints: &[String], account: &MemberId) -> NostrSubscription {
     }
 }
 
-/// One reconciliation pass as the recovery owner runs it, with the caller's
-/// `allowance`, optionally dropped after `budget`.
-async fn reconcile_pass(
-    fx: &Fixture,
-    endpoints: &[String],
-    allowance: Duration,
-    budget: Option<Duration>,
-) -> Pass {
+/// One completed reconciliation pass with the recovery owner's allowance.
+async fn reconcile_pass(fx: &Fixture, endpoints: &[String], allowance: Duration) -> Pass {
     let cursor = Cursor::default();
     let started = Instant::now();
     let pass = fx.sdk.reconcile_subscription(
@@ -2092,17 +2184,12 @@ async fn reconcile_pass(
         &cursor,
         tokio::time::Instant::now() + allowance,
     );
-    let result = match budget {
-        Some(budget) => tokio::time::timeout(budget, pass).await.ok(),
-        None => Some(pass.await),
-    };
-    let outcome = match result {
-        Some(Ok((summary, events))) => PassOutcome::Ok {
+    let outcome = match pass.await {
+        Ok((summary, events)) => PassOutcome::Ok {
             relays_failed: summary.relays_failed,
             returned: events.len(),
         },
-        Some(Err(_)) => PassOutcome::Err,
-        None => PassOutcome::Dropped,
+        Err(_) => PassOutcome::Err,
     };
     Pass {
         elapsed: started.elapsed(),
@@ -2378,25 +2465,24 @@ async fn neg_waits_cancel_and_isolate() {
         8,
         "expired wait cannot open NEG"
     );
-    let queued = {
-        let sdk = fx.sdk.clone();
-        let subscription = reconciliation_route(&url, &fx.account);
-        tokio::spawn(async move {
-            sdk.reconcile_subscription(
-                subscription,
-                &[],
-                SINCE,
-                UNTIL,
-                &Cursor::default(),
-                tokio::time::Instant::now() + SETTLE_TIMEOUT,
-            )
-            .await
-        })
-    };
-    // Let the queued call enter its wait while all eight relay sessions remain live.
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    queued.abort();
-    assert!(queued.await.unwrap_err().is_cancelled());
+    {
+        let cursor = Cursor::default();
+        let mut queued = Box::pin(fx.sdk.reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + SETTLE_TIMEOUT,
+        ));
+        assert!(
+            futures::poll!(queued.as_mut()).is_pending(),
+            "the actual call waits behind the eight observed NEG owners"
+        );
+        assert!(owners.iter().all(|owner| !owner.is_finished()));
+        assert_eq!(fx.limit.stats().neg_active_now(), 8);
+        // Drop the polled production future while its permit is unavailable.
+    }
     assert_eq!(fx.limit.stats().neg_opens, 8);
     for owner in &owners {
         owner.abort();
@@ -2452,7 +2538,7 @@ async fn neg_sessions_return_to_zero_after_each_completed_pass() {
     let mut unhealthy = 0;
     let started = Instant::now();
     for _ in 0..PASSES {
-        let pass = reconcile_pass(&fx, std::slice::from_ref(&url), SETTLE_TIMEOUT, None).await;
+        let pass = reconcile_pass(&fx, std::slice::from_ref(&url), SETTLE_TIMEOUT).await;
         unhealthy += usize::from(!pass.healthy());
         lingering.push(neg_sessions_after_pass(&fx).await);
     }
@@ -2490,26 +2576,16 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
     };
     let (fx, url) = connected_fixture(config, 10).await;
     let endpoints = std::slice::from_ref(&url);
-    let cases: [(&str, NegFault, Option<Duration>, usize); 6] = [
-        ("completion", NegFault::None, None, 3),
-        ("neg_err", NegFault::ErrOnOpen, None, 3),
-        ("first_reply_timeout", NegFault::SilentOpen, None, 3),
-        ("route_deadline", NegFault::FingerprintLoop, None, 2),
-        (
-            "dropped_awaiting_reply",
-            NegFault::SilentOpen,
-            Some(Duration::from_millis(100)),
-            3,
-        ),
-        (
-            "dropped_mid_pass",
-            NegFault::None,
-            Some(Duration::from_millis(2)),
-            6,
-        ),
+    let cases: [(&str, NegFault, bool, usize); 6] = [
+        ("completion", NegFault::None, false, 3),
+        ("neg_err", NegFault::ErrOnOpen, false, 3),
+        ("first_reply_timeout", NegFault::SilentOpen, false, 3),
+        ("route_deadline", NegFault::FingerprintLoop, false, 2),
+        ("dropped_awaiting_reply", NegFault::SilentOpen, true, 3),
+        ("dropped_mid_pass", NegFault::StallAfterReply, true, 6),
     ];
     let mut report = Vec::new();
-    for (label, fault, budget, passes) in cases {
+    for (label, fault, dropped, passes) in cases {
         fx.limit.set_neg_fault(fault);
         let rounds_before = fx.limit.stats().neg_fingerprint_rounds;
         // A comparison that never converges runs to the caller's deadline.
@@ -2521,9 +2597,66 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
         let mut latencies = Vec::new();
         let mut outcomes = Vec::new();
         for _ in 0..passes {
-            let pass = reconcile_pass(&fx, endpoints, allowance, budget).await;
+            let pass = if dropped {
+                let before = fx.limit.stats();
+                let cursor = Cursor::default();
+                let started = Instant::now();
+                let mut pass = Box::pin(fx.sdk.reconcile_subscription(
+                    route_on(endpoints, &fx.account),
+                    &[],
+                    SINCE,
+                    UNTIL,
+                    &cursor,
+                    tokio::time::Instant::now() + allowance,
+                ));
+                tokio::select! {
+                    result = pass.as_mut() => {
+                        let exit = if result.is_ok() { "completed" } else { "errored" };
+                        panic!("{label}: {exit} before its observed drop stage");
+                    }
+                    observed = fx.limit.wait_for(SETTLE_TIMEOUT, |stats| match fault {
+                        NegFault::SilentOpen => stats.neg_opens > before.neg_opens,
+                        NegFault::StallAfterReply => stats.neg_fingerprint_rounds > before.neg_fingerprint_rounds,
+                        _ => unreachable!(),
+                    }) => assert!(observed, "{label}: its actual NEG activity never occurred"),
+                }
+                assert!(
+                    futures::poll!(pass.as_mut()).is_pending(),
+                    "{label}: the request must still be active"
+                );
+                drop(pass);
+                Pass {
+                    elapsed: started.elapsed(),
+                    outcome: PassOutcome::Dropped,
+                }
+            } else {
+                reconcile_pass(&fx, endpoints, allowance).await
+            };
+            if dropped {
+                assert!(matches!(pass.outcome, PassOutcome::Dropped), "{label}");
+            } else if fault == NegFault::None {
+                assert!(pass.healthy(), "{label}: {pass:?}");
+            } else {
+                assert!(
+                    matches!(
+                        pass.outcome,
+                        PassOutcome::Ok {
+                            relays_failed: 1,
+                            ..
+                        }
+                    ),
+                    "{label}: {pass:?}"
+                );
+            }
             latencies.push(pass.elapsed.as_millis());
             outcomes.push(format!("{:?}", pass.outcome));
+            if dropped {
+                assert_eq!(
+                    neg_sessions_after_pass(&fx).await,
+                    0,
+                    "{label}: observed cancellation must free its scarce NEG slot before the next pass"
+                );
+            }
         }
         let lingering = neg_sessions_after_pass(&fx).await;
         if fault == NegFault::FingerprintLoop {
@@ -2534,7 +2667,7 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
         }
         fx.limit.set_neg_fault(NegFault::None);
         let notices_before = fx.limit.stats().neg_cap_notices;
-        let probe = reconcile_pass(&fx, endpoints, SETTLE_TIMEOUT, None).await;
+        let probe = reconcile_pass(&fx, endpoints, SETTLE_TIMEOUT).await;
         let probe_lingering = neg_sessions_after_pass(&fx).await;
         let notices = fx.limit.stats().neg_cap_notices - notices_before;
         eprintln!(
@@ -2561,18 +2694,20 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
 // (g) Fast and slow reconciliation failures
 // ---------------------------------------------------------------------------
 
-async fn timed_failures(fx: &Fixture, endpoints: &[String], passes: usize) -> Vec<(u128, String)> {
+async fn timed_passes(fx: &Fixture, endpoints: &[String], passes: usize) -> Vec<Pass> {
     let mut out = Vec::new();
     for _ in 0..passes {
-        let pass = reconcile_pass(fx, endpoints, SETTLE_TIMEOUT, None).await;
-        out.push((pass.elapsed.as_millis(), format!("{:?}", pass.outcome)));
+        let pass = reconcile_pass(fx, endpoints, SETTLE_TIMEOUT).await;
+        out.push(pass);
     }
     out
 }
 
-fn all_failed(results: &[(u128, String)], endpoints: usize) -> bool {
-    let needle = format!("relays_failed: {endpoints},");
-    results.iter().all(|(_, outcome)| outcome.contains(&needle))
+fn all_failed(results: &[Pass], endpoints: usize) -> bool {
+    results.iter().all(|pass| {
+        matches!(pass.outcome,
+        PassOutcome::Ok { relays_failed, returned: 0 } if relays_failed == endpoints)
+    })
 }
 
 /// The relay answers NEG-OPEN with strfry's NEG-cap NOTICE (no session id).
@@ -2597,7 +2732,7 @@ async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
         .wait_for(SETTLE_TIMEOUT, |s| s.open_connections() == 1)
         .await;
     let endpoints = [url, second.url()];
-    let results = timed_failures(&fx, &endpoints, 3).await;
+    let results = timed_passes(&fx, &endpoints, 3).await;
     let stats = fx.limit.stats();
     eprintln!(
         "[g] NEG cap NOTICE, 2 endpoints: (ms, outcome)={results:?} {}",
@@ -2607,7 +2742,9 @@ async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
     // The five-second first-reply timeout ends each pass, not the caller's
     // longer deadline.
     assert!(
-        results.iter().all(|(ms, _)| (4_900..6_500).contains(ms)),
+        results
+            .iter()
+            .all(|pass| (4_900..6_500).contains(&pass.elapsed.as_millis())),
         "{results:?}"
     );
     assert!(stats.neg_cap_notices >= 3);
@@ -2631,11 +2768,11 @@ async fn fast_and_slow_reconciliation_failure_paths() {
     // Not in the pool: never added to this SDK client.
     let absent = |port: u16| format!("ws://127.0.0.1:{port}");
     let not_in_pool = [absent(9), absent(10)];
-    let not_in_pool_results = timed_failures(&fx, &not_in_pool, 3).await;
+    let not_in_pool_results = timed_passes(&fx, &not_in_pool, 3).await;
 
     // In the pool, disconnected, low success rate.
     let dead = [dead_relay(&fx.sdk).await, dead_relay(&fx.sdk).await];
-    let refused_results = timed_failures(&fx, &dead, 3).await;
+    let refused_results = timed_passes(&fx, &dead, 3).await;
 
     // In the pool with a good history, dropped a moment ago, slow to return.
     let flaky = LimitRelay::start(fx.upstream_url.clone(), LimitConfig::default()).await;
@@ -2657,8 +2794,15 @@ async fn fast_and_slow_reconciliation_failure_paths() {
     flaky
         .wait_for(SETTLE_TIMEOUT, |s| s.open_connections() == 0)
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let dropped_results = timed_failures(&fx, &[flaky.url()], 2).await;
+    let disconnected = fx.sdk.client().relay(flaky.url()).await.unwrap().unwrap();
+    tokio::time::timeout(SETTLE_TIMEOUT, async {
+        while disconnected.status() != RelayStatus::Disconnected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the SDK processes the actual socket disconnect");
+    let dropped_results = timed_passes(&fx, &[flaky.url()], 2).await;
 
     eprintln!(
         "[g] not_in_pool (ms, outcome)={not_in_pool_results:?}\n[g] low_success_rate={refused_results:?}\n\
@@ -2668,9 +2812,17 @@ async fn fast_and_slow_reconciliation_failure_paths() {
         all_failed(&not_in_pool_results, 2),
         "{not_in_pool_results:?}"
     );
-    assert!(not_in_pool_results.iter().all(|(ms, _)| *ms < 100));
+    assert!(
+        not_in_pool_results
+            .iter()
+            .all(|pass| pass.elapsed < Duration::from_millis(100))
+    );
     assert!(all_failed(&refused_results, 2), "{refused_results:?}");
-    assert!(refused_results.iter().all(|(ms, _)| *ms < 100));
+    assert!(
+        refused_results
+            .iter()
+            .all(|pass| pass.elapsed < Duration::from_millis(100))
+    );
     assert!(all_failed(&dropped_results, 1), "{dropped_results:?}");
     fx.shutdown().await;
 }
@@ -2886,8 +3038,19 @@ async fn assert_replay_before_live(mode: OrderedReplay) {
         .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(live_timestamp))
         .finalize(&keys)
         .unwrap();
+    let mut observed = fx.sdk.client().notifications();
     publisher.send_event(&live).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if matches!(observed.next().await.expect("the SDK notification stream remains open"), ClientNotification::Event { event, .. } if event.id == live.id) {
+                break;
+            }
+        }
+    }).await.expect("the SDK receives the actual live marker while replay is backpressured");
+    assert!(
+        fx.adapter.take_replay_status(&fx.account).await.pending,
+        "history must remain pending until the consumer places and ACKs it"
+    );
     expected.push((live_timestamp, live.id.to_bytes()));
     let mut delivery = first;
     for (position, (timestamp, id)) in expected.into_iter().enumerate() {
@@ -3712,9 +3875,10 @@ async fn prompt_relay_refusals_fail_in_round_trips() {
     let (fx, url) = connected_fixture(small_limit(), 10).await;
     fx.limit.set_client_delay(RTT);
     let endpoints = std::slice::from_ref(&url);
-    let healthy = timed_failures(&fx, endpoints, 2).await;
+    let healthy = timed_passes(&fx, endpoints, 2).await;
+    assert!(healthy.iter().all(Pass::healthy), "{healthy:?}");
     fx.limit.set_neg_fault(NegFault::ErrOnOpen);
-    let neg_err = timed_failures(&fx, endpoints, 3).await;
+    let neg_err = timed_passes(&fx, endpoints, 3).await;
     fx.limit.set_neg_fault(NegFault::None);
     fx.limit.set_client_delay(Duration::ZERO);
     fx.adapter
@@ -3723,7 +3887,7 @@ async fn prompt_relay_refusals_fail_in_round_trips() {
         .unwrap();
     fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     fx.limit.set_client_delay(RTT);
-    let full_socket = timed_failures(&fx, endpoints, 3).await;
+    let full_socket = timed_passes(&fx, endpoints, 3).await;
     eprintln!(
         "[g] rtt_ms={} healthy={healthy:?}\n[g] neg_err={neg_err:?}\n[g] full_socket={full_socket:?}\n[g] {}",
         RTT.as_millis(),
@@ -3731,12 +3895,16 @@ async fn prompt_relay_refusals_fail_in_round_trips() {
     );
     assert!(all_failed(&neg_err, 1), "{neg_err:?}");
     assert!(
-        neg_err.iter().all(|(ms, _)| (15..150).contains(ms)),
+        neg_err
+            .iter()
+            .all(|pass| (15..150).contains(&pass.elapsed.as_millis())),
         "{neg_err:?}"
     );
     assert!(all_failed(&full_socket, 1), "{full_socket:?}");
     assert!(
-        full_socket.iter().all(|(ms, _)| (30..250).contains(ms)),
+        full_socket
+            .iter()
+            .all(|pass| (30..250).contains(&pass.elapsed.as_millis())),
         "{full_socket:?}"
     );
     fx.shutdown().await;
