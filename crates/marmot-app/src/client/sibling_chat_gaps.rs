@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1};
+use cgka_traits::app_components::{DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::{EpochId, GroupId};
 use serde::{Deserialize, Serialize};
@@ -290,12 +290,21 @@ impl AppClient {
         chat: &GroupId,
         slot: DeviceSlotId,
     ) -> Result<bool, AppError> {
+        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
+            return Ok(false);
+        }
         let key = exchange
             .roster
             .devices
             .get(&slot)
             .and_then(|entry| entry.tag_signature_key.as_deref());
-        self.sibling_missing_from_chat(&exchange.roster, chat, slot, key)
+        Ok(!self
+            .runtime
+            .own_account_leaf_claims(chat, &exchange.roster)?
+            .into_iter()
+            .any(|(held, claim)| {
+                claim == DeviceTagClaim::Device(slot) || key == Some(held.as_slice())
+            }))
     }
 
     pub(super) fn receive_gap_fill_claim(
@@ -438,17 +447,9 @@ impl AppClient {
             }
         }
         let mut needed = HashMap::<DeviceSlotId, u32>::new();
-        for (chat, slot) in &self.sibling_chat_gaps.waiting_for_stock {
+        for (_, slot) in &self.sibling_chat_gaps.waiting_for_stock {
             if !ready.contains(slot) {
                 continue;
-            }
-            match self.invitation_allows_sibling_add(chat) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
             }
             let count = needed.entry(*slot).or_default();
             *count = count.saturating_add(1);

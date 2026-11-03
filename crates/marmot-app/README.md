@@ -263,8 +263,9 @@ records durable work for this matching local leaf's ordinary Leave; a later acce
 Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by
 all devices. Normal leave, archive and deletion are not shared invitation decisions.
 
-A known decline for the current admission also holds new automatic sibling Adds and stock requests owed only to
-those Adds, even before ordinary Leave can be requested. A later winning accept can resume an existing opted-in
+A known decline for the current admission also holds new automatic sibling Adds, even before ordinary Leave can be
+requested. Private KeyPackage requests follow the ordinary stock rules. A decline does not reach a copy this device
+already deleted locally. A later winning accept can resume an existing opted-in
 flow; it creates no Add or join obligation. Other generations and new founding admissions stay independent, and
 already admitted or signed traffic follows its ordinary settlement rules.
 

@@ -138,7 +138,8 @@
   inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline
   wins; no automatic join/rejoin or cancellation of an already-requested Leave. Existing host APIs and release
   feature gates stay unchanged; custom experimental peers must adopt V2 sibling Welcomes together.
-  A known current-generation decline holds new automatic sibling Adds and their sole stock demand; a higher
+  A known current-generation decline holds new automatic sibling Adds; private stock follows ordinary rules. A decline
+  does not reach a copy this device already deleted locally. A higher
   acceptance wakes existing opt-in work without recalling admitted traffic or changing another generation.
 
 - Linked devices fill missing sibling chat memberships with private

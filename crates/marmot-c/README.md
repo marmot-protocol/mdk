@@ -472,7 +472,8 @@ cargo run --release -p marmot-c --example nip46_smoke
 Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
 and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
 fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
-local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A zero-publication
+local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
+this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
 `CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
 membership state; ordinary archive/leave/delete is not an invitation decision. This adds no host API or working
 linking control to released builds, which cannot enable device groups. Custom experimental peers must update together

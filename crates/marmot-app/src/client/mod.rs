@@ -3887,15 +3887,11 @@ impl AppClient {
         audit_context: AuditEventContext,
         invitation: Option<&storage_sqlite::InvitationDecision>,
     ) -> Result<SendSummary, AppError> {
-        if let Some(invitation) = invitation {
-            if !self.invitation_decline_is_current(invitation)? {
-                return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
-            }
-            // A checked matching admission may retain only its native copy
-            // after local deletion. Ordinary public Leave still needs its UI row.
-            self.runtime.group_record(group_id)?;
-        } else {
-            self.ensure_group(group_id)?;
+        self.ensure_group(group_id)?;
+        if let Some(invitation) = invitation
+            && !self.invitation_decline_is_current(invitation)?
+        {
+            return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
         }
 
         // Once the MLS leave commits we can no longer author an in-group token

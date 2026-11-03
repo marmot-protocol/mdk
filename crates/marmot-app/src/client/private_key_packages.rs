@@ -617,16 +617,11 @@ impl AppClient {
         }
         self.send_private_key_package_hand_offs(&exchange).await?;
         // Then this device's own.
-        let mut first_error = None;
         for sibling in exchange.siblings() {
-            if let Err(error) = self
-                .request_private_key_packages_when_needed(&exchange, &sibling, now)
-                .await
-            {
-                first_error.get_or_insert(error);
-            }
+            self.request_private_key_packages_when_needed(&exchange, &sibling, now)
+                .await?;
         }
-        first_error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     /// Send every hand-off not yet queued to a sibling the roster lists, at
@@ -704,10 +699,8 @@ impl AppClient {
             .filter(|record| record.issuer_slot_hex == issuer_slot_hex && record.usable_at(now))
             .count();
         let need = storage.private_key_package_need(&issuer_slot_hex)?;
-        let recorded_want = need.as_ref().map_or(1, |need| need.need);
-        // Normal cleanup is based on the original recorded need. A temporary
-        // narrower cap must retain its clock for a later acceptance.
-        if usable >= recorded_want as usize {
+        let wanted = need.as_ref().map_or(1, |need| need.need);
+        if usable >= wanted as usize {
             if need.is_some() {
                 storage.delete_private_key_package_need(&issuer_slot_hex)?;
             }
@@ -720,18 +713,6 @@ impl AppClient {
         {
             return Ok(());
         }
-        // Consult chats only for an otherwise-new burst; baseline, satisfied
-        // and throttled requests need no chat reads. Unreadable chats justify
-        // no burst while healthy chats and the baseline continue independently.
-        let (cap, chat_error) = if recorded_want > 1 {
-            self.invitation_chat_stock_cap(exchange, *sibling)?
-        } else {
-            (None, None)
-        };
-        let wanted = recorded_want.min(cap.unwrap_or(u32::MAX));
-        if usable >= wanted as usize {
-            return chat_error.map_or(Ok(()), Err);
-        }
         let want = wanted
             .max(PRIVATE_KEY_PACKAGE_STOCK_TARGET as u32)
             .min(MAX_PRIVATE_KEY_PACKAGE_WANT);
@@ -742,7 +723,7 @@ impl AppClient {
         };
         storage.put_private_key_package_need(&PrivateKeyPackageNeed {
             issuer_slot_hex: issuer_slot_hex.clone(),
-            need: recorded_want,
+            need: wanted,
             requested_at: Some(now),
         })?;
         if !self
@@ -758,7 +739,7 @@ impl AppClient {
                 None => storage.delete_private_key_package_need(&issuer_slot_hex)?,
             }
         }
-        chat_error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     pub(crate) fn prepared_private_key_packages<'a>(

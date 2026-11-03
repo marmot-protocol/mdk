@@ -218,6 +218,13 @@ impl AppClient {
             return Ok(());
         }
         let group = self.app.group(&self.state.label, &decision.group_id_hex)?;
+        if group.is_none() || self.is_device_group(&group_id)? {
+            // A decline does not reach a copy this device already deleted
+            // locally. Retain the winner/broadcast without installing a chat
+            // or acting on hidden native membership.
+            storage.defer_uninstalled_invitation_decision(decision)?;
+            return Ok(());
+        }
         // Winning values durably owe this pass. Reuse its retry ownership to
         // wake an existing gap even if only application state changed, with no
         // chat epoch or device-group eligibility change. A failed read above
@@ -236,9 +243,8 @@ impl AppClient {
             let mut leave_requested = account.leave_request(&group_id)?.is_some();
             let mut native_member = false;
             if !leave_requested {
-                // Local deletion may hide the app row while retaining a live
-                // native leaf. Read current native authority, never recreate a
-                // projection to make that leaf eligible for ordinary Leave.
+                // Recheck native eligibility before push drain or send sync.
+                // A refused attempt keeps the decision work owed.
                 let authority = self
                     .runtime
                     .group_authority_view()
