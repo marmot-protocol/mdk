@@ -129,6 +129,8 @@ fn account_key() -> SqlCipherKey {
 }
 
 fn account() -> Account {
+    // Open independently of an app constructor without enabling the process-wide allocator.
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let storage =
         SqliteAccountStorage::open_encrypted(dir.path().join(ACCOUNT_DB), &account_key()).unwrap();
