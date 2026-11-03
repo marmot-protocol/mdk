@@ -160,7 +160,7 @@ pub trait GroupStorage {
     ) -> StorageResult<Option<crate::group::InvitationAdmission>>;
 
     /// Replace the local-copy association in the native join/create transaction.
-    /// `None` installs an unidentified legacy sibling admission.
+    /// `None` removes the association; legacy sibling admissions remain unidentified.
     fn put_invitation_admission(
         &self,
         id: &GroupId,

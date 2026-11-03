@@ -1013,9 +1013,13 @@ fork can prompt again. Accept never joins/rejoins or resets explicit archive int
 local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
 this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
 `CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
-membership state; ordinary archive/leave/delete is not an invitation decision. This adds no host API or working
-linking control to released builds, which cannot enable device groups. Custom experimental peers must update together
-before using V2 sibling Welcomes; no capability negotiation or mixed-old-receiver guarantee is added.
+membership state; ordinary archive/leave/delete is not an invitation decision. Invitation decisions use the existing
+host APIs. Released builds cannot enable device groups or provide working linking controls. Custom experimental peers
+must update together before using V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
+
+At the maximum decision version, an opposite local choice is refused and the held winner remains. Retained invitation
+generations have no expiry or count cap: a malicious currently linked device can inflate stored decisions and broadcast
+pages.
 
 `linked_devices(account_ref)` returns this account's own devices as `LinkedDeviceFfi` records, read from the roster of
 the device group this device trusts, for a Devices screen:

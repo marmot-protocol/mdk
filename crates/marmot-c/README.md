@@ -469,15 +469,8 @@ cargo run --release -p marmot-c --example nip46_smoke
 
 ## Linked devices
 
-Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
-and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
-fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
-local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
-this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
-`CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
-membership state; ordinary archive/leave/delete is not an invitation decision. This adds no host API or working
-linking control to released builds, which cannot enable device groups. Custom experimental peers must update together
-before using V2 sibling Welcomes; no capability negotiation or mixed-old-receiver guarantee is added.
+See the [shared linked-device guidance](../marmot-uniffi/README.md#linked-devices) for invitation decisions,
+compatibility and retained-state limits.
 
 `marmot_linked_devices` blocks on the account worker, reads local group state only, and writes an owned
 `MarmotLinkedDeviceList`; free it with `marmot_linked_device_list_free`. Each `MarmotLinkedDevice` has its
@@ -485,8 +478,7 @@ before using V2 sibling Welcomes; no capability negotiation or mixed-old-receive
 `linked_by_slot_id_hex` that is NULL for the founder, a `MarmotLinkedDeviceStatus` and three setting flags. The list
 is empty until this device trusts a device group, and in every release build until the roster's spec lands. Re-read
 it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` blocks on the account worker and renames one
-device by its `slot_id_hex` with one roster commit; an empty label clears it. See the
-[shared contract](../marmot-uniffi/README.md#linked-devices).
+device by its `slot_id_hex` with one roster commit; an empty label clears it.
 
 `marmot_update_linked_device_settings` blocks on the account worker and patches any linked device's settings.
 Each `has_<setting>`/`<setting>` pair uses `uint8_t`: zero presence leaves the setting unchanged; nonzero presence
