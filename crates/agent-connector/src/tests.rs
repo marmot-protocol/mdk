@@ -7317,6 +7317,121 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
     }
 }
 
+/// Verify co-admin validation, alias deduplication, and rights in the initial Welcome.
+#[tokio::test]
+async fn connector_creates_admin_in_founding_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let owner = connector.account_home.create_account("owner").unwrap();
+    let outsider = connector.account_home.create_account("outsider").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&owner.label)
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let capabilities = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "capabilities",
+        AgentControlRequest::GroupCreateCapabilities,
+    )
+    .await;
+    assert!(matches!(
+        capabilities.payload,
+        AgentControlResponse::GroupCreateCapabilities {
+            initial_admins: true
+        }
+    ));
+    assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+    for (error_code, admins) in [
+        (
+            Some("invalid_group_create"),
+            vec![outsider.account_id_hex.clone()],
+        ),
+        (Some("app_error"), vec!["invalid".to_owned()]),
+        (Some("app_error"), vec![String::new()]),
+        (
+            None,
+            vec![
+                marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap(),
+                owner.account_id_hex.clone(),
+            ],
+        ),
+    ] {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "create",
+            AgentControlRequest::GroupCreateWithAdmins {
+                account_id_hex: agent.account_id_hex.clone(),
+                name: "Team".into(),
+                members: vec![owner.account_id_hex.clone()],
+                admins,
+                description: None,
+                relays: None,
+            },
+        )
+        .await;
+        if let Some(expected_code) = error_code {
+            assert!(
+                matches!(response.payload, AgentControlResponse::Error { code, .. } if code == expected_code)
+            );
+            assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+            continue;
+        }
+        let AgentControlResponse::GroupCreated { group_id_hex, .. } = response.payload else {
+            panic!("Expected founding-admin creation");
+        };
+        let group = connector
+            .app
+            .group(&agent.label, &group_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group
+                .admin_policy
+                .admins
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([agent.account_id_hex.clone(), owner.account_id_hex.clone()])
+        );
+        let group_id = GroupId::new(hex::decode(&group_id_hex).unwrap());
+        timeout(Duration::from_secs(10), async {
+            while connector
+                .app
+                .group(&owner.label, &group_id_hex)
+                .unwrap()
+                .is_none()
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        accept_group_invite_retrying_busy(&connector.runtime, &owner.label, &group_id).await;
+        let joined = connector
+            .app
+            .group(&owner.label, &group_id_hex)
+            .unwrap()
+            .unwrap();
+        assert!(joined.admin_policy.admins.contains(&owner.account_id_hex));
+    }
+    connector.runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
     let dir = tempfile::tempdir().unwrap();
@@ -7392,6 +7507,11 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             .unwrap();
         assert_eq!(group.profile.name, "Agent group");
         assert_eq!(
+            group.admin_policy.admins,
+            vec![agent.account_id_hex.clone()],
+            "Legacy creation keeps creator-only admins"
+        );
+        assert_eq!(
             group.profile.description,
             "Created through the control socket"
         );
@@ -7450,6 +7570,7 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             &agent.account_id_hex,
             "Untracked group".into(),
             vec![peer.label.clone()],
+            Vec::new(),
             None,
             None,
         )
@@ -7854,6 +7975,7 @@ async fn connector_leave_group_case(block_cleanup: bool) {
             &agent.account_id_hex,
             "Leave test".into(),
             vec![peer.label.clone()],
+            Vec::new(),
             None,
             None,
         )

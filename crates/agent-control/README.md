@@ -150,6 +150,16 @@ plane. References reconstructed from received `imeta` tags omit it, and remain
 valid download inputs. Sending a reference without known upload provenance
 requires a fresh upload; the field is never carried in Marmot events.
 
+## Group creation
+
+`group_create_capabilities` reports founding-admin support before creation is submitted.
+`group_create_with_admins` accepts the same fields as `group_create`, plus an `admins` list of invited member references.
+The creator may also be listed redundantly; all other admins must be invited members.
+The creator remains an admin. Selected invitees receive admin rights in the founding state and initial Welcome.
+Non-member admins are rejected before creation. The response is `group_created`; creation remains non-idempotent.
+Older connectors reject this distinct operation rather than silently dropping admin rights. Legacy `group_create`
+keeps its creator-only admin policy.
+
 ## Run the tests
 
 ```sh

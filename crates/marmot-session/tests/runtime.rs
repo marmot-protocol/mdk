@@ -689,6 +689,55 @@ impl TransportAdapter for RecordingAdapter {
     }
 }
 
+/// Keep one actual publish pending while observing another adapter result.
+/// This controls transport completion only; the runtime owns row settlement.
+#[derive(Clone)]
+struct OutOfOrderWelcomeAdapter {
+    inner: RecordingAdapter,
+    held: Arc<Mutex<Option<MessageId>>>,
+    release: Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::mpsc::UnboundedSender<MessageId>,
+}
+
+#[async_trait]
+impl TransportAdapter for OutOfOrderWelcomeAdapter {
+    async fn activate_account(
+        &self,
+        activation: TransportAccountActivation,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.activate_account(activation).await
+    }
+
+    async fn sync_account_groups(
+        &self,
+        sync: TransportGroupSync,
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.sync_account_groups(sync).await
+    }
+
+    async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
+        self.inner.deactivate_account(account_id).await
+    }
+
+    async fn publish(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        let held = self.held.lock().unwrap().as_ref() == Some(&request.message.id);
+        if held {
+            self.release.acquire().await.unwrap().forget();
+        }
+        let message_id = request.message.id.clone();
+        let result = self.inner.publish(request).await;
+        self.completed.send(message_id).unwrap();
+        result
+    }
+
+    async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
+        self.inner.receive().await
+    }
+}
+
 #[derive(Clone)]
 struct MismatchedPendingGroupRouting {
     wrong_group_id: GroupId,
@@ -3434,10 +3483,16 @@ async fn maintenance_fails_an_obligation_left_on_a_removed_copy() {
         obligation.attempt_count, 0,
         "the refusal must precede the send, not count as an attempt"
     );
-    assert!(
-        bob_runtime.schedule_manual_self_update(&group_id).is_err(),
-        "a manual rotation on a terminal copy must be refused, not persisted"
-    );
+    let error = bob_runtime
+        .schedule_manual_self_update(&group_id)
+        .expect_err("a manual rotation on a terminal copy must be refused, not persisted");
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::InvalidTransition(transition))
+            if transition.from == "Removed"
+                && transition.to == "SelfUpdate"
+                && transition.reason == "terminal local group copy has no leaf to rotate"
+    ));
 }
 
 /// A pending leave gates every send but the leave itself, and the record stays
@@ -5235,6 +5290,15 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
     let alice_path = dir.path().join("alice-finish.sqlite");
     let session = current_session(&alice_path, &key, b"alice-finish");
     let adapter = RecordingAdapter::default();
+    let held = Arc::new(Mutex::new(None));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (completed, mut completion_order) = tokio::sync::mpsc::unbounded_channel();
+    let controlled_adapter = OutOfOrderWelcomeAdapter {
+        inner: adapter.clone(),
+        held: held.clone(),
+        release: release.clone(),
+        completed,
+    };
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_inbox_route(
@@ -5247,7 +5311,7 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
             );
     let mut runtime = AccountDeviceRuntime::new(
         session,
-        adapter.clone(),
+        controlled_adapter,
         policy.clone(),
         RecordingKeyPackages::default(),
     );
@@ -5290,10 +5354,25 @@ async fn current_founding_welcome_finish_failure_still_reconciles_later_recipien
     // bookkeeping fails as if the durable fanout persist lost the database
     // lock. Carol's identical work must still be reconciled.
     runtime.arm_finish_stage_failure(bob_welcome_id.clone());
-    let error = runtime
-        .publish_session_effects(prepared.effects)
+    *held.lock().unwrap() = Some(welcomes[0].id.clone());
+    let error = {
+        let publication = runtime.publish_session_effects(prepared.effects);
+        tokio::pin!(publication);
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut publication => panic!("publish finished while the first Welcome was held"),
+                completed = completion_order.recv() => completed.expect("second publish completed"),
+            }
+        })
         .await
-        .expect_err("the armed finish-stage failure must surface");
+        .expect("the other Welcome must publish while the first is held");
+        assert_eq!(completed, welcomes[1].id);
+        release.add_permits(1);
+        publication
+            .await
+            .expect_err("the armed finish-stage failure must surface")
+    };
+    assert_eq!(completion_order.try_recv().unwrap(), welcomes[0].id);
     assert!(
         matches!(error, AccountError::Session(_)),
         "expected the injected session failure, got {error:?}"
@@ -5539,7 +5618,12 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
 
     // A non-welcome message id is rejected without publishing anything.
     let commit_id = publishes[0].message.id.clone();
-    assert!(runtime.redeliver_welcome(&commit_id).await.is_err());
+    let error = runtime.redeliver_welcome(&commit_id).await.unwrap_err();
+    assert!(matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::EngineError::Backend(reason))
+            if reason == "stored message is not an outbound sent record"
+    ));
     assert_eq!(adapter.publishes().len(), 3);
 }
 

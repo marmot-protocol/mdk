@@ -273,6 +273,9 @@ experimental senders and receivers must update together before using invitation 
 are not retrofitted. Released builds still cannot enable device groups. Hosts continue to render MDK's invitation
 and membership projections and must not infer broader account-wide departure across unrelated generations.
 
+`AppCreateGroupOptions::initial_admins` names invited account references to grant admin in the founding group state.
+The creator remains an admin. Omitting this option preserves creator-only admin authority.
+
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.
