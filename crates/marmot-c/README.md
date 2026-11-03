@@ -476,8 +476,7 @@ compatibility and retained-state limits.
 `MarmotLinkedDeviceList`; free it with `marmot_linked_device_list_free`. Each `MarmotLinkedDevice` has its
 `slot_id_hex` handle, `is_this_device`, `label`, `client` and `platform` (empty until set), `linked_at`, a
 `linked_by_slot_id_hex` that is NULL for the founder, a `MarmotLinkedDeviceStatus` and three setting flags. The list
-is empty until this device trusts a device group, and in every release build until the roster's spec lands. Re-read
-it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` blocks on the account worker and renames one
+is empty until this device trusts a device group. Re-read it on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`. `marmot_rename_linked_device` blocks on the account worker and renames one
 device by its `slot_id_hex` with one roster commit; an empty label clears it.
 
 `marmot_update_linked_device_settings` blocks on the account worker and patches any linked device's settings.
