@@ -650,6 +650,7 @@ async fn a_wrong_more_costs_requests_never_history() {
         sweep.policy.initial_delta = DAY;
         sweep
     };
+    for (events, raw_only) in [(events, false), (Vec::new(), true)] {
     let honest = ModelRelay::new(Profile::Wok, events.clone());
     let baseline = run_sweep(
         sweep(),
@@ -663,7 +664,6 @@ async fn a_wrong_more_costs_requests_never_history() {
 
     // The relay sends the whole slice but says `more`: the sweep drops the
     // reply, asks for both halves, and admits the same events once.
-    for raw_only in [false, true] {
         let wrong = ModelRelay::new(Profile::Wok, events.clone());
         let all = wrong.matching(route(), range.since, range.until);
         let reply = if raw_only {
