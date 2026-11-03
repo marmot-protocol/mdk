@@ -6051,13 +6051,14 @@ impl AppClient {
                 .await;
         }
         if self.app.recovery_runner_owns_debt() {
-            return Err(ClassifiedSyncFailure::at_stage(
+            return Err(incomplete_full_history_repair(
                 SyncSummary::default(),
-                cgka_traits::storage::StorageError::Serialization(
-                    "recovery runner is not ready".into(),
-                )
-                .into(),
-                SyncFailureStage::StatePersist,
+                if cancelled() {
+                    crate::FullHistoryRepairIncompleteReason::Cancelled
+                } else {
+                    crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+                },
+                self.delivery_loss_blocks_cursor(),
             ));
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
@@ -10670,6 +10671,40 @@ mod tests {
                 error.source.to_string().contains(reason.as_str()),
                 "the caller must be able to distinguish why the repair stayed incomplete",
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repair_before_the_worker_seats_its_runner_is_coverage_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        // The actual local-open stage precedes the worker's fallible runner
+        // preparation. It has no network or runner yet.
+        let mut client = app
+            .local_client_with_relay_plane("alice", &app.relay_plane, None)
+            .await
+            .unwrap();
+        for cancelled in [false, true] {
+            let error = client
+                .repair_full_history_cancellable(&|| cancelled, None)
+                .await
+                .unwrap_err();
+            let expected = if cancelled {
+                crate::FullHistoryRepairIncompleteReason::Cancelled
+            } else {
+                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+            };
+            assert!(matches!(
+                error.source,
+                crate::AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: false,
+                } if reason == expected
+            ));
+            assert_eq!(error.partial_summary, SyncSummary::default());
         }
     }
 
