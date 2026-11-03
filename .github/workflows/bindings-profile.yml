@@ -37,8 +37,15 @@ env:
   PRODUCT_ANALYTICS_EXPORT: "1"
 
 jobs:
+  signatures:
+    name: PR signatures
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-signatures.yml
+
   identity:
     name: Resolve exact candidate identity
+    needs: signatures
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
