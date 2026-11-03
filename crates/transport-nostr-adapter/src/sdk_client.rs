@@ -12457,7 +12457,14 @@ mod tests {
         assert_eq!(batch.request_durations.len(), ids.len());
         for (outcome, id) in batch.outcomes.into_iter().zip(ids) {
             let outcome = outcome.expect("every actual ACK must retain its request slot");
-            assert_eq!(outcome.message_id.as_slice(), hex::decode(id).unwrap());
+            assert_eq!(
+                outcome
+                    .message_id
+                    .as_ref()
+                    .expect("an ACK retains the event identity")
+                    .as_slice(),
+                hex::decode(id).unwrap()
+            );
             assert_eq!(outcome.accepted.len(), 1);
             assert_eq!(outcome.accepted[0].endpoint, wire.endpoint);
             assert!(outcome.failed.is_empty());
