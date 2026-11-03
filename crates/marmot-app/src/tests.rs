@@ -6408,27 +6408,34 @@ async fn failed_leave_push_compensation_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let alice = app.account_home().account("alice").unwrap().account_id_hex;
-    let mut alice_client = app.client("alice").await.unwrap();
-    let key = canonical_membership::published_key_package(&mut alice_client, &relay).await;
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
+    let mut alice_client = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    alice_client.publish_key_package().await.unwrap();
     let bob_dir = tempfile::tempdir().unwrap();
     AccountHome::open(bob_dir.path())
         .create_account("bob")
         .unwrap();
-    let bob_app = canonical_membership::app_at(&bob_dir, relay.clone());
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
-    let mut bob = bob_app.client("bob").await.unwrap();
-    let group_id = bob.create_group("alpha", &[]).await.unwrap();
-    let effects = bob
-        .runtime
-        .send(cgka_traits::SendIntent::Invite {
-            group_id: group_id.clone(),
-            key_packages: vec![key],
-            initial_admins: vec![],
-        })
+    let mut bob = bob_app
+        .client_with_relay_plane("bob", &plane, None)
         .await
         .unwrap();
-    bob.observe_drained_session_events(&effects).await.unwrap();
-    device_group::deliver_all(&mut alice_client, &relay).await;
+    let group_id = bob.create_group("alpha", &[alice.as_str()]).await.unwrap();
+    assert!(
+        alice_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "Alice must really join as a nonadmin before the compensation phase"
+    );
     alice_client.accept_group_invite(&group_id).unwrap();
     // The external inviter has completed its only task. Release its client
     // and close its separately owned account store before the worker phase.
@@ -6444,6 +6451,8 @@ async fn failed_leave_push_compensation_body() {
             .any(|key| hex::encode(key) == alice)
     );
     drop(alice_client);
+    drop(eose);
+    drop(plane);
     use cgka_traits::storage::GroupStorage as _;
     let store = app.account_storage("alice").unwrap();
     let admission = store.invitation_admission(&group_id).unwrap().unwrap();
