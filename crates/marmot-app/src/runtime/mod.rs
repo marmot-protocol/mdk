@@ -2828,6 +2828,23 @@ impl MarmotAppRuntime {
         self.accounts.turn_off_backups(account_ref).await
     }
 
+    /// Report the host's current Wi-Fi and charging facts for background
+    /// backup admission. Both must be true. Default closed on each worker
+    /// start/replacement: report on start and changes; no environment is kept
+    /// across restart. Existing role/due/backoff/media-credit checks still apply.
+    /// An already-admitted pass settles even after false; subsequent passes
+    /// (including retry/cleanup) wait. Manual restore is unaffected.
+    pub async fn set_backup_background_conditions(
+        &self,
+        account_ref: &str,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .set_backup_background_conditions(account_ref, wifi, charging)
+            .await
+    }
+
     /// Begin an ephemeral, history-only restore with user-supplied words.
     /// Completion is observed through the status/watch APIs; secrets are never
     /// persisted or resumed after reconnect/close. Backups/settings are unchanged.

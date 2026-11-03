@@ -15,7 +15,7 @@ use marmot_uniffi::conversions::{
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
-use super::history_import::MarmotHistoryImportSource;
+use super::history_import::{MarmotHistoryImportProvenance, MarmotHistoryImportSource};
 use super::markdown::MarmotMarkdownDocument;
 use super::media::MarmotMediaAttachmentOutcome;
 use crate::MarmotStatus;
@@ -270,6 +270,8 @@ c_mirror! {
         /// for a row that arrived live. Draw "Imported from <device>"
         /// where rows change from imported to live.
         opt_rec imported_from: MarmotHistoryImportSource,
+        /// Complete typed provenance; legacy imported_from remains sibling-only.
+        opt_rec history_import_provenance: MarmotHistoryImportProvenance,
     }
 }
 

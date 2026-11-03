@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- Expose recovery-word setup/settings, manual backup restore controls/status/watch/current-chat hints and background
+  Wi-Fi/charging reports, with matching deep frees. `MarmotTimelineMessageRecord` adds nullable tagged
+  `history_import_provenance` (Device or Backup), changing its layout and embedding records. The legacy
+  `imported_from` stays sibling-only. Recompile consumers with the matching generated header and native library.
+  Closing a watch does not cancel restore; returned words and borrowed host inputs need explicit secret handling.
+  Background writer work defaults closed on each worker start until the host reports both Wi-Fi and charging.
+  Already admitted passes settle after conditions change; manual restore remains independent.
+
 - `MarmotMediaAttachmentReference` adds nullable `source_epoch_identity`
   (mdk#2840), changing its layout and every record embedding it. Preserve this
   local upload metadata when sending a returned reference. A missing identity
