@@ -638,11 +638,12 @@ async fn a_stopped_fetch_preserves_its_uncertified_prefix() {
 
 #[tokio::test(start_paused = true)]
 async fn sink_failure_never_certifies_a_complete_or_partial_window() {
-    struct RejectingSink(Vec<Batch>);
+    struct RejectingSink(Vec<Batch>, u64);
     #[async_trait]
     impl CompareSink for RejectingSink {
-        async fn admit(&mut self, window: SweepRange, certified: bool, events: Vec<Event>, _bytes: u64) -> Result<(), SweepSinkError> {
+        async fn admit(&mut self, window: SweepRange, certified: bool, events: Vec<Event>, bytes: u64) -> Result<(), SweepSinkError> {
             self.0.push(Batch { window, certified, events });
+            self.1 += bytes;
             Err(SweepSinkError)
         }
     }
@@ -661,7 +662,7 @@ async fn sink_failure_never_certifies_a_complete_or_partial_window() {
                 IdsReply::Unreachable(UnreachableKind::Disconnected),
             ]);
         }
-        let mut sink = RejectingSink(Vec::new());
+        let mut sink = RejectingSink(Vec::new(), 0);
         let report = run_comparison(
             CompareRequest { route: route(), range: day(), local: &[], deadline: None, policy: limits },
             &relay, &mut sink, &CancellationToken::new(),
@@ -675,7 +676,9 @@ async fn sink_failure_never_certifies_a_complete_or_partial_window() {
         assert_eq!(sink.0[0].certified, !partial);
         let mut expected = if partial { by_id[..2].to_vec() } else { by_id };
         expected.sort_by_key(|event| (event.created_at, event.id));
+        let expected_bytes = expected.iter().map(|event| event.as_json().len() as u64).sum();
         assert_eq!(sink.0[0].events, expected);
+        assert_eq!(sink.1 + report.unadmitted_bytes, expected_bytes);
     }
 }
 
@@ -724,7 +727,9 @@ async fn only_requested_route_events_can_satisfy_a_difference() {
             .custom_created_at(Timestamp::from_secs(at))
             .finalize(&keys).unwrap()
     };
-    let good = [event(445, GROUP, T0, "first"), event(445, GROUP, T0 + DAY - 1, "last")];
+    let mut ties = [event(445, GROUP, T0 + 1, "tie a"), event(445, GROUP, T0 + 1, "tie b")];
+    ties.sort_by_key(|event| event.id);
+    let good = [event(445, GROUP, T0, "first"), ties[0].clone(), ties[1].clone(), event(445, GROUP, T0 + DAY - 1, "last")];
     let foreign = [
         event(445, [8; 32], T0, "wrong group"),
         event(1, GROUP, T0, "wrong kind"),
@@ -741,13 +746,14 @@ async fn only_requested_route_events_can_satisfy_a_difference() {
         missing: good.iter().chain(&foreign).map(|event| event.id).collect(),
         relay_set: good.len() + foreign.len(),
     });
-    relay.fetch_replies.lock().unwrap().push_back(IdsReply::Answered(
-        foreign.iter().cloned().chain([unsolicited, good[1].clone(), good[0].clone()]).collect()
-    ));
+    let incoming = foreign.iter().cloned().chain([unsolicited]).chain(good.iter().rev().cloned()).collect::<Vec<_>>();
+    let incoming_bytes = incoming.iter().map(|event| event.as_json().len() as u64).sum();
+    relay.fetch_replies.lock().unwrap().push_back(IdsReply::Answered(incoming));
     let (report, sink) = compare(&relay, day(), &[], policy(20)).await;
     assert_eq!(report.end, CompareEnd::Withheld);
     assert!(report.certified.is_empty());
     assert_eq!(sink.batches.len(), 1);
     assert!(!sink.batches[0].certified);
     assert_eq!(sink.batches[0].events, good);
+    assert_eq!(sink.bytes + report.unadmitted_bytes, incoming_bytes);
 }

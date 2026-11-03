@@ -12,26 +12,27 @@
 mod limit_relay;
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use limit_relay::{LimitConfig, LimitRelay};
+use limit_relay::{LimitConfig, LimitRelay, NegFault};
 use nostr_relay_builder::prelude::{
     MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RateLimit,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, FinalizeEvent, Keys, Kind, RelayUrl, Tag, Timestamp,
+    Client, ClientMessage, Event, EventBuilder, FinalizeEvent, Keys, Kind, RelayUrl, SubscriptionId, Tag, Timestamp,
 };
 use tokio_util::sync::CancellationToken;
 use transport_nostr_adapter::NostrSdkRelayClient;
 use transport_nostr_adapter::compare::{
-    CompareEnd, ComparePolicy, CompareRequest, CompareSink, run_comparison,
+    CompareEnd, ComparePolicy, CompareReply, CompareRequest, CompareSink, run_comparison,
 };
 use transport_nostr_adapter::sweep::{
     CoveredSlice, INTERRUPT_GRACE, RelayCaps, SdkSweepRelay, SliceProof, SliceQuery, SliceReply,
     SweepCursor, SweepCursorStore, SweepEnd, SweepPolicy, SweepRange, SweepRelay, SweepRequest,
-    SweepRoute, SweepSink, SweepSinkError, SweepStoreError, run_sweep,
+    SweepRoute, SweepSink, SweepSinkError, SweepStoreError, SecondReply, UnreachableKind, run_sweep,
 };
 
 const GROUP: [u8; 32] = [3; 32];
@@ -137,6 +138,7 @@ struct Sink {
     events: Vec<Event>,
     /// Cancel once this many slices were admitted.
     cancel_after: Option<(usize, CancellationToken)>,
+    covered_through: Option<Arc<Mutex<Option<u64>>>>,
 }
 
 #[async_trait]
@@ -148,6 +150,9 @@ impl SweepSink for Sink {
     ) -> Result<(), SweepSinkError> {
         self.slices.push(slice);
         self.events.extend(events);
+        if let Some(through) = &self.covered_through {
+            *through.lock().unwrap() = Some(slice.until);
+        }
         if let Some((after, token)) = &self.cancel_after
             && self.slices.len() >= *after
         {
@@ -155,6 +160,35 @@ impl SweepSink for Sink {
         }
         Ok(())
     }
+}
+
+/// Observes the actual SDK request boundary without replacing its fetches.
+struct UncoveredSdkRelay {
+    relay: SdkSweepRelay,
+    covered_through: Arc<Mutex<Option<u64>>>,
+}
+
+impl UncoveredSdkRelay {
+    fn assert_uncovered(&self, since: u64) {
+        if let Some(through) = *self.covered_through.lock().unwrap() {
+            assert!(since > through, "SDK request refetched an admitted prefix");
+        }
+    }
+}
+
+#[async_trait]
+impl SweepRelay for UncoveredSdkRelay {
+    fn caps(&self) -> RelayCaps { SweepRelay::caps(&self.relay) }
+    async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
+        self.assert_uncovered(query.since);
+        self.relay.fetch_slice(query).await
+    }
+    async fn fetch_second(&self, route: SweepRoute, second: u64, cap: Option<u32>) -> SecondReply {
+        self.assert_uncovered(second);
+        self.relay.fetch_second(route, second, cap).await
+    }
+    fn take_fetched_bytes(&self) -> u64 { SweepRelay::take_fetched_bytes(&self.relay) }
+    fn interrupt(&self) -> bool { SweepRelay::interrupt(&self.relay) }
 }
 
 fn request(range: SweepRange) -> SweepRequest {
@@ -237,9 +271,10 @@ async fn sweep_resumes_over_the_wire_without_refetching() {
     let fixture = Fixture::new().await;
     let (events, wanted, _) = backlog();
     fixture.store(&events).await;
-    let relay = fixture.relay();
+    let through = Arc::new(Mutex::new(None));
+    let relay = UncoveredSdkRelay { relay: fixture.relay(), covered_through: through.clone() };
     let store = MemoryStore::default();
-    let mut sink = Sink::default();
+    let mut sink = Sink { covered_through: Some(through), ..Sink::default() };
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -596,19 +631,21 @@ async fn a_second_cut_after_completed_chunks_reports_every_byte_it_read() {
 struct CompareBatches {
     events: usize,
     bytes: u64,
+    batches: Vec<(SweepRange, bool, Vec<Event>)>,
 }
 
 #[async_trait]
 impl CompareSink for CompareBatches {
     async fn admit(
         &mut self,
-        _window: SweepRange,
-        _certified: bool,
+        window: SweepRange,
+        certified: bool,
         events: Vec<Event>,
         fetched_bytes: u64,
     ) -> Result<(), SweepSinkError> {
         self.events += events.len();
         self.bytes += fetched_bytes;
+        self.batches.push((window, certified, events));
         Ok(())
     }
 }
@@ -647,4 +684,86 @@ async fn a_comparison_fetch_cut_mid_reply_reports_every_byte_it_read() {
     assert_eq!(fixture.limit.stats().events_before_stall, 30);
     assert_eq!(sink.bytes + report.unadmitted_bytes, 30 * one);
     assert!(returned < deadline + INTERRUPT_GRACE);
+}
+
+/// Comparison exact-id fetches have their own splitting implementation; the
+/// saturated-second sweep case does not execute it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comparison_splits_byte_cut_chunks_and_withholds_an_oversize_id() {
+    for oversize in [false, true] {
+        let fixture = Fixture::with_limits(LimitConfig {
+            req_limit_clamp: Some(50), req_default_limit: Some(2), ..LimitConfig::default()
+        }).await;
+        let (mut events, one) = uniform_events(24, |_| T0);
+        let mut expected = events.clone();
+        expected.sort_by_key(|event| event.id);
+        let extra_bytes = if oversize {
+            let large = EventBuilder::new(Kind::MlsGroupMessage, "x".repeat(6 * one as usize))
+                .tags([Tag::custom("h", [hex::encode(GROUP)])])
+                .custom_created_at(Timestamp::from_secs(T0))
+                .finalize(&Keys::generate()).unwrap();
+            let bytes = large.as_json().len() as u64;
+            events.push(large);
+            bytes
+        } else { 0 };
+        fixture.store(&events).await;
+        let relay = fixture.relay_with_caps(HINTED_NIP11).with_reply_max_bytes(3 * one as usize);
+        let window = SweepRange { since: T0, until: T0 };
+        let mut sink = CompareBatches::default();
+        let report = run_comparison(
+            CompareRequest {
+                route: SweepRoute::Group { nostr_group_id: GROUP }, range: window,
+                local: &[], deadline: None,
+                policy: ComparePolicy {
+                    pacing: SweepPolicy { min_request_interval: Duration::ZERO, ..SweepPolicy::default() },
+                    ..ComparePolicy::new(50, 8 * 1024 * 1024)
+                },
+            },
+            &relay, &mut sink, &CancellationToken::new(),
+        ).await;
+        assert_eq!(report.end, if oversize { CompareEnd::Withheld } else { CompareEnd::Finished }, "{report:?}");
+        assert_eq!(sink.batches.len(), 1);
+        assert_eq!(sink.batches[0], (window, !oversize, expected));
+        assert_eq!(report.certified.len(), usize::from(!oversize));
+        assert_eq!(sink.events, 24);
+        assert_eq!(report.unadmitted_bytes, 0);
+        if oversize {
+            assert!(sink.bytes >= 24 * one + extra_bytes, "even the over-budget singleton is metered");
+        } else {
+            // A 24-id chunk splits 24 -> 12 -> 6 -> 3. Seven cut
+            // attempts each read their fourth event; eight fitting leaves
+            // read the 24 retained events. The relay default is only two.
+            assert_eq!(sink.bytes, 52 * one);
+        }
+        assert_eq!(fixture.limit.stats().max_req_limit_seen, events.len() as u64);
+        fixture.sdk.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_comparison_ends_neg_and_starts_no_acquisition() {
+    let fixture = Fixture::new().await;
+    fixture.limit.set_neg_fault(NegFault::SilentOpen);
+    let relay = fixture.relay();
+    let route = SweepRoute::Group { nostr_group_id: GROUP };
+    let compare = transport_nostr_adapter::compare::CompareRelay::compare(&relay, route, range(), &[], 50);
+    let interrupt = async {
+        assert!(fixture.limit.wait_for(Duration::from_secs(5), |stats| stats.neg_opens == 1).await);
+        assert!(SweepRelay::interrupt(&relay));
+    };
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(compare, interrupt) })
+        .await.expect("interrupted NEG must end before its original ten-second timeout");
+    assert!(matches!(reply, CompareReply::Unreachable(UnreachableKind::Disconnected)), "{reply:?}");
+
+    let reply = relay.fetch_slice(SliceQuery { route, since: T0, until: T0 + DAY - 1, limit: Some(50) }).await;
+    assert!(matches!(reply, SliceReply::Unreachable(UnreachableKind::Disconnected)), "{reply:?}");
+    // A FIFO marker is an outbound boundary only: no claim is made that it
+    // proves the SDK processed inbound event bytes.
+    let marker = format!("{}{}", limit_relay::FLUSH_PREFIX, SubscriptionId::generate());
+    fixture.sdk.client().relay(fixture.limit.url()).await.unwrap().unwrap()
+        .send_msg(ClientMessage::Close(std::borrow::Cow::Owned(SubscriptionId::new(&marker)))).await.unwrap();
+    assert!(fixture.limit.wait_for(Duration::from_secs(5), |stats| stats.flushes.contains(&marker)).await);
+    assert_eq!(fixture.limit.stats().total_reqs, 0);
+    assert_eq!(relay.take_fetched_bytes(), 0);
+    fixture.sdk.shutdown().await;
 }
