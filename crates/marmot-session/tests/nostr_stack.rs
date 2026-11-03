@@ -1,3 +1,5 @@
+#[path = "nostr_stack/chaos.rs"]
+mod chaos;
 mod support;
 
 use cgka_engine::canonicalization::CanonicalizationPolicy;
@@ -7,7 +9,7 @@ use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory};
 use cgka_traits::{
     EpochId, MessageId, TransportAdapterError, TransportEndpoint, TransportPublishReport,
 };
-use marmot_session::{IngestEffects, PublishWork};
+use marmot_session::PublishWork;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 
 #[tokio::test]
@@ -253,60 +255,6 @@ async fn duplicate_group_relay_delivery_is_idempotent_at_session_boundary() {
 }
 
 #[tokio::test]
-async fn reordered_and_duplicated_group_app_deliveries_preserve_valid_outputs() {
-    let stack = NostrStackHarness::new();
-    let mut alice = stack.client("alice").await;
-    let mut bob = stack.client("bob").await;
-    let created = create_group_for_bob(&mut alice, &mut bob).await;
-    publish_confirm_and_deliver_welcome(
-        &stack,
-        &mut alice,
-        &mut bob,
-        created.pending,
-        created.welcome,
-    )
-    .await;
-    stack.sync_group(&bob, &created.group_id).await;
-
-    let event_zero = publish_app_event(&stack, &mut alice, &created.group_id, b"zero").await;
-    let event_one = publish_app_event(&stack, &mut alice, &created.group_id, b"one").await;
-    let event_two = publish_app_event(&stack, &mut alice, &created.group_id, b"two").await;
-
-    let second = stack
-        .deliver_event_to_session(
-            &mut bob,
-            stack.group_endpoint(),
-            "second",
-            event_two.clone(),
-        )
-        .await
-        .expect("second delivery should route");
-    let first = stack
-        .deliver_event_to_session(&mut bob, stack.group_endpoint(), "first", event_zero)
-        .await
-        .expect("first delivery should route");
-    let middle = stack
-        .deliver_event_to_session(&mut bob, stack.group_endpoint(), "middle", event_one)
-        .await
-        .expect("middle delivery should route");
-    let duplicate = stack
-        .deliver_event_to_session(&mut bob, stack.group_endpoint(), "duplicate", event_two)
-        .await
-        .expect("duplicate delivery should route");
-
-    assert_eq!(message_payloads(&second), vec![b"two".to_vec()]);
-    assert_eq!(message_payloads(&first), vec![b"zero".to_vec()]);
-    assert_eq!(message_payloads(&middle), vec![b"one".to_vec()]);
-    assert!(matches!(
-        duplicate.outcome,
-        IngestOutcome::Ignored {
-            category: InputRejectionCategory::Duplicate
-        }
-    ));
-    assert!(duplicate.effects.events.is_empty());
-}
-
-#[tokio::test]
 async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
     let stack = NostrStackHarness::new();
     let mut alice = stack.client("alice").await;
@@ -431,21 +379,6 @@ fn key_package_with_event_id(key_package: KeyPackage, marker: u8) -> KeyPackage 
     )
 }
 
-async fn publish_app_event(
-    stack: &NostrStackHarness,
-    sender: &mut StackClient,
-    group_id: &cgka_traits::GroupId,
-    payload: &[u8],
-) -> transport_nostr_peeler::NostrTransportEvent {
-    let app_message = send_app_message(sender, group_id, payload).await;
-    let report = stack
-        .publish_group(sender, group_id, app_message, 1)
-        .await
-        .unwrap();
-    assert!(report.met_required_acks());
-    stack.take_one_published().event
-}
-
 async fn send_app_message(
     sender: &mut StackClient,
     group_id: &cgka_traits::GroupId,
@@ -466,18 +399,6 @@ async fn send_app_message(
     }
 }
 
-fn message_payloads(ingest: &IngestEffects) -> Vec<Vec<u8>> {
-    ingest
-        .effects
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            GroupEvent::MessageReceived { payload, .. } => Some(app_content(payload)),
-            _ => None,
-        })
-        .collect()
-}
-
 fn app_payload_for(sender: &StackClient, payload: impl AsRef<[u8]>) -> Vec<u8> {
     let content = String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8");
     MarmotAppEvent::new(
@@ -489,13 +410,6 @@ fn app_payload_for(sender: &StackClient, payload: impl AsRef<[u8]>) -> Vec<u8> {
     )
     .encode()
     .expect("test app event encodes")
-}
-
-fn app_content(payload: &[u8]) -> Vec<u8> {
-    MarmotAppEvent::decode(payload)
-        .expect("test app event decodes")
-        .content
-        .into_bytes()
 }
 
 async fn publish_confirm_and_deliver_welcome(

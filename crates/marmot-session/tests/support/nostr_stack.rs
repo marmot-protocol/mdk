@@ -1,8 +1,4 @@
-#![allow(dead_code)]
-//! Shared no-network Nostr stack harness for session integration tests.
-//!
-//! Each integration test binary compiles this module independently, so some
-//! public helpers are intentionally used by only one sibling test file.
+//! Shared no-network Nostr stack harness for the `nostr_stack` integration binary.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -377,10 +373,6 @@ impl NostrStackHarness {
 
     pub fn group_endpoint(&self) -> TransportEndpoint {
         self.group_endpoint.clone()
-    }
-
-    pub fn nostr_routing_component(&self, seed: &[u8]) -> AppComponentData {
-        nostr_routing_component(seed)
     }
 }
 

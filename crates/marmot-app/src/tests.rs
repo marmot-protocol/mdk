@@ -10993,6 +10993,19 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
     );
 }
 
+fn sign_directory_fixture(keys: &Keys, event: NostrTransportEvent) -> NostrTransportEvent {
+    assert_eq!(event.pubkey, keys.public_key().to_hex());
+    let signed = EventBuilder::new(
+        Kind::from(u16::try_from(event.kind).unwrap()),
+        event.content,
+    )
+    .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+    .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+    .finalize(keys)
+    .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
 #[test]
 fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
     let dir = tempfile::tempdir().unwrap();
@@ -11000,7 +11013,8 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "22".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let record = |created_at, tags| {
         let mut event = NostrTransportEvent::new_unsigned(
             account_id.clone(),
@@ -11009,6 +11023,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             String::new(),
         );
         event.created_at = created_at;
+        let event = sign_directory_fixture(&keys, event);
         transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://source.example".into())],
             event,
@@ -11052,7 +11067,8 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "23".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
 
     for (kind, tag_name) in [
         (KIND_NIP65_RELAY_LIST, "r"),
@@ -11066,6 +11082,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 String::new(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(&keys, event);
             transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event,
@@ -11103,7 +11120,8 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "24".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         account_id.clone(),
         KIND_MARMOT_INBOX_RELAY_LIST,
@@ -11111,6 +11129,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         String::new(),
     );
     event.created_at = 0;
+    let event = sign_directory_fixture(&keys, event);
 
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
@@ -11639,14 +11658,14 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
     // replaces it, for peers and for accounts held on this device alike.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let alice = home.create_account("alice").unwrap();
+    home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let peer = format!("{:064x}", 1973);
+    let peer_keys = Keys::generate();
+    let alice_keys = home.load_signing_keys("alice").unwrap();
     let created_at = 1_700_001_973;
-    for (account_id, local) in [
-        (peer.as_str(), false),
-        (alice.account_id_hex.as_str(), true),
-    ] {
+    for (keys, local) in [(&peer_keys, false), (&alice_keys, true)] {
+        let account_id_hex = keys.public_key().to_hex();
+        let account_id = account_id_hex.as_str();
         app.directory()
             .remember_directory_profile(
                 account_id,
@@ -11666,6 +11685,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(keys, event);
             app.directory()
                 .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
                     endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -11756,7 +11776,8 @@ fn directory_entry_reconciles_nostr_components_independently() {
     let account = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let contact = format!("{:064x}", 920);
+    let keys = Keys::generate();
+    let contact = keys.public_key().to_hex();
 
     let mut cached = test_directory_record(&contact, "new-profile", 100);
     cached.relay_lists.nip65.created_at = 10;
@@ -11829,6 +11850,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
+    let stale_event = sign_directory_fixture(&keys, stale_event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             event: stale_event,
@@ -12583,7 +12605,8 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
     // A remote, non-local user whose contact list arrives over a relay.
-    let author = format!("{:064x}", 42);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     app.directory()
         .remember_directory_user_with_reason_for_test(&author, "message")
         .unwrap();
@@ -12595,7 +12618,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
         .collect::<Vec<_>>();
     let record = transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
-        event: contact_list_event(&author, &follows),
+        event: sign_directory_fixture(&keys, contact_list_event(&author, &follows)),
     };
 
     app.directory()
@@ -12658,7 +12681,8 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 867);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
         KIND_NOSTR_METADATA,
@@ -12676,6 +12700,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -12760,7 +12785,8 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 868);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
@@ -12781,6 +12807,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],

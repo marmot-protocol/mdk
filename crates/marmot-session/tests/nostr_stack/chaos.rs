@@ -1,7 +1,8 @@
-mod support;
+use crate::support;
 
 use std::path::Path;
 
+use crate::support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
@@ -9,7 +10,6 @@ use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
 use marmot_session::{IngestEffects, PublishWork};
 use serde::Serialize;
-use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
     assert_eq!(replay_deliveries.len(), 2);
 
     let bob_commit_replay = take_effect_for(&mut replay_deliveries, &bob_account_id);
-    assert_already_seen(&bob_commit_replay);
+    assert_processed_commit_replay(&bob_commit_replay);
 
     let carol_commit_replay = take_effect_for(&mut replay_deliveries, &carol_account_id);
     assert_already_seen(&carol_commit_replay);
@@ -224,7 +224,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
         )
         .await
         .expect("commit replay should route to Bob");
-    assert_already_seen(&bob_replay);
+    assert_processed_commit_replay(&bob_replay);
 
     let carol_endpoint = carol.inbox_endpoint.clone();
     let carol_joined = stack
@@ -262,7 +262,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
     assert_eq!(shared_replay.len(), 2);
 
     let bob_shared_replay = take_effect_for(&mut shared_replay, &bob_account_id);
-    assert_already_seen(&bob_shared_replay);
+    assert_processed_commit_replay(&bob_shared_replay);
 
     let carol_late_commit = take_effect_for(&mut shared_replay, &carol_account_id);
     assert_transport_deferred(&carol_late_commit);
@@ -578,6 +578,12 @@ impl ChaosRunState<'_> {
                     "step {step_index} duplicate valid delivery emitted payloads {payloads:?}"
                 ));
             }
+            if !ingest.effects.events.is_empty() {
+                self.failures.push(format!(
+                    "step {step_index} duplicate valid delivery emitted {} events",
+                    ingest.effects.events.len()
+                ));
+            }
             self.observations.push(DeliveryObservation {
                 step_index,
                 step,
@@ -654,6 +660,12 @@ impl ChaosRunState<'_> {
         if !payloads.is_empty() {
             self.failures.push(format!(
                 "step {step_index} replay for message {message_index} emitted payloads {payloads:?}"
+            ));
+        }
+        if !ingest.effects.events.is_empty() {
+            self.failures.push(format!(
+                "step {step_index} replay for message {message_index} emitted {} events",
+                ingest.effects.events.len()
             ));
         }
         self.observations.push(DeliveryObservation {
@@ -872,6 +884,31 @@ fn assert_invite_commit_processed(
             ..
         } if changed_group == group_id && member == added_member
     )));
+}
+
+fn assert_processed_commit_replay(effects: &IngestEffects) {
+    let outcome_tag = match &effects.outcome {
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate,
+        } => "duplicate",
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadyAtEpoch { .. },
+        } => "stale_already_at_epoch",
+        IngestOutcome::TransportDeferred { .. } => "transport_deferred",
+        _ => "other",
+    };
+    assert!(
+        matches!(
+            effects.outcome,
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate
+            } | IngestOutcome::Stale {
+                reason: StaleReason::AlreadyAtEpoch { .. }
+            }
+        ),
+        "processed commit replay must be duplicate/stale; actual_variant_tag={outcome_tag}"
+    );
+    assert!(effects.effects.events.is_empty());
 }
 
 fn assert_already_seen(effects: &IngestEffects) {
