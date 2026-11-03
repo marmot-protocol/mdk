@@ -58,7 +58,7 @@ impl MaintenanceRandom for DayStepRandom {
 #[tokio::test]
 async fn an_upgrade_replaces_the_published_key_package_with_one_advertising_account_devices() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("kp slot account-devices upgrade").unwrap();
     let database = dir.path().join("alice.sqlite");
     // KeyPackage lifetimes come from the system clock.
@@ -125,7 +125,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
     const WINDOW_5_DAYS: u64 = 5 * 24 * 60 * 60;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("leaf refresh account-devices upgrade").unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     // Bob is already on the new build; Alice made both groups before she was.
@@ -273,7 +273,7 @@ async fn an_upgrade_refreshes_each_existing_leaf_at_its_own_random_time() {
 #[tokio::test]
 async fn a_device_that_does_not_advertise_account_devices_still_joins() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("account-devices mixed join").unwrap();
     let mut alice = account_devices_session(dir.path().join("alice.sqlite"), &key, b"alice", true);
     let mut carol = account_devices_session(dir.path().join("carol.sqlite"), &key, b"carol", false);
@@ -371,7 +371,7 @@ async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
     use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
     use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("account-devices activation").unwrap();
     let alice_database = dir.path().join("alice.sqlite");
     let mut bob = account_devices_session(dir.path().join("bob.sqlite"), &key, b"bob", true);

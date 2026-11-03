@@ -111,7 +111,7 @@ fn welcome_publishes(adapter: &RecordingAdapter) -> Vec<TransportMessage> {
 /// the startup retry, maintenance, or explicit redelivery.
 #[tokio::test]
 async fn withdrawn_welcome_is_not_published_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -182,7 +182,7 @@ async fn withdrawn_welcome_is_not_published_again() {
 /// detached startup publish holds it, is dropped by maintenance unpublished.
 #[tokio::test]
 async fn maintenance_drops_the_retry_record_of_a_withdrawn_welcome() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -218,7 +218,7 @@ async fn maintenance_drops_the_retry_record_of_a_withdrawn_welcome() {
 /// published, even after the commit confirms on a restart.
 #[tokio::test]
 async fn withdrawn_staged_welcome_stays_unpublished_after_its_commit_confirms() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let alice_path = dir.path().join("alice-staged-withdrawal.sqlite");
     let key_text = "marmot staged withdrawal key";
     let key = SqlCipherKey::new(key_text).unwrap();
@@ -344,7 +344,7 @@ async fn withdrawn_staged_welcome_stays_unpublished_after_its_commit_confirms() 
 /// that is not an outbound Welcome.
 #[tokio::test]
 async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -381,7 +381,7 @@ async fn withdrawal_reports_a_delivered_welcome_and_refuses_other_messages() {
 /// before the task runs, never reaches the relay.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let OwedInviteWelcome {
         mut runtime,
         adapter,
@@ -428,7 +428,7 @@ async fn detached_startup_retry_skips_a_welcome_withdrawn_before_it_runs() {
 /// is still queued behind the concurrency limit; the started ones finish.
 #[tokio::test]
 async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot queued withdrawal key").unwrap();
     let mut members = Vec::new();
     let mut policy =
@@ -527,7 +527,7 @@ async fn detached_startup_retry_skips_a_queued_welcome_withdrawn_while_it_runs()
 /// Welcome is left as it was.
 #[tokio::test]
 async fn legacy_create_welcome_cannot_be_withdrawn() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot legacy withdrawal key").unwrap();
     let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-legacy");
     let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-legacy");
@@ -566,7 +566,7 @@ async fn legacy_create_welcome_cannot_be_withdrawn() {
 /// group is hydrated, and nothing publishes it afterwards, hydrated or not.
 #[tokio::test]
 async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("marmot unhydrated withdrawal key").unwrap();
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-unhydrated");
@@ -663,7 +663,7 @@ async fn welcome_is_withdrawn_before_its_group_is_hydrated() {
 /// nothing reports a delivery failure.
 #[tokio::test]
 async fn a_link_welcome_is_never_published_from_its_deadline_on() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = relaxed_storage_dir().unwrap();
     let key = SqlCipherKey::new("marmot link welcome deadline key").unwrap();
     let mut alice = current_session(dir.path().join("alice.sqlite"), &key, b"alice-deadline");
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob-deadline");
