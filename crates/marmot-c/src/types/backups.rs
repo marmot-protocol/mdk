@@ -1,8 +1,8 @@
 //! C-owned backup setup, status and availability records.
 use crate::macros::{c_enum, c_mirror};
 use marmot_uniffi::conversions::{
-    BackupHistoryAvailabilityFfi, BackupRestorePhaseFfi, BackupRestoreStatusFfi, BackupSettingsFfi,
-    RecoveryWordsFfi,
+    BackgroundBackupOutcomeFfi, BackupHistoryAvailabilityFfi, BackupRestorePhaseFfi,
+    BackupRestoreStatusFfi, BackupSettingsFfi, RecoveryWordsFfi,
 };
 
 c_mirror! {
@@ -20,6 +20,12 @@ c_mirror! {
     free marmot_backup_settings_free {
         copy enabled: bool,
         copy this_device_writes: bool,
+    }
+}
+c_enum! {
+    /// One due background pass's admission/completion, not publication success.
+    MarmotBackgroundBackupOutcome from BackgroundBackupOutcomeFfi {
+        NotStarted, FinishedAttempt
     }
 }
 c_enum! {

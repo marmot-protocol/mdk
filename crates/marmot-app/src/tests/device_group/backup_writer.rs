@@ -848,6 +848,8 @@ async fn the_archive_key_never_reaches_storage() {
 /// backup pass off the worker and publishes its pointer as it completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_runtime_writes_a_due_backup() {
+    use crate::BackgroundBackupOutcome::{FinishedAttempt, NotStarted};
+
     let blossom = local_blossom();
     let (devices, _chat, words) = lone_writer(&blossom).await;
     let Devices {
@@ -858,6 +860,11 @@ async fn the_runtime_writes_a_due_backup() {
         ..
     } = devices;
     drop(phone);
+    let account_id = phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
     let ledger = storage(&phone_app);
     let old_run = [0xe1; 16];
     ledger.begin_backup_run(&old_run, &[0xf2; 32], 1).unwrap();
@@ -867,19 +874,21 @@ async fn the_runtime_writes_a_due_backup() {
         relay.clone(),
         every_subscription,
     );
-    let runtime = MarmotAppRuntime::new(phone_app.clone());
-    runtime.reconcile_accounts().await.unwrap();
-    // prepare_backup_pass forgets foreign-key ledger work synchronously.
-    // This genuine durable witness catches even a background pass whose
-    // HTTP future has not yet been polled: false must gate BEFORE prepare.
-    runtime.run_due_maintenance("alice").await.unwrap();
+    let closed = MarmotAppRuntime::new(phone_app.clone());
+    closed.reconcile_accounts().await.unwrap();
+    // Durable cleanup happens synchronously during preparation, so this
+    // proves closed admission even before any HTTP future could be polled.
+    closed.run_due_maintenance("alice").await.unwrap();
     assert_eq!(ledger.backup_runs().unwrap(), before);
     for (wifi, charging) in [(true, false), (false, true)] {
-        runtime
+        closed
             .set_backup_background_conditions("alice", wifi, charging)
             .await
             .unwrap();
-        runtime.run_due_maintenance("alice").await.unwrap();
+        assert_eq!(
+            closed.run_due_backup_pass("alice").await.unwrap(),
+            NotStarted
+        );
         assert_eq!(
             ledger.backup_runs().unwrap(),
             before,
@@ -887,33 +896,59 @@ async fn the_runtime_writes_a_due_backup() {
         );
     }
     assert_eq!(pointers_published(&relay), 0);
-    let mut upload = blossom.hold_upload();
+    closed.shutdown().await;
+
+    let runtime = MarmotAppRuntime::new(phone_app.clone());
+    // With no workers or watch receivers, the report must still be retained.
     runtime
-        .set_backup_background_conditions("alice", true, true)
-        .await
+        .set_runtime_backup_background_conditions(true, true)
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), upload.entered())
+    let invalid = runtime
+        .set_backup_background_conditions("missing-account", false, false)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        AppError::AccountHome(AccountHomeError::UnknownAccount(_))
+    ));
+    let mut upload = blossom.hold_upload();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.run_due_maintenance("alice").await.unwrap();
     assert!(
         !ledger
             .backup_runs()
             .unwrap()
             .iter()
-            .any(|run| run.backup_id == old_run)
+            .any(|run| run.backup_id == old_run),
+        "eligible facts reported before workers must reach preparation"
     );
-    runtime
-        .set_backup_background_conditions("alice", false, false)
+    tokio::time::timeout(Duration::from_secs(10), upload.entered())
         .await
         .unwrap();
+    // The pass is already admitted and held at real I/O. Both callers join
+    // it; the following command is a FIFO barrier proving their admission.
+    let mut completion = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut completion).is_pending());
+    let mut cancelled_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut cancelled_waiter).is_pending());
+    runtime.backup_settings("alice").await.unwrap();
+    let pending = futures::poll!(&mut completion);
+    assert!(
+        pending.is_pending(),
+        "held pass completed before serialized settlement: {pending:?}"
+    );
+    drop(cancelled_waiter);
+    runtime
+        .set_runtime_backup_background_conditions(false, false)
+        .unwrap();
     upload.release();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while ledger.backup_schedule().unwrap().next_pass_at == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("an admitted pass settles after the reported conditions close");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), completion)
+            .await
+            .expect("the admitted pass settles after conditions close")
+            .unwrap(),
+        FinishedAttempt
+    );
     let listed = pointer(&relay, &words.public);
     assert_eq!(listed.len(), 1);
     assert_eq!(
@@ -925,14 +960,18 @@ async fn the_runtime_writes_a_due_backup() {
     ledger
         .schedule_backup_pass(BackupSchedule::default())
         .unwrap();
-    runtime.run_due_maintenance("alice").await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted
+    );
     assert_eq!(
         ledger.backup_runs().unwrap()[0].backup_id,
         next_run,
         "false blocks later passes, including cleanup"
     );
-    // Report eligible facts on this worker without a due pass, then replace
-    // it. The next worker must not inherit facts from the previous lifetime.
+    // Eligible facts survive an actual account-worker replacement in THIS
+    // runtime. A recent pointer needs no upload, but its real cleanup pass
+    // must retire the foreign-key run before reporting completion.
     ledger
         .schedule_backup_pass(BackupSchedule {
             next_pass_at: ANY_TIME,
@@ -940,17 +979,83 @@ async fn the_runtime_writes_a_due_backup() {
         })
         .unwrap();
     runtime
-        .set_backup_background_conditions("alice", true, true)
-        .await
+        .set_runtime_backup_background_conditions(true, true)
         .unwrap();
-    runtime.shutdown().await;
-    let replacement = MarmotAppRuntime::new(phone_app.clone());
-    replacement.reconcile_accounts().await.unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted
+    );
+    runtime.restart_account(&account_id).await.unwrap();
     ledger
         .schedule_backup_pass(BackupSchedule::default())
         .unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        FinishedAttempt
+    );
+    assert!(
+        !ledger
+            .backup_runs()
+            .unwrap()
+            .iter()
+            .any(|run| run.backup_id == next_run),
+        "replacement workers inherit the runtime's eligible facts"
+    );
+    assert_eq!(pointers_published(&relay), 1);
+
+    // A new confirmed recovery key has no pointer yet, so it gives another
+    // genuine due upload without faking clocks, receipts or pass outcomes.
+    runtime
+        .set_runtime_backup_background_conditions(false, false)
+        .unwrap();
+    let shown = runtime.begin_recovery_words("alice").await.unwrap();
+    let answers = shown
+        .confirm_positions
+        .iter()
+        .map(|position| shown.words[*position as usize - 1].clone())
+        .collect();
+    runtime
+        .confirm_recovery_words("alice", answers)
+        .await
+        .unwrap();
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    let mut stopped_upload = blossom.hold_upload();
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    let mut stopped_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut stopped_waiter).is_pending());
+    tokio::time::timeout(Duration::from_secs(10), stopped_upload.entered())
+        .await
+        .unwrap();
+    runtime.backup_settings("alice").await.unwrap();
+    assert!(futures::poll!(&mut stopped_waiter).is_pending());
+    runtime.shutdown().await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), stopped_waiter)
+            .await
+            .expect("worker stop must close its completion sender"),
+        Err(AppError::TransportClosed)
+    ));
+    stopped_upload.release();
+
+    // A NEW runtime starts closed even though the previous one reported true.
+    let replacement = MarmotAppRuntime::new(phone_app.clone());
+    let new_run = [0xe5; 16];
+    ledger.begin_backup_run(&new_run, &[0xf6; 32], 3).unwrap();
+    let after_stop = ledger.backup_runs().unwrap();
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    replacement.reconcile_accounts().await.unwrap();
+    assert_eq!(
+        replacement.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted
+    );
     replacement.run_due_maintenance("alice").await.unwrap();
-    assert_eq!(ledger.backup_runs().unwrap()[0].backup_id, next_run);
+    assert_eq!(ledger.backup_runs().unwrap(), after_stop);
     assert_eq!(pointers_published(&relay), 1);
     replacement.shutdown().await;
 }

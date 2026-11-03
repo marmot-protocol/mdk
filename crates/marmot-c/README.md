@@ -638,6 +638,14 @@ for the shared setup, current-membership restore, background eligibility and sec
 use the same names with the `marmot_` prefix and snake case; Wi-Fi and charging inputs are `uint8_t` booleans.
 All operations block according to the usual ABI rules.
 
+`marmot_set_runtime_backup_background_conditions` reports once for the runtime and starts no worker. The
+account-shaped function remains a validating compatibility wrapper. `marmot_run_due_backup_pass` blocks through one
+current/newly admitted due pass and writes `MarmotBackgroundBackupOutcome` by value; no allocation or free is needed.
+`FinishedAttempt` is settlement-attempt completion, not publication success. Use the call off the host UI thread;
+if the OS opportunity ends, stopping the worker/runtime from another thread ends the wait with
+`MARMOT_STATUS_TRANSPORT_CLOSED`. New exports need the matching generated header/library; existing parameter layouts
+are unchanged.
+
 Free recovery-word output with `marmot_recovery_words_free` after clearing displayed and caller-owned copies.
 The free releases MDK's returned C allocations; it does not promise to erase host copies or C string storage.
 Confirmation answers and restore phrases are borrowed inputs. Keep them valid for the call, then clear the host's

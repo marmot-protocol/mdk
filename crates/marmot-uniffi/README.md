@@ -1200,7 +1200,7 @@ land:
 
 ## Backup recovery and background conditions
 
-These experimental commands require `devDeviceGroups`, which is off by default, and a build with experimental
+Backup setup and manual restore require `devDeviceGroups`, which is off by default, and a build with experimental
 device-group support. MDK owns backup selection, due work, download limits, import validation and membership checks;
 the host supplies platform facts, renders status and obtains recovery words from the user.
 
@@ -1210,12 +1210,18 @@ words at the two returned **1-based** `confirmPositions`, in order, and pass tho
 `turnOffBackups` disables future account backups without deleting existing archives. A busy or failed confirmation
 keeps the core setup available for another try. Read settings again rather than treating a submitted choice as settled.
 
-Report `setBackupBackgroundConditions(accountRef, wifi, charging)` when an account worker starts and whenever either
-fact changes. Background writer work requires **both Wi-Fi and charging**; each replacement worker starts closed until
-the host reports eligible conditions. An admitted backup pass finishes and settles even if either fact becomes false;
-false blocks the next pass, including pointer checks, retries and cleanup. The report wakes MDK's existing dispatcher,
-not a forced backup or a publication receipt. MDK still applies writer, due-time, backoff and resource checks. The host
-owns OS execution opportunities; it need not implement another backup scheduler. Manual restore is independent of these facts.
+Report `setRuntimeBackupBackgroundConditions(wifi, charging)` once per runtime, before workers exist and on
+changes. Background writer work requires **both Wi-Fi and charging**. Reports survive account-worker restarts; a new
+runtime starts closed. An admitted pass settles after false, while later passes wait. The account-shaped
+`setBackupBackgroundConditions` remains a compatibility wrapper that validates the active account before reporting
+the same runtime-wide facts and never starts its worker. Manual restore is independent.
+
+An OS background task can await `runDueBackupPass(accountRef)`: it joins the current pass or tries ordinary due
+admission once. `NotStarted` admits nothing; `FinishedAttempt` means the pass's serialized settlement attempt and
+credit release ended. It is not a publication-success receipt, forced backup, future-due wait or whole-runtime idle
+barrier. Cancelling this caller detaches its wait; worker stop/replacement returns `TransportClosed`. The host
+bounds its OS execution opportunity and supplies fresh facts to each new runtime. Disabled device-group support returns
+`NotStarted` without starting a worker; the fact-report method itself is local and available.
 
 `beginBackupRestore(accountRef, words)` starts one manual history-only operation per account and returns its status.
 Old words remain usable independently of the current backup key; restore never enables backups or changes that key.

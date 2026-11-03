@@ -621,6 +621,14 @@ typedef enum MarmotLinkedDeviceStatus {
 } MarmotLinkedDeviceStatus;
 
 /**
+ * One due background pass's admission/completion, not publication success.
+ */
+typedef enum MarmotBackgroundBackupOutcome {
+  MARMOT_BACKGROUND_BACKUP_OUTCOME_NOT_STARTED,
+  MARMOT_BACKGROUND_BACKUP_OUTCOME_FINISHED_ATTEMPT,
+} MarmotBackgroundBackupOutcome;
+
+/**
  * Aggregate operation phase. Complete does not prove global recovery or
  * that a pointer existed; render committed-prefix counts independently.
  */
@@ -8382,8 +8390,21 @@ MarmotStatus marmot_backup_settings(const struct MarmotClient *client,
                                     struct MarmotBackupSettings **out);
 
 /**
- * Report Wi-Fi/charging on worker start and changes; both are required
- * for new background passes. A replacement worker defaults closed.
+ * Report Wi-Fi/charging once per runtime, before workers and on changes.
+ * Worker replacement retains facts; a new runtime is closed. Starts no worker.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_runtime_backup_background_conditions(const struct MarmotClient *client,
+                                                             uint8_t wifi,
+                                                             uint8_t charging);
+
+/**
+ * Compatibility runtime-wide report: validates an active account first.
  * Admitted work settles after false; manual restoration is unaffected.
  *
  * # Safety
@@ -8396,6 +8417,21 @@ MarmotStatus marmot_set_backup_background_conditions(const struct MarmotClient *
                                                      const char *account_ref,
                                                      uint8_t wifi,
                                                      uint8_t charging);
+
+/**
+ * Block for one current/newly admitted due backup pass through settlement.
+ * FinishedAttempt is not publication success. Worker stop is transport-closed;
+ * caller/host lifetime bounds remain its responsibility.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_run_due_backup_pass(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        enum MarmotBackgroundBackupOutcome *out);
 
 /**
  * Begin manual history-only restore. Words borrowed, never retained by
