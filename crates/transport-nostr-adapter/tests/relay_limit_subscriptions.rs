@@ -1922,19 +1922,11 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
         .unwrap();
     let mut cancelled_after_req = 0;
     for _ in 0..DROPS {
-        let attempt = fx
+        let previous_attempt = fx
             .adapter
             .account_subscription_attempt(&fx.account)
             .await
-            .unwrap()
-            .next();
-        let inbox_id = NostrSubscription::AccountInbox {
-            account_id: fx.account.clone(),
-            endpoints: vec![TransportEndpoint(url.clone())],
-            since: None,
-            attempt,
-        }
-        .subscription_id();
+            .unwrap();
         let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
         let mut activation = Box::pin(
             fx.adapter
@@ -1944,22 +1936,34 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
         tokio::time::timeout(SETTLE_TIMEOUT, async {
             loop {
                 if polled_pending
-                    && relay
+                    && let Some(attempt) =
+                        fx.adapter.account_subscription_attempt(&fx.account).await
+                    && attempt != previous_attempt
+                {
+                    let inbox_id = NostrSubscription::AccountInbox {
+                        account_id: fx.account.clone(),
+                        endpoints: vec![TransportEndpoint(url.clone())],
+                        since: None,
+                        attempt,
+                    }
+                    .subscription_id();
+                    if relay
                         .subscription(&SubscriptionId::new(&inbox_id))
                         .await
                         .is_some()
-                {
-                    assert!(
-                        fx.limit
-                            .wait_for(SETTLE_TIMEOUT, |stats| stats
-                                .req_log
-                                .iter()
-                                .any(|req| req.subscription_id == inbox_id))
-                            .await,
-                        "the cancelled attempt's own registered inbox reaches the wire"
-                    );
-                    cancelled_after_req += 1;
-                    break;
+                    {
+                        assert!(
+                            fx.limit
+                                .wait_for(SETTLE_TIMEOUT, |stats| stats
+                                    .req_log
+                                    .iter()
+                                    .any(|req| req.subscription_id == inbox_id))
+                                .await,
+                            "the cancelled attempt's own registered inbox reaches the wire"
+                        );
+                        cancelled_after_req += 1;
+                        break;
+                    }
                 }
                 match futures::poll!(activation.as_mut()) {
                     std::task::Poll::Ready(result) => {
