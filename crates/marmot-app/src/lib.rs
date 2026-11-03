@@ -8028,10 +8028,13 @@ impl MarmotApp {
     }
 
     /// Whether this device advertises the device roster and so can create and
-    /// join its account's device group. Off outside test-policy builds until
-    /// the roster's spec merges (mdk#2628 item 3.1).
+    /// join its account's device group. The roster spec is adopted; this still
+    /// requires explicit dev-build capability and runtime intent (mdk#2628 D98).
     pub(crate) fn device_groups_enabled(&self) -> bool {
-        cfg!(feature = "test-policy-overrides") && self.config.dev_device_groups
+        cfg!(any(
+            feature = "dev-device-groups",
+            feature = "test-policy-overrides"
+        )) && self.config.dev_device_groups
     }
 
     /// The convergence settlement window the engine runs under, in

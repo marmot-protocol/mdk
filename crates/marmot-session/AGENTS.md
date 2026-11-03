@@ -189,3 +189,6 @@ multi-device Welcome delivery, Welcome withdrawal, staged and owed Welcome deliv
 ```sh
 cargo test -p marmot-session
 ```
+
+`dev-device-groups` forwards only engine roster capability for explicit dev CLI builds. Ordinary releases keep it off;
+policy-test timing overrides are separate and must not enter dogfood artifacts.

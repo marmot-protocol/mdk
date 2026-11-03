@@ -10,6 +10,10 @@ The crate root is the facade: the runtime, its effects, `SessionConfig`, the err
 exposes. The session itself is a private module; the `test-support` feature re-exports it for tests that drive it
 directly.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Opening a session
 
 `SessionConfig::new(database_path, database_key, identity, peeler)` takes the SQLCipher database path and key, the

@@ -60,6 +60,11 @@ behavior and JSON fields are documented in the README; the rules below are the o
   `Unreleased` changelog entries when changing them.
 - Other namespaces: `chats`, `follows`, `profile`, `relays`, `settings`, `users`, `notifications`, `stream`, `debug`,
   `usage-diagnostics`, `tui`.
+- `devices` exists only with `dev-device-groups`: list and start/status/confirm-match/approve/cancel use the
+  existing daemon-owned runtime. Never create one-shot pairing state or add a CLI pairing store. Both user confirmations
+  remain separate. Core owns authentication, roster state and validation; commands only render it.
+  The real daemon/CLI owner in `tests/cli.rs` is selected in CI with `dev-device-groups` and no policy overrides;
+  local two-process coverage is not D66 VM/device acceptance.
 
 ## Daemon Guidance
 

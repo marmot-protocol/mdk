@@ -790,6 +790,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           shared-key: cli-e2e
 
+      # Keep the narrow dogfood path separate: workspace policy features would
+      # mask an accidental test-policy-only device-group capability gate.
+      - name: Dev device linking at production timing
+        run: cargo nextest run -p wn-cli --test cli --features dev-device-groups --locked --profile ci --retries 0 -E 'test(=dev_devices_link_across_daemon_commands_at_production_timing)' --no-tests=fail
+
       - name: Verify CLI shard coverage
         run: bash scripts/check_ci_partitions.sh count:2 -p wn-cli --test cli --features test-policy-overrides --locked --profile ci -E 'all()'
 

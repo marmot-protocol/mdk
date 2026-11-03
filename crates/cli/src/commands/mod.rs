@@ -16,3 +16,6 @@ pub(crate) mod settings;
 pub(crate) mod stream;
 pub(crate) mod sync;
 pub(crate) mod users;
+
+#[cfg(feature = "dev-device-groups")]
+pub(crate) mod devices;

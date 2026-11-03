@@ -70,6 +70,9 @@ cargo install --path crates/cli --locked --bins
 
 The [`wn` guide](crates/cli/README.md) covers configuration, a two-account quick start against local relays, the full
 command map, the daemon, the TUI, and JSON output for scripting.
+Explicit dev builds can [link and list account devices](crates/cli/README.md#device-linking-dev-builds) through
+`wn devices` and persistent `wnd`, using `--features dev-device-groups` independently of policy-test timing.
+Ordinary release builds keep this off.
 
 ## Build an app on MDK
 

@@ -9943,3 +9943,202 @@ fn groups_add_members_can_assign_initial_admins_in_one_commit() {
     );
     assert_eq!(admin_accounts(&admins), sorted_accounts([&alice, &carol]));
 }
+
+#[cfg(not(feature = "dev-device-groups"))]
+#[test]
+fn ordinary_builds_do_not_expose_device_link_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("unopened");
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--home")
+        .arg(&home)
+        .args(["--json", "devices", "list"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "usage");
+    assert!(
+        !home.exists(),
+        "ordinary command parsing never opens a device runtime"
+    );
+}
+
+/// A local CLI/daemon regression, not D66's separate VM/device acceptance.
+/// Compile this owner without policy overrides so the real dev capability and
+/// production settlement, persistent SAS session and two confirmations run.
+#[cfg(all(feature = "dev-device-groups", not(feature = "test-policy-overrides")))]
+#[test]
+fn dev_devices_link_across_daemon_commands_at_production_timing() {
+    fn invoke(home: &std::path::Path, socket: &std::path::Path, args: &[&str]) -> Value {
+        let output = wn(home)
+            .arg("--socket")
+            .arg(socket)
+            .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+            .args(args)
+            .output()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "device command failed: {}: {}",
+            value["error"]["code"],
+            value["error"]["message"]
+        );
+        value["result"].clone()
+    }
+    fn wait(mut read: impl FnMut() -> Option<Value>) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(value) = read() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "device link state did not advance"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let homes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let sockets = homes
+        .each_ref()
+        .map(|home| home.path().join("dev").join("wnd.sock"));
+    let absent = run_json_error(homes[0].path(), &["devices", "link", "start"]);
+    assert_eq!(absent["code"], "daemon_required");
+    assert!(
+        absent["repair"]["start"]
+            .as_str()
+            .unwrap()
+            .contains("daemon start")
+    );
+
+    let relay = TestRelay::new();
+    let daemons: Vec<_> = homes
+        .iter()
+        .zip(&sockets)
+        .map(|(home, socket)| {
+            DaemonGuard::start(socket, |wnd| {
+                wnd.arg("--home")
+                    .arg(home.path())
+                    .arg("--secret-store")
+                    .arg("file")
+                    .arg("--discovery-relays")
+                    .arg(relay.url())
+                    .arg("--default-account-relays")
+                    .arg(relay.url())
+                    .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+                    .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
+            })
+        })
+        .collect();
+    let keys = nostr::prelude::Keys::generate();
+    let nsec = zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap());
+    let mut accounts = Vec::new();
+    for (home, socket) in homes.iter().zip(&sockets) {
+        let mut command = wn(home.path());
+        command
+            .arg("--socket")
+            .arg(socket)
+            .env_remove("WN_DEV_SETTLEMENT_QUIESCENCE_MS");
+        let account = run_json_with_stdin_command(command, &["login", "--nsec-stdin"], &nsec);
+        accounts.push(account["account_id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(accounts[0], accounts[1]);
+    let selected = |index: usize, suffix: &[&str]| {
+        let mut args = vec!["--account", accounts[index].as_str(), "devices"];
+        args.extend_from_slice(suffix);
+        invoke(homes[index].path(), &sockets[index], &args)
+    };
+    assert!(
+        selected(0, &["list"])["devices"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let started = selected(1, &["link", "start"]);
+    assert_eq!(started["new_device"]["state"], "waiting_for_answer");
+    // This is another process/RPC. A one-shot runtime would lose the session.
+    assert!(!selected(1, &["link", "status"])["new_device"].is_null());
+    let prompt = wait(|| {
+        selected(0, &["link", "status"])["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|prompt| prompt["state"] == "comparing")
+            .cloned()
+    });
+    let new = wait(|| {
+        let snapshot = selected(1, &["link", "status"]);
+        (snapshot["new_device"]["state"] == "comparing").then(|| snapshot["new_device"].clone())
+    });
+    assert_eq!(new["code"].as_array().unwrap().len(), 7);
+    assert!(
+        new["code"] == prompt["code"],
+        "the two authenticated screens must match"
+    );
+    let prompt_id = prompt["prompt_id"].as_str().unwrap();
+    selected(
+        0,
+        &[
+            "link",
+            "approve",
+            prompt_id,
+            "--label",
+            "dogfood laptop",
+            "--no-add-to-all-chats",
+            "--no-bring-history",
+        ],
+    );
+    let waiting = selected(1, &["link", "status"]);
+    assert_eq!(
+        waiting["new_device"]["state"], "comparing",
+        "approving on the existing device does not confirm the new device"
+    );
+    assert!(
+        selected(0, &["list"])["devices"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "one confirmation cannot create the device group"
+    );
+    selected(1, &["link", "confirm-match"]);
+    wait(|| {
+        let new = selected(1, &["link", "status"]);
+        let existing = selected(0, &["link", "status"]);
+        (new["new_device"]["state"] == "linked"
+            && existing["prompts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["prompt_id"] == prompt_id && p["state"] == "linked"))
+        .then_some(new)
+    });
+    let lists = [selected(0, &["list"]), selected(1, &["list"])];
+    let own_slots: Vec<_> = lists
+        .iter()
+        .map(|list| {
+            let devices = list["devices"].as_array().unwrap();
+            assert_eq!(devices.len(), 2);
+            let own = devices
+                .iter()
+                .find(|d| d["is_this_device"] == true)
+                .unwrap();
+            own["slot_id_hex"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_ne!(own_slots[0], own_slots[1]);
+    let linked = lists[0]["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["slot_id_hex"] == own_slots[1])
+        .unwrap();
+    assert_eq!(linked["label"], "dogfood laptop");
+    assert_eq!(linked["add_to_all_chats"], false);
+    assert_eq!(linked["bring_history"], false);
+    for daemon in daemons {
+        daemon.stop();
+    }
+}
