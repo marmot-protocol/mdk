@@ -3930,8 +3930,12 @@ impl AppClient {
         }
 
         if initially_admin {
-            Box::pin(self.demote_account_for_leave(group_id, audit_context.clone(), invitation))
-                .await?;
+            Box::pin(self.demote_admitted_account_for_leave(
+                group_id,
+                audit_context.clone(),
+                invitation,
+            ))
+            .await?;
         }
 
         // Once the MLS leave commits we can no longer author an in-group token
@@ -3957,7 +3961,8 @@ impl AppClient {
                 && self.account_leave_needs_demotion(group_id)?
                 && !initially_admin
             {
-                Box::pin(self.demote_account_for_leave(
+                self.ensure_group_change_admitted(group_id)?;
+                Box::pin(self.demote_admitted_account_for_leave(
                     group_id,
                     audit_context.clone(),
                     invitation,
@@ -4370,13 +4375,14 @@ impl AppClient {
             .await
     }
 
-    async fn demote_account_for_leave(
+    // Both callers have already admitted this account-policy change. The
+    // delivery acknowledgment is one-shot and must not be consumed again.
+    async fn demote_admitted_account_for_leave(
         &mut self,
         group_id: &GroupId,
         audit_context: AuditEventContext,
         invitation: Option<&storage_sqlite::InvitationDecision>,
     ) -> Result<(), AppError> {
-        self.ensure_group_change_admitted(group_id)?;
         self.sync_runtime_groups_for_send("leave_admin_demotion")
             .await?;
         if let Some(invitation) = invitation

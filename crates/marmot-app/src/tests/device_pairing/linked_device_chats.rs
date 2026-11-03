@@ -358,6 +358,7 @@ async fn invite_account_for_leave(
     phone: &mut Device,
     laptop: &mut Device,
     admin: bool,
+    relays: Option<Vec<String>>,
 ) -> (tempfile::TempDir, AppClient, GroupId) {
     let alice = phone
         .app
@@ -370,7 +371,17 @@ async fn invite_account_for_leave(
     let app = crate::tests::canonical_membership::app_at(&dir, relay.clone());
     remember_test_member_inbox(&app, &alice, "wss://relay.example");
     let mut bob = app.client("bob").await.unwrap();
-    let chat = bob.create_group("account departure", &[]).await.unwrap();
+    let chat = bob
+        .create_group_with_options(
+            "account departure",
+            &[],
+            AppCreateGroupOptions {
+                relays,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let keys = vec![
         published_key_package(&mut phone.client, relay).await,
         published_key_package(&mut laptop.client, relay).await,
@@ -453,7 +464,7 @@ async fn user_account_leave_case(admin: bool) {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
     let (_bob_dir, mut bob, chat) =
-        invite_account_for_leave(&relay, &mut phone, &mut laptop, admin).await;
+        invite_account_for_leave(&relay, &mut phone, &mut laptop, admin, None).await;
     let chat_hex = hex::encode(chat.as_slice());
     let store = phone.app.account_storage("alice").unwrap();
     let admission = store.invitation_admission(&chat).unwrap().unwrap();
@@ -524,6 +535,91 @@ async fn user_account_leave_case(admin: bool) {
     }
 }
 
+/// A user's one real delivery acknowledgment admits the whole account Leave,
+/// including its admin demotion, rather than being consumed twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_undelivered_commit_ack_admits_an_admin_account_leave() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_dir, _bob, chat) = invite_account_for_leave(
+        &relay,
+        &mut phone,
+        &mut laptop,
+        true,
+        Some(vec![
+            "wss://relay-a.example".into(),
+            "wss://relay-b.example".into(),
+        ]),
+    )
+    .await;
+    phone.client.commit_delivery_gate_grace_secs = 0;
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    phone
+        .client
+        .update_group_profile(&chat, Some("one relay still owes this"), None)
+        .await
+        .unwrap();
+    let delivery = phone.client.group_commit_delivery(&chat).unwrap().unwrap();
+    assert_eq!(
+        delivery.owed_relay_urls,
+        vec!["wss://relay-b.example".to_owned()]
+    );
+    assert_eq!(delivery.relay_count, 2);
+    let store = phone.app.account_storage("alice").unwrap();
+    let generation = store
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let chat_hex = hex::encode(chat.as_slice());
+    let choice = store
+        .app_storage()
+        .invitation_decision(&chat_hex, &generation)
+        .unwrap();
+    let published = relay.published_event_ids().len();
+    assert!(matches!(phone.client.leave_group(&chat).await,
+        Err(AppError::GroupCommitUndelivered(ref held)) if held == &chat_hex));
+    assert_eq!(
+        store
+            .app_storage()
+            .invitation_decision(&chat_hex, &generation)
+            .unwrap(),
+        choice
+    );
+    assert_eq!(relay.published_event_ids().len(), published);
+    assert!(store.leave_request(&chat).unwrap().is_none());
+    assert!(
+        phone
+            .client
+            .acknowledge_group_commit_undelivered(&chat)
+            .unwrap()
+    );
+    phone
+        .client
+        .leave_group(&chat)
+        .await
+        .expect("one public acknowledgment must admit demotion and departure");
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&chat_hex, &generation)
+            .unwrap()
+            .unwrap()
+            .declined
+    );
+    assert!(store.leave_request(&chat).unwrap().is_some());
+    let own = phone.client.runtime.self_id();
+    assert!(
+        !phone
+            .client
+            .runtime
+            .admin_pubkeys(&chat)
+            .unwrap()
+            .iter()
+            .any(|admin| admin.as_slice() == own.as_slice())
+    );
+}
+
 /// Two leaves of the sole admin account are one admin, not two. Refusal
 /// precedes the replicated choice, push removal and any demotion publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -532,7 +628,7 @@ async fn the_last_admin_account_cannot_leave_from_either_device() {
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
     let (_dir, mut bob, chat) =
-        invite_account_for_leave(&relay, &mut phone, &mut laptop, true).await;
+        invite_account_for_leave(&relay, &mut phone, &mut laptop, true, None).await;
     bob.self_demote_admin(&chat).await.unwrap();
     for device in [&mut phone, &mut laptop] {
         deliver_new(&mut device.client, &relay, &mut device.cursor).await;
@@ -602,7 +698,8 @@ async fn maximum_choice_and_signout_keep_ordinary_leaf_departure() {
     use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
     let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
     link(&relay, &mut phone, &mut laptop, "Laptop").await;
-    let (_dir, _bob, chat) = invite_account_for_leave(&relay, &mut phone, &mut laptop, false).await;
+    let (_dir, _bob, chat) =
+        invite_account_for_leave(&relay, &mut phone, &mut laptop, false, None).await;
     receive_account_choice(
         &relay,
         &mut laptop,
@@ -654,6 +751,178 @@ async fn maximum_choice_and_signout_keep_ordinary_leaf_departure() {
     assert_eq!(
         store.app_storage().unsent_invitation_decisions().unwrap(),
         unsent
+    );
+}
+
+/// A real accepted SelfRemove-bearing Commit is confirmed by the deferred
+/// worker's startup drain. Its trusted tag context must already be named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
+    use cgka_traits::storage::{GroupStorage as _, OutboundFanoutStorage as _};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let device_group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, _bob, chat) =
+        invite_account_for_leave(&relay, &mut phone, &mut laptop, false, None).await;
+    let slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
+    let store = phone.app.account_storage("alice").unwrap();
+    let mut persisted_groups = store.list_groups().unwrap();
+    persisted_groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected_groups = vec![device_group.clone(), chat.clone()];
+    expected_groups.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(persisted_groups, expected_groups);
+    assert!(
+        persisted_groups.len()
+            <= crate::runtime::account_worker::STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST
+    );
+    let db = account_database(&phone.app);
+    db.execute_batch(&format!(
+        "CREATE TRIGGER hold_departure_confirmation BEFORE INSERT ON cgka_groups
+         WHEN NEW.id = x'{}' AND instr(CAST(NEW.record AS TEXT), 'self_removed_sibling_slots') > 0
+         BEGIN SELECT RAISE(FAIL, 'accepted departure confirmation held'); END;",
+        hex::encode(chat.as_slice()),
+    ))
+    .unwrap();
+    let cursor = relay.published_events.lock().unwrap().len();
+    laptop.client.leave_group_for_sign_out(&chat).await.unwrap();
+    let proposals: Vec<_> = relay.published_events.lock().unwrap()[cursor..]
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .cloned()
+        .collect();
+    assert!(
+        !proposals.is_empty(),
+        "the actual sibling SelfRemove must publish"
+    );
+    let account = phone.app.account_home().account("alice").unwrap();
+    let mut held = false;
+    for event in proposals {
+        let result = phone
+            .client
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                group_id_hint: Some(chat.clone()),
+                message: event.to_transport_message().unwrap(),
+                received_at: cgka_traits::Timestamp(crate::unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::Group,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await;
+        if let Err(error) = result {
+            assert!(
+                error
+                    .to_string()
+                    .contains("accepted departure confirmation held"),
+                "{error}"
+            );
+            held = true;
+        }
+    }
+    if !held {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match phone
+                    .client
+                    .advance_convergence_with_projection_progress_and_yield(
+                        &chat,
+                        None,
+                        std::future::pending(),
+                    )
+                    .await
+                {
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("accepted departure confirmation held"),
+                            "{error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the real accepted Commit reaches its fallible confirmation");
+    }
+    let fanout = store
+        .list_outbound_fanouts_for_group(&chat)
+        .unwrap()
+        .into_iter()
+        .find(|fanout| {
+            matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+                && fanout.outcome().accepted_targets > 0
+        })
+        .expect("actual relay acceptance is durable before failed MLS confirmation");
+    assert!(fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1));
+    let publication = fanout.message_id().clone();
+    assert!(
+        !store
+            .get_group(&chat)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot)
+    );
+    assert_eq!(phone.client.runtime.device_tag_group(), Some(&device_group));
+    db.execute_batch("DROP TRIGGER hold_departure_confirmation")
+        .unwrap();
+    drop(db);
+    drop(store);
+    drop(phone.client);
+    phone.app.close_storage().unwrap();
+    // Reopen the real encrypted account on a new application/worker, not a
+    // copied receipt or an engine-only approximation of startup ordering.
+    let reopened = MarmotApp::with_relay_and_config(
+        phone._dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_dev_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let reopened_store = reopened.account_storage("alice").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let pending = reopened_store
+                .list_outbound_fanouts_for_group(&chat)
+                .unwrap()
+                .into_iter()
+                .any(|fanout| {
+                    fanout.message_id() == &publication
+                        && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+                });
+            if !pending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real deferred worker confirms its accepted pending publication");
+    let recorded = reopened_store
+        .get_group(&chat)
+        .unwrap()
+        .self_removed_sibling_slots
+        .contains(&slot);
+    // Finish cleanup before the intended before-fix assertion can fail.
+    drop(reopened_store);
+    let _eose = scripted_eose_pump(
+        reopened.relay_plane.clone(),
+        relay.clone(),
+        every_subscription,
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(
+        recorded,
+        "the first deferred startup drain must retain the authenticated sibling departure"
     );
 }
 

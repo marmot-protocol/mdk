@@ -268,7 +268,9 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   Publication writes it before the existing own-commit checkpoint. Selected apply retains known slots through anchor
   rewind/checkpoint reconstruction and clears only slots present in the final selected tree. Fresh Welcome admission
   resets the set. Shared private Add admission returns `SiblingLeft` for an absent held slot before stock is spent.
-  Source-roster storage errors propagate through normal transaction retry; malformed/unclaimed tags identify no slot.
+  Known unavailable context (quarantined/unhydrated or missing MLS group) identifies no slot and never blocks another
+  chat's apply. Source-roster load/decode errors on a live group still propagate through transaction retry; malformed
+  or unclaimed tags identify no slot. Retain prior facts when context is unavailable; do not invent retroactive proof.
   Owners: `account_devices/sibling_welcomes.rs::an_applied_sibling_self_remove_holds_private_adds` and
   `::a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns`.
 - **Commit-derived group records are atomic with the MLS apply.** Every durable projection of an accepted commit (the

@@ -157,16 +157,24 @@ impl<S: StorageProvider> Engine<S> {
         else {
             return Ok(None);
         };
-        self.ensure_group_live(trusted)?;
+        match self.ensure_group_live(trusted) {
+            Ok(()) => {}
+            Err(EngineError::UnknownGroup(_) | EngineError::GroupNotHydrated(_)) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
         // Reading another leaf's tag does not require this observer's own
         // entry to have announced its tag key. Reuse the same trusted live
         // roster, but preserve real load/storage errors for transaction retry.
-        let device_group = MlsGroup::load(
+        let Some(device_group) = MlsGroup::load(
             self.storage.mls_storage(),
             &openmls::group::GroupId::from_slice(trusted.as_slice()),
         )
         .map_err(|error| EngineError::Backend(format!("load device group: {error:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(trusted.clone()))?;
+        else {
+            return Ok(None);
+        };
         if !device_group.is_active()
             || !crate::app_components::group_requires_device_roster(&device_group)?
         {
