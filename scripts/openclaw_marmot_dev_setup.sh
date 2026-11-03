@@ -187,7 +187,20 @@ if ! command -v openclaw >/dev/null 2>&1; then
     echo "error: openclaw launcher not found on PATH. Install OpenClaw before running the gateway helper." >&2
     exit 1
 fi
-openclaw plugins install --force --accept-capabilities "$OPENCLAW_PLUGIN_SRC"
+# Pack the built files: copying a dev directory would include node_modules,
+# exceed the host's copy preflight limit, and risk a second SDK instance.
+pack_root="$(mktemp -d "$dev_root/plugin-pack.XXXXXX")"
+trap 'rm -rf "$pack_root"' EXIT
+pnpm --dir "$OPENCLAW_PLUGIN_SRC" build
+pnpm --dir "$OPENCLAW_PLUGIN_SRC" pack --pack-destination "$pack_root"
+plugin_archive=""
+for archive in "$pack_root"/*.tgz; do
+    [ -f "$archive" ] && plugin_archive="$archive"
+done
+[ -n "$plugin_archive" ] || { echo "error: plugin pack produced no archive" >&2; exit 1; }
+openclaw plugins install --force --accept-capabilities "$plugin_archive"
+rm -rf "$pack_root"
+trap - EXIT
 openclaw plugins enable marmot
 exec openclaw gateway run "$@"
 SCRIPT

@@ -195,16 +195,16 @@ version_at_least() {
 require_node_version() {
     local version
     version="$(node --version 2>/dev/null)" || {
-        echo "error: could not determine Node version; Node 24.16+ (24.x) or 26.1+ is required" >&2
+        echo "error: could not determine Node version; Node 24.22.1+ (24.x) or 26.12.1+ is required" >&2
         exit 1
     }
     if ! printf '%s\n' "$version" | awk -F '[v.]' '
         /^v[0-9]+\.[0-9]+\.[0-9]+$/ {
-            if (($2 == 24 && $3 >= 16) || ($2 == 26 && $3 >= 1) || $2 > 26) ok = 1;
+            if (($2 == 24 && ($3 > 22 || ($3 == 22 && $4 >= 1))) || ($2 == 26 && ($3 > 12 || ($3 == 12 && $4 >= 1))) || $2 > 26) ok = 1;
         }
         END { exit !ok }
     '; then
-        echo "error: Node 24.16+ (24.x) or 26.1+ is required (found $version); upgrade Node separately, then rerun this installer" >&2
+        echo "error: Node 24.22.1+ (24.x) or 26.12.1+ is required (found $version); upgrade Node separately, then rerun this installer" >&2
         exit 1
     fi
 }
@@ -959,7 +959,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     require_openclaw_version
     need_cmd python3
 else
-    log "would require OpenClaw $MIN_OPENCLAW_VERSION or newer and Node 24.16+ (24.x) or 26.1+ on PATH"
+    log "would require OpenClaw $MIN_OPENCLAW_VERSION or newer and Node 24.22.1+ (24.x) or 26.12.1+ on PATH"
 fi
 
 platform="$(detect_platform)"

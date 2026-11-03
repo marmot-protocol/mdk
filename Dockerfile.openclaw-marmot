@@ -34,7 +34,8 @@ RUN --mount=type=cache,id=mdk-openclaw-target,target=/work/mdk/target,sharing=lo
     cargo build --locked --release -p agent-connector --bin wn-agent \
     && install -m 0755 target/release/wn-agent /usr/local/bin/wn-agent \
     && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
-    && ( cd integrations/openclaw/marmot && pnpm build )
+    && mkdir -p /opt/marmot-plugin \
+    && ( cd integrations/openclaw/marmot && pnpm build && pnpm pack --pack-destination /opt/marmot-plugin )
 
 # Development phone-test image only. Do not copy the permissive invite/debug
 # controls below into a production image; use an explicit invite allowlist and

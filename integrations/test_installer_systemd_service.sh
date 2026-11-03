@@ -144,7 +144,7 @@ if [ "$flavor" = openclaw ]; then
     cat >"$mock_bin/node" <<'EOF'
 #!/usr/bin/env bash
 [ "${1:-}" = --version ] || exit 2
-printf '%s\n' v24.16.0
+printf '%s\n' v24.22.1
 EOF
 fi
 chmod +x "$mock_bin"/*

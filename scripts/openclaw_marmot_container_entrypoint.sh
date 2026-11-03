@@ -90,10 +90,15 @@ if ! node -e 'process.exit(require(process.argv[1]).gateway?.mode==="local"?0:1)
     openclaw onboard "${onboard_args[@]}"
 fi
 
-# --force overwrites an already-installed copy. OPENCLAW_HOME lives on a
-# persisted volume, so without --force a rebuilt image's updated plugin dist is
-# ignored in favor of the stale copy left in the volume from a prior run.
-openclaw plugins install --force --accept-capabilities /work/mdk/integrations/openclaw/marmot
+# Install the same packed artifact shape as release installs. Copying a source
+# directory would traverse the host's large node_modules tree; linking it also
+# creates ambiguous workspace/install ownership in the host registry.
+plugin_archive=""
+for archive in /opt/marmot-plugin/*.tgz; do
+    [ -f "$archive" ] && plugin_archive="$archive"
+done
+[ -n "$plugin_archive" ] || { echo "error: image plugin archive is missing" >&2; exit 1; }
+openclaw plugins install --force --accept-capabilities "$plugin_archive"
 openclaw plugins enable marmot
 
 # Enabling the plugin loads its code but does not start a channel: OpenClaw only

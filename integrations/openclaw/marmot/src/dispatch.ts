@@ -612,6 +612,17 @@ export function createMarmotInboundDispatcher(
                     return;
                   }
                   finalDeliveries += 1;
+                  const requiredCapabilities = deriveDurableFinalDeliveryRequirements({
+                    payload,
+                    replyToId: message.messageIdHex,
+                    threadId: ctxPayload.MessageThreadId,
+                  });
+                  // Text sends require the identity persisted by the host queue.
+                  // Media has no unknown-send reconciler, so preserve its
+                  // existing host handoff without demanding that capability.
+                  if (!requiredCapabilities.media) {
+                    requiredCapabilities.reconcileUnknownSend = true;
+                  }
                   const result = await deliverInboundReply({
                     cfg: turnCfg as never,
                     channel: "marmot",
@@ -620,17 +631,7 @@ export function createMarmotInboundDispatcher(
                     ctxPayload,
                     payload,
                     info,
-                    // The adapter requires the identity persisted by the host's
-                    // durable queue. Without this capability request the SDK
-                    // chooses best-effort delivery and supplies no queue id.
-                    requiredCapabilities: {
-                      ...deriveDurableFinalDeliveryRequirements({
-                        payload,
-                        replyToId: message.messageIdHex,
-                        threadId: ctxPayload.MessageThreadId,
-                      }),
-                      reconcileUnknownSend: true,
-                    },
+                    requiredCapabilities,
                     // A normal response threads to the inbound message that
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.

@@ -79,18 +79,18 @@ describe("OpenClaw installer prerequisites", () => {
     }
   }
 
-  it.each(["v22.19.0", "v24.15.0", "v25.0.0", "v26.0.0", "unknown"])(
+  it.each(["v22.19.0", "v24.16.0", "v24.22.0", "v25.0.0", "v26.1.0", "v26.12.0", "unknown"])(
     "refuses unsupported Node %s before downloading", (version) => {
       const result = runInstaller(version, "OpenClaw 2026.10.10");
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("Node 24.16+ (24.x) or 26.1+ is required");
+      expect(result.stderr).toContain("Node 24.22.1+ (24.x) or 26.12.1+ is required");
       expect(result.downloadStarted).toBe(false);
     },
   );
 
   it.each(["2026.7.1", "2026.10.9", "2026.10.10-beta.1", "unknown"])(
     "refuses unsupported OpenClaw %s before downloading", (version) => {
-      const result = runInstaller("v24.16.0", `OpenClaw ${version}`);
+      const result = runInstaller("v24.22.1", `OpenClaw ${version}`);
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("OpenClaw 2026.10.10 or newer is required");
       expect(result.downloadStarted).toBe(false);
@@ -98,8 +98,8 @@ describe("OpenClaw installer prerequisites", () => {
   );
 
   it.each([
-    ["v24.16.0", "2026.10.10"],
-    ["v26.1.0", "2026.10.10"],
+    ["v24.22.1", "2026.10.10"],
+    ["v26.12.1", "2026.10.10"],
     ["v24.22.1", "2026.10.10-1"],
     ["v24.22.1", "2026.10.11"],
   ])("accepts supported Node %s and OpenClaw %s", (node, host) => {

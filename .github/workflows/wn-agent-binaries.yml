@@ -485,10 +485,14 @@ jobs:
 
   openclaw-host-compat:
     needs: changes
-    name: OpenClaw beta host compatibility
+    name: OpenClaw beta host compatibility (Node ${{ matrix.node }})
     if: needs.changes.outputs.run_openclaw == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24.22.1", "26.12.1"]
 
     steps:
       - name: Check out repository
@@ -500,14 +504,17 @@ jobs:
       - name: Install OpenClaw Node runtime
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24.22.1"
+          node-version: ${{ matrix.node }}
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: "10.13.1"
 
       - name: Test supported OpenClaw beta host
         shell: bash
         run: |
           set -euo pipefail
-          corepack enable
-          corepack prepare pnpm@10.13.1 --activate
           integrations/openclaw/marmot/test/openclaw-host-compat.sh
 
   openclaw-plugin:
@@ -528,6 +535,11 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24.22.1"
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: "10.13.1"
 
       - name: Package OpenClaw Marmot plugin tarball
         shell: bash
@@ -560,8 +572,6 @@ jobs:
               exit 1
             fi
           fi
-          corepack enable
-          corepack prepare pnpm@10.13.1 --activate
           packed_dir="$RUNNER_TEMP/openclaw-pack"
           rm -rf "$packed_dir"; mkdir -p "$packed_dir"
           # Build dist/ before packing: package.json#files ships dist (which is

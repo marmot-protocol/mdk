@@ -6,4 +6,3 @@ onlyBuiltDependencies:
   - esbuild
   - openclaw
   - protobufjs
-  - tree-sitter-bash

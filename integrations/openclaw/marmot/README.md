@@ -15,12 +15,14 @@ to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart o
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 - Pinned OpenClaw development SDK: **`openclaw@2026.10.10`**.
-- Toolchain: TypeScript, pnpm 10.13.1, Node 24.16+ (24.x) or 26.1+, Vitest.
+- Toolchain: TypeScript, pnpm 10.13.1, Node 24.22.1+ (24.x) or 26.12.1+, Vitest.
 
 The installed host supplies the SDK as a peer dependency. The optional-peer
 marker prevents package managers from installing a second host; OpenClaw itself
-enforces the declared host/API minimum when loading the plugin. Source entries
-are paired with explicit built JavaScript runtime entries in `package.json`.
+enforces the declared host/API minimum when loading the plugin. The Node floor
+also satisfies the host’s SQLite WAL-safety requirement for durable reply queues.
+Source entries are paired with explicit built JavaScript runtime entries in
+`package.json`.
 
 ## Contents
 
@@ -203,7 +205,7 @@ Prerequisites:
   host and never installs or upgrades OpenClaw. The SDK and current beta
   compatibility lane are both pinned to `2026.10.10`; the minimum is an API
   floor, not a promise that every future host release is compatible.
-- Node 24.16+ (24.x) or 26.1+
+- Node 24.22.1+ (24.x) or 26.12.1+
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 - The plugin and `wn-agent` are released as one cohort. Install both from the
   same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
@@ -407,7 +409,9 @@ relay, phone, or OpenClaw gateway.
 The image runs OpenClaw and the plugin SDK from the same frozen dependency graph,
 including its security overrides. Its Node image is pinned to `24.22.1` and its
 OpenClaw default is `2026.10.10`. The `OPENCLAW_VERSION` build argument must match
-the development SDK pin and committed lockfiles; update them together.
+the development SDK pin and committed lockfiles; update them together. The
+image packs the built plugin once and installs that archive at startup, using
+the same peer-linking path as a release install.
 
 
 A Compose profile builds a container with `wn-agent`, OpenClaw, this plugin, and
