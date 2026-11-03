@@ -7601,7 +7601,10 @@ fn self_arrival_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupI
 #[cfg(test)]
 mod live_cursor_checkpoint_tests {
     use super::SyncSummary;
-    use crate::tests::{LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test};
+    use crate::tests::{
+        LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test,
+        run_composed_app_runtime_test_on_one_thread,
+    };
 
     /// Queue a newer delivery ahead of an older one, as relays replay stored
     /// history newest-first, and arm the older one's ingest to fail. Returns
@@ -7901,56 +7904,66 @@ mod live_cursor_checkpoint_tests {
     /// would lose it, since the restart re-subscribes above it.
     #[test]
     fn a_delivery_arriving_during_a_drain_checkpoint_save_survives_a_stop() {
-        run_composed_app_runtime_test("drain-checkpoint-arrival-during-save", || async {
-            let mut fixture = LiveCursorFixture::open().await;
-            let cursor_before = fixture.cursor_before;
-            // A drained prefix: admitted without promoting, as a drain's
-            // ingests are until its checkpoint.
-            let drained = fixture
-                .delivery(fixture.probe(cursor_before + 4_000, "drained"))
-                .await;
-            fixture
-                .client
-                .admit_recovered_delivery(&drained, crate::client::sync::InventoryWrite::Immediate)
-                .await
-                .unwrap();
-            assert_eq!(
-                fixture.client.state.last_transport_timestamp,
-                Some(cursor_before + 4_000)
-            );
-            assert_eq!(fixture.persisted(), Some(cursor_before));
-
-            let late_at = cursor_before + 1_000;
-            let late = fixture.probe(late_at, "late");
-            let delivery = fixture.delivery(late.clone()).await;
-            fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
-            fixture
-                .client
-                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
-                .await
-                .unwrap_or_else(|_| panic!("the checkpoint saves"));
-
-            let persisted = fixture.persisted();
-            assert_eq!(persisted, Some(cursor_before + 4_000));
-            assert!(
-                fixture
-                    .app
-                    .relay_plane
-                    .subscription_rebuild_since(persisted)
-                    .is_some_and(|since| since.0 > late_at),
-                "the regression needs a restart floor above the late delivery"
-            );
-            assert!(
+        run_composed_app_runtime_test_on_one_thread(
+            "drain-checkpoint-arrival-during-save",
+            || async {
+                let mut fixture = LiveCursorFixture::open().await;
+                // The seal intentionally defers on lock contention. This case
+                // places one arrival at the successful save's hook; duplicate
+                // scripted EOSE reports must not contend with that one seal.
+                fixture.stop_eose_pump().await;
+                let cursor_before = fixture.cursor_before;
+                // A drained prefix: admitted without promoting, as a drain's
+                // ingests are until its checkpoint.
+                let drained = fixture
+                    .delivery(fixture.probe(cursor_before + 4_000, "drained"))
+                    .await;
                 fixture
                     .client
-                    .adapter
-                    .try_receive_account_delivery()
-                    .is_none(),
-                "the queue never holds a delivery below the checkpoint's floor"
-            );
-            fixture.wait_for_spilled(&late.id).await;
-            fixture.reopen_and_admit_spilled(&late.id).await;
-        });
+                    .admit_recovered_delivery(
+                        &drained,
+                        crate::client::sync::InventoryWrite::Immediate,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.client.state.last_transport_timestamp,
+                    Some(cursor_before + 4_000)
+                );
+                assert_eq!(fixture.persisted(), Some(cursor_before));
+
+                let late_at = cursor_before + 1_000;
+                let late = fixture.probe(late_at, "late");
+                let delivery = fixture.delivery(late.clone()).await;
+                fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
+                fixture
+                    .client
+                    .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
+                    .await
+                    .unwrap_or_else(|_| panic!("the checkpoint saves"));
+
+                let persisted = fixture.persisted();
+                assert_eq!(persisted, Some(cursor_before + 4_000));
+                assert!(
+                    fixture
+                        .app
+                        .relay_plane
+                        .subscription_rebuild_since(persisted)
+                        .is_some_and(|since| since.0 > late_at),
+                    "the regression needs a restart floor above the late delivery"
+                );
+                assert!(
+                    fixture
+                        .client
+                        .adapter
+                        .try_receive_account_delivery()
+                        .is_none(),
+                    "the queue never holds a delivery below the checkpoint's floor"
+                );
+                fixture.wait_for_spilled(&late.id).await;
+                fixture.reopen_and_admit_spilled(&late.id).await;
+            },
+        );
     }
 
     /// Before its first cursor an account's restart relies on its
@@ -7960,8 +7973,12 @@ mod live_cursor_checkpoint_tests {
     /// admits it.
     #[test]
     fn an_older_arrival_during_an_accounts_first_checkpoint_survives_a_stop() {
-        run_composed_app_runtime_test("first-cursor-arrival-during-save", || async {
+        run_composed_app_runtime_test_on_one_thread("first-cursor-arrival-during-save", || async {
             let mut fixture = LiveCursorFixture::open_without_cursor().await;
+            // The seal intentionally defers on lock contention. This case
+            // places one arrival at the successful save's hook; duplicate
+            // scripted EOSE reports must not contend with that one seal.
+            fixture.stop_eose_pump().await;
             let cursor_before = fixture.cursor_before;
             let drained = fixture
                 .delivery(fixture.probe(cursor_before + 4_000, "drained"))
@@ -10132,10 +10149,11 @@ mod tests {
         {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
-            let (app, mut client, route) = crate::tests::undecryptable_probe_route(
+            let (app, mut client, route) = crate::tests::undecryptable_probe_route_with_owner(
                 &dir,
                 &relay,
                 bounded_epoch_backfill_config(),
+                Some(false),
             )
             .await;
             let group = route.group_id.clone();

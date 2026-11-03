@@ -14183,7 +14183,8 @@ impl LiveCursorFixture {
     /// every subscription is past end-of-stored-events. A cursor seal reads
     /// replay admission without waiting and defers its commit while the
     /// adapter's state lock is taken, and each of the pump's repeat reports
-    /// takes that lock. A REQ issued afterwards never reaches EOSE. Other
+    /// takes that lock. A REQ issued afterwards never reaches EOSE until a
+    /// simulated reopen starts a fresh pump. Other
     /// tasks, such as the replay supervisor, still take the lock, so a test
     /// that asserts what one commit persists also runs on one thread, where
     /// none of them runs between the commit's readiness read and its seal.
@@ -14254,6 +14255,10 @@ impl LiveCursorFixture {
             _dir,
         } = self;
         drop(client);
+        // A reopened connection gets fresh relay replies, even when the old
+        // connection's duplicate EOSE pump was stopped for an atomic seal.
+        drop(_eose);
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let client = client_on_app_relay_plane(&app, "alice").await;
         Self {
             app,
@@ -21555,6 +21560,16 @@ pub(crate) async fn undecryptable_probe_route(
     relay: &Arc<ScriptedPushRelayClient>,
     config: MarmotAppConfig,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    undecryptable_probe_route_with_owner(dir, relay, config, None).await
+}
+
+/// The same real fixture, with an explicit owner only for legacy grant tests.
+pub(crate) async fn undecryptable_probe_route_with_owner(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+    owner: Option<bool>,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
     let account_id_hex = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap()
@@ -21562,6 +21577,9 @@ pub(crate) async fn undecryptable_probe_route(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
+    if let Some(owns) = owner {
+        app = app.with_recovery_runner_ownership_for_test(owns);
+    }
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
     app.relay_plane =
