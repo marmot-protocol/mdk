@@ -14,16 +14,17 @@
 //! harness pitfall), and every bob boot is a brand-new `MarmotApp`/
 //! `MarmotAppRuntime` pair over the same on-disk store, exactly how the
 //! confirmed iOS trigger runs ("a full runtime per push"). Messages destined
-//! for a cold boot are sent while bob is fully offline so the boot's initial
-//! catch-up drain — not a live subscription — is what delivers them.
+//! for the frozen cold boot are sent while bob is fully offline. Startup
+//! ingress or the recovery runner may ingest them before an explicit drain.
+//! The next boot observes the persisted floor before fresh traffic is sent.
 //!
 //! # Cursor observable
 //!
 //! The persisted cursor has no public accessor by design; the observation
 //! channel is the forensic audit rows added for exactly this
 //! comparison. A `sync_drain` row records the in-memory cursor before/after
-//! each drain, and the *first* drain of a cold boot records the
-//! freshly-loaded persisted value as `cursor_before_secs` — so the frozen
+//! each drain. With no fresh traffic yet, the first drain of the next boot
+//! records the freshly-loaded persisted value as `cursor_before_secs`, so the frozen
 //! boot's rows prove the pass itself never moved the cursor, and the next
 //! (Advance) boot's rows prove the *store* still holds the pre-frozen value.
 //! `subscription_rebuild` rows double-check the derived `since` floor. This
@@ -339,25 +340,16 @@ async fn frozen_wake_collection_body() {
             "a frozen drain must leave the cursor exactly where it loaded it: {drain}"
         );
     }
-    assert!(
-        boot2_drains
-            .iter()
-            .any(|drain| drain["kind"]["deliveries"].as_u64().unwrap_or(0) >= 1),
-        "the frozen boot's catch-up drain — not a live tail — must have \
-         ingested the offline-published delivery: {boot2_drains:?}"
-    );
+    // Durable projection above proves ingestion, whichever startup path won.
+    // The runner may have ingested it before the first explicit sync drain.
     // Unresolved original windows may widen REQs independently of the cursor.
     // Reopening below verifies that Frozen left the durable cursor untouched.
 
     // A fresh message for the Advance boot: the frozen-ingested one is
     // seen-id deduped on redelivery (by design — bounded redelivery is the
     // documented worst case), so only genuinely new traffic advances the
-    // cursor. Published while bob is offline so the first catch-up drain
-    // ingests it.
-    alice_client
-        .send(&group_id, b"advance resumes the ratchet")
-        .await
-        .unwrap();
+    // cursor. First observe the loaded floor before publishing that traffic:
+    // otherwise the runner could advance it before the first audit drain.
 
     // --- boot 3 (Advance, the default): the same store must surface the
     // byte-identical pre-frozen cursor, then advance it normally. ---
@@ -366,6 +358,22 @@ async fn frozen_wake_collection_body() {
     let mut events_boot3 = runtime_bob_boot3.subscribe();
     runtime_bob_boot3.start().await.unwrap();
     wait_for_first_catch_up(&runtime_bob_boot3).await;
+    runtime_bob_boot3.catch_up_accounts().await.unwrap();
+    let mut boot3_rows = audit_rows.new_rows(&app_bob_boot3, "bob");
+    let loaded_drains = rows_of_kind(&boot3_rows, "sync_drain");
+    assert_eq!(
+        loaded_drains
+            .first()
+            .expect("the reopened runtime recorded its initial drain")["kind"]["cursor_before_secs"]
+            .as_u64(),
+        Some(baseline),
+        "the Advance boot must load the untouched pre-frozen persisted cursor"
+    );
+    wait_for_wall_clock_past(baseline).await;
+    alice_client
+        .send(&group_id, b"advance resumes the ratchet")
+        .await
+        .unwrap();
     wait_for_event(&mut events_boot3, "boot 3 advancing message", |event| {
         matches!(
             event,
@@ -399,21 +407,27 @@ async fn frozen_wake_collection_body() {
         1,
         "redelivery of the frozen-ingested message is absorbed by seen-id dedup"
     );
+    assert_eq!(
+        advance_boot_messages
+            .iter()
+            .filter(|message| message.plaintext == "advance resumes the ratchet")
+            .count(),
+        1,
+        "fresh traffic must project exactly once in the Advance boot"
+    );
     runtime_bob_boot3.shutdown().await;
 
-    let boot3_rows = audit_rows.new_rows(&app_bob_boot3, "bob");
+    boot3_rows.extend(audit_rows.new_rows(&app_bob_boot3, "bob"));
     let boot3_drains = rows_of_kind(&boot3_rows, "sync_drain");
     // Core assertion: the Advance boot loaded a persisted cursor
     // byte-identical to the pre-frozen baseline — the frozen pass's
     // save_state never moved the durable floor — and a fresh delivery
-    // advanced it normally in the same drain.
+    // advanced it normally, whether ingress or a drain handled the event.
     assert!(
         boot3_drains.iter().any(|drain| {
-            drain["kind"]["cursor_before_secs"].as_u64() == Some(baseline)
-                && drain["kind"]["deliveries"].as_u64().unwrap_or(0) >= 1
-                && drain["kind"]["cursor_after_secs"]
-                    .as_u64()
-                    .is_some_and(|after| after > baseline)
+            drain["kind"]["cursor_after_secs"]
+                .as_u64()
+                .is_some_and(|after| after > baseline)
         }),
         "an Advance runtime over the same store must load the untouched \
          pre-frozen cursor ({baseline}) and advance past it on fresh \
