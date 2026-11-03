@@ -1,3 +1,4 @@
+import { EventEmitter, once } from "node:events";
 import { createServer, type Server, type Socket } from "node:net";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -157,6 +158,7 @@ type FinalDeliver = (payload: { text: string }, info: { kind: "final" }) => Prom
 function recordingRuntime(
   turns: string[],
   sessionStorePath: string,
+  onKernel?: () => void,
 ): OpenClawChannelRuntime {
   return {
     routing: {
@@ -177,6 +179,7 @@ function recordingRuntime(
     reply: {
       dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
         turns.push("kernel");
+        onKernel?.();
         const typed = params as {
           dispatcherOptions: {
             deliver: FinalDeliver;
@@ -270,6 +273,7 @@ function hostStatusContext(
     logs: string[];
     sessionStorePath: string;
     accountId?: string;
+    onKernel?: () => void;
   },
 ): {
   ctx: ChannelGatewayContext<ResolvedMarmotAccount>;
@@ -288,7 +292,7 @@ function hostStatusContext(
     setStatus: (next: Record<string, unknown>) => {
       snapshots.push(next);
     },
-    channelRuntime: recordingRuntime(options.turns, options.sessionStorePath),
+    channelRuntime: recordingRuntime(options.turns, options.sessionStorePath, options.onKernel),
     log: {
       info: (message: string) => options.logs.push(message),
       warn: (message: string) => options.logs.push(message),
@@ -333,10 +337,11 @@ function packagedConfig(
 }
 
 describe("packaged OpenClaw sender-policy entrypoint", () => {
-  it("loads the plugin and enforces sender ACL through registered gateway.startAccount", async () => {
+  it("loads the plugin and enforces sender ACL through registered gateway.startAccount", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "marmot-sender-policy-entrypoint-"));
     const control = await startRecordingControl(root);
     const turns: string[] = [];
+    const progress = new EventEmitter();
     const logs: string[] = [];
     const host = await preparePackagedHost(root);
     try {
@@ -360,6 +365,7 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
         turns,
         logs,
         sessionStorePath: host.sessionStorePath,
+        onKernel: () => { progress.emit("kernel"); },
       });
       const running = plugin.gateway!.startAccount!(ctx);
       try {
@@ -393,11 +399,11 @@ describe("packaged OpenClaw sender-policy entrypoint", () => {
         expect(logs.join("\n")).not.toContain(ALLOWED);
         expect(logs.join("\n")).not.toContain(ACCOUNT);
 
+        const kernelStarted = once(progress, "kernel", { signal });
         control.push(inboundEvent({ messageId: HEX32("d2"), sender: ALLOWED, mentionsSelf: true }));
         control.push(inboundEvent({ messageId: HEX32("d5"), sender: ALLOWED, mentionsSelf: true }));
-        await vi.waitFor(() => {
-          expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
-        });
+        await kernelStarted;
+        expect(turns.filter((item) => item === "kernel")).toEqual(["kernel"]);
         await sendText({
           cfg,
           accountId: "default",
