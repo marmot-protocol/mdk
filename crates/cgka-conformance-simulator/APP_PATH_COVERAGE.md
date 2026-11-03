@@ -164,17 +164,20 @@ switch-over.
   restart alice sends a live message to the busy group every three seconds. It asserts:
   - both timelines are exact within 30 minutes;
   - every live message arrives;
-  - no history window (a `REQ` without ids, or a `NEG-OPEN`) is asked twice on one endpoint;
+  - during restart recovery, no history window (a `REQ` without ids, or a `NEG-OPEN`) is asked twice on one endpoint;
   - each endpoint sees at most four bursts of history requests;
   - both groups' routes are asked on both endpoints;
   - a message to the quiet group arrives within a minute, while the busy group is still owed.
 
   Then it records a 200-second idle window and cuts endpoint 0 for 10 seconds. With nothing inside the rebuild
   lookback, every route's new live count there is empty. The journey asserts that both routes are asked again on
-  endpoint 0, that the runner's quanta after the reconnect newly cover at least the outage's span, that the account
+  endpoint 0, that the runner's aggregate advancing quanta after the reconnect newly cover at least the outage's span, that the account
   reports caught up within five minutes (nothing catching up and no notice, read after a runner attempt since the
   reconnect: until a runner surveys, the status lists nothing, and across a reconnect it keeps its last answer), and
-  that a quiet-group message sent after the reconnect arrives. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
+  that a quiet-group message sent after the reconnect arrives. The aggregate includes inbox comparisons; it does
+  not prove the runner itself re-swept each group, since the route requests count both owners. Reconnect repeated
+  windows and idle-window requests are recorded, not asserted absent. Runner-only group attribution remains a 5g
+  obligation. Beside the earlier owner its capture holds live frames until the backlog lands, so the restart
   bounds no live message's wait.
 
 Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
@@ -184,6 +187,18 @@ Each run writes `report.json`, `history.json` (bob's history requests, routes by
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
 cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
   public_app_runner -- --ignored --test-threads=1 --nocapture
+```
+
+Run these trace-capturing proofs with this filter or one exact test name per invocation, or use nextest's separate
+test processes. Do not combine them with other ignored tests in one cargo test process: another test may install
+the process-wide tracing subscriber first.
+
+The runner-enabled report-only large-account scorecard has its own command:
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
+  public_app_large_account_recovery_scorecard_runner_owns_debt -- --exact --ignored --test-threads=1 --nocapture
 ```
 
 ## First basic public journeys

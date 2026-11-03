@@ -1539,7 +1539,8 @@ pub(super) async fn owed_history() {
         let trace_idle = runner_trace::now_ms();
         let restart_trace = trace_between(trace_restart, trace_idle);
 
-        // Idle: nothing is owed, so nothing is fetched. (A status read is local.)
+        // Record an idle interval; outstanding hybrid debt may still cause
+        // requests. This interval has no silence assertion. Status reads are local.
         let idle_clocks = relay_clocks(subject).await?;
         let idle_started = Instant::now();
         while idle_started.elapsed() < QUIET_AGE {
@@ -1662,8 +1663,9 @@ pub(super) async fn owed_history() {
         if resweep_result.is_err() {
             return failure("the reconnect's owed ranges were not swept");
         }
-        // A failed quantum or an inbox re-check alone is no re-proof, and every
-        // route's owed range there spans at least the outage.
+        // Aggregate runner progress, including inbox comparisons, must cover
+        // at least the outage. The route checks above count both owners; this
+        // hybrid bound does not attribute group re-proof to the runner alone.
         if advanced_seconds(&reconnect_trace) < OUTAGE_MS / 1000 {
             return failure("the runner re-proved less than the outage after the reconnect");
         }
