@@ -8,6 +8,12 @@
 // the locked nostr 0.44.8 / bech32 0.11.1 encoder from explicit TLV
 // bytes. Wrapper, checksum-mutation, and oversized cases are built with
 // `std` string construction.
+//
+// Provenance: every bech32 constant in this file (npub, nprofile, note,
+// nevent, naddr, nrelay — including the 1,023- and 1,025-byte boundary
+// fixtures) was independently decoded and revalidated against that same
+// locked encoder: checksums verify, TLV entries match the per-constant
+// comments, and the encoded lengths match the stated byte budgets.
 
 #[allow(dead_code)]
 pub struct IdentityReferenceCase {

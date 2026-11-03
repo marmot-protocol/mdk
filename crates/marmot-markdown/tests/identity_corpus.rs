@@ -27,16 +27,30 @@ fn expected_hrp(name: &str) -> NostrHrp {
 }
 
 // Every corpus input is a single line, so each document holds at most one
-// top-level paragraph and the recognizer's inline findings are all in its
-// inlines — a single flat_map over those suffices.
+// top-level paragraph — but entities can nest inside emphasized spans,
+// inline code and links, so the walk recurses through container inlines
+// rather than trusting the top level alone.
 fn collect_top_level_hrps(block: &Block, hrps: &mut Vec<NostrHrp>) {
     let Block::Paragraph { inlines, .. } = block else {
         return;
     };
-    hrps.extend(inlines.iter().filter_map(|inline| match inline {
-        Inline::NostrMention(entity) | Inline::NostrUri(entity) => Some(entity.hrp),
-        _ => None,
-    }));
+    collect_inlined_hrps(inlines, hrps);
+}
+
+fn collect_inlined_hrps(inlines: &[Inline], hrps: &mut Vec<NostrHrp>) {
+    for inline in inlines {
+        match inline {
+            Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
+                hrps.push(entity.hrp);
+            }
+            Inline::Emph(nested) | Inline::Strong(nested) | Inline::Strikethrough(nested) => {
+                collect_inlined_hrps(nested, hrps)
+            }
+            Inline::Link { children, .. } => collect_inlined_hrps(children, hrps),
+            Inline::Image { alt, .. } => collect_inlined_hrps(alt, hrps),
+            _ => {}
+        }
+    }
 }
 
 #[test]
