@@ -467,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_missing_from_the_pool_stays_unreachable() {
-        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let sdk = NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder(Ok(None)));
         let relay = SdkSweepRelay::new(
             &sdk,
             RelayUrl::parse("wss://missing.example.com").unwrap(),
