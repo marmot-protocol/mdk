@@ -14,7 +14,7 @@ import {
   runChannelInboundEvent,
   type InboundMediaFacts,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { deliverInboundReplyWithMessageSendContext } from "openclaw/plugin-sdk/channel-outbound";
+import { deliverInboundReplyWithMessageSendContext, deriveDurableFinalDeliveryRequirements } from "openclaw/plugin-sdk/channel-outbound";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 
@@ -612,6 +612,17 @@ export function createMarmotInboundDispatcher(
                     return;
                   }
                   finalDeliveries += 1;
+                  const requiredCapabilities = deriveDurableFinalDeliveryRequirements({
+                    payload,
+                    replyToId: message.messageIdHex,
+                    threadId: ctxPayload.MessageThreadId,
+                  });
+                  // Text sends require the identity persisted by the host queue.
+                  // Media has no unknown-send reconciler, so preserve its
+                  // existing host handoff without demanding that capability.
+                  if (!requiredCapabilities.media) {
+                    requiredCapabilities.reconcileUnknownSend = true;
+                  }
                   const result = await deliverInboundReply({
                     cfg: turnCfg as never,
                     channel: "marmot",
@@ -620,6 +631,7 @@ export function createMarmotInboundDispatcher(
                     ctxPayload,
                     payload,
                     info,
+                    requiredCapabilities,
                     // A normal response threads to the inbound message that
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.

@@ -1514,6 +1514,20 @@ async fn a_chat_that_fails_does_not_hold_back_the_others() {
         laptop,
         ..
     } = devices;
+    // Settle founding invitation decisions before the removal stimulus: the
+    // injected rejection below must reach a chat Remove, not that broadcast.
+    phone.drive_small_state().await;
+    assert!(
+        phone
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .unsent_invitation_decisions()
+            .unwrap()
+            .is_empty(),
+        "founding invitation decisions are settled before removal"
+    );
     let laptop_slot_bytes = slot_of(&laptop);
     commit_removal_decided_elsewhere(&mut phone, &group, laptop_slot_bytes).await;
     let after = roster(&phone, &group);
