@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Separate explicit dev device-roster advertisement capability from policy-test timing overrides.
+
 ### Fixed
 
 - Attachment-bearing kind-7 reactions carry their authenticated source-epoch

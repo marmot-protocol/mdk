@@ -72,6 +72,44 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
+#[cfg(feature = "dev-device-groups")]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+pub(crate) enum DevicesCommand {
+    #[command(about = "List devices from this account's trusted device group")]
+    List,
+    #[command(about = "Compare the seven emoji and link a device")]
+    Link {
+        #[command(subcommand)]
+        command: DeviceLinkCommand,
+    },
+}
+
+#[cfg(feature = "dev-device-groups")]
+#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+pub(crate) enum DeviceLinkCommand {
+    #[command(about = "On the new device, request a link")]
+    Start,
+    #[command(about = "Read the code, pending prompts and link progress")]
+    Status,
+    #[command(about = "On the new device, confirm both screens show the same seven emoji")]
+    ConfirmMatch,
+    #[command(about = "On the existing device, approve after comparing both screens")]
+    Approve {
+        prompt_id: String,
+        #[arg(long, help = "Name the new device (at most 64 bytes)")]
+        label: String,
+        #[arg(
+            long,
+            help = "Do not add the new device to this account's existing chats"
+        )]
+        no_add_to_all_chats: bool,
+        #[arg(long, help = "Do not bring existing chat history to the new device")]
+        no_bring_history: bool,
+    },
+    #[command(about = "On the new device, cancel the link")]
+    Cancel,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 pub enum SecretStoreKind {
     Keychain,
@@ -111,6 +149,12 @@ pub(crate) enum Command {
             help = "Comma-separated default account relays forwarded to daemon start and account setup on first run"
         )]
         default_account_relays: Vec<String>,
+    },
+    #[cfg(feature = "dev-device-groups")]
+    #[command(about = "Link and list this account's devices (dev build; requires wnd)")]
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
     },
     #[command(about = "Inspect local runtime diagnostics")]
     Debug {

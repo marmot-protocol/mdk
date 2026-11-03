@@ -7,14 +7,13 @@ publish.workspace = true
 
 [features]
 default = []
+# Explicit dev dogfood capability; never enables test-policy timing overrides.
+dev-device-groups = ["unreleased-device-pairing", "marmot-session/dev-device-groups"]
 product-analytics-export = ["marmot-observability/product-analytics-export"]
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
 # marmot-session forwards this to cgka-engine, which is a dev-dependency here.
-# Device pairing runs only behind `dev_device_groups`, itself test-policy only.
 test-policy-overrides = ["marmot-session/test-policy-overrides", "unreleased-device-pairing"]
-# Device pairing through the account runtime (#2628). Unreleased until the
-# pairing and device-group specs merge: only `test-policy-overrides` enables
-# it, so no release sends or reads pairing messages.
+# Internal pairing capability shared by explicit dev builds and policy tests.
 unreleased-device-pairing = [
     "dep:marmot-pairing",
     "transport-nostr-adapter/unreleased-device-pairing",

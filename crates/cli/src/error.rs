@@ -113,6 +113,11 @@ pub(crate) enum WnError {
     UnsafeQuicEndpoint,
     #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
     InsecureLocalRequiresLoopback(SocketAddr),
+    #[cfg(feature = "dev-device-groups")]
+    #[error(
+        "devices requires a running wnd from the same dev build with relay defaults; start it with `wn daemon start --discovery-relays <urls> --default-account-relays <urls>`"
+    )]
+    DevicesRequireDaemon,
     #[error("messages subscribe requires the daemon; start it with `wn daemon start`")]
     MessagesSubscribeRequiresDaemon,
     #[error("chats subscribe requires the daemon; start it with `wn daemon start`")]
@@ -366,6 +371,12 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "insecure_local_requires_loopback",
             "message": err.to_string(),
             "addr": addr.to_string(),
+        }),
+        #[cfg(feature = "dev-device-groups")]
+        WnError::DevicesRequireDaemon => json!({
+            "code": "daemon_required",
+            "message": err.to_string(),
+            "repair": {"start": "wn daemon start --discovery-relays <urls> --default-account-relays <urls>"},
         }),
         WnError::MessagesSubscribeRequiresDaemon => json!({
             "code": "daemon_required",

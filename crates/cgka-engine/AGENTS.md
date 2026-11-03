@@ -91,8 +91,9 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `conformance_snapshot.rs` | Feature `test-conformance-snapshot` only: privacy-safe canonical-state and aggregate pending-work projections for the simulator. Structural progress counts completed distinct-context attempts; terminal equality excludes device-local authorship metadata. Never feeds protocol selection or production telemetry |
 | `test_crash_hooks.rs` | Feature `test-crash-hooks` only: subprocess pause points selected by `MDK_CGKA_TEST_CRASH_POINT` |
 
-Features (`Cargo.toml`): `test-policy-overrides`, `test-crash-hooks`, `test-conformance-snapshot`. All three are
-test-only; production/app consumers must not enable them.
+Features (`Cargo.toml`): `test-policy-overrides`, `test-crash-hooks`, `test-conformance-snapshot` are test-only;
+production/app consumers must not enable them. The separate default-off `dev-device-groups` permits only adopted
+roster advertisement for explicit dev CLI builds; it never enables timing overrides.
 
 ## Design deviations
 
@@ -124,8 +125,8 @@ Load-bearing departures from the original plan; each is also documented at its s
    because a group may require what its members advertise. Advertising never changes an existing group: upgrades
    require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
    unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`). The
-   device roster (0x800e, mdk#2628 3.1) is advertisable only in `test-policy-overrides` builds until its spec is
-   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group. The host never lists
+   device roster (0x800e, mdk#2628 3.1) is advertisable with explicit `dev-device-groups` capability or policy tests
+   (`DEVICE_ROSTER_ADVERTISABLE`); ordinary release builds keep the dev capability off. The host never lists
    the device tag (0x800f): the engine advertises it on exactly the leaves it tags, and only a device group gives it
    a roster to tag from.
 

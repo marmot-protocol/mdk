@@ -301,8 +301,8 @@ for reconnect/backoff and relay status mechanics.
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
   Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
   Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.
-- Keep `pairing` behind `unreleased-device-pairing` (and `cfg(test)`) until the pairing spec merges, and never enable
-  that feature from a crate that ships. A pairing reader accepts only rumors the account authored; that proves the
+- Keep `pairing` behind `unreleased-device-pairing` (and `cfg(test)`). The explicit default-off `dev-device-groups`
+  CLI capability forwards it with production timing; ordinary releases do not enable it. A pairing reader accepts only rumors the account authored; that proves the
   account, never a device.
 - Use Marmot kind `30443` for KeyPackages; never substitute deprecated NIP-104 key package kinds. There is no dedicated
   KeyPackage relay list; KeyPackages go to the NIP-65 kind `10002` relays.

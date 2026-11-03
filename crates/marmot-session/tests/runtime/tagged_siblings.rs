@@ -4,7 +4,8 @@
 // account's device group, each KeyPackage is a private one its sibling handed
 // over, and the chat names its relays. The Add publishes no Welcome; the
 // adder owes a sibling Welcome, which it carries as a 461 in the device group.
-// The device roster is advertisable only in test-policy builds.
+// This fixture uses policy-test roster advertisement; explicit dev-device-groups
+// builds may also advertise the adopted roster.
 
 /// Builders for two tagged devices of one account, a chat one of them is in,
 /// and the 461 that carries a sibling Welcome between them.

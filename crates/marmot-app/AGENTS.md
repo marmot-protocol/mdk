@@ -381,7 +381,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   roster's `inactive` status from it.
 - Keep device pairing (mdk#2628 item 3.3b) in `src/client/device_pairing.rs` (host DTOs) and
   `src/client/device_pairing/live.rs` (behind `unreleased-device-pairing`, and inert unless
-  `MarmotAppConfig::dev_device_groups` is set). The Welcome peeler opens each gift wrap to the account once and hands
+  `MarmotAppConfig::dev_device_groups` is set with explicit `dev-device-groups` capability or policy tests). The Welcome peeler opens each gift wrap to the account once and hands
   pairing rumors to the `PairingInbox`; the engine still sees them refused. Pairing secrets (the code, keys and session
   ids) live only in the in-memory `marmot-pairing` sessions: never persist them, and never log them, a slot or a label.
   A device adds a sibling only after both users confirmed the code and the new device's confirmation verified, through
@@ -1044,6 +1044,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 
 ## Features
 
+- `dev-device-groups`: default-off dev CLI capability forwarding only pairing and engine roster advertisement.
+  Runtime intent is still required; normal releases remain off. Never forward timing overrides through this feature.
 - `test-policy-overrides`: test-only convergence timing/rewind overrides. Never enable in app artifacts.
 - `otlp-export`: OTLP protobuf encoding and HTTP push for relay telemetry (the privacy mapping stays in the default
   build); forwards to `marmot-observability/otlp-export`.

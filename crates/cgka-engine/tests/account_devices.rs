@@ -88,13 +88,13 @@ mod activation;
 #[path = "account_devices/private_key_packages.rs"]
 mod private_key_packages;
 
-// The device roster's wire format is unreleased, so only test-policy builds
-// may advertise it (mdk#2628 3.1).
+// These roster fixtures use policy-test builds. Explicit dev-device-groups
+// builds may also advertise the adopted roster (mdk#2628 D98).
 #[cfg(feature = "test-policy-overrides")]
 #[path = "account_devices/device_roster.rs"]
 mod device_roster;
 
-// The link Commit writes the roster, so it is test-policy only too
+// These link Commit fixtures use the same policy-test roster setup
 // (mdk#2628 3.3b).
 #[cfg(feature = "test-policy-overrides")]
 #[path = "account_devices/link_device.rs"]
@@ -116,9 +116,8 @@ mod device_tag;
 #[path = "account_devices/roster_tag_keys.rs"]
 mod roster_tag_keys;
 
-// Adding a sibling to a chat sends it a sibling Welcome through the device
-// group, so a same-account Add goes through only in test-policy builds
-// (mdk#2628 3.5b).
+// These sibling Welcome fixtures use the policy-test device-group setup
+// (mdk#2628 3.5b); explicit dev builds also permit the adopted capability.
 #[cfg(feature = "test-policy-overrides")]
 #[path = "account_devices/sibling_welcomes.rs"]
 mod sibling_welcomes;
