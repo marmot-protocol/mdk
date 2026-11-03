@@ -706,7 +706,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   prefix on the first NoTrace/error, pending effects or self-removal; never charge every input a separate worker handoff.
   Admission releases a group's staged events oldest first below its admission frontier, never past an event the
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
-  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
+  admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences;
+  fetched staging inside that capture keeps it fenced until admission, even after acquisition coverage completes.
+  Staging outside a capture never turns empty-count or restart-gap debt into a fence. The fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a

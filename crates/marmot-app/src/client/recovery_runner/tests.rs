@@ -3331,6 +3331,74 @@ async fn recovery_runner_admits_nothing_newer_ahead_of_a_laggards_older_commit()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_fence_waits_for_fetched_history_admission() {
+    let account = account();
+    let clock = Clock::new();
+    let now = clock.now();
+    let (capture, empty) = (group(1), group(2));
+    for route in [&capture, &empty] {
+        account.goal(route, now - 100);
+    }
+    let relay = ModelRelay::new(RELAY, caps(500, false)).build();
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&capture, &[RELAY]), required(&empty, &[RELAY])],
+        &[&relay],
+    );
+    for route in [&capture, &empty] {
+        host.tails.stand(route, RELAY, now);
+    }
+    host.set_counts(vec![
+        LiveCount {
+            routes: vec![capture.clone()],
+            relay: RELAY.into(),
+            since: now - 100,
+            oldest_seen: Some(now - 50),
+        },
+        LiveCount {
+            routes: vec![empty.clone()],
+            relay: RELAY.into(),
+            since: now - 100,
+            oldest_seen: None,
+        },
+    ]);
+    let (mut owner, _) = runner(&host, test_policy());
+    owner
+        .admit(None)
+        .await
+        .unwrap_or_else(|_| panic!("admission stopped"));
+    assert_eq!(
+        account.fences(),
+        vec![(capture.clone(), RELAY.into(), range(now - 100, now - 50))]
+    );
+    let older = event([1; 32], now - 90);
+    account.swept(&capture, RELAY, &[older], now - 100, now - 1);
+    account.swept(
+        &empty,
+        RELAY,
+        &[event([2; 32], now - 90)],
+        now - 100,
+        now - 1,
+    );
+    host.set_counts(Vec::new()); // A restart forgets counts, not durable capture or staging.
+    assert_eq!(
+        host.fences().await,
+        vec![(vec![capture.clone()], now - 90)],
+        "coverage proves fetching, not admission; an empty count still must not fence"
+    );
+    owner
+        .admit(None)
+        .await
+        .unwrap_or_else(|_| panic!("admission stopped"));
+    assert_eq!(account.admitted_events(), 2);
+    assert!(
+        host.fences().await.is_empty(),
+        "seen staging retires the capture fence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_fences_live_frames_below_a_non_empty_count_alone() {
     let account = account();
     let clock = Clock::new();

@@ -31,8 +31,10 @@
 //!   count left unproven. An empty count's range is cold-start debt, owed but
 //!   never fencing, and so are loss, re-check and epoch-gap debt. A group's
 //!   held frames are released below the first second its fencing units still
-//!   owe in their capture debt. A unit off the frontier fences nothing until
-//!   it is back on it. Each unit keeps every capture range it still owes
+//!   owe in their capture debt or still awaiting admission inside the capture.
+//!   A unit off the frontier does not fence unfetched debt, but an already
+//!   fetched capture prefix still reaches the engine before newer live input.
+//!   Each unit keeps every capture range it still owes
 //!   durably, so the hold comes back after a restart, when the counts are
 //!   gone.
 //!
@@ -161,13 +163,20 @@ struct Member {
     /// in them.
     fences: Vec<RecoveryCoverageRange>,
     first_owed: Option<u64>,
+    /// Fetched but not yet admitted input inside this member's capture.
+    /// Coverage can finish before this prefix reaches the engine.
+    first_staged: Option<u64>,
 }
 
 impl Member {
     /// Below which second it lets its group's live frames go, if it holds
     /// them.
     fn holds_live_frames(&self) -> Option<u64> {
-        self.first_owed.filter(|_| self.on_frontier)
+        self.first_owed
+            .filter(|_| self.on_frontier)
+            .into_iter()
+            .chain(self.first_staged)
+            .min()
     }
 }
 
@@ -476,6 +485,10 @@ impl<'t> Admission<'t> {
     fn read_group(&mut self, key: &GroupKey) -> StorageResult<Group> {
         let turn = self.turn;
         let routes = self.groups.get(key).cloned().unwrap_or_default();
+        let group_routes = routes
+            .iter()
+            .map(|route| route.route.clone())
+            .collect::<Vec<_>>();
         let mut members = Vec::new();
         for route in routes.iter().copied() {
             for relay in route.required.iter().collect::<BTreeSet<_>>() {
@@ -501,7 +514,27 @@ impl<'t> Admission<'t> {
                     )
                     .collect();
                 let position = debt.first().map(|range| range.since_seconds);
-                let (fences, first_owed) = owed(merge(captures), &debt);
+                let captures = merge(captures);
+                let (mut fences, first_owed) = owed(captures.clone(), &debt);
+                let mut first_staged = None;
+                for capture in captures {
+                    let mut pending = None;
+                    for route in &group_routes {
+                        let items = turn.app.staged_recovery_items(
+                            route,
+                            capture.since_seconds,
+                            capture.until_seconds,
+                        )?;
+                        pending = super::sooner(pending, items.first().map(|item| item.created_at));
+                    }
+                    if let Some(at) = pending {
+                        first_staged = super::sooner(first_staged, Some(at));
+                        if !fences.contains(&capture) {
+                            fences.push(capture);
+                        }
+                    }
+                }
+                fences.sort_by_key(|range| range.since_seconds);
                 members.push(Member {
                     key,
                     position,
@@ -509,6 +542,7 @@ impl<'t> Admission<'t> {
                     stored,
                     fences,
                     first_owed,
+                    first_staged,
                 });
             }
         }
