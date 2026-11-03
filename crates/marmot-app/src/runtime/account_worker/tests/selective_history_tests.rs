@@ -23,7 +23,7 @@ struct TextCounts {
     neg_opens: AtomicUsize,
     requests: AtomicUsize,
     event_json: AtomicUsize,
-    window_requests: AtomicUsize,
+    group_history_requests: std::sync::Mutex<Vec<Value>>,
     group_events: std::sync::Mutex<Vec<nostr_sdk::prelude::Event>>,
 }
 
@@ -71,9 +71,9 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
                                 if let Ok(frame) = serde_json::from_str::<Vec<Value>>(text)
                                     && frame
                                         .get(2)
-                                        .and_then(|filter| filter.get("limit"))
-                                        .and_then(Value::as_u64)
-                                        == Some(256)
+                                        .and_then(|filter| filter.get("until"))
+                                        .is_some()
+                                    && frame.get(2).and_then(|filter| filter.get("ids")).is_none()
                                     && frame
                                         .get(2)
                                         .and_then(|filter| filter.get("kinds"))
@@ -87,7 +87,11 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
                                             })
                                         })
                                 {
-                                    tally.window_requests.fetch_add(1, Ordering::SeqCst);
+                                    tally
+                                        .group_history_requests
+                                        .lock()
+                                        .unwrap()
+                                        .push(frame[2].clone());
                                 }
                             }
                             if text.starts_with("[\"EVENT\"")
@@ -359,18 +363,27 @@ async fn late_commit_700_recovers() {
     .await;
     assert!(
         recovered.is_ok(),
-        "late commit recovery failed: local_epoch={}, target_epoch={epoch}, window_requests={}",
+        "late commit recovery failed: local_epoch={}, target_epoch={epoch}, history_requests={}",
         runtime
             .group_mls_state(&alice.label, &group)
             .await
             .unwrap()
             .epoch,
-        proxy.counts.window_requests.load(Ordering::SeqCst)
+        proxy.counts.group_history_requests.lock().unwrap().len()
     );
-    assert!(
-        proxy.counts.window_requests.load(Ordering::SeqCst) > 1,
-        "recovery must pass the newest page after NEG refusal"
-    );
+    {
+        let history = proxy.counts.group_history_requests.lock().unwrap();
+        assert!(
+            history.len() > 1,
+            "recovery must pass the newest page after NEG refusal"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|filter| filter.get("limit").and_then(Value::as_u64) == Some(500)),
+            "only the runner's bounded sweep may page history; native paging stays disabled"
+        );
+    }
     runtime.shutdown_and_close().await.unwrap();
     backend.shutdown();
 }

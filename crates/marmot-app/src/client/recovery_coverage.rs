@@ -1,4 +1,4 @@
-//! The coverage ledger recorder, in shadow mode (mdk#2660 phase 2).
+//! Coverage recording and the runner-owned debt handoff (mdk#2660).
 //!
 //! Fills storage's coverage ledger from facts the stack already produces:
 //! live REQ boundaries the adapter admitted, comparison certificates at
@@ -7,13 +7,14 @@
 //! and a certificate loses whatever was un-covered after its grant was
 //! selected. Then the recorder
 //! compares the ledger with every pending obligation and reports agreement as
-//! aggregate counts. Nothing here schedules, retries or fences recovery, and
-//! legacy observation writes are best effort: a failure is logged and the
-//! recovery step it follows goes on. Runner-owned conversion and loss import
-//! are authoritative and fallible before the runner or native REQs start. No route, relay, group or obligation identity is logged.
+//! aggregate counts. Legacy observation writes are best effort: a failure is
+//! logged and the recovery step it follows goes on. Runner-owned conversion,
+//! loss import and newly armed epoch gaps are authoritative and fallible.
+//! The runner schedules their debt; this module also wires its bounded live
+//! fences. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
+use cgka_traits::storage::{GroupStorage, StorageError, StorageProvider, StorageResult};
 use storage_sqlite::{
     RecoveryCause, RecoveryCoverageMark, RecoveryCoverageProof, RecoveryCoverageSlice,
     RecoveryLossCause, RecoveryLossImport, RecoveryLossReach, RecoveryPredicate,
@@ -314,9 +315,62 @@ fn fence_plan(ticket: ReplayFenceTicket, fences: &[LiveFence]) -> ReplayFencePla
     }
 }
 
-/// The runner's fence seam. Nothing calls it until the switch-over (5g).
+/// Runner-owned debt and live-fence handoffs.
 #[cfg_attr(not(test), allow(dead_code))]
 impl AppClient {
+    /// A newly armed gap contradicts earlier coverage of this group's retained
+    /// history. Commit its legacy diagnostic obligation and runnable ledger
+    /// debt together, once per obligation revision, before waking the owner.
+    pub(crate) fn arm_epoch_gap_recovery(
+        &self,
+        intents: &[storage_sqlite::StoredEpochBackfillIntent],
+    ) -> Result<(), AppError> {
+        if !self.app.recovery_runner_owns_debt() || intents.is_empty() {
+            return self
+                .app
+                .arm_epoch_backfill_intents(&self.state.label, intents);
+        }
+        let storage = self.coverage_storage()?;
+        let current = self.current_coverage_routes();
+        let floor = retention_floor(unix_now_seconds());
+        let changed = storage.with_transaction(|storage| -> Result<bool, AppError> {
+            let app = storage.app_storage();
+            let before = app.pending_recovery_demands()?;
+            app.arm_epoch_backfill_intents(intents)?;
+            let mut changed = false;
+            for demand in app.pending_recovery_demands()?.iter().filter(|demand| {
+                demand.cause == RecoveryCause::EpochGap
+                    && !before.iter().any(|prior| prior.ticket == demand.ticket)
+            }) {
+                let routes = current
+                    .iter()
+                    .filter(|route| route.group_id == demand.group_id)
+                    .collect::<Vec<_>>();
+                if routes.is_empty() {
+                    return Err(
+                        StorageError::Backend("epoch gap routes are not installed".into()).into(),
+                    );
+                }
+                for route in routes {
+                    // The Welcome time is only a goal hint, never evidence for
+                    // invalidation. Preserve the actual durable goal, bounded
+                    // by retention; a route with no goal owes the whole window.
+                    let since = app
+                        .recovery_coverage_goal(&route.route)?
+                        .unwrap_or(floor)
+                        .max(floor);
+                    app.uncover_recovery_coverage(std::slice::from_ref(&route.route), since)?;
+                }
+                changed = true;
+            }
+            Ok(changed)
+        })?;
+        if changed {
+            self.routing.wake_recovery_runner();
+        }
+        Ok(())
+    }
+
     /// The adapter's admitted live counts for the runner's fence, read now
     /// with the fence ticket and the held routes from the same look. The
     /// runner's host reads this with each debt turn's tails (from 5g).

@@ -2047,8 +2047,7 @@ impl AppClient {
                 stalled_epoch: *epoch,
             })
             .collect::<Vec<_>>();
-        self.app
-            .arm_epoch_backfill_intents(&self.state.label, &arms)?;
+        self.arm_epoch_gap_recovery(&arms)?;
         self.pending_recovery_arm_writes.clear();
         for (group, epoch) in &self.pending_recovery_capacity_writes {
             storage.app_storage().record_recovery_capacity_pressure(

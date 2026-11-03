@@ -605,7 +605,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
   fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
   records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
-  ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. The native source's
+  ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. A newly armed
+  epoch-gap obligation and invalidation of its group's existing ledger goals commit together through
+  `arm_epoch_gap_recovery`. Invalidate only on a new obligation revision, using the durable goal bounded by retention,
+  never the Welcome hint; duplicate observations preserve replacement coverage. Failed writes remain buffered for
+  the existing retry seam. Wake the runner after the transaction succeeds. The native source's
   original range is durably owed before its generation may authorize a cursor seal; the seal still checks placement,
   spill and held input under the existing locks. A failed ledger write never grants that permission. Every account open widens every current route's standing goal, cursor or not; a runner
   settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,

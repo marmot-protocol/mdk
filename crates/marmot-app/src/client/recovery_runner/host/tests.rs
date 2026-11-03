@@ -780,6 +780,135 @@ fn fault_connection(client: &AppClient) -> rusqlite::Connection {
     connection
 }
 
+/// Fresh epoch-gap evidence must create durable work even if the route was
+/// already swept. A failed handoff retries as one transaction, and polling an
+/// unchanged obligation must not erase the replacement proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_epoch_gap_reopens_covered_history_once_and_atomically() {
+    use crate::client::recovery_coverage::scenario_tests::{fixture_on, relay, routes};
+    let fixture = fixture_on(vec![relay()], true, Some(1), None).await;
+    let client = &fixture.client;
+    let app = fixture.storage.app_storage();
+    let routes = routes(client);
+    let group_route = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap();
+    let now = unix_now_seconds();
+    let since = now - 2 * HOUR;
+    app.widen_recovery_coverage_goals(std::slice::from_ref(group_route), since)
+        .unwrap();
+    let relay = relay();
+    let cover = || {
+        for route in &routes {
+            app.record_recovery_coverage(
+                &[RecoveryCoverageSlice {
+                    route,
+                    relay: &relay,
+                    since_seconds: since,
+                    until_seconds: now,
+                    proof: RecoveryCoverageProof::SweepSlice,
+                }],
+                now,
+            )
+            .unwrap();
+        }
+    };
+    cover();
+    let mut wake = client.routing.recovery_runner_wake().subscribe();
+    let intent = StoredEpochBackfillIntent {
+        group_id_hex: hex::encode(fixture.group.as_slice()),
+        stalled_epoch: 0,
+    };
+    let faults = fault_connection(client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_gap_uncover BEFORE INSERT ON account_recovery_coverage_uncovers
+        BEGIN SELECT RAISE(ABORT, 'injected epoch-gap uncover'); END;",
+        )
+        .unwrap();
+    match client.arm_epoch_gap_recovery(std::slice::from_ref(&intent)) {
+        Err(crate::AppError::Storage(cgka_traits::storage::StorageError::Backend(message))) => {
+            assert!(message.contains("injected epoch-gap uncover"));
+        }
+        other => panic!("expected injected epoch-gap uncover failure, got {other:?}"),
+    }
+    assert!(
+        !app.pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|d| d.cause == RecoveryCause::EpochGap)
+    );
+    assert!(
+        app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    assert!(
+        !woken(&mut wake),
+        "a rolled-back arm does not wake the runner"
+    );
+    faults
+        .execute_batch("DROP TRIGGER fail_gap_uncover")
+        .unwrap();
+    let prior = app.recovery_coverage_mark().unwrap();
+    client
+        .arm_epoch_gap_recovery(std::slice::from_ref(&intent))
+        .unwrap();
+    assert!(woken(&mut wake));
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    assert!(
+        app.recovery_coverage_covers(
+            &TransportReconciliationRoute::Inbox,
+            std::slice::from_ref(&relay),
+            since,
+            now
+        )
+        .unwrap()
+    );
+    assert!(app.recovery_coverage_goal(group_route).unwrap().unwrap() <= since);
+    // A quantum already running before the arm cannot certify over it.
+    app.record_recovery_coverage_since(
+        &[RecoveryCoverageSlice {
+            route: group_route,
+            relay: &relay,
+            since_seconds: since,
+            until_seconds: now,
+            proof: RecoveryCoverageProof::SweepSlice,
+        }],
+        now,
+        prior,
+    )
+    .unwrap();
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    cover();
+    let mark = app.recovery_coverage_mark().unwrap();
+    client
+        .arm_epoch_gap_recovery(std::slice::from_ref(&intent))
+        .unwrap();
+    assert_eq!(app.recovery_coverage_mark().unwrap(), mark);
+    assert!(!woken(&mut wake));
+    assert!(
+        app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+    let newer = StoredEpochBackfillIntent {
+        stalled_epoch: 1,
+        ..intent
+    };
+    client.arm_epoch_gap_recovery(&[newer]).unwrap();
+    assert!(woken(&mut wake));
+    assert!(
+        !app.recovery_coverage_covers(group_route, std::slice::from_ref(&relay), since, now)
+            .unwrap()
+    );
+}
+
 /// A settle the stop serves whose write fails leaves its attempt open, so the
 /// stop still refunds it once the runner can send no more turns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4650,10 +4650,7 @@ impl AppClient {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 stalled_epoch,
             };
-            let result = self.app.arm_epoch_backfill_intents(
-                &self.state.label,
-                std::slice::from_ref(&durable_intent),
-            );
+            let result = self.arm_epoch_gap_recovery(std::slice::from_ref(&durable_intent));
             match result {
                 Ok(()) => {
                     self.pending_recovery_arm_writes.remove(group_id);
