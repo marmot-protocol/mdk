@@ -217,6 +217,14 @@ impl AppClient {
             storage.defer_uninstalled_invitation_decision(decision)?;
             return Ok(());
         }
+        // The queued projection is newer than the saved row. Let its existing
+        // checkpoint commit before adopting that row or applying this choice.
+        if self
+            .pending_group_projection_updates
+            .contains(&decision.group_id_hex)
+        {
+            return Ok(());
+        }
         let group = self.app.group(&self.state.label, &decision.group_id_hex)?;
         if self.is_device_group(&group_id)? {
             storage.defer_uninstalled_invitation_decision(decision)?;
