@@ -894,7 +894,7 @@ mod tests {
     /// no arming of that count a fact, so the next prune drops it.
     #[tokio::test]
     async fn an_ended_count_admitted_later_is_no_fact() {
-        for immediate_prune in [true, false] {
+        for immediate_prune in [false, true] {
             let (mut coverage, id, _) = fenced_coverage(true);
             let (tx, _rx) = mpsc::channel(8);
             replay(&mut coverage, &id, &[(0, 150)], &tx);
