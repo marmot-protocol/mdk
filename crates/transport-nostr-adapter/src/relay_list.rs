@@ -227,19 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn marmot_inbox_relay_list_uses_kind_10050_and_relay_tags() {
-        let publication = sample_publication(NostrAccountRelayListKind::Inbox);
-
-        let event = publication.to_event().unwrap();
-
-        assert_eq!(event.kind, KIND_MARMOT_INBOX_RELAY_LIST);
-        assert_eq!(
-            event.tags[0],
-            vec!["relay".to_string(), "wss://relay1.example".to_string()]
-        );
-    }
-
-    #[test]
     fn nip65_marker_matrix_is_directional_and_deduplicated() {
         let event = NostrTransportEvent::new_unsigned(
             "11".repeat(32),

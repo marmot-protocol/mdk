@@ -7233,7 +7233,7 @@ async fn executor_failure_records_loss_cancels_io_and_preserves_retained_input()
         NostrNotificationLossFloor::Since(floor - 172_800)
     );
     wait_until(
-        "all failed replay IO is destroyed before credit is free",
+        "failed replay IO is destroyed and its credit is released",
         || {
             relay.active_acquisitions.load(Ordering::SeqCst) == 0
                 && credits.available_permits() == 1
@@ -7245,6 +7245,15 @@ async fn executor_failure_records_loss_cancels_io_and_preserves_retained_input()
     {
         let status = adapter.take_replay_status(&account).await;
         assert!(status.sources().all(|source| !source.admitted()));
+        let source = status
+            .sources()
+            .find(|source| source.id() == id.as_str())
+            .expect("the failed group request remains observable debt");
+        assert!(
+            !source.terminally_refused(),
+            "executor failure leaves unfinished sources recoverable"
+        );
+        assert_eq!(source.endpoints().count(), 2);
     }
     let transport_nostr_adapter::ReplayBatchTake::Ready(mut batch) =
         ingress.take_batch(Some(&group.group_id)).await

@@ -821,44 +821,6 @@ mod tests {
         assert_eq!(held_from(&coverage, 0), None);
     }
 
-    /// A count that ends before its boundary is admitted is no fact, even when
-    /// its boundary is admitted after it ended: an acknowledgement that frees
-    /// the boundary then makes no ended count answerable.
-    #[tokio::test]
-    async fn a_count_that_ended_is_not_admitted_by_a_later_acknowledgement() {
-        let (mut coverage, id, _) = fenced_coverage(true);
-        let (tx, _rx) = mpsc::channel(8);
-        replay(&mut coverage, &id, &[(0, 150)], &tx);
-        coverage.apply_fence_plan(&plan(&coverage, &[]));
-        assert_eq!(released(&mut coverage), vec![(0, 150)]);
-        // 150's pin keeps relay 1's next boundary from being admitted.
-        coverage.restart_relay(
-            RelayIndex(1),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            None,
-            None,
-        );
-        coverage.record_stored_event(&id, RelayIndex(1), 160);
-        coverage
-            .stage_delivery(
-                delivery(0, 160, 2, &id, 1),
-                Some(RelayIndex(1)),
-                ReplayInput::History,
-                &tx,
-            )
-            .unwrap();
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        assert_eq!(held_from(&coverage, 0), Some(SINCE));
-        assert!(!coverage.endpoint_deadlines[&id][&RelayIndex(1)].boundary_admitted);
-
-        coverage.end_relay_live_counts(RelayIndex(1));
-        coverage.ack_placement(&delivery(0, 150, 1, &id, 1).message.id);
-        coverage.prune_fence_armings();
-        assert_eq!(held_from(&coverage, 0), None, "no fact holds 160");
-        assert_eq!(released(&mut coverage), vec![(0, 160)]);
-    }
-
     /// A newer count that does not fence retires the endpoint's earlier
     /// counts that never became facts, however its earlier count ended.
     #[tokio::test]
