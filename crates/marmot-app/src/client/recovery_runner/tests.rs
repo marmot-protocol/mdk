@@ -970,6 +970,9 @@ struct TestHost {
     client: Option<Arc<AppClient>>,
     relays: BTreeMap<&'static str, Arc<ModelRelay>>,
     debt_turns: AtomicUsize,
+    /// Delay before a worker answers a debt turn, as competing commands cause.
+    debt_turn_latency: Mutex<Duration>,
+    largest_admission_batch: AtomicUsize,
     /// How long a NIP-11 read takes.
     caps_latency: Mutex<Duration>,
     /// Every NIP-11 read is unknown, as a relay that serves no document.
@@ -1048,6 +1051,8 @@ impl TestHost {
                 .map(|relay| (relay.url, Arc::clone(relay)))
                 .collect(),
             debt_turns: AtomicUsize::new(0),
+            debt_turn_latency: Mutex::new(Duration::ZERO),
+            largest_admission_batch: AtomicUsize::new(0),
             caps_latency: Mutex::new(Duration::ZERO),
             caps_unknown: AtomicBool::new(false),
             failing_turns: AtomicUsize::new(0),
@@ -1157,6 +1162,10 @@ impl RunnerHost for TestHost {
         self.debt_turns.fetch_add(1, Ordering::SeqCst);
         self.clock
             .advance(self.debt_turn_seconds.load(Ordering::SeqCst));
+        let latency = *self.debt_turn_latency.lock().unwrap();
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
         Some(answer)
     }
 
@@ -1212,6 +1221,8 @@ impl RunnerHost for TestHost {
         &self,
         deliveries: Vec<TransportDelivery>,
     ) -> Option<Vec<Result<Admitted, &'static str>>> {
+        self.largest_admission_batch
+            .fetch_max(deliveries.len(), Ordering::SeqCst);
         let mut outcomes = Vec::with_capacity(deliveries.len());
         for delivery in deliveries {
             self.clock
@@ -3228,7 +3239,7 @@ fn recovery_runner_policy_holds_the_starting_values() {
         ),
         (2_048, 8 * 1024 * 1024, 64 * 1024 * 1024)
     );
-    assert_eq!(policy.admission_per_turn, 4);
+    assert_eq!(policy.admission_per_turn, 16);
     assert_eq!(policy.fences_per_unit, 8);
     let holds = (1..=8)
         .map(|failures| policy.local_failure_backoff_seconds(failures))

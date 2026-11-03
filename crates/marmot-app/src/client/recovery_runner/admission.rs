@@ -679,22 +679,23 @@ fn plan(
     policy: &RecoveryRunnerPolicy,
     held: &BTreeSet<GroupKey>,
 ) -> StorageResult<Batch> {
+    // Retry selection shares this already-required worker turn. A merely
+    // pending gap must not add another scheduling round trip to every batch.
+    // A visit that actually reopens debt yields to its network selection.
+    let stalled = Stalled {
+        all: false,
+        groups: held.clone(),
+    };
+    if super::epoch_gap::advance(turn, policy, &stalled)?.started {
+        return Ok(Batch {
+            events: Vec::new(),
+            discarded: 0,
+        });
+    }
     let mut admission = Admission::new(turn);
     admission.reclaim_unlisted()?;
     admission.record_fences(policy.fences_per_unit)?;
     admission.releasable(policy.admission_per_turn, held)
-}
-
-/// A bounded batch yielded to retry selection. After that selection has
-/// refreshed debt, use its current frontiers to decide whether local admission
-/// can continue before waiting for a network quantum. Staging alone is not
-/// enough: held events and events beyond a frontier still need network work.
-pub(super) fn ready(turn: &DebtTurn<'_>, stalled: &Stalled) -> StorageResult<bool> {
-    if stalled.all {
-        return Ok(false);
-    }
-    let batch = Admission::new(turn).releasable(1, &stalled.groups)?;
-    Ok(!batch.events.is_empty() || batch.discarded > 0)
 }
 
 /// How an admission pass ended: when admission next has something to retry,
@@ -782,9 +783,9 @@ impl Memory {
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
-    /// Admit in bounded worker batches. Pending epoch-gap work returns to retry
-    /// selection after each batch; other passes drain their ready staging.
-    /// A large backlog must not keep a due gap visit waiting for its entire drain.
+    /// Admit in bounded worker batches. Each batch's plan also checks due gap
+    /// visits, so neither a large backlog nor extra worker scheduling can
+    /// starve recovery. Only opening a visit yields to network selection.
     /// Returns how the pass ended, or the step to end with.
     /// Holds and waits are armed from the clock as read after the awaits
     /// that led to them, so none is born expired.
@@ -857,28 +858,15 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 .iter()
                 .map(|(_, event_id)| event_id.clone())
                 .collect::<Vec<_>>();
-            let (removed, more_staged, gap_pending) = match self
+            let removed = match self
                 .host
                 .turn(move |turn| {
-                    let removed = event_ids
+                    event_ids
                         .iter()
                         .map(|event_id| {
                             Ok(turn.app.remove_seen_staged_recovery_events(&[event_id])? > 0)
                         })
-                        .collect::<StorageResult<Vec<bool>>>()?;
-                    let gap_pending = turn.app.pending_recovery_demands()?.iter().any(|demand| {
-                        demand.cause == storage_sqlite::RecoveryCause::EpochGap
-                            && matches!(
-                                demand.eligibility,
-                                storage_sqlite::RecoveryEligibility::Ready
-                                    | storage_sqlite::RecoveryEligibility::Retry
-                            )
-                    });
-                    Ok::<_, cgka_traits::storage::StorageError>((
-                        removed,
-                        gap_pending && turn.app.staged_recovery_total()?.events > 0,
-                        gap_pending,
-                    ))
+                        .collect::<StorageResult<Vec<bool>>>()
                 })
                 .await
             {
@@ -922,13 +910,6 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     .failed("admission_ingest", kind, now, &self.policy));
             }
             self.admission.failures = 0;
-            if gap_pending {
-                // Revisit admission promptly, but first let the scheduler
-                // observe due gap work. NoTrace groups still cannot buy a fetch.
-                let mut drained = self.admission.end(now, self.admission.held_at(now));
-                drained.due = super::sooner(drained.due, more_staged.then_some(now));
-                return Ok(drained);
-            }
         }
     }
 }

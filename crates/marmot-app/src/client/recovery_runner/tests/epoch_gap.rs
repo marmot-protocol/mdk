@@ -26,7 +26,8 @@ async fn epoch_gap_visit_waits_for_its_releasable_history() {
         .app
         .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
         .unwrap();
-    let events = every([1; 32], now - 16, now, 1);
+    let count = test_policy().admission_per_turn as u64 * 4;
+    let events = every([1; 32], now - count, now, 1);
     account.swept(&route, RELAY, &events, now - 100, now - 1);
     let mut owned = required(&route, &[RELAY]);
     owned.group_id = Some(vec![0x0a]);
@@ -36,8 +37,13 @@ async fn epoch_gap_visit_waits_for_its_releasable_history() {
     let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
     host.tails.stand(&route, RELAY, now);
     host.ingest_seconds.store(5, Ordering::SeqCst);
+    *host.debt_turn_latency.lock().unwrap() = Duration::from_millis(100);
     let (mut owner, _) = runner(&host, test_policy());
-    owner.step().await;
+    // Observe a genuinely admitted prefix before its pass budget ends, rather
+    // than assuming that a whole runner step means one worker batch.
+    owner.run_pass(Duration::from_millis(100)).await;
+    assert!(account.admitted_events() > 0);
+    assert!(account.admitted_events() < events.len() as u64);
     assert!(
         account
             .app
@@ -47,6 +53,7 @@ async fn epoch_gap_visit_waits_for_its_releasable_history() {
             .in_progress,
         "a visit must not finish while its own fetched history is ready for admission"
     );
+    *host.debt_turn_latency.lock().unwrap() = Duration::ZERO;
     for _ in 0..events.len() {
         if account.admitted_events() == events.len() as u64 {
             break;
@@ -136,7 +143,7 @@ async fn epoch_gap_outage_does_not_spend_unanswered_visit_budget() {
 // Paused time makes a slow relay deterministic without a wall-clock wait.
 #[tokio::test(start_paused = true)]
 async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
-    for gap_pending in [false, true] {
+    for (gap_pending, turn_ms) in [(false, 0), (true, 0), (false, 100), (true, 100)] {
         let account = account();
         account
             .fault_connection()
@@ -145,7 +152,10 @@ async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
         let clock = Clock::new();
         let now = clock.now();
         let route = group(1);
-        account.goal(&route, now - 100);
+        // Keep sixteen batches at every production batch size: enlarging a
+        // batch must not accidentally erase the scheduling regression.
+        let since = now - test_policy().admission_per_turn as u64 * 16 - 20;
+        account.goal(&route, since);
         if gap_pending {
             account
                 .app
@@ -157,14 +167,14 @@ async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
             let ticket = account.app.pending_recovery_demands().unwrap()[0].ticket;
             account
                 .app
-                .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), now - 100)], now)
+                .begin_recovery_epoch_gap_retry(ticket, &[(route.clone(), since)], now)
                 .unwrap();
         }
         // Every staged event is below the required source's frontier. Only
         // newer history still needs the network, so none of these deliveries
         // needs to wait for that request to answer.
-        let events = every([1; 32], now - 100, now - 36, 1);
-        account.swept(&route, RELAY, &events, now - 100, now - 20);
+        let events = every([1; 32], since, now - 20, 1);
+        account.swept(&route, RELAY, &events, since, now - 20);
         let mut owned = required(&route, &[RELAY]);
         owned.group_id = Some(vec![0x0a]);
         let relay = ModelRelay::new(RELAY, caps(500, false))
@@ -172,12 +182,16 @@ async fn ready_history_admission_does_not_wait_for_newer_network_debt() {
             .build();
         let host = TestHost::new(&account, &clock, vec![owned], &[&relay]);
         host.tails.stand(&route, RELAY, now);
+        *host.debt_turn_latency.lock().unwrap() = Duration::from_millis(turn_ms);
         let (mut owner, _) = runner(&host, test_policy());
-        owner.run_pass(Duration::from_secs(1)).await;
+        // Ready history gets the same bounded pass when worker commands delay
+        // its turns. A pending gap must not double its scheduling round trips.
+        let budget = if turn_ms == 0 { 1 } else { 2 };
+        owner.run_pass(Duration::from_secs(budget)).await;
         assert_eq!(
             account.admitted_events(),
             events.len() as u64,
-            "ready history must drain before waiting on newer network debt; gap_pending={gap_pending}"
+            "ready history must drain before waiting on newer network debt; gap_pending={gap_pending}, turn_ms={turn_ms}"
         );
     }
 }
@@ -267,7 +281,8 @@ async fn epoch_gap_retry_is_not_starved_by_a_large_staged_admission() {
     // The gap's own ready prefix must drain before another visit. This
     // separate group's backlog cannot postpone a due visit for the gap.
     let other_route = group(2);
-    let events = every([2; 32], now - 16, now, 1);
+    let count = test_policy().admission_per_turn as u64 * 4;
+    let events = every([2; 32], now - count, now, 1);
     account.goal(&other_route, now - 100);
     account.swept(&route, RELAY, &[], now - 100, now - 1);
     account.swept(&other_route, RELAY, &events, now - 100, now - 1);
@@ -289,8 +304,8 @@ async fn epoch_gap_retry_is_not_starved_by_a_large_staged_admission() {
     let (mut owner, _) = runner(&host, policy);
     owner.step().await;
     assert!(
-        account.admitted_events() <= policy.admission_per_turn as u64,
-        "an admission batch must return to the runner's retry selection"
+        host.largest_admission_batch.load(Ordering::SeqCst) <= policy.admission_per_turn,
+        "each worker command must keep admission bounded while checking due visits"
     );
     for _ in 0..4 {
         if account

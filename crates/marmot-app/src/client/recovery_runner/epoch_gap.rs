@@ -13,16 +13,25 @@ use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATIO
 use super::admission::{Admission, Stalled};
 use super::{DebtTurn, RecoveryRunnerPolicy, sooner};
 
+/// A newly opened visit needs ordinary debt selection before more admission;
+/// otherwise ready local history can keep draining in bounded worker batches.
+#[derive(Default)]
+pub(super) struct Advanced {
+    pub(super) next_due: Option<u64>,
+    pub(super) started: bool,
+}
+
 /// Prepare due return visits and report the earliest future one. This runs in
 /// the existing runner's short worker turn, before selecting ordinary debt.
 pub(super) fn advance(
     turn: &DebtTurn<'_>,
     policy: &RecoveryRunnerPolicy,
     stalled: &Stalled,
-) -> StorageResult<Option<u64>> {
+) -> StorageResult<Advanced> {
     let app = turn.app;
     let mut admission = Admission::new(turn);
     let mut next = None;
+    let mut started = false;
     let floor = turn
         .now
         .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
@@ -124,8 +133,11 @@ pub(super) fn advance(
                 next = sooner(next, Some(state.next_retry_at_seconds));
                 continue;
             }
-            app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
+            started |= app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
         }
     }
-    Ok(next)
+    Ok(Advanced {
+        next_due: next,
+        started,
+    })
 }

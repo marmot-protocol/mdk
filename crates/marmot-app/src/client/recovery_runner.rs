@@ -688,13 +688,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
-        let admission_yielded = admission_due.is_some_and(|at| at <= self.host.now_seconds());
-        let (mut survey, epoch_gap_due, admission_ready) = match self
+        let (mut survey, epoch_gap_due) = match self
             .host
             .debt_turn(move |turn| {
-                let due = epoch_gap::advance(turn, &policy, &stalled)?;
-                let ready = admission_yielded && admission::ready(turn, &stalled)?;
-                Ok((select::survey(turn, &policy, &stalled)?, due, ready))
+                let due = epoch_gap::advance(turn, &policy, &stalled)?.next_due;
+                Ok((select::survey(turn, &policy, &stalled)?, due))
             })
             .await
         {
@@ -718,15 +716,6 @@ impl<H: RunnerHost> RecoveryRunner<H> {
         let admission_due = sooner(admission_due, epoch_gap_due);
         self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
-        // Checking due visits between worker batches must not couple ready
-        // local history to the latency of another network request. A visit
-        // that reopened an older frontier can make ready false, so the
-        // missing older history still gets its quantum.
-        if admission_ready {
-            return Step::Idle {
-                next_due: Some(now),
-            };
-        }
         if let Some(step) = self.report_pause(survey.paused_until, now).await {
             return step;
         }

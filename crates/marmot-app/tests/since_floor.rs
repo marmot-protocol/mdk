@@ -136,11 +136,15 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
+    // These assertions characterize the old comparison owner's reservations,
+    // NIP-77 set differences and counters. Runner-only recovery has independent
+    // default-on proofs; do not wait for a retired owner's telemetry there.
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
+    .with_recovery_runner_ownership_for_test(false)
 }
 
 fn test_unix_now_seconds() -> u64 {

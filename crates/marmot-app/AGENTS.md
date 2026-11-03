@@ -698,10 +698,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
-  With pending epoch-gap work, each runner step admits at most the configured batch before retry selection; an immediate next admission turn
-  cannot make a due epoch-gap visit wait for the entire queue. Explicit passes continue these immediate steps
-  within their existing time bound. After retry selection refreshes the frontiers, continue releasable local admission
-  before waiting for another network quantum; merely nonempty or held staging does not defer needed fetches.
+  Each bounded admission batch checks due epoch-gap visits inside its existing planning turn. Merely pending
+  gap work adds no worker round trip; ready history continues draining within the caller's existing bound.
+  Opening a visit yields to ordinary debt selection so unrelated staging cannot postpone its fetch. Updated
+  frontiers still hold newer staging; nonempty or held staging alone never defers needed network work.
   Send that bounded admission batch in one worker command, stopping its attempted
   prefix on the first NoTrace/error, pending effects or self-removal; never charge every input a separate worker handoff.
   Admission releases a group's staged events oldest first below its admission frontier, never past an event the
@@ -1084,6 +1084,8 @@ than replaying those matrices here.
 
 ```sh
 cargo test -p marmot-app
+# Retained comparison-owner cursor characterization (existing test-support selector):
+cargo nextest run -p marmot-app --test since_floor --features test-support,test-policy-overrides
 # Accelerated recovery/retry scenarios (also enabled by workspace CI):
 cargo test -p marmot-app --features test-policy-overrides
 # Opt-in OTLP exporter wire encoding and push (heavy deps behind a feature):
