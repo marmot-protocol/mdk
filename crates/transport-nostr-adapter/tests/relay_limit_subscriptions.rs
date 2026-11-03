@@ -1911,8 +1911,14 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
         tokio::time::timeout(SETTLE_TIMEOUT, async {
             loop {
                 if polled_pending
-                    && let Some(attempt) =
-                        fx.adapter.account_subscription_attempt(&fx.account).await
+                    // A pending observer must not stop activation behind its
+                    // own queued write. Drop that read and keep driving it.
+                    && let std::task::Poll::Ready(Some(attempt)) = {
+                        let mut observation = std::pin::pin!(
+                            fx.adapter.account_subscription_attempt(&fx.account)
+                        );
+                        futures::poll!(observation.as_mut())
+                    }
                     && attempt != previous_attempt
                 {
                     let inbox_id = NostrSubscription::AccountInbox {
@@ -1922,11 +1928,11 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
                         attempt,
                     }
                     .subscription_id();
-                    if relay
-                        .subscription(&SubscriptionId::new(&inbox_id))
-                        .await
-                        .is_some()
-                    {
+                    if let std::task::Poll::Ready(Some(_)) = {
+                        let subscription_id = SubscriptionId::new(&inbox_id);
+                        let mut observation = std::pin::pin!(relay.subscription(&subscription_id));
+                        futures::poll!(observation.as_mut())
+                    } {
                         assert!(
                             fx.limit
                                 .wait_for(SETTLE_TIMEOUT, |stats| stats
