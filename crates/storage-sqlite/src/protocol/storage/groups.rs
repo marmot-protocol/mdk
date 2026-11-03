@@ -262,6 +262,54 @@ mod tests {
         assert_eq!(store.list_groups().unwrap(), vec![gid(1), gid(2)]);
     }
 
+    #[test]
+    fn invitation_admission_changes_join_the_callers_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        let admission = cgka_traits::group::InvitationAdmission {
+            generation: [7; 32],
+            created_locally: true,
+            via_welcome: None,
+        };
+        store.lock().unwrap().execute_batch("CREATE TRIGGER refuse_admission_transaction BEFORE UPDATE ON cgka_groups BEGIN SELECT RAISE(ABORT, 'admission transaction rollback'); END;").unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_invitation_admission(&group.id, Some(&admission))?;
+            storage.put_group(&group)
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(reason)) if reason.contains("admission transaction rollback")),
+            "{result:?}"
+        );
+        assert!(store.invitation_admission(&group.id).unwrap().is_none());
+
+        store
+            .put_invitation_admission(&group.id, Some(&admission))
+            .unwrap();
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_invitation_admission(&group.id, None)?;
+            storage.put_group(&group)
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(reason)) if reason.contains("admission transaction rollback")),
+            "{result:?}"
+        );
+        assert_eq!(
+            store.invitation_admission(&group.id).unwrap(),
+            Some(admission)
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_admission_transaction")
+            .unwrap();
+        store
+            .with_transaction(|storage| storage.put_invitation_admission(&group.id, None))
+            .unwrap();
+        assert!(store.invitation_admission(&group.id).unwrap().is_none());
+    }
+
     fn route(
         transport_group_id: [u8; 32],
         group_id: &cgka_traits::types::GroupId,

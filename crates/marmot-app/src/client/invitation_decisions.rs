@@ -218,11 +218,23 @@ impl AppClient {
             return Ok(());
         }
         let group = self.app.group(&self.state.label, &decision.group_id_hex)?;
-        if group.is_none() || self.is_device_group(&group_id)? {
-            // A decline does not reach a copy this device already deleted
-            // locally. Retain the winner/broadcast without installing a chat
-            // or acting on hidden native membership.
+        if self.is_device_group(&group_id)? {
             storage.defer_uninstalled_invitation_decision(decision)?;
+            return Ok(());
+        }
+        if group.is_none() {
+            // Only an actual local deletion retires this copy's application
+            // work. A native admission can precede its App checkpoint; keep
+            // its existing debt while that ordinary projection is missing.
+            // A pending clear belongs to a new admission crossing an older
+            // deletion frontier, not to a deletion of the newly joined copy.
+            if !self
+                .pending_local_group_deletion_frontier_clears
+                .contains_key(&decision.group_id_hex)
+                && self.has_local_group_deletion_frontier(&group_id)?
+            {
+                storage.defer_uninstalled_invitation_decision(decision)?;
+            }
             return Ok(());
         }
         // Winning values durably owe this pass. Reuse its retry ownership to
@@ -278,11 +290,13 @@ impl AppClient {
                 }
             }
             if leave_requested || !native_member {
-                storage
-                    .invitation_decline_handed_off(&decision.group_id_hex, &decision.generation)?;
                 if group.is_some() {
                     self.set_group_invite_confirmation(&group_id, false, true)?;
                 }
+                // Native Leave owns the departure already, but application
+                // work stays owed until its fallible presentation save succeeds.
+                storage
+                    .invitation_decline_handed_off(&decision.group_id_hex, &decision.generation)?;
                 storage.mark_invitation_decision_applied(decision)?;
             }
         } else if work.apply_owed {

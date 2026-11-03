@@ -2622,8 +2622,75 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
     assert!(devices.phone.state_group_record(&chat).is_some());
     devices.relay.allow_publishes();
 
-    let later = storage_sqlite::InvitationDecision {
+    // Bound this additional checkpoint phase using the owner's existing
+    // heap-owned async boundary, without changing the test thread stack.
+    devices.phone = Box::pin(async {
+    // A later retained decline still needs its presentation checkpoint even
+    // though the original departure already belongs to durable native Leave.
+    devices.phone.set_group_archived(&chat, false).unwrap();
+    let repeated = storage_sqlite::InvitationDecision {
         version: 4,
+        declined: true,
+        ..accepted.clone()
+    };
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&repeated),
+    ))
+    .unwrap();
+    assert!(
+        devices
+            .laptop
+            .send_device_group_message(&device_group, KIND_SMALL_STATE_UPDATE, content)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.phone, &devices.relay).await;
+    let request = phone_store.leave_request(&chat).unwrap().unwrap();
+    let db = account_database(&devices.phone_app);
+    db.execute_batch("CREATE TRIGGER reject_decline_presentation BEFORE INSERT ON account_state BEGIN SELECT RAISE(FAIL, 'decline presentation held'); END;").unwrap();
+    let before = devices.relay.published_event_ids().len();
+    devices.phone.drive_invitation_decisions().await;
+    assert_eq!(
+        phone_store.leave_request(&chat).unwrap(),
+        Some(request.clone())
+    );
+    assert!(
+        !devices
+            .phone_app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    assert_eq!(devices.relay.published_event_ids().len(), before);
+    db.execute_batch("DROP TRIGGER reject_decline_presentation")
+        .unwrap();
+    drop(db);
+    drop(devices.phone);
+    let mut phone = devices.phone_app.client("alice").await.unwrap();
+    let before = devices.relay.published_event_ids().len();
+    phone.drive_invitation_decisions().await;
+    assert!(
+        devices
+            .phone_app
+            .group("alice", &chat_hex)
+            .unwrap()
+            .unwrap()
+            .archived,
+        "failed presentation work must survive the native handoff and restart"
+    );
+    assert_eq!(phone_store.leave_request(&chat).unwrap(), Some(request));
+    assert_eq!(
+        devices.relay.published_event_ids().len(),
+        before,
+        "retrying the presentation must not publish another departure"
+    );
+
+    phone
+    }).await;
+
+    let later = storage_sqlite::InvitationDecision {
+        version: 5,
         ..accepted
     };
     let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
@@ -2838,4 +2905,176 @@ async fn a_shared_decline_keeps_native_leave_work_across_a_later_accept_and_rest
         );
     })
     .await;
+}
+
+/// The native join and the App checkpoint are separate real transactions.
+/// A retained pre-Welcome decision must survive maintenance between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_welcome_decline_survives_a_failed_join_projection_checkpoint() {
+    use crate::small_state::{KIND_SMALL_STATE_UPDATE, encode_invitation_decision_updates};
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+
+    let (mut devices, device_group) = tagging_devices().await;
+    published_key_package(&mut devices.phone, &devices.relay).await;
+    published_key_package(&mut devices.laptop, &devices.relay).await;
+    let alice = devices
+        .phone_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, devices.relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let first_welcome = devices.relay.published_events.lock().unwrap().len();
+    let chat = bob
+        .create_group("checkpoint retains invitation work", &[&alice])
+        .await
+        .unwrap();
+    let welcomes: Vec<_> = devices.relay.published_events.lock().unwrap()[first_welcome..]
+        .iter()
+        .filter(|event| event.kind == 1059)
+        .cloned()
+        .collect();
+    assert!(!welcomes.is_empty());
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let admission = group_storage(&devices.laptop)
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap();
+    let decision = storage_sqlite::InvitationDecision {
+        group_id_hex: hex::encode(chat.as_slice()),
+        generation: admission.generation,
+        version: 1,
+        declined: true,
+    };
+    let [(content, _)] = <[_; 1]>::try_from(encode_invitation_decision_updates(
+        std::slice::from_ref(&decision),
+    ))
+    .unwrap();
+    assert!(
+        devices
+            .laptop
+            .send_device_group_message(&device_group, KIND_SMALL_STATE_UPDATE, content)
+            .await
+            .unwrap()
+    );
+    // Deliver the actual authenticated DG traffic before the account inbox
+    // carrying this device's Welcome, without inventing an admission event.
+    let group_events: Vec<_> = devices
+        .relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .cloned()
+        .collect();
+    deliver_events(&mut devices.phone, &group_events).await;
+    let account = group_storage(&devices.phone);
+    assert!(account.invitation_admission(&chat).unwrap().is_none());
+    devices.phone.drive_invitation_decisions().await;
+    assert_eq!(
+        devices_storage(&devices.phone)
+            .invitation_decision(&decision.group_id_hex, &decision.generation)
+            .unwrap(),
+        Some(decision.clone())
+    );
+
+    let db = account_database(&devices.phone_app);
+    db.execute_batch("CREATE TRIGGER reject_invitation_checkpoint BEFORE INSERT ON account_state BEGIN SELECT RAISE(FAIL, 'invitation checkpoint held'); END;").unwrap();
+    let mut checkpoint_failed = false;
+    for event in &welcomes {
+        let result = devices
+            .phone
+            .ingest_received_delivery(cgka_traits::TransportDelivery {
+                account_id: MemberId::new(hex::decode(&alice).unwrap()),
+                group_id_hint: None,
+                message: event.to_transport_message().unwrap(),
+                received_at: Timestamp(crate::unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane: cgka_traits::TransportDeliveryPlane::AccountInbox,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await;
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("invitation checkpoint held"),
+                "{error}"
+            );
+            checkpoint_failed = true;
+        }
+        if account.invitation_admission(&chat).unwrap().is_some() {
+            break;
+        }
+    }
+    assert!(checkpoint_failed);
+    assert_eq!(
+        account
+            .invitation_admission(&chat)
+            .unwrap()
+            .unwrap()
+            .generation,
+        decision.generation
+    );
+    assert!(devices.phone.state_group_record(&chat).is_some());
+    assert!(
+        devices
+            .phone_app
+            .group("alice", &decision.group_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !devices
+            .phone
+            .has_local_group_deletion_frontier(&chat)
+            .unwrap()
+    );
+    assert!(devices.phone.arm_failed_receive_projection_retry());
+    assert!(
+        devices_storage(&devices.phone)
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision == decision && work.decline_owed)
+    );
+    if let Err(error) = devices.phone.run_due_maintenance().await {
+        assert!(
+            error.to_string().contains("invitation checkpoint held"),
+            "{error}"
+        );
+    }
+    let still_owed = devices_storage(&devices.phone)
+        .invitation_decision_work()
+        .unwrap()
+        .iter()
+        .any(|work| work.decision == decision && work.decline_owed);
+    assert!(account.leave_request(&chat).unwrap().is_none());
+    db.execute_batch("DROP TRIGGER reject_invitation_checkpoint")
+        .unwrap();
+    assert!(
+        still_owed,
+        "the authenticated admission's existing decline work must survive ordinary maintenance while its App row is only temporarily absent"
+    );
+    // A later ordinary maintenance checkpoint owns the projection retry;
+    // retaining this same decision must not require replaying its Welcome.
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(
+        devices
+            .phone_app
+            .group("alice", &decision.group_id_hex)
+            .unwrap()
+            .is_some()
+    );
+    devices.phone.run_due_maintenance().await.unwrap();
+    assert!(account.leave_request(&chat).unwrap().is_some());
 }
