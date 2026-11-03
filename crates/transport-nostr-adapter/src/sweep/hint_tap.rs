@@ -619,7 +619,7 @@ mod tests {
         let group = hex::encode([93; 32]);
         let filter = Filter::new().custom_tag(
             nostr::prelude::SingleLetterTag::from_char('h').unwrap(),
-            [group.clone()],
+            group.clone(),
         );
         let hints = Arc::new(EoseHints::default());
         let watch = hints.watch(&endpoint, &filter);
