@@ -53,6 +53,7 @@
 
 mod admission;
 mod compare;
+mod epoch_gap;
 pub(crate) mod host;
 mod open_attempts;
 mod policy;
@@ -661,6 +662,9 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     }
                 }
                 Step::Raced => {}
+                // A bounded admission batch yielded with more immediate work.
+                // Give it another scheduling step within this caller's bound.
+                Step::Idle { next_due: Some(at) } if at <= self.host.now_seconds() => {}
                 Step::Idle { .. } | Step::Stopped => break,
             }
         }
@@ -683,9 +687,12 @@ impl<H: RunnerHost> RecoveryRunner<H> {
             Err(step) => return step,
         };
         let policy = self.policy;
-        let mut survey = match self
+        let (mut survey, epoch_gap_due) = match self
             .host
-            .debt_turn(move |turn| select::survey(turn, &policy, &stalled))
+            .debt_turn(move |turn| {
+                let due = epoch_gap::advance(turn, &policy, &stalled)?;
+                Ok((select::survey(turn, &policy, &stalled)?, due))
+            })
             .await
         {
             None => return Step::Stopped,
@@ -705,6 +712,7 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                 };
             }
         };
+        let admission_due = sooner(admission_due, epoch_gap_due);
         self.host.surveyed(std::mem::take(&mut survey.catching_up));
         let now = self.host.now_seconds();
         if let Some(step) = self.report_pause(survey.paused_until, now).await {

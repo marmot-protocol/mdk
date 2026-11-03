@@ -9,11 +9,13 @@ use storage_sqlite::RecoveryUnitPolicy;
 use transport_nostr_adapter::compare::ComparePolicy;
 use transport_nostr_adapter::sweep::SweepPolicy;
 
-/// The first no-progress backoff of a unit; each further one doubles it.
+/// The first no-progress backoff of a unit or complete unresolved epoch-gap
+/// visit; each further one doubles it.
 pub(crate) const RUNNER_BACKOFF_BASE_SECS: u64 = 30;
 pub(crate) const RUNNER_BACKOFF_CAP_SECS: u64 = 60 * 60;
-/// No-progress answers in a row before a unit breaks. With the backoff above,
-/// six answers take about 15 minutes.
+/// No-progress answers in a row before a unit breaks, also the complete
+/// unsuccessful visit cap for an epoch gap. The first five delays total about
+/// 15 minutes.
 pub(crate) const RUNNER_BREAK_AFTER_NO_PROGRESS: u32 = 6;
 /// How long a unit whose relay was unreachable waits before its next attempt.
 pub(crate) const RUNNER_UNREACHABLE_RETRY_SECS: u64 = 30;
@@ -41,7 +43,7 @@ pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
 pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 /// Staged bytes the whole account may hold.
 pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
-/// Staged events one admission turn ingests before it yields, as the
+/// Staged events one runner step's admission turn ingests before retry selection, as the
 /// comparison job's admission does (A13).
 pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 4;
 /// Capture ranges one unit keeps fenced across a restart. Past it the newest

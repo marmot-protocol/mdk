@@ -186,6 +186,8 @@ impl RunnerHost for AccountRunnerHost {
             Box::pin(async move {
                 let app = runner_storage(client)?;
                 let now = unix_now();
+                // The actual local epoch, never a successful sweep, ends a gap.
+                client.drop_settled_epoch_backfill_intents();
                 if let Err(error) = client.settle_recovery_route_changes(&app, now) {
                     return Some(Err(error));
                 }

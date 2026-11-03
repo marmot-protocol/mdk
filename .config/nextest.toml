@@ -40,6 +40,13 @@ app-runtime-journeys = { max-threads = 2 }
 # These session delivery scripts retain real adapter/peeler flows and convergence
 # waits over encrypted SQLCipher sessions. Keep at most two active.
 session-chaos = { max-threads = 2 }
+# Real-SDK epoch-gap history cases include the production 30-second retry.
+bounded-sdk-history = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(marmot-app) & test(runtime::account_worker::tests::selective_history_tests::late_commit)'
+test-group = 'bounded-sdk-history'
+
 
 [[profile.default.overrides]]
 filter = 'package(wn-cli) & binary(cli)'

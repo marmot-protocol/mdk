@@ -712,8 +712,9 @@ impl Memory {
 }
 
 impl<H: RunnerHost> RecoveryRunner<H> {
-    /// Admit what staging may release, one turn after another, until a turn
-    /// finds nothing. Returns how the pass ended, or the step to end with.
+    /// Admit one bounded batch, then return to retry selection. A large staged
+    /// backlog must not keep a due history visit waiting for the entire drain.
+    /// Returns how the pass ended, or the step to end with.
     /// Holds and waits are armed from the clock as read after the awaits
     /// that led to them, so none is born expired.
     pub(super) async fn admit(&mut self, pass: Option<&PassBound>) -> Result<Drained, Step> {
@@ -828,6 +829,11 @@ impl<H: RunnerHost> RecoveryRunner<H> {
                     .failed("admission_ingest", kind, now, &self.policy));
             }
             self.admission.failures = 0;
+            // Revisit admission promptly, but first let the scheduler observe
+            // due work. NoTrace groups remain held and cannot buy a fetch.
+            let mut drained = self.admission.end(now, self.admission.held_at(now));
+            drained.due = Some(now);
+            return Ok(drained);
         }
     }
 }

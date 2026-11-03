@@ -154,6 +154,17 @@ async fn switching_relay(backend: String) -> SwitchingRelay {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_commit_700_recovers() {
+    late_commit_recovery(false).await;
+}
+
+/// Real SDK filters omit a commit published late below their live floor.
+/// Existing coverage must not strand a still-unresolved epoch gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_commit_published_after_gap_coverage_recovers() {
+    late_commit_recovery(true).await;
+}
+
+async fn late_commit_recovery(publish_after_cover: bool) {
     use marmot_account::AccountHome;
     use nostr_relay_builder::prelude::{EventId as RelayEventId, Filter as RelayFilter};
     use nostr_sdk::prelude::Timestamp;
@@ -313,10 +324,12 @@ async fn late_commit_700_recovers() {
         .custom_created_at(Timestamp::from_secs(base))
         .finalize(&outer)
         .unwrap();
-    database
-        .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
-        .await
-        .unwrap();
+    if !publish_after_cover {
+        database
+            .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
     database
         .delete(RelayFilter::new().id(RelayEventId::from_byte_array(commit.id.to_bytes())))
         .await
@@ -333,12 +346,58 @@ async fn late_commit_700_recovers() {
             .await
             .unwrap();
     }
+    let mark_before_gap = storage.recovery_coverage_mark().unwrap();
     runtime
         .accounts()
         .sign_in_account(&alice.label)
         .await
         .unwrap();
     runtime.reconcile_accounts().await.unwrap();
+    if publish_after_cover {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                runtime.catch_up_accounts().await.unwrap();
+                let gap = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| {
+                        demand.group_id.as_deref() == Some(group.as_ref())
+                            && demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                    });
+                let covered = storage
+                    .recovery_coverage_ranges(
+                        &storage_sqlite::TransportReconciliationRoute::Group(route),
+                        &url,
+                    )
+                    .unwrap()
+                    .iter()
+                    .any(|proof| {
+                        proof.range.since_seconds <= base
+                            && proof.range.until_seconds >= base
+                            && proof.proof == storage_sqlite::RecoveryCoverageProof::SweepSlice
+                    });
+                if gap && storage.recovery_coverage_mark().unwrap() > mark_before_gap && covered {
+                    assert!(
+                        runtime
+                            .group_mls_state(&alice.label, &group)
+                            .await
+                            .unwrap()
+                            .epoch
+                            < epoch
+                    );
+                    database
+                        .save_event(&serde_json::from_str(late.as_json().as_str()).unwrap())
+                        .await
+                        .unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("fresh gap followed by real sweep coverage before late publication");
+    }
     // Held-only cuts retain production backoff between scan attempts.
     let recovered = tokio::time::timeout(Duration::from_secs(180), async {
         loop {
@@ -361,6 +420,21 @@ async fn late_commit_700_recovers() {
         }
     })
     .await;
+    if recovered.is_err() {
+        // Preserve a private, closed capsule when a runner-only history proof
+        // fails; generated test keys must never be posted with its log.
+        let local_epoch = runtime
+            .group_mls_state(&alice.label, &group)
+            .await
+            .unwrap()
+            .epoch;
+        let capsule = dir.keep();
+        runtime.shutdown_and_close().await.unwrap();
+        panic!(
+            "late commit recovery failed: local_epoch={local_epoch}, target_epoch={epoch}; private capsule at {}",
+            capsule.display()
+        );
+    }
     assert!(
         recovered.is_ok(),
         "late commit recovery failed: local_epoch={}, target_epoch={epoch}, history_requests={}",

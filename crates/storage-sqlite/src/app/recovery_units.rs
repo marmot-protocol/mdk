@@ -1574,8 +1574,20 @@ impl SqliteAppStorage {
     /// due now. Relay cooldowns and the account's budget stay. Returns the
     /// broken and retired units re-armed.
     pub fn rearm_all_recovery_units(&self) -> StorageResult<usize> {
-        self.connection
-            .with_transaction(|| rearm_all_units_tx(&*self.lock()?))
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let rearmed = rearm_all_units_tx(&conn)?;
+            // Explicit repair grants a fresh epoch-gap visit budget too.
+            // Conversion's internal unit re-arm leaves epoch obligations alone.
+            conn.execute_cached("DELETE FROM account_recovery_epoch_gap_retries", [])
+                .storage()?;
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET eligibility=0,parked_at_ms=NULL,revision=revision+1
+                 WHERE cause=1 AND state=0",
+                [],
+            ).storage()?;
+            Ok(rearmed)
+        })
     }
 
     /// Record a relay's NIP-11 caps. An unknown read is never evidence and

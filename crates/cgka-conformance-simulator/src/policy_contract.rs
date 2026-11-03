@@ -255,6 +255,8 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 43] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
+    // A19 also bounds durable epoch-gap return visits and admission before retry
+    // selection, using the same values.
     // The recovery runner's retry, breaker, quantum and interrupt-grace values
     // pace which history it fetches and when; they certify nothing a fetch did
     // not prove.

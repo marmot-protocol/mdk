@@ -8,15 +8,14 @@
 //!   late-publication repair is guaranteed only inside it, as for the
 //!   comparison job. Below its floor the account's held set is incomplete,
 //!   so a comparison would fetch what the account holds; nothing there is
-//!   re-checked, and an epoch gap's bound below it is raised to it.
+//!   periodically re-checked. Epoch-gap return visits are [`super::epoch_gap`].
 //!
 //! - Only a required relay whose recorded caps show NIP-77 is re-checked. A
 //!   cap-only relay's count proofs cannot re-check anything (decision 2), and
 //!   a best-effort relay is never re-checked.
 //! - A pass falls due 6 h after the last full one, and at once when its state
-//!   says so: a unit no pass has finished yet, an epoch gap
-//!   (`make_recovery_recheck_due` from the gap's bound, which PR 5 calls),
-//!   explicit repair (`rearm_all_recovery_units`), or a relay that answers or
+//!   says so: a unit no pass has finished yet, explicit repair
+//!   (`rearm_all_recovery_units`), or a relay that answers or
 //!   reconnects after a cooldown longer than an hour (storage makes its
 //!   re-checks due in the write that ends the cooldown).
 //! - The runner picks one only when no debt unit is eligible (`select::pick`).

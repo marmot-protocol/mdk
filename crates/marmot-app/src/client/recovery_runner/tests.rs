@@ -46,6 +46,7 @@ use crate::runtime::account_worker::recovery_credits::{
 };
 
 mod comparison;
+mod epoch_gap;
 mod inbox;
 
 const RELAY: &str = "wss://a.example";

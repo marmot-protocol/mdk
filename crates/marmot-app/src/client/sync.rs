@@ -5149,7 +5149,7 @@ impl AppClient {
     /// An epoch gap also completes on its own evidence: once the group's local
     /// epoch moves past the stalled one, that exact gap no longer applies. A
     /// later stall arms a new gap at its own epoch.
-    fn drop_settled_epoch_backfill_intents(&mut self) {
+    pub(in crate::client) fn drop_settled_epoch_backfill_intents(&mut self) {
         let intents = match self
             .app
             .account_storage(&self.state.label)

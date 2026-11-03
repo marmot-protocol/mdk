@@ -1,0 +1,120 @@
+//! Bounded return visits authorized by unresolved durable epoch-gap demand.
+//!
+//! Reopening a retained goal lets the ordinary runner resume from its ledger
+//! cursor. Only a complete visit advances this separate durable backoff; partial
+//! sweep progress cannot forgive it. Healthy periodic re-checks remain NIP-77-only.
+
+use cgka_traits::storage::StorageResult;
+use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATION_RETENTION_SECS};
+
+use super::admission::Stalled;
+use super::{DebtTurn, RecoveryRunnerPolicy, sooner};
+
+/// Prepare due return visits and report the earliest future one. This runs in
+/// the existing runner's short worker turn, before selecting ordinary debt.
+pub(super) fn advance(
+    turn: &DebtTurn<'_>,
+    policy: &RecoveryRunnerPolicy,
+    stalled: &Stalled,
+) -> StorageResult<Option<u64>> {
+    let app = turn.app;
+    let mut next = None;
+    let floor = turn
+        .now
+        .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    for demand in app
+        .pending_recovery_demands()?
+        .into_iter()
+        .filter(|demand| {
+            demand.cause == RecoveryCause::EpochGap
+                && matches!(
+                    demand.eligibility,
+                    RecoveryEligibility::Ready | RecoveryEligibility::Retry
+                )
+        })
+    {
+        let routes = turn
+            .routes
+            .iter()
+            .filter(|route| route.group_id.is_some() && route.group_id == demand.group_id)
+            .collect::<Vec<_>>();
+        // Route hydration/lifecycle and admission wake the same runner. Neither
+        // an absent source nor a suspended copy grants an automatic visit.
+        if routes.is_empty()
+            || routes
+                .iter()
+                .any(|route| route.suspended() || stalled.holds(route) || route.required.is_empty())
+        {
+            continue;
+        }
+        let floors = routes
+            .iter()
+            .map(|route| {
+                Ok((
+                    route.route.clone(),
+                    app.recovery_coverage_goal(&route.route)?
+                        .unwrap_or(floor)
+                        .max(floor),
+                ))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let state = app.recovery_epoch_gap_retry(demand.ticket)?;
+        if state.is_some_and(|state| state.exhausted) {
+            app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
+            continue;
+        }
+
+        if let Some(state) = state.filter(|state| state.in_progress) {
+            let mut complete = true;
+            for route in &routes {
+                let since = app
+                    .recovery_coverage_goal(&route.route)?
+                    .unwrap_or(floor)
+                    .max(floor);
+                for relay in &route.required {
+                    if !app.recovery_coverage_covers(
+                        &route.route,
+                        std::slice::from_ref(relay),
+                        since,
+                        turn.owed_until(route, relay),
+                    )? {
+                        complete = false;
+                    }
+                }
+            }
+            // The host cleared genuinely resolved epochs before this turn.
+            // Remaining newer staging must not prevent a visit for an older
+            // missing commit. Normal admission holds and staging caps still
+            // govern every selected quantum.
+            if !complete {
+                continue;
+            }
+            let exhausted = state.visits >= u64::from(policy.unit.break_after_no_progress);
+            let shift = state.visits.saturating_sub(1).min(63) as u32;
+            let delay = policy
+                .unit
+                .backoff_base_seconds
+                .saturating_mul(1_u64 << shift)
+                .min(policy.unit.backoff_cap_seconds);
+            if app.finish_recovery_epoch_gap_retry(
+                demand.ticket,
+                state.visits,
+                turn.now,
+                delay,
+                exhausted,
+            )? && !exhausted
+            {
+                next = sooner(next, Some(turn.now.saturating_add(delay)));
+            }
+        } else {
+            if let Some(state) = state {
+                if state.next_retry_at_seconds > turn.now {
+                    next = sooner(next, Some(state.next_retry_at_seconds));
+                    continue;
+                }
+            }
+            app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
+        }
+    }
+    Ok(next)
+}

@@ -304,6 +304,12 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
   floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
   shadow mode: no obligation, retry, fence or schedule reads it.
+- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0172).** An unresolved missing epoch has a durable
+  visit count, active-visit marker, exhaustion state and next retry time. Beginning a visit and reopening its
+  retained goals commit together. Restart resumes ledger progress; observations and revised tickets at the same
+  epoch preserve the budget. A higher missing epoch or explicit repair can start a fresh budget. Exhaustion
+  parks the existing EpochGap obligation without claiming coverage or MLS recovery. Storage schedules nothing;
+  the account's recovery runner owns these visits.
 - **Retry state and staging (`recovery_units.rs`, `recovery_staging.rs`, migration 0127, mdk#2660).** One row per
   `(route, relay)` unit holds the recovery runner's retry state: active, broken (no progress or refused, with a park
   revision and one probe a newer loss can earn) or retired, plus backoff, slicing, planned relay caps and re-check progress. Relay health (unreachable streak, cooldown, NIP-11 caps), the account's rolling-hour attempt and

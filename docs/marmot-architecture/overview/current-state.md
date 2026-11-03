@@ -25,6 +25,8 @@ records loss as durable debt; a worker runs bounded acquisition off its command 
 client runs a pass from its event/sync calls. Ordinary native subscription input still enters through the ordered
 admission path, but both owner-granted backward capture and autonomous clamp continuation are disabled for these
 accounts. Nonempty live replies may hold bounded fences; empty replies and restart gaps remain unfenced debt.
+Unresolved epoch gaps authorize paced, bounded return visits to retained group history, including relays without
+NIP-77. Their visit budget survives restart, and exhaustion remains visibly unresolved.
 Coverage, durable retention and visible/decryptable chat history are separate claims. Lower-level adapter/session
 embedders still retain the native pager, whose raw-page accounting and retirement remain tracked by #2885.
 See [account history recovery](../further-context/account-recovery.md) and the

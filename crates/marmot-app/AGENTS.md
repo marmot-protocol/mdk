@@ -652,10 +652,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Known disagreements
   are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the recovery runner in `src/client/recovery_runner.rs` and its `admission`, `select`, `quantum`, `compare`,
-  `recheck`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
+  `recheck`, `epoch_gap`, `repair`, `policy`, `tails` and `host` modules (mdk#2660 phase 4). It runs only behind the internal
   `runner_owns_debt` gate (`RECOVERY_RUNNER_OWNS_DEBT` in `lib.rs`, on). Controlled comparison fixtures can select
   the old owner through the value-only `test-support` builder; this is never a host setting or cargo feature.
-  With the gate off nothing constructs it and the comparison owner keeps every behavior. `host` is its only seat:
+  With the gate off nothing constructs it and the comparison owner keeps every behavior.
+  `epoch_gap` gives unresolved durable epoch gaps bounded return visits, including non-NIP-77 relays. Visits
+  reopen only that group's retention-bounded goals and use ordinary quanta, credits, staging and account caps.
+  A separate durable budget keyed by the missing epoch survives restart: partial sweep progress and same-epoch
+  ticket revisions never reset it. Complete visits without actual epoch recovery back off using the existing
+  unit policy and eventually park the EpochGap visibly. Explicit repair resets the budget; a higher stalled
+  epoch starts a new one. Before each debt turn, actual local epoch advancement clears resolved gaps.
+  Suspended groups receive no visits. Healthy periodic rechecks remain NIP-77-only. `host` is its only seat:
   the account worker spawns it with the worker, serves one of its turns each pass of its loop (as comparison
   admission gets one) and waits for the next in one select arm, and stops it on the client at every exit that still
   holds one (`SpawnedRunner::stop`), so a preempted quantum settles there but nothing is ingested on the way out.
@@ -687,7 +694,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   under the pass revision it began on (a request that makes the pass due mid-quantum wins), and never un-covers; it
   runs only when no debt unit is eligible, on required relays whose recorded caps show NIP-77. Storage makes a relay's
   re-checks due in the same write that ends a cooldown longer than an hour; do not split that into a second write.
-  Admission releases a group's staged events oldest first below its admission frontier, never past an event the
+  Each runner step admits at most the configured batch before retry selection; an immediate next admission turn
+  cannot make a due epoch-gap visit wait for the entire queue. Explicit passes continue these immediate steps
+  within their existing time bound. Admission releases a group's staged events oldest first below its admission frontier, never past an event the
   engine kept no trace of. Nothing is swept, compared or re-checked for a group admission cannot drain (held, or
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own

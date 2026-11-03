@@ -348,6 +348,8 @@ pub(crate) struct Migration {
 mod migration_0167_reaction_attachment_sources;
 #[path = "migrations/0171_device_edit_settings.rs"]
 mod migration_0171_device_edit_settings;
+#[path = "migrations/0172_epoch_gap_retries.rs"]
+mod migration_0172_epoch_gap_retries;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1312,6 +1314,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0171_device_edit_settings",
         suspend_foreign_keys: &[],
         apply: migration_0171_device_edit_settings::apply,
+    },
+    Migration {
+        version: 172,
+        name: "0172_epoch_gap_retries",
+        suspend_foreign_keys: &[],
+        apply: migration_0172_epoch_gap_retries::apply,
     },
 ];
 

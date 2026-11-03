@@ -332,7 +332,8 @@ impl AppClient {
         }
         let storage = self.coverage_storage()?;
         let current = self.current_coverage_routes();
-        let floor = retention_floor(unix_now_seconds());
+        let now = unix_now_seconds();
+        let floor = retention_floor(now);
         let changed = storage.with_transaction(|storage| -> Result<bool, AppError> {
             let app = storage.app_storage();
             let before = app.pending_recovery_demands()?;
@@ -351,16 +352,20 @@ impl AppClient {
                         StorageError::Backend("epoch gap routes are not installed".into()).into(),
                     );
                 }
-                for route in routes {
-                    // The Welcome time is only a goal hint, never evidence for
-                    // invalidation. Preserve the actual durable goal, bounded
-                    // by retention; a route with no goal owes the whole window.
-                    let since = app
-                        .recovery_coverage_goal(&route.route)?
-                        .unwrap_or(floor)
-                        .max(floor);
-                    app.uncover_recovery_coverage(std::slice::from_ref(&route.route), since)?;
-                }
+                let floors = routes
+                    .into_iter()
+                    .map(|route| {
+                        // The Welcome time is only a goal hint, never evidence for
+                        // invalidation. Preserve the actual durable goal, bounded
+                        // by retention; a route with no goal owes the whole window.
+                        let since = app
+                            .recovery_coverage_goal(&route.route)?
+                            .unwrap_or(floor)
+                            .max(floor);
+                        Ok((route.route.clone(), since))
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()?;
+                app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, now)?;
                 changed = true;
             }
             Ok(changed)

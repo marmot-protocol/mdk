@@ -844,9 +844,9 @@ relay) on a required relay with NIP-77 has one resumable pass over its covered a
 ranges inside the route's complete reconciliation inventory: the retention window, raised past
 whatever the inventory compacted beyond its 16,384 ids. That is the window inside which
 automatic late-publication repair is guaranteed; below it the held set is incomplete, so
-nothing is re-checked there, and an epoch gap's bound below it is raised to it. Best-effort relays get none, and a relay that can only
-prove by count is never re-checked. A pass falls due 6 h after the last full pass, and at once
-after an epoch gap (that group, from the gap's bound), explicit repair, or a cooldown of its
+nothing is periodically re-checked there. Best-effort relays get none, and a relay that can only
+prove by count receives no periodic re-checks. A pass falls due 6 h after the last full pass, and at once
+after explicit repair or a cooldown of its
 relay longer than an hour. Storage makes them due in the write that ends the cooldown, and each
 such request bumps the pass's revision; a quantum records its pass's progress only under the
 revision it began on, so a request that arrives while one runs is never swallowed. Re-checks run
@@ -856,6 +856,18 @@ late input and counted, and a retired span it proves becomes coverage. A failed 
 pass un-covers nothing and resumes from its position after the unit backoff's doubling. A
 re-check charges the account budget and the relay's streak like any quantum, never the unit's
 own retry state. These values are decision A20.
+
+An unresolved durable epoch gap additionally authorizes bounded return visits to that group's retained goals,
+including on relays without NIP-77. This handles a commit published with an old timestamp after an earlier sweep.
+The existing runner reopens those goals and resumes ordinary comparison or sweep quanta under the same credits,
+staging bounds and account budgets. A completed visit that leaves the epoch missing waits 30 seconds before the
+next, doubling the delay under the existing unit policy. After six unsuccessful complete visits the EpochGap
+obligation parks visibly. Partial sweep progress does not reset this visit budget. Its count, unfinished-visit
+state and next retry time survive restart, and revisions of a ticket at the same missing epoch preserve them.
+A higher stalled epoch or explicit repair starts a fresh budget. Actual local epoch advancement clears the gap;
+reading all history successfully does not. Suspended groups receive no visits. These visits are unfenced and
+do not enable either native backward pager. Healthy routes retain the six-hour NIP-77-only periodic policy.
+
 
 Coverage and retention do not imply decryptability. The ledger can prove a range and retain its events while
 an event remains held as undecryptable protocol input. It must not report that as a visible chat message.
