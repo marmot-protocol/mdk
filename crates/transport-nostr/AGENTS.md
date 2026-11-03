@@ -54,6 +54,10 @@ drop: storage imports loss by count, so a token's count must cover every drop un
 - Shutdown aborts the router and the notification forwarders, but does not join the spill writer (`delivery_spill.rs`
   spawns `write()`), the loss-marker task (`persist_marker_before_drop`) or the directory fetch tasks; the plane
   registers nothing in the app's close registry (#2341). Follow-up: join or register them.
+- Dropping the last plane handle without shutdown aborts the same router and forwarder tasks
+  (`Drop for MarmotRelayPlaneInner`). They hold the transport, so without it every short-lived plane (one per `wnd`
+  Execute request) stayed alive with its SDK clients. Never give those tasks a `MarmotRelayPlane` clone, or the
+  plane can no longer drop.
 - The plane owns each account's signer-bound publish client (`account_publish_client`). Order matters: the signer is
   installed before activation, and the client is evicted (`evict_account_publish_client`) before its account reopens
   or its signer is replaced, because a cache hit ignores the signer passed in.

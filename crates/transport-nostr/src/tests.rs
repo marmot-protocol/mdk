@@ -7043,3 +7043,25 @@ async fn live_notification_consumer_reports_relay_closed() {
     supervisor.abort();
     let _ = supervisor.await;
 }
+
+/// A plane dropped without its explicit shutdown must not stay alive through
+/// its own router and forwarder tasks. `wnd` builds one `MarmotApp` (and so one
+/// plane with three SDK clients) per Execute request and drops it; before this,
+/// each request kept ~3 MB until the process exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_last_plane_handle_releases_its_transport() {
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), false);
+    let transport = Arc::downgrade(&plane.inner.transport);
+    assert!(
+        plane.inner.transport.router.lock().await.is_some(),
+        "construction inside a runtime spawns the router this test is about"
+    );
+    drop(plane);
+    for _ in 0..100 {
+        if transport.upgrade().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the router and forwarders kept a dropped plane's transport alive");
+}
