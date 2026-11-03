@@ -1024,7 +1024,10 @@ User Leave automatically demotes a nonlast active admin account before SelfRemov
 refused on all its devices before any new choice or departure publication. `can_leave` includes eligible admin Leave;
 `requires_self_demote_before_leave` remains in the DTO and is false because core performs that step. The coarse
 chat-list Leave action opens the authoritative command and need not imply last-admin eligibility. Sign-out stays
-leaf-only and does not demote the account.
+leaf-only and does not demote the account. A recorded Decline remains if a later eligibility check refuses departure;
+a committed demotion remains if the following Leave fails. Already admitted native work retains its ordinary retry
+owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
+repair does not promise to recover that attribution retroactively.
 
 At the maximum decision version, an opposite invitation choice is refused and the held winner remains; ordinary User
 Leave still proceeds without writing another version. Retained invitation generations have no expiry or count cap:

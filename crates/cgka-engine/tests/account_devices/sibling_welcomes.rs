@@ -300,7 +300,90 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
         SqliteAccountStorage::open_encrypted(&path, &key).unwrap(),
         b"bob",
     );
+    // The same real encrypted reopen can find only the device group corrupt.
+    // Its optional attribution context must not block an ordinary chat Commit.
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let reopened_context: Vec<u8> = observer
+        .query_row(
+            "SELECT value FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &dg_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![b"{".as_slice(), b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
     phone.engine.hydrate_all_stored_groups().unwrap();
+    assert!(
+        phone
+            .engine
+            .quarantined_groups()
+            .iter()
+            .any(|(id, _)| id == &device_group)
+    );
+    let error = phone
+        .engine
+        .set_device_tag_group(Some(device_group.clone()))
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::UnknownGroup(ref id) if id == &device_group),
+        "{error}"
+    );
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2))
+    );
+    let before_update = load_group(&phone, &gid).epoch().as_u64();
+    let SendResult::GroupEvolution {
+        msg: post_quarantine_update,
+        pending,
+        ..
+    } = phone
+        .engine
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary chat SelfUpdate stages");
+    };
+    phone
+        .engine
+        .confirm_published(pending)
+        .await
+        .expect("unavailable sibling attribution must not block the chat's ordinary Commit");
+    assert_eq!(load_group(&phone, &gid).epoch().as_u64(), before_update + 1);
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2)),
+        "unavailable context must preserve previously applied knowledge"
+    );
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![&reopened_context, b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
+    assert!(
+        phone
+            .engine
+            .retry_hydrate_quarantined_group(&device_group)
+            .unwrap()
+    );
+    drop(observer);
     phone
         .engine
         .set_device_tag_group(Some(device_group))
@@ -331,6 +414,12 @@ async fn an_applied_sibling_self_remove_holds_private_adds() {
         .await
         .unwrap();
     assert_accepted(&mut alice, &route_to_group(&publication.msg, &gid), &gid).await;
+    assert_accepted(
+        &mut alice,
+        &route_to_group(&post_quarantine_update, &gid),
+        &gid,
+    )
+    .await;
     let fresh = phone.engine.fresh_key_package().await.unwrap();
     let remove_account = send_commit(
         &mut alice,

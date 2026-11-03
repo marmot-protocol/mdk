@@ -323,7 +323,9 @@ requests its own leaf's SelfRemove. The last active administrator account is ref
 choice or departure is published. Queued work is pending, not completed departure; native Leave owns its retry.
 Sign-out uses leaf-only departure and never demotes the account or records a shared Decline. Detailed conversation
 capabilities allow eligible admin Leave without a separate demotion prompt; the coarse chat-list action only opens
-this authoritative flow.
+this authoritative flow. A recorded Decline remains if a later eligibility check refuses departure. An admin demotion
+that committed is not undone when the following Leave fails; without a trusted device group there is no new shared
+departure obligation. Already admitted native work follows its ordinary retry rules.
 
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
