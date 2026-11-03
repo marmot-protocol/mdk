@@ -1,4 +1,4 @@
-//! Explicit full-history repair runs the one comparison job in place. It
+//! The legacy explicit repair executor runs one comparison job in place. It
 //! compares every route of its grant inside the repair budget, never installs
 //! or replays a subscription, and succeeds only on certified coverage.
 //! Cancellation and the deadline stop it at safe boundaries.
@@ -22,6 +22,7 @@ fn fixture_with_relays(
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relays_and_config(dir.path(), relays, MarmotAppConfig::white_noise())
+        .with_recovery_runner_ownership_for_test(false)
         .with_test_relay_client(relay.clone());
     (dir, app, relay)
 }
@@ -365,8 +366,9 @@ async fn unfinished_overflow_repair_survives_reopen() {
     assert!(client.repair_full_history().await.is_err());
     drop(client);
     drop(app);
-    let reopened =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_recovery_runner_ownership_for_test(false)
+        .with_test_relay_client(relay);
     assert!(
         reopened
             .account_storage("alice")

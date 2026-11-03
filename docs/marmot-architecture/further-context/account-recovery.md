@@ -563,8 +563,9 @@ dismissing the notice clears both. Each prune also settles every route below its
 prune parks only from there up, because it no longer holds the coverage below. Widening a goal
 back below that floor, as the shadow report does each time for pending loss, therefore parks
 nothing twice and does not bring back a dismissed remainder; only loss lowers the settled floor
-to its own. While the ledger is in shadow mode nothing sweeps, so most routes gather a
-remainder; the switch-over drops those.
+to its own. Pre-conversion shadow mode performed no sweeps, so routes could accumulate
+remainders without an acquisition attempt. Ownership conversion discards that shadow evidence
+and rebuilds authoritative debt from retained obligations and current route floors.
 
 A count proves only what its relay had stored when it ran the query, so its live boundary ends
 the second before the count's request stamp. The adapter takes that stamp before it issues the
