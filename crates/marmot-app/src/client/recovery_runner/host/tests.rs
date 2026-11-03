@@ -260,7 +260,7 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
 
     // Open on the existing plane, without network maintenance: the goal must
     // exist before transport activation or any epoch-gap demand can supply it.
-    let mut reopened = app
+    let reopened = app
         .local_client_with_relay_plane("alice", &app.relay_plane, None)
         .await
         .unwrap();
@@ -288,7 +288,19 @@ async fn cursor_reopen_owes_restart_gap(fail_open_write: bool) {
     assert!(!off.inbox_catching_up);
     assert!(off.notices.is_empty());
 
-    reopened.app = reopened.app.clone().with_recovery_runner_owning_debt();
+    // A real takeover stops the old account context before installing the
+    // new policy; switching an already active adapter is deliberately refused.
+    let enabled_app = reopened.app.clone().with_recovery_runner_owning_debt();
+    enabled_app
+        .relay_plane
+        .deactivate_account_context(reopened.adapter.account_id())
+        .await
+        .unwrap();
+    drop(reopened);
+    let mut reopened = enabled_app
+        .local_client_with_relay_plane("alice", &enabled_app.relay_plane, None)
+        .await
+        .unwrap();
     reactivate_client(&mut reopened).await;
     let counts = reopened.recovery_runner_live_counts().await.counts;
     let group_counts = counts
@@ -438,6 +450,14 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
         .widen_recovery_coverage_goals(&groups, started - HOUR)
         .unwrap();
     let before = storage.recovery_account_usage(started).unwrap().attempts;
+    // Fresh service markers make this pass observable even when setup's
+    // inbox turn happened in the same wall-clock second.
+    fault_connection(&client)
+        .execute(
+            "UPDATE account_recovery_units SET last_served_at_seconds = NULL",
+            [],
+        )
+        .unwrap();
 
     let report = client.run_recovery_runner_pass().await.unwrap();
     let served = storage
@@ -628,6 +648,11 @@ async fn unreadable_welcome_metadata_never_widens_the_goal() {
     .await;
     let ledger = storage.app_storage();
     let route = group_routes(&client).pop().unwrap();
+    // Account-owned native ranges now create goals immediately. This fixture
+    // starts the route-goal preparation contract with no prior goal.
+    fault_connection(&client)
+        .execute("DELETE FROM account_recovery_coverage_goals", [])
+        .unwrap();
     assert_eq!(ledger.recovery_coverage_goal(&route).unwrap(), None);
     let welcome_at = unix_now_seconds() - 60 * 60;
     let mut record = storage.get_group(&group).unwrap();
@@ -1342,4 +1367,122 @@ async fn a_run_of_turns_never_starves_a_repairs_cancel() {
     .expect("the cancel is seen between turns");
     assert!(served.answered);
     assert!(matches!(served.end, RepairEnd::Cancelled));
+}
+
+/// The app hands loss to durable debt before releasing the plane's cursor
+/// fence. A failure after plane acknowledgment restores that fence and rolls
+/// back both causes' reclamation; retry never certifies the missing history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_loss_handoff_restores_the_guard_after_reclaim_failure() {
+    use crate::client::recovery_coverage::scenario_tests::fixture_on;
+    use storage_sqlite::RecoveryLossCause;
+    let Fixture {
+        mut client,
+        storage,
+        _dir,
+        _pump,
+        relay: _relay,
+        ..
+    } = fixture_on(
+        vec!["wss://a.example".into()],
+        true,
+        None,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let app = storage.app_storage();
+    assert!(!app.recovery_conversion_pending().unwrap());
+    let route = group_routes(&client).pop().unwrap();
+    let since = unix_now_seconds() - 100;
+    for (cause, token, count) in [
+        (RecoveryLossCause::Queue, 77, 2),
+        (RecoveryLossCause::NotificationConsumer, 78, 0),
+    ] {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            cause,
+            token,
+            count,
+            unix_now_seconds(),
+            Some(since),
+            Some(&[(route.clone(), since)]),
+        )
+        .unwrap();
+    }
+    client.synchronize_recovery_loss(&app).unwrap();
+    assert_eq!(app.converted_recovery_loss().unwrap().len(), 2);
+    assert!(
+        app.pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| !matches!(
+                demand.cause,
+                RecoveryCause::QueueLoss
+                    | RecoveryCause::NotificationLoss
+                    | RecoveryCause::SubscriptionReplay
+                    | RecoveryCause::IncrementalHistory
+                    | RecoveryCause::ExplicitHistory
+            ))
+    );
+    // Same durable-marker adoption boundary the plane uses on reopen.
+    client.adapter.start_delivery_overflow_recovery(77);
+    assert!(client.adapter.delivery_loss_blocks_cursor());
+    let faults = fault_connection(&client);
+    faults
+        .execute_batch(
+            "CREATE TRIGGER fail_runner_loss_reclaim BEFORE DELETE ON
+        account_delivery_loss_evidence WHEN OLD.cause = 1
+        BEGIN SELECT RAISE(ABORT, 'injected runner loss reclaim'); END;",
+        )
+        .unwrap();
+    match client.finish_runner_loss_import() {
+        Err(crate::AppError::Storage(cgka_traits::storage::StorageError::Backend(message))) => {
+            assert!(message.contains("injected runner loss reclaim"))
+        }
+        other => panic!("expected injected runner loss reclaim failure, got {other:?}"),
+    }
+    assert!(
+        client.delivery_loss_blocks_cursor(),
+        "failed reclaim restores the guard"
+    );
+    assert!(
+        client
+            .adapter
+            .pending_delivery_overflow_generation()
+            .is_some()
+    );
+    assert_eq!(
+        app.converted_recovery_loss().unwrap().len(),
+        2,
+        "the earlier cause's reclamation rolls back too"
+    );
+    assert_eq!(
+        app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+            .unwrap()
+            .len(),
+        1
+    );
+    faults
+        .execute_batch("DROP TRIGGER fail_runner_loss_reclaim")
+        .unwrap();
+    assert!(client.finish_runner_loss_import().unwrap());
+    assert!(!client.delivery_loss_blocks_cursor());
+    assert!(app.converted_recovery_loss().unwrap().is_empty());
+    for cause in [
+        RecoveryLossCause::Queue,
+        RecoveryLossCause::NotificationConsumer,
+    ] {
+        assert!(
+            app.recovery_loss_watermarks("alice", cause)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(app.recovery_coverage_goal(&route).unwrap().unwrap() <= since);
+    assert!(
+        app.recovery_coverage_ranges(&route, "wss://a.example")
+            .unwrap()
+            .is_empty(),
+        "handoff is debt, never recovered coverage"
+    );
 }

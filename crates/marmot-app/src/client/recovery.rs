@@ -453,9 +453,12 @@ impl AccountRecoveryOwner {
         wall_now_ms: u64,
         monotonic_now: Instant,
         policy: RecoveryRetryPolicy,
+        runner_owns_debt: bool,
     ) -> StorageResult<Self> {
         policy.delay_ms(0)?;
-        storage.restore_unacknowledged_recovery_loss()?;
+        if !runner_owns_debt {
+            storage.restore_unacknowledged_recovery_loss()?;
+        }
         storage.restore_recovery_waiters()?;
         storage.reclaim_completed_recovery_events()?;
         storage.restore_recovery_retry(wall_now_ms, duration_ms(policy.cap)?)?;
@@ -866,10 +869,80 @@ impl From<StorageError> for FreezeError {
 }
 
 impl AppClient {
+    /// Native ingress remains ordered. Its original windows become durable
+    /// ledger debt, without legacy replay obligations or a coverage claim.
+    /// The actual seal still checks this generation, placement and held frames
+    /// under the plane's existing locks.
+    async fn synchronize_runner_native_replay(&mut self) -> Result<(), AppError> {
+        let adapter = self.adapter.clone();
+        let observation = adapter.replay_admission().await;
+        let generation = observation.generation();
+        if self.recovery_owner.native_replay_authorizes(generation)
+            && !self.delivery_loss_blocks_cursor()
+        {
+            return Ok(());
+        }
+        let changed_generation = self.recovery_owner.replay_generation != Some(generation);
+        self.recovery_owner.replay_generation = None;
+        self.recovery_owner.replay_complete = false;
+        self.recovery_owner.replay_sources.clear();
+        self.recovery_owner.replay_ticket = None;
+        let active = observation.active();
+        let floor = unix_now_seconds()
+            .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+        let routing = self.routing.snapshot();
+        let mut goals = std::collections::BTreeMap::<u64, Vec<_>>::new();
+        for source in observation.sources() {
+            let routes = source
+                .group_routes()
+                .copied()
+                .filter(|route| {
+                    routing
+                        .group_routes
+                        .iter()
+                        .any(|current| current.transport_group_id.as_slice() == route.as_slice())
+                })
+                .map(storage_sqlite::TransportReconciliationRoute::Group)
+                .collect::<Vec<_>>();
+            let routes = if source.group_routes().next().is_none() {
+                vec![storage_sqlite::TransportReconciliationRoute::Inbox]
+            } else {
+                routes
+            };
+            goals
+                .entry(source.since().max(floor))
+                .or_default()
+                .extend(routes);
+        }
+        drop(observation);
+        let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
+        self.synchronize_recovery_loss(&app)?;
+        self.finish_runner_loss_import()?;
+        storage.with_transaction(|_| {
+            for (since, routes) in &goals {
+                app.widen_recovery_coverage_goals(routes, *since)?;
+            }
+            Ok::<_, StorageError>(())
+        })?;
+        if changed_generation {
+            self.wake_recovery_runner();
+        }
+        self.record_native_coverage(&app).await;
+        // Permission means the input is placed or durably owed, never that a
+        // full live EOSE proved complete history. A stale generation cannot seal.
+        self.recovery_owner.replay_generation = active.then_some(generation);
+        self.recovery_owner.replay_complete = active;
+        Ok(())
+    }
+
     /// Copy limited native source facts, then persist without holding the
     /// adapter guard. The cursor seal rechecks the copied generation and current
     /// pending/loss facts; this is never exhaustive history or loss evidence.
     pub(crate) async fn synchronize_native_replay(&mut self) -> Result<(), AppError> {
+        if self.app.recovery_runner_owns_debt() {
+            return self.synchronize_runner_native_replay().await;
+        }
         use sha2::{Digest, Sha256};
         let adapter = self.adapter.clone();
         let observation = adapter.replay_admission().await;
@@ -1639,8 +1712,86 @@ impl AppClient {
         Ok(())
     }
 
+    /// Imported ledger debt replaces the cursor's loss fence. This is a
+    /// durable handoff, not proof of recovery and not a recovery-success metric.
+    pub(crate) fn finish_runner_loss_import(&mut self) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
+        let entries = app
+            .converted_recovery_loss()?
+            .into_iter()
+            .filter(|entry| entry.account_label == self.state.label)
+            .collect::<Vec<_>>();
+        let observed = self.adapter.pending_delivery_overflow_generation();
+        if let Some(observed) = observed {
+            self.delivery_overflow_recovery_pending = true;
+            let contains = |cause, token, count| {
+                entries.iter().any(|entry| {
+                    entry.cause == cause
+                        && entry.watermarks.iter().any(|watermark| {
+                            watermark.marker_token == token && watermark.observed_count == count
+                        })
+                })
+            };
+            if (observed.dropped > 0
+                && !contains(
+                    storage_sqlite::RecoveryLossCause::Queue,
+                    observed.marker_token,
+                    observed.dropped,
+                ))
+                || (observed.notification_losses > 0
+                    && !contains(
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                        observed.notification_token,
+                        0,
+                    ))
+            {
+                return Ok(false);
+            }
+            // Exact current counters, durable marker, no marker writer still
+            // running and no queued signal. The plane holds all these checks
+            // under its own lock; a concurrent new omission keeps its guard.
+            if self
+                .adapter
+                .finish_delivery_overflow_recovery(observed)
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        let restore_token = observed.map(|observed| observed.marker_token).or_else(|| {
+            entries
+                .iter()
+                .flat_map(|entry| &entry.watermarks)
+                .next()
+                .map(|mark| mark.marker_token)
+        });
+        let reclaimed = storage.with_transaction(|_| {
+            for entry in &entries {
+                if !app.reclaim_converted_recovery_loss(entry)? {
+                    return Err(StorageError::NotFound);
+                }
+            }
+            Ok::<_, StorageError>(())
+        });
+        if let Err(error) = reclaimed {
+            self.delivery_overflow_recovery_pending = true;
+            if let Some(token) = restore_token {
+                self.adapter.restore_delivery_overflow_guard(token);
+            }
+            return Err(error.into());
+        }
+        let pending = self.adapter.pending_delivery_overflow_generation();
+        self.delivery_overflow_recovery_pending = pending.is_some();
+        self.delivery_overflow_recovery_marker_token = pending.map(|pending| pending.marker_token);
+        Ok(!self.delivery_overflow_recovery_pending)
+    }
+
     pub(super) fn abandon_loss_completion(&mut self) -> Result<(), AppError> {
         self.recovery_owner.pending_loss_acknowledgments.clear();
+        if self.app.recovery_runner_owns_debt() {
+            return Ok(());
+        }
         self.app
             .account_storage(&self.state.label)?
             .app_storage()
@@ -1909,6 +2060,9 @@ impl AppClient {
         self.pending_recovery_capacity_writes.clear();
         drop(self.transport_receipts()?);
         self.observe_recovery_route_policy()?;
+        if self.app.recovery_runner_owns_debt() {
+            return Ok(None);
+        }
         let routing = self.routing.snapshot();
         let readiness = if self.recovery_endpoints_admitted() {
             RecoveryReadiness::Unknown
@@ -3393,7 +3547,7 @@ mod tests {
         app.ensure_account_projection("alice").unwrap();
         app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
         let now = Instant::now();
-        let owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         (storage, owner, now)
     }
 
@@ -3452,7 +3606,7 @@ mod tests {
             )
             .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         owner.replay_sources.push(NativeReplaySource {
             plan: RecoveryScopePlan {
                 scope_id: 0,
@@ -3545,7 +3699,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         owner.replay_sources.push(NativeReplaySource {
             plan: RecoveryScopePlan {
                 since_seconds: Some(50),
@@ -3591,7 +3745,7 @@ mod tests {
             )
             .unwrap();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         let grant = owner
             .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
             .unwrap()
@@ -3974,7 +4128,7 @@ mod tests {
         let storage = app.account_storage("alice").unwrap();
         let app = storage.app_storage();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         let ticket = app
             .request_recovery(
                 storage_sqlite::RecoveryRequest::MaintenanceBoundary {
@@ -4151,9 +4305,14 @@ mod tests {
                 .unwrap(),
         );
         let reopened_at = now + Duration::from_secs(2);
-        let mut reopened =
-            AccountRecoveryOwner::open(&storage.app_storage(), 900_000, reopened_at, policy())
-                .unwrap();
+        let mut reopened = AccountRecoveryOwner::open(
+            &storage.app_storage(),
+            900_000,
+            reopened_at,
+            policy(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             storage
                 .app_storage()
@@ -5981,7 +6140,8 @@ mod tests {
         );
         let now = Instant::now();
         let wall = client.recovery_owner.logical_now_ms(now).unwrap();
-        client.recovery_owner = AccountRecoveryOwner::open(&app, wall, now, policy()).unwrap();
+        client.recovery_owner =
+            AccountRecoveryOwner::open(&app, wall, now, policy(), false).unwrap();
         assert_eq!(app.recovery_retry_state().unwrap(), retry);
         app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
         assert_eq!(
@@ -6454,7 +6614,7 @@ mod tests {
         let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
         let app = storage.app_storage();
         let now = Instant::now();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy(), false).unwrap();
         app.join_recovery_comparison(&[1; 16], 1_000_000, &[comparison_goal()])
             .unwrap();
         let first = owner
@@ -6473,7 +6633,7 @@ mod tests {
         let before = app.recovery_retry_state().unwrap();
         app.join_recovery_comparison(&[2; 16], 1_001_000, &[comparison_goal()])
             .unwrap();
-        let mut owner = AccountRecoveryOwner::open(&app, 1_001_000, now, policy()).unwrap();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_001_000, now, policy(), false).unwrap();
         assert!(
             owner
                 .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)

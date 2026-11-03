@@ -717,6 +717,7 @@ impl ComparisonNetworkJob {
             client.test_comparison_delay,
             client.test_comparison_saved_cursor,
         );
+        let runner_owns_debt = client.app.recovery_runner_owns_debt();
         let handle = tokio::spawn(async move {
             #[cfg(test)]
             let _job_active = witness.as_ref().map(|witness| {
@@ -728,7 +729,7 @@ impl ComparisonNetworkJob {
             // Native capture and comparison share the cutoff, not each other's
             // wait. A quiet original REQ must not consume the whole pass first.
             let capture = async {
-                if replay_capture.sources.is_empty() {
+                if runner_owns_debt || replay_capture.sources.is_empty() {
                     return None;
                 }
                 if tokio::time::Instant::now() < deadline {

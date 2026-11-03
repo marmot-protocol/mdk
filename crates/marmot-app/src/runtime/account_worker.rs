@@ -2113,6 +2113,14 @@ async fn run_app_runtime_account_worker(
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
         }
+        if recovery_runner.is_none()
+            && app.recovery_runner_owns_debt()
+            && !client.has_pending_runtime_group_subscription_refresh()
+        {
+            // A successful paced preparation retry can start the runner here.
+            // A failure re-arms that retry rather than spinning in this loop.
+            recovery_runner = client.spawn_recovery_runner().await;
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {

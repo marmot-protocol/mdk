@@ -2001,7 +2001,7 @@ impl MarmotApp {
         // Seated here, where the client is already held: in `client()` the
         // extra await would copy the client through its stack, gate off or
         // not.
-        client.seat_recovery_runner_in_place().await;
+        client.seat_recovery_runner_in_place().await?;
         Ok(client)
     }
 
@@ -2099,6 +2099,7 @@ impl MarmotApp {
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
+            self.recovery_runner_owns_debt(),
         )?;
         // Before the client activates any REQ; a failed read trusts none.
         let live_coverage = client::LiveCoverage::open(
@@ -2109,9 +2110,10 @@ impl MarmotApp {
             &open.adapter,
         )
         .await;
-        let incremental_request = if relay_plane
-            .subscription_rebuild_since(open.state.last_transport_timestamp)
-            .is_none()
+        let incremental_request = if !self.recovery_runner_owns_debt()
+            && relay_plane
+                .subscription_rebuild_since(open.state.last_transport_timestamp)
+                .is_none()
         {
             Some(
                 self.account_storage(&open.state.label)?
@@ -5011,25 +5013,50 @@ impl MarmotApp {
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
-        recovery_storage
-            .app_storage()
-            .restore_unacknowledged_recovery_loss()?;
-        let recovery_loss_imports = recovery_storage
-            .app_storage()
-            .synchronize_account_delivery_loss(label)?;
-        let delivery_overflow_recovery = recovery_storage
-            .app_storage()
-            .account_delivery_recovery(label)?;
-        let notification_loss = recovery_storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
-        let delivery_overflow_recovery_pending =
-            delivery_overflow_recovery.is_some() || notification_loss.is_some();
-        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
-            .map(|recovery| recovery.marker_token)
-            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+        let (
+            recovery_loss_imports,
+            delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token,
+        ) = if self.recovery_runner_owns_debt() {
+            // Retain the local cursor guard until fallible conversion/import
+            // runs with current routing. Reopen never recreates old jobs.
+            let app = recovery_storage.app_storage();
+            let pending = !app
+                .recovery_loss_snapshot(label, storage_sqlite::RecoveryLossCause::Queue)?
+                .is_empty()
+                || !app
+                    .recovery_loss_snapshot(
+                        label,
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                    )?
+                    .is_empty();
+            (Vec::new(), pending, None)
+        } else {
+            recovery_storage
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()?;
+            let recovery_loss_imports = recovery_storage
+                .app_storage()
+                .synchronize_account_delivery_loss(label)?;
+            let delivery_overflow_recovery = recovery_storage
+                .app_storage()
+                .account_delivery_recovery(label)?;
+            let notification_loss = recovery_storage
+                .app_storage()
+                .pending_recovery_demands()?
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
+            let delivery_overflow_recovery_pending =
+                delivery_overflow_recovery.is_some() || notification_loss.is_some();
+            let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
+                .map(|recovery| recovery.marker_token)
+                .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+            (
+                recovery_loss_imports,
+                delivery_overflow_recovery_pending,
+                delivery_overflow_recovery_marker_token,
+            )
+        };
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();

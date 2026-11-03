@@ -8,8 +8,9 @@
 //! selected. Then the recorder
 //! compares the ledger with every pending obligation and reports agreement as
 //! aggregate counts. Nothing here schedules, retries or fences recovery, and
-//! every write is best effort: a failure is logged and the recovery step it
-//! follows goes on. No route, relay, group or obligation identity is logged.
+//! legacy observation writes are best effort: a failure is logged and the
+//! recovery step it follows goes on. Runner-owned conversion and loss import
+//! are authoritative and fallible before the runner or native REQs start. No route, relay, group or obligation identity is logged.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cgka_traits::storage::{GroupStorage, StorageError, StorageResult};
@@ -529,6 +530,61 @@ fn scope_route(scope: &StoredRecoveryScope) -> Option<TransportReconciliationRou
 }
 
 impl AppClient {
+    /// Convert before any runner work or REQ, then charge later loss directly
+    /// to the ledger. All route floors are validated before the first write.
+    /// The caller is the shared loss-import seam, never the router callback.
+    pub(crate) fn synchronize_runner_loss(&self, app: &SqliteAppStorage) -> Result<bool, AppError> {
+        let now = unix_now_seconds();
+        let routes = self
+            .current_coverage_routes()
+            .iter()
+            .map(|current| {
+                Ok(storage_sqlite::RecoveryConversionRoute {
+                    route: current.route.clone(),
+                    required_relays: current.required.clone(),
+                    standing_floor_seconds: self.standing_floor(current, now)?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let input = storage_sqlite::RecoveryConversionInput {
+            routes: &routes,
+            canonical_relay: &transport_nostr::canonical_relay,
+            retention_floor_seconds: retention_floor(now),
+            now_seconds: now,
+        };
+        app.convert_recovery_obligations(&input)?;
+        if let Some(report) = app.recovery_conversion_report()? {
+            // Aggregate evidence that precedes the first runner quantum.
+            // Conversion never records history coverage or recovery success.
+            tracing::debug!(target: "marmot_app::recovery_runner", method = "conversion",
+                shadow_ranges = report.shadow_ranges,
+                shadow_remainders = report.shadow_remainders,
+                units_broken = report.units_broken,
+                "recovery conversion complete");
+            for (cause, counts) in report.obligations {
+                tracing::debug!(target: "marmot_app::recovery_runner", method = "conversion",
+                    cause = ?cause, pending = counts.pending, parked = counts.parked,
+                    dismissed = counts.dismissed, settled = counts.settled,
+                    "recovery obligations converted");
+            }
+            app.acknowledge_recovery_conversion_report()?;
+        }
+        Ok(app.import_recovery_loss_to_ledger(&self.state.label, &input)?)
+    }
+
+    /// Account-local ownership is installed before even staging native input.
+    /// The adapter rejects a late first switch; repeat setup is idempotent.
+    pub(crate) async fn prepare_runner_ownership(&self) -> Result<(), AppError> {
+        if !self.app.recovery_runner_owns_debt() {
+            return Ok(());
+        }
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        self.synchronize_recovery_loss(&app)?;
+        self.adapter.delegate_replay_recovery().await?;
+        self.enable_live_fences().await;
+        Ok(())
+    }
+
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;

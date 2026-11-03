@@ -1320,8 +1320,9 @@ impl AppClient {
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
-        let rebuild_since = self.subscription_rebuild_since()?;
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership().await?;
+        let rebuild_since = self.subscription_rebuild_since()?;
         let result = self.sync_runtime_groups_since(rebuild_since).await;
         if result.is_ok() {
             self.pending_runtime_group_subscription_refresh = false;
@@ -1512,10 +1513,65 @@ impl AppClient {
         }
     }
 
+    fn observe_runner_delivery_overflow(
+        &mut self,
+        overflow: transport_nostr::AccountDeliveryOverflow,
+    ) -> Result<(), AppError> {
+        self.delivery_overflow_recovery_pending = true;
+        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
+        if overflow.dropped > 0 {
+            let routes = self.adapter.delivery_loss_routes(&overflow).map(|routes| {
+                routes
+                    .into_iter()
+                    .map(|(route, earliest)| (crate::reconciliation_route(route), earliest))
+                    .collect::<Vec<_>>()
+            });
+            app.record_account_recovery_loss_routed(
+                &self.state.label,
+                storage_sqlite::RecoveryLossCause::Queue,
+                overflow.marker_token,
+                overflow.dropped,
+                unix_now_seconds(),
+                overflow.earliest_dropped,
+                routes.as_deref(),
+            )?;
+        }
+        if overflow.notification_losses > 0 {
+            let routes = self
+                .adapter
+                .notification_loss_routes(&overflow)
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|(route, since)| (crate::reconciliation_route(route), since))
+                        .collect::<Vec<_>>()
+                });
+            app.record_account_recovery_loss_routed(
+                &self.state.label,
+                storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                overflow.notification_token,
+                0,
+                unix_now_seconds(),
+                overflow.notification_floor,
+                routes.as_deref(),
+            )?;
+        }
+        self.synchronize_recovery_loss(&app)?;
+        if overflow.notification_losses > 0 {
+            self.adapter.notification_loss_persisted(overflow);
+        }
+        self.finish_runner_loss_import()?;
+        Ok(())
+    }
+
     fn observe_delivery_overflow(
         &mut self,
         overflow: transport_nostr::AccountDeliveryOverflow,
     ) -> Result<(), AppError> {
+        if self.app.recovery_runner_owns_debt() {
+            return self.observe_runner_delivery_overflow(overflow);
+        }
         // The router's process-local fence already froze cursor advancement at
         // the omission. Re-observe the same token here so the queued signal is
         // also an idempotent storage boundary before recovery starts.
@@ -1822,6 +1878,9 @@ impl AppClient {
     ) -> Result<(), (SyncFailureStage, AppError)> {
         // Failed/cancelled activation must retain a retry intent for scheduled work.
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership()
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
@@ -5994,6 +6053,16 @@ impl AppClient {
             return self
                 .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)
                 .await;
+        }
+        if self.app.recovery_runner_owns_debt() {
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                cgka_traits::storage::StorageError::Serialization(
+                    "recovery runner is not ready".into(),
+                )
+                .into(),
+                SyncFailureStage::StatePersist,
+            ));
         }
         self.repair_full_history_with_control(&FullHistoryRepairControl {
             started: tokio::time::Instant::now(),

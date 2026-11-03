@@ -602,8 +602,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
-  and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. Every account open widens every current route's standing goal, cursor or not; a runner
+  in the legacy observer. With runner ownership on, conversion and new loss imports are authoritative and
+  fallible: `synchronize_recovery_loss` builds current routes with validated standing floors, completes conversion,
+  records its per-cause aggregate `conversion` trace before the first quantum, acknowledges that report and imports
+  ongoing evidence through `import_recovery_loss_to_ledger`, without creating old loss jobs. The native source's
+  original range is durably owed before its generation may authorize a cursor seal; the seal still checks placement,
+  spill and held input under the existing locks. A failed ledger write never grants that permission. Every account open widens every current route's standing goal, cursor or not; a runner
   settles routing changes and widens current routes' goals before reading debt. Both widen the ledger directly,
   without creating an old-owner IncrementalHistory request on a cursor-present open. A live boundary proves only
   what its relay's count does, once per generation: from the
@@ -684,8 +688,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences; the fence is a query
   (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
-  with the adapter's fence ticket and held routes; `fence_live_frames` answers with that ticket. Nothing calls
-  them or `enable_live_fences` before the switch-over. The inbox is a route like a group's, compared only and never
+  with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
+  successful debt turn. Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`
+  plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
+  for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
+  repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
+  armed; a successful retry seats it. Gate-off callers keep the legacy behavior. Imported loss releases the plane
+  cursor fence only at the exact generation/writer barrier; transactional evidence reclamation follows, restoring
+  the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
   comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the

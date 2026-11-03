@@ -429,8 +429,17 @@ impl AppClient {
 
     /// Spawn the account's runner, for the account worker to serve. Only
     /// with the internal `runner_owns_debt` gate on.
-    pub(crate) async fn spawn_recovery_runner(&self) -> Option<SpawnedRunner> {
+    pub(crate) async fn spawn_recovery_runner(&mut self) -> Option<SpawnedRunner> {
         if !self.app.recovery_runner_owns_debt() {
+            return None;
+        }
+        if let Err(error) = self.prepare_runner_ownership().await {
+            // The worker's existing subscription-refresh retry is paced. A
+            // failed conversion or policy installation never starts a runner.
+            self.pending_runtime_group_subscription_refresh = true;
+            tracing::warn!(target: TARGET, method = "spawn_recovery_runner",
+                error_kind = error.privacy_safe_kind(),
+                "recovery ownership preparation failed; retry remains armed");
             return None;
         }
         let AccountRunner {
@@ -449,10 +458,12 @@ impl AppClient {
 
     /// Give a directly owned client its in-place runner. Only with the
     /// internal `runner_owns_debt` gate on.
-    pub(crate) async fn seat_recovery_runner_in_place(&mut self) {
+    pub(crate) async fn seat_recovery_runner_in_place(&mut self) -> Result<(), crate::AppError> {
         if self.app.recovery_runner_owns_debt() {
+            self.prepare_runner_ownership().await?;
             self.seat_in_place().await;
         }
+        Ok(())
     }
 
     async fn seat_in_place(&mut self) {
