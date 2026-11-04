@@ -38,6 +38,7 @@ impl Config {
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
         let backend = OpencodeBackend {
             bin: self.0.bin,
+            native: Default::default(),
             execution_profile: self.0.harness.execution_profile,
         };
         (self.0.harness, backend)

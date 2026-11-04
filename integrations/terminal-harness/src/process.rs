@@ -367,7 +367,32 @@ impl fmt::Debug for ParsedEvent {
 pub async fn run_jsonl_process<Parse, ParseError>(
     spec: ProcessSpec,
     tx: mpsc::Sender<RunnerEvent>,
+    parse_event: Parse,
+) -> std::result::Result<Outcome, RunFailure>
+where
+    Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
+{
+    run_jsonl_process_inner(spec, tx, parse_event, None).await
+}
+
+/// Run the same bounded child with persistent JSONL input. `None` closes stdin.
+pub async fn run_interactive_jsonl_process<Parse, ParseError>(
+    spec: ProcessSpec,
+    tx: mpsc::Sender<RunnerEvent>,
+    parse_event: Parse,
+    input: mpsc::Receiver<Option<String>>,
+) -> std::result::Result<Outcome, RunFailure>
+where
+    Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
+{
+    run_jsonl_process_inner(spec, tx, parse_event, Some(input)).await
+}
+
+async fn run_jsonl_process_inner<Parse, ParseError>(
+    spec: ProcessSpec,
+    tx: mpsc::Sender<RunnerEvent>,
     mut parse_event: Parse,
+    input: Option<mpsc::Receiver<Option<String>>>,
 ) -> std::result::Result<Outcome, RunFailure>
 where
     Parse: FnMut(&str) -> std::result::Result<ParsedEvent, ParseError>,
@@ -424,7 +449,20 @@ where
     let total_deadline = Instant::now() + total_timeout;
     let mut writer_task = match prompt {
         PromptTransport::Stdin(prompt) => match child.stdin.take() {
-            Some(stdin) => Some(write_stdin(stdin, prompt)),
+            Some(stdin) => Some(match input {
+                Some(mut input) => tokio::spawn(async move {
+                    let mut stdin = stdin;
+                    stdin.write_all(prompt.as_bytes()).await?;
+                    stdin.flush().await?;
+                    while let Some(Some(record)) = input.recv().await {
+                        stdin.write_all(record.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    }
+                    stdin.shutdown().await
+                }),
+                None => write_stdin(stdin, prompt),
+            }),
             None => {
                 kill_and_reap(&mut child, &mut process_group).await;
                 return Err(spawn_failure());

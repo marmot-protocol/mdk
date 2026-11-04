@@ -359,6 +359,77 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 return DispatchOutcome::Continue;
             }
             let disposition = classify_prompt(&message.text);
+            if !ctx.dedupe.insert(message.message_id_hex.clone()).await {
+                debug!(
+                    target: TRACE_TARGET,
+                    method = "dispatch_event",
+                    event = "duplicate",
+                    "ignoring duplicate inbound event"
+                );
+                return DispatchOutcome::Continue;
+            }
+
+            // Try live input only after sender authorization and deduplication.
+            // Reserved commands and workdir selection retain their FIFO semantics.
+            if let PromptDisposition::Forward {
+                prompt,
+                allow_workdir_picker,
+            } = &disposition
+                && (!allow_workdir_picker || !prompt.trim_start().starts_with('/'))
+                && ctx.queues.can_steer(&group_id_hex).await
+            {
+                let outcome =
+                    if !message.media.is_empty() && ctx.backend.has_active_turn(&group_id_hex) {
+                        let inbound = InboundPrompt {
+                            account_ref: account_id_hex.clone(),
+                            group_ref: group_id_hex.clone(),
+                            message_ref: message.message_id_hex.clone(),
+                            text: prompt.clone(),
+                            media: message.media.clone(),
+                        };
+                        match prepare_attachment_batch(&ctx, &inbound).await {
+                            Ok(Some(batch)) => {
+                                let attachments = batch.attachments.clone();
+                                ctx.backend
+                                    .steer_with_attachments(
+                                        &group_id_hex,
+                                        prompt,
+                                        attachments,
+                                        Box::new(batch),
+                                    )
+                                    .await
+                            }
+                            Ok(None) => crate::SteerOutcome::Unavailable,
+                            Err(err) => {
+                                let _ = send_reply(
+                                    &ctx,
+                                    &account_id_hex,
+                                    &group_id_hex,
+                                    &message.message_id_hex,
+                                    &attachment_failure_reply(&ctx.cfg, &err),
+                                    0,
+                                )
+                                .await;
+                                return DispatchOutcome::Continue;
+                            }
+                        }
+                    } else if message.media.is_empty() {
+                        ctx.backend.steer(&group_id_hex, prompt).await
+                    } else {
+                        crate::SteerOutcome::Unavailable
+                    };
+                match outcome {
+                    crate::SteerOutcome::Accepted => return DispatchOutcome::Continue,
+                    crate::SteerOutcome::Uncertain => {
+                        let _ = send_reply(&ctx, &account_id_hex, &group_id_hex,
+                            &message.message_id_hex,
+                            &format!("[{}] Follow-up delivery is unconfirmed. It may already be steering the active turn; it has not been queued or retried.", ctx.cfg.spec.reply_prefix), 0).await;
+                        return DispatchOutcome::Continue;
+                    }
+                    crate::SteerOutcome::Unavailable => {}
+                }
+            }
+
             let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
             let Some(permit) = permit else {
                 warn!(
@@ -389,15 +460,6 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 });
                 return DispatchOutcome::Continue;
             };
-            if !ctx.dedupe.insert(message.message_id_hex.clone()).await {
-                debug!(
-                    target: TRACE_TARGET,
-                    method = "dispatch_event",
-                    event = "duplicate",
-                    "ignoring duplicate inbound event"
-                );
-                return DispatchOutcome::Continue;
-            }
 
             let inbound = InboundPrompt {
                 account_ref: account_id_hex,
@@ -2761,6 +2823,16 @@ impl GroupQueues {
         )
     }
 
+    /// A queued command/prompt owns a permit beyond the running turn's one.
+    /// Do not let live input overtake a pending reset, workdir, or goal change.
+    async fn can_steer(&self, group_ref: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(group_ref)
+            .is_none_or(|queue| queue.active.load(Ordering::Acquire) <= 1)
+    }
+
     async fn try_enter_waiter(&self, group_ref: &str) -> Option<GroupPermit> {
         let queue = self.queue(group_ref).await?;
         let waiting = queue.waiting.clone().try_acquire_owned().ok()?;
@@ -2849,6 +2921,19 @@ mod tests {
     use std::os::unix::net::UnixListener as StdUnixListener;
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn queued_context_change_blocks_steering_until_its_permit_finishes() {
+        let queues = GroupQueues::new(2);
+        let running = queues.try_enter_waiter("room").await.unwrap();
+        assert!(queues.can_steer("room").await);
+        let reset = queues.try_enter_waiter("room").await.unwrap();
+        assert!(!queues.can_steer("room").await);
+        assert!(queues.can_steer("other").await);
+        drop(reset);
+        assert!(queues.can_steer("room").await);
+        drop(running);
+    }
 
     #[test]
     fn attachment_names_are_sanitized_and_keep_stable_ordering() {
