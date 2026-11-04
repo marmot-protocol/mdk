@@ -663,12 +663,15 @@ Starting that same linking flow while this device already trusts a device group 
 `moves` distinguishes WaitingForWelcome, Joining and Made: the old trust remains until the destination's first selected
 own change is present. A pre-Made failure forgets only the destination. The move preserves ordinary chat membership,
 local small-state values and their versions; old admitted group-pinned traffic can settle before old local storage is
-forgotten. There is no cross-device-group delivery guarantee or immediate quiet deadline. If completion facts cannot be
-recovered, the fallback is unlinked with a fresh compared-code link, without restoring an old trust.
+forgotten. There is no cross-device-group delivery guarantee or immediate quiet deadline. An unrecoverable destination
+before Made retains old trust and ordinary repair; it can stay pending indefinitely and need manual local recovery.
+Corrupt or unreadable local move facts can fail progress/status reads and need manual recovery or reset/relink; no
+automatic unlinked state or notification is promised, and old trust is never reconstructed.
 
 Move views carry local recognition hints for old siblings and destination rejection collisions.
 `dismiss_device_group_move_sibling` dismisses only one hint. `LinkedDeviceStatus::Moved` distinguishes old-roster
-cleanup from removing a device from its chats. See the [host move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
+cleanup from removing a device from its chats. Recognition hints apply only on the mover: old siblings may ask “Was this
+you?” after cleanup, and the user can dismiss that prompt. See the [host move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 
 ## History may be incomplete notices
 

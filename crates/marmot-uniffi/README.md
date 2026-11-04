@@ -1107,9 +1107,13 @@ an old rejection. Moves carry rejected slots with their original ages, never rej
 
 `LinkedDeviceStatusFfi::Moved` is the old group's own status for a moving device; its cleanup leaves the device's
 ordinary chats alone. Already admitted old-group traffic may finish through normal delivery rules before local old-group
-storage is forgotten; there is no immediate-quiet deadline or cancellation promise. A move that fails before Made
-forgets only the destination and keeps the old trust. If the facts needed to finish cannot be recovered, show the
-device as unlinked and offer a fresh compared-code link, rather than guessing or restoring an old trust.
+storage is forgotten; there is no immediate-quiet deadline or cancellation promise. A known failed link before Made
+forgets only the destination and keeps old trust. An unrecoverable destination keeps that trust while ordinary repair
+applies; it may stay pending indefinitely and need manual local recovery. Corrupt or unreadable local move facts can
+fail progress/status reads and need manual local recovery or reset followed by a fresh compared-code link. Do not
+infer an unlinked state or expect an unlink notification for those errors, and never reconstruct old trust.
+Recognition hints suppress questions only on the mover. Old siblings can ask “Was this you?” after cleanup; the user
+can dismiss that prompt.
 
 ### This device unlinked
 

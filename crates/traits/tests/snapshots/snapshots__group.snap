@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(), protocol_profile:\n    ProtocolProfile::Current, removed: false, unrecoverable: false, disbanded:\n    None, join_epoch: EpochId(2), local_copy_install_epoch: EpochId(2),\n    local_copy_welcome_created_at: None,\n}"
+expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(), protocol_profile:\n    ProtocolProfile::Current, removed: false, unrecoverable: false, disbanded:\n    None, join_epoch: EpochId(2), local_copy_install_epoch: EpochId(2),\n    self_removed_sibling_slots: Default::default(),\n    local_copy_welcome_created_at: None, device_roster_departures:\n    vec![cgka_traits::group::DeviceRosterDeparture\n    {\n        label: \"Moving laptop\".into(), slot: [0x11; 32], tag_signature_key:\n        Some(vec![0x12; 4]), linked_at: 10, entry_rename_id: Some([0x13; 16]),\n        source_epoch: EpochId(2), commit_id: mid(), cause:\n        cgka_traits::group::DeviceRosterDepartureCause::Moved,\n    }, cgka_traits::group::DeviceRosterDeparture\n    {\n        label: \"Old phone\".into(), slot: [0x21; 32], tag_signature_key: None,\n        linked_at: 8, entry_rename_id: None, source_epoch: EpochId(1),\n        commit_id: MessageId::new(vec![0x22; 4]), cause:\n        cgka_traits::group::DeviceRosterDepartureCause::Ordinary,\n    },],\n}"
 ---
 {
   "id": [
@@ -35,5 +35,125 @@ expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for o
   "removed": false,
   "unrecoverable": false,
   "join_epoch": 2,
-  "local_copy_install_epoch": 2
+  "local_copy_install_epoch": 2,
+  "device_roster_departures": [
+    {
+      "label": "Moving laptop",
+      "slot": [
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17,
+        17
+      ],
+      "tag_signature_key": [
+        18,
+        18,
+        18,
+        18
+      ],
+      "linked_at": 10,
+      "entry_rename_id": [
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19,
+        19
+      ],
+      "source_epoch": 2,
+      "commit_id": [
+        187,
+        187,
+        187,
+        187
+      ],
+      "cause": "Moved"
+    },
+    {
+      "label": "Old phone",
+      "slot": [
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33,
+        33
+      ],
+      "tag_signature_key": null,
+      "linked_at": 8,
+      "entry_rename_id": null,
+      "source_epoch": 1,
+      "commit_id": [
+        34,
+        34,
+        34,
+        34
+      ],
+      "cause": "Ordinary"
+    }
+  ]
 }

@@ -392,6 +392,55 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
                 .unwrap()
                 .is_none()
         }));
+        // Ordinary native old-group work may still finish after Made. A
+        // post-status SelfUpdate follows destination tagging, so cleanup must
+        // identify the actual leaf by the selected old entry's signature key.
+        moving.step(&relay).await;
+        assert_eq!(
+            moving.roster(&old).devices[&slot].status,
+            cgka_traits::app_components::DeviceStatusV1::Moved
+        );
+        let effects = moving
+            .client
+            .runtime
+            .send(SendIntent::SelfUpdate {
+                group_id: old.clone(),
+            })
+            .await
+            .unwrap();
+        moving
+            .client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        deliver_new(&mut original.client, &relay, &mut original.cursor).await;
+        assert!(original.roster(&old).devices.contains_key(&slot));
+        assert!(
+            !original
+                .client
+                .runtime
+                .own_account_leaf_claims(&old, &original.roster(&old))
+                .unwrap()
+                .iter()
+                .any(|(_, claim)| *claim
+                    == cgka_traits::app_components::DeviceTagClaim::Device(slot)),
+            "the still-member mover no longer tags against the old roster"
+        );
+        assert!(
+            moving
+                .client
+                .runtime
+                .canonical_group_membership(&old)
+                .unwrap()
+                .local_leaf_active
+        );
+        original.client.drive_device_removals().await;
+        assert!(!original.roster(&old).devices.contains_key(&slot));
+        deliver_new(&mut moving.client, &relay, &mut moving.cursor).await;
+        assert!(
+            moving.client.runtime.group_record(&old).unwrap().removed,
+            "moved cleanup removes the actual MLS leaf, not only its roster entry"
+        );
         for _ in 0..8 {
             moving.step(&relay).await;
             original.step(&relay).await;
@@ -556,6 +605,37 @@ fn a_failed_move_forgets_only_the_destination_without_restoring_old_trust() {
             "actual native join preceded its authenticated removal"
         );
         assert!(moving.client.runtime.group_record(&target).unwrap().removed);
+        let fault = linked_device_chats::account_database(&moving.app);
+        fault.execute_batch("CREATE TRIGGER fail_move_end AFTER UPDATE OF phase ON device_group_moves WHEN NEW.phase = 3 BEGIN SELECT RAISE(ABORT, 'move end after forget failed'); END;").unwrap();
+        let failed = moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await;
+        assert!(
+            matches!(failed, Err(ref error) if error.to_string().contains("move end after forget failed")),
+            "{failed:?}"
+        );
+        assert!(
+            store.is_group_forgotten(&target).unwrap(),
+            "real native forget committed before the later phase-end fault"
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .device_group_move(&target)
+                .unwrap()
+                .unwrap()
+                .phase,
+            storage_sqlite::DeviceGroupMovePhase::Joined
+        );
+        fault.execute_batch("DROP TRIGGER fail_move_end").unwrap();
+        drop(fault);
+        moving = reopen(moving).await;
+        moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await
+            .unwrap();
         let view = moving.op(DeviceLinkOp::Read).await;
         assert_eq!(
             view.moves.last().unwrap().state,

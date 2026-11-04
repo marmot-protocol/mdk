@@ -1171,6 +1171,39 @@ async fn a_sibling_welcome_is_delivered_only_by_its_carrier() {
         m.bob.engine.carried_sibling_welcomes().unwrap(),
         vec![(next_id.clone(), b"withdrawn".to_vec())]
     );
+    // A namespace cut retires pending new delivery, not delivered history.
+    // The real transaction can roll back that retirement with the trust cut.
+    let delivered = m.bob.storage.get_message(id).unwrap();
+    let pending = m.bob.storage.get_message(&next_id).unwrap();
+    let rollback = m.bob.storage.with_transaction(|store| {
+        m.bob.engine.retire_sibling_welcome_deliveries()?;
+        let retained = store.get_message(id).unwrap();
+        assert_eq!(
+            retained.state,
+            MessageState::Processed,
+            "Made must leave delivered history unchanged"
+        );
+        assert_eq!(
+            retained, delivered,
+            "the immutable delivered body stays unchanged"
+        );
+        let retired = store.get_message(&next_id).unwrap();
+        assert_eq!(retired.state, MessageState::Failed);
+        assert_eq!(
+            retired.payload, pending.payload,
+            "admitted carrier/body remain immutable for ordinary settlement"
+        );
+        Err::<(), EngineError>(EngineError::Other("rollback move retirement proof".into()))
+    });
+    assert!(
+        matches!(rollback, Err(EngineError::Other(ref message)) if message == "rollback move retirement proof")
+    );
+    assert_eq!(m.bob.storage.get_message(id).unwrap(), delivered);
+    assert_eq!(
+        m.bob.storage.get_message(&next_id).unwrap(),
+        pending,
+        "the later failed cut keeps the exact pending carrier replayable"
+    );
     m.bob
         .storage
         .update_message_state(&origin, MessageState::EpochInvalidated)

@@ -629,24 +629,34 @@ impl<S: StorageProvider> Engine<S> {
         Ok(owed)
     }
 
-    /// End new delivery of the sibling Welcomes retained in the current
-    /// namespace when the host cuts device-group trust. The immutable body,
-    /// carrier and admitted native fanout remain intact for ordinary settlement.
-    /// The caller composes this with its trust/debt transaction.
+    /// End pending new delivery of sibling Welcomes when the host cuts
+    /// device-group trust. Only Sent source records retire; delivered records
+    /// remain unchanged. Immutable bodies, carriers and admitted native fanout
+    /// remain intact for ordinary settlement. The caller composes this with
+    /// its trust/debt transaction, including old delivered-Welcome repair timing.
     pub fn retire_sibling_welcome_deliveries(&self) -> Result<(), EngineError> {
         self.storage.with_transaction(|store| {
             for group in store.list_groups()? {
-                for record in store.list_messages_in_states(
+                // Made also deletes the old resend timing rows, so Processed
+                // Welcomes cannot be re-owed through the host repair path.
+                let mut pending = Vec::new();
+                store.visit_messages_in_states(
                     &group,
-                    &[MessageState::Sent, MessageState::Processed],
+                    &[MessageState::Sent],
                     EpochId(0),
-                )? {
-                    if matches!(
-                        StoredMessagePayload::decode(&record.payload),
-                        Ok(StoredMessagePayload::OutboundSiblingWelcome { .. })
-                    ) {
-                        store.update_message_state(&record.id, MessageState::Failed)?;
-                    }
+                    &mut |record| {
+                        if matches!(
+                            StoredMessagePayload::decode(&record.payload),
+                            Ok(StoredMessagePayload::OutboundSiblingWelcome { .. })
+                        ) {
+                            pending.push(record.id);
+                        }
+                        true
+                    },
+                )?;
+                // The visitor may hold the storage connection lock.
+                for id in pending {
+                    store.update_message_state(&id, MessageState::Failed)?;
                 }
             }
             Ok::<_, EngineError>(())

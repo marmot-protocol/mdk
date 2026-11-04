@@ -977,7 +977,28 @@ fn snapshot_group_and_member() {
             local_copy_install_epoch: EpochId(2),
             self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
-            device_roster_departures: Vec::new(),
+            device_roster_departures: vec![
+                cgka_traits::group::DeviceRosterDeparture {
+                    label: "Moving laptop".into(),
+                    slot: [0x11; 32],
+                    tag_signature_key: Some(vec![0x12; 4]),
+                    linked_at: 10,
+                    entry_rename_id: Some([0x13; 16]),
+                    source_epoch: EpochId(2),
+                    commit_id: mid(),
+                    cause: cgka_traits::group::DeviceRosterDepartureCause::Moved,
+                },
+                cgka_traits::group::DeviceRosterDeparture {
+                    label: "Old phone".into(),
+                    slot: [0x21; 32],
+                    tag_signature_key: None,
+                    linked_at: 8,
+                    entry_rename_id: None,
+                    source_epoch: EpochId(1),
+                    commit_id: MessageId::new(vec![0x22; 4]),
+                    cause: cgka_traits::group::DeviceRosterDepartureCause::Ordinary,
+                },
+            ],
         }
     );
 }
