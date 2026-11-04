@@ -149,7 +149,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages; [tests](crates/marmot-session/README.md#tests) |
 | | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
-| | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |
+| | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime, projections and host background controls used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
 | | [`marmot-observability`](crates/marmot-observability/README.md) | Diagnostics exporters: relay telemetry, product analytics and its consent state, audit delivery |
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
@@ -176,6 +176,11 @@ just fast-ci                 # formatting, static gates, CI's two clippy passes;
 cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
+
+On x86-64 Linux with Nix, [`flake.nix`](flake.nix) provides rustup, `just`, nextest, cargo-audit, cargo-llvm-cov,
+cbindgen, valgrind, Python with uv, Tamarin and Java for TLC. Enter it with
+`nix --extra-experimental-features 'nix-command flakes' develop`. The relay recipes need a separate `docker compose`
+(Docker or rootless Podman with Docker compatibility).
 
 Pull requests run a pre-check of a few minutes: formatting, the static and
 contract gates (the tracing audit among them), dependency audit, workspace

@@ -45,8 +45,8 @@ use cgka_traits::app_event::MarmotAppEvent;
 use cgka_traits::storage::SiblingAddStorage as _;
 use cgka_traits::{EpochId, GroupId, MessageId};
 use storage_sqlite::{
-    HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle, ParkedHistoryDelivery,
-    SqliteAccountStorage,
+    DeviceGroupRecord, HISTORY_DELIVERY_RETENTION_SECS, OwedHistoryDelivery, ParkedBundle,
+    ParkedHistoryDelivery, SqliteAccountStorage,
 };
 use transport_nostr_peeler::MarmotNostrSigner;
 use zeroize::Zeroizing;
@@ -106,6 +106,7 @@ fn blossom_retry_at(now: u64, attempts: u64) -> u64 {
 /// bundle keys it uploaded; [`AppClient::finish_history_upload`] then seals
 /// them and sends the deliveries.
 pub(crate) struct HistoryUpload {
+    source: DeviceGroupRecord,
     owed: OwedHistoryDelivery,
     storage: SqliteAccountStorage,
     chat: GroupId,
@@ -117,6 +118,7 @@ pub(crate) struct HistoryUpload {
 
 /// What a [`HistoryUpload`] uploaded, or why it stopped.
 pub(crate) struct HistoryUploadOutcome {
+    source: DeviceGroupRecord,
     owed: OwedHistoryDelivery,
     result: Result<Vec<UploadedBundle>, AppError>,
 }
@@ -132,6 +134,7 @@ impl HistoryUpload {
     pub(crate) async fn run(self) -> HistoryUploadOutcome {
         let result = self.upload().await;
         HistoryUploadOutcome {
+            source: self.source,
             owed: self.owed,
             result,
         }
@@ -213,6 +216,7 @@ impl HistoryUpload {
 /// [`AppClient::prepare_history_fetch`]. Running it fetches the blob off the
 /// worker; [`AppClient::finish_history_fetch`] imports it.
 pub(crate) struct HistoryFetch {
+    source: DeviceGroupRecord,
     parked: ParkedHistoryDelivery,
     servers: Vec<String>,
     ciphertext_sha256: [u8; 32],
@@ -221,16 +225,9 @@ pub(crate) struct HistoryFetch {
 
 /// What a [`HistoryFetch`] fetched, or why it did not.
 pub(crate) struct HistoryFetchOutcome {
+    source: DeviceGroupRecord,
     parked: ParkedHistoryDelivery,
     result: Result<Vec<u8>, AppError>,
-}
-
-#[cfg(all(test, feature = "test-policy-overrides"))]
-impl HistoryFetchOutcome {
-    /// A fetch of `parked` that ended in `result`. Test support only.
-    pub(crate) fn new(parked: ParkedHistoryDelivery, result: Result<Vec<u8>, AppError>) -> Self {
-        Self { parked, result }
-    }
 }
 
 impl HistoryFetch {
@@ -251,6 +248,7 @@ impl HistoryFetch {
             }
         }
         HistoryFetchOutcome {
+            source: self.source,
             parked: self.parked,
             result,
         }
@@ -258,6 +256,28 @@ impl HistoryFetch {
 }
 
 impl AppClient {
+    // Detached HTTP work is bound to the actual trust row at preparation.
+    // A Made cut cannot retarget its result to the new group.
+    fn history_source(&self) -> Result<Option<DeviceGroupRecord>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_groups()?
+            .into_iter()
+            .find(|record| record.trust.is_trusted()))
+    }
+
+    fn history_source_is_current(&self, source: &DeviceGroupRecord) -> Result<bool, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_group(&source.group_id_hex)?
+            .as_ref()
+            == Some(source))
+    }
+
     /// Maintenance's history-delivery pass: expire week-old deliveries,
     /// import parked ones whose chat this device now holds, owe the history
     /// of each chat this device added a sibling to, then send what is owed. A
@@ -544,6 +564,9 @@ impl AppClient {
         else {
             return Ok(None);
         };
+        let Some(source) = self.history_source()? else {
+            return Ok(None);
+        };
         let account = self.app.account_storage(&self.state.label)?;
         let storage = account.app_storage();
         // One history that fails to prepare backs off and never holds up the
@@ -598,6 +621,7 @@ impl AppClient {
                 }
             };
             return Ok(Some(HistoryUpload {
+                source,
                 owed,
                 storage: account,
                 chat,
@@ -616,7 +640,30 @@ impl AppClient {
     /// sent is forgotten. Returns whether completion was handled without an
     /// error, so another ready history may start at once.
     pub(crate) async fn finish_history_upload(&mut self, outcome: HistoryUploadOutcome) -> bool {
-        let HistoryUploadOutcome { owed, result } = outcome;
+        let HistoryUploadOutcome {
+            source,
+            owed,
+            result,
+        } = outcome;
+        let current = self.history_source_is_current(&source).and_then(|current| {
+            if !current {
+                return Ok(false);
+            }
+            Ok(self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .history_delivery_is_current(&owed)?)
+        });
+        match current {
+            Ok(false) => return true,
+            Err(error) => {
+                tracing::warn!(target: TRACE_TARGET, method = "finish_history_upload",
+                    error_kind = error.privacy_safe_kind(), "history upload ownership could not be read");
+                return false;
+            }
+            Ok(true) => {}
+        }
         let Err(error) = self.send_uploaded_history(&owed, result).await else {
             return true;
         };
@@ -719,6 +766,9 @@ impl AppClient {
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(None);
         };
+        let Some(source) = self.history_source()? else {
+            return Ok(None);
+        };
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         for parked in storage.due_parked_history_fetches(unix_now_seconds(), usize::MAX)? {
             let ParkedBundle::Blossom { servers, .. } = &parked.bundle else {
@@ -736,6 +786,7 @@ impl AppClient {
             match self.open_parked_history_delivery(&exchange, &parked) {
                 Ok((_, _, _, hash)) => {
                     return Ok(Some(HistoryFetch {
+                        source,
                         parked,
                         servers,
                         ciphertext_sha256: hash,
@@ -773,9 +824,32 @@ impl AppClient {
     /// reason but a refusal. Returns whether the delivery was settled, so the
     /// next one may start at once.
     pub(crate) fn finish_history_fetch(&mut self, outcome: HistoryFetchOutcome) -> bool {
-        let HistoryFetchOutcome { parked, result } = outcome;
-        // No exchange now, as while trust re-settles, is no verdict on the
-        // delivery: it waits like a failed fetch (`Ok(false)`).
+        let HistoryFetchOutcome {
+            source,
+            parked,
+            result,
+        } = outcome;
+        let current = self.history_source_is_current(&source).and_then(|current| {
+            if !current {
+                return Ok(false);
+            }
+            Ok(self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .parked_history_delivery_is_current(&parked)?)
+        });
+        match current {
+            Ok(false) => return true,
+            Err(error) => {
+                tracing::warn!(target: TRACE_TARGET, method = "finish_history_fetch",
+                    error_kind = error.privacy_safe_kind(), "history fetch ownership could not be read");
+                return false;
+            }
+            Ok(true) => {}
+        }
+        // An unchanged trust row may still have no usable native exchange.
+        // Keep its ordinary retry behavior; a trust cut was handled above.
         let imported = result.and_then(|ciphertext| {
             let Some(exchange) = self.device_group_exchange()? else {
                 return Ok(false);

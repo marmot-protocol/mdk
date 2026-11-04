@@ -256,43 +256,6 @@ impl AppClient {
         Ok(())
     }
 
-    /// Project bounded native accepted facts, including Commit/Proposal batches
-    /// with no application effects. Attribution reuses the native stamp; errors
-    /// leave the durable work pending for ordinary maintenance/restart.
-    pub(crate) fn observe_pending_sibling_welcome_activity(&mut self) -> Result<(), AppError> {
-        let Some(exchange) = self.device_group_exchange()? else {
-            return Ok(());
-        };
-        if self.epoch_gap_holds_group(&exchange.group_id, super::super::recovery::wall_now_ms()?)? {
-            return Ok(());
-        }
-        let sources = self
-            .runtime
-            .pending_device_group_activity(&exchange.group_id, &exchange.roster)?;
-        let storage = self.app.account_storage(&self.state.label)?.app_storage();
-        for (id, _epoch, slot) in sources {
-            if let Some(slot) = slot.filter(|slot| exchange.is_sibling(slot)) {
-                let Some(key) = exchange
-                    .roster
-                    .devices
-                    .get(&slot)
-                    .and_then(|entry| entry.tag_signature_key.as_deref())
-                else {
-                    continue;
-                };
-                storage.qualify_sibling_welcome_activity(&exchange.group_id, &id, &slot, key)?;
-            } else {
-                storage.ignore_sibling_welcome_activity(&exchange.group_id, &id)?;
-            }
-        }
-        // Healthy proof-present traffic is projected even if an older partial
-        // source cannot currently be reauthenticated. Newly recovered proof is
-        // picked up by the next ordinary pass with its original stamp.
-        self.runtime
-            .recover_pending_device_group_sources(&exchange.group_id)?;
-        Ok(())
-    }
-
     /// Refuse a message unless the leaf that sent it, at the message's epoch,
     /// carries a device tag that reads as `from`'s in `roster` (mdk#2628 D33).
     /// A sibling whose leaf is not tagged yet is refused and not counted; it

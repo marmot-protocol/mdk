@@ -30,6 +30,7 @@ pub(crate) struct WrappedWelcome {
     message: TransportMessage,
     key_package_ref: Vec<u8>,
 }
+const MAX_RECOVERY_MEMBERS: usize = 32;
 
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_ready(
@@ -117,7 +118,16 @@ impl<S: StorageProvider> Engine<S> {
                 key_packages,
                 initial_admins,
             } => {
-                self.do_send_invite(group_id, key_packages, initial_admins)
+                self.do_send_member_adds(group_id, key_packages, initial_admins, Vec::new())
+                    .await
+            }
+            SendIntent::RecoverMembers { group_id, members } => {
+                if members.is_empty() || members.len() > MAX_RECOVERY_MEMBERS {
+                    return Err(EngineError::Other(format!(
+                        "recovery requires 1 to {MAX_RECOVERY_MEMBERS} member grants"
+                    )));
+                }
+                self.do_send_member_adds(group_id, Vec::new(), Vec::new(), members)
                     .await
             }
             SendIntent::RemoveMembers { group_id, members } => {
@@ -194,6 +204,21 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_send_record_removed_slot(group_id, roster_update)
                     .await
             }
+            SendIntent::ImportDeviceGroupRejections {
+                group_id,
+                roster_update,
+            } => {
+                self.do_send_import_device_group_rejections(group_id, roster_update)
+                    .await
+            }
+            SendIntent::MarkDeviceGroupMoved {
+                group_id,
+                slot,
+                expected,
+            } => {
+                self.do_send_mark_device_group_moved(group_id, slot, *expected)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (
@@ -219,12 +244,14 @@ impl<S: StorageProvider> Engine<S> {
         result
     }
 
-    async fn do_send_invite(
+    async fn do_send_member_adds(
         &mut self,
         group_id: GroupId,
         key_packages: Vec<cgka_traits::engine::KeyPackage>,
         initial_admins: Vec<MemberId>,
+        recovery_sources: Vec<cgka_traits::group_recovery::GroupMemberRecovery>,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         // Load group + require Stable.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -246,7 +273,25 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        // Ordinary invitations remain admin-only. Recovery authorizes every
+        // exact target below through the shared member-edit classifier, then
+        // authorizes the complete staged Commit through the replay gate.
+        if recovery_sources.is_empty() {
+            crate::app_components::require_admin(&mls_group, &group_id, self.identity.self_id())?;
+        }
+
+        // Source-bound grants are checked against this exact pre-staging MLS
+        // state, with no await between validation and staging. Replacing only
+        // these leaves preserves siblings and the account-level admin policy.
+        let mut recovery_removals = Vec::with_capacity(recovery_sources.len());
+        let mut seen_leaves = HashSet::with_capacity(recovery_sources.len());
+        for recovery in &recovery_sources {
+            let source = &recovery.source;
+            if !seen_leaves.insert(source.leaf_index) {
+                return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+            }
+            recovery_removals.push(openmls::prelude::LeafNodeIndex::new(source.leaf_index));
+        }
 
         // Validate capabilities (same rule as create_group — see Risk #1
         // capability doc). The group's required capabilities cover required MLS
@@ -281,7 +326,7 @@ impl<S: StorageProvider> Engine<S> {
             .map(|member| member.credential.clone())
             .collect::<HashSet<_>>();
         let mut source_kps = Vec::with_capacity(key_packages.len());
-        let mut parsed_kps = Vec::with_capacity(key_packages.len());
+        let mut parsed_kps = Vec::with_capacity(key_packages.len() + recovery_sources.len());
         for kp in key_packages {
             let parsed = self.parse_key_package(&kp)?;
             if !signature_keys.insert(parsed.leaf_node().signature_key().as_slice().to_vec()) {
@@ -303,6 +348,18 @@ impl<S: StorageProvider> Engine<S> {
             }
             source_kps.push(kp);
             parsed_kps.push(parsed);
+        }
+        // Recovery deliberately reuses the exact removed device's signer.
+        // Never apply ordinary-invite deduplication to these authenticated
+        // replacements: every grant must be validated and staged in full.
+        for recovery in &recovery_sources {
+            parsed_kps.push(self.validate_recovery_for_group(
+                &group_id,
+                &mls_group,
+                existing.protocol_profile,
+                &required,
+                recovery,
+            )?);
         }
         if parsed_kps.is_empty() {
             return Err(EngineError::Other(
@@ -346,10 +403,28 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
+        let mut recovery_evolution = if recovery_sources.is_empty() {
+            None
+        } else {
+            Some(self.prepare_member_recovery(&group_id, &mls_group, &recovery_sources)?)
+        };
+        let mut pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        if let Some(evolution) = &recovery_evolution {
+            pending_commit_guard.set_recovery_evolution(evolution.id.clone());
+            crate::test_crash_hooks::pause_if_requested("recovery_after_preparing");
+            // Persistence may cross an expiry boundary. No OpenMLS mutation
+            // is allowed until this final freshness check has passed.
+            if recovery_sources
+                .iter()
+                .any(|recovery| recovery.expires_at <= self.wall_clock.now().0)
+            {
+                pending_commit_guard.rollback_recovery()?;
+                return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+            }
+        }
 
         // Stage the add-members commit. Publish-before-apply keeps
         // `mls_group` at the pre-commit epoch with the staged commit attached.
@@ -357,10 +432,23 @@ impl<S: StorageProvider> Engine<S> {
         // which is the right key for receivers to derive when peeling
         // (they're at the same pre-commit epoch when they decrypt the
         // wrap; only after they apply the inner commit do they advance).
-        // Empty `initial_admins` keeps the add-only OpenMLS path so Welcome
-        // fanout after confirm is unchanged. Non-empty grants couple the
-        // admin-policy update into the same Add commit (#1298).
-        let (commit_out, welcome_out) = if granted_admin_ids.is_empty() {
+        // Replacements use the own-account primitive: atomic by-value
+        // Remove+Add, with no proposal-store consumption or policy changes.
+        // Ordinary invitations retain their add-only/admin-grant paths.
+        let (commit_out, welcome_out) = if !recovery_removals.is_empty() {
+            // Preparing already owns this attempt. A kill inside OpenMLS
+            // staging leaves either the original state or a complete
+            // pending commit that hydration can atomically abandon.
+            let (commit, welcome) = self.storage.with_transaction(|_| {
+                self.stage_member_edits(&mut mls_group, &provider, &parsed_kps, &recovery_removals)
+            })?;
+            (
+                commit,
+                welcome.ok_or_else(|| {
+                    EngineError::Backend("member recovery produced no Welcome".into())
+                })?,
+            )
+        } else if granted_admin_ids.is_empty() {
             // OpenMLS's `add_members`, whose UpdatePath tags this device's
             // leaf when the leaf needs a tag.
             let leaf_node_parameters = self.own_commit_leaf_parameters(&mls_group, &[])?;
@@ -385,16 +473,18 @@ impl<S: StorageProvider> Engine<S> {
                 .ok_or_else(|| EngineError::Backend("add_members produced no Welcome".into()))?;
             (bundle.into_commit(), welcome_out)
         } else {
-            let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
-                GROUP_ADMIN_POLICY_COMPONENT_ID,
-                crate::app_components::encode_admin_policy(&resulting_admins)?,
-            )));
+            let admin_updates = vec![Proposal::AppDataUpdate(Box::new(
+                AppDataUpdateProposal::update(
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    crate::app_components::encode_admin_policy(&resulting_admins)?,
+                ),
+            ))];
             let (commit_out, welcome_out) = self.stage_commit_with_app_data_updates(
                 &mut mls_group,
                 &provider,
                 Vec::new(),
                 parsed_kps.clone(),
-                vec![admin_update],
+                admin_updates,
                 "invite",
             )?;
             let welcome_out = welcome_out.ok_or_else(|| {
@@ -423,7 +513,7 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.self_id(),
             self.ciphersuite,
         )?;
-        if !granted_admin_ids.is_empty() {
+        if !granted_admin_ids.is_empty() || !recovery_sources.is_empty() {
             crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
                 &mls_group,
                 &group_id,
@@ -456,7 +546,13 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
         let welcomes = self
-            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &key_packages, &parsed_kps)
+            .wrap_staged_welcomes(
+                &mls_group,
+                &welcome_bytes,
+                &key_packages,
+                &recovery_sources,
+                &parsed_kps,
+            )
             .await?;
         crate::capability_manager::check_key_package_profiles(
             &self.storage,
@@ -470,9 +566,44 @@ impl<S: StorageProvider> Engine<S> {
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        let projected_members =
-            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        let mut group_record = existing;
+        if !recovery_sources.is_empty() {
+            // Unlike an Add-only invite, the old target leaf must disappear
+            // from the pending projection even when its account has siblings.
+            let removed: HashSet<_> = recovery_sources
+                .iter()
+                .map(|recovery| recovery.source.leaf_index)
+                .collect();
+            group_record.members = mls_group
+                .members()
+                .filter(|member| !removed.contains(&member.index.u32()))
+                .map(|member| {
+                    Ok(cgka_traits::group::Member {
+                        id: crate::identity::validated_member_id(&member.credential)?,
+                        credential: member.signature_key,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            for kp in &parsed_kps {
+                group_record.members.push(cgka_traits::group::Member {
+                    id: crate::identity::validated_member_id_of_leaf(kp.leaf_node())?,
+                    credential: kp.leaf_node().signature_key().as_slice().to_vec(),
+                });
+            }
+        } else {
+            group_record.members =
+                crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        }
 
+        if let Some(evolution) = recovery_evolution.as_mut() {
+            // Retain ownership before writing the signed-message row. A crash
+            // at either boundary can then retire every unexposed artifact.
+            evolution.signed_message_id = Some(commit_msg.id.clone());
+            if let Err(error) = self.maintenance_storage()?.put_group_evolution(evolution) {
+                pending_commit_guard.rollback_recovery()?;
+                return Err(error.into());
+            }
+        }
         self.record_sent_openmls_message(
             &commit_msg,
             commit_bytes.as_slice(),
@@ -486,18 +617,37 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             None,
         )?;
-        let mut group_record = existing;
-        group_record.members = projected_members;
         self.storage.put_group(&group_record)?;
+
+        if recovery_evolution.is_some() {
+            crate::test_crash_hooks::pause_if_requested("recovery_after_staging");
+        }
 
         // State: begin pending at the projected new epoch via EpochManager.
         // The MLS group is still at the pre-commit epoch, so the projected
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        if let Some(evolution) = recovery_evolution.as_mut() {
+            evolution.phase = cgka_traits::maintenance::GroupEvolutionPhase::Prepared;
+            evolution.signed_message_id = Some(commit_msg.id.clone());
+            evolution.pending_ref = Some(pending_ref);
+            if let Err(error) = self.storage.with_transaction(|storage| {
+                storage
+                    .maintenance_storage()
+                    .ok_or_else(|| {
+                        EngineError::Backend("maintenance storage is unavailable".into())
+                    })?
+                    .put_group_evolution(evolution)?;
+                Ok::<_, EngineError>(())
+            }) {
+                pending_commit_guard.rollback_recovery()?;
+                return Err(error);
+            }
+        }
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
@@ -537,16 +687,23 @@ impl<S: StorageProvider> Engine<S> {
     /// before it records its Commit: a Welcome that cannot be wrapped, as one
     /// for a KeyPackage that names no publication, refuses the intent with
     /// nothing written. [`Self::record_staged_welcomes`] records them.
+    /// Parsed packages follow ordinary packages, then recovery packages.
     pub(crate) async fn wrap_staged_welcomes(
         &self,
         mls_group: &MlsGroup,
         welcome_bytes: &[u8],
         key_packages: &[cgka_traits::engine::KeyPackage],
+        recovery_sources: &[cgka_traits::group_recovery::GroupMemberRecovery],
         parsed_kps: &[openmls::prelude::KeyPackage],
     ) -> Result<Vec<WrappedWelcome>, EngineError> {
         let mut welcomes = Vec::with_capacity(parsed_kps.len());
         let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
-        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
+        for (index, parsed_kp) in parsed_kps.iter().enumerate() {
+            let source_kp = if index < key_packages.len() {
+                &key_packages[index]
+            } else {
+                &recovery_sources[index - key_packages.len()].key_package
+            };
             let recipient = {
                 let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
                     .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
@@ -611,6 +768,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         members: Vec<MemberId>,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         let mut target_set = HashSet::new();
         let mut unique_targets = Vec::new();
         for member in members {
@@ -822,7 +980,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);

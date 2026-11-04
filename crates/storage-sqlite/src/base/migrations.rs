@@ -331,6 +331,8 @@ mod migration_0169_sibling_welcome_resends;
 mod migration_0170_invitation_decisions;
 #[path = "migrations/0172_group_rejoin.rs"]
 mod migration_0172_group_rejoin;
+#[path = "migrations/0175_pending_ref_watermark.rs"]
+mod migration_0175_pending_ref_watermark;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -354,6 +356,11 @@ mod migration_0167_reaction_attachment_sources;
 mod migration_0171_device_edit_settings;
 #[path = "migrations/0173_recipient_confirmed_sends.rs"]
 mod migration_0173_recipient_confirmed_sends;
+
+#[path = "migrations/0174_heartbeat_welcome_repair.rs"]
+mod migration_0174_heartbeat_welcome_repair;
+#[path = "migrations/0176_device_group_moves.rs"]
+mod migration_0176_device_group_moves;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1336,6 +1343,24 @@ const MIGRATIONS: &[Migration] = &[
         name: "0173_recipient_confirmed_sends",
         suspend_foreign_keys: &[],
         apply: migration_0173_recipient_confirmed_sends::apply,
+    },
+    Migration {
+        version: 174,
+        name: "0174_heartbeat_welcome_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0174_heartbeat_welcome_repair::apply,
+    },
+    Migration {
+        version: 175,
+        name: "0175_pending_ref_watermark",
+        suspend_foreign_keys: &[],
+        apply: migration_0175_pending_ref_watermark::apply,
+    },
+    Migration {
+        version: 176,
+        name: "0176_device_group_moves",
+        suspend_foreign_keys: &[],
+        apply: migration_0176_device_group_moves::apply,
     },
 ];
 
@@ -2534,7 +2559,7 @@ mod tests {
         // Call serde_json directly to pin the v1 envelope. The current
         // `StoredMessagePayload::encode` intentionally emits binary v2.
         let payload = serde_json::to_vec(&StoredMessagePayload::outbound_welcome(
-            transport, None, None,
+            transport, None, None, None,
         ))
         .unwrap();
         MessageRecord {

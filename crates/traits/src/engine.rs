@@ -26,6 +26,7 @@ use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
 use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
+use crate::group_recovery::{GroupMemberRecovery, GroupRecoverySource};
 use crate::ingest::IngestOutcome;
 use crate::transport::{Timestamp, TransportMessage};
 use crate::transport_adapter::TransportEndpoint;
@@ -181,6 +182,13 @@ pub enum SendIntent {
         #[serde(default)]
         initial_admins: Vec<MemberId>,
     },
+    /// Atomically refresh exact member leaves using authenticated, source-bound
+    /// recovery grants. Unlike ordinary intents, this is never queued or
+    /// automatically reissued after branch supersession: obtain fresh grants.
+    RecoverMembers {
+        group_id: GroupId,
+        members: Vec<GroupMemberRecovery>,
+    },
     /// Remove existing members from the group.
     RemoveMembers {
         group_id: GroupId,
@@ -268,6 +276,23 @@ pub enum SendIntent {
     RecordRemovedSlot {
         group_id: GroupId,
         roster_update: Vec<u8>,
+    },
+    /// Carry original rejected-slot records only into missing destination
+    /// slots. Preparation rechecks destination precedence and expiry; never
+    /// queued or re-issued, and consumes no unrelated pending proposals.
+    ImportDeviceGroupRejections {
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    },
+    /// Set only this device's own complete old roster entry to moved,
+    /// preserving all other fields and retaining or producing its old-roster
+    /// leaf tag. The host authorizes
+    /// the Made old-group exception; native preparation rechecks own slot,
+    /// signing key and the entire expected entry. Other proposals stay queued.
+    MarkDeviceGroupMoved {
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: Box<DeviceEntryV1>,
     },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
@@ -534,6 +559,10 @@ pub enum SendAcceptDisposition {
 pub struct AutoPublish {
     pub msg: TransportMessage,
     pub pending: PendingStateRef,
+    /// Exact retained Welcomes to fan out only after commit confirmation.
+    /// Restarted member recovery must resume these with its immutable commit.
+    #[serde(default)]
+    pub welcomes: Vec<TransportMessage>,
 }
 
 /// Why an application message did not become canonical group output.
@@ -1321,6 +1350,19 @@ pub trait CgkaEngine: Send + Sync {
     /// index. Roster order can diverge from MLS leaf positions after removals
     /// blank leaves in the tree.
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError>;
+
+    /// Bind a recovery challenge to the current authenticated branch and exact
+    /// current leaf whose signing-key SHA256 is `device_key_hash`, owned by
+    /// `member`. Requires a healthy, settled copy and current member-edit
+    /// authority: an admin, or an own-account sibling when account-devices is
+    /// required. The coordinator's own leaf is never a replacement target.
+    /// Device groups require `LinkDevice` and cannot supply recovery sources.
+    fn group_recovery_source(
+        &self,
+        group_id: &GroupId,
+        member: &MemberId,
+        device_key_hash: &[u8; 32],
+    ) -> Result<GroupRecoverySource, EngineError>;
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 

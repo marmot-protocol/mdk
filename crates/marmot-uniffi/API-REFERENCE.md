@@ -1250,9 +1250,9 @@ Read only the requested local attachment, rejecting a changed selected draft.
 pub async fn cancel_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-On the new device, cancel the link and tell the other device. `new_device` becomes `Ended { reason: Cancelled }`. Cancelling while `Joining` first stops this device waiting for its Welcome, so none joins it after; if that fails, the call returns the error, the link stays `Joining`, and the worker retries until it ends. Refused with `no_link_in_progress` when no link is in progress.
+On the new device, request cancellation of the link and notify the other device. Before an authenticated Welcome is admitted, successful cancellation ends `new_device` as `Ended { reason: Cancelled }`. Cancelling while still waiting in `Joining` first withdraws this device's Welcome expectation; if that fails, the call returns the error, the link stays `Joining`, and the worker retries. Cancellation does not undo an already-admitted Welcome: an ordinary link can resolve as `Linked`; for a move, inspect `moves` for the durable outcome. Refused with `no_link_in_progress` when no link is in progress.
 
-[Source](src/commands/device_link.rs#L35)
+[Source](src/commands/device_link.rs#L37)
 
 ### `Marmot::confirm_device_link_match`
 
@@ -1264,7 +1264,7 @@ pub async fn confirm_device_link_match( &self, account_ref: String, ) -> Result<
 
 On the new device, record that the user says both screens show the same emoji. `new_device` moves to `WaitingForOtherDevice` until the other device's user chooses Link device, then `Joining` while that device adds this one, then `Linked` once its Welcome arrives. This device joins only through a Welcome into the device group the other device's verified confirmation named, sent by the leaf that confirmation named, and only while the link waits for it. A mismatch is the user's to report: cancel instead. Refused with `no_link_in_progress` when there is no link to confirm, and ends the link with a reason when the exchange fails a check or time ran out.
 
-[Source](src/commands/device_link.rs#L23)
+[Source](src/commands/device_link.rs#L25)
 
 ### `Marmot::decline_device_link`
 
@@ -1276,7 +1276,7 @@ pub async fn decline_device_link( &self, account_ref: String, prompt_id: String,
 
 On a device already signed in, Not now for the prompt `prompt_id`: the prompt goes and the new device's link ends with `CancelledElsewhere`. Refused with `unknown_prompt` for a stale prompt.
 
-[Source](src/commands/device_link.rs#L67)
+[Source](src/commands/device_link.rs#L69)
 
 ### `Marmot::device_link_snapshot`
 
@@ -1286,9 +1286,22 @@ On a device already signed in, Not now for the prompt `prompt_id`: the prompt go
 pub async fn device_link_snapshot( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-Linking as this device shows it now, changing nothing: `new_device` while this device asked to be linked, and `prompts` for the sign-ins it can link, newest last. Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; that ends any link in progress, since pairing keeps its secrets only in memory. Always refused in release builds (`pairing_unsupported`) until the pairing and device-group specs land. Runs on the account worker and sends what linking owes.
+Current linking and durable move progress: `new_device` while this device asked to be linked, `prompts` for the sign-ins it can link, newest last, and `moves` as described in [move guidance](README.md#moving-this-device-to-another-device-group). Each prompt's state says what to show: `Preparing` while the sign-in's KeyPackage is checked, `Comparing` with the code, `CompetingRequests`, `RateLimited` until `retry_at`, `CannotLink` with what its client lacks, `TooManyDevices`, `Linking`, `Linked`, `AddedElsewhere` ("<device_label> was added by <added_by_label>") or `Ended` with a reason. Re-read on `MarmotEventFfi::DeviceLinkChanged`, which also fires each time the account's worker opens or reconnects; unconfirmed comparisons end because their secrets are memory-only, while admitted native/move work keeps its durable owner. Refused when the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends what linking owes.
 
-[Source](src/commands/device_link.rs#L82)
+[Source](src/commands/device_link.rs#L99)
+
+### `Marmot::dismiss_device_group_move_sibling`
+
+```rust
+pub async fn dismiss_device_group_move_sibling( &self, account_ref: String, move_id: String, slot_id_hex: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
+```
+
+End one local old-sibling recognition hint from `device_link_snapshot().moves`. Pass its opaque `move_id` and the
+hint's `slot_id_hex`; this neither links, removes nor trusts the sibling. The returned snapshot reflects the hint.
+Refused when device linking is disabled or the move/sibling is unknown. Refresh on `DeviceLinkChanged`; see
+[move guidance](README.md#moving-this-device-to-another-device-group).
+
+[Source](src/commands/device_link.rs#L83)
 
 ### `Marmot::link_device`
 
@@ -1298,9 +1311,9 @@ Linking as this device shows it now, changing nothing: `new_device` while this d
 pub async fn link_device( &self, account_ref: String, prompt_id: String, label: String, add_to_all_chats: bool, bring_history: bool, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-On a device already signed in, Link device for the prompt `prompt_id`, offered while its state is `Comparing`. `label` is the name the user gave the new device: not blank, at most 64 bytes (`label_invalid`). Offer `add_to_all_chats` and `bring_history` as toggles, both on by default. The prompt moves to `Linking` until the new device's confirmation verifies; then this device creates the account's device group on a first link, or adds the new device to the one it trusts, in one commit that also writes its roster entry. That commit is the approval. Its Welcome goes out only once relays confirm the commit, and the prompt moves to `Linked` only once relays have confirmed it and taken the Welcome; a Welcome they have not taken is published again while the new device waits for it. A commit whose publish is retried keeps the prompt `Linking`. A device group that is still settling makes this device retry while the new device waits for its Welcome. A commit that rolls back, or a link not confirmed before the new device stops waiting, ends the prompt with `LinkFailed`. Refused with `unknown_prompt` for a stale prompt, including one from before the client reopened, `link_unavailable` while more than one sign-in competes or the code is not shown, `device_already_linked`, or `too_many_devices` at 20 devices (remove one first).
+On a device already signed in, Link device for the prompt `prompt_id`, offered while its state is `Comparing`. `label` is the name the user gave the new device: not blank, at most 64 bytes (`label_invalid`). Offer `add_to_all_chats` and `bring_history` as toggles, both on by default. The prompt moves to `Linking` until the new device's confirmation verifies; then this device creates the account's device group on a first link, or adds the new device to the one it trusts, in one commit that also writes its roster entry. That commit is the approval. Its Welcome goes out only once relays confirm the commit, and the prompt remains `Linking` until the new device's first selected own change is present; a Welcome not taken by relays remains under its existing bounded delivery owner. A commit whose publish is retried keeps the prompt `Linking`. A device group that is still settling makes this device retry while the new device waits for its Welcome. A commit that rolls back, or a link not confirmed before the new device stops waiting, ends the prompt with `LinkFailed`. Refused with `unknown_prompt` for a stale prompt, including one from before the client reopened, `link_unavailable` while more than one sign-in competes or the code is not shown, `device_already_linked`, or `too_many_devices` at 20 devices (remove one first).
 
-[Source](src/commands/device_link.rs#L46)
+[Source](src/commands/device_link.rs#L48)
 
 ### `Marmot::start_device_link`
 
@@ -1310,9 +1323,9 @@ On a device already signed in, Link device for the prompt `prompt_id`, offered w
 pub async fn start_device_link( &self, account_ref: String, ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError>
 ```
 
-On a new device, ask a device of this account already signed in to link this one, and return linking as this device now shows it. The request names this device's published KeyPackage, never one this device already joined a group by, so publish one first, and again after such a join (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `DeviceGroupRefused` when this device already trusts a device group (`device_group_exists`) or a link is in progress (`pairing_in_progress`), and always in release builds (`pairing_unsupported`) until the pairing and device-group specs land. Runs on the account worker and sends one gift-wrapped request to the account's relays.
+Ask a device of this account already signed in to link this one, returning its current comparison state. If this device already trusts a different device group, the same flow moves only this device; keep showing the old trust until `snapshot.moves` reports Made, as described in [move guidance](README.md#moving-this-device-to-another-device-group). The request names this device's published KeyPackage, never one this device already joined a group by, so publish one first, and again after such a join (`key_package_not_published`). `new_device` starts at `WaitingForAnswer`: ask the user to open the app on a device already signed in. Once one answers it moves to `Comparing` with the seven emoji both screens show, each with an English `description` for screen readers; offer "They match" (`confirm_device_link_match`) and cancel (`cancel_device_link`). Refresh on `MarmotEventFfi::DeviceLinkChanged`. Refused with `DeviceGroupRefused` while a link is in progress (`pairing_in_progress`) or the explicit experimental build/runtime gates are disabled (`pairing_unsupported`). Runs on the account worker and sends one gift-wrapped request to the account's relays.
 
-[Source](src/commands/device_link.rs#L15)
+[Source](src/commands/device_link.rs#L17)
 
 </details>
 
@@ -5232,7 +5245,7 @@ pub async fn backup_history_availability( &self, account_ref: String, group_id_h
 
 Read private words-again hints for a currently joined chat, using its variable-length MLS group id. A hint does not prove downloadable content or create membership. Re-read after a restore-watch revision or real join.
 
-[Source](src/commands/backups.rs#L122)
+[Source](src/commands/backups.rs#L145)
 
 ### `Marmot::backup_restore_status`
 
@@ -5242,7 +5255,7 @@ pub async fn backup_restore_status( &self, account_ref: String, ) -> Result<Back
 
 Read aggregate status without changing the operation. `Complete` means eligible work settled, not global completeness or proof that a pointer existed. Counts retain committed prefixes after cancellation.
 
-[Source](src/commands/backups.rs#L101)
+[Source](src/commands/backups.rs#L124)
 
 ### `Marmot::backup_settings`
 
@@ -5252,7 +5265,7 @@ pub async fn backup_settings( &self, account_ref: String, ) -> Result<BackupSett
 
 Read the selected account backup settings, including whether this device writes. Use this authoritative read after setup or a concurrent setting change; submitting a change is not proof it remains selected.
 
-[Source](src/commands/backups.rs#L48)
+[Source](src/commands/backups.rs#L49)
 
 ### `Marmot::begin_backup_restore`
 
@@ -5262,7 +5275,7 @@ pub async fn begin_backup_restore( &self, account_ref: String, words: String, ) 
 
 Start one ephemeral manual history-only restore per account from old recovery words. Only current own-leaf member chats can receive history; current keys and archived preferences stay unchanged. Keep the returned opaque operation token for cancellation. Clear host-owned word copies promptly; generated strings are not secure buffers.
 
-[Source](src/commands/backups.rs#L72)
+[Source](src/commands/backups.rs#L95)
 
 ### `Marmot::begin_recovery_words`
 
@@ -5272,7 +5285,7 @@ pub async fn begin_recovery_words( &self, account_ref: String, ) -> Result<Recov
 
 Generate twelve new words for backup setup and two 1-based confirmation positions. Show once and confirm answers in that order. Never persist or log the words; this is separate from restoring with existing words.
 
-[Source](src/commands/backups.rs#L17)
+[Source](src/commands/backups.rs#L18)
 
 ### `Marmot::cancel_backup_restore`
 
@@ -5282,7 +5295,7 @@ pub async fn cancel_backup_restore( &self, account_ref: String, operation: Strin
 
 Cancel only the named account-scoped operation. A stale valid token returns false; a malformed token is rejected. Committed history remains. Retry requires words again; dropping a watch does not call this command.
 
-[Source](src/commands/backups.rs#L86)
+[Source](src/commands/backups.rs#L109)
 
 ### `Marmot::cancel_recovery_words`
 
@@ -5292,7 +5305,7 @@ pub async fn cancel_recovery_words(&self, account_ref: String) -> Result<(), Mar
 
 Forget a pending recovery-word confirmation without changing existing account backups. Clear host-managed display/input copies separately.
 
-[Source](src/commands/backups.rs#L40)
+[Source](src/commands/backups.rs#L41)
 
 ### `Marmot::confirm_recovery_words`
 
@@ -5302,7 +5315,27 @@ pub async fn confirm_recovery_words( &self, account_ref: String, answers: Vec<St
 
 Confirm the two requested words in position order. Busy or error results keep the core setup for another try. MDK guards its owned queued answers; caller/generated copies still need host handling. Read backup settings again to render the selected outcome.
 
-[Source](src/commands/backups.rs#L29)
+[Source](src/commands/backups.rs#L30)
+
+### `Marmot::run_due_backup_pass`
+
+```rust
+pub async fn run_due_backup_pass( &self, account_ref: String, ) -> Result<BackgroundBackupOutcomeFfi, MarmotKitError>
+```
+
+Await one current or newly admitted due pass through serialized settlement and credit release. NotStarted means this call joined/admitted none; FinishedAttempt includes failed attempts and does not prove pointer publication. This neither forces work nor waits for future due work or global idleness. Cancelling the host await detaches only the waiter; worker stop/replacement returns TransportClosed. The host bounds its OS task lifetime; disabled device groups return NotStarted without starting a worker.
+
+[Source](src/commands/backups.rs#L85)
+
+### `Marmot::set_runtime_backup_background_conditions`
+
+```rust
+pub async fn set_runtime_backup_background_conditions( &self, wifi: bool, charging: bool, ) -> Result<(), MarmotKitError>
+```
+
+Report the runtime-wide current Wi-Fi and charging facts before workers exist and on changes; both are required for background admission. The latest report survives account-worker replacement and intervals with no workers, while a new runtime starts closed. This requires no account and starts no worker; eligible reports wake existing due dispatchers. An admitted pass settles after false. Manual restore remains independent.
+
+[Source](src/commands/backups.rs#L58)
 
 ### `Marmot::set_backup_background_conditions`
 
@@ -5310,9 +5343,9 @@ Confirm the two requested words in position order. Busy or error results keep th
 pub async fn set_backup_background_conditions( &self, account_ref: String, wifi: bool, charging: bool, ) -> Result<(), MarmotKitError>
 ```
 
-Report Wi-Fi and charging facts on worker start and changes. Both are required before the next background writer pass; replacement workers default closed. An admitted whole pass settles after false. This wakes existing due/backoff/resource checks, never forces a backup, and does not gate manual restore.
+Compatibility wrapper for the runtime-wide platform report. It validates the existing active, signable, fully onboarded account before changing the shared facts and never starts that account worker. Prefer the account-free runtime setter; no parameter or return layout changed. Admitted passes settle after false; manual restore is independent.
 
-[Source](src/commands/backups.rs#L58)
+[Source](src/commands/backups.rs#L70)
 
 ### `Marmot::turn_off_backups`
 
@@ -5322,7 +5355,7 @@ pub async fn turn_off_backups(&self, account_ref: String) -> Result<(), MarmotKi
 
 Disable future account backups through the selected account setting. Existing archives remain; this is not archive deletion or cancellation of an already admitted pass.
 
-[Source](src/commands/backups.rs#L44)
+[Source](src/commands/backups.rs#L45)
 
 ### `Marmot::watch_backup_restore`
 
@@ -5332,6 +5365,6 @@ pub async fn watch_backup_restore( &self, account_ref: String, ) -> Result<Arc<B
 
 Observe one initial snapshot and later progress/availability revisions. Closing the watch stops observation only. Keep its account context and cancel explicitly with the operation token when desired.
 
-[Source](src/commands/backups.rs#L113)
+[Source](src/commands/backups.rs#L136)
 
 </details>

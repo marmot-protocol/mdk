@@ -2,7 +2,8 @@
 use crate::Marmot;
 use crate::conversions::group_id_from_hex;
 use crate::conversions::{
-    BackupHistoryAvailabilityFfi, BackupRestoreStatusFfi, BackupSettingsFfi, RecoveryWordsFfi,
+    BackgroundBackupOutcomeFfi, BackupHistoryAvailabilityFfi, BackupRestoreStatusFfi,
+    BackupSettingsFfi, RecoveryWordsFfi,
 };
 use crate::errors::MarmotKitError;
 use crate::subscriptions::BackupRestoreSubscription;
@@ -51,10 +52,21 @@ impl Marmot {
     ) -> Result<BackupSettingsFfi, MarmotKitError> {
         Ok(self.runtime.backup_settings(&account_ref).await?.into())
     }
-    /// Report current platform facts on worker start and changes. Background
-    /// backups require Wi-Fi AND charging; each replacement worker defaults
-    /// closed. Admitted passes settle after false; later work waits. This is
-    /// not a forced backup or completion receipt; manual restore is unaffected.
+    /// Report platform facts once per runtime, before workers exist and on
+    /// changes. Same-runtime worker restarts retain them; a new runtime is closed.
+    /// This starts no account worker. Admitted passes settle after false.
+    pub async fn set_runtime_backup_background_conditions(
+        &self,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_runtime_backup_background_conditions(wifi, charging)?)
+    }
+
+    /// Compatibility wrapper for the runtime-wide report. Validates the
+    /// existing active account first and never starts a worker.
     pub async fn set_backup_background_conditions(
         &self,
         account_ref: String,
@@ -66,6 +78,17 @@ impl Marmot {
             .set_backup_background_conditions(&account_ref, wifi, charging)
             .await?)
     }
+    /// Join the current background pass or try due admission once. Finished
+    /// means its serialized settlement attempt ended, not successful publication.
+    /// Host cancellation detaches this wait; worker stop closes it. The host
+    /// bounds its OS-task lifetime. This neither forces work nor waits for future due work.
+    pub async fn run_due_backup_pass(
+        &self,
+        account_ref: String,
+    ) -> Result<BackgroundBackupOutcomeFfi, MarmotKitError> {
+        Ok(self.runtime.run_due_backup_pass(&account_ref).await?.into())
+    }
+
     /// Start one manual history-only restore. Words move immediately into the
     /// redacted core guard; managed/generated input copies remain host-owned.
     /// This never changes the current recovery key or joins/re-adds a chat.
@@ -194,6 +217,13 @@ mod tests {
             runtime: app.runtime(),
             app,
         };
+        kit.set_runtime_backup_background_conditions(false, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            kit.run_due_backup_pass("alice".into()).await.unwrap(),
+            BackgroundBackupOutcomeFfi::NotStarted
+        );
         let observer = kit.watch_backup_restore("alice".into()).await.unwrap();
         assert_eq!(
             observer.snapshot().unwrap().phase,
@@ -245,6 +275,11 @@ mod tests {
         kit.set_backup_background_conditions("alice".into(), false, false)
             .await
             .unwrap();
+        assert_eq!(
+            kit.run_due_backup_pass("alice".into()).await.unwrap(),
+            BackgroundBackupOutcomeFfi::NotStarted,
+            "the reported closed facts gate background work, not manual restore"
+        );
         let phrase = words.words.join(" ");
         let first = kit
             .begin_backup_restore("alice".into(), phrase.clone())

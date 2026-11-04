@@ -377,6 +377,9 @@ impl<S: StorageProvider> Engine<S> {
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<ChosenGroup>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            self.epoch_manager.ensure_pending_space()?;
+        }
         if let Some(chosen) = &chosen {
             // A legacy create holds its Welcomes with its pending commit,
             // which keeps no delivery deadline (D40).
@@ -825,6 +828,7 @@ impl<S: StorageProvider> Engine<S> {
             self_removed_sibling_slots: Default::default(),
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         };
 
         // 5. Wrap welcomes via the peeler, before the group record or any
@@ -999,6 +1003,7 @@ impl<S: StorageProvider> Engine<S> {
                         for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
                             let payload = StoredMessagePayload::outbound_welcome(
                                 welcome.clone(),
+                                None,
                                 Some(
                                     crate::key_package::key_package_ref(parsed_kp)?
                                         .as_slice()
@@ -1129,7 +1134,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             EpochId(0)
         };
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);
@@ -1644,15 +1649,18 @@ impl<S: StorageProvider> Engine<S> {
             };
             let (local_state_is_stale, repaired_unrecoverable) = match discarded.as_ref() {
                 Some(group) => {
-                    // A sibling device's leaf keeps this account on the roster
-                    // after this device's removal, so the roster alone never
-                    // makes the discarded copy an active member.
                     let copy_is_member =
                         crate::identity::local_copy_is_member(group, self.identity.self_id());
-                    if copy_is_member && !group.unrecoverable {
-                        // A fork can have advanced beyond the replacement epoch.
-                        // Epoch ordering never grants consent: every distinct fully
-                        // validated Welcome only offers explicit branch replacement.
+                    // A sibling keeps the account on the roster after this
+                    // device's removal. Check native inactivity as well as the
+                    // durable marker before allowing that copy to re-enter.
+                    let self_is_recorded_member = group
+                        .members
+                        .iter()
+                        .any(|member| &member.id == self.identity.self_id());
+                    if self_is_recorded_member && !group.unrecoverable {
+                        // A usable fork can be newer than the replacement.
+                        // Epoch ordering never grants replacement authority.
                         let old = MlsGroup::load(
                             provider.storage(),
                             &openmls::group::GroupId::from_slice(group_id.as_slice()),
@@ -1662,13 +1670,24 @@ impl<S: StorageProvider> Engine<S> {
                         if old.pending_commit().is_some() {
                             return Err(rejoin_confirmation_required());
                         }
-                        let token = Sha256::digest(old.epoch_authenticator().as_slice()).to_vec();
-                        if let Some((expected_group, expected_token)) = consent {
-                            if expected_group != &group_id || expected_token != token {
-                                return Err(rejoin_confirmation_required());
+                        // An atomic remove/add can leave this account on the
+                        // roster while its old native copy is inactive. The
+                        // trusted-removal retry owns that reentry, not consent
+                        // to discard a still-usable fork.
+                        let trusted_removal = group.removed && !old.is_active();
+                        if trusted_removal && consent.is_some() {
+                            return Err(rejoin_confirmation_required());
+                        }
+                        if !trusted_removal {
+                            let token =
+                                Sha256::digest(old.epoch_authenticator().as_slice()).to_vec();
+                            if let Some((expected_group, expected_token)) = consent {
+                                if expected_group != &group_id || expected_token != token {
+                                    return Err(rejoin_confirmation_required());
+                                }
+                            } else {
+                                confirmation_token = Some(token);
                             }
-                        } else {
-                            confirmation_token = Some(token);
                         }
                     }
                     if consent.is_some() && (!copy_is_member || group.unrecoverable) {
@@ -1810,19 +1829,19 @@ impl<S: StorageProvider> Engine<S> {
             // the account key can read it and found a group under it. The
             // join consumes the expectation in this transaction.
             let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
-            match storage.device_group_welcome_expectation(&group_id)? {
+            let accepted_device_group = match storage.device_group_welcome_expectation(&group_id)? {
                 Some(expected)
                     if roster_required
                         && expected.sender_signature_key == welcome_sender_key
                         && expected.key_package_ref == consumed_key_package_ref
                         && joined_at.0 < expected.expires_at =>
                 {
-                    storage.delete_device_group_welcome_expectation(&group_id)?;
+                    Some(expected)
                 }
                 Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
-                None => {}
-            }
+                None => None,
+            };
             // While a link waits, the KeyPackage it confirmed is reserved for
             // it: no Welcome into another group, a chat included, consumes
             // it (D41).
@@ -1900,6 +1919,7 @@ impl<S: StorageProvider> Engine<S> {
                 // The joining device's clock is the one bound it can trust.
                 local_copy_welcome_created_at: welcome_created_at
                     .map(|created_at| created_at.min(joined_at)),
+                device_roster_departures: Vec::new(),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
             let admission = match &route {
@@ -1967,6 +1987,14 @@ impl<S: StorageProvider> Engine<S> {
                 self.identity.self_id(),
                 self.ciphersuite,
             )?;
+            // Only a fully validated device-roster Welcome can consume its
+            // exact expectation and join local move bookkeeping. Every write,
+            // including subsequent dedup, remains in this native transaction.
+            if let Some(expected) = accepted_device_group
+                && !storage.accept_device_group_welcome(&expected, joined_at)?
+            {
+                return Err(EngineError::UnexpectedDeviceGroupWelcome);
+            }
 
             for candidate in storage.list_welcomes()? {
                 if candidate.group_id == group_id

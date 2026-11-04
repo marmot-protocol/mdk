@@ -70,6 +70,7 @@ impl<S: StorageProvider> Engine<S> {
         roster_update: Vec<u8>,
         deliver_until: Timestamp,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(
             provider.storage(),
@@ -171,7 +172,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
         let welcomes = self
-            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &parsed_kps)
+            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &[], &parsed_kps)
             .await?;
         // `members()` shows the linked device while the publish is pending;
         // `confirm_published` and `publish_failed` re-derive the record from
@@ -213,6 +214,7 @@ impl<S: StorageProvider> Engine<S> {
         leaf_signature_key: Vec<u8>,
         roster_update: Vec<u8>,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(
             provider.storage(),
@@ -359,7 +361,7 @@ impl<S: StorageProvider> Engine<S> {
         commit_msg: &cgka_traits::transport::TransportMessage,
     ) -> Result<PendingStateRef, EngineError> {
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),

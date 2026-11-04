@@ -7,14 +7,22 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
+  Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
+  setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
+
 ### Breaking changes
+
+- Device-link snapshots add owned move views and old-sibling recognition hints; linked-device status appends Moved.
+  `dismiss_device_group_move_sibling` dismisses one hint. Regenerate host bindings and rebuild consumers with the
+  matching native library/header: the snapshot layout changes. Moves remain behind the existing experimental gate.
 
 - Expose recovery-word setup/settings, manual backup restore controls/status/watch/current-chat hints and background
   Wi-Fi/charging reports, with matching deep frees. `MarmotTimelineMessageRecord` adds nullable tagged
   `history_import_provenance` (Device or Backup), changing its layout and embedding records. The legacy
   `imported_from` stays sibling-only. Recompile consumers with the matching generated header and native library.
   Closing a watch does not cancel restore; returned words and borrowed host inputs need explicit secret handling.
-  Background writer work defaults closed on each worker start until the host reports both Wi-Fi and charging.
+  Background writer work defaults closed on each new runtime until the host reports both Wi-Fi and charging.
   Already admitted passes settle after conditions change; manual restore remains independent.
 
 - `MarmotMediaAttachmentReference` adds nullable `source_epoch_identity`
@@ -109,6 +117,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   spec lands. A rename whose commit loses a fork is made again later, unless
   another rename of that device won. Use matching regenerated headers and
   libraries.
+- Append `MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED` (117) and
+  `MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH` (118), preserving all previous
+  status values. The first waits for source evolution or local recovery-state
+  synchronization. The second refuses ineligible or stale recovery authority:
+  recheck local eligibility before obtaining another challenge, rather than
+  retrying the same grant. Use matching regenerated headers and libraries.
 - `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
   stuck syncing; `marmot_retry_group_convergence` grants one more attempt.

@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
+  `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
+  `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
+  eligibility. `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs instead of Welcome ids.
+  Rust callers must update and rebuild. Migration 0174 retires D90/D91 observation indexes and local ordering
+  clock, preserving processed-wrapper dedup, known publication times and carrier high-water; unused nullable
+  legacy columns remain inert.
+
 - A peer's reaction settles a send whose publish was judged to have reached
   no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`:
   true for a failed own row with no relay acceptance that another account
@@ -21,6 +29,12 @@
   chat-list preview index and settles existing rows from their stored
   reactions.
 
+- Migration 0175 adds a full-width pending-reference watermark outside group snapshots. Saved fanout/evolution
+  writes raise it atomically; deletion never lowers it. `StorageProvider` implementations must supply
+  `pending_ref_high_water` and preserve that bound. Undecodable pre-index artifacts abort migration rather than
+  guessing a safe handle; malformed artifacts after indexing remain isolated to their group.
+- Stored-message variant 13 retains a confirmed Welcome's origin Commit. Existing originless variants keep their
+  bytes and handling; older binaries refuse schema 175 on open.
 - Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
 
 - Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,

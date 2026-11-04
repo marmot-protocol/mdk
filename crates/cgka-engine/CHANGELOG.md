@@ -2,10 +2,24 @@
 
 ## Unreleased
 
+- Retire D90/D91 device-group source-observation/proof recovery and its unused Engine APIs; sibling-Welcome origin, current tagged participation, expiry and immutable-carrier guards remain (D100).
+
 - Separate explicit dev device-roster advertisement capability from policy-test timing overrides.
 
 ### Fixed
 
+- Retain exact SelfUpdate publication bytes across compatibility restart even when Welcome storage is unavailable.
+  Ordinary updates have no Welcome artifacts to discover.
+- Allow member recovery past ownerless ordinary Preparing work and obsolete ordinary source records, including
+  rollback after a crash during recovery preparation. Current-source prepared/attempted publications and retained
+  recovery artifacts still block it.
+- Keep the origin Commit on promoted existing-group Welcomes. Reversible branch loss holds the exact artifact and
+  retry owner for re-adoption; only terminal origins atomically retire undelivered Welcomes. Already delivered
+  usable copies still require explicit replacement consent.
+- Reserve saved publication handles from independent durable metadata before hydration. Corrupt pending artifacts
+  no longer block healthy groups once that bound exists; exhausted handles refuse staging before mutation.
+- Keep recovery send refusals consistent with source validation: pending leave/disband is transient; legacy-cutover
+  and device-group refusal is permanent and happens before staging.
 - Attachment-bearing kind-7 reactions carry their authenticated source-epoch
   encrypted-media key through receive and convergence replay, including late
   replay after that epoch's retained anchor is pruned (mdk#2151). Plain

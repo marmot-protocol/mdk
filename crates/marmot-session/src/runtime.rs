@@ -806,30 +806,6 @@ where
     /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
     /// its own retained anchor. `None` when `epoch` is neither current nor
     /// retained, or no leaf sat at that index. See
-    /// Recover immutable accepted source proof without changing its first observation.
-    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> AccountResult<()> {
-        Ok(self
-            .session
-            .recover_pending_device_group_sources(group_id)?)
-    }
-
-    /// Attribute accepted native DG sources under the current trusted roster.
-    pub fn pending_device_group_activity(
-        &self,
-        group_id: &GroupId,
-        roster: &DeviceRosterV1,
-    ) -> AccountResult<
-        Vec<(
-            cgka_traits::MessageId,
-            EpochId,
-            Option<cgka_traits::app_components::DeviceSlotId>,
-        )>,
-    > {
-        Ok(self
-            .session
-            .pending_device_group_activity(group_id, roster)?)
-    }
-
     /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
@@ -964,6 +940,26 @@ where
     /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
     pub fn own_signature_key(&self) -> Vec<u8> {
         self.session.own_signature_key()
+    }
+
+    /// Pin original trust and destination expectation before a move Confirm.
+    pub fn prepare_device_group_move(
+        &mut self,
+        expectation: &cgka_traits::storage::DeviceGroupWelcomeExpectation,
+        own_slot: [u8; 32],
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session
+            .prepare_device_group_move(expectation, own_slot, now)
+    }
+
+    /// Apply the present selected Made cut on the session's own connection.
+    pub fn record_device_group_move_made(
+        &mut self,
+        destination: &GroupId,
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session.record_device_group_move_made(destination, now)
     }
 
     /// See `CgkaEngine::expect_device_group_welcome`.
@@ -2917,6 +2913,7 @@ where
                                 publish: vec![PublishWork::AutoPublish {
                                     msg: fanout.exact_message,
                                     pending,
+                                    welcomes: Vec::new(),
                                 }],
                                 queued: Vec::new(),
                                 pending_convergence: Vec::new(),
@@ -3605,7 +3602,9 @@ where
         prepared: PreparedSessionCommit,
     ) -> AccountResult<AccountDeviceEffects> {
         let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
-        prepared_effects.publish.clear();
+        prepared_effects.publish.retain(|work| {
+            !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
+        });
 
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
@@ -3954,17 +3953,19 @@ where
                 let outcome = fanout.outcome();
                 outcome.outstanding_targets > 0
                     || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || !fanout.pending_post_confirmation_welcomes().is_empty()
                     || (outcome.accepted_targets > 0 && fanout.application_message().is_some())
             }))
     }
 
-    /// Return the earliest durable retry cutoff for an incomplete frozen
-    /// fanout in `group_id`.
+    /// Return the earliest durable retry cutoff up to the first fanout below
+    /// quorum or awaiting MLS confirmation, including earlier retained Welcomes.
     ///
     /// `None` means the group has no network retry cutoff to honor. It may
     /// still have local-only work, such as acknowledgement cleanup for an
-    /// accepted application-message fanout; callers should schedule that on
-    /// their ordinary retry delay. A zero delay means at least one exact event
+    /// accepted application-message fanout or Welcome preparation without a
+    /// stored attempt cutoff; callers should schedule that on their ordinary
+    /// retry delay. A zero delay means at least one exact event
     /// is eligible now (including after a connectivity-restored wake).
     pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
         let now_ms = self.wall_clock.now_ms();
@@ -3979,10 +3980,21 @@ where
                 // behind an unrelated transport backoff in the same group.
                 return Ok(None);
             }
+            if matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && !fanout.pending_post_confirmation_welcomes().is_empty()
+            {
+                let Some(delay) = self
+                    .welcome_retry_delay_ms(fanout.pending_post_confirmation_welcomes(), now_ms)?
+                else {
+                    return Ok(None);
+                };
+                earliest = Some(earliest.map_or(delay, |prior: u64| prior.min(delay)));
+            }
             if outcome.outstanding_targets == 0 {
                 if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
                     return Ok(None);
                 }
+
                 continue;
             }
             for index in fanout.outstanding_target_indexes() {
@@ -4003,6 +4015,30 @@ where
                 || outcome.accepted_targets < fanout.request().required_acks.max(1)
             {
                 return Ok(earliest);
+            }
+        }
+        Ok(earliest)
+    }
+
+    fn welcome_retry_delay_ms(
+        &self,
+        welcomes: &[TransportMessage],
+        now_ms: u64,
+    ) -> AccountResult<Option<u64>> {
+        let mut earliest = None;
+        for welcome in welcomes {
+            let Some(fanout) = self.session.transport_fanout(&welcome.id)? else {
+                // No durable attempt cutoff exists yet. Use the ordinary
+                // scheduler delay for preparation or local bookkeeping.
+                return Ok(None);
+            };
+            for target in &fanout.targets {
+                if let Some(delay_ms) = transport_retry_delay_ms(target, now_ms) {
+                    if target.last_attempt_at.is_none() {
+                        return Ok(None);
+                    }
+                    earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
+                }
             }
         }
         Ok(earliest)
@@ -4198,7 +4234,20 @@ where
                     self.publish_founding_group_created(welcomes, output, queue, context.clone())
                         .await?;
                 }
+                PublishWork::AutoPublish {
+                    msg,
+                    pending,
+                    welcomes,
+                } if welcomes.is_empty() => {
+                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
+                        .await?;
+                }
                 PublishWork::GroupEvolution {
+                    msg,
+                    welcomes,
+                    pending,
+                }
+                | PublishWork::AutoPublish {
                     msg,
                     welcomes,
                     pending,
@@ -4212,10 +4261,6 @@ where
                         context.clone(),
                     ))
                     .await?;
-                }
-                PublishWork::AutoPublish { msg, pending } => {
-                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
-                        .await?;
                 }
             }
         }
@@ -4326,6 +4371,7 @@ where
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || !fanout.pending_post_confirmation_welcomes().is_empty()
             {
                 let fanout_group = fanout.group_id().cloned();
                 let status =
@@ -6795,22 +6841,30 @@ fn accepted_fanout_targets(fanout: &DurableTransportFanout) -> usize {
 }
 
 fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
+    transport_retry_delay_ms(target, now.0.saturating_mul(1_000)) == Some(0)
+}
+
+fn transport_retry_delay_ms(target: &TransportFanoutTarget, now_ms: u64) -> Option<u64> {
     if matches!(
         target.state,
         TransportFanoutAttemptState::Accepted | TransportFanoutAttemptState::PolicyProhibited
     ) {
-        return false;
+        return None;
     }
     let shift = target.attempt_count.saturating_sub(1).min(7);
     let backoff = 30_u64.saturating_mul(1_u64 << shift).min(60 * 60);
-    target
-        .last_attempt_at
-        .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
+    Some(target.last_attempt_at.map_or(0, |last| {
+        last.0
+            .saturating_add(backoff)
+            .saturating_mul(1_000)
+            .saturating_sub(now_ms)
+    }))
 }
 
-/// Pull Welcome payloads off publish work so the commit/create can confirm
+/// Pull caller-owned Welcome payloads off publish work so the commit/create can confirm
 /// without waiting for recipient delivery. Empty Welcome vectors remain on the
-/// original work items so later publish still confirms the commit.
+/// original work items so later publish still confirms the commit. Automatic
+/// work retains its Welcomes until its own commit is acknowledged.
 fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
     let mut welcomes = Vec::new();
     for work in &mut effects.publish {
@@ -6834,6 +6888,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::RemoveMembers { .. }
             | SendIntent::AddOwnAccountDevices { .. }
             | SendIntent::RemoveOwnAccountDevices { .. }
@@ -6847,6 +6902,8 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }
+            | SendIntent::ImportDeviceGroupRejections { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
     )
 }
 

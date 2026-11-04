@@ -134,6 +134,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
+        SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
         SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
@@ -147,6 +148,8 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::ImportDeviceGroupRejections { .. } => "import_device_group_rejections",
+        SendIntent::MarkDeviceGroupMoved { .. } => "mark_device_group_moved",
         SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }
@@ -161,6 +164,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
+        | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
@@ -174,6 +178,8 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::ImportDeviceGroupRejections { group_id, .. }
+        | SendIntent::MarkDeviceGroupMoved { group_id, .. }
         | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id.clone(),
     }

@@ -158,6 +158,29 @@ pub struct Group {
     /// history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_copy_welcome_created_at: Option<crate::transport::Timestamp>,
+    /// Latest selected departure per roster slot, with the actual source
+    /// entry/Commit. Group snapshots rewind this cause; a current entry ends
+    /// it. Never an observed-ever exception for another admission or branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_roster_departures: Vec<DeviceRosterDeparture>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRosterDeparture {
+    pub label: String,
+    pub slot: crate::app_components::DeviceSlotId,
+    pub tag_signature_key: Option<Vec<u8>>,
+    pub linked_at: u64,
+    pub entry_rename_id: Option<crate::app_components::DeviceRenameId>,
+    pub source_epoch: EpochId,
+    pub commit_id: crate::types::MessageId,
+    pub cause: DeviceRosterDepartureCause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceRosterDepartureCause {
+    Moved,
+    Ordinary,
 }
 
 impl Group {
@@ -279,6 +302,7 @@ mod tests {
             local_copy_install_epoch: EpochId(4),
             self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: welcome.map(Timestamp),
+            device_roster_departures: Vec::new(),
         }
     }
 

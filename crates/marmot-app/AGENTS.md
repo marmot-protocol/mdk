@@ -97,7 +97,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
 - Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, settings, announcements).
-  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The sole move exception is the post-Made old-group `MarkDeviceGroupMoved`: this device's own complete-entry CAS,
+  changing only status and retaining label/settings/rename id with the original group's tag. It never retargets an
+  ordinary edit. The Made trust cut stays in the outer pairing drive, never nested projection/sync/recovery callbacks.
+  The ordinary edit path refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
   replacement never undoes a change that lands in between. A user edit (`client/device_renames.rs`, D37/D86) writes
   a fresh rename id next to its label/settings snapshot and is kept on disk before its commit is sent. Legacy NULL settings remain
@@ -149,7 +152,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Worker background admission is memory-only and defaults closed: Wi-Fi AND charging must be reported before
   `prepare_backup_pass`, including cleanup/retry passes. An admitted whole pass still runs and settles after false;
   do not interrupt its blobs or bypass the gate through generic maintenance/shared media completion. Replacement
-  workers reset the facts. This gate does not apply to manual restore or redefine lower-level AppClient APIs.
+  workers read the runtime-wide latest facts; only a new runtime defaults closed. Report through the retained shared
+  watch before workers exist. Only enabled workers subscribe to changes. The finite due-pass wait joins one admitted
+  flight or tries existing admission once, waits outside the serialized command lane, and signals after finish, permit
+  return and flight clear. The completion sender stays worker-owned, never in detached HTTP work; stop closes
+  pending waits. Caller cancellation detaches without cancelling a pass. FinishedAttempt is not publication success.
+  This gate does not apply to manual restore or redefine lower-level AppClient APIs.
 - Manual backup restore (`src/client/backup_restore.rs`, mdk#2628 4.4c, D93) owns one ephemeral account-worker job.
   Never drive `BackupPass` from its manual dispatcher: that pass deletes and publishes. Use the shared read-only
   pointer discovery and bounded media credits; retain the credit through serialized completion. Check the actual
@@ -282,18 +290,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
-  delivered one again before D70's fixed wait. `sibling_welcome_resends` owns one indexed timing row per original
-  Welcome: the first durable accepted-publication observation, then the first newly observed target-device DG
-  activity and a fixed 600-second deadline. Application, accepted member Commit and Proposal traffic qualify through immutable
-  authenticated source-epoch leaf proof and current roster keys. Native acceptance owns first local time/order in the
-  existing processed-wrapper ledger outside snapshots; app attribution never allocates or changes a stamp. Missing
-  source proof is recovered from exact ciphertext under a retained anchor, never a later occupant at the same index.
-  Empty-effect batches and ordinary maintenance project bounded proof-present work independently of unavailable proof. Replay, rewrap and later traffic never rearm or slide the wait. Each
-  successful new carrier needs fresh later activity. Persist the current roster tag key actually used to verify the
-  source leaf key with its slot: this verified DG device principal coalesces valid-app aliases across MLS leaf rekeys,
-  while a different tag-key incarnation or another device with the same inner event id remains independent. Unknown
-  earlier source proof holds only aliases of that event; current-key-unready hints never grant attribution. D91 freezes the existing local DG's epoch at upgrade; only
-  later-epoch traffic qualifies, while new local groups qualify immediately and initial delivery is unchanged.
+  delivered one again before D100's heartbeat boundary. `sibling_welcome_resends` owns one timing row per original
+  Welcome: the latest carrier's immutable first actual accepted-publication time and prepared-carrier high-water.
+  Reuse the existing 32-row retirement keyset walk to check repair. Only D35 counted heartbeat `last_active_at` for
+  the current roster entry's slot and `linked_at`, at least 600 seconds after that publication time, qualifies.
+  First sighting, arbitrary DG traffic and old-incarnation activity never qualify. A carrier with unknown acceptance
+  time is not repaired. There is no D90/D91 per-message source-proof journal, alias recovery, local ordering clock or
+  upgrade epoch cutoff. Each newly accepted carrier requires a sufficiently later heartbeat; cadence/skew remain
+  best-effort limits.
   Due work reuses the engine-owned Welcome/ref/expiry/origin, consumes no KeyPackage and makes no Add or history offer.
   A current matching Update/Commit target leaf suppresses repair; the Add's tagged KeyPackage leaf alone does not.
   Reserve the actual generated carrier timestamp and engine carrier association together before handoff, using the
@@ -1060,8 +1064,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (the diagnostics test fixtures and hooks). Enable it only as a dev-dependency.
 
 Background condition ownership extends `the_runtime_writes_a_due_backup`: durable pre-prepare ledger state proves
-closed/default admission, held real PUT proves current-pass settlement after false, and worker replacement resets
-facts. The bounded host token codec owner lives in `client/backup_restore.rs`; wrappers own stale-token, watch-close,
+closed/default admission, held real PUT proves current-pass settlement after false, and same-runtime worker replacement retains
+facts. A new runtime remains closed. The same held-PUT owner covers joining completion, detached caller cancellation,
+serialized settlement after false, and worker-stop completion closure. The bounded host token codec owner lives in `client/backup_restore.rs`; wrappers own stale-token, watch-close,
 DTO cache and C deep-free tests rather than duplicating history/crypto owners.
 
 Manual restore owners are in `src/tests/device_group/backup_restore.rs` (the backup-writer test module's child):
