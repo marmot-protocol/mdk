@@ -386,6 +386,9 @@ cargo test -p wn-opencode real_opencode_run_file_contract -- --ignored --nocaptu
 
 ## Active-turn steering (opt-in native transport)
 
+The transport is selected once at startup: unset or `cli` keeps the default;
+`native` enables steering. Other values fail configuration validation.
+
 `WN_OPENCODE_TRANSPORT=native` uses a per-turn `opencode serve` process and
 OpenCode's native session API. A follow-up is saved in the same session while
 the current model/tool loop runs; it becomes available at the next step rather
@@ -395,6 +398,12 @@ This uses the shared terminal harness's `Backend::steer` contract, sender checks
 attachment leases, group routing, session map, process cleanup and uncertain
 outcome handling. The connector continues to own durable message delivery.
 The default remains the existing CLI transport.
+
+Native HTTP responses have a separate bounded budget: the configured aggregate
+attachment limit after base64 expansion, plus 4 MiB for JSON, text and metadata.
+The JSONL control-input limit remains 4 MiB. A response exceeding its budget
+(for example, a history page containing multiple large batches) fails the turn;
+an uncertain submission is never replayed.
 
 Native mode currently requires Linux, Python 3 at `/usr/bin/python3`, OpenCode 1.18.32 and a protected
 loopback port range. Set `WN_OPENCODE_NATIVE_PASSWORD_FILE` to a nonempty, private

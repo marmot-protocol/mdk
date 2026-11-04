@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
+    pub(crate) native_enabled: bool,
     pub(crate) execution_profile: ExecutionProfile,
     pub(crate) native: std::sync::Arc<crate::native::Native>,
 }
@@ -21,7 +22,7 @@ pub(crate) struct OpencodeBackend {
 #[async_trait]
 impl Backend for OpencodeBackend {
     fn has_active_turn(&self, group: &str) -> bool {
-        native_enabled() && self.native.active(group)
+        self.native_enabled && self.native.active(group)
     }
     async fn steer(&self, group: &str, text: &str) -> SteerOutcome {
         self.native.steer(group, text, vec![], None).await
@@ -55,7 +56,7 @@ impl Backend for OpencodeBackend {
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        if native_enabled() {
+        if self.native_enabled {
             return self
                 .native
                 .run(
@@ -76,7 +77,7 @@ impl Backend for OpencodeBackend {
         attachments: Vec<Attachment>,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        if native_enabled() {
+        if self.native_enabled {
             return self
                 .native
                 .run(
@@ -340,9 +341,6 @@ impl OpencodeError {
     }
 }
 
-fn native_enabled() -> bool {
-    std::env::var("WN_OPENCODE_TRANSPORT").is_ok_and(|v| v == "native")
-}
 fn native_environment(profile: ExecutionProfile) -> Vec<EnvironmentChange> {
     let mut environment = config_overlay(profile)
         .map(|(remove, name, value)| {

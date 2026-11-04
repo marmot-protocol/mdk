@@ -19,11 +19,18 @@ import urllib.parse
 import urllib.request
 
 LIMIT = 4 * 1024 * 1024
+# JSONL carries file paths; HTTP readback can contain the whole admitted batch
+# encoded as data URLs. Keep a separate bounded budget with base64 expansion
+# and the existing 4 MiB allowance for JSON, text and message metadata.
+ATTACHMENT_LIMIT = int(os.environ.get('WN_OPENCODE_MAX_ATTACHMENT_BYTES', str(64 * 1024 * 1024)))
+RESPONSE_LIMIT = LIMIT + 4 * ((ATTACHMENT_LIMIT + 2) // 3)
 
 def emit(kind, **fields):
+    """Emit one bounded-protocol event for the enclosing Rust runner."""
     print(json.dumps(dict(type=kind, **fields), separators=(",", ":")), flush=True)
 
 def message_id():
+    """Generate unique IDs in the chronological order expected by OpenCode."""
     # Same chronological prefix as OpenCode Identifier.ascending; unique per bridge.
     global last_tick
     tick = max(int(time.time() * 1000) * 4096, last_tick + 1)
@@ -34,6 +41,7 @@ def message_id():
 last_tick = 0
 
 def parts(prompt, files):
+    """Reference staged absolute files for native Read processing."""
     result = [{"type": "text", "text": prompt}]
     for file in files:
         p = Path(file)
@@ -43,6 +51,7 @@ def parts(prompt, files):
     return result
 
 def persisted_message(result, mid, prompt, expected):
+    """Require exact prompt and every attachment before acknowledging persistence."""
     if result.get('info', {}).get('id') != mid:
         return False
     actual = result.get('parts', [])
@@ -59,6 +68,7 @@ def persisted_message(result, mid, prompt, expected):
 
 class Server:
     def __init__(self, binary):
+        """Start one authenticated server on a protected, exclusively reserved port."""
         # Below the host's unprivileged threshold: another Unix user cannot take
         # the listener after server death and capture authenticated prompt traffic.
         threshold = int(Path('/proc/sys/net/ipv4/ip_unprivileged_port_start').read_text())
@@ -123,16 +133,18 @@ class Server:
                     raise
                 time.sleep(.1)
     def call(self, method, path, body=None, timeout=10):
+        """Make one HTTP attempt and decode a bounded response without retrying."""
         if self.child.poll() is not None:
             raise ValueError('Native server exited')
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, headers=self.headers, method=method)
         with self.http.open(req, timeout=timeout) as response:
-            raw = response.read(LIMIT + 1)
-            if len(raw) > LIMIT:
+            raw = response.read(RESPONSE_LIMIT + 1)
+            if len(raw) > RESPONSE_LIMIT:
                 raise ValueError('Response too large')
             return json.loads(raw) if raw else None
     def close(self):
+        """Stop the owned server before releasing its exclusive listener lock."""
         if self.child.poll() is None:
             self.child.terminate()
             try:
@@ -145,6 +157,7 @@ class Server:
             self.port_lock = None
 
 def run():
+    """Persist ordered inputs and emit only a completed answer to the latest input."""
     # Unbuffered FileIO avoids a daemon holding Python buffered-stdin locks
     # during interpreter shutdown. Also avoids prefetching later JSONL frames.
     stream = getattr(sys.stdin.buffer, "raw", sys.stdin.buffer)
@@ -166,6 +179,7 @@ def run():
         done = threading.Event()
         failure = []
         def start():
+            """Keep the initial model call alive until it completes or the runner stops."""
             try:
                 server.call('POST', route + '/message', {'messageID': first, 'parts': wanted}, timeout=None)
             except Exception:
@@ -189,6 +203,7 @@ def run():
             time.sleep(.05)
         incoming = queue.Queue(maxsize=64)
         def read_input():
+            """Read complete bounded control frames without buffered-stdin shutdown locks."""
             while True:
                 raw = stream.readline(LIMIT + 1)
                 if not raw or len(raw) > LIMIT:
