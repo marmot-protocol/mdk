@@ -488,11 +488,14 @@ async fn dispatch_authorized(
         }
     }
 
-    let Some(permit) = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await
+    let Some(mut permit) = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await
     else {
         reply_queue_full(ctx, inbound);
         return;
     };
+    // Keep admission ordered until the handler actually owns its serial turn.
+    // Spawning alone does not enroll a task in Tokio's FIFO mutex wait queue.
+    permit.ingress = Some(ingress);
     tokio::spawn(handle_message(ctx, inbound, permit));
 }
 
@@ -505,7 +508,7 @@ fn reply_queue_full(ctx: Arc<BridgeContext>, inbound: InboundPrompt) {
             &inbound.group_ref,
             &inbound.message_ref,
             &format!(
-                "[{}] too many prompts are already queued for this group; try again shortly.",
+                "[{}] too many prompts are already queued for this group; send a new message shortly.",
                 ctx.cfg.spec.reply_prefix
             ),
             0,
@@ -656,7 +659,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             }
             let Some(pending) = permit.queue.pending.clone().try_acquire_owned().ok() else {
                 let text = format!(
-                    "[{}] too many prompts are already queued for this group; try again shortly.",
+                    "[{}] too many prompts are already queued for this group; send a new message shortly.",
                     ctx.cfg.spec.reply_prefix
                 );
                 let _ = send_reply(
@@ -681,6 +684,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         }
     };
 
+    permit.ingress.take();
     let mut retrying = false;
     let forced_run = match disposition {
         PromptDisposition::ResetSession => {
@@ -2813,6 +2817,7 @@ struct GroupPermit {
     _waiting: Option<OwnedSemaphorePermit>,
     _pending: Option<OwnedSemaphorePermit>,
     serial_admission: bool,
+    ingress: Option<IngressPermit>,
 }
 
 struct IngressPermit {
@@ -2922,13 +2927,14 @@ impl GroupQueues {
         let queue = self.queue(group_ref).await?;
         let waiting = queue.waiting.clone().try_acquire_owned().ok()?;
         queue.active.fetch_add(1, Ordering::Relaxed);
-        queue.serial_active.fetch_add(1, Ordering::Relaxed);
+        queue.serial_active.fetch_add(1, Ordering::AcqRel);
         Some(GroupPermit {
             queue: queue.clone(),
             serial: queue.serial.clone(),
             _waiting: Some(waiting),
             _pending: None,
             serial_admission: true,
+            ingress: None,
         })
     }
 
@@ -2942,7 +2948,7 @@ impl GroupQueues {
         let queue = self.queue(group_ref).await?;
         queue.active.fetch_add(1, Ordering::Relaxed);
         if serial_admission {
-            queue.serial_active.fetch_add(1, Ordering::Relaxed);
+            queue.serial_active.fetch_add(1, Ordering::AcqRel);
         }
         Some(GroupPermit {
             queue: queue.clone(),
@@ -2950,6 +2956,7 @@ impl GroupQueues {
             _waiting: None,
             _pending: None,
             serial_admission,
+            ingress: None,
         })
     }
 
@@ -2966,7 +2973,7 @@ impl Drop for GroupPermit {
     fn drop(&mut self) {
         self.queue.active.fetch_sub(1, Ordering::Relaxed);
         if self.serial_admission {
-            self.queue.serial_active.fetch_sub(1, Ordering::Relaxed);
+            self.queue.serial_active.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -3194,6 +3201,66 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), third.wait())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_keeps_context_admission_until_it_acquires_the_serial_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let mut config = test_config(root.path());
+        config.allowed_senders.insert("sender".into());
+        let server = spawn_final_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            Arc::new(RecordingBackend::default()),
+        );
+        ctx.sessions
+            .record_session("group", "old-session".into(), home)
+            .await
+            .unwrap();
+        let queue = ctx.queues.queue("group").await.unwrap();
+        let running = queue.serial.lock().await;
+        dispatch_event(ctx.clone(), ingress_event("group", "reset", "/new")).await;
+        let mut next = ctx.queues.reserve_ingress("group").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queue.serial_active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut wait = Box::pin(next.wait());
+        let state = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(wait.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            state.is_pending(),
+            "later admission overtook the reset before its serial wait"
+        );
+        drop(running);
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap();
+        drop(next);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queue.serial_active.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            ctx.sessions
+                .get("group")
+                .await
+                .unwrap()
+                .session_id
+                .is_empty()
+        );
+        server.abort();
     }
 
     #[tokio::test]

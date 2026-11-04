@@ -307,5 +307,6 @@ if __name__ == '__main__':
     try:
         run()
     except Exception:
+        emit('stopping')
         emit('error')
         sys.exit(1)
