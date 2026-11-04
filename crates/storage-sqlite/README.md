@@ -159,6 +159,13 @@ refuse an upgraded schema; downgrading a binary requires a pre-upgrade backup.
 
 ## Recovery semantics
 
+**Pending publication references.** Migration 0175 seeds an account-device high-water from retained fanouts and group
+evolutions once. An undecodable legacy artifact aborts that migration: without an independent bound, skipping it could
+reuse a saved recovery handle. Subsequent artifact writes raise the full-width `u64` bound in the same transaction;
+deletion and group snapshot restoration never lower it. Engine construction reads only this independent metadata, so
+later payload corruption is isolated by per-group hydration. Missing or malformed metadata fails closed. Exhaustion
+refuses new native staging before mutation; already saved references can still be restored and settled.
+
 **Retained anchors** are engine/group policy, not hidden SQLite policy. `max_rewind_commits` defaults to `5` when no
 group policy is stored, and the engine persists negotiated policy bytes per group. Retained anchor snapshots are pruned
 after successful stable canonicalization advances the tip. Invalidated message records are kept as audit/debug
@@ -439,7 +446,7 @@ and use the returned source slot with existing acquisition and local-read APIs.
 
 ### Experimental device-group moves
 
-Migration 0175 adds finite local move records for every account database, including builds with device groups disabled.
+Migration 0176 adds finite local move records for every account database, including builds with device groups disabled.
 A validated expected roster Welcome records Joined inside the native join transaction. The session's present-selected
 Made proof then captures old roster facts, switches the one trusted row, retires old App delivery/edit debt and owes the
 existing full small-state broadcast/request in one transaction. Taken private-KeyPackage references remain tombstones;

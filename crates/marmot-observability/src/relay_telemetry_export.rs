@@ -2460,12 +2460,30 @@ mod otlp {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn wire_collection_omits_history_and_uses_the_permit_identity() {
+            use cgka_traits::TransportAdapter;
+
+            let fixture = transport_nostr::test_support::AccountPublishFixture::activate().await;
+            let inbox_endpoints = fixture
+                .plane
+                .sanitize_relay_endpoints(vec![fixture.endpoint.clone()], "telemetry fixture")
+                .unwrap();
             let (endpoint, mut requests, server) = collector(&[200]).await;
             let product = crate::ProductAnalytics::default();
             crate::grant(&product);
             let permit = product.permit().unwrap();
             let diagnostic_id = permit.diagnostic_id.clone();
-            let exporter = exporter(endpoint, permit);
+            let exporter = crate::RelayTelemetryExporter::new(
+                &fixture.plane,
+                crate::RelayTelemetryExportConfig::enabled(endpoint).with_runtime_config(
+                    crate::RelayTelemetryRuntimeConfig {
+                        authorization_bearer_token: Some("collector-token".into()),
+                        resource: Some(test_resource()),
+                        ..Default::default()
+                    },
+                ),
+                permit,
+            )
+            .unwrap();
             let performance = crate::AppPerformanceTelemetry::default();
             for _ in 0..3 {
                 performance.record(
@@ -2474,7 +2492,44 @@ mod otlp {
                     true,
                 );
             }
-            for expected in [0, 1] {
+            let mut relay_baseline = None;
+            for expected in [0_u64, 1, 2] {
+                // Full-history activation reissues an ordinary inbox REQ with
+                // a new attempt. Its real EOSE tracking computes the timing.
+                fixture
+                    .adapter
+                    .activate_account(cgka_traits::TransportAccountActivation {
+                        account_id: fixture.account_id.clone(),
+                        inbox_endpoints: inbox_endpoints.clone(),
+                        group_subscriptions: Vec::new(),
+                        since: None,
+                    })
+                    .await
+                    .unwrap();
+                let subscription = transport_nostr_adapter::NostrSubscription::AccountInbox {
+                    account_id: fixture.account_id.clone(),
+                    endpoints: inbox_endpoints.clone(),
+                    since: None,
+                    attempt: fixture
+                        .adapter
+                        .account_subscription_attempt()
+                        .await
+                        .unwrap(),
+                }
+                .subscription_id();
+                fixture
+                    .plane
+                    .handle_relay_eose_for_test(inbox_endpoints[0].clone(), subscription)
+                    .await;
+                let rollup = fixture.plane.telemetry_rollup(None).await;
+                assert_eq!(
+                    rollup.relays.len(),
+                    1,
+                    "the wire fixture must have real relay telemetry"
+                );
+                let source = &rollup.relays[0].eose_latency;
+                assert_eq!(source.sample_count(), expected + 1);
+                let baseline = relay_baseline.get_or_insert_with(|| source.clone());
                 if expected != 0 {
                     performance.record(
                         crate::AppPerformanceOperation::AppStart,
@@ -2496,9 +2551,80 @@ mod otlp {
                         .unwrap(),
                     &string_key_value("service.instance.id", &diagnostic_id)
                 );
-                assert_eq!(app_start_attempts(&request), expected);
+                assert_eq!(app_start_attempts(&request), expected as i64);
+                let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+                let relay_names = [
+                    metric_names::FIRST_EVENT_LATENCY,
+                    metric_names::EOSE_LATENCY,
+                    metric_names::DELIVERY_COUNT,
+                    metric_names::REDUNDANT_COUNT,
+                ];
+                for metric in metrics {
+                    let attributes: Vec<_> = match metric.data.as_ref().unwrap() {
+                        metric::Data::Histogram(value) => value
+                            .data_points
+                            .iter()
+                            .map(|point| &point.attributes)
+                            .collect(),
+                        metric::Data::Sum(value) => value
+                            .data_points
+                            .iter()
+                            .map(|point| &point.attributes)
+                            .collect(),
+                        metric::Data::Gauge(value) => value
+                            .data_points
+                            .iter()
+                            .map(|point| &point.attributes)
+                            .collect(),
+                        other => panic!("unexpected metric data: {other:?}"),
+                    };
+                    for attributes in attributes {
+                        if relay_names.contains(&metric.name.as_str()) {
+                            assert_eq!(
+                                attributes,
+                                &vec![string_key_value("relay", "wss://relay.example/")]
+                            );
+                        } else {
+                            assert!(
+                                attributes.is_empty(),
+                                "population metrics carry no identity"
+                            );
+                        }
+                    }
+                }
+                for name in relay_names {
+                    assert_eq!(
+                        metrics.iter().filter(|metric| metric.name == name).count(),
+                        1,
+                        "exactly one resolved relay series for {name}"
+                    );
+                }
+                let eose = metrics
+                    .iter()
+                    .find(|metric| metric.name == metric_names::EOSE_LATENCY)
+                    .unwrap();
+                let Some(metric::Data::Histogram(histogram)) = &eose.data else {
+                    panic!("EOSE is a histogram on the actual wire");
+                };
+                assert_eq!(histogram.data_points.len(), 1);
+                let point = &histogram.data_points[0];
+                assert_eq!(
+                    point.count, expected,
+                    "exclude history and retain later observations"
+                );
+                let mut expected_counts: Vec<_> = source
+                    .buckets
+                    .iter()
+                    .zip(&baseline.buckets)
+                    .map(|(current, base)| current.count - base.count)
+                    .collect();
+                expected_counts.push(source.overflow_count - baseline.overflow_count);
+                assert_eq!(point.bucket_counts, expected_counts);
+                assert_eq!(point.sum, Some((source.sum_ms - baseline.sum_ms) as f64));
             }
             server.abort();
+            let _ = server.await;
+            fixture.plane.shutdown().await;
         }
 
         #[tokio::test(start_paused = true)]
@@ -2592,7 +2718,7 @@ mod otlp {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn periodic_export_stops_after_shutdown_channel_close_or_consent_revocation() {
-            for stop in ["shutdown", "closed", "revoked"] {
+            for stop in ["shutdown", "closed", "revoked", "plain"] {
                 let (endpoint, mut requests, server) = collector(&[200]).await;
                 let product = crate::ProductAnalytics::default();
                 crate::grant(&product);
@@ -2621,36 +2747,58 @@ mod otlp {
                     }
                 }
                 let (tx, rx) = tokio::sync::watch::channel(false);
+                if stop == "shutdown" {
+                    // Leave an unseen false update ready before the worker
+                    // enters its periodic select, so its continuation does not
+                    // depend on racing a timer or a completed HTTP request.
+                    tx.send(false).unwrap();
+                }
                 let performance = crate::AppPerformanceTelemetry::default();
-                let worker =
-                    tokio::spawn(exporter.run_with_app_performance(rx, performance.clone()));
+                let mut worker = if stop == "plain" {
+                    tokio::spawn(exporter.run(rx))
+                } else {
+                    tokio::spawn(exporter.run_with_app_performance(rx, performance.clone()))
+                };
                 let first =
                     tokio::time::timeout(std::time::Duration::from_secs(10), requests.recv())
                         .await
                         .unwrap()
                         .unwrap();
-                assert_eq!(app_start_attempts(&first), 0);
-                performance.record(
-                    crate::AppPerformanceOperation::AppStart,
-                    std::time::Duration::from_millis(1),
-                    true,
-                );
-                // Initial-window retries reuse its original performance snapshot.
-                // Only a new periodic collection can include the added sample.
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    loop {
-                        let request = requests.recv().await.expect("collector stopped");
-                        match app_start_attempts(&request) {
-                            0 => continue,
-                            1 => break,
-                            other => panic!("unexpected attempts: {other}"),
+                if stop == "plain" {
+                    assert!(
+                        first.resource_metrics[0].scope_metrics[0]
+                            .metrics
+                            .iter()
+                            .all(|metric| !metric.name.starts_with("app_")),
+                        "the public plain worker adds no app-performance source"
+                    );
+                } else {
+                    assert_eq!(app_start_attempts(&first), 0);
+                    performance.record(
+                        crate::AppPerformanceOperation::AppStart,
+                        std::time::Duration::from_millis(1),
+                        true,
+                    );
+                    // Initial-window retries reuse its original performance snapshot.
+                    // Only a new periodic collection can include the added sample.
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let request = tokio::select! {
+                                request = requests.recv() => request.expect("collector stopped"),
+                                result = &mut worker => panic!("worker stopped before resampling: {result:?}"),
+                            };
+                            match app_start_attempts(&request) {
+                                0 => continue,
+                                1 => break,
+                                other => panic!("unexpected attempts: {other}"),
+                            }
                         }
-                    }
-                })
-                .await
-                .expect("a periodic collection must sample updated performance");
+                    })
+                    .await
+                    .expect("a periodic collection must sample updated performance after a false shutdown update");
+                }
                 match stop {
-                    "shutdown" => {
+                    "shutdown" | "plain" => {
                         tx.send(true).unwrap();
                     }
                     "closed" => drop(tx),
@@ -2661,6 +2809,7 @@ mod otlp {
                     .unwrap()
                     .unwrap();
                 server.abort();
+                let _ = server.await;
             }
         }
 

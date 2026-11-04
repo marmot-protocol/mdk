@@ -780,6 +780,7 @@ impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
 }
 
 include!("runtime/frozen_fanout.rs");
+include!("runtime/hydrated_welcome.rs");
 include!("runtime/key_package_generation_upgrade.rs");
 include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");

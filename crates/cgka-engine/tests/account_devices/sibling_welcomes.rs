@@ -1267,9 +1267,12 @@ impl marmot_forensics::ForensicRecorder for StateRows {
 /// and clearing a failed carrier change no state and write none.
 #[tokio::test]
 async fn a_delivered_sibling_welcome_writes_its_state_row() {
-    let (mut m, mut new) = siblings(1).await;
+    let (mut m, mut new) = siblings(2).await;
     let gid = m.gid.clone();
     let sibling = handed(&mut new[0], slot(2), slot(1));
+    send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
+    let id = owed(&m.bob).remove(0).id;
+    let sibling = handed(&mut new[1], slot(3), slot(1));
     send_commit(&mut m.bob, add_own_devices(&gid, vec![sibling]), &gid).await;
     let Device { engine, storage } = m.bob;
     drop(engine);
@@ -1280,10 +1283,11 @@ async fn a_delivered_sibling_welcome_writes_its_state_row() {
         Box::new(state_rows.clone()),
     );
     bob.engine.hydrate_all_stored_groups().unwrap();
-    let [owed_now] = &owed(&bob)[..] else {
-        panic!("one owed sibling Welcome")
-    };
-    let id = owed_now.id.clone();
+    assert_eq!(
+        owed(&bob).len(),
+        2,
+        "two actual sibling Adds survived reopen"
+    );
     let epoch = bob.storage.get_message(&id).unwrap().epoch.0;
 
     assert!(bob.engine.carry_sibling_welcome(&id, b"first").unwrap());
@@ -1302,6 +1306,42 @@ async fn a_delivered_sibling_welcome_writes_its_state_row() {
     assert_eq!(
         state_rows.of(&id),
         vec![(Some("sent".into()), "processed".into(), Some(epoch))]
+    );
+
+    let [pending] = &owed(&bob)[..] else {
+        panic!("one pending sibling Welcome")
+    };
+    let pending_id = pending.id.clone();
+    let pending_epoch = bob.storage.get_message(&pending_id).unwrap().epoch.0;
+    let rollback = bob.storage.with_transaction(|_| {
+        bob.engine.retire_sibling_welcome_deliveries()?;
+        Err::<(), EngineError>(EngineError::Other("audit retirement rollback".into()))
+    });
+    assert!(
+        matches!(rollback, Err(EngineError::Other(ref message)) if message == "audit retirement rollback")
+    );
+    assert_eq!(
+        bob.storage.get_message(&pending_id).unwrap().state,
+        MessageState::Sent
+    );
+    assert!(
+        state_rows.of(&pending_id).is_empty(),
+        "a rolled-back cut records no retirement"
+    );
+    bob.engine.retire_sibling_welcome_deliveries().unwrap();
+    assert_eq!(
+        bob.storage.get_message(&pending_id).unwrap().state,
+        MessageState::Failed
+    );
+    assert_eq!(
+        state_rows.of(&pending_id),
+        vec![(Some("sent".into()), "failed".into(), Some(pending_epoch))],
+        "the committed cut records the pending Welcome's retirement"
+    );
+    assert_eq!(
+        state_rows.of(&id),
+        vec![(Some("sent".into()), "processed".into(), Some(epoch))],
+        "retiring pending delivery leaves delivered history and its audit unchanged"
     );
 }
 

@@ -1,8 +1,8 @@
 //! The engine's `StorageProvider` and `KeyPackageBundleStorage` impls for the account database.
 
-use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
 use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
+use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{
     KeyPackageBundleStorage, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
 };
@@ -13,6 +13,11 @@ impl StorageProvider for SqliteAccountStorage {
 
     fn mls_storage(&self) -> &Self::Mls {
         &self.openmls
+    }
+
+    fn pending_ref_high_water(&self) -> StorageResult<u64> {
+        let connection = self.lock()?;
+        read_pending_high_water(&connection)
     }
 
     fn mls_write_generation(&self) -> Option<u64> {
@@ -105,6 +110,43 @@ impl StorageProvider for SqliteAccountStorage {
     fn backend(&self) -> Backend {
         Backend::Sqlite
     }
+}
+
+fn read_pending_high_water(connection: &rusqlite::Connection) -> StorageResult<u64> {
+    use rusqlite::{OptionalExtension, types::ValueRef};
+
+    let value = connection
+        .query_row_cached(
+            "SELECT high_water FROM cgka_pending_ref_watermark WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(match row.get_ref(0)? {
+                    ValueRef::Blob(bytes) => bytes.try_into().ok().map(u64::from_be_bytes),
+                    _ => None,
+                })
+            },
+        )
+        .optional()
+        .storage()?;
+    value.flatten().ok_or_else(|| {
+        StorageError::Backend("pending reference high-water metadata is missing or corrupt".into())
+    })
+}
+
+/// The caller owns a transaction/savepoint containing the artifact write.
+pub(super) fn raise_pending_ref(
+    connection: &rusqlite::Connection,
+    pending: u64,
+) -> StorageResult<()> {
+    if pending > read_pending_high_water(connection)? {
+        connection
+            .execute_cached(
+                "UPDATE cgka_pending_ref_watermark SET high_water = ?1 WHERE singleton = 1",
+                rusqlite::params![pending.to_be_bytes().as_slice()],
+            )
+            .storage()?;
+    }
+    Ok(())
 }
 
 impl KeyPackageBundleStorage for SqliteAccountStorage {

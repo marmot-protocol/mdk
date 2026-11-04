@@ -637,57 +637,60 @@ async fn new_words_mid_pass_abandon_the_run_before_its_pointer() {
 /// A sibling takes over writing from a writer that listed nothing for a
 /// week since the sibling first saw it named, and at once from a writer
 /// that is leaving. A writer just named is not taken over.
+/// Quiet, leaving and moved writers release the role to a staying sibling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_takes_over_a_quiet_or_leaving_writer() {
-    let blossom = local_blossom();
-    let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
-    let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
-    let writer = |device: &AppClient| roster(device, &group).account.backup_writer;
-    let start = devices.relay.published_events.lock().unwrap().len();
-    let mut cursors = (start, start);
+    for status in [DeviceStatusV1::Leaving, DeviceStatusV1::Moved] {
+        let blossom = local_blossom();
+        let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
+        let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
+        let writer = |device: &AppClient| roster(device, &group).account.backup_writer;
+        let start = devices.relay.published_events.lock().unwrap().len();
+        let mut cursors = (start, start);
 
-    devices.laptop.drive_backup_pass().await;
-    assert_eq!(writer(&devices.laptop), Some(phone_slot));
+        devices.laptop.drive_backup_pass().await;
+        assert_eq!(writer(&devices.laptop), Some(phone_slot));
 
-    let ledger = storage(&devices.laptop_app);
-    ledger
-        .note_backup_writer(&words.public, &laptop_slot, 0)
-        .unwrap();
-    ledger
-        .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
-        .unwrap();
-    due_now(&devices.laptop);
-    devices.laptop.drive_backup_pass().await;
-    assert_eq!(writer(&devices.laptop), Some(laptop_slot));
-    exchange(
-        &mut devices.phone,
-        &mut devices.laptop,
-        &devices.relay,
-        &group,
-        &mut cursors,
-    )
-    .await;
-    assert_eq!(writer(&devices.phone), Some(laptop_slot));
+        let ledger = storage(&devices.laptop_app);
+        ledger
+            .note_backup_writer(&words.public, &laptop_slot, 0)
+            .unwrap();
+        ledger
+            .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
+            .unwrap();
+        due_now(&devices.laptop);
+        devices.laptop.drive_backup_pass().await;
+        assert_eq!(writer(&devices.laptop), Some(laptop_slot));
+        exchange(
+            &mut devices.phone,
+            &mut devices.laptop,
+            &devices.relay,
+            &group,
+            &mut cursors,
+        )
+        .await;
+        assert_eq!(writer(&devices.phone), Some(laptop_slot));
 
-    let edit = devices
-        .laptop
-        .runtime
-        .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
-            entry.status = DeviceStatusV1::Leaving;
-        })
-        .await
-        .unwrap();
-    assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
-    exchange(
-        &mut devices.phone,
-        &mut devices.laptop,
-        &devices.relay,
-        &group,
-        &mut cursors,
-    )
-    .await;
-    devices.phone.drive_backup_takeover().await;
-    assert_eq!(writer(&devices.phone), Some(phone_slot));
+        let edit = devices
+            .laptop
+            .runtime
+            .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+                entry.status = status;
+            })
+            .await
+            .unwrap();
+        assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
+        exchange(
+            &mut devices.phone,
+            &mut devices.laptop,
+            &devices.relay,
+            &group,
+            &mut cursors,
+        )
+        .await;
+        devices.phone.drive_backup_takeover().await;
+        assert_eq!(writer(&devices.phone), Some(phone_slot));
+    }
 }
 
 /// A writer named again after this device wrote gets a fresh week: the

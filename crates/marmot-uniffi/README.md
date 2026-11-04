@@ -1098,6 +1098,11 @@ first selected authenticated change there. Its trust then switches once, with or
 at unchanged versions. Chats and chat membership stay in place; the move does not promise delivery between the two
 device groups. Released binding builds still provide no working linking entry.
 
+At most one confirmed move link is kept, with its Welcome expectation while that Welcome is pending. After restart
+another code comparison can begin, but if the earlier move is still pending at confirmation the new exchange ends
+before this device sends its Confirm (`LinkFailed` locally, `CannotLink` on the answering device). The earlier link
+and any still-live expectation stay unchanged; no second link approval or Add is made.
+
 Each move has an opaque `move_id`. `old_siblings` names recognized devices left in the old group; while
 `question_suppressed` is true, offer to link that device here rather than treating its sign-in as unknown.
 `dismiss_device_group_move_sibling(account_ref, move_id, slot_id_hex)` ends only that local recognition hint; it does
@@ -1107,13 +1112,17 @@ an old rejection. Moves carry rejected slots with their original ages, never rej
 
 `LinkedDeviceStatusFfi::Moved` is the old group's own status for a moving device; its cleanup leaves the device's
 ordinary chats alone. Already admitted old-group traffic may finish through normal delivery rules before local old-group
-storage is forgotten; there is no immediate-quiet deadline or cancellation promise. A known failed link before Made
+storage is forgotten; there is no immediate-quiet deadline or cancellation promise. Several old siblings can race
+cleanup, costing extra Commits and convergence passes under normal branch selection. A known failed link before Made
 forgets only the destination and keeps old trust. An unrecoverable destination keeps that trust while ordinary repair
-applies; it may stay pending indefinitely and need manual local recovery. Corrupt or unreadable local move facts can
+applies; it may stay pending indefinitely and need manual local recovery. While pending, this device cannot confirm
+another move or answer new pairing Requests. Corrupt or unreadable local move facts can
 fail progress/status reads and need manual local recovery or reset followed by a fresh compared-code link. Do not
 infer an unlinked state or expect an unlink notification for those errors, and never reconstruct old trust.
 Recognition hints suppress questions only on the mover. Old siblings can ask “Was this you?” after cleanup; the user
-can dismiss that prompt.
+can dismiss that prompt. An old in-flight chat Add can leave a membership leaf whose Welcome no longer reaches this
+device. Automatic gap filling may not replace that leaf; manual chat membership repair can be needed. Moving adds no
+duplicate-leaf cleanup or recall of admitted Adds.
 
 ### This device unlinked
 

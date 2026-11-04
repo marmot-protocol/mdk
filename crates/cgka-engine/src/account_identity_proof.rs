@@ -366,6 +366,22 @@ fn validate_current_proof(
     account_identity: &[u8],
     ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
+    validate_current_proof_for_key(
+        raw,
+        account_identity,
+        leaf.signature_key().as_slice(),
+        ciphersuite,
+    )
+}
+
+/// Verify durable current-profile material with the same rules as a member leaf.
+/// Age never invalidates a binding; the original signed timestamp is preserved.
+pub(crate) fn validate_current_proof_for_key(
+    raw: &[u8],
+    account_identity: &[u8],
+    mls_signature_public_key: &[u8],
+    ciphersuite: Ciphersuite,
+) -> Result<(), EngineError> {
     if raw.len() != CURRENT_PROOF_LEN {
         return Err(EngineError::InvalidAccountIdentityProof(format!(
             "current proof component must be exactly {CURRENT_PROOF_LEN} bytes"
@@ -382,12 +398,16 @@ fn validate_current_proof(
     signature.copy_from_slice(&raw[40..]);
     let request = AccountIdentityProofRequest::current(
         signer_pubkey.to_vec(),
-        leaf.signature_key().as_slice().to_vec(),
+        mls_signature_public_key.to_vec(),
         ciphersuite,
         ciphersuite.signature_algorithm(),
         created_at,
     );
-    validate_proof_bindings(&request, leaf, account_identity, ciphersuite)?;
+    if signer_pubkey != account_identity {
+        return Err(EngineError::InvalidAccountIdentityProof(
+            "proof account identity does not match credential identity".into(),
+        ));
+    }
     verify_proof_signature(&request, &signature)
 }
 

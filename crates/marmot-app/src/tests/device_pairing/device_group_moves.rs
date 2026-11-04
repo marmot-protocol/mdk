@@ -291,6 +291,33 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             "the ordinary gap Add consumed real private stock"
         );
         fault.execute_batch("CREATE TRIGGER fail_app_move_made BEFORE UPDATE OF phase ON device_group_moves WHEN NEW.phase = 2 BEGIN SELECT RAISE(ABORT, 'app move Made checkpoint failed'); END;").unwrap();
+        // Reopening loses the in-memory new-device pairing session, not the
+        // joined move. A real new request must still stay unanswered until Made.
+        moving = reopen(moving).await;
+        published_key_package(&mut destination.client, &relay).await;
+        assert_eq!(
+            destination.op(DeviceLinkOp::Start).await.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer)
+        );
+        let waiting = moving.step(&relay).await;
+        let requesting = destination.step(&relay).await;
+        assert_eq!(
+            requesting.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer),
+            "the real requester must receive no Answer from the reopened Joined mover"
+        );
+        assert_eq!(
+            waiting
+                .prompt_for_slot(&destination.slot_hex())
+                .expect("the actual new request reached the reopened mover")
+                .state,
+            DeviceLinkPromptState::Preparing,
+            "a reopened Joined mover must not answer a pairing request"
+        );
+        assert_eq!(
+            moving.client.trusted_device_group().unwrap(),
+            Some(old.clone())
+        );
         let error = moving
             .client
             .drive_device_group_moves(unix_now_seconds())

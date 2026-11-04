@@ -117,6 +117,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   spec lands. A rename whose commit loses a fork is made again later, unless
   another rename of that device won. Use matching regenerated headers and
   libraries.
+- Append `MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED` (117) and
+  `MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH` (118), preserving all previous
+  status values. The first waits for source evolution or local recovery-state
+  synchronization. The second refuses ineligible or stale recovery authority:
+  recheck local eligibility before obtaining another challenge, rather than
+  retrying the same grant. Use matching regenerated headers and libraries.
 - `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
   group whose convergence pass spent its failure budget (mdk#2684). Show it as
   stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
