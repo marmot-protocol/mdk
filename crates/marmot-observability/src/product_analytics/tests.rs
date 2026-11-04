@@ -283,6 +283,32 @@ fn no_preconsent_backlog_and_idempotent_background() {
     let rows = c.test_payloads();
     let foreground = &rows[resumed.len()..];
     assert_eq!(foreground.len(), 3);
+    let foreground_tuples: BTreeSet<_> = foreground
+        .iter()
+        .map(|row| {
+            (
+                row["eventName"].as_str().unwrap(),
+                row["props"]["operation"].as_str().unwrap(),
+                row["props"]["unit"].as_str().unwrap(),
+                row["props"]["outcome"].as_str().unwrap_or(""),
+                row["props"]["count_bucket"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        foreground_tuples,
+        BTreeSet::from([
+            (
+                "mdk_maintenance_summary",
+                "sweep",
+                "transition",
+                "performed",
+                "1"
+            ),
+            ("mdk_runtime_summary", "coverage", "coverage", "", "1"),
+            ("mdk_maintenance_summary", "pending", "backlog", "", "2"),
+        ])
+    );
     assert!(foreground.iter().any(|row| {
         row["eventName"] == "mdk_maintenance_summary"
             && row["props"]["operation"] == "sweep"

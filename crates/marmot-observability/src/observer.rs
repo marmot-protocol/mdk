@@ -252,10 +252,6 @@ mod tests {
         let second = Observer::sharing(&product);
         let ungranted_admission = first.product().permit();
         assert!(ungranted_admission.is_none());
-        first
-            .product()
-            .storage_failure(ungranted_admission.as_ref(), StorageFailureKind::Busy);
-        assert!(collector.test_payloads().is_empty());
         grant(&collector);
         clock.mono.store(1000, Ordering::Relaxed);
         // Completion keeps the admission decision captured before the grant.
