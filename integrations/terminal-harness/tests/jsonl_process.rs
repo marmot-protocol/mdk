@@ -925,3 +925,44 @@ fn process_debug_output_redacts_paths_arguments_prompts_and_events() {
     );
     assert!(!format!("{:?}", ParsedEvent::Text("secret text".to_owned())).contains("secret text"));
 }
+
+#[tokio::test]
+async fn interactive_input_reaches_the_same_running_child_before_completion() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "interactive",
+        r#"#!/bin/sh
+IFS= read -r first
+[ "$first" = initial ] || exit 64
+printf '%s\n' '{"type":"session","id":"same-session"}' '{"type":"text","text":"ready"}'
+IFS= read -r second
+[ "$second" = followup ] || exit 65
+printf '%s\n' '{"type":"text","text":"steered"}'
+"#,
+    );
+    let spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::Stdin("initial\n".into()),
+    );
+    let (events, mut receive) = mpsc::channel(8);
+    let (input, commands) = mpsc::channel(8);
+    let run = tokio::spawn(
+        marmot_terminal_harness::process::run_interactive_jsonl_process(
+            spec,
+            events,
+            parse_event,
+            commands,
+        ),
+    );
+    assert!(matches!(receive.recv().await, Some(RunnerEvent::Text(text)) if text == "ready"));
+    assert!(!run.is_finished());
+    input.send(Some("followup".into())).await.unwrap();
+    assert!(matches!(receive.recv().await, Some(RunnerEvent::Text(text)) if text == "steered"));
+    input.send(None).await.unwrap();
+    let result = run.await.unwrap().unwrap();
+    assert_eq!(result.observed_session.as_deref(), Some("same-session"));
+    assert_eq!(result.exit_code, Some(0));
+}
