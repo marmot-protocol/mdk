@@ -3967,7 +3967,7 @@ Remove an account and its local state from this device.
 MarmotStatus marmot_rename_linked_device(const struct MarmotClient *client, const char *account_ref, const char *slot_id_hex, const char *label);
 ```
 
-Rename one of this account's devices, this one included, by its `slot_id_hex` from `marmot_linked_devices`: one roster commit in the device group that sets only that device's label (at most 64 bytes of UTF-8; empty clears it). Refused with nothing sent in release builds, for a label that is too long, without a device group, for an unknown slot, and while an earlier change of this device's is still in flight there (retry later). A rename whose commit loses a fork is made again later, unless another user edit of that device won; show the label `marmot_linked_devices` returns after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
+Rename one of this account's devices, this one included, by its `slot_id_hex` from `marmot_linked_devices`: one roster commit in the device group that sets only that device's label (at most 64 bytes of UTF-8; empty clears it). Refused with nothing sent when device groups are unavailable for this client, for a label that is too long, without a device group, for an unknown slot, while its roster cannot be read (`roster_unavailable`), and while an earlier change of this device's is still in flight there (retry later). A rename whose commit loses a fork is made again later, unless another user edit of that device won; show the label `marmot_linked_devices` returns after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotrename_linked_device) · [Header contract](include/marmot.h#L8596)
 
@@ -3988,7 +3988,7 @@ Patch a linked device's settings on the account worker. Each `has_`/value pair i
 MarmotStatus marmot_remove_linked_device(const struct MarmotClient *client, const char *account_ref, const char *slot_id_hex);
 ```
 
-Remove another of this account's devices, by its `slot_id_hex` from `marmot_linked_devices`, from the device group and every chat, and delete its KeyPackage slot. The removal is recorded at once and carried out as the device group allows; the device shows `removal_pending` until the device group takes it. Refused with nothing recorded in release builds, without a device group, for an unknown slot, for this device (sign out instead), and for a device whose link may still fail. Re-read `marmot_linked_devices` after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
+Remove another of this account's devices, by its `slot_id_hex` from `marmot_linked_devices`, from the device group and every chat, and delete its KeyPackage slot. The removal is recorded at once and carried out as the device group allows; the device shows `removal_pending` until the device group takes it. Refused with nothing recorded when device groups are unavailable for this client, without a device group, for an unknown slot, for this device (sign out instead), while its roster cannot be read (`roster_unavailable`), and for a device whose link may still fail. Re-read `marmot_linked_devices` after `MARMOT_EVENT_LINKED_DEVICES_CHANGED`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotremove_linked_device) · [Header contract](include/marmot.h#L8645)
 

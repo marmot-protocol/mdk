@@ -194,7 +194,7 @@ macOS release-artifact checks (after `xcframework-macos.sh`, which needs `OTLP_E
 
 For Android NDK prerequisites and initialization see README.md#kotlin--android.
 
-Experimental host-entry owner: `marmot-c/tests/secret_store_client.rs` runs an authenticated real-relay two-device link
+Experimental host-entry owner: `marmot-c/tests/secret_store_client.rs` runs an authenticated two-device link through a local WebSocket relay
 through exported C calls with `dev-device-groups` and no timing overrides; the same owner proves normal
 constructors stay disabled. Default C and UniFFI constructor owners prove unavailable builds leave roots unopened
 and C callbacks owned by the host. Keep shared option/open paths and the C options layout unchanged.

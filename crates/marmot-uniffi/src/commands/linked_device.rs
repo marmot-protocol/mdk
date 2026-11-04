@@ -44,7 +44,7 @@ impl Marmot {
     /// `slot_id_hex` from `linked_devices`: one roster commit in the device
     /// group. Any device may rename any device. The label is at most 64
     /// bytes of UTF-8; empty clears it. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds), `label_too_long`,
+    /// `roster_unsupported` (device groups unavailable for this client), `label_too_long`,
     /// `no_device_group`, `unknown_device`, `roster_unavailable`, or
     /// `device_group_busy` while the device group has an earlier change in
     /// flight (retry later). A rename whose commit loses a fork is made again
@@ -96,7 +96,7 @@ impl Marmot {
     /// recorded at once and carried out as the device group allows;
     /// `linked_devices` shows the device with `removal_pending` until the
     /// device group takes it. Refused with `DeviceGroupRefused`:
-    /// `roster_unsupported` (release builds), `no_device_group`,
+    /// `roster_unsupported` (device groups unavailable for this client), `no_device_group`,
     /// `unknown_device`, `this_device` (sign out instead),
     /// `device_link_pending` while the device's link may still fail, or
     /// `roster_unavailable`. Refresh on `LinkedDevicesChanged`.
