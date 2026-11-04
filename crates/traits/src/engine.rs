@@ -1339,6 +1339,7 @@ pub trait CgkaEngine: Send + Sync {
     /// `member`. Requires a healthy, settled copy and current member-edit
     /// authority: an admin, or an own-account sibling when account-devices is
     /// required. The coordinator's own leaf is never a replacement target.
+    /// Device groups require `LinkDevice` and cannot supply recovery sources.
     fn group_recovery_source(
         &self,
         group_id: &GroupId,

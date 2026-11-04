@@ -1042,6 +1042,9 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::Storage(StorageError::NotFound));
             };
             if group.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy {
+                if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                    return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+                }
                 return Err(EngineError::InvalidTransition(
                     cgka_traits::engine_state::InvalidTransition {
                         from: "LegacyProfile",
@@ -1075,7 +1078,22 @@ impl<S: StorageProvider> Engine<S> {
             // denotes.
             return Err(EngineError::GroupUnrecoverableRepairRequired { group_id });
         }
+        // Recovery replaces a leaf through an Add, but a device group admits
+        // new leaves only through LinkDevice. Refuse permanently before any
+        // settlement gate or transition to Preparing, as the source read does.
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && group.is_some()
+            && self.with_mls_group(
+                &group_id,
+                crate::app_components::group_requires_device_roster,
+            )?
+        {
+            return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+        }
         if self.disbanding_in_progress(&group_id)? {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanding",
@@ -1085,6 +1103,9 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
         if !matches!(intent, SendIntent::Leave { .. }) && self.leave_in_progress(&group_id)? {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Leaving",

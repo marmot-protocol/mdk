@@ -2163,7 +2163,11 @@ impl<S: StorageProvider> Engine<S> {
                         matches!(
                             evolution.phase,
                             GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
-                        )
+                        ) && (matches!(
+                            &evolution.semantic,
+                            GroupEvolutionSemantic::RecoverMembers { .. }
+                        ) || (evolution.source_epoch == EpochId(mls_group.epoch().as_u64())
+                            && evolution.own_leaf_before_hash == own_leaf_hash))
                     })
                     || preparing[0].source_epoch != EpochId(mls_group.epoch().as_u64())
                     || preparing[0].own_leaf_before_hash != own_leaf_hash

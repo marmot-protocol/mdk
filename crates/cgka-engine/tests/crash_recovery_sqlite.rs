@@ -1457,6 +1457,299 @@ async fn recovery_ref_frozen_reopen() {
     run_pending_ref_restart("fanout").await;
 }
 
+#[tokio::test]
+async fn recovery_stale_preparing() {
+    run_stale_ordinary_recovery(GroupEvolutionPhase::Preparing).await;
+}
+
+#[tokio::test]
+async fn recovery_stale_prepared() {
+    run_stale_ordinary_recovery(GroupEvolutionPhase::Prepared).await;
+}
+
+#[tokio::test]
+async fn recovery_stale_attempting() {
+    run_stale_ordinary_recovery(GroupEvolutionPhase::Attempting).await;
+}
+
+async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("stale-ordinary.sqlite3");
+    let key = SqlCipherKey::raw([0x73; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let target_storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+    let mut coordinator = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    let mut target = build_recovery_client(RECOVERY_TARGET, target_storage.clone());
+    let (group_id, created) = coordinator
+        .create_group(CreateGroupRequest {
+            name: "recovery after ordinary publication fallback".into(),
+            description: String::new(),
+            members: vec![target.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    let founding = welcomes.remove(0);
+    target.join_welcome(founding.clone()).await.unwrap();
+    coordinator
+        .mark_sent_welcome_delivered(&founding.id)
+        .unwrap();
+    let (abandoned, _) = evolution(
+        coordinator
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    let mut orphan = storage
+        .list_group_evolutions_for_group(&group_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    // Model an interrupted ordinary preparation, or an incomplete legacy
+    // publication that hydration explicitly abandons through its fallback.
+    orphan.phase = phase;
+    if phase == GroupEvolutionPhase::Preparing {
+        orphan.signed_message_id = None;
+        orphan.pending_ref = None;
+    }
+    storage.put_group_evolution(&orphan).unwrap();
+    storage.delete_message(&abandoned.id).unwrap();
+    assert!(
+        recovery_mls_group(&storage, &group_id)
+            .pending_commit()
+            .is_some()
+    );
+    drop(coordinator);
+    drop(storage);
+
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut coordinator = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    coordinator.hydrate_all_stored_groups().unwrap();
+    assert!(coordinator.quarantined_groups().is_empty());
+    assert!(coordinator.drain_auto_publish().is_empty());
+    assert!(
+        recovery_mls_group(&storage, &group_id)
+            .pending_commit()
+            .is_none()
+    );
+    assert_eq!(coordinator.epoch(&group_id).unwrap(), orphan.source_epoch);
+    assert_eq!(
+        storage.group_evolution(&orphan.id).unwrap(),
+        Some(orphan.clone())
+    );
+
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let mut grant = sign_recovery_crash_grant(
+        &target_storage,
+        &group_id,
+        &coordinator.self_id(),
+        GroupMemberRecovery {
+            member: target.self_id(),
+            source: coordinator
+                .group_recovery_source(
+                    &group_id,
+                    &target.self_id(),
+                    &target.own_recovery_key_hash(&group_id).unwrap(),
+                )
+                .unwrap(),
+            key_package: target.fresh_key_package().await.unwrap(),
+            request_id: [73; 32],
+            expires_at,
+            device_signature: vec![],
+        },
+    );
+    coordinator
+        .validate_member_recovery(&group_id, &grant)
+        .unwrap();
+    assert!(
+        matches!(
+            coordinator.send(SendIntent::RecoverMembers {
+                group_id: group_id.clone(),
+                members: vec![grant.clone()],
+            }).await,
+            Err(cgka_traits::EngineError::GroupRecoveryUnsettled { group_id: refused })
+                if refused == group_id
+        ),
+        "a current-source ordinary publication still owns its source"
+    );
+    assert_eq!(
+        storage.group_evolution(&orphan.id).unwrap(),
+        Some(orphan.clone())
+    );
+
+    // Only a real authenticated inbound epoch advance makes the ordinary
+    // source obsolete. It does not clean up the ordinary evolution record.
+    let (advance, pending) = evolution(
+        target
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    target.confirm_published(pending).await.unwrap();
+    coordinator
+        .buffer_openmls_convergence_message_at(&group_id, route(advance, &group_id), 1_000)
+        .unwrap();
+    coordinator
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(coordinator.epoch(&group_id).unwrap(), orphan.target_epoch);
+    assert_eq!(
+        storage.group_evolution(&orphan.id).unwrap(),
+        Some(orphan.clone())
+    );
+    grant.source = coordinator
+        .group_recovery_source(
+            &group_id,
+            &target.self_id(),
+            &target.own_recovery_key_hash(&group_id).unwrap(),
+        )
+        .unwrap();
+    let grant =
+        sign_recovery_crash_grant(&target_storage, &group_id, &coordinator.self_id(), grant);
+    coordinator
+        .validate_member_recovery(&group_id, &grant)
+        .unwrap();
+    let SendResult::GroupEvolution { welcomes, .. } = coordinator
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant.clone()],
+        })
+        .await
+        .expect("a stale ordinary evolution must not prevent native member recovery")
+    else {
+        panic!("remove-and-add member recovery")
+    };
+    assert_eq!(welcomes.len(), 1);
+    // Reproduce a process death after recovery staging but before handoff.
+    // The old ordinary artifact must not quarantine this new Preparing row.
+    let mut preparing = storage
+        .list_group_evolutions_for_group(&group_id)
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            matches!(
+                &record.semantic,
+                GroupEvolutionSemantic::RecoverMembers { .. }
+            )
+        })
+        .unwrap();
+    preparing.phase = GroupEvolutionPhase::Preparing;
+    preparing.pending_ref = None;
+    storage.put_group_evolution(&preparing).unwrap();
+    drop(coordinator);
+    drop(storage);
+
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let mut coordinator = build_recovery_client(RECOVERY_COORDINATOR, storage.clone());
+    coordinator.hydrate_all_stored_groups().unwrap();
+    assert!(
+        coordinator.quarantined_groups().is_empty(),
+        "a stale ordinary artifact cannot own the new recovery source"
+    );
+    assert!(coordinator.drain_auto_publish().is_empty());
+    assert!(
+        recovery_mls_group(&storage, &group_id)
+            .pending_commit()
+            .is_none()
+    );
+    assert_eq!(coordinator.epoch(&group_id).unwrap(), orphan.target_epoch);
+    assert_eq!(
+        storage.group_evolution(&orphan.id).unwrap(),
+        Some(orphan.clone())
+    );
+    assert!(storage.group_evolution(&preparing.id).unwrap().is_none());
+    assert_eq!(
+        storage
+            .get_message(preparing.signed_message_id.as_ref().unwrap())
+            .unwrap()
+            .state,
+        MessageState::Failed
+    );
+    assert!(coordinator.outstanding_sent_welcomes().unwrap().is_empty());
+    assert_eq!(
+        storage.get_message(&welcomes[0].id).unwrap().state,
+        MessageState::Failed
+    );
+    let mut fresh = grant;
+    fresh.request_id = [74; 32];
+    fresh.key_package = target.fresh_key_package().await.unwrap();
+    let fresh =
+        sign_recovery_crash_grant(&target_storage, &group_id, &coordinator.self_id(), fresh);
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = coordinator
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![fresh],
+        })
+        .await
+        .expect("fresh recovery must succeed after abandoning the unexposed stage")
+    else {
+        panic!("retried remove-and-add member recovery")
+    };
+    assert_eq!(welcomes.len(), 1);
+    coordinator.confirm_published(pending).await.unwrap();
+    assert_eq!(storage.group_evolution(&orphan.id).unwrap(), Some(orphan));
+    assert!(matches!(
+        target.join_welcome(welcomes[0].clone()).await,
+        Err(cgka_traits::EngineError::InvalidTransition(error))
+            if error.from == "ActiveMember" && error.to == "JoinWelcome"
+    ));
+    let offer = target
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .pop()
+        .unwrap();
+    target
+        .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery_mls_group(&target_storage, &group_id)
+            .epoch_authenticator()
+            .as_slice(),
+        recovery_mls_group(&storage, &group_id)
+            .epoch_authenticator()
+            .as_slice(),
+    );
+    coordinator
+        .mark_sent_welcome_delivered(&welcomes[0].id)
+        .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = coordinator
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload: app_payload_for(&coordinator, b"recovery past ordinary orphan delivers"),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("post-recovery application")
+    };
+    assert!(matches!(
+        target.ingest(route(msg, &group_id)).await.unwrap(),
+        cgka_traits::IngestOutcome::Processed
+    ));
+    assert!(target.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::MessageReceived { payload, .. }
+            if MarmotAppEvent::decode(payload).unwrap().content == "recovery past ordinary orphan delivers"
+    )));
+}
+
 async fn stage_ordinary_restart_group(
     engine: &mut Engine<SqliteAccountStorage>,
 ) -> (GroupId, TransportMessage) {

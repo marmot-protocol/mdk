@@ -96,10 +96,9 @@ impl SessionError {
         }
     }
 
-    /// Whether this error reflects transient backend contention worth retrying
-    /// (a `SQLITE_BUSY` that survived the backend's own retries) rather than a
-    /// durable failure. Used by the account layer to retry the retry-safe
-    /// `confirm_published` path instead of surfacing a lock blip as fatal.
+    /// Whether backend contention or unsettled group recovery makes this
+    /// failure transient. The account layer uses this for retry-safe
+    /// `confirm_published` retries rather than surfacing a lock blip as fatal.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         self.as_engine_error().is_transient()

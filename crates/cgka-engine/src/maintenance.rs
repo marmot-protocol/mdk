@@ -223,6 +223,9 @@ impl<S: StorageProvider> Engine<S> {
                 .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?;
             // Never replace an immutable or possibly exposed publication, even
             // when the caller supplies the exact same grant a second time.
+            // An ordinary artifact left by hydration fallback owns only its
+            // original source; recovery publications remain immutable across
+            // source changes.
             if maintenance.group_evolution(&evolution.id)?.is_some()
                 || maintenance
                     .list_group_evolutions_for_group(group_id)?
@@ -233,7 +236,11 @@ impl<S: StorageProvider> Engine<S> {
                             GroupEvolutionPhase::Preparing
                                 | GroupEvolutionPhase::Prepared
                                 | GroupEvolutionPhase::Attempting
-                        )
+                        ) && (matches!(
+                            &record.semantic,
+                            GroupEvolutionSemantic::RecoverMembers { .. }
+                        ) || (record.source_epoch == evolution.source_epoch
+                            && record.own_leaf_before_hash == evolution.own_leaf_before_hash))
                     })
             {
                 return Err(EngineError::GroupRecoveryUnsettled {
@@ -433,6 +440,11 @@ impl<S: StorageProvider> Engine<S> {
         }
         if record.unrecoverable || self.epoch_manager.is_unrecoverable(group_id) {
             return Err(EngineError::GroupUnrecoverableRepairRequired {
+                group_id: group_id.clone(),
+            });
+        }
+        if crate::app_components::group_requires_device_roster(group)? {
+            return Err(EngineError::GroupRecoverySourceMismatch {
                 group_id: group_id.clone(),
             });
         }

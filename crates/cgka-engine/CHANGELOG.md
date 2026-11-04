@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- Allow member recovery past orphaned ordinary evolution records from an older source, including rollback after
+  a crash during recovery preparation. Current-source ordinary publications and retained recovery artifacts still block it.
+- Keep recovery send refusals consistent with source validation: pending leave/disband is transient; legacy-cutover
+  and device-group refusal is permanent and happens before staging.
 - Attachment-bearing kind-7 reactions carry their authenticated source-epoch
   encrypted-media key through receive and convergence replay, including late
   replay after that epoch's retained anchor is pruned (mdk#2151). Plain

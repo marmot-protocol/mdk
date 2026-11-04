@@ -41,6 +41,9 @@ use tls_codec::{Deserialize as _, Serialize as _};
 mod support;
 use support::proof_signer;
 
+#[path = "invite_leave/recovery_batch.rs"]
+mod recovery_batch;
+
 async fn advance_selfremove_auto_commit(
     engine: &mut Engine<SqliteAccountStorage>,
     group_id: &GroupId,
@@ -1561,9 +1564,252 @@ async fn recovery_binds_coordinator() {
 }
 
 #[tokio::test]
+async fn recovery_departure_refusal() {
+    use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, DisbandRequestStorage as _};
+
+    for disband in [false, true] {
+        let (mut admin, storage, mut target, _, group_id, target_storage) =
+            member_recovery_fixture().await;
+        let target_key = target.own_recovery_key_hash(&group_id).unwrap();
+        let source = admin
+            .group_recovery_source(&group_id, &target.self_id(), &target_key)
+            .unwrap();
+        let grant = signed_member_recovery(
+            &target_storage,
+            &group_id,
+            &admin.self_id(),
+            &target.self_id(),
+            source,
+            target.fresh_key_package().await.unwrap(),
+        );
+        if disband {
+            storage
+                .put_disband_request(&DisbandRequest {
+                    group_id: group_id.clone(),
+                    requested_at_ms: 1,
+                    status: DisbandRequestStatus::Pending,
+                    last_prepared_epoch: None,
+                })
+                .unwrap();
+        } else {
+            storage
+                .put_leave_request(&cgka_traits::storage::LeaveRequest {
+                    group_id: group_id.clone(),
+                    requested_at_ms: 1,
+                    last_proposed_epoch: None,
+                })
+                .unwrap();
+        }
+        let record = storage.get_group(&group_id).unwrap();
+        let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+        let state = admin.epoch_state(&group_id).unwrap();
+        for refusal in [
+            admin
+                .group_recovery_source(&group_id, &target.self_id(), &target_key)
+                .unwrap_err(),
+            admin
+                .validate_member_recovery(&group_id, &grant)
+                .unwrap_err(),
+            admin
+                .send(SendIntent::RecoverMembers {
+                    group_id: group_id.clone(),
+                    members: vec![grant],
+                })
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(refusal.is_transient(), "{refusal:?}");
+            assert!(matches!(
+                refusal,
+                EngineError::GroupRecoveryUnsettled { .. }
+            ));
+        }
+        // Ordinary membership changes retain their existing departure refusal.
+        assert!(matches!(
+            admin
+                .send(SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages: vec![target.fresh_key_package().await.unwrap()],
+                    initial_admins: vec![],
+                })
+                .await,
+            Err(EngineError::InvalidTransition(_))
+        ));
+        assert_eq!(storage.get_group(&group_id).unwrap(), record);
+        assert_eq!(storage.list_group_snapshots(&group_id).unwrap(), snapshots);
+        assert_eq!(admin.epoch_state(&group_id).unwrap(), state);
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(admin.outstanding_sent_welcomes().unwrap().is_empty());
+        let (native, _) = load_group_and_signer(&storage, &admin.self_id(), &group_id);
+        assert!(native.pending_commit().is_none());
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn recovery_device_group_refusal() {
+    use cgka_traits::app_components::{
+        ACCOUNT_DEVICES_COMPONENT_ID, AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1,
+        DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1,
+        encode_device_roster_update_v1, encode_device_roster_v1,
+    };
+    use cgka_traits::storage::DeviceGroupWelcomeExpectation;
+
+    let client = || {
+        let storage = SqliteAccountStorage::in_memory_for_test().unwrap();
+        let mut supported: Vec<_> = cgka_traits::app_components::default_group_components()
+            .into_iter()
+            .collect();
+        supported.extend([ACCOUNT_DEVICES_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID]);
+        let engine = EngineBuilder::new(storage.clone())
+            .identity(pad32(b"recovery-device-account"))
+            .account_identity_proof_signer(proof_signer(b"recovery-device-account"))
+            .feature_registry(selfremove_registry())
+            .supported_app_components(supported)
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap();
+        (engine, storage)
+    };
+    let (mut admin, storage) = client();
+    let (mut target, target_storage) = client();
+    let key_package = target.fresh_key_package().await.unwrap();
+    let key_package_ref = hex::decode(
+        cgka_engine::key_package::key_package_metadata(&key_package)
+            .unwrap()
+            .key_package_ref_hex,
+    )
+    .unwrap();
+    let chosen = GroupId::new(vec![0x42; 16]);
+    target
+        .expect_device_group_welcome(&DeviceGroupWelcomeExpectation {
+            group_id: chosen.clone(),
+            sender_signature_key: admin.own_signature_key(),
+            key_package_ref: key_package_ref.clone(),
+            expires_at: u64::MAX,
+        })
+        .unwrap();
+    let roster = DeviceRosterV1 {
+        leaf_tag_key: [0x33; 32],
+        devices: [([1; 32], DeviceEntryV1::default())].into_iter().collect(),
+        ..DeviceRosterV1::default()
+    };
+    let update = DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(
+        [2; 32],
+        DeviceEntryV1 {
+            announced_key_package: Some(key_package_ref),
+            ..DeviceEntryV1::default()
+        },
+    )])
+    .unwrap();
+    let (group_id, created) = admin
+        .create_group_with_chosen_id_and_audit_context(
+            CreateGroupRequest {
+                name: "device recovery refusal".into(),
+                description: String::new(),
+                members: vec![key_package],
+                required_features: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: DEVICE_ROSTER_COMPONENT_ID,
+                    data: encode_device_roster_v1(&roster).unwrap(),
+                }],
+                initial_admins: vec![],
+            },
+            chosen,
+            Some(encode_device_roster_update_v1(&update).unwrap()),
+            Timestamp(u64::MAX),
+            None,
+        )
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current device group")
+    };
+    target.join_welcome(welcomes.remove(0)).await.unwrap();
+    for (_, welcome) in admin.outstanding_sent_welcomes().unwrap() {
+        admin.mark_sent_welcome_delivered(&welcome.id).unwrap();
+    }
+    // Capture the real target leaf without using the eligibility API under test.
+    let (native, _) = load_group_and_signer(&target_storage, &target.self_id(), &group_id);
+    let leaf = native.own_leaf_node().unwrap();
+    let target_key = target.own_recovery_key_hash(&group_id).unwrap();
+    let source = cgka_traits::group_recovery::GroupRecoverySource {
+        epoch: cgka_traits::EpochId(native.epoch().as_u64()),
+        epoch_authenticator_hash: sha2::Sha256::digest(native.epoch_authenticator().as_slice())
+            .into(),
+        leaf_index: native.own_leaf_index().u32(),
+        leaf_hash: sha2::Sha256::digest(leaf.tls_serialize_detached().unwrap()).into(),
+        device_key_hash: target_key,
+        coordinator_key_hash: admin.own_recovery_key_hash(&group_id).unwrap(),
+    };
+    let grant = signed_member_recovery(
+        &target_storage,
+        &group_id,
+        &admin.self_id(),
+        &target.self_id(),
+        source,
+        target.fresh_key_package().await.unwrap(),
+    );
+    let record = storage.get_group(&group_id).unwrap();
+    let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+    let state = admin.epoch_state(&group_id).unwrap();
+    let send_refusal = admin
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant.clone()],
+        })
+        .await
+        .unwrap_err();
+    assert!(!send_refusal.is_transient());
+    assert!(matches!(
+        send_refusal,
+        EngineError::GroupRecoverySourceMismatch { .. }
+    ));
+    for refusal in [
+        admin
+            .group_recovery_source(&group_id, &target.self_id(), &target_key)
+            .unwrap_err(),
+        admin
+            .validate_member_recovery(&group_id, &grant)
+            .unwrap_err(),
+    ] {
+        assert!(!refusal.is_transient());
+        assert!(matches!(
+            refusal,
+            EngineError::GroupRecoverySourceMismatch { .. }
+        ));
+    }
+    assert!(matches!(
+        admin.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![target.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        }).await,
+        Err(EngineError::InvalidTransition(transition)) if transition.from == "DeviceGroup"
+    ));
+    assert_eq!(storage.get_group(&group_id).unwrap(), record);
+    assert_eq!(storage.list_group_snapshots(&group_id).unwrap(), snapshots);
+    assert_eq!(admin.epoch_state(&group_id).unwrap(), state);
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(admin.outstanding_sent_welcomes().unwrap().is_empty());
+    let (native, _) = load_group_and_signer(&storage, &admin.self_id(), &group_id);
+    assert!(native.pending_commit().is_none());
+}
+
+#[tokio::test]
 async fn recovery_legacy_coordinator() {
     let (mut admin, storage) = build_with_storage(b"recovery-legacy-admin");
-    let mut target = build_client(b"recovery-legacy-target");
+    let (mut target, target_storage) = build_with_storage(b"recovery-legacy-target");
     let (group_id, created) = admin
         .create_group(CreateGroupRequest {
             name: "legacy recovery coordinator".into(),
@@ -1585,9 +1831,17 @@ async fn recovery_legacy_coordinator() {
     admin.confirm_published(pending).await.unwrap();
     target.join_welcome(welcomes.remove(0)).await.unwrap();
     let target_key = target.own_recovery_key_hash(&group_id).unwrap();
-    admin
+    let source = admin
         .group_recovery_source(&group_id, &target.self_id(), &target_key)
         .unwrap();
+    let grant = signed_member_recovery(
+        &target_storage,
+        &group_id,
+        &admin.self_id(),
+        &target.self_id(),
+        source,
+        target.fresh_key_package().await.unwrap(),
+    );
     drop(admin);
     let mut admin = EngineBuilder::new(storage.clone())
         .identity(pad32(b"recovery-legacy-admin"))
@@ -1598,10 +1852,48 @@ async fn recovery_legacy_coordinator() {
         .build()
         .unwrap();
     admin.hydrate_all_stored_groups().unwrap();
+    let record = storage.get_group(&group_id).unwrap();
+    let snapshots = storage.list_group_snapshots(&group_id).unwrap();
+    for refusal in [
+        admin
+            .group_recovery_source(&group_id, &target.self_id(), &target_key)
+            .unwrap_err(),
+        admin
+            .validate_member_recovery(&group_id, &grant)
+            .unwrap_err(),
+        admin
+            .send(SendIntent::RecoverMembers {
+                group_id: group_id.clone(),
+                members: vec![grant.clone()],
+            })
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(!refusal.is_transient(), "{refusal:?}");
+        assert!(matches!(
+            refusal,
+            EngineError::GroupRecoverySourceMismatch { .. }
+        ));
+    }
     assert!(matches!(
-        admin.group_recovery_source(&group_id, &target.self_id(), &target_key),
-        Err(EngineError::GroupRecoverySourceMismatch { .. })
+        admin.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![target.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        }).await,
+        Err(EngineError::InvalidTransition(transition))
+            if transition.from == "LegacyProfile" && transition.to == "Invite"
     ));
+    assert_eq!(storage.get_group(&group_id).unwrap(), record);
+    assert_eq!(storage.list_group_snapshots(&group_id).unwrap(), snapshots);
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    let (native, _) = load_group_and_signer(&storage, &admin.self_id(), &group_id);
+    assert!(native.pending_commit().is_none());
     let SendResult::GroupEvolution { msg, pending, .. } = target
         .send(SendIntent::RemoveMembers {
             group_id: group_id.clone(),
@@ -1618,6 +1910,15 @@ async fn recovery_legacy_coordinator() {
     assert!(storage.get_group(&group_id).unwrap().removed);
     assert!(matches!(
         admin.group_recovery_source(&group_id, &target.self_id(), &target_key),
+        Err(EngineError::NotAMember { .. })
+    ));
+    assert!(matches!(
+        admin
+            .send(SendIntent::RecoverMembers {
+                group_id: group_id.clone(),
+                members: vec![grant],
+            })
+            .await,
         Err(EngineError::NotAMember { .. })
     ));
 }
