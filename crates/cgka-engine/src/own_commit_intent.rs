@@ -171,6 +171,7 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
             SendIntent::UpdateAppComponents { .. }
             | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
             | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
