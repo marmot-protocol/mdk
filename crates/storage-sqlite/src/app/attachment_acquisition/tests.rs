@@ -577,6 +577,19 @@ fn attachment_job_candidate_pages_and_expiry_cleanup_use_bounded_indexes() {
             "EXPLAIN QUERY PLAN SELECT token FROM attachment_acquisition WHERE expires_at<=?1 ORDER BY expires_at,token LIMIT 64",
             "attachment_acquisition_expiry",
         ),
+        // The idle probes run on every attachment pass (mdk#2923); a scan
+        // here would cost what the probe exists to avoid.
+        (
+            &format!("EXPLAIN QUERY PLAN {EXPIRED_ACQUISITION_PROBE}"),
+            "attachment_acquisition_expiry",
+        ),
+        (
+            &format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::partial::EXPIRED_PARTIAL_PROBE
+            ),
+            "attachment_partial_expiry",
+        ),
     ] {
         let rows = conn
             .prepare(query)
@@ -585,7 +598,13 @@ fn attachment_job_candidate_pages_and_expiry_cleanup_use_bounded_indexes() {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(rows.iter().any(|s| s.contains(index)), "{rows:?}");
+        // A range search on the index, not a scan of it: a covering-index
+        // scan still names the index but reads every row.
+        assert!(
+            rows.iter()
+                .any(|s| s.starts_with("SEARCH") && s.contains(index)),
+            "{rows:?}"
+        );
     }
     drop(conn);
     sql(&store, "UPDATE app_events SET retention_expires_at=12");

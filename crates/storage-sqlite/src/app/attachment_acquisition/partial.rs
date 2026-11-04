@@ -17,6 +17,11 @@ pub const ATTACHMENT_CHECKPOINT_BYTES: usize = media_store::CHECKPOINT_APPEND_MA
 /// deadline, so a prefix kept through a long park is still loadable when the
 /// job resumes by any of those paths.
 pub(super) const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Whether any partial has passed its expiry, answered from the
+/// `attachment_partial_expiry` index.
+pub(crate) const EXPIRED_PARTIAL_PROBE: &str =
+    "SELECT EXISTS(SELECT 1 FROM attachment_partial WHERE expires_at<=?1)";
 /// Longest a storage-parked job keeps its prefix, measured from its latest
 /// park. A parked prefix is exempt from the idle expiry until then, so it
 /// survives while the user frees space, but it cannot hold its disk and its
@@ -477,17 +482,28 @@ impl SqliteAppStorage {
         let exempt_after = now
             .saturating_add(PARTIAL_TTL_SECONDS)
             .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
-        self.lock()?
-            .execute(
-                "DELETE FROM attachment_partial WHERE token IN (
-                 SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
-                 AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
-                     WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
-                     AND q.storage_blocked_headroom IS NOT NULL))
-                 ORDER BY p.expires_at,p.token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
-            )
-            .storage()
+        let conn = self.lock()?;
+        // Probe before compiling the DELETE, as for expired acquisitions
+        // (mdk#2923). The probe ignores the storage-blocked exemption, so it
+        // may admit a DELETE that removes nothing, never skip one that would.
+        let expired: bool = conn
+            .query_row_cached(EXPIRED_PARTIAL_PROBE, params![u64_to_i64(now)?], |row| {
+                row.get(0)
+            })
+            .storage()?;
+        if !expired {
+            return Ok(0);
+        }
+        conn.execute_cached(
+            "DELETE FROM attachment_partial WHERE token IN (
+             SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
+             AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
+                 WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
+                 AND q.storage_blocked_headroom IS NOT NULL))
+             ORDER BY p.expires_at,p.token LIMIT ?2)",
+            params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
+        )
+        .storage()
     }
 
     /// Bytes `reference`'s checkpoint has recorded, if it has one. Unfenced:

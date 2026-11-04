@@ -18,6 +18,11 @@ pub const MAX_RETAINED_ATTACHMENT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_RETAINED_FILE_ATTACHMENT_BYTES: u64 = 900 * 1024 * 1024;
 pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
+
+/// Whether any acquisition has expired, answered from the
+/// `attachment_acquisition_expiry` index.
+pub(crate) const EXPIRED_ACQUISITION_PROBE: &str =
+    "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE expires_at<=?1)";
 const MAX_DESCRIPTOR_BYTES: usize = 16384;
 /// Consecutive local-readiness deferrals before a job fails. With 15-second
 /// doubling this spans about eight minutes: far beyond the normal readiness lag
@@ -982,14 +987,24 @@ impl SqliteAppStorage {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid attachment cleanup limit"));
         }
-        self.lock()?
-            .execute(
-                "DELETE FROM attachment_acquisition WHERE token IN (
-                SELECT token FROM attachment_acquisition WHERE expires_at<=?1
-                ORDER BY expires_at,token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64],
-            )
-            .storage()
+        let now = u64_to_i64(now)?;
+        let conn = self.lock()?;
+        // Nothing has expired on almost every call. Compiling this DELETE
+        // codes every trigger and foreign-key action on the table, which
+        // costs far more than the indexed probe (mdk#2923).
+        let expired: bool = conn
+            .query_row_cached(EXPIRED_ACQUISITION_PROBE, params![now], |row| row.get(0))
+            .storage()?;
+        if !expired {
+            return Ok(0);
+        }
+        conn.execute_cached(
+            "DELETE FROM attachment_acquisition WHERE token IN (
+             SELECT token FROM attachment_acquisition WHERE expires_at<=?1
+             ORDER BY expires_at,token LIMIT ?2)",
+            params![now, limit as i64],
+        )
+        .storage()
     }
     /// Cap the account database at its current size plus `slack_pages`, so a
     /// publication that needs more fails with the backend's capacity error
