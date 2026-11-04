@@ -785,9 +785,18 @@ fn with_another_mls_key(
     template: &SiblingKeyPackage,
     roster: &cgka_traits::app_components::DeviceRosterV1,
 ) -> SiblingKeyPackage {
+    with_another_mls_key_for_ciphersuite(sibling, template, roster, DEFAULT_CIPHERSUITE)
+}
+
+fn with_another_mls_key_for_ciphersuite(
+    sibling: &Device,
+    template: &SiblingKeyPackage,
+    roster: &cgka_traits::app_components::DeviceRosterV1,
+    ciphersuite: cgka_engine::Ciphersuite,
+) -> SiblingKeyPackage {
     let parsed = parse_key_package(&template.key_package);
     let leaf = parsed.leaf_node();
-    let signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).unwrap();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
     let mut dictionary = leaf
         .extensions()
         .app_data_dictionary()
@@ -803,8 +812,8 @@ fn with_another_mls_key(
         account_identity_proof_component(
             &pad32(b"bob"),
             signer.public(),
-            DEFAULT_CIPHERSUITE,
-            DEFAULT_CIPHERSUITE.signature_algorithm(),
+            ciphersuite,
+            ciphersuite.signature_algorithm(),
             created_at,
             proof_signer(b"bob").as_ref(),
         )
@@ -829,10 +838,16 @@ fn with_another_mls_key(
         .unwrap();
     let bundle = MlsKeyPackage::builder()
         .key_package_lifetime(*parsed.life_time())
-        .leaf_node_capabilities(leaf.capabilities().clone())
+        .leaf_node_capabilities(openmls::prelude::Capabilities::new(
+            Some(leaf.capabilities().versions()),
+            Some(&[ciphersuite]),
+            Some(leaf.capabilities().extensions()),
+            Some(leaf.capabilities().proposals()),
+            Some(leaf.capabilities().credentials()),
+        ))
         .leaf_node_extensions(extensions)
         .build(
-            DEFAULT_CIPHERSUITE,
+            ciphersuite,
             &OpenMlsRustCrypto::default(),
             &signer,
             CredentialWithKey {
@@ -2120,15 +2135,38 @@ async fn a_founding_add_keeps_sibling_and_transport_welcomes_independent() {
     );
 }
 
-/// A published KeyPackage never qualifies for the optional private route.
-/// Its omission preserves the ordinary founder and its transport Welcome.
+/// Published or group-incompatible KeyPackages never qualify for the optional
+/// private route. Their omission preserves the ordinary founder and its Welcome.
 #[tokio::test]
 async fn an_inadmissible_founding_sibling_does_not_block_other_accounts() {
-    let (mut creator, mut siblings, _) = tagged_devices(b"alice", 1).await;
-    let mut other = chat_device(b"bob");
+    let (mut creator, mut siblings, device_group) = tagged_devices(b"bob", 1).await;
+    let mut other = chat_device(b"alice");
     let public = other.engine.fresh_key_package().await.unwrap();
-    let mut private = handed(&mut siblings[0], slot(2), slot(1));
-    private.key_package.source = Some(KeyPackageSource {
+    let private = handed(&mut siblings[0], slot(2), slot(1));
+    let roster = super::device_roster::roster_of(&creator, &device_group);
+    let incompatible = with_another_mls_key_for_ciphersuite(
+        &siblings[0],
+        &private,
+        &roster,
+        cgka_engine::Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let metadata = cgka_engine::private_key_packages::validate_received_private_key_package(
+        &incompatible.key_package,
+        &creator.engine.self_id(),
+        &roster,
+        &incompatible.slot,
+        now,
+    )
+    .expect("the alternate-suite package is a valid private handoff before chat admission");
+    assert_eq!(metadata.ciphersuite, 0x0003);
+    assert_eq!(metadata.protocol_profile, ProtocolProfile::Current);
+    assert!(incompatible.key_package.source.is_none());
+    let mut published = private;
+    published.key_package.source = Some(KeyPackageSource {
         event_id: MessageId::new(vec![7; 32]),
     });
     let (gid, result) = creator
@@ -2136,7 +2174,7 @@ async fn an_inadmissible_founding_sibling_does_not_block_other_accounts() {
         .create_group_with_siblings_and_audit_context(
             founding_request(vec![public]),
             Vec::new(),
-            vec![private],
+            vec![published, incompatible],
             None,
         )
         .await
