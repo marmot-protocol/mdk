@@ -2095,7 +2095,7 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() {
     use cgka_traits::message::{MessageState, StoredMessagePayload};
-    use cgka_traits::storage::MessageStorage as _;
+    use cgka_traits::storage::{MessageStorage as _, RosterTagKeyStorage as _};
     struct EarlierClock(u64);
     impl marmot_session::WallClock for EarlierClock {
         fn now(&self) -> Timestamp {
@@ -2223,6 +2223,115 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
         before,
         "the newly accepted carrier needs a later heartbeat"
     );
+    // Absence without remembered keys is not proven removal. Exercise the
+    // App's evidence gate; native status/key eligibility is owned separately.
+    use cgka_traits::app_components::{
+        AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1,
+        DeviceRosterUpdateV1, encode_device_roster_update_v1,
+    };
+    let old_entry = roster(&devices.laptop, &device_group).devices[&phone_slot].clone();
+    let roster_change = |operation| SendIntent::UpdateAppComponents {
+        group_id: device_group.clone(),
+        updates: vec![AppComponentData {
+            component_id: DEVICE_ROSTER_COMPONENT_ID,
+            data: encode_device_roster_update_v1(
+                &DeviceRosterUpdateV1::new(vec![operation]).unwrap(),
+            )
+            .unwrap(),
+        }],
+    };
+    devices
+        .laptop
+        .runtime
+        .send(roster_change(DeviceRosterOperationV1::RemoveDevice(
+            phone_slot,
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !roster(&devices.laptop, &device_group)
+            .devices
+            .contains_key(&phone_slot)
+    );
+    assert!(matches!(
+        devices.laptop.runtime.epoch_state(&device_group),
+        Some(cgka_traits::EpochState::Stable { .. })
+    ));
+    assert!(
+        !devices
+            .laptop
+            .runtime
+            .has_pending_convergence_inputs(&device_group)
+            .unwrap()
+    );
+    assert!(
+        store
+            .roster_tag_keys(&device_group, 0)
+            .unwrap()
+            .iter()
+            .any(|key| key.slot == phone_slot)
+    );
+    // Inject missing local evidence through its real storage owner. This
+    // deliberately prunes unexpired produced keys: an evidence-loss fault,
+    // not normal retention/expiry proof. No source identity or key is invented.
+    store
+        .prune_roster_tag_keys(
+            crate::unix_now_seconds().saturating_add(1),
+            cgka_traits::storage::ROSTER_TAG_KEYS_PER_SLOT,
+        )
+        .unwrap();
+    assert!(
+        store
+            .roster_tag_keys(&device_group, 0)
+            .unwrap()
+            .iter()
+            .all(|key| key.slot != phone_slot)
+    );
+    let storage = store.app_storage();
+    let retained = storage.sibling_welcome_resend_batch(None, 32).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].0, original.id.as_slice());
+    let before_unknown = devices.relay.published_events.lock().unwrap().len();
+    // One retained row needs at most two turns to cross the prior keyset
+    // continuation boundary and visit it. Neither turn may retire or send it.
+    for _ in 0..2 {
+        devices.laptop.send_owed_sibling_welcomes(&[]).await;
+        assert_eq!(
+            devices.relay.published_events.lock().unwrap().len(),
+            before_unknown
+        );
+        assert_eq!(
+            store.get_message(&original.id).unwrap().state,
+            MessageState::Processed,
+            "unproven absence must not retire the retained Welcome"
+        );
+        assert_eq!(
+            storage.sibling_welcome_resend_batch(None, 32).unwrap(),
+            retained,
+            "unproven absence preserves the original carrier and repair obligation"
+        );
+    }
+    // Restore the actual entry, including its user marker, through a Commit.
+    devices
+        .laptop
+        .runtime
+        .send(roster_change(DeviceRosterOperationV1::SetDevice(
+            phone_slot, old_entry,
+        )))
+        .await
+        .unwrap();
+    assert!(
+        roster(&devices.laptop, &device_group)
+            .devices
+            .contains_key(&phone_slot)
+    );
+    assert!(
+        store
+            .roster_tag_keys(&device_group, 0)
+            .unwrap()
+            .iter()
+            .any(|key| key.slot == phone_slot)
+    );
     assert_eq!(
         stashed(&devices.phone),
         0,
@@ -2233,6 +2342,48 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() 
     assert!(
         devices.phone.state_group_record(&chat).is_some(),
         "the repaired Welcome actually joins its target"
+    );
+    assert_eq!(
+        store.get_message(&original.id).unwrap().state,
+        MessageState::Processed
+    );
+    devices
+        .laptop
+        .remove_linked_device(&hex::encode(phone_slot))
+        .await
+        .unwrap();
+    let removed_roster = roster(&devices.laptop, &device_group);
+    assert!(!removed_roster.devices.contains_key(&phone_slot));
+    assert_eq!(
+        removed_roster.rejected_slots[&phone_slot].reason,
+        cgka_traits::app_components::RejectedSlotReasonV1::Removed
+    );
+    let before_gone = devices.relay.published_events.lock().unwrap().len();
+    for _ in 0..2 {
+        if storage
+            .sibling_welcome_resend_batch(None, 32)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    }
+    assert_eq!(
+        devices.relay.published_events.lock().unwrap().len(),
+        before_gone,
+        "proven removal cannot publish a replacement carrier"
+    );
+    assert_eq!(
+        store.get_message(&original.id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(
+        storage
+            .sibling_welcome_resend_batch(None, 32)
+            .unwrap()
+            .is_empty(),
+        "proven removal retires App timing metadata without waiting for another heartbeat"
     );
 }
 
