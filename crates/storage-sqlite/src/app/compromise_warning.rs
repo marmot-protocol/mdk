@@ -224,9 +224,10 @@ impl SqliteAppStorage {
 }
 
 /// Record `first`, taken as `group` comes to trust, in `tx`: the trust
-/// write's transaction. Returns whether the unseen items changed.
+/// write's transaction. The caller owns that transaction (including a native
+/// same-connection crossing). Returns whether the unseen items changed.
 pub(crate) fn record_first_trusted_roster(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id_hex: &str,
     first: &FirstTrustedRoster<'_>,
 ) -> StorageResult<bool> {
@@ -243,7 +244,7 @@ pub(crate) fn record_first_trusted_roster(
 /// roster is that device group's first: its rejections go in seen and the
 /// group becomes the baseline. Returns whether the unseen items changed.
 fn record_gather(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     own: &[ObservedWarningItem],
     roster: &[ObservedWarningItem],
     baseline: Option<&str>,
@@ -277,7 +278,7 @@ fn record_gather(
 /// Add `item` unless a row for its reason and subject exists, seen or not.
 /// Returns whether it added an unseen row.
 fn insert_item(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     item: &ObservedWarningItem,
     now: i64,
     seen_at: Option<i64>,
@@ -308,7 +309,7 @@ fn insert_item(
 /// device group dropped carried it. One that stands again warns again. A seen
 /// one stays, so it never warns twice.
 fn drop_ended_sign_in_rejections(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     own: &[ObservedWarningItem],
     roster: &[ObservedWarningItem],
 ) -> StorageResult<bool> {
@@ -354,7 +355,7 @@ fn drop_ended_sign_in_rejections(
 /// longer ago than the retention: by then the KeyPackage has expired, so a
 /// relay that serves it again does not bring it back. Then drop the oldest
 /// items past the cap, seen ones first. Returns whether an unseen item went.
-fn prune(tx: &rusqlite::Transaction<'_>, now: i64) -> StorageResult<bool> {
+fn prune(tx: &rusqlite::Connection, now: i64) -> StorageResult<bool> {
     tx.execute_cached(
         "DELETE FROM account_compromise_warning_items
          WHERE reason = ?1 AND seen_at IS NOT NULL AND occurred_at <= ?2 - ?3",

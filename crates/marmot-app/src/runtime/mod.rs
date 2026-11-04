@@ -1611,9 +1611,10 @@ pub enum MarmotAppEvent {
     },
     /// Linking a new device may have changed as this device shows it:
     /// re-read `device_link_snapshot`. Also fires once each time the
-    /// account's worker opens or reconnects, which ends any link in
-    /// progress. Carries no device, session or group identities, and may
-    /// fire with no visible change.
+    /// account's worker opens or reconnects. Live comparison sessions are
+    /// lost then; admitted moves resume from durable progress. Carries no
+    /// device, session or group identities, and may fire with no visible
+    /// change.
     DeviceLinkChanged {
         account_id_hex: String,
         account_label: String,
@@ -4371,7 +4372,9 @@ impl MarmotAppRuntime {
     }
 
     /// Linking a new device of this account (mdk#2628 item 3.3b), on the new
-    /// device: ask a device already signed in to link this one. Refused unless
+    /// device: ask a device already signed in to link this one. When this
+    /// device already trusts a group, the confirmed link moves only this
+    /// device to the answering group, keeping old trust until Made. Refused unless
     /// the build has `unreleased-device-pairing` and device groups are on.
     pub async fn start_device_link(
         &self,
@@ -4427,6 +4430,24 @@ impl MarmotAppRuntime {
             account_ref,
             crate::DeviceLinkOp::Decline {
                 prompt_id: prompt_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Dismiss one private old-sibling recognition hint from a made move.
+    /// This changes only local presentation; it never links or rejects a slot.
+    pub async fn dismiss_device_group_move_sibling(
+        &self,
+        account_ref: &str,
+        move_id: &str,
+        slot_id_hex: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::DismissMoveSibling {
+                move_id: move_id.to_owned(),
+                slot_id_hex: slot_id_hex.to_owned(),
             },
         )
         .await

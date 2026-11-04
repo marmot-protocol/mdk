@@ -27,6 +27,13 @@ use tls_codec::{Serialize as _, Size as _, VLByteSlice};
 const APP_STATE_MAX_ENTRIES: usize = 32;
 const APP_STATE_MAX_ENCODED_LEN: usize = 8192;
 
+#[derive(Clone, Copy)]
+enum AppDataCommitPurpose {
+    Ordinary,
+    Isolated,
+    MoveStatus(DeviceSlotId),
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_send_update_group_data(
         &mut self,
@@ -138,6 +145,96 @@ impl<S: StorageProvider> Engine<S> {
         .await
     }
 
+    pub(crate) async fn do_send_import_device_group_rejections(
+        &mut self,
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    ) -> Result<SendResult, EngineError> {
+        let proposed =
+            decode_device_roster_update_v1(&roster_update).map_err(EngineError::Serialize)?;
+        let now = self.wall_clock.now().0;
+        let operations = self.with_mls_group(&group_id, |group| {
+            if !crate::app_components::group_requires_device_roster(group)? {
+                return Err(EngineError::Other(
+                    "carried rejection requires a device roster".into(),
+                ));
+            }
+            let roster = crate::app_components::device_roster_of_group(group)
+                .ok_or_else(|| EngineError::Other("destination roster is unavailable".into()))?;
+            let mut operations = Vec::new();
+            for operation in proposed.operations() {
+                let DeviceRosterOperationV1::SetRejectedSlot(slot, record) = operation else {
+                    return Err(EngineError::Other(
+                        "carried rejection contains another operation".into(),
+                    ));
+                };
+                if !roster.devices.contains_key(slot)
+                    && !roster.rejected_slots.contains_key(slot)
+                    && !(record.reason == RejectedSlotReasonV1::Removed
+                        && now.saturating_sub(record.rejected_at) >= 30 * 24 * 60 * 60)
+                {
+                    operations.push(operation.clone());
+                }
+            }
+            Ok(operations)
+        })?;
+        if operations.is_empty() {
+            return Ok(SendResult::NoChange { group_id });
+        }
+        let update = DeviceRosterUpdateV1::new(operations)
+            .and_then(|update| encode_device_roster_update_v1(&update))
+            .map_err(EngineError::Serialize)?;
+        self.do_send_app_data_updates_with_purpose(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+            Vec::new(),
+            AppDataCommitPurpose::Isolated,
+        )
+        .await
+    }
+
+    pub(crate) async fn do_send_mark_device_group_moved(
+        &mut self,
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: DeviceEntryV1,
+    ) -> Result<SendResult, EngineError> {
+        let valid = crate::device_tag::own_device_slot(&self.storage)? == Some(slot)
+            && self.with_mls_group(&group_id, |group| {
+                let Some(roster) = crate::app_components::device_roster_of_group(group) else {
+                    return Ok(false);
+                };
+                Ok(crate::app_components::group_requires_device_roster(group)?
+                    && roster.devices.get(&slot) == Some(&expected)
+                    && expected.tag_signature_key.as_deref() == Some(self.identity.signer.public())
+                    && group.own_leaf_node().is_some_and(|leaf| {
+                        leaf.signature_key().as_slice() == self.identity.signer.public()
+                    }))
+            })?;
+        if !valid {
+            return Err(EngineError::DeviceEntryChanged { group_id });
+        }
+        let mut moved = expected;
+        moved.status = cgka_traits::app_components::DeviceStatusV1::Moved;
+        let update =
+            DeviceRosterUpdateV1::new(vec![DeviceRosterOperationV1::SetDevice(slot, moved)])
+                .and_then(|update| encode_device_roster_update_v1(&update))
+                .map_err(EngineError::Serialize)?;
+        self.do_send_app_data_updates_with_purpose(
+            group_id,
+            vec![AppComponentData {
+                component_id: DEVICE_ROSTER_COMPONENT_ID,
+                data: update,
+            }],
+            Vec::new(),
+            AppDataCommitPurpose::MoveStatus(slot),
+        )
+        .await
+    }
+
     /// Stage a [`cgka_traits::engine::SendIntent::ReplaceDeviceEntry`]: one
     /// roster `SetDevice` of `slot`, only while the roster still holds
     /// `expected` there. A direct send, a drained queued copy and a re-issue
@@ -210,6 +307,22 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
         removals: Vec<AppComponentId>,
+    ) -> Result<SendResult, EngineError> {
+        self.do_send_app_data_updates_with_purpose(
+            group_id,
+            updates,
+            removals,
+            AppDataCommitPurpose::Ordinary,
+        )
+        .await
+    }
+
+    async fn do_send_app_data_updates_with_purpose(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+        removals: Vec<AppComponentId>,
+        purpose: AppDataCommitPurpose,
     ) -> Result<SendResult, EngineError> {
         self.epoch_manager.ensure_pending_space()?;
         if updates.is_empty() {
@@ -336,16 +449,81 @@ impl<S: StorageProvider> Engine<S> {
                 Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::remove(*component_id)))
             }))
             .collect::<Vec<_>>();
-        let commit_out = self
-            .stage_commit_with_app_data_updates(
+        let commit_out = match purpose {
+            AppDataCommitPurpose::Ordinary => self.stage_commit_with_app_data_updates(
                 &mut mls_group,
                 &provider,
                 Vec::new(),
                 Vec::new(),
                 proposals,
                 "app_data_update",
-            )?
-            .0;
+            )?,
+            AppDataCommitPurpose::Isolated => self.stage_app_data_commit(
+                &mut mls_group,
+                &provider,
+                Vec::new(),
+                Vec::new(),
+                proposals,
+                false,
+                None,
+                "carried_rejections",
+            )?,
+            AppDataCommitPurpose::MoveStatus(slot) => {
+                // Only this status operation tags from the authenticated old
+                // roster. Ordinary old queued work may have replaced its tag
+                // after the global name changed; it must not strand cleanup.
+                let roster =
+                    crate::app_components::device_roster_of_group(&mls_group).ok_or_else(|| {
+                        EngineError::DeviceEntryChanged {
+                            group_id: group_id.clone(),
+                        }
+                    })?;
+                let own = crate::device_tag::OwnDeviceTag::find(
+                    roster,
+                    Some(slot),
+                    self.identity.signer.public(),
+                )
+                .ok_or_else(|| EngineError::DeviceEntryChanged {
+                    group_id: group_id.clone(),
+                })?;
+                let leaf =
+                    mls_group
+                        .own_leaf_node()
+                        .ok_or_else(|| EngineError::DeviceEntryChanged {
+                            group_id: group_id.clone(),
+                        })?;
+                let parameters = if own.reads_as_own(leaf) {
+                    openmls::prelude::LeafNodeParameters::default()
+                } else {
+                    let tag = own.seal(&self.crypto, &self.identity.signer)?;
+                    // Keep the current support list and every unrelated leaf
+                    // field; this is not an ordinary capability refresh.
+                    let advertised = crate::app_components::app_components_of_leaf(leaf)?;
+                    let extensions = crate::leaf_advertisement::own_leaf_refresh_extensions(
+                        leaf,
+                        &advertised,
+                        Some(tag),
+                    )?
+                    .ok_or_else(|| EngineError::DeviceEntryChanged {
+                        group_id: group_id.clone(),
+                    })?;
+                    openmls::prelude::LeafNodeParameters::builder()
+                        .with_extensions(extensions)
+                        .build()
+                };
+                self.stage_app_data_commit(
+                    &mut mls_group,
+                    &provider,
+                    Vec::new(),
+                    Vec::new(),
+                    proposals,
+                    false,
+                    Some(parameters),
+                    "move_status",
+                )?
+            }
+        }
+        .0;
         let staged_commit = mls_group.pending_commit().ok_or_else(|| {
             EngineError::Backend("app data update produced no pending commit".into())
         })?;
@@ -497,8 +675,18 @@ impl<S: StorageProvider> Engine<S> {
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
+        // A first own destination key must describe exactly its post-roster:
+        // another member's pending proposals cannot change that first tag.
+        let consume_pending = self.first_own_roster_tag(mls_group, &proposals).is_none();
         self.stage_app_data_commit(
-            mls_group, provider, removals, adds, proposals, true, context,
+            mls_group,
+            provider,
+            removals,
+            adds,
+            proposals,
+            consume_pending,
+            None,
+            context,
         )
     }
 
@@ -517,7 +705,7 @@ impl<S: StorageProvider> Engine<S> {
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         self.stage_app_data_commit(
-            mls_group, provider, removals, adds, proposals, false, context,
+            mls_group, provider, removals, adds, proposals, false, None, context,
         )
     }
 
@@ -530,6 +718,7 @@ impl<S: StorageProvider> Engine<S> {
         adds: Vec<MlsKeyPackage>,
         proposals: Vec<Proposal>,
         consume_pending: bool,
+        preserve_leaf: Option<openmls::prelude::LeafNodeParameters>,
         context: &str,
     ) -> Result<(MlsMessageOut, Option<MlsMessageOut>), EngineError> {
         // Validate the proposal set as one operation. In particular, removal
@@ -546,7 +735,10 @@ impl<S: StorageProvider> Engine<S> {
         // The roster `proposals` leave decides whether a Commit that sets this
         // device's own tag key tags its UpdatePath leaf; one another member's
         // pending proposal changes as well is not foreseen here.
-        let leaf_node_parameters = self.own_commit_leaf_parameters(mls_group, &proposals)?;
+        let leaf_node_parameters = match preserve_leaf {
+            Some(parameters) => parameters,
+            None => self.own_commit_leaf_parameters(mls_group, &proposals)?,
+        };
         let mut builder = mls_group
             .commit_builder()
             .consume_proposal_store(consume_pending)

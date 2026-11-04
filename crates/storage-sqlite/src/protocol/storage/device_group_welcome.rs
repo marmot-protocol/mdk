@@ -54,6 +54,14 @@ impl DeviceGroupWelcomeStorage for SqliteAccountStorage {
         records.iter().map(|record| deserialize(record)).collect()
     }
 
+    fn accept_device_group_welcome(
+        &self,
+        expected: &DeviceGroupWelcomeExpectation,
+        joined_at: cgka_traits::Timestamp,
+    ) -> StorageResult<bool> {
+        crate::cross::device_group_moves::accept_welcome(self, expected, joined_at)
+    }
+
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool> {
         let deleted = self
             .lock()?

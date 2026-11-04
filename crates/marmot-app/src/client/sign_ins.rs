@@ -442,11 +442,15 @@ impl AppClient {
         }
         let own_slot = self.own_key_packages()?.slot;
         let roster = self.trusted_device_roster()?.map(|(_, roster)| roster);
+        let exceptions = self.old_move_sibling_exceptions()?;
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         Ok(storage
             .sign_ins()?
             .into_iter()
             .filter_map(|record| {
+                if exceptions.contains(&record.slot_id_hex) {
+                    return None;
+                }
                 let state = listed_state(&record, roster.as_ref(), own_slot.as_deref())?;
                 Some(UnrecognizedSignIn {
                     slot_id_hex: record.slot_id_hex,
@@ -588,6 +592,9 @@ impl AppClient {
         for record in pending {
             if linked(record, &roster) {
                 end_rejection(&storage, record)?;
+                continue;
+            }
+            if self.moving_rejection_is_carried(record)? {
                 continue;
             }
             match rejected_slot(record, &roster)? {

@@ -4216,6 +4216,12 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
+                let roster_before = if retain_replayed_anchors.is_some() {
+                    crate::device_roster_departures::capture(&mls_group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                } else {
+                    None
+                };
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));
                 let additions = group_activity::staged_additions(&staged)?;
@@ -4231,6 +4237,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                if retain_replayed_anchors.is_some() {
+                    crate::device_roster_departures::record(
+                        storage,
+                        group_id,
+                        roster_before,
+                        &mls_group,
+                        &message.id,
+                    )
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+                }
                 observations.push(OpenMlsReplayObservation::CommitStaged {
                     message_id: message_id.clone(),
                     source_epoch,

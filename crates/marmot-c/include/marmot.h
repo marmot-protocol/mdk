@@ -626,6 +626,10 @@ typedef enum MarmotLinkedDeviceStatus {
    * It recorded that it is signing out.
    */
   MARMOT_LINKED_DEVICE_STATUS_LEAVING,
+  /**
+   * It moved to another device group; old cleanup keeps its chats.
+   */
+  MARMOT_LINKED_DEVICE_STATUS_MOVED,
 } MarmotLinkedDeviceStatus;
 
 /**
@@ -707,6 +711,16 @@ typedef enum MarmotDeviceLinkEndReason {
    */
   MARMOT_DEVICE_LINK_END_REASON_LINK_FAILED,
 } MarmotDeviceLinkEndReason;
+
+/**
+ * Local move progress; admission alone is Joining, not Made.
+ */
+typedef enum MarmotDeviceGroupMoveState {
+  MARMOT_DEVICE_GROUP_MOVE_STATE_WAITING_FOR_WELCOME,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_JOINING,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_MADE,
+  MARMOT_DEVICE_GROUP_MOVE_STATE_FAILED,
+} MarmotDeviceGroupMoveState;
 
 /**
  * Why a stored group was quarantined instead of hydrated.
@@ -3244,6 +3258,27 @@ typedef struct MarmotDeviceLinkPrompt {
 } MarmotDeviceLinkPrompt;
 
 /**
+ * Private old-sibling guidance, never authority to Add or trust it.
+ */
+typedef struct MarmotDeviceGroupMoveSibling {
+  char *slot_id_hex;
+  char *label;
+  bool question_suppressed;
+} MarmotDeviceGroupMoveSibling;
+
+/**
+ * Local move progress. Freed with the containing link snapshot.
+ */
+typedef struct MarmotDeviceGroupMoveView {
+  char *move_id;
+  enum MarmotDeviceGroupMoveState state;
+  struct MarmotDeviceGroupMoveSibling *old_siblings;
+  uintptr_t old_siblings_len;
+  char **overridden_rejection_slots;
+  uintptr_t overridden_rejection_slots_len;
+} MarmotDeviceGroupMoveView;
+
+/**
  * Linking as this device shows it. `new_device` is NULL unless this
  * device asked to be linked; `prompts` lists the sign-ins it can link.
  */
@@ -3251,6 +3286,8 @@ typedef struct MarmotDeviceLinkSnapshot {
   struct MarmotNewDeviceLinkState *new_device;
   struct MarmotDeviceLinkPrompt *prompts;
   uintptr_t prompts_len;
+  struct MarmotDeviceGroupMoveView *moves;
+  uintptr_t moves_len;
 } MarmotDeviceLinkSnapshot;
 
 /**
@@ -6093,9 +6130,10 @@ typedef enum MarmotEvent_Tag {
   /**
    * Linking a new device may have changed as this device shows it;
    * re-read `marmot_device_link_snapshot`. Also fires once each time the
-   * account's worker opens or reconnects, which ends any link in
-   * progress. Carries no device, session or group identities, and may
-   * fire with no visible change.
+   * account's worker opens or reconnects. Live comparison sessions are
+   * lost then; admitted moves resume from durable progress. Carries no
+   * device, session or group identities, and may fire with no visible
+   * change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
   /**
@@ -8693,8 +8731,9 @@ MarmotStatus marmot_dismiss_compromise_warning(const struct MarmotClient *client
 
 /**
  * On a new device: ask a device of this account already signed in to
- * link this one. Refused in release builds until the pairing and
- * device-group specs land. Re-read on the `DeviceLinkChanged` event.
+ * link this one, or move this already-linked device to that group.
+ * Explicit experimental build and runtime gates are required. Re-read
+ * on the `DeviceLinkChanged` event; inspect `moves` for Joining/Made.
  * Free with `marmot_device_link_snapshot_free`.
  *
  * # Safety
@@ -8734,6 +8773,22 @@ MarmotStatus marmot_confirm_device_link_match(const struct MarmotClient *client,
 MarmotStatus marmot_cancel_device_link(const struct MarmotClient *client,
                                        const char *account_ref,
                                        struct MarmotDeviceLinkSnapshot **out);
+
+/**
+ * Dismiss one local old-sibling recognition hint. Free the returned
+ * snapshot with `marmot_device_link_snapshot_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_dismiss_device_group_move_sibling(const struct MarmotClient *client,
+                                                      const char *account_ref,
+                                                      const char *move_id,
+                                                      const char *slot_id_hex,
+                                                      struct MarmotDeviceLinkSnapshot **out);
 
 /**
  * On a device already signed in: Link device. `label` is the name the

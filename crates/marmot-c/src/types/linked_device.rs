@@ -12,6 +12,8 @@ c_enum! {
         Inactive,
         /// It recorded that it is signing out.
         Leaving,
+        /// It moved to another device group; old cleanup keeps its chats.
+        Moved,
     }
 }
 

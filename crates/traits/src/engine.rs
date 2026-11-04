@@ -277,6 +277,23 @@ pub enum SendIntent {
         group_id: GroupId,
         roster_update: Vec<u8>,
     },
+    /// Carry original rejected-slot records only into missing destination
+    /// slots. Preparation rechecks destination precedence and expiry; never
+    /// queued or re-issued, and consumes no unrelated pending proposals.
+    ImportDeviceGroupRejections {
+        group_id: GroupId,
+        roster_update: Vec<u8>,
+    },
+    /// Set only this device's own complete old roster entry to moved,
+    /// preserving all other fields and retaining or producing its old-roster
+    /// leaf tag. The host authorizes
+    /// the Made old-group exception; native preparation rechecks own slot,
+    /// signing key and the entire expected entry. Other proposals stay queued.
+    MarkDeviceGroupMoved {
+        group_id: GroupId,
+        slot: DeviceSlotId,
+        expected: Box<DeviceEntryV1>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.

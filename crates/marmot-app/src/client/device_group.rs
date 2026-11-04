@@ -154,6 +154,8 @@ pub enum LinkedDeviceStatus {
     Inactive,
     /// It recorded that it is signing out.
     Leaving,
+    /// It moved to another device group; old cleanup keeps its chats.
+    Moved,
 }
 
 impl AppClient {
@@ -496,6 +498,21 @@ impl AppClient {
         if self.stored_group(&link.device_group_id)?.is_some() {
             return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
+        if self.trusted_device_group()?.is_some() {
+            let expectation = DeviceGroupWelcomeExpectation {
+                group_id: link.device_group_id.clone(),
+                sender_signature_key: link.welcome_sender_key.clone(),
+                key_package_ref: hex::decode(&link.key_package_ref_hex)?,
+                expires_at: now.saturating_add(WELCOME_WAIT_SECS),
+            };
+            if !self
+                .runtime
+                .prepare_device_group_move(&expectation, self.own_slot()?, now)?
+            {
+                return Err(AppError::DeviceGroupRefused("move_in_progress"));
+            }
+            return Ok(());
+        }
         let key_package_ref = hex::decode(&link.key_package_ref_hex)?;
         let group_id_hex = hex::encode(link.device_group_id.as_slice());
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
@@ -615,6 +632,18 @@ impl AppClient {
             // join to be recorded again: the pairing drive makes this
             // device's first commit there as soon as it can (D40).
             storage.record_device_group_join(&group_id_hex, now)?;
+        }
+        if storage
+            .device_group_move(group_id)?
+            .is_some_and(|movement| {
+                matches!(
+                    movement.phase,
+                    storage_sqlite::DeviceGroupMovePhase::Waiting
+                        | storage_sqlite::DeviceGroupMovePhase::Joined
+                )
+            })
+        {
+            return Ok(true);
         }
         if self.trust_device_group(
             group_id,
@@ -944,15 +973,47 @@ impl AppClient {
         leaf_signature_key: Vec<u8>,
         operations: Vec<DeviceRosterOperationV1>,
     ) -> Result<(), AppError> {
+        self.unlink_device_from_group_with_context(
+            group_id,
+            leaf_signature_key,
+            operations,
+            Self::local_human_action_context(
+                "unlink_device",
+                vec!["members"],
+                vec![DEVICE_ROSTER_COMPONENT_ID],
+                Some(1),
+            ),
+        )
+        .await
+    }
+
+    pub(crate) async fn unlink_moved_device_from_group(
+        &mut self,
+        group_id: &GroupId,
+        leaf_signature_key: Vec<u8>,
+        slot: DeviceSlotId,
+    ) -> Result<(), AppError> {
+        self.unlink_device_from_group_with_context(
+            group_id,
+            leaf_signature_key,
+            vec![DeviceRosterOperationV1::RemoveDevice(slot)],
+            marmot_forensics::AuditEventContext::default(),
+        )
+        .await
+    }
+
+    async fn unlink_device_from_group_with_context(
+        &mut self,
+        group_id: &GroupId,
+        leaf_signature_key: Vec<u8>,
+        operations: Vec<DeviceRosterOperationV1>,
+        audit_context: marmot_forensics::AuditEventContext,
+    ) -> Result<(), AppError> {
         let roster_update = DeviceRosterUpdateV1::new(operations)
-            .and_then(|update| encode_device_roster_update_v1(&update).map_err(|e| e.to_string()))
+            .and_then(|update| {
+                encode_device_roster_update_v1(&update).map_err(|error| error.to_string())
+            })
             .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
-        let audit_context = Self::local_human_action_context(
-            "unlink_device",
-            vec!["members"],
-            vec![DEVICE_ROSTER_COMPONENT_ID],
-            Some(1),
-        );
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -1121,6 +1182,7 @@ fn linked_device(
             DeviceStatusV1::Active => LinkedDeviceStatus::Active,
             DeviceStatusV1::Inactive => LinkedDeviceStatus::Inactive,
             DeviceStatusV1::Leaving => LinkedDeviceStatus::Leaving,
+            DeviceStatusV1::Moved => LinkedDeviceStatus::Moved,
         },
         add_to_all_chats: entry.settings.add_to_all_chats,
         bring_history: entry.settings.bring_history,

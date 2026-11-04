@@ -310,6 +310,10 @@ impl AppClient {
                 self.choose_link_device(&prompt_id, choices, now)
             }
             DeviceLinkOp::Decline { prompt_id } => self.decline_link(&prompt_id, now),
+            DeviceLinkOp::DismissMoveSibling {
+                move_id,
+                slot_id_hex,
+            } => self.dismiss_move_sibling(&move_id, &slot_id_hex),
             DeviceLinkOp::Read => Ok(()),
         };
         // Send what the op owes even when it was refused.
@@ -372,6 +376,9 @@ impl AppClient {
         if self.device_unlinked {
             // An unlinked device answers nothing more (D67).
             return;
+        }
+        if let Err(error) = self.drive_device_group_moves(now).await {
+            tracing::warn!(target: TARGET, method = "drive_device_pairing_at", error_kind = error.privacy_safe_kind(), "could not advance a device-group move; retrying");
         }
         self.decide_device_links(now).await;
         self.device_pairing.prompts.retain(|prompt| {
@@ -491,9 +498,6 @@ impl AppClient {
             .is_some_and(|link| link.outcome.is_none())
         {
             return Err(AppError::DeviceGroupRefused("pairing_in_progress"));
-        }
-        if self.trusted_device_group()?.is_some() {
-            return Err(AppError::DeviceGroupRefused("device_group_exists"));
         }
         let lifecycle = self
             .app
@@ -656,6 +660,30 @@ impl AppClient {
         }
     }
 
+    pub(crate) fn note_move_link_made(&mut self, destination: &GroupId) {
+        if let Some(link) = self.device_pairing.new_device.as_mut()
+            && link
+                .joining
+                .as_ref()
+                .is_some_and(|(group, _)| group == destination)
+        {
+            link.joining = None;
+            link.outcome = Some(NewDeviceOutcome::Linked);
+        }
+    }
+
+    pub(crate) fn note_move_link_failed(&mut self, destination: &GroupId) {
+        if let Some(link) = self.device_pairing.new_device.as_mut()
+            && link
+                .joining
+                .as_ref()
+                .is_some_and(|(group, _)| group == destination)
+        {
+            link.joining = None;
+            link.outcome = Some(NewDeviceOutcome::Ended(DeviceLinkEndReason::LinkFailed));
+        }
+    }
+
     /// Record how the new-device session ended, once it has, unless it is
     /// waiting for its Welcome, where [`Self::follow_joining`] decides.
     fn end_new_device_if_over(&mut self, _now: u64) {
@@ -694,10 +722,16 @@ impl AppClient {
         let Some((group_id, deadline)) = link.joining.clone() else {
             return Ok(());
         };
-        let trusted = self
-            .app
-            .account_storage(&self.state.label)?
-            .app_storage()
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if storage
+            .device_group_move(&group_id)?
+            .is_some_and(|movement| movement.phase == storage_sqlite::DeviceGroupMovePhase::Joined)
+        {
+            // Native admission already won any later Cancel, but a move is
+            // still Joining until the outer drive records present Made proof.
+            return Ok(());
+        }
+        let trusted = storage
             .device_group(&hex::encode(group_id.as_slice()))?
             .is_some_and(|record| record.trust == DeviceGroupTrust::Linked);
         let ended = if trusted {
@@ -815,6 +849,24 @@ impl AppClient {
     /// Check a found KeyPackage against the device group and answer its
     /// request, or say why it can't be linked.
     fn check_and_answer(&mut self, session_id: &SessionId, now: u64) -> Result<(), AppError> {
+        // A restart drops the in-memory new-device session, not its pending
+        // move. It still must not answer as an approver before Made.
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_group_moves()?
+            .iter()
+            .any(|movement| {
+                matches!(
+                    movement.phase,
+                    storage_sqlite::DeviceGroupMovePhase::Waiting
+                        | storage_sqlite::DeviceGroupMovePhase::Joined
+                )
+            })
+        {
+            return Ok(());
+        }
         let own_slot = self.own_slot()?;
         let account_id_hex = self
             .app
@@ -1697,6 +1749,19 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         let trusted = self.trusted_device_group()?;
         for (group_id_hex, _) in storage.device_group_joins()? {
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            if storage
+                .device_group_move(&group_id)?
+                .is_some_and(|movement| {
+                    matches!(
+                        movement.phase,
+                        storage_sqlite::DeviceGroupMovePhase::Waiting
+                            | storage_sqlite::DeviceGroupMovePhase::Joined
+                    )
+                })
+            {
+                continue;
+            }
             let joined = trusted
                 .as_ref()
                 .is_some_and(|group_id| hex::encode(group_id.as_slice()) == group_id_hex);
@@ -1970,6 +2035,7 @@ impl AppClient {
         Ok(DeviceLinkSnapshot {
             new_device,
             prompts,
+            moves: self.device_group_move_views()?,
         })
     }
 }
