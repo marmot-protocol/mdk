@@ -24,15 +24,16 @@ assert!(matches!(doc.blocks.as_slice(), [Block::Heading { level: 1, .. }]));
 
 ## Renderer security contract
 
-Message Markdown and every link destination are untrusted. The parser preserves destinations instead of deleting or
-rewriting them, and annotates links, images, and autolinks with `LinkDestinationKind`. That classification is context
-for client policy; it is not authorization to navigate or fetch.
+Message Markdown and every link destination are untrusted. After Markdown decoding, explicit destinations retain
+their spelling in the AST. Inferred bare domains carry the original visible label and an HTTPS destination with a
+validated ASCII host. Links, images and autolinks also carry `LinkDestinationKind`. This classification informs client
+policy; opening or fetching still requires a client decision.
 
 Renderers **must inspect `classification` before making a destination actionable**. In particular:
 
 - `Dangerous` (`javascript:`, `data:`, `vbscript:`, `file:`) and `Sensitive` (`nsec` / `ncryptsec`, including Nostr
   wrappers) should remain non-actionable by default.
-- `Unknown` and `Relative` require an explicit client decision rather than inheriting a WebView or OS opener default.
+- `Unknown` and `Relative` require an explicit client policy before delegating to a WebView or OS opener.
 - `Web`, `Contact`, `App`, and `Nostr` identify recognized destination families, but clients still apply their own
   navigation, deep-link, privacy, and network policies.
 - Image renderers must apply the classification and their network policy before fetching `dest`; classification alone
@@ -59,7 +60,7 @@ This is a block-oriented extension, not a general HTML parser:
   (formatting, entities, links, and Nostr mentions). Missing or empty summaries
   yield `summary: []`; clients may supply a localized fallback label. A later
   summary is ordinary body text. A malformed initial summary falls back to
-  ordinary Markdown instead of dropping text.
+  ordinary Markdown, preserving its text.
 - The `open` attribute means expanded even when written `open="false"`. Other
   attributes are ignored and never tokenized as destinations. Styles, scripts,
   event handlers, and URLs are not rendering instructions.
@@ -74,7 +75,7 @@ This is a block-oriented extension, not a general HTML parser:
   and unmatched backtick runs are never rescanned. An open summary code span
   keeps interior `</summary>` and `</details>` lines as content until a
   matching run closes it. Failed candidates restore ordinary block structure
-  and source gaps instead of collapsing to one paragraph.
+  and the original source gaps.
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.
@@ -142,7 +143,7 @@ names remain text, case-insensitively, even when the ending is a delegated root.
 Other ordinary file extensions absent from the root list also remain text.
 
 Controls, bidirectional formatting controls and default-ignorable formatting
-characters are rejected in inferred destinations rather than silently removed.
+characters are rejected in inferred destinations.
 IDNA does not detect all lookalike domains. Renderers must retain their labelled-link
 confirmation policy, show the actual ASCII authority when confirming an IDN, and
 never replace confusable characters with a guessed Latin destination. Existing

@@ -14,15 +14,15 @@ Markdown parser and typed AST for app message rendering. For the human overview,
 
 ## Layout
 
-- `src/lib.rs` — `parse`, public constants (`MAX_CONTAINER_DEPTH`, `MAX_SOURCE_BLANK_LINES`), re-exports.
-- `src/ast.rs` — `Block`, `Inline`, `Document`, `LinkDestinationKind`, and other AST types.
-- `src/block.rs` — pass 1, block structure. `src/inline.rs` — pass 2, inline tokenization. Keep the passes unfused.
-- `src/details.rs` — bounded `<details>` / `<summary>` grammar.
-- `src/destination.rs` — untrusted link-destination classification.
-- `src/nostr.rs` — bech32 shape validation and HRP classification (shape only, no checksum).
-- `src/domain.rs` — offline bare-domain inference and filename exceptions; `src/iana-tlds.txt` — reviewed root snapshot.
-- `src/entity.rs` — HTML entity decoding. `src/scanner.rs` — shared byte-level scanning helpers.
-- `tests/golden/` — `*.md` inputs with `*.json` expected ASTs; `tests/unit_*.rs`, `tests/spec*.rs` — focused coverage.
+- `src/lib.rs`: `parse`, public constants (`MAX_CONTAINER_DEPTH`, `MAX_SOURCE_BLANK_LINES`), re-exports.
+- `src/ast.rs`: `Block`, `Inline`, `Document`, `LinkDestinationKind`, and other AST types.
+- `src/block.rs`: pass 1, block structure. `src/inline.rs`: pass 2, inline tokenization. Keep the passes unfused.
+- `src/details.rs`: bounded `<details>` / `<summary>` grammar.
+- `src/destination.rs`: untrusted link-destination classification.
+- `src/nostr.rs`: bech32 shape validation and HRP classification (shape only, no checksum).
+- `src/domain.rs`: offline bare-domain inference and filename exceptions; `src/iana-tlds.txt`: reviewed root snapshot.
+- `src/entity.rs`: HTML entity decoding. `src/scanner.rs`: shared byte-level scanning helpers.
+- `tests/golden/`: `*.md` inputs with `*.json` expected ASTs; `tests/unit_*.rs`, `tests/spec*.rs`: focused coverage.
 
 ## Verification
 
