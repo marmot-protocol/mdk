@@ -43,11 +43,22 @@ mod tests {
     }
 
     #[test]
+    fn older_signer_record_without_proof_remains_readable() {
+        let binding: AccountDeviceSignerBinding =
+            deserialize(br#"{"marmot_identity":[1,1,1,1],"mls_signature_public_key":[9,8,7]}"#)
+                .unwrap();
+        assert_eq!(binding.marmot_identity, member_id(1));
+        assert_eq!(binding.mls_signature_public_key, vec![9, 8, 7]);
+        assert_eq!(binding.account_identity_proof, None);
+    }
+
+    #[test]
     fn account_device_signer_binding_round_trips() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let binding = AccountDeviceSignerBinding {
             marmot_identity: member_id(1),
             mls_signature_public_key: vec![9, 8, 7],
+            account_identity_proof: Some(vec![1, 2, 3]),
         };
         store.put_account_device_signer(&binding).unwrap();
         assert_eq!(
