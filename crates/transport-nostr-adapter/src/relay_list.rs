@@ -206,6 +206,7 @@ impl NostrNip65RelayListPublication {
 mod tests {
     use super::*;
 
+    // Owns NIP-65 (10002/r) and Inbox (10050/relay) literal kind/tag contracts.
     #[test]
     fn nip65_relay_list_uses_kind_10002_and_r_tags() {
         for (kind, expected_kind, tag) in [

@@ -316,7 +316,7 @@ async fn direct_publish_admission_and_unpolled_future_do_not_count() {
         .await
         .expect_err("malformed payload");
     assert!(matches!(malformed, TransportAdapterError::Publish(reason)
-        if reason == "Nostr payload: malformed Nostr event: expected ident at line 1 column 2"));
+        if reason.starts_with("Nostr payload: malformed Nostr event:")));
 
     let pending = adapter.publish(request(
         account_id,

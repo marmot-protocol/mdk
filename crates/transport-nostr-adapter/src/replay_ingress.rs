@@ -1105,7 +1105,7 @@ mod tests {
             assert_eq!(
                 reopened.shared.held(),
                 (1, 1),
-                "reopening the same durable row does not charge it twice"
+                "a released preactivation cache reloads one durable row"
             );
             drop(adapter);
             assert!(matches!(
