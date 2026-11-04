@@ -176,6 +176,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("history_deliveries_parked", Side::App),
     ("history_delivery_sends", Side::App),
     ("imported_media_file_keys", Side::App),
+    ("kept_recipient_receipts", Side::App),
     ("local_group_deletion_frontiers", Side::App),
     ("local_message_submissions", Side::App),
     ("media_file_refs", Side::App),

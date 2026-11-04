@@ -325,7 +325,8 @@ pub struct TimelineMessageRecordFfi {
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
     /// commits and projects locally *before* it publishes, so a message that
     /// was committed but not yet delivered (e.g. sent offline / relay
-    /// unreachable) carries `None` here — render it as pending/failed. On
+    /// unreachable) carries `None` here — render it as pending/failed unless
+    /// `recipient_confirmed` is set. On
     /// delivery/convergence the same row is upserted with `Some(..)` (the
     /// published source event id), so flip the UI to delivered once this
     /// becomes non-null. To re-drive delivery of a stuck pending message
@@ -381,6 +382,15 @@ pub struct TimelineMessageRecordFfi {
     /// instead of disappearing; the value is the engine invalidation reason
     /// (e.g. `LosingBranch`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+    /// True when a peer reacted to this own send after it failed with no relay
+    /// acceptance on record: the reaction proves that peer received it
+    /// (mdk#1291). It stays true if retention later prunes that reaction.
+    /// Render it as delivered. `source_message_id_hex` stays `None` for such a
+    /// row, because the reaction does not say which published event carried
+    /// the message, and `invalidation_status` is `None`. A change arrives with
+    /// the `DeliveryOrSendStateChanged` trigger. Always `false` for received
+    /// and system rows.
+    pub recipient_confirmed: bool,
     /// The device this row came from in a chat history it sent; `None` for
     /// a row that arrived live. Draw "Imported from <device>" where rows
     /// change from imported to live.
@@ -436,6 +446,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             deletion_source: value.deletion_source.into(),
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,
             invalidation_status: value.invalidation_status,
+            recipient_confirmed: value.recipient_confirmed,
             imported_from: value.imported_from.map(Into::into),
             history_import_provenance: value.history_import_provenance.map(Into::into),
         }
@@ -834,6 +845,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         }
