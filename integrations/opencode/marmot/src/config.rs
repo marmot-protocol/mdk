@@ -18,7 +18,7 @@ const SPEC: ConfigSpec = ConfigSpec {
 };
 
 #[derive(Clone)]
-pub(crate) struct Config(LoadedConfig);
+pub(crate) struct Config(LoadedConfig, bool);
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self> {
@@ -32,13 +32,23 @@ impl Config {
     }
 
     fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        load_config_with(SPEC, lookup).map(Self)
+        let native_enabled = match lookup("WN_OPENCODE_TRANSPORT").as_deref() {
+            None | Some("cli") => false,
+            Some("native") => true,
+            Some(_) => {
+                return Err(marmot_terminal_harness::HarnessError::Config(
+                    "WN_OPENCODE_TRANSPORT must be cli or native".into(),
+                ));
+            }
+        };
+        load_config_with(SPEC, lookup).map(|loaded| Self(loaded, native_enabled))
     }
 
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
         let backend = OpencodeBackend {
             bin: self.0.bin,
             native: Default::default(),
+            native_enabled: self.1,
             execution_profile: self.0.harness.execution_profile,
         };
         (self.0.harness, backend)
@@ -87,6 +97,37 @@ mod tests {
             Config::from_pairs(&[("HOME", "/home/test"), ("WN_OPENCODE_ADMIN_HEX", SENDER)])
                 .unwrap();
         assert!(config.0.harness.allowed_senders.contains(SENDER));
+    }
+
+    #[test]
+    fn transport_selection_is_validated_before_backend_construction() {
+        assert!(
+            !Config::from_pairs(&defaults())
+                .unwrap()
+                .into_harness()
+                .1
+                .native_enabled
+        );
+        for (value, expected) in [("cli", false), ("native", true)] {
+            let mut pairs = defaults();
+            pairs.push(("WN_OPENCODE_TRANSPORT", value));
+            assert_eq!(
+                Config::from_pairs(&pairs)
+                    .unwrap()
+                    .into_harness()
+                    .1
+                    .native_enabled,
+                expected
+            );
+        }
+        for value in ["", "Native", "native ", "unknown"] {
+            let mut pairs = defaults();
+            pairs.push(("WN_OPENCODE_TRANSPORT", value));
+            assert!(
+                matches!(Config::from_pairs(&pairs), Err(marmot_terminal_harness::HarnessError::Config(message))
+                if message == "WN_OPENCODE_TRANSPORT must be cli or native")
+            );
+        }
     }
 
     #[test]

@@ -156,6 +156,48 @@ class NativeTests(unittest.TestCase):
             self.assertFalse(bridge.persisted_message(result,'msg_fixture','prompt',expected))
             result['parts']=expected+[{'type':'text','synthetic':True,'text':'Read tool failed to read fixture'}]
             self.assertFalse(bridge.persisted_message(result,'msg_fixture','prompt',expected))
+    def test_http_budget_accepts_inline_media_for_initial_readback_and_followup(self):
+        # Exercise Server.call itself: FakeServer bypasses its response guard.
+        server = bridge.Server.__new__(bridge.Server)
+        server.child = MagicMock()
+        server.child.poll.return_value = None
+        server.base = 'http://127.0.0.1:700'
+        server.headers = {}
+        server.http = MagicMock()
+        media = 'data:image/png;base64,' + bridge.base64.b64encode(b'x' * (4 * 1024 * 1024)).decode()
+        message = {'info': {'id': 'msg_media'}, 'parts': [
+            {'type': 'text', 'text': 'prompt'},
+            {'type': 'file', 'filename': 'image.png', 'url': media}]}
+        expected = [{'type': 'text', 'text': 'prompt'},
+                    {'filename': 'image.png', 'url': 'file:///image.png'}]
+        for method, path, body, result in [
+            ('GET', '/session/ses_fixture/message?limit=10', None, [message]),
+            ('POST', '/session/ses_fixture/message', {'noReply': True}, message),
+        ]:
+            with self.subTest(method=method):
+                response = io.BytesIO(bridge.json.dumps(result).encode())
+                server.http.open.return_value = response
+                observed = server.call(method, path, body)
+                if method == 'GET': observed = observed[0]
+                self.assertTrue(bridge.persisted_message(observed, 'msg_media', 'prompt', expected))
+
+    def test_http_budget_still_rejects_oversized_responses_without_retry(self):
+        server = bridge.Server.__new__(bridge.Server)
+        server.child = MagicMock()
+        server.child.poll.return_value = None
+        server.base = 'http://127.0.0.1:700'
+        server.headers = {}
+        server.http = MagicMock()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'x' * 33
+        server.http.open.return_value = response
+        with patch.object(bridge, 'RESPONSE_LIMIT', 32):
+            with self.assertRaisesRegex(ValueError, '^Response too large$'):
+                server.call('POST', '/session/ses_fixture/message', {'noReply': True})
+        response.read.assert_called_once_with(33)
+        server.http.open.assert_called_once()
+
     def test_relative_attachment_rejected(self):
         with self.assertRaises(ValueError):bridge.parts('prompt',['relative.txt'])
 
