@@ -107,7 +107,7 @@ impl<S: StorageProvider> Engine<S> {
             .map(|staged| {
                 sibling_context
                     .as_ref()
-                    .map(|context| context.staged_slots(&mls_group, staged))
+                    .map(|context| context.proposal_slots(&mls_group, staged.queued_proposals()))
                     .unwrap_or_default()
             })
             .unwrap_or_default();

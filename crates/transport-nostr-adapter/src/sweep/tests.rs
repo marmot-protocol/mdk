@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nostr::prelude::{EventId, Keys, Kind as NostrKind, PublicKey, Signature, Tag};
+use nostr::prelude::{
+    EventBuilder, EventId, FinalizeEvent, Keys, Kind as NostrKind, PublicKey, Signature, Tag,
+};
 
 use super::*;
 
@@ -394,15 +396,33 @@ fn caps_come_from_nip11() {
 
 #[test]
 fn closed_reasons_keep_only_their_category() {
-    assert_eq!(
-        ClosedReason::from_message("rate-limited: too many historical queries waiting").0,
-        Some(TransportEndpointRejectionCategory::RateLimited)
-    );
-    assert_eq!(
-        ClosedReason::from_message("blocked: too many concurrent REQs").0,
-        Some(TransportEndpointRejectionCategory::Blocked)
-    );
-    assert_eq!(ClosedReason::from_message("nope").0, None);
+    use TransportEndpointRejectionCategory as Category;
+    for (message, category) in [
+        ("duplicate: private diagnostic", Some(Category::Duplicate)),
+        ("pow: private diagnostic", Some(Category::Pow)),
+        ("blocked: private diagnostic", Some(Category::Blocked)),
+        (
+            "rate-limited: private diagnostic",
+            Some(Category::RateLimited),
+        ),
+        ("invalid: private diagnostic", Some(Category::Invalid)),
+        ("error: private diagnostic", Some(Category::Error)),
+        (
+            "unsupported: private diagnostic",
+            Some(Category::Unsupported),
+        ),
+        (
+            "auth-required: private diagnostic",
+            Some(Category::AuthRequired),
+        ),
+        ("restricted: private diagnostic", Some(Category::Restricted)),
+        ("custom: private diagnostic", None),
+        ("private diagnostic", None),
+    ] {
+        let reason = ClosedReason::from_message(message);
+        assert_eq!(reason.0, category, "{message}");
+        assert!(!format!("{reason:?}").contains("private diagnostic"));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -641,76 +661,58 @@ async fn a_wrong_more_costs_requests_never_history() {
         sweep.policy.initial_delta = DAY;
         sweep
     };
-    let honest = ModelRelay::new(Profile::Wok, events.clone());
-    let baseline = run_sweep(
-        sweep(),
-        &honest,
-        &mut honest.sink(),
-        &MemoryStore::default(),
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(baseline.stats.requests, 1);
+    for (events, raw_only) in [(events, false), (Vec::new(), true)] {
+        let honest = ModelRelay::new(Profile::Wok, events.clone());
+        let baseline = run_sweep(
+            sweep(),
+            &honest,
+            &mut honest.sink(),
+            &MemoryStore::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(baseline.stats.requests, 1);
 
-    // The relay sends the whole slice but says `more`: the sweep drops the
-    // reply, asks for both halves, and admits the same events once.
-    let wrong = ModelRelay::new(Profile::Wok, events.clone());
-    let all = wrong.matching(route(), range.since, range.until);
-    let reply = SliceReply::Answered {
-        received: all.len(),
-        events: all.iter().map(|stored| stored.event.clone()).collect(),
-        more: true,
-    };
-    wrong.script.lock().unwrap().push_back(reply);
-    let mut sink = wrong.sink();
-    let report = run_sweep(
-        sweep(),
-        &wrong,
-        &mut sink,
-        &MemoryStore::default(),
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, SweepEnd::Finished);
-    assert_eq!(report.stats.halvings, 1);
-    assert_eq!(report.stats.requests, baseline.stats.requests + 2);
-    assert_eq!(report.stats.events, baseline.stats.events);
-    assert_contiguous(&report.covered, range);
-    assert_admitted_once_in_order(&sink, &events, range);
-}
-
-#[tokio::test(start_paused = true)]
-async fn wok_more_hint_splits_below_the_cap() {
-    let range = SweepRange {
-        since: T0,
-        until: T0 + DAY - 1,
-    };
-    let relay = ModelRelay::new(Profile::Wok, Vec::new());
-    // A cut the count cannot see (one filter asking for the cap makes this
-    // unreachable on wok today): `more` still wins.
-    relay
-        .script
-        .lock()
-        .unwrap()
-        .push_back(SliceReply::Answered {
-            events: Vec::new(),
-            received: 10,
-            more: true,
-        });
-    let report = run_sweep(
-        request(range),
-        &relay,
-        &mut relay.sink(),
-        &MemoryStore::default(),
-        &CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(report.end, SweepEnd::Finished);
-    assert_eq!(report.stats.halvings, 1);
-    assert_eq!(
-        report.covered[0].until - report.covered[0].since + 1,
-        DAY / 2
-    );
+        // The relay sends the whole slice but says `more`: the sweep drops the
+        // reply, asks for both halves, and admits the same events once.
+        let wrong = ModelRelay::new(Profile::Wok, events.clone());
+        let all = wrong.matching(route(), range.since, range.until);
+        let reply = if raw_only {
+            // The raw count can include events the SDK rejected. `more`
+            // still overrides a count below the published cap.
+            SliceReply::Answered {
+                events: Vec::new(),
+                received: 10,
+                more: true,
+            }
+        } else {
+            SliceReply::Answered {
+                received: all.len(),
+                events: all.iter().map(|stored| stored.event.clone()).collect(),
+                more: true,
+            }
+        };
+        wrong.script.lock().unwrap().push_back(reply);
+        let mut sink = wrong.sink();
+        let report = run_sweep(
+            sweep(),
+            &wrong,
+            &mut sink,
+            &MemoryStore::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.end, SweepEnd::Finished);
+        assert_eq!(report.stats.halvings, 1);
+        assert_eq!(report.stats.requests, baseline.stats.requests + 2);
+        assert_eq!(report.stats.events, baseline.stats.events);
+        assert_eq!(
+            report.covered[0].until - report.covered[0].since + 1,
+            DAY / 2
+        );
+        assert_contiguous(&report.covered, range);
+        assert_admitted_once_in_order(&sink, &events, range);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1198,6 +1200,9 @@ fn an_inbox_route_asks_for_and_keeps_only_its_recipients_gift_wraps() {
     assert_eq!(json["#p"], serde_json::json!([hex::encode(recipient)]));
     assert_eq!(json["since"], serde_json::json!(T0));
     assert_eq!(json["until"], serde_json::json!(T0 + DAY));
+    assert_eq!(json["limit"], serde_json::json!(500));
+    let unlimited = serde_json::to_value(inbox.slice_filter(T0, T0 + DAY, None)).unwrap();
+    assert!(unlimited.get("limit").is_none());
 
     let wrap = |kind: u16, recipient: [u8; 32]| {
         Event::new(
@@ -1217,4 +1222,242 @@ fn an_inbox_route_asks_for_and_keeps_only_its_recipients_gift_wraps() {
         !route().matches(&wrap(1059, GROUP)),
         "a group route keeps no gift wrap"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_failures_preserve_admitted_and_saved_prefixes() {
+    struct FaultStore {
+        cursor: Mutex<Option<SweepCursor>>,
+        fail_load: Mutex<bool>,
+        fail_save: Option<usize>,
+        saves: Mutex<usize>,
+        operations: Arc<Mutex<Vec<(&'static str, u64)>>>,
+    }
+    #[async_trait]
+    impl SweepCursorStore for FaultStore {
+        async fn load(&self) -> Result<Option<SweepCursor>, SweepStoreError> {
+            if std::mem::take(&mut *self.fail_load.lock().unwrap()) {
+                return Err(SweepStoreError);
+            }
+            Ok(*self.cursor.lock().unwrap())
+        }
+        async fn save(&self, cursor: SweepCursor) -> Result<(), SweepStoreError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(("save", cursor.next_since));
+            let mut saves = self.saves.lock().unwrap();
+            *saves += 1;
+            if self.fail_save == Some(*saves) {
+                return Err(SweepStoreError);
+            }
+            *self.cursor.lock().unwrap() = Some(cursor);
+            Ok(())
+        }
+    }
+    struct FaultSink {
+        fail_admit: Option<usize>,
+        attempts: usize,
+        // Caller-owned admission is idempotent across a failed cursor save.
+        events: HashSet<EventId>,
+        operations: Arc<Mutex<Vec<(&'static str, u64)>>>,
+    }
+    #[async_trait]
+    impl SweepSink for FaultSink {
+        async fn admit(
+            &mut self,
+            slice: CoveredSlice,
+            events: Vec<Event>,
+        ) -> Result<(), SweepSinkError> {
+            self.operations.lock().unwrap().push(("admit", slice.since));
+            self.attempts += 1;
+            if self.fail_admit == Some(self.attempts) {
+                return Err(SweepSinkError);
+            }
+            self.events.extend(events.into_iter().map(|event| event.id));
+            Ok(())
+        }
+    }
+
+    for fault in [
+        "load",
+        "first_admit",
+        "second_admit",
+        "first_save",
+        "second_save",
+    ] {
+        let keys = Keys::generate();
+        let events = (0..3)
+            .map(|n| {
+                EventBuilder::new(NostrKind::MlsGroupMessage, format!("history-{n}"))
+                    .tags([Tag::custom("h", [hex::encode(GROUP)])])
+                    .custom_created_at(Timestamp::from_secs(T0 + n))
+                    .finalize(&keys)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let wanted = events.iter().map(|event| event.id).collect::<HashSet<_>>();
+        let relay = ModelRelay::new(Profile::Strfry, events);
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let initial = SweepCursor {
+            next_since: T0,
+            delta: 1,
+            observed_cap: None,
+        };
+        let store = FaultStore {
+            cursor: Mutex::new(Some(initial)),
+            fail_load: Mutex::new(fault == "load"),
+            fail_save: match fault {
+                "first_save" => Some(1),
+                "second_save" => Some(2),
+                _ => None,
+            },
+            saves: Mutex::new(0),
+            operations: operations.clone(),
+        };
+        let mut sink = FaultSink {
+            fail_admit: match fault {
+                "first_admit" => Some(1),
+                "second_admit" => Some(2),
+                _ => None,
+            },
+            attempts: 0,
+            events: HashSet::new(),
+            operations: operations.clone(),
+        };
+        let mut sweep = request(SweepRange {
+            since: T0,
+            until: T0 + 2,
+        });
+        sweep.policy.initial_delta = 1;
+        sweep.policy.max_delta = 1;
+        let report = run_sweep(sweep, &relay, &mut sink, &store, &CancellationToken::new()).await;
+        let (end, admitted, saved, expected_operations) = match fault {
+            "load" => (SweepEnd::StoreFailed, 0, T0, vec![]),
+            "first_admit" => (SweepEnd::SinkFailed, 0, T0, vec![("admit", T0)]),
+            "second_admit" => (
+                SweepEnd::SinkFailed,
+                1,
+                T0 + 1,
+                vec![("admit", T0), ("save", T0 + 1), ("admit", T0 + 1)],
+            ),
+            "first_save" => (
+                SweepEnd::StoreFailed,
+                1,
+                T0,
+                vec![("admit", T0), ("save", T0 + 1)],
+            ),
+            "second_save" => (
+                SweepEnd::StoreFailed,
+                2,
+                T0 + 1,
+                vec![
+                    ("admit", T0),
+                    ("save", T0 + 1),
+                    ("admit", T0 + 1),
+                    ("save", T0 + 2),
+                ],
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(report.end, end, "{fault}");
+        assert_eq!(report.outcome(), SweepOutcomeKind::LocalFailure, "{fault}");
+        assert_eq!(report.covered.len(), admitted, "{fault}");
+        assert_eq!(report.stats.events, admitted as u64);
+        assert_eq!(*operations.lock().unwrap(), expected_operations, "{fault}");
+        assert_eq!(
+            store.cursor.lock().unwrap().unwrap().next_since,
+            saved,
+            "{fault}"
+        );
+        if fault == "load" {
+            assert_eq!(report.cursor, None);
+            assert_eq!(report.stats.requests, 0);
+            assert!(relay.queries().is_empty());
+        } else {
+            // This is the admitted in-memory position, not a claim that a
+            // failed save committed it to the caller's durable cursor.
+            assert_eq!(report.cursor.unwrap().next_since, T0 + admitted as u64);
+        }
+
+        let queries_before = relay.queries().len();
+        let again = run_sweep(sweep, &relay, &mut sink, &store, &CancellationToken::new()).await;
+        assert_eq!(again.end, SweepEnd::Finished, "{fault}");
+        assert_eq!(relay.queries()[queries_before].since, saved, "{fault}");
+        assert_eq!(sink.events, wanted, "{fault}");
+        assert_eq!(store.cursor.lock().unwrap().unwrap().next_since, T0 + 3);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_eligible_returned_events_reach_the_sweep_sink() {
+    let keys = Keys::generate();
+    let event = |kind: u16, group: [u8; 32], at: u64, content: &str| {
+        EventBuilder::new(NostrKind::from(kind), content)
+            .tags([Tag::custom("h", [hex::encode(group)])])
+            .custom_created_at(Timestamp::from_secs(at))
+            .finalize(&keys)
+            .unwrap()
+    };
+    let range = SweepRange {
+        since: T0,
+        until: T0 + 2,
+    };
+    let first = event(445, GROUP, T0, "first");
+    let last = event(445, GROUP, T0 + 2, "last");
+    let mut ties = [
+        event(445, GROUP, T0 + 1, "tie a"),
+        event(445, GROUP, T0 + 1, "tie b"),
+    ];
+    ties.sort_by_key(|event| event.id);
+    let expected = [
+        first.clone(),
+        ties[0].clone(),
+        ties[1].clone(),
+        last.clone(),
+    ];
+    let incoming = vec![
+        last,
+        ties[1].clone(),
+        event(445, OTHER_GROUP, T0, "wrong group"),
+        event(1, GROUP, T0, "wrong kind"),
+        event(445, GROUP, T0 - 1, "too early"),
+        event(445, GROUP, T0 + 3, "too late"),
+        ties[0].clone(),
+        first,
+    ];
+    let relay = ModelRelay::new(Profile::Strfry, Vec::new());
+    relay
+        .script
+        .lock()
+        .unwrap()
+        .push_back(SliceReply::Answered {
+            events: incoming,
+            received: 11,
+            more: false,
+        });
+    let mut sink = RecordingSink::default();
+    let report = run_sweep(
+        request(range),
+        &relay,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished);
+    assert_eq!(sink.events, expected);
+    assert_eq!(
+        report.covered,
+        [CoveredSlice {
+            since: T0,
+            until: T0 + 2,
+            proof: SliceProof::BelowCap {
+                received: 11,
+                cap: 500
+            },
+            events: 4
+        }]
+    );
+    assert_eq!(sink.slices, report.covered);
 }

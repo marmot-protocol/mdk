@@ -613,6 +613,40 @@ mod tests {
     #[derive(Debug)]
     struct Scripted(Mutex<Vec<Message>>);
 
+    #[test]
+    fn debug_keeps_registered_watch_identities_private() {
+        let endpoint = RelayUrl::parse("wss://private-watch.example.com/history-secret").unwrap();
+        let group = hex::encode([93; 32]);
+        let filter = Filter::new().custom_tag(
+            nostr::prelude::SingleLetterTag::from_char('h').unwrap(),
+            group.clone(),
+        );
+        let hints = Arc::new(EoseHints::default());
+        let watch = hints.watch(&endpoint, &filter);
+        let endpoint_text = <&Url>::from(&endpoint).as_str();
+        hints.sent(
+            endpoint_text,
+            &req("private-subscription-secret", vec![filter]),
+        );
+        let transport =
+            HintTransport::new(Arc::new(Scripted(Mutex::new(Vec::new()))), hints.clone());
+
+        for debug in [format!("{hints:?}"), format!("{transport:?}")] {
+            for secret in [endpoint_text, group.as_str(), "private-subscription-secret"] {
+                assert!(
+                    !debug.contains(secret),
+                    "watch identity leaked through Debug"
+                );
+            }
+        }
+        // Keep the real registration alive throughout both format calls.
+        hints.received(
+            endpoint_text,
+            r#"["EOSE","private-subscription-secret",["more"]]"#,
+        );
+        assert!(watch.more());
+    }
+
     impl WebSocketTransport for Scripted {
         fn support_ping(&self) -> bool {
             false

@@ -94,6 +94,62 @@ fn snapshot_transport_message_group() {
 }
 
 #[test]
+fn snapshot_recovery_dtos() {
+    let source = cgka_traits::GroupRecoverySource {
+        epoch: EpochId(7),
+        epoch_authenticator_hash: [17; 32],
+        leaf_index: 3,
+        leaf_hash: [34; 32],
+        device_key_hash: [68; 32],
+        coordinator_key_hash: [102; 32],
+    };
+    let bodies = [
+        cgka_traits::GroupRecoveryBody::Request {
+            device_key_hash: [68; 32],
+        },
+        cgka_traits::GroupRecoveryBody::Challenge {
+            source: source.clone(),
+        },
+        cgka_traits::GroupRecoveryBody::Grant {
+            source: source.clone(),
+            key_package: KeyPackage::new(vec![1, 2, 3]),
+            device_signature: vec![85; 64],
+        },
+    ];
+    insta::assert_snapshot!(serde_json::to_string(&source).unwrap(), @r###"{"epoch":7,"epoch_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],"leaf_index":3,"leaf_hash":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34],"device_key_hash":[68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68],"coordinator_key_hash":[102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102]}"###);
+    let message = cgka_traits::GroupRecoveryMessage {
+        group_id: gid(),
+        request_id: [51; 32],
+        expires_at: 1234,
+        body: bodies[0].clone(),
+    };
+    insta::assert_snapshot!(serde_json::to_string(&message).unwrap(), @r###"{"group_id":[170,170,170,170],"request_id":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],"expires_at":1234,"body":{"type":"request","device_key_hash":[68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68]}}"###);
+    let message = cgka_traits::GroupRecoveryMessage {
+        group_id: gid(),
+        request_id: [51; 32],
+        expires_at: 1234,
+        body: bodies[1].clone(),
+    };
+    insta::assert_snapshot!(serde_json::to_string(&message).unwrap(), @r###"{"group_id":[170,170,170,170],"request_id":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],"expires_at":1234,"body":{"type":"challenge","source":{"epoch":7,"epoch_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],"leaf_index":3,"leaf_hash":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34],"device_key_hash":[68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68],"coordinator_key_hash":[102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102]}}}"###);
+    let message = cgka_traits::GroupRecoveryMessage {
+        group_id: gid(),
+        request_id: [51; 32],
+        expires_at: 1234,
+        body: bodies[2].clone(),
+    };
+    insta::assert_snapshot!(serde_json::to_string(&message).unwrap(), @r###"{"group_id":[170,170,170,170],"request_id":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],"expires_at":1234,"body":{"type":"grant","source":{"epoch":7,"epoch_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],"leaf_index":3,"leaf_hash":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34],"device_key_hash":[68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68],"coordinator_key_hash":[102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102]},"key_package":{"bytes":[1,2,3],"protocol_profile":"legacy"},"device_signature":[85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85]}}"###);
+    let member = cgka_traits::GroupMemberRecovery {
+        member: mem_id(),
+        source,
+        key_package: KeyPackage::new(vec![1, 2, 3]),
+        request_id: [51; 32],
+        expires_at: 1234,
+        device_signature: vec![85; 64],
+    };
+    insta::assert_snapshot!(serde_json::to_string(&member).unwrap(), @r###"{"member":[97,108,105,99,101],"source":{"epoch":7,"epoch_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],"leaf_index":3,"leaf_hash":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34],"device_key_hash":[68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68,68],"coordinator_key_hash":[102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102]},"key_package":{"bytes":[1,2,3],"protocol_profile":"legacy"},"request_id":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],"expires_at":1234,"device_signature":[85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85]}"###);
+}
+
+#[test]
 fn snapshot_transport_message_welcome() {
     let msg = TransportMessage {
         id: mid(),
