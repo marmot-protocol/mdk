@@ -451,6 +451,12 @@ media, and agent-stream anchors/finals in conversation order. Projected history 
 first, then local receipt/insertion order, so synced stream anchors and finals stay in conversation order rather than
 relay catch-up order.
 
+**Delivery.** A timeline row (`messages timeline list|search|subscribe`) carries `invalidation_status`, which names
+why the row was withdrawn or failed (`local_publish_failed`, `LosingBranch`, ...) and is `null` otherwise. A row is
+delivered when `invalidation_status` is `null` and either `source_message_id` is set or `recipient_confirmed` is
+`true`. The second case is an own send that no relay accepted but another member reacted to, proving they received
+it. A row with `invalidation_status` set is not delivered, even when it keeps its `source_message_id`.
+
 **Subscriptions.** `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`,
 `groups subscribe-state`, and `notifications subscribe` require `wnd`. With `--json` they print newline-delimited
 responses with a typed `result.type`:

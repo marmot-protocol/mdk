@@ -810,6 +810,8 @@ pub(crate) fn timeline_message_record_json(
     json!({
         "message_id": message.message_id_hex,
         "source_message_id": message.source_message_id_hex,
+        "recipient_confirmed": message.recipient_confirmed,
+        "invalidation_status": message.invalidation_status,
         "direction": message.direction,
         "group_id": message.group_id_hex,
         "from": message.sender,
@@ -1079,6 +1081,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         };
@@ -1102,6 +1105,61 @@ mod tests {
             "You were removed from the group by alice"
         );
         assert_eq!(value["group_system"]["subject_is_self"], true);
+    }
+
+    /// A send a peer's reaction confirmed has no source id, so the JSON row
+    /// must carry `recipient_confirmed` for clients to read it as delivered.
+    #[test]
+    fn timeline_message_record_json_carries_recipient_confirmation() {
+        let sender = "aa".repeat(32);
+        let record = |recipient_confirmed| TimelineMessageRecord {
+            client_token: None,
+            has_reports: false,
+            group_system: None,
+            poll: None,
+            edit: None,
+            message_id_hex: "sent-1".to_owned(),
+            source_message_id_hex: None,
+            source_epoch: Some(3),
+            retention_seconds: None,
+            retention_expires_at: None,
+            direction: "sent".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: sender.clone(),
+            plaintext: "hello".to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media: None,
+            agent_text_stream: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deletion_source: Default::default(),
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+            recipient_confirmed,
+            imported_from: None,
+            history_import_provenance: None,
+        };
+
+        for confirmed in [true, false] {
+            let value =
+                timeline_message_record_json(record(confirmed), Some(&sender), &mut |_| None);
+            assert_eq!(value["source_message_id"], Value::Null);
+            assert_eq!(value["recipient_confirmed"], confirmed);
+            assert_eq!(value["invalidation_status"], Value::Null);
+        }
+
+        // A withdrawn row keeps its source id but is not delivered, so the
+        // JSON row names why it was withdrawn.
+        let mut withdrawn = record(false);
+        withdrawn.source_message_id_hex = Some("source-1".to_owned());
+        withdrawn.invalidation_status = Some("LosingBranch".to_owned());
+        let value = timeline_message_record_json(withdrawn, Some(&sender), &mut |_| None);
+        assert_eq!(value["invalidation_status"], "LosingBranch");
     }
 
     #[test]
