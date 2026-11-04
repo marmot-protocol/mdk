@@ -419,10 +419,77 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
                 .unwrap()
                 .is_none()
         }));
+        // Destination failure must not block the separately available old
+        // status Commit. Use the same real hydration-quarantine boundary as
+        // the gap-recovery owner, then repair it before the captured assertion.
+        {
+            use cgka_traits::storage::GroupStorage;
+            deliver_new(&mut moving.client, &relay, &mut moving.cursor).await;
+            let target_record = store.get_group(&target).unwrap();
+            let mut damaged = target_record.clone();
+            damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+            store.put_group(&damaged).unwrap();
+            moving = reopen(moving).await;
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .quarantined_groups()
+                    .iter()
+                    .any(|(group, _)| group == &target)
+            );
+            assert!(matches!(
+                moving.client.trusted_device_roster(),
+                Err(AppError::DeviceGroupRefused("roster_unavailable"))
+            ));
+            assert_eq!(
+                moving.client.trusted_device_group().unwrap(),
+                Some(target.clone())
+            );
+            assert!(moving.client.runtime.ensure_group_hydrated(&old).unwrap());
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .canonical_group_membership(&old)
+                    .unwrap()
+                    .local_leaf_active
+            );
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .device_group_takes_commit(&old, &[])
+                    .unwrap()
+            );
+            assert_eq!(
+                moving.roster(&old).devices[&slot].status,
+                cgka_traits::app_components::DeviceStatusV1::Active
+            );
+            // The ordinary pairing drive catches destination errors; its old
+            // cleanup must still get its independent attempt in the same pass.
+            moving
+                .client
+                .drive_device_pairing_at(unix_now_seconds())
+                .await;
+            let status = moving.roster(&old).devices[&slot].status;
+            store.put_group(&target_record).unwrap();
+            assert!(
+                moving
+                    .client
+                    .retry_hydrate_quarantined_group(&target)
+                    .unwrap()
+            );
+            moving.client.drain_pending_session_events().await.unwrap();
+            assert_eq!(
+                status,
+                cgka_traits::app_components::DeviceStatusV1::Moved,
+                "destination quarantine must not prevent the available old status Commit"
+            );
+        }
         // Ordinary native old-group work may still finish after Made. A
         // post-status SelfUpdate follows destination tagging, so cleanup must
         // identify the actual leaf by the selected old entry's signature key.
-        moving.step(&relay).await;
         assert_eq!(
             moving.roster(&old).devices[&slot].status,
             cgka_traits::app_components::DeviceStatusV1::Moved

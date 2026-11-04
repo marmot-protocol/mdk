@@ -20,7 +20,7 @@ use super::*;
 use cgka_engine::ManualConvergenceClock;
 use cgka_traits::app_components::{
     AccountEntryV1, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterOperationV1,
-    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, NOSTR_ROUTING_COMPONENT_ID,
+    DeviceRosterUpdateV1, DeviceRosterV1, DeviceSlotId, DeviceStatusV1, NOSTR_ROUTING_COMPONENT_ID,
     RejectedSlotReasonV1, RejectedSlotV1, decode_device_roster_v1, encode_device_roster_update_v1,
     encode_device_roster_v1,
 };
@@ -1264,6 +1264,16 @@ async fn race_roster_commits(
         &mut [&mut laptop],
     )
     .await;
+    race_prepared_roster_commits(phone, laptop, gid, by_phone, by_laptop).await
+}
+
+async fn race_prepared_roster_commits(
+    mut phone: Device,
+    mut laptop: Device,
+    gid: GroupId,
+    by_phone: impl FnOnce(&Device, &GroupId) -> SendIntent,
+    by_laptop: impl FnOnce(&Device, &GroupId) -> SendIntent,
+) -> (Device, Device, GroupId, SupersededIntentReport) {
     let by_phone = by_phone(&phone, &gid);
     let phone_commit = send_commit(&mut phone, by_phone, &gid).await;
     let by_laptop = by_laptop(&laptop, &gid);
@@ -1278,6 +1288,17 @@ async fn race_roster_commits(
             .converge_stored_openmls_messages_at(&gid, 1_000_000)
             .unwrap();
     }
+    assert_ne!(
+        phone
+            .engine
+            .owes_superseded_own_commit_reissue(&gid)
+            .unwrap(),
+        laptop
+            .engine
+            .owes_superseded_own_commit_reissue(&gid)
+            .unwrap(),
+        "exactly one retained own intent lost the selected branch"
+    );
     let phone_reports = phone
         .engine
         .reissue_superseded_own_commits_from_state()
@@ -1314,6 +1335,68 @@ async fn a_superseded_device_entry_replacement_is_reissued_when_the_winner_left_
     let devices = roster_of(&loser, &gid).devices;
     assert_eq!(devices[&slot(1)].label, "By phone");
     assert_eq!(devices[&slot(2)].label, "By laptop");
+}
+
+/// A moved-status Commit retains and reissues its full-entry CAS through
+/// the same native supersession owner as other roster replacements.
+#[tokio::test]
+async fn a_superseded_moved_status_is_reissued_when_its_old_entry_is_unchanged() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    super::device_tag::hold_slot(&phone, slot(1));
+    super::device_tag::hold_slot(&laptop, slot(2));
+    phone
+        .engine
+        .set_device_tag_group(Some(gid.clone()))
+        .unwrap();
+    laptop
+        .engine
+        .set_device_tag_group(Some(gid.clone()))
+        .unwrap();
+    super::device_tag::set_own_key(&mut phone, slot(1), &gid, &mut [&mut laptop]).await;
+    super::device_tag::set_own_key(&mut laptop, slot(2), &gid, &mut [&mut phone]).await;
+    let before = roster_of(&phone, &gid);
+    assert_eq!(before, roster_of(&laptop, &gid));
+    for (device, own_slot) in [(&phone, slot(1)), (&laptop, slot(2))] {
+        assert_eq!(
+            before.devices[&own_slot].tag_signature_key,
+            Some(device.engine.own_signature_key()),
+            "the real moved-status send has its own authenticated roster key"
+        );
+    }
+    let moved = |device: &Device, group_id: &GroupId, own_slot| SendIntent::MarkDeviceGroupMoved {
+        group_id: group_id.clone(),
+        slot: own_slot,
+        expected: Box::new(roster_of(device, group_id).devices[&own_slot].clone()),
+    };
+    let (mut loser, _winner, gid, report) = race_prepared_roster_commits(
+        phone,
+        laptop,
+        gid,
+        |device, group_id| moved(device, group_id, slot(1)),
+        |device, group_id| moved(device, group_id, slot(2)),
+    )
+    .await;
+    assert_eq!(report.kind, SupersededIntentKind::AppComponents);
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    let queued = queued_intents(&loser, &gid);
+    let [intent] = queued.as_slice() else {
+        panic!("the lost status is queued exactly once: {queued:?}")
+    };
+    assert!(matches!(intent, SendIntent::MarkDeviceGroupMoved { .. }));
+    let drained = loser
+        .engine
+        .converge_and_drain_queued_outbound_intents(&gid, 2_000_000)
+        .await
+        .unwrap();
+    let [SendResult::GroupEvolution { pending, .. }] = drained.as_slice() else {
+        panic!("the reissued moved status is prepared: {drained:?}")
+    };
+    loser.engine.confirm_published(*pending).await.unwrap();
+    let mut expected = before;
+    for entry in expected.devices.values_mut() {
+        entry.status = DeviceStatusV1::Moved;
+    }
+    assert_eq!(roster_of(&loser, &gid), expected);
 }
 
 /// A superseded replacement whose entry the winning branch changed is a
