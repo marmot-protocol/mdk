@@ -11,6 +11,11 @@ static ROOT_LABELS: OnceLock<Vec<&'static str>> = OnceLock::new();
 /// policy, not a statement about whether the corresponding domains exist.
 const FILE_ENDINGS: &[&str] = &["md", "pdf", "zip"];
 
+/// Necessary raw-source condition shared with explicit-label precedence handling.
+pub(crate) fn has_host_separator(text: &str) -> bool {
+    text.contains(['.', '。', '．', '｡'])
+}
+
 pub(crate) fn eligible_start(raw: &str, i: usize) -> bool {
     let Some(c) = raw[i..].chars().next() else {
         return false;
@@ -69,7 +74,7 @@ fn infer(text: &str) -> Option<String> {
     let authority_end = text.find(['/', '?', '#']).unwrap_or(text.len());
     let authority = &text[..authority_end];
     if authority.len() > 1024
-        || !authority.contains(['.', '。', '．', '｡'])
+        || !has_host_separator(authority)
         || authority.contains(['@', '\\', '%'])
     {
         return None;
@@ -87,14 +92,15 @@ fn infer(text: &str) -> Option<String> {
     // Scheme-bearing URLs, www URLs and Nostr entities keep their existing
     // recognizers and contracts. Private-key-looking values stay inert.
     let lower = host.to_ascii_lowercase();
-    if lower.starts_with("www.")
-        || lower.starts_with("nsec1")
-        || lower.starts_with("ncryptsec1")
-        || lower.starts_with("npub1")
-    {
+    if lower.starts_with("www.") || reserved_nostr_host(&lower) {
         return None;
     }
     let ascii = idna::domain_to_ascii_strict(host).ok()?;
+    // Compatibility mappings can turn fullwidth/mixed prefixes into ASCII.
+    // Apply the privacy/precedence guard to the actual destination as well.
+    if reserved_nostr_host(&ascii) {
+        return None;
+    }
     let (_, root) = ascii.rsplit_once('.')?;
     if root.is_empty() || FILE_ENDINGS.contains(&root) {
         return None;
@@ -113,6 +119,12 @@ fn infer(text: &str) -> Option<String> {
     }
     dest.push_str(&text[authority_end..]);
     Some(dest)
+}
+
+fn reserved_nostr_host(host: &str) -> bool {
+    ["nsec1", "ncryptsec1", "npub1"]
+        .iter()
+        .any(|prefix| host.starts_with(prefix))
 }
 
 fn unsafe_character(c: char) -> bool {

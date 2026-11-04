@@ -861,10 +861,13 @@ fn try_close_bracket(
     // The replacement pass never reparses labels again. Work is bounded by the
     // existing bracket/depth cap, including nested image labels.
     let explicit_label = || {
-        infer_domains.then(|| {
-            let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
-            tokenize_inner(source, refs, false)
-        })
+        if !infer_domains {
+            return None;
+        }
+        let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
+        // No inferred domain can occur without a raw host separator. Keep
+        // already parsed ordinary labels rather than tokenize them twice.
+        crate::domain::has_host_separator(source).then(|| tokenize_inner(source, refs, false))
     };
 
     // 1. Inline link: `](dest "title")`

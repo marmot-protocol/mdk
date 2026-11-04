@@ -463,6 +463,10 @@ fn schemeless_domain_file_endings_and_invalid_contexts_remain_inert() {
         "xn--.chat",
         "nsec1qqqqqq.chat",
         "ncryptsec1qqqqqq.chat",
+        "ｎｓｅｃ１qqqqqq.chat",
+        "nｓec1qqqqqq.chat",
+        "ｎｃｒｙｐｔｓｅｃ１qqqqqq.chat",
+        "ｎｐｕｂ１qqqqqq.chat",
     ] {
         assert_eq!(parse_inlines(source), vec![t(source)], "{source}");
     }
@@ -471,10 +475,18 @@ fn schemeless_domain_file_endings_and_invalid_contexts_remain_inert() {
 #[test]
 fn schemeless_domain_does_not_override_authored_links_code_or_escapes() {
     let expected = vec![domain_link("example.chat", "https://other.example")];
-    assert_eq!(
-        parse_inlines("[example.chat](https://other.example)"),
-        expected
-    );
+    for label in [
+        "example.chat",
+        "example。chat",
+        "example．chat",
+        "example｡chat",
+        "bücher.de",
+    ] {
+        assert_eq!(
+            parse_inlines(&format!("[{label}](https://other.example)")),
+            vec![domain_link(label, "https://other.example")]
+        );
+    }
     assert_eq!(
         parse_inlines("[example.chat][target]\n\n[target]: https://other.example"),
         expected
