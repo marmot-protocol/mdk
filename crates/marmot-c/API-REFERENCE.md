@@ -6469,7 +6469,7 @@ Start one manual current-membership history restore with borrowed recovery words
 MarmotStatus marmot_begin_recovery_words(const struct MarmotClient *client, const char *account_ref, struct MarmotRecoveryWords **out);
 ```
 
-Generate twelve setup words and two 1-based confirmation positions. Display once, never log/persist, and free output with `marmot_recovery_words_free`. Clear host copies separately; ordinary C strings are not secure buffers.
+Generate twelve setup words and two 1-based confirmation positions. Display once, never log/persist, and free output with `marmot_recovery_words_free`, which erases the returned word buffers before release. Clear host copies separately; earlier managed/FFI copies are outside that free's scope.
 
 [Header contract](include/marmot.h#L8390)
 
@@ -6509,7 +6509,7 @@ Pass the two answers in requested position order as borrowed strings. Keep the a
 void marmot_recovery_words_free(struct MarmotRecoveryWords *ptr);
 ```
 
-Deep-free returned words and confirmation positions; NULL is allowed. It does not erase other host copies or promise C-string erasure. This is not the pending setup cancel command.
+Erase the returned word buffers, then deep-free the record and confirmation positions; NULL is allowed. It does not erase host copies or earlier managed/FFI copies. This is not the pending setup cancel command.
 
 [Header contract](include/marmot.h#L13779)
 

@@ -652,7 +652,8 @@ if the OS opportunity ends, stopping the worker/runtime from another thread ends
 are unchanged.
 
 Free recovery-word output with `marmot_recovery_words_free` after clearing displayed and caller-owned copies.
-The free releases MDK's returned C allocations; it does not promise to erase host copies or C string storage.
+The free erases MDK's returned word buffers before releasing their C allocations. It does not erase host copies
+or earlier managed/FFI copies.
 Confirmation answers and restore phrases are borrowed inputs. Keep them valid for the call, then clear the host's
 buffers; MDK never retains the caller's pointer. Do not print words or entire recovery output records.
 
