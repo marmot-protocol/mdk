@@ -69,7 +69,7 @@ impl Native {
         let Some(active) = active else {
             return SteerOutcome::Unavailable;
         };
-        let (request, response) = {
+        let (request, id, response) = {
             let mut state = active.state.lock().unwrap();
             if state.closed {
                 return SteerOutcome::Unavailable;
@@ -83,11 +83,13 @@ impl Native {
             }
             (
                 json!({"type":"steer","id":id,"prompt":text,"files":files}).to_string(),
+                id,
                 rx,
             )
         };
         if active.input.send(Some(request)).await.is_err() {
-            return SteerOutcome::Uncertain;
+            active.state.lock().unwrap().pending.remove(&id);
+            return SteerOutcome::Unavailable;
         }
         tokio::time::timeout(Duration::from_secs(20), response)
             .await
@@ -181,11 +183,20 @@ impl Active {
             }
             Some("finishing") => {
                 let mut state = self.state.lock().unwrap();
-                if state.pending.is_empty() {
-                    state.closed = true;
+                if !state.closed && state.pending.is_empty() {
                     self.input
                         .try_send(Some(json!({"type":"finish"}).to_string()))
                         .map_err(|_| ())?;
+                    state.closed = true;
+                    if matches!(
+                        self.input.try_send(None),
+                        Err(mpsc::error::TrySendError::Full(_))
+                    ) {
+                        let input = self.input.clone();
+                        tokio::spawn(async move {
+                            let _ = input.send(None).await;
+                        });
+                    }
                 }
                 Ok(ParsedEvent::Ignored)
             }
@@ -230,11 +241,27 @@ mod tests {
             serde_json::from_str::<Value>(&receive_a.recv().await.unwrap().unwrap()).unwrap()["type"],
             "finish"
         );
+        assert!(matches!(receive_a.recv().await, Some(None)));
+        first.active.observe(r#"{"type":"finishing"}"#).unwrap();
+        assert!(receive_a.try_recv().is_err());
         assert_eq!(
             native.steer("first", "later", vec![], None).await,
             SteerOutcome::Unavailable
         );
         assert!(native.active("second"));
+    }
+
+    #[tokio::test]
+    async fn closed_writer_is_definitely_unavailable_and_drops_pending_ack() {
+        let native = Native::default();
+        let (input, receive) = mpsc::channel(8);
+        let registration = native.register(Some("room".into()), input);
+        drop(receive);
+        assert_eq!(
+            native.steer("room", "unsent", vec![], None).await,
+            SteerOutcome::Unavailable
+        );
+        assert!(registration.active.state.lock().unwrap().pending.is_empty());
     }
 
     #[tokio::test]

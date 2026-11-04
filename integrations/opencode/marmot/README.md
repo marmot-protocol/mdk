@@ -267,7 +267,7 @@ The bounded transport comparison was:
 | --- | --- | --- |
 | `opencode run --format json` with stdin | Preserves durable session ids, process isolation, completed-event filtering, timeouts, cancellation, cleanup, and future `run` permission flags while removing prompt argv exposure. | Selected. |
 | [`opencode acp`](https://opencode.ai/docs/acp/) | Moves prompts to stdio, but adds a stateful JSON-RPC connection, initialize/load/prompt/cancel framing, and permission-request replies. | Not selected; no benefit over `run` stdin for this harness. |
-| [`opencode serve`](https://opencode.ai/docs/server/) | Provides a local OpenAPI HTTP interface, but adds server startup/readiness, authentication, port ownership, event-stream, and crash-recovery obligations. | Not selected; it weakens the current process-per-message boundary. |
+| [`opencode serve`](https://opencode.ai/docs/server/) | Provides a local OpenAPI HTTP interface, but adds server startup/readiness, authentication, port ownership, event-stream, and crash-recovery obligations. | Opt-in through `WN_OPENCODE_TRANSPORT=native` for active-turn steering; `run` remains the default. |
 
 This ACP decision concerns only the OpenCode backend below the shared `Backend`
 trait. It does not change `marmot.agent-control.v2` and does not imply an ACP
@@ -396,7 +396,7 @@ attachment leases, group routing, session map, process cleanup and uncertain
 outcome handling. The connector continues to own durable message delivery.
 The default remains the existing CLI transport.
 
-Native mode currently requires Linux, Python 3, OpenCode 1.18.32 and a protected
+Native mode currently requires Linux, Python 3 at `/usr/bin/python3`, OpenCode 1.18.32 and a protected
 loopback port range. Set `WN_OPENCODE_NATIVE_PASSWORD_FILE` to a nonempty, private
 0600 file owned by the service user; the same password must reach the spawned
 OpenCode server. Set `WN_OPENCODE_NATIVE_USERNAME` if it differs from `opencode`.
