@@ -1048,16 +1048,14 @@ the device group this device trusts, for a Devices screen:
 - `inactive` is this device's own judgement, for showing the user: 30 days have passed since a sibling's last activity
   or since this device first found it in the roster, whichever is later. It is never set for this device. `status`
   `Inactive` is the roster's own mark.
-- The list is empty until this device trusts a device group (a single-device account has none), and in every release
-  build until the roster's spec lands.
+- The list is empty until this device trusts a device group (a single-device account has none).
 - The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
   device or group identities. It also fires once each time the account's worker opens or reconnects, so it may fire
   with no visible change.
 
 Chat history from another device: each imported `TimelineMessageRecordFfi` names its source in `imported_from`, and
 `chat_history_imports(account_ref)` lists each held chat's history as `Receiving` (`retrying` once an attempt to get its
-bundle failed) or `Imported`. The list is empty and the event silent in every release build until the roster's spec
-lands. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
+bundle failed) or `Imported`. The list is empty and the event silent while device groups are disabled. Draw "Imported from <device>" where rows change from imported to live, and say "another device" for an empty
 `device_label`. Re-read the list on `MarmotEventFfi::ChatHistoryImportsChanged`, which fires whenever its answer
 changes, a source device's rename or removal included; re-read rows on `LinkedDevicesChanged` for their new names.
 
@@ -1090,6 +1088,28 @@ tries the existing recovery of an earlier lost edit and re-reads the roster. Ret
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
+
+### Moving this device to another device group
+
+In an experimental device-group build, start the same compared-code linking flow on a device that already trusts a
+device group to move only that device. Keep showing the existing group while `DeviceLinkSnapshotFfi.moves` is
+`WaitingForWelcome` or `Joining`. Joining the destination alone does not switch trust: `Made` requires this device's
+first selected authenticated change there. Its trust then switches once, with ordinary full small-state synchronization
+at unchanged versions. Chats and chat membership stay in place; the move does not promise delivery between the two
+device groups. Released binding builds still provide no working linking entry.
+
+Each move has an opaque `move_id`. `old_siblings` names recognized devices left in the old group; while
+`question_suppressed` is true, offer to link that device here rather than treating its sign-in as unknown.
+`dismiss_device_group_move_sibling(account_ref, move_id, slot_id_hex)` ends only that local recognition hint; it does
+not remove or link a device. A later confirmed link or selected departure ends the hint too. Slots in
+`overridden_rejection_slots` were already devices in the destination, so that destination entry took precedence over
+an old rejection. Moves carry rejected slots with their original ages, never rejected KeyPackages.
+
+`LinkedDeviceStatusFfi::Moved` is the old group's own status for a moving device; its cleanup leaves the device's
+ordinary chats alone. Already admitted old-group traffic may finish through normal delivery rules before local old-group
+storage is forgotten; there is no immediate-quiet deadline or cancellation promise. A move that fails before Made
+forgets only the destination and keeps the old trust. If the facts needed to finish cannot be recovered, show the
+device as unlinked and offer a fresh compared-code link, rather than guessing or restoring an old trust.
 
 ### This device unlinked
 

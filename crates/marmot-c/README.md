@@ -485,6 +485,11 @@ Each `has_<setting>`/`<setting>` pair uses `uint8_t`: zero presence leaves the s
 supplies a value, with zero false and nonzero true. No structs or returned allocations are involved. Re-read the
 list on `MARMOT_EVENT_LINKED_DEVICES_CHANGED`; see the [shared settings and recovery contract](../marmot-uniffi/README.md#linked-devices).
 
+`MarmotDeviceLinkSnapshot.moves` owns its move views, sibling labels and overridden-slot strings; its existing
+`marmot_device_link_snapshot_free` releases them all. `marmot_dismiss_device_group_move_sibling` blocks on the account
+worker and returns another owned snapshot. Treat `move_id` as opaque. The status enum appends `MARMOT_LINKED_DEVICE_STATUS_MOVED`.
+See the [shared move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
+
 `marmot_chat_history_imports` blocks on the account worker and writes an owned `MarmotChatHistoryImportList`; free it
 with `marmot_chat_history_import_list_free`. Each entry's tagged `state` is `Receiving` or `Imported`. Imported
 `MarmotTimelineMessageRecord`s name their source in the nullable `imported_from`. Re-read on

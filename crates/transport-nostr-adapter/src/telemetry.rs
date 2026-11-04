@@ -1302,11 +1302,6 @@ mod tests {
     #[test]
     fn settled_staged_starts_commit_and_roll_back_per_subscription() {
         let mut telem = RelaySyncTelemetry::default();
-        let mut expected = telem.clone();
-        expected.record_subscription_start("kept", &[A], 100);
-        expected.record_first_event("kept", A, 110);
-        expected.record_eose("kept", A, 120);
-
         telem.begin_staged_subscription_starts();
         telem.stage_subscription_start("kept", &[A], 100);
         telem.stage_subscription_start("dropped", &[B], 100);
@@ -1316,7 +1311,16 @@ mod tests {
         telem.record_eose("dropped", B, 140);
         telem.settle_staged_subscription_starts(|id| id == "kept");
 
-        assert_eq!(telem.snapshot(), expected.snapshot());
+        let snapshot = telem.snapshot();
+        assert_eq!(snapshot.tracked_subscriptions, 1);
+        assert_eq!(snapshot.synced_subscriptions, 1);
+        assert_sync_histogram(&snapshot.first_event, 10, &[(10, 1)]);
+        assert_sync_histogram(&snapshot.eose, 20, &[(20, 1)]);
+        assert_eq!(snapshot.per_relay.len(), 1);
+        assert_eq!(snapshot.per_relay[0].relay_index, A.0);
+        assert_sync_histogram(&snapshot.per_relay[0].first_event, 10, &[(10, 1)]);
+        assert_sync_histogram(&snapshot.per_relay[0].eose, 20, &[(20, 1)]);
+        assert!(snapshot.refusals.is_empty());
         assert_eq!(telem.subscription_synced("kept"), Some(true));
         assert_eq!(telem.subscription_synced("dropped"), None);
     }
@@ -1327,11 +1331,6 @@ mod tests {
         telem.record_subscription_start("reissued", &[A], 0);
         telem.record_eose("reissued", A, 10);
         telem.record_subscription_start("unrelated", &[B], 0);
-        let mut expected = telem.clone();
-        expected.record_first_event("reissued", A, 110);
-        expected.record_first_event("unrelated", B, 30);
-        expected.record_eose("unrelated", B, 40);
-
         telem.begin_staged_subscription_starts();
         telem.stage_subscription_start("reissued", &[A], 100);
         telem.stage_subscription_start("new", &[C], 100);
@@ -1343,9 +1342,45 @@ mod tests {
         telem.record_eose("unrelated", B, 40);
         telem.rollback_staged_subscription_starts();
 
-        assert_eq!(telem.snapshot(), expected.snapshot());
+        let snapshot = telem.snapshot();
+        assert_eq!(snapshot.tracked_subscriptions, 2);
+        assert_eq!(snapshot.synced_subscriptions, 2);
+        assert_sync_histogram(&snapshot.first_event, 140, &[(30, 1), (150, 1)]);
+        assert_sync_histogram(&snapshot.eose, 50, &[(10, 1), (50, 1)]);
+        assert_eq!(snapshot.per_relay.len(), 2);
+        assert_eq!(snapshot.per_relay[0].relay_index, A.0);
+        assert_sync_histogram(&snapshot.per_relay[0].first_event, 110, &[(150, 1)]);
+        assert_sync_histogram(&snapshot.per_relay[0].eose, 10, &[(10, 1)]);
+        assert_eq!(snapshot.per_relay[1].relay_index, B.0);
+        assert_sync_histogram(&snapshot.per_relay[1].first_event, 30, &[(30, 1)]);
+        assert_sync_histogram(&snapshot.per_relay[1].eose, 40, &[(50, 1)]);
+        assert!(snapshot.refusals.is_empty());
         assert_eq!(telem.subscription_synced("reissued"), Some(true));
         assert_eq!(telem.subscription_synced("unrelated"), Some(true));
         assert_eq!(telem.subscription_synced("new"), None);
+    }
+
+    /// Literal occupied buckets and sums, independent of the recorder under
+    /// test. Every remaining bucket must be empty, including a dropped relay's.
+    fn assert_sync_histogram(
+        histogram: &DurationHistogramSnapshot,
+        sum_ms: u64,
+        occupied: &[(u64, u64)],
+    ) {
+        assert_eq!(histogram.sum_ms, sum_ms);
+        assert_eq!(histogram.overflow_count, 0);
+        assert_eq!(
+            histogram.sample_count(),
+            occupied.iter().map(|(_, count)| count).sum::<u64>()
+        );
+        assert_eq!(
+            histogram
+                .buckets
+                .iter()
+                .filter(|bucket| bucket.count != 0)
+                .map(|bucket| (bucket.upper_bound_ms, bucket.count))
+                .collect::<Vec<_>>(),
+            occupied
+        );
     }
 }

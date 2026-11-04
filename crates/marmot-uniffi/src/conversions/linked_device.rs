@@ -9,6 +9,8 @@ pub enum LinkedDeviceStatusFfi {
     Inactive,
     /// It recorded that it is signing out.
     Leaving,
+    /// It moved to another device group; old cleanup keeps its chats.
+    Moved,
 }
 
 impl From<LinkedDeviceStatus> for LinkedDeviceStatusFfi {
@@ -17,6 +19,7 @@ impl From<LinkedDeviceStatus> for LinkedDeviceStatusFfi {
             LinkedDeviceStatus::Active => Self::Active,
             LinkedDeviceStatus::Inactive => Self::Inactive,
             LinkedDeviceStatus::Leaving => Self::Leaving,
+            LinkedDeviceStatus::Moved => Self::Moved,
         }
     }
 }

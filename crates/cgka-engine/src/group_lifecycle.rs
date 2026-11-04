@@ -825,6 +825,7 @@ impl<S: StorageProvider> Engine<S> {
             self_removed_sibling_slots: Default::default(),
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         };
 
         // 5. Wrap welcomes via the peeler, before the group record or any
@@ -1810,19 +1811,19 @@ impl<S: StorageProvider> Engine<S> {
             // the account key can read it and found a group under it. The
             // join consumes the expectation in this transaction.
             let roster_required = crate::app_components::group_requires_device_roster(&mls_group)?;
-            match storage.device_group_welcome_expectation(&group_id)? {
+            let accepted_device_group = match storage.device_group_welcome_expectation(&group_id)? {
                 Some(expected)
                     if roster_required
                         && expected.sender_signature_key == welcome_sender_key
                         && expected.key_package_ref == consumed_key_package_ref
                         && joined_at.0 < expected.expires_at =>
                 {
-                    storage.delete_device_group_welcome_expectation(&group_id)?;
+                    Some(expected)
                 }
                 Some(_) => return Err(EngineError::UnexpectedDeviceGroupWelcome),
                 None if roster_required => return Err(EngineError::UnexpectedDeviceGroupWelcome),
-                None => {}
-            }
+                None => None,
+            };
             // While a link waits, the KeyPackage it confirmed is reserved for
             // it: no Welcome into another group, a chat included, consumes
             // it (D41).
@@ -1900,6 +1901,7 @@ impl<S: StorageProvider> Engine<S> {
                 // The joining device's clock is the one bound it can trust.
                 local_copy_welcome_created_at: welcome_created_at
                     .map(|created_at| created_at.min(joined_at)),
+                device_roster_departures: Vec::new(),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
             let admission = match &route {
@@ -1967,6 +1969,14 @@ impl<S: StorageProvider> Engine<S> {
                 self.identity.self_id(),
                 self.ciphersuite,
             )?;
+            // Only a fully validated device-roster Welcome can consume its
+            // exact expectation and join local move bookkeeping. Every write,
+            // including subsequent dedup, remains in this native transaction.
+            if let Some(expected) = accepted_device_group
+                && !storage.accept_device_group_welcome(&expected, joined_at)?
+            {
+                return Err(EngineError::UnexpectedDeviceGroupWelcome);
+            }
 
             for candidate in storage.list_welcomes()? {
                 if candidate.group_id == group_id

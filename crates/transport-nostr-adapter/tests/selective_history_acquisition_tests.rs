@@ -457,7 +457,7 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
 /// with a realistic round trip: passes, wall time, requests and the largest
 /// per-relay event payload one pass carried. Prints its measurement.
 #[tokio::test]
-async fn large_gap_of_small_events_recovers_in_few_passes() {
+async fn large_gap_of_small_events_recovers_with_batched_requests() {
     const MISSING: usize = 512;
     let keys = Keys::generate();
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {

@@ -99,6 +99,7 @@ fn status(status: LinkedDeviceStatus) -> &'static str {
         LinkedDeviceStatus::Active => "active",
         LinkedDeviceStatus::Inactive => "inactive",
         LinkedDeviceStatus::Leaving => "leaving",
+        LinkedDeviceStatus::Moved => "moved",
     }
 }
 
@@ -153,7 +154,20 @@ fn snapshot_json(snapshot: DeviceLinkSnapshot) -> Value {
         object.insert("requested_at".to_owned(),json!(prompt.requested_at));
         state
     }).collect::<Vec<_>>();
-    json!({"new_device":new_device,"prompts":prompts})
+    let moves = snapshot.moves.into_iter().map(|movement| {
+        let state = match movement.state {
+            marmot_app::DeviceGroupMoveState::WaitingForWelcome => "waiting_for_welcome",
+            marmot_app::DeviceGroupMoveState::Joining => "joining",
+            marmot_app::DeviceGroupMoveState::Made => "made",
+            marmot_app::DeviceGroupMoveState::Failed => "failed",
+        };
+        let old_siblings = movement.old_siblings.into_iter().map(|sibling| json!({
+            "slot_id_hex": sibling.slot_id_hex, "label": sibling.label,
+            "question_suppressed": sibling.question_suppressed,
+        })).collect::<Vec<_>>();
+        json!({"move_id":movement.move_id,"state":state,"old_siblings":old_siblings,"overridden_rejection_slots":movement.overridden_rejection_slots})
+    }).collect::<Vec<_>>();
+    json!({"new_device":new_device,"prompts":prompts,"moves":moves})
 }
 
 fn snapshot_plain(snapshot: &Value) -> String {
@@ -172,6 +186,27 @@ fn snapshot_plain(snapshot: &Value) -> String {
             prompt["state"].as_str().unwrap_or("unknown")
         ));
         append_details(&mut lines, prompt);
+    }
+    for movement in snapshot["moves"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "move {}: {}",
+            terminal_safe_text(movement["move_id"].as_str().unwrap_or("")),
+            terminal_safe_text(movement["state"].as_str().unwrap_or("unknown"))
+        ));
+        for sibling in movement["old_siblings"].as_array().into_iter().flatten() {
+            if sibling["question_suppressed"].as_bool() == Some(true) {
+                lines.push(format!(
+                    "previously linked device: {}",
+                    terminal_safe_text(sibling["label"].as_str().unwrap_or(""))
+                ));
+            }
+        }
+        if movement["overridden_rejection_slots"]
+            .as_array()
+            .is_some_and(|slots| !slots.is_empty())
+        {
+            lines.push("a confirmed destination link overrode an earlier rejection".to_owned());
+        }
     }
     if lines.is_empty() {
         "no device link in progress".to_owned()
@@ -257,6 +292,7 @@ mod tests {
                     },
                 },
             ],
+            moves: Vec::new(),
         });
         assert!(
             json["prompts"][0]["device_label"] == device_label,
