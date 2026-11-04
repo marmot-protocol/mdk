@@ -502,89 +502,149 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
     deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
-    ffi_guard(|| {
-        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
-            return status;
-        }
-        let deployment = match unsafe { required_deployment(deployment) } {
-            Ok(deployment) => deployment,
-            Err(status) => return status,
-        };
-        let defaults = MarmotClientOptions {
-            attachment_acquisition_mode: 0,
-            relay_policy: 0,
-            cursor_persistence: 0,
-            client_name: std::ptr::null(),
-            store: std::ptr::null(),
-            device_platform: std::ptr::null(),
-        };
-        let options = unsafe { options.as_ref() }.unwrap_or(&defaults);
-        let policy = match options.relay_policy {
-            0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
-            1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
-            2 => marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
-            _ => {
-                set_last_error("invalid relay policy");
-                return MarmotStatus::InvalidArgument;
-            }
-        };
-        let attachment_mode = match attachment_controls::MarmotAttachmentAcquisitionMode::from_c(
-            options.attachment_acquisition_mode,
-        ) {
-            Ok(mode) => mode.into(),
-            Err(status) => return status,
-        };
-        let store = options.store;
-        let cursor = match MarmotCursorPersistence::from_c(options.cursor_persistence) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        let name = match unsafe { optional_str(options.client_name) } {
-            Ok(name) => name,
-            Err(status) => return status,
-        };
-        let platform = match unsafe { optional_str(options.device_platform) } {
-            Ok(platform) => platform,
-            Err(status) => return status,
-        };
-        let store = if store.is_null() {
-            None
-        } else {
-            match unsafe { CSecretStore::from_c(store) } {
-                Ok(store) => Some(Arc::new(store)),
-                Err(status) => return status,
-            }
-        };
-        let status = unsafe {
-            open_client(root_path, relay_urls, relay_urls_len, out_client, {
-                let store = store
-                    .as_ref()
-                    .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
-                move |root, relays| {
-                    Marmot::new_with_configuration(
-                        root,
-                        relays,
-                        marmot_uniffi::MarmotOptions {
-                            attachment_acquisition_mode: Some(attachment_mode),
-                            relay_policy: Some(policy),
-                            cursor_persistence: Some(cursor.into()),
-                            client_name: name,
-                            device_platform: platform,
-                            secret_store: store,
-                            moderation_report_config: None,
-                            deployment,
-                        },
-                    )
-                }
-            })
-        };
-        if status == MarmotStatus::Ok
-            && let Some(store) = store
-        {
-            store.arm();
-        }
-        status
+    ffi_guard(|| unsafe {
+        open_client_with_configuration(
+            root_path,
+            relay_urls,
+            relay_urls_len,
+            options,
+            deployment,
+            out_client,
+            false,
+        )
     })
+}
+
+/// Open an explicitly experimental device-group test build, with the same
+/// options and ownership as marmot_client_new_with_configuration. Requires a
+/// library built with `dev-device-groups`; unavailable builds return
+/// MARMOT_STATUS_RUNTIME before opening the root or taking callback ownership.
+/// Normal constructors remain disabled even in a capable library.
+///
+/// # Safety
+/// Same pointer contracts as marmot_client_new_with_configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_experimental_device_groups(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    options: *const MarmotClientOptions,
+    deployment: *const deployment::MarmotDeployment,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| unsafe {
+        open_client_with_configuration(
+            root_path,
+            relay_urls,
+            relay_urls_len,
+            options,
+            deployment,
+            out_client,
+            true,
+        )
+    })
+}
+
+/// Shared option validation and ownership for normal and experimental opens.
+///
+/// # Safety
+/// Same pointer contracts as marmot_client_new_with_configuration.
+unsafe fn open_client_with_configuration(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    options: *const MarmotClientOptions,
+    deployment: *const deployment::MarmotDeployment,
+    out_client: *mut *mut MarmotClient,
+    experimental_device_groups: bool,
+) -> MarmotStatus {
+    if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+        return status;
+    }
+    if experimental_device_groups
+        && let Err(error) = marmot_uniffi::require_experimental_device_groups()
+    {
+        return status::status_from_error(&error);
+    }
+    let deployment = match unsafe { required_deployment(deployment) } {
+        Ok(deployment) => deployment,
+        Err(status) => return status,
+    };
+    let defaults = MarmotClientOptions {
+        attachment_acquisition_mode: 0,
+        relay_policy: 0,
+        cursor_persistence: 0,
+        client_name: std::ptr::null(),
+        store: std::ptr::null(),
+        device_platform: std::ptr::null(),
+    };
+    let options = unsafe { options.as_ref() }.unwrap_or(&defaults);
+    let policy = match options.relay_policy {
+        0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
+        1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+        2 => marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
+        _ => {
+            set_last_error("invalid relay policy");
+            return MarmotStatus::InvalidArgument;
+        }
+    };
+    let attachment_mode = match attachment_controls::MarmotAttachmentAcquisitionMode::from_c(
+        options.attachment_acquisition_mode,
+    ) {
+        Ok(mode) => mode.into(),
+        Err(status) => return status,
+    };
+    let store = options.store;
+    let cursor = match MarmotCursorPersistence::from_c(options.cursor_persistence) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let name = match unsafe { optional_str(options.client_name) } {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    let platform = match unsafe { optional_str(options.device_platform) } {
+        Ok(platform) => platform,
+        Err(status) => return status,
+    };
+    let store = if store.is_null() {
+        None
+    } else {
+        match unsafe { CSecretStore::from_c(store) } {
+            Ok(store) => Some(Arc::new(store)),
+            Err(status) => return status,
+        }
+    };
+    let status = unsafe {
+        open_client(root_path, relay_urls, relay_urls_len, out_client, {
+            let store = store
+                .as_ref()
+                .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
+            move |root, relays| {
+                let options = marmot_uniffi::MarmotOptions {
+                    attachment_acquisition_mode: Some(attachment_mode),
+                    relay_policy: Some(policy),
+                    cursor_persistence: Some(cursor.into()),
+                    client_name: name,
+                    device_platform: platform,
+                    secret_store: store,
+                    moderation_report_config: None,
+                    deployment,
+                };
+                if experimental_device_groups {
+                    Marmot::new_with_experimental_device_groups(root, relays, options)
+                } else {
+                    Marmot::new_with_configuration(root, relays, options)
+                }
+            }
+        })
+    };
+    if status == MarmotStatus::Ok
+        && let Some(store) = store
+    {
+        store.arm();
+    }
+    status
 }
 
 /// Shared body of the client constructors: read the borrowed arguments,
