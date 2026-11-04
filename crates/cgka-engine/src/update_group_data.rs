@@ -31,7 +31,7 @@ const APP_STATE_MAX_ENCODED_LEN: usize = 8192;
 enum AppDataCommitPurpose {
     Ordinary,
     Isolated,
-    MoveStatus,
+    MoveStatus(DeviceSlotId),
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -211,8 +211,7 @@ impl<S: StorageProvider> Engine<S> {
                     && roster.devices.get(&slot) == Some(&expected)
                     && expected.tag_signature_key.as_deref() == Some(self.identity.signer.public())
                     && group.own_leaf_node().is_some_and(|leaf| {
-                        crate::device_tag::device_tag_claim(leaf, &roster)
-                            == cgka_traits::app_components::DeviceTagClaim::Device(slot)
+                        leaf.signature_key().as_slice() == self.identity.signer.public()
                     }))
             })?;
         if !valid {
@@ -231,7 +230,7 @@ impl<S: StorageProvider> Engine<S> {
                 data: update,
             }],
             Vec::new(),
-            AppDataCommitPurpose::MoveStatus,
+            AppDataCommitPurpose::MoveStatus(slot),
         )
         .await
     }
@@ -468,16 +467,60 @@ impl<S: StorageProvider> Engine<S> {
                 None,
                 "carried_rejections",
             )?,
-            AppDataCommitPurpose::MoveStatus => self.stage_app_data_commit(
-                &mut mls_group,
-                &provider,
-                Vec::new(),
-                Vec::new(),
-                proposals,
-                false,
-                Some(openmls::prelude::LeafNodeParameters::default()),
-                "move_status",
-            )?,
+            AppDataCommitPurpose::MoveStatus(slot) => {
+                // Only this status operation tags from the authenticated old
+                // roster. Ordinary old queued work may have replaced its tag
+                // after the global name changed; it must not strand cleanup.
+                let roster =
+                    crate::app_components::device_roster_of_group(&mls_group).ok_or_else(|| {
+                        EngineError::DeviceEntryChanged {
+                            group_id: group_id.clone(),
+                        }
+                    })?;
+                let own = crate::device_tag::OwnDeviceTag::find(
+                    roster,
+                    Some(slot),
+                    self.identity.signer.public(),
+                )
+                .ok_or_else(|| EngineError::DeviceEntryChanged {
+                    group_id: group_id.clone(),
+                })?;
+                let leaf =
+                    mls_group
+                        .own_leaf_node()
+                        .ok_or_else(|| EngineError::DeviceEntryChanged {
+                            group_id: group_id.clone(),
+                        })?;
+                let parameters = if own.reads_as_own(leaf) {
+                    openmls::prelude::LeafNodeParameters::default()
+                } else {
+                    let tag = own.seal(&self.crypto, &self.identity.signer)?;
+                    // Keep the current support list and every unrelated leaf
+                    // field; this is not an ordinary capability refresh.
+                    let advertised = crate::app_components::app_components_of_leaf(leaf)?;
+                    let extensions = crate::leaf_advertisement::own_leaf_refresh_extensions(
+                        leaf,
+                        &advertised,
+                        Some(tag),
+                    )?
+                    .ok_or_else(|| EngineError::DeviceEntryChanged {
+                        group_id: group_id.clone(),
+                    })?;
+                    openmls::prelude::LeafNodeParameters::builder()
+                        .with_extensions(extensions)
+                        .build()
+                };
+                self.stage_app_data_commit(
+                    &mut mls_group,
+                    &provider,
+                    Vec::new(),
+                    Vec::new(),
+                    proposals,
+                    false,
+                    Some(parameters),
+                    "move_status",
+                )?
+            }
         }
         .0;
         let staged_commit = mls_group.pending_commit().ok_or_else(|| {

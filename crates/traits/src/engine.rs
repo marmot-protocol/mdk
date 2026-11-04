@@ -277,7 +277,8 @@ pub enum SendIntent {
         roster_update: Vec<u8>,
     },
     /// Set only this device's own complete old roster entry to moved,
-    /// preserving all other fields and its old leaf tag. The host authorizes
+    /// preserving all other fields and retaining or producing its old-roster
+    /// leaf tag. The host authorizes
     /// the Made old-group exception; native preparation rechecks own slot,
     /// signing key and the entire expected entry. Other proposals stay queued.
     MarkDeviceGroupMoved {

@@ -398,6 +398,7 @@ async fn a_device_signs_every_leaf_with_its_one_signature_key() {
 /// one native transaction. Join alone never changes the trusted namespace.
 #[tokio::test]
 async fn a_move_welcome_joins_without_cutting_original_trust() {
+    use cgka_traits::storage::OutboundIntentStorage as _;
     use storage_sqlite::{
         DeviceGroupMovePhase, DeviceGroupRecord, DeviceGroupTrust, FirstTrustedRoster, SqlCipherKey,
     };
@@ -624,8 +625,27 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     else {
         panic!("old status Commit");
     };
+    let tag_bytes = |leaf: &LeafNode| {
+        leaf.extensions()
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .get(&cgka_traits::app_components::DEVICE_TAG_COMPONENT_ID)
+            .unwrap()
+            .to_vec()
+    };
+    let valid_old_tag = tag_bytes(load_group(&moving, &original).own_leaf_node().unwrap());
     let staged_group = load_group(&moving, &original);
     let staged = staged_group.pending_commit().unwrap();
+    assert_eq!(
+        tag_bytes(
+            staged
+                .update_path_leaf_node()
+                .unwrap_or_else(|| staged_group.own_leaf_node().unwrap())
+        ),
+        valid_old_tag,
+        "an already-valid original tag is preserved byte-for-byte"
+    );
     assert_eq!(
         staged.add_proposals().count(),
         0,
@@ -645,6 +665,133 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
         super::send_intents::pending_proposals(&moving, &original),
         1,
         "failed old status leaves pending work intact"
+    );
+    // Real native work prepared after the trust cut can still use this held
+    // old MLS copy. Queue it through the ordinary public outbox and drain,
+    // not fabricated rows or a pre-cut-queue claim. The first failed status
+    // above separately owns valid-tag byte preservation/proposal isolation.
+    let heartbeat = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(moving.engine.self_id().as_slice()),
+        13,
+        457,
+        vec![],
+        String::new(),
+    )
+    .encode()
+    .unwrap();
+    let SendResult::Queued {
+        intent_id: heartbeat_id,
+        ..
+    } = moving
+        .engine
+        .queue_app_message(original.clone(), heartbeat)
+        .await
+        .unwrap()
+    else {
+        panic!("the public outbox owns the old application");
+    };
+    let SendResult::Queued {
+        intent_id: update_id,
+        ..
+    } = moving
+        .engine
+        .send(SendIntent::SelfUpdate {
+            group_id: original.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the self-update queues behind the actual old outbox");
+    };
+    assert_ne!(heartbeat_id, update_id);
+    assert_eq!(
+        moving
+            .storage
+            .list_queued_outbound_intents(&original)
+            .unwrap()
+            .len(),
+        2
+    );
+    for _ in 0..4 {
+        if !moving
+            .engine
+            .has_queued_outbound_intents(&original)
+            .unwrap()
+        {
+            break;
+        }
+        for result in moving
+            .engine
+            .converge_and_drain_queued_outbound_intents(&original, 1_000_000)
+            .await
+            .unwrap()
+        {
+            match result {
+                SendResult::ApplicationMessage { msg, .. } => {
+                    assert_eq!(
+                        original_creator
+                            .engine
+                            .ingest(route_to_group(&msg, &original))
+                            .await
+                            .unwrap(),
+                        IngestOutcome::Processed
+                    );
+                    let (_, queued) = moving
+                        .engine
+                        .regenerated_queued_intent_for_message(&msg.id)
+                        .unwrap();
+                    assert_eq!(queued, heartbeat_id);
+                    moving
+                        .engine
+                        .confirm_queued_outbound_intent(&queued)
+                        .unwrap();
+                }
+                SendResult::GroupEvolution { msg, pending, .. } => {
+                    moving.engine.confirm_published(pending).await.unwrap();
+                    assert_accepted(
+                        &mut original_creator,
+                        &route_to_group(&msg, &original),
+                        &original,
+                    )
+                    .await;
+                }
+                other => panic!("unexpected old queued output: {other:?}"),
+            }
+        }
+    }
+    assert!(
+        !moving
+            .engine
+            .has_queued_outbound_intents(&original)
+            .unwrap()
+    );
+    assert_eq!(
+        super::device_roster::roster_of(&moving, &original).devices[&slot(2)],
+        expected_old
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &original).own_leaf_node().unwrap(),
+            &original_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Unclaimed,
+        "ordinary queued preparation follows the now-named destination"
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &original).own_leaf_node().unwrap(),
+            &destination_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2))
+    );
+    assert_eq!(
+        load_group(&moving, &original)
+            .own_leaf_node()
+            .unwrap()
+            .signature_key()
+            .as_slice(),
+        moving.engine.own_signature_key(),
+        "the original own signer is unchanged"
     );
     let marked = send_commit(&mut moving, intent, &original).await;
     assert_accepted(&mut original_creator, &marked, &original).await;
