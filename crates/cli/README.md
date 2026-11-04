@@ -451,6 +451,12 @@ media, and agent-stream anchors/finals in conversation order. Projected history 
 first, then local receipt/insertion order, so synced stream anchors and finals stay in conversation order rather than
 relay catch-up order.
 
+**Delivery.** A timeline row (`messages timeline list|search|subscribe`) carries `invalidation_status`, which names
+why the row was withdrawn or failed (`local_publish_failed`, `LosingBranch`, ...) and is `null` otherwise. A row is
+delivered when `invalidation_status` is `null` and either `source_message_id` is set or `recipient_confirmed` is
+`true`. The second case is an own send that no relay accepted but another member reacted to, proving they received
+it. A row with `invalidation_status` set is not delivered, even when it keeps its `source_message_id`.
+
 **Subscriptions.** `messages subscribe`, `messages timeline subscribe`, `chats subscribe`, `chats subscribe-archived`,
 `groups subscribe-state`, and `notifications subscribe` require `wnd`. With `--json` they print newline-delimited
 responses with a typed `result.type`:
@@ -670,10 +676,12 @@ No command creates or authenticates a device by its account key alone.
 
 Running the same `devices link start` flow on an already linked device moves only that device to the destination's
 device group. `link status` adds `moves[]`: Joining still trusts the old group; Made is the trust switch after the new
-device's first selected change. Old siblings remain local recognition hints, not automatic links. A pre-Made failure
-keeps old trust and forgets only the destination. The move leaves existing chat membership intact and does not promise
-traffic between device groups; admitted old-group traffic can finish normally. If completion cannot be recovered, use
-a fresh compared-code link from the unlinked state. See [move behavior and limits](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
+device's first selected change. Old siblings remain local recognition hints, not automatic links. A known failed link
+before Made keeps old trust and forgets only the destination. The move leaves existing chat membership intact and does
+not promise traffic between device groups; admitted old-group traffic can finish normally. An unrecoverable destination
+can stay pending indefinitely while ordinary repair applies, keeping old trust and preventing another confirmed move.
+Corrupt or unreadable local move records may need manual local recovery or reset. These conditions do not themselves
+unlink this device. See [move behavior and limits](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 
 For this dev-testing build, run **all account commands through a persistent matching daemon**. Select it explicitly
 with `--socket` or exported `WN_SOCKET`, so connection failure is reported instead of falling back to local execution.
@@ -689,6 +697,9 @@ behavior, so inspect `devices list` before retrying. Restarting does not roll ba
 This dogfood CLI does not expose the existing-device **Not now** action. Do not approve an unwanted request or
 mismatching codes; cancel from the requesting/new device or let the exchange expire. `devices link cancel` applies
 only to the requesting/new device; it does not dismiss an existing-device prompt.
+
+This dev CLI also cannot manually dismiss a move's old-sibling recognition hint. A later confirmed link or selected
+departure can end the hint automatically; dismissing a hint does not link or remove a device.
 
 `--json` returns the existing state without terminal escaping: `devices list` has `devices[]` with public slot,
 label/status, own-device flag and settings; `link` responses have nullable `new_device` and `prompts[]` with flat

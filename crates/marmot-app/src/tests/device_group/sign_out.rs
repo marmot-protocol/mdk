@@ -155,41 +155,70 @@ async fn a_chat_with_no_sibling_in_it_is_left_by_the_device() {
     assert_eq!(left_to_siblings, [hex::encode(shared.as_slice())]);
 }
 
-/// The phone signs out first, so its entry is `leaving`. The laptop then has
-/// no sibling that stays, so it signs out on its own and commits nothing; a
-/// device that is signing out never decides another's removal.
+/// A sibling that is leaving or moved does not stay to remove this device.
+/// The laptop signs out on its own and commits nothing; a device that is
+/// signing out never decides another's removal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_whose_only_sibling_is_leaving_signs_out_on_its_own() {
-    let (devices, group) = tagging_devices().await;
-    let Devices {
-        _dirs,
-        relay,
-        phone_app,
-        mut phone,
-        laptop_app,
-        mut laptop,
-        ..
-    } = devices;
-    let mut laptop_cursor = published_count(&relay);
-    let _phone_signing_out = phone_app.begin_signing_out(&account_id_hex(&phone_app));
-    phone.sign_out_through_siblings_step().await.unwrap();
-    assert!(matches!(
-        phone.sign_out_through_siblings_step().await.unwrap(),
-        SiblingSignOut::Confirmed { .. }
-    ));
-    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
-    laptop.sync().await.unwrap();
-    assert_eq!(status_of(&laptop, &group, &phone), DeviceStatusV1::Leaving);
+    for status in [DeviceStatusV1::Leaving, DeviceStatusV1::Moved] {
+        let (devices, group) = tagging_devices().await;
+        let Devices {
+            _dirs,
+            relay,
+            phone_app,
+            mut phone,
+            laptop_app,
+            mut laptop,
+            ..
+        } = devices;
+        let mut laptop_cursor = published_count(&relay);
+        let _phone_signing_out = phone_app.begin_signing_out(&account_id_hex(&phone_app));
+        phone.sign_out_through_siblings_step().await.unwrap();
+        assert!(matches!(
+            phone.sign_out_through_siblings_step().await.unwrap(),
+            SiblingSignOut::Confirmed { .. }
+        ));
+        deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+        laptop.sync().await.unwrap();
+        assert_eq!(status_of(&laptop, &group, &phone), DeviceStatusV1::Leaving);
 
-    let _laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex(&laptop_app));
-    let published = published_count(&relay);
-    assert_eq!(
-        laptop.sign_out_through_siblings_step().await.unwrap(),
-        SiblingSignOut::OnItsOwn
-    );
-    laptop.drive_device_removals().await;
-    assert_eq!(published_count(&relay), published, "nothing goes out");
-    assert_eq!(pending_removals(&laptop_app), 0);
+        if status == DeviceStatusV1::Moved {
+            let phone_slot = slot_of(&phone);
+            let edit = phone
+                .runtime
+                .edit_device_roster_entry(&group, &phone_slot, &[], |entry| {
+                    entry.status = DeviceStatusV1::Moved;
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                edit,
+                marmot_session::DeviceRosterEdit::Committed(_)
+            ));
+            deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+            assert_eq!(status_of(&laptop, &group, &phone), DeviceStatusV1::Moved);
+        }
+
+        let _laptop_signing_out = laptop_app.begin_signing_out(&account_id_hex(&laptop_app));
+        let published = published_count(&relay);
+        assert_eq!(
+            laptop.sign_out_through_siblings_step().await.unwrap(),
+            SiblingSignOut::OnItsOwn
+        );
+        assert_eq!(
+            published_count(&relay),
+            published,
+            "sign-out commits nothing"
+        );
+        if status == DeviceStatusV1::Leaving {
+            // Retain the leaving-decider refusal proof. Ordinary maintenance
+            // is not driven during sign-out; its separate Moved cleanup is
+            // not part of this sign-out admission contract.
+            laptop.drive_device_removals().await;
+            assert_eq!(published_count(&relay), published, "nothing goes out");
+        }
+        assert_eq!(pending_removals(&laptop_app), 0);
+    }
 }
 
 /// A device with no device group, or whose own link is not made yet, signs

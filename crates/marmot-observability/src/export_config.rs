@@ -408,6 +408,33 @@ mod tests {
 
     #[test]
     fn export_allowed_requires_opt_in_endpoint_and_tls() {
+        let complete = RelayTelemetryExportConfig::enabled("https://otlp.example.org/v1/metrics")
+            .with_runtime_config(runtime_config());
+        assert!(complete.export_allowed());
+        assert!(transport_nostr::RelayExportGate::export_allowed(&complete));
+        // Exercise raw gate inputs independently. The exporter constructor
+        // replaces service_instance_id, so it cannot own this rejection.
+        for case in [
+            "opt-in",
+            "endpoint",
+            "token",
+            "resource",
+            "service.instance.id",
+        ] {
+            let mut config = complete.clone();
+            match case {
+                "opt-in" => config.enabled = false,
+                "endpoint" => config.endpoint = None,
+                "token" => config.authorization_bearer_token = Some(" \t ".into()),
+                "resource" => config.resource = None,
+                _ => config.resource.as_mut().unwrap().service_instance_id = " \t ".into(),
+            }
+            assert!(!config.export_allowed(), "raw gate accepted missing {case}");
+            assert!(
+                !transport_nostr::RelayExportGate::export_allowed(&config),
+                "relay identity gate accepted missing {case}"
+            );
+        }
         // Off by default, and an endpoint alone does not enable export.
         assert!(!RelayTelemetryExportConfig::disabled().export_allowed());
         assert!(

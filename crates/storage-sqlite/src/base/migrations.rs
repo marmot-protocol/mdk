@@ -331,6 +331,8 @@ mod migration_0169_sibling_welcome_resends;
 mod migration_0170_invitation_decisions;
 #[path = "migrations/0172_group_rejoin.rs"]
 mod migration_0172_group_rejoin;
+#[path = "migrations/0175_pending_ref_watermark.rs"]
+mod migration_0175_pending_ref_watermark;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -352,11 +354,13 @@ pub(crate) struct Migration {
 mod migration_0167_reaction_attachment_sources;
 #[path = "migrations/0171_device_edit_settings.rs"]
 mod migration_0171_device_edit_settings;
+#[path = "migrations/0173_recipient_confirmed_sends.rs"]
+mod migration_0173_recipient_confirmed_sends;
 
 #[path = "migrations/0174_heartbeat_welcome_repair.rs"]
 mod migration_0174_heartbeat_welcome_repair;
-#[path = "migrations/0175_device_group_moves.rs"]
-mod migration_0175_device_group_moves;
+#[path = "migrations/0176_device_group_moves.rs"]
+mod migration_0176_device_group_moves;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1335,6 +1339,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0172_group_rejoin::apply,
     },
     Migration {
+        version: 173,
+        name: "0173_recipient_confirmed_sends",
+        suspend_foreign_keys: &[],
+        apply: migration_0173_recipient_confirmed_sends::apply,
+    },
+    Migration {
         version: 174,
         name: "0174_heartbeat_welcome_repair",
         suspend_foreign_keys: &[],
@@ -1342,11 +1352,24 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 175,
-        name: "0175_device_group_moves",
+        name: "0175_pending_ref_watermark",
         suspend_foreign_keys: &[],
-        apply: migration_0175_device_group_moves::apply,
+        apply: migration_0175_pending_ref_watermark::apply,
+    },
+    Migration {
+        version: 176,
+        name: "0176_device_group_moves",
+        suspend_foreign_keys: &[],
+        apply: migration_0176_device_group_moves::apply,
     },
 ];
+
+/// Run migration 0173's recipient-confirmed backfill on an open database, so a
+/// test can compare it with the live projector. Test support only.
+#[cfg(test)]
+pub(crate) fn rerun_recipient_confirmed_settle(connection: &Connection) -> StorageResult<()> {
+    migration_0173_recipient_confirmed_sends::settle_recipient_confirmed_sends(connection)
+}
 
 /// Run migration 0117's push-token share repair on an open database. Test
 /// support only.
@@ -1792,6 +1815,129 @@ mod tests {
             )
             .unwrap();
         assert_eq!(group, (7, vec![0]));
+    }
+
+    /// Migration 0173 settles a failed, unaccepted send a peer reacted to and
+    /// nothing else: pending sends, relay-accepted failures, own reactions,
+    /// convergence withdrawals, accepted sends, received rows and unreadable
+    /// summaries keep their state.
+    #[test]
+    fn migration_0173_settles_only_sends_a_peer_reacted_to() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_through(&mut conn, 172).unwrap();
+        let reactions = |senders: &[&str]| {
+            let user_reactions = senders
+                .iter()
+                .map(|sender| serde_json::json!({ "sender": sender, "emoji": "+" }))
+                .collect::<Vec<_>>();
+            serde_json::json!({ "by_emoji": {}, "user_reactions": user_reactions }).to_string()
+        };
+        let rows = [
+            (
+                "failed_peer",
+                "sent",
+                None,
+                Some("local_publish_failed"),
+                reactions(&["peer"]),
+            ),
+            (
+                "pending_peer",
+                "sent",
+                None,
+                None,
+                reactions(&["me", "peer"]),
+            ),
+            (
+                "accepted_failed_peer",
+                "sent",
+                Some("wrapper-f"),
+                Some("local_publish_failed"),
+                reactions(&["peer"]),
+            ),
+            (
+                "failed_self",
+                "sent",
+                None,
+                Some("local_publish_failed"),
+                reactions(&["me"]),
+            ),
+            (
+                "failed_none",
+                "sent",
+                None,
+                Some("local_publish_failed"),
+                reactions(&[]),
+            ),
+            (
+                "losing_peer",
+                "sent",
+                None,
+                Some("LosingBranch"),
+                reactions(&["peer"]),
+            ),
+            (
+                "accepted_peer",
+                "sent",
+                Some("wrapper-a"),
+                None,
+                reactions(&["peer"]),
+            ),
+            (
+                "received_peer",
+                "received",
+                Some("wrapper-r"),
+                None,
+                reactions(&["peer"]),
+            ),
+            (
+                "damaged",
+                "sent",
+                None,
+                Some("local_publish_failed"),
+                "not json".to_owned(),
+            ),
+        ];
+        for (index, (id, direction, source, status, reactions_json)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO message_timeline
+                    (group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                     plaintext, kind, tags_json, timeline_at, received_at, reactions_json,
+                     invalidation_status)
+                 VALUES ('g', ?1, ?2, ?3, 'me', 'hi', 9, '[]', ?4, ?4, ?5, ?6)",
+                rusqlite::params![id, source, direction, index as i64, reactions_json, status],
+            )
+            .unwrap();
+        }
+
+        run_through(&mut conn, 173).unwrap();
+
+        let state = |id: &str| -> (Option<String>, i64) {
+            conn.query_row(
+                "SELECT invalidation_status, recipient_confirmed FROM message_timeline
+                 WHERE message_id_hex = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let failed = Some("local_publish_failed".to_owned());
+        assert_eq!(state("failed_peer"), (None, 1));
+        assert_eq!(state("pending_peer"), (None, 0));
+        assert_eq!(state("accepted_failed_peer"), (failed.clone(), 0));
+        assert_eq!(state("failed_self"), (failed.clone(), 0));
+        assert_eq!(state("failed_none"), (failed.clone(), 0));
+        assert_eq!(state("losing_peer"), (Some("LosingBranch".to_owned()), 0));
+        assert_eq!(state("accepted_peer"), (None, 0));
+        assert_eq!(state("received_peer"), (None, 0));
+        assert_eq!(state("damaged"), (failed, 0));
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_message_timeline_chat_preview'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("recipient_confirmed = 1"));
     }
 
     #[test]
@@ -2413,7 +2559,7 @@ mod tests {
         // Call serde_json directly to pin the v1 envelope. The current
         // `StoredMessagePayload::encode` intentionally emits binary v2.
         let payload = serde_json::to_vec(&StoredMessagePayload::outbound_welcome(
-            transport, None, None,
+            transport, None, None, None,
         ))
         .unwrap();
         MessageRecord {

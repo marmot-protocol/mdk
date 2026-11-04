@@ -78,31 +78,70 @@ fn build_export_batch_labels_only_resolved_relays() {
         .iter()
         .filter(|point| point.relay.is_some())
         .collect();
-    assert!(
-        relay_points
+    assert_eq!(relay_points.len(), 5, "unresolved relays add no series");
+    for (name, value) in [
+        (
+            metric_names::FIRST_EVENT_LATENCY,
+            ExportMetricValue::Histogram(ExportHistogram {
+                bounds_ms: vec![50],
+                bucket_counts: vec![2],
+                overflow_count: 0,
+                sum_ms: 100,
+            }),
+        ),
+        (
+            metric_names::EOSE_LATENCY,
+            ExportMetricValue::Histogram(ExportHistogram {
+                bounds_ms: vec![50],
+                bucket_counts: vec![1],
+                overflow_count: 0,
+                sum_ms: 50,
+            }),
+        ),
+        (metric_names::DELIVERY_COUNT, ExportMetricValue::Counter(4)),
+        (metric_names::REDUNDANT_COUNT, ExportMetricValue::Counter(1)),
+        (
+            metric_names::FIRST_DELIVERER_RATE,
+            ExportMetricValue::Gauge(0.75),
+        ),
+    ] {
+        let points: Vec<_> = relay_points
             .iter()
-            .all(|point| point.relay.as_deref() == Some("wss://a.example")),
-        "every per-relay point carries the single resolved relay label",
-    );
-    assert!(
-        relay_points
-            .iter()
-            .any(|point| point.name == metric_names::FIRST_EVENT_LATENCY)
-    );
-    assert!(relay_points.iter().any(|point| {
-        point.name == metric_names::DELIVERY_COUNT && point.value == ExportMetricValue::Counter(4)
-    }));
-    assert!(relay_points.iter().any(|point| {
-        point.name == metric_names::FIRST_DELIVERER_RATE
-            && point.value == ExportMetricValue::Gauge(0.75)
-    }));
+            .filter(|point| point.name == name)
+            .collect();
+        assert_eq!(points.len(), 1, "one resolved relay series for {name}");
+        assert_eq!(points[0].relay.as_deref(), Some("wss://a.example"));
+        assert_eq!(points[0].failure, None);
+        assert_eq!(points[0].value, value, "source value for {name}");
+    }
 
     // Population points carry no label, and the cross-relay spread is one.
-    assert!(
-        batch.points.iter().any(|point| {
-            point.name == metric_names::CROSS_RELAY_SPREAD && point.relay.is_none()
-        })
-    );
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::CROSS_RELAY_SPREAD
+            && point.relay.is_none()
+            && point.value
+                == ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![50],
+                    bucket_counts: vec![5],
+                    overflow_count: 0,
+                    sum_ms: 250,
+                })
+    }));
+    for (name, value) in [
+        (metric_names::CONNECTION_ATTEMPTS, 4),
+        (metric_names::CONNECTION_SUCCESSES, 3),
+        (metric_names::PUBLISH_ATTEMPTS, 2),
+        (metric_names::PUBLISH_SUCCESSES, 2),
+    ] {
+        let points: Vec<_> = batch
+            .points
+            .iter()
+            .filter(|point| point.name == name)
+            .collect();
+        assert_eq!(points.len(), 1, "population series for {name}");
+        assert_eq!(points[0].value, ExportMetricValue::Counter(value));
+        assert_eq!(points[0].failure, None);
+    }
     // No publish/connection/population point ever carries a relay label.
     assert!(
         batch
@@ -165,27 +204,36 @@ fn build_export_batch_folds_in_engine_metrics_when_present() {
         ..Default::default()
     };
     let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
-    assert!(batch.points.iter().any(|point| {
-        point.name == metric_names::OBSERVED_REORG_RATE
-            && point.value == ExportMetricValue::Gauge(0.25)
-    }));
-    assert!(
-        batch
+    for (name, value) in [
+        (metric_names::SETTLES, ExportMetricValue::Counter(4)),
+        (
+            metric_names::POST_SETTLE_REORGS,
+            ExportMetricValue::Counter(1),
+        ),
+        (
+            metric_names::OBSERVED_REORG_RATE,
+            ExportMetricValue::Gauge(0.25),
+        ),
+        (
+            metric_names::REORG_LATENESS,
+            ExportMetricValue::Histogram(ExportHistogram {
+                bounds_ms: vec![50],
+                bucket_counts: vec![1],
+                overflow_count: 0,
+                sum_ms: 50,
+            }),
+        ),
+    ] {
+        let points: Vec<_> = batch
             .points
             .iter()
-            .any(|point| point.name == metric_names::REORG_LATENESS)
-    );
-    // Engine metrics are population-level: no relay label.
-    assert!(
-        batch
-            .points
-            .iter()
-            .filter(|point| point.name == metric_names::SETTLES
-                || point.name == metric_names::POST_SETTLE_REORGS
-                || point.name == metric_names::OBSERVED_REORG_RATE
-                || point.name == metric_names::REORG_LATENESS)
-            .all(|point| point.relay.is_none())
-    );
+            .filter(|point| point.name == name)
+            .collect();
+        assert_eq!(points.len(), 1, "one optional engine series for {name}");
+        assert_eq!(points[0].value, value, "engine source value for {name}");
+        assert_eq!(points[0].relay, None);
+        assert_eq!(points[0].failure, None);
+    }
 }
 
 #[test]
@@ -269,7 +317,7 @@ fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
 
 #[test]
 fn build_export_batch_appends_unlabeled_app_performance_metrics() {
-    let app_performance = AppPerformanceSnapshot {
+    let mut app_performance = AppPerformanceSnapshot {
         app_start: AppPerformanceOperationSnapshot {
             attempts: 3,
             successes: 2,
@@ -364,6 +412,202 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
         sqlcipher_migration_probe_skips: 42,
         ..Default::default()
     };
+    // These stages previously checked only point presence. Distinct source
+    // values catch a mapper that substitutes a sibling stage's snapshot.
+    let stage_expectations: Vec<_> = [
+        (
+            &mut app_performance.group_create_queue_wait,
+            [
+                metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
+                metric_names::APP_GROUP_CREATE_QUEUE_WAIT_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_QUEUE_WAIT_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_QUEUE_WAIT_FAILURES,
+            ],
+            11_u64,
+        ),
+        (
+            &mut app_performance.group_create_key_package_lookup,
+            [
+                metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
+                metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_FAILURES,
+            ],
+            12_u64,
+        ),
+        (
+            &mut app_performance.group_create_image_upload,
+            [
+                metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
+                metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_FAILURES,
+            ],
+            13_u64,
+        ),
+        (
+            &mut app_performance.group_create_mls_prepare_persist,
+            [
+                metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
+                metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_FAILURES,
+            ],
+            14_u64,
+        ),
+        (
+            &mut app_performance.group_create_welcome_publish,
+            [
+                metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
+                metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_FAILURES,
+            ],
+            15_u64,
+        ),
+        (
+            &mut app_performance.group_create_local_projection_save,
+            [
+                metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
+                metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_FAILURES,
+            ],
+            16_u64,
+        ),
+        (
+            &mut app_performance.group_create_subscription_refresh,
+            [
+                metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
+                metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_FAILURES,
+            ],
+            17_u64,
+        ),
+        (
+            &mut app_performance.group_create_post_mutation_catch_up,
+            [
+                metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
+                metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_FAILURES,
+            ],
+            18_u64,
+        ),
+        (
+            &mut app_performance.group_create_total_caller_latency,
+            [
+                metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
+                metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_ATTEMPTS,
+                metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_SUCCESSES,
+                metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_FAILURES,
+            ],
+            19_u64,
+        ),
+        (
+            &mut app_performance.media_download_queue_wait,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
+            ],
+            20_u64,
+        ),
+        (
+            &mut app_performance.media_download_preparation,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
+            ],
+            21_u64,
+        ),
+        (
+            &mut app_performance.media_download_host_setup,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
+            ],
+            22_u64,
+        ),
+        (
+            &mut app_performance.media_download_response_headers,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
+            ],
+            23_u64,
+        ),
+        (
+            &mut app_performance.media_download_first_byte,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
+            ],
+            24_u64,
+        ),
+        (
+            &mut app_performance.media_download_locator_failover,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
+            ],
+            25_u64,
+        ),
+        (
+            &mut app_performance.media_download_ciphertext_verify,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
+            ],
+            26_u64,
+        ),
+        (
+            &mut app_performance.media_download_decrypt,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
+            ],
+            27_u64,
+        ),
+        (
+            &mut app_performance.media_download_plaintext_verify,
+            [
+                metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
+                metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
+                metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
+                metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
+            ],
+            28_u64,
+        ),
+    ]
+    .into_iter()
+    .map(|(source, names, seed)| {
+        *source = AppPerformanceOperationSnapshot {
+            attempts: seed * 3,
+            successes: seed * 2,
+            failures: seed,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(seed),
+        };
+        (names, seed)
+    })
+    .collect();
     let batch = build_export_batch_with_app_performance(
         &RelayTelemetryRollup::default(),
         &RelayLabelResolution::default(),
@@ -371,6 +615,29 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     );
 
     assert!(batch.points.iter().all(|point| point.relay.is_none()));
+    for (names, seed) in stage_expectations {
+        for (name, expected) in names.into_iter().zip([
+            ExportMetricValue::Histogram(ExportHistogram {
+                bounds_ms: vec![50],
+                bucket_counts: vec![seed],
+                overflow_count: 0,
+                sum_ms: seed * 50,
+            }),
+            ExportMetricValue::Counter(seed * 3),
+            ExportMetricValue::Counter(seed * 2),
+            ExportMetricValue::Counter(seed),
+        ]) {
+            let points: Vec<_> = batch
+                .points
+                .iter()
+                .filter(|point| point.name == name)
+                .collect();
+            assert_eq!(points.len(), 1, "one stage series for {name}");
+            assert_eq!(points[0].value, expected, "stage source value for {name}");
+            assert_eq!(points[0].relay, None);
+            assert_eq!(points[0].failure, None);
+        }
+    }
     let sync_failure = batch
         .points
         .iter()
@@ -453,22 +720,6 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             && point.relay.is_none()
             && point.value == ExportMetricValue::Counter(42)
     }));
-    for metric_name in [
-        metric_names::APP_GROUP_CREATE_QUEUE_WAIT_DURATION,
-        metric_names::APP_GROUP_CREATE_KEY_PACKAGE_LOOKUP_DURATION,
-        metric_names::APP_GROUP_CREATE_IMAGE_UPLOAD_DURATION,
-        metric_names::APP_GROUP_CREATE_MLS_PREPARE_PERSIST_DURATION,
-        metric_names::APP_GROUP_CREATE_WELCOME_PUBLISH_DURATION,
-        metric_names::APP_GROUP_CREATE_LOCAL_PROJECTION_SAVE_DURATION,
-        metric_names::APP_GROUP_CREATE_SUBSCRIPTION_REFRESH_DURATION,
-        metric_names::APP_GROUP_CREATE_POST_MUTATION_CATCH_UP_DURATION,
-        metric_names::APP_GROUP_CREATE_TOTAL_CALLER_LATENCY_DURATION,
-    ] {
-        assert!(
-            batch.points.iter().any(|point| point.name == metric_name),
-            "missing create-group telemetry export {metric_name}",
-        );
-    }
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_ROSTER_READ_ATTEMPTS
             && point.value == ExportMetricValue::Counter(1)
@@ -497,80 +748,20 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
         point.name == metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES
             && point.value == ExportMetricValue::Counter(1)
     }));
-    // Every media phase uses the same population-only export path. Assert all
-    // four points per phase remain free of relay and failure attributes so a
-    // later field addition cannot silently turn media activity into a dynamic
-    // per-host, per-account, or per-message series.
-    for metric_names in [
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
-        ],
-        [
-            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
-            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
-            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
-            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
-        ],
+    // The preexisting body-transfer sample keeps the same population-only
+    // contract as the other media stages above.
+    for name in [
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
     ] {
-        for name in metric_names {
-            assert!(
-                batch.points.iter().any(|point| point.name == name
-                    && point.relay.is_none()
-                    && point.failure.is_none()),
-                "missing unlabeled media telemetry export {name}",
-            );
-        }
+        assert!(
+            batch.points.iter().any(|point| point.name == name
+                && point.relay.is_none()
+                && point.failure.is_none()),
+            "missing unlabeled media telemetry export {name}",
+        );
     }
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS

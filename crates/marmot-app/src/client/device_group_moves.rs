@@ -149,9 +149,10 @@ impl AppClient {
                 }
             }
             DeviceGroupMovePhase::Joined => {
-                if self
-                    .stored_group(&movement.destination_id)?
-                    .is_some_and(|group| group.is_terminal())
+                if account.is_group_forgotten(&movement.destination_id)?
+                    || self
+                        .stored_group(&movement.destination_id)?
+                        .is_some_and(|group| group.is_terminal())
                 {
                     self.finish_move_before_made(movement).await?;
                     return Ok(());
@@ -179,23 +180,38 @@ impl AppClient {
             DeviceGroupMovePhase::Made | DeviceGroupMovePhase::Finished
                 if movement.rejected_slots.is_some() =>
             {
-                self.end_joined_move_sibling_guidance(movement)?;
-                self.carry_move_rejections(movement).await?;
-                if movement.phase == DeviceGroupMovePhase::Made {
-                    if account.is_group_forgotten(&movement.original_id)? {
-                        storage.complete_device_group_move(movement.move_id)?;
-                    } else if self.finish_old_moved_status(movement).await?
-                        && !self
-                            .runtime
-                            .has_pending_outbound_fanouts(&movement.original_id)?
-                        && !self
-                            .runtime
-                            .has_queued_outbound_intents(&movement.original_id)?
-                    {
-                        self.forget_group_local(&movement.original_id).await?;
-                        storage.complete_device_group_move(movement.move_id)?;
-                        self.device_link_changed = true;
+                // Destination bookkeeping must retry without blocking the
+                // independent old-group status/settlement owner. Report the
+                // first error only after each existing obligation got its turn.
+                let mut first_error = self.end_joined_move_sibling_guidance(movement).err();
+                if let Err(error) = self.carry_move_rejections(movement).await {
+                    first_error.get_or_insert(error);
+                }
+                let cleanup = async {
+                    if movement.phase == DeviceGroupMovePhase::Made {
+                        if account.is_group_forgotten(&movement.original_id)? {
+                            storage.complete_device_group_move(movement.move_id)?;
+                        } else if self.finish_old_moved_status(movement).await?
+                            && !self
+                                .runtime
+                                .has_pending_outbound_fanouts(&movement.original_id)?
+                            && !self
+                                .runtime
+                                .has_queued_outbound_intents(&movement.original_id)?
+                        {
+                            self.forget_group_local(&movement.original_id).await?;
+                            storage.complete_device_group_move(movement.move_id)?;
+                            self.device_link_changed = true;
+                        }
                     }
+                    Ok::<(), AppError>(())
+                }
+                .await;
+                if let Err(error) = cleanup {
+                    first_error.get_or_insert(error);
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
                 }
             }
             _ => {}

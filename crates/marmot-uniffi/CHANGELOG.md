@@ -26,6 +26,21 @@
   field is local metadata, never written to `imeta`. Received and legacy
   references remain downloadable. Regenerate bindings with the matching library.
 
+- `TimelineMessageRecordFfi` adds `recipient_confirmed: bool` (mdk#1291):
+  true when a peer reacted to an own send that failed with no relay
+  acceptance on record, which proves the peer received it. It stays true if
+  retention later prunes that reaction. Render the row as delivered:
+  its `invalidation_status` is null and its `source_message_id_hex` stays
+  null. The flip arrives with the `DeliveryOrSendStateChanged` trigger, and
+  `ChatListMessageDeliveryStateFfi` reports `Delivered`. A host that derives
+  "sending" from a null `source_message_id_hex` must also read
+  `recipient_confirmed`, or a settled send shows as sending instead of
+  failed. A row's change carries one trigger, so the reaction that settles
+  or unsettles a send arrives as `DeliveryOrSendStateChanged`: recompute
+  that row's reactions for this trigger too. Replies quoting the send arrive
+  as `ReplyPreviewChanged`. Regenerate bindings with the matching native
+  library.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
   first records in the device group that it is leaving, which can take about
@@ -76,6 +91,11 @@
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
   matching native library.
 
+- `MarmotKitError` adds `GroupRecoveryUnsettled { group_id_hex }` and
+  `GroupRecoverySourceMismatch { group_id_hex }`. The former waits for the
+  source or local recovery state to settle. The latter requires checking local
+  eligibility and authenticated authority again, not blindly retrying the same
+  grant; a usable local copy must not recover. Update exhaustive host error handling.
 - `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
   (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
   with the matching native library.

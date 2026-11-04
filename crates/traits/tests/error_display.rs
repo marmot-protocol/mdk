@@ -49,6 +49,14 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
             group_id: group_id.clone(),
         }
         .to_string(),
+        EngineError::GroupRecoveryUnsettled {
+            group_id: group_id.clone(),
+        }
+        .to_string(),
+        EngineError::GroupRecoverySourceMismatch {
+            group_id: group_id.clone(),
+        }
+        .to_string(),
         EngineError::ForkedEpoch {
             group_id,
             last_stable: EpochId(1),
@@ -65,6 +73,14 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
 
 #[test]
 fn typed_inbound_rejection_display_is_fixed_and_privacy_safe() {
+    let group_id = cgka_traits::GroupId::new(vec![0xaa; 16]);
+    assert!(
+        EngineError::GroupRecoveryUnsettled {
+            group_id: group_id.clone()
+        }
+        .is_transient()
+    );
+    assert!(!EngineError::GroupRecoverySourceMismatch { group_id }.is_transient());
     assert_eq!(
         PeelerError::InvalidSignature.to_string(),
         "invalid transport signature"

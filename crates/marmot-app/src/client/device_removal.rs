@@ -199,7 +199,7 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .device_removals()?;
-        let Some((slot, _)) = roster.devices.iter().find(|(slot, entry)| {
+        let Some((slot, entry)) = roster.devices.iter().find(|(slot, entry)| {
             **slot != own
                 && entry.status == cgka_traits::app_components::DeviceStatusV1::Moved
                 && !removals.iter().any(|removal| {
@@ -209,12 +209,11 @@ impl AppClient {
         }) else {
             return Ok(());
         };
-        let leaf = self
-            .runtime
-            .own_account_leaf_claims(&group_id, &roster)?
-            .into_iter()
-            .find_map(|(key, claim)| (claim == DeviceTagClaim::Device(*slot)).then_some(key))
-            .unwrap_or_default();
+        // Later ordinary Updates can retag the old leaf from its new trust.
+        // The selected old entry identifies it independently of that tag.
+        let Some(leaf) = entry.tag_signature_key.clone() else {
+            return Ok(());
+        };
         self.unlink_moved_device_from_group(&group_id, leaf, *slot)
             .await?;
         self.linked_devices_changed = true;
