@@ -415,6 +415,7 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     expect_link_welcome(&mut moving, &original, &original_creator, &original_package);
     let mut original_roster = roster(&[(1, "Original"), (2, "Moving")]);
     original_roster.leaf_tag_key = [0x31; 32];
+    original_roster.devices.get_mut(&slot(2)).unwrap().rename_id = Some([0x72; 16]);
     let (_, created) = create_under(
         &mut original_creator,
         &original_roster,
@@ -590,6 +591,87 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
         app.device_group(&original_hex).unwrap().unwrap().trust,
         DeviceGroupTrust::Linked
     );
+    // The Made cut is local storage bookkeeping here; the Session/App owner
+    // separately owns authorizing this call from its selected-state proof.
+    assert!(
+        moving
+            .storage
+            .commit_device_group_move_made(&movement, &original_roster, &destination_roster, 13)
+            .unwrap()
+    );
+    let movement = app.device_group_move(&chosen()).unwrap().unwrap();
+    moving.engine.set_device_tag_group(Some(chosen())).unwrap();
+    let expected_old =
+        super::device_roster::roster_of(&moving, &original).devices[&slot(2)].clone();
+    assert_eq!(expected_old.rename_id, Some([0x72; 16]));
+    let pending_package = destination_creator
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    super::send_intents::store_pending_add(&moving, &original, &pending_package);
+    assert_eq!(
+        super::send_intents::pending_proposals(&moving, &original),
+        1
+    );
+    let intent = SendIntent::MarkDeviceGroupMoved {
+        group_id: original.clone(),
+        slot: slot(2),
+        expected: Box::new(expected_old.clone()),
+    };
+    let SendResult::GroupEvolution { pending, .. } =
+        moving.engine.send(intent.clone()).await.unwrap()
+    else {
+        panic!("old status Commit");
+    };
+    let staged_group = load_group(&moving, &original);
+    let staged = staged_group.pending_commit().unwrap();
+    assert_eq!(
+        staged.add_proposals().count(),
+        0,
+        "unrelated Add was not admitted"
+    );
+    assert_eq!(
+        staged.queued_proposals().count(),
+        1,
+        "only the inline status update"
+    );
+    assert_eq!(
+        super::send_intents::pending_proposals(&moving, &original),
+        1
+    );
+    moving.engine.publish_failed(pending).await.unwrap();
+    assert_eq!(
+        super::send_intents::pending_proposals(&moving, &original),
+        1,
+        "failed old status leaves pending work intact"
+    );
+    let marked = send_commit(&mut moving, intent, &original).await;
+    assert_accepted(&mut original_creator, &marked, &original).await;
+    let mut expected_moved = expected_old;
+    expected_moved.status = cgka_traits::app_components::DeviceStatusV1::Moved;
+    let old_after = super::device_roster::roster_of(&moving, &original);
+    assert_eq!(
+        old_after.devices[&slot(2)],
+        expected_moved,
+        "old status changes nothing else, including user marker/settings"
+    );
+    assert_eq!(load_group(&moving, &original).members().count(), 2);
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &original).own_leaf_node().unwrap(),
+            &old_after
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2)),
+        "old status retains its old tag despite new global trust"
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &original).own_leaf_node().unwrap(),
+            &destination_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Unclaimed
+    );
     drop(app);
     drop(moving);
     drop(fault);
@@ -602,13 +684,13 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     assert_eq!(app.device_group_move(&chosen()).unwrap().unwrap(), movement);
     assert_eq!(
         app.device_group(&original_hex).unwrap().unwrap().trust,
-        DeviceGroupTrust::Linked
+        DeviceGroupTrust::Untrusted
     );
     assert_eq!(
         app.device_group(&hex::encode(chosen().as_slice()))
             .unwrap()
             .unwrap()
             .trust,
-        DeviceGroupTrust::AwaitingWelcome
+        DeviceGroupTrust::Linked
     );
 }

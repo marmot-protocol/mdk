@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- Device-link snapshots add owned move views and old-sibling recognition hints; linked-device status appends Moved.
+  `dismiss_device_group_move_sibling` dismisses one hint. Regenerate host bindings and rebuild consumers with the
+  matching native library/header: the snapshot layout changes. Moves remain behind the existing experimental gate.
+
 - Expose recovery-word setup/settings, manual backup restore controls/status/watch/current-chat hints and background
   Wi-Fi/charging reports, with matching deep frees. `MarmotTimelineMessageRecord` adds nullable tagged
   `history_import_provenance` (Device or Backup), changing its layout and embedding records. The legacy

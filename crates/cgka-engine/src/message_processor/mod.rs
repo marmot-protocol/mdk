@@ -914,6 +914,7 @@ impl<S: StorageProvider> Engine<S> {
                 SendIntent::LinkDevice { .. }
                     | SendIntent::UnlinkDevice { .. }
                     | SendIntent::RecordRemovedSlot { .. }
+                    | SendIntent::ImportDeviceGroupRejections { .. }
             ) {
                 return Err(EngineError::LinkDeviceUnsettled { group_id });
             }
@@ -4215,6 +4216,8 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::LinkDevice { group_id, .. }
         | SendIntent::UnlinkDevice { group_id, .. }
+        | SendIntent::ImportDeviceGroupRejections { group_id, .. }
+        | SendIntent::MarkDeviceGroupMoved { group_id, .. }
         | SendIntent::RecordRemovedSlot { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
@@ -4243,6 +4246,8 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::LinkDevice { .. }
         | SendIntent::UnlinkDevice { .. }
         | SendIntent::RecordRemovedSlot { .. }
+        | SendIntent::ImportDeviceGroupRejections { .. }
+        | SendIntent::MarkDeviceGroupMoved { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

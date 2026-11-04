@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- Device-link snapshots add owned move views and old-sibling recognition hints; linked-device status appends Moved.
+  `dismiss_device_group_move_sibling` dismisses one hint. Regenerate host bindings and rebuild consumers with the
+  matching native library/header: the snapshot layout changes. Moves remain behind the existing experimental gate.
+
 - Expose recovery-word setup/settings, manual backup restore begin/cancel/status/watch/current-chat hints, and
   account-worker Wi-Fi/charging reports. Closing a restore observer does not cancel work. Timeline and conversation
   rows add typed `history_import_provenance` for Device or Backup while preserving sibling-only `imported_from`.

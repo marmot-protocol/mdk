@@ -168,7 +168,7 @@ impl SqliteAppStorage {
             let Some(reference) = &original.key_package_ref_hex else {
                 return Err(StorageError::Backend("original device group lacks confirmed provenance".into()));
             };
-            if original_id == expectation.group_id.as_slice() || expectation.sender_signature_key.is_empty() || expectation.key_package_ref.is_empty() {
+            if expectation.group_id.as_slice().is_empty() || original_id == expectation.group_id.as_slice() || expectation.sender_signature_key.is_empty() || expectation.key_package_ref.is_empty() {
                 return Err(StorageError::Backend("invalid move destination expectation".into()));
             }
             let conn = self.lock()?;
@@ -176,6 +176,98 @@ impl SqliteAppStorage {
             if blocked { return Ok(false); }
             conn.execute_cached("INSERT INTO device_group_moves (destination_id, original_id, original_trust, original_key_package_ref_hex, original_recorded_at, sender_signature_key, key_package_ref, expires_at, own_slot, siblings, phase) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)", params![expectation.group_id.as_slice(), original_id, if original.trust == crate::DeviceGroupTrust::Created {"created"} else {"linked"}, reference, u64_to_i64(original.recorded_at)?, expectation.sender_signature_key, expectation.key_package_ref, u64_to_i64(expectation.expires_at)?, own_slot.as_slice(), serialize(&Vec::<MoveSibling>::new())?]).storage()?;
             conn.execute_cached("INSERT INTO device_groups(group_id_hex,trust,key_package_ref_hex,recorded_at) VALUES(?1,'awaiting_welcome',?2,?3)", params![hex::encode(expectation.group_id.as_slice()),hex::encode(&expectation.key_package_ref),u64_to_i64(now)?]).storage()?;
+            Ok(true)
+        })
+    }
+    /// One-way end of pre-Made local progress, after the caller withdrew the
+    /// expectation and forgot only the destination. Never restores old trust.
+    pub fn end_device_group_move_before_made(&self, move_id: i64) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "UPDATE device_group_moves SET phase = 3 WHERE move_id = ?1 AND phase IN (0,1)",
+                params![move_id],
+            )
+            .storage()?
+            == 1)
+    }
+
+    /// Old native traffic has settled and its copy was intentionally forgotten.
+    pub fn complete_device_group_move(&self, move_id: i64) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "UPDATE device_group_moves SET phase = 3 WHERE move_id = ?1 AND phase = 2",
+                params![move_id],
+            )
+            .storage()?
+            == 1)
+    }
+
+    /// End private old-sibling guidance on actual destination admission or an
+    /// explicit dismissal. It is never an authority to Add or trust that slot.
+    pub fn end_device_group_move_sibling_guidance(
+        &self,
+        move_id: i64,
+        slot: &[u8; 32],
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let Some(mut movement) = self
+                .device_group_moves()?
+                .into_iter()
+                .find(|row| row.move_id == move_id && row.rejected_slots.is_some())
+            else {
+                return Ok(false);
+            };
+            let Some(sibling) = movement
+                .siblings
+                .iter_mut()
+                .find(|sibling| sibling.slot == *slot && !sibling.ended)
+            else {
+                return Ok(false);
+            };
+            sibling.ended = true;
+            self.lock()?
+                .execute_cached(
+                    "UPDATE device_group_moves SET siblings = ?2 WHERE move_id = ?1",
+                    params![move_id, serialize(&movement.siblings)?],
+                )
+                .storage()?;
+            Ok(true)
+        })
+    }
+
+    /// Settle one captured fact without changing its original age/reason/key.
+    pub fn settle_device_group_move_carry(
+        &self,
+        move_id: i64,
+        slot: &[u8; 32],
+        outcome: MoveCarryOutcome,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let Some(mut movement) = self
+                .device_group_moves()?
+                .into_iter()
+                .find(|row| row.move_id == move_id)
+            else {
+                return Ok(false);
+            };
+            let Some(facts) = movement.rejected_slots.as_mut() else {
+                return Ok(false);
+            };
+            let Some(fact) = facts
+                .iter_mut()
+                .find(|fact| fact.slot == *slot && fact.outcome.is_none())
+            else {
+                return Ok(false);
+            };
+            fact.outcome = Some(outcome);
+            self.lock()?
+                .execute_cached(
+                    "UPDATE device_group_moves SET rejected_slots = ?2 WHERE move_id = ?1",
+                    params![move_id, serialize(&facts)?],
+                )
+                .storage()?;
             Ok(true)
         })
     }

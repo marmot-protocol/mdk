@@ -825,6 +825,7 @@ impl<S: StorageProvider> Engine<S> {
             self_removed_sibling_slots: Default::default(),
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         };
 
         // 5. Wrap welcomes via the peeler, before the group record or any
@@ -1900,6 +1901,7 @@ impl<S: StorageProvider> Engine<S> {
                 // The joining device's clock is the one bound it can trust.
                 local_copy_welcome_created_at: welcome_created_at
                     .map(|created_at| created_at.min(joined_at)),
+                device_roster_departures: Vec::new(),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
             let admission = match &route {

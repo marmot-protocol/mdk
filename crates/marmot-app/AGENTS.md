@@ -97,7 +97,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `key_package_refresh_overdue_changed`, which the same two seams drain into one payload-free
   `KeyPackageRefreshOverdueChanged`. It opens set, for the same reason as `linked_devices_changed`.
 - Write a device entry of the roster only through the runtime's `edit_device_roster_entry` (renaming, settings, announcements).
-  It refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
+  The sole move exception is the post-Made old-group `MarkDeviceGroupMoved`: this device's own complete-entry CAS,
+  changing only status and retaining label/settings/rename id with the original group's tag. It never retargets an
+  ordinary edit. The Made trust cut stays in the outer pairing drive, never nested projection/sync/recovery callbacks.
+  The ordinary edit path refuses while the device group has anything of this device's in flight; surface that as `device_group_busy`.
   The engine stages a `ReplaceDeviceEntry` only while the entry is still the one the edit read, so a whole-entry
   replacement never undoes a change that lands in between. A user edit (`client/device_renames.rs`, D37/D86) writes
   a fresh rename id next to its label/settings snapshot and is kept on disk before its commit is sent. Legacy NULL settings remain

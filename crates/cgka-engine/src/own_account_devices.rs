@@ -702,8 +702,11 @@ impl<S: StorageProvider> Engine<S> {
             self.update_stored_message_state(id, MessageState::Failed)?;
             return Ok(SiblingWelcomeResendOutcome::Complete);
         };
-        if entry.status == cgka_traits::app_components::DeviceStatusV1::Leaving
-            || entry.tag_signature_key.is_none()
+        if matches!(
+            entry.status,
+            cgka_traits::app_components::DeviceStatusV1::Leaving
+                | cgka_traits::app_components::DeviceStatusV1::Moved
+        ) || entry.tag_signature_key.is_none()
         {
             return Ok(SiblingWelcomeResendOutcome::Held);
         }

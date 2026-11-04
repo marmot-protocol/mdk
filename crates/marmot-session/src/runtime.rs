@@ -6843,6 +6843,8 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }
+            | SendIntent::ImportDeviceGroupRejections { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
     )
 }
 

@@ -655,9 +655,20 @@ link (`new_device`) and the prompts for sign-ins this device can link (`prompts`
   group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
   again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
   20 devices, when several sign-ins compete, and who added the device on another device.
-- `device_link_snapshot` reads linking without changing it. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
-  also fires once each time the account's worker opens or reconnects, which ends any link in progress: pairing keeps
-  its secrets only in memory.
+- `device_link_snapshot` returns current linking and move progress. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
+  also fires once each time the account's worker opens or reconnects. Unconfirmed comparisons end because their
+  secrets are memory-only; admitted move bookkeeping resumes from storage.
+
+Starting that same linking flow while this device already trusts a device group moves only this device. The snapshot's
+`moves` distinguishes WaitingForWelcome, Joining and Made: the old trust remains until the destination's first selected
+own change is present. A pre-Made failure forgets only the destination. The move preserves ordinary chat membership,
+local small-state values and their versions; old admitted group-pinned traffic can settle before old local storage is
+forgotten. There is no cross-device-group delivery guarantee or immediate quiet deadline. If completion facts cannot be
+recovered, the fallback is unlinked with a fresh compared-code link, without restoring an old trust.
+
+Move views carry local recognition hints for old siblings and destination rejection collisions.
+`dismiss_device_group_move_sibling` dismisses only one hint. `LinkedDeviceStatus::Moved` distinguishes old-roster
+cleanup from removing a device from its chats. See the [host move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
 
 ## History may be incomplete notices
 
