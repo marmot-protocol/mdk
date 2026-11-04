@@ -181,6 +181,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
         (204, "", AuditOtlpSendResult::Blocked),
         (202, "{}", AuditOtlpSendResult::Blocked),
         (200, "", AuditOtlpSendResult::Blocked),
+        (200, "[]", AuditOtlpSendResult::Blocked),
         (200, "{\"partialSuccess\":{}}", AuditOtlpSendResult::Blocked),
         (200, "{", AuditOtlpSendResult::Blocked),
         (200, "{} ", AuditOtlpSendResult::Blocked),
@@ -295,13 +296,20 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
     let bodies = batch.bodies.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
-    let sender = AuditOtlpSender::for_loopback_dev("other-gateway", endpoint, "token").unwrap();
-    let outcome = sender.send(batch).await;
+    let sender = AuditOtlpSender::for_loopback_dev("other-gateway", &endpoint, "token").unwrap();
+    let outcome = tokio::select! {
+        outcome = sender.send(batch) => outcome,
+        accepted = listener.accept() => {
+            accepted.unwrap();
+            panic!("a mismatched destination must not connect");
+        }
+    };
     assert_eq!(outcome, AuditOtlpSendResult::Blocked);
     assert_eq!(outcome.for_finish(), None);
     assert!(
@@ -317,6 +325,92 @@ async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
     };
     assert_eq!(replay.token, token);
     assert_eq!(replay.bodies, bodies);
+    drop(owner);
+
+    // The same endpoint, policy and reopened range must be capable of sending.
+    let collector = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        stream.write_all(&reply(200, "{}")).await.unwrap();
+        request
+    });
+    let matching = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), matching.send(replay))
+            .await
+            .expect("the matching destination must reach the collector"),
+        AuditOtlpSendResult::Complete
+    );
+    let request = collector.await.unwrap();
+    assert!(request.headers.starts_with("POST /v1/logs HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn rejected_resolution_keeps_the_prepared_range_replayable() {
+    crate::collector_host_safety::hand_in_direct_http_builder();
+    let (_dir, active, state, batch) = prepared();
+    let token = batch.token.clone();
+    let bodies = batch.bodies.clone();
+    let sender =
+        AuditOtlpSender::new(TEST_DESTINATION, "https://10.0.0.1/v1/logs", "token").unwrap();
+    let outcome = sender.send(batch).await;
+    assert_eq!(outcome, AuditOtlpSendResult::Unknown);
+    assert_eq!(outcome.for_finish(), None);
+    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+    let Preparation::Batch(replay) = owner.prepare_once().unwrap() else {
+        panic!("a rejected resolution must remain replayable");
+    };
+    assert_eq!(replay.token, token);
+    assert_eq!(replay.bodies, bodies);
+}
+
+// The first process policy is immutable, including in cargo test's shared process.
+#[tokio::test]
+async fn rejected_client_policy_keeps_the_prepared_range_replayable() {
+    const CHILD: &str = "MDK_AUDIT_SENDER_REJECTED_POLICY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        crate::collector_host_safety::hand_in_http_builder(|_| Err("private proxy policy"));
+        let (_dir, active, state, batch) = prepared();
+        let token = batch.token.clone();
+        let bodies = batch.bodies.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+        let sender =
+            AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+        let outcome = sender.send(batch).await;
+        assert_eq!(outcome, AuditOtlpSendResult::Unknown);
+        assert_eq!(outcome.for_finish(), None);
+        let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+        let Preparation::Batch(replay) = owner.prepare_once().unwrap() else {
+            panic!("a rejected client policy must remain replayable");
+        };
+        assert_eq!(replay.token, token);
+        assert_eq!(replay.bodies, bodies);
+        return;
+    }
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_otlp_sender::tests::rejected_client_policy_keeps_the_prepared_range_replayable",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+        "the isolated sender policy test must actually execute"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -389,47 +483,59 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
 #[tokio::test(flavor = "current_thread")]
 async fn timeout_after_acceptance_is_unknown() {
     crate::collector_host_safety::hand_in_direct_http_builder();
-    let (_dir, active, state, batch) = prepared();
-    let token = batch.token.clone();
-    let original = batch.bodies.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
-    let (accepted, observed) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let request = read_request(&mut stream).await;
-        accepted.send(()).unwrap();
-        released.await.unwrap();
-        request
-    });
-    let sender = AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-    let send = tokio::spawn(async move { sender.send(batch).await });
-    let ready = tokio::time::timeout(Duration::from_secs(5), observed).await;
-    if !matches!(ready, Ok(Ok(()))) {
-        send.abort();
-        task.abort();
-    }
-    ready
-        .expect("the collector must accept the request before its timeout")
-        .unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_millis(1), send)
+    // Keep the default client deadline and independently exercise the enclosing
+    // attempt deadline while the client's thirty-second budget is still open.
+    for (attempt_timeout, elapsed) in [
+        (
+            collector_host_safety::REQUEST_TIMEOUT,
+            Duration::from_secs(31),
+        ),
+        (Duration::from_secs(1), Duration::from_secs(2)),
+    ] {
+        let (_dir, active, state, batch) = prepared();
+        let token = batch.token.clone();
+        let original = batch.bodies.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
+        let (accepted, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            accepted.send(()).unwrap();
+            released.await.unwrap();
+            request
+        });
+        let mut sender =
+            AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
+        sender.timeout = attempt_timeout;
+        let send = tokio::spawn(async move { sender.send(batch).await });
+        let ready = tokio::time::timeout(Duration::from_secs(5), observed).await;
+        if !matches!(ready, Ok(Ok(()))) {
+            send.abort();
+            task.abort();
+        }
+        ready
+            .expect("the collector must accept the request before its timeout")
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(elapsed).await;
+        let outcome = tokio::time::timeout(Duration::from_millis(1), send)
             .await
-            .expect("the 30-second request timeout must have fired")
-            .unwrap(),
-        AuditOtlpSendResult::Unknown
-    );
-    release.send(()).unwrap();
-    task.await.unwrap();
-    let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
-    let Preparation::Batch(replay) = owner.prepare_once().unwrap() else {
-        panic!("timed-out range must remain replayable");
-    };
-    assert_eq!(replay.token, token);
-    assert_eq!(replay.bodies, original);
+            .expect("the selected deadline must fire before the completion watchdog")
+            .unwrap();
+        assert_eq!(outcome, AuditOtlpSendResult::Unknown);
+        assert_eq!(outcome.for_finish(), None);
+        release.send(()).unwrap();
+        task.await.unwrap();
+        let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
+        let Preparation::Batch(replay) = owner.prepare_once().unwrap() else {
+            panic!("timed-out range must remain replayable");
+        };
+        assert_eq!(replay.token, token);
+        assert_eq!(replay.bodies, original);
+        tokio::time::resume();
+    }
 }
 
 #[tokio::test]

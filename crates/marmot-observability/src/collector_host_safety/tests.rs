@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::AsyncReadExt;
 
 async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, CollectorRequestError> {
     let ips = ips.iter().map(|ip| ip.parse().unwrap()).collect();
@@ -225,6 +226,97 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
             .is_err()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_timeout_bounds_a_stalled_tls_handshake() {
+    hand_in_direct_http_builder();
+    // This watchdog uses wall time even after Tokio's clock is paused. Keep
+    // it alive around both actual TCP/TLS readiness and deadline completion.
+    let (finished, finish) = std::sync::mpsc::channel();
+    let (expired, expiry) = tokio::sync::oneshot::channel();
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            finish.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = expired.send(());
+        }
+    });
+    let operation = async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}/v1/metrics",
+            listener.local_addr().unwrap().port()
+        );
+        let pin = resolve(&endpoint, &["127.0.0.1"]).await.unwrap();
+        let client = pin.build_client().unwrap();
+        let (hello_sent, hello_received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let collector = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Handshake messages can span TLS records. A TCP accept or one
+            // readable byte alone does not establish ClientHello readiness.
+            let mut handshake = Vec::new();
+            loop {
+                let mut record = [0; 5];
+                stream.read_exact(&mut record).await.unwrap();
+                assert_eq!(record[0], 22, "expected a TLS handshake record");
+                let length = usize::from(u16::from_be_bytes([record[3], record[4]]));
+                assert!((1..=18_432).contains(&length));
+                let start = handshake.len();
+                handshake.resize(start + length, 0);
+                stream.read_exact(&mut handshake[start..]).await.unwrap();
+                if handshake.len() >= 4 {
+                    assert_eq!(handshake[0], 1, "expected ClientHello");
+                    let hello_length = usize::from(handshake[1]) * 65_536
+                        + usize::from(handshake[2]) * 256
+                        + usize::from(handshake[3]);
+                    assert!((1..=65_536).contains(&hello_length));
+                    if handshake.len() >= 4 + hello_length {
+                        break;
+                    }
+                }
+            }
+            hello_sent.send(()).unwrap();
+            // Deliberately withhold ServerHello; no certificate or trust
+            // validation is fabricated by this connection-deadline fixture.
+            released.await.unwrap();
+        });
+        let mut request = tokio::spawn(async move { client.get(pin.url).send().await });
+        tokio::time::timeout(Duration::from_secs(5), hello_received)
+            .await
+            .expect("the collector must read the complete ClientHello")
+            .unwrap();
+        assert!(
+            !request.is_finished(),
+            "the TLS handshake must still be pending"
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let error = tokio::time::timeout(Duration::from_millis(1), &mut request)
+            .await
+            .expect("connect timeout must fire before the thirty-second request deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.is_timeout(),
+            "expected a real reqwest timeout: {error:?}"
+        );
+        assert!(
+            error.is_connect(),
+            "the timeout must be in connection setup"
+        );
+        release.send(()).unwrap();
+        collector.await.unwrap();
+        tokio::time::resume();
+    };
+    tokio::select! {
+        () = operation => {},
+        _ = expiry => panic!("TLS timeout fixture exceeded its wall-clock watchdog"),
+    }
+    finished.send(()).unwrap();
+    watchdog.join().unwrap();
 }
 
 // The builder is a process-wide OnceLock. A subprocess preserves the same

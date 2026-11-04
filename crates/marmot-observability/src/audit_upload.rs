@@ -485,6 +485,8 @@ fn audit_log_reqwest_error(err: reqwest::Error) -> AuditUploadError {
 mod tests {
     use std::fs;
     use std::io::Write;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 
@@ -533,6 +535,183 @@ mod tests {
                 !display.contains(leak) && !debug.contains(leak),
                 "leaked {leak} via {display} / {debug}"
             );
+        }
+    }
+
+    async fn read_upload_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+            assert!(headers.len() < 8192, "request headers must be bounded");
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        (headers, body)
+    }
+
+    fn assert_request_error(error: AuditUploadError, expected: &str) {
+        assert!(matches!(&error, AuditUploadError::AuditLogUpload(message) if message == expected));
+        assert_eq!(
+            error.to_string(),
+            format!("audit log upload failed: {expected}")
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            format!("AuditLogUpload({expected:?})")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert_privacy_safe(&error);
+        for sentinel in [
+            "private-audit-path",
+            "private-audit-body",
+            "private-response",
+        ] {
+            assert!(!error.to_string().contains(sentinel));
+            assert!(!format!("{error:?}").contains(sentinel));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_request_failures_are_context_free() {
+        const BODY: &[u8] = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"seq\":1,\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"private-audit-body\"}}\n";
+        collector_host_safety::hand_in_direct_http_builder();
+        // Fail during real TLS connection setup after receiving ClientHello.
+        // A bound, non-listening socket need not refuse immediately on every OS.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://{}/private-audit-path?token=secret-query",
+            listener.local_addr().unwrap()
+        );
+        let mut peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut handshake = Vec::new();
+            loop {
+                let mut record = [0; 5];
+                stream.read_exact(&mut record).await.unwrap();
+                assert_eq!(record[0], 22, "expected a TLS handshake record");
+                let length = usize::from(u16::from_be_bytes([record[3], record[4]]));
+                assert!((1..=18_432).contains(&length));
+                let start = handshake.len();
+                handshake.resize(start + length, 0);
+                stream.read_exact(&mut handshake[start..]).await.unwrap();
+                if handshake.len() >= 4 {
+                    assert_eq!(handshake[0], 1, "expected ClientHello");
+                    let hello_length = usize::from(handshake[1]) * 65_536
+                        + usize::from(handshake[2]) * 256
+                        + usize::from(handshake[3]);
+                    assert!((1..=65_536).contains(&hello_length));
+                    if handshake.len() >= 4 + hello_length {
+                        break;
+                    }
+                }
+            }
+            // No ServerHello or certificate: this observes a setup error,
+            // without fabricating a successful trust-validation handshake.
+            stream.shutdown().await.unwrap();
+        });
+        let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = send_audit_upload(
+                &endpoint,
+                BODY.to_vec(),
+                Some("bearer-secret"),
+                None,
+                None,
+                None,
+                |_, _| async { panic!("a literal loopback endpoint must not use DNS") },
+            )
+            .await;
+            (&mut peer).await.unwrap();
+            response
+        })
+        .await;
+        if attempt.is_err() {
+            peer.abort();
+            let _ = peer.await;
+        }
+        let error = attempt
+            .expect("the observed TLS setup failure must complete")
+            .unwrap_err();
+        assert_request_error(error, "connection failed");
+
+        for stalled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!(
+                "http://{}/private-audit-path?token=secret-query",
+                listener.local_addr().unwrap()
+            );
+            let (accepted, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let collector = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (headers, body) = read_upload_request(&mut stream).await;
+                assert!(
+                    headers.starts_with("POST /private-audit-path?token=secret-query HTTP/1.1\r\n")
+                );
+                assert!(headers.contains("authorization: Bearer bearer-secret\r\n"));
+                assert_eq!(body, BODY);
+                accepted.send(()).unwrap();
+                if !stalled {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 invalid private-response\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+                released.await.unwrap();
+            });
+            let mut send = tokio::spawn(async move {
+                send_audit_upload(
+                    &endpoint,
+                    BODY.to_vec(),
+                    Some("bearer-secret"),
+                    None,
+                    None,
+                    None,
+                    |_, _| async { panic!("a literal loopback endpoint must not use DNS") },
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), observed)
+                .await
+                .expect("the collector must read the complete request")
+                .unwrap();
+            let completion = if stalled {
+                // Call the real request directly so the enclosing upload
+                // timeout cannot substitute for reqwest's own error mapper.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(5)
+            };
+            let error = tokio::time::timeout(completion, &mut send)
+                .await
+                .expect("the actual request fault must complete")
+                .unwrap()
+                .unwrap_err();
+            release.send(()).unwrap();
+            collector.await.unwrap();
+            assert_request_error(
+                error,
+                if stalled {
+                    "request timed out"
+                } else {
+                    "request failed"
+                },
+            );
+            if stalled {
+                tokio::time::resume();
+            }
         }
     }
 
@@ -972,9 +1151,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::disallowed_methods)]
     async fn snapshot_receipts_describe_the_capture_and_keep_rejected_retry_after() {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
         collector_host_safety::hand_in_direct_http_builder();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -1002,26 +1178,8 @@ mod tests {
             let expected_body = valid.clone();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let body_start = loop {
-                    request.push(stream.read_u8().await.unwrap());
-                    if request.ends_with(b"\r\n\r\n") {
-                        break request.len();
-                    }
-                    assert!(request.len() < 8192);
-                };
-                let headers = std::str::from_utf8(&request).unwrap();
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|value| value.parse().ok())
-                    })
-                    .unwrap();
-                request.resize(body_start + length, 0);
-                stream.read_exact(&mut request[body_start..]).await.unwrap();
-                assert_eq!(&request[body_start..], expected_body);
+                let (_, body) = read_upload_request(&mut stream).await;
+                assert_eq!(body, expected_body);
                 let retry_header =
                     retry_after.map_or(String::new(), |value| format!("Retry-After: {value}\r\n"));
                 stream.write_all(format!("HTTP/1.1 {status} Test\r\n{retry_header}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
