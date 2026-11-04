@@ -2562,10 +2562,13 @@ impl<S: StorageProvider> Engine<S> {
         if mls_group.pending_commit().is_none() {
             return recovery_failed();
         }
-        let welcomes = match self.staged_welcomes_for_evolution(group_id, source_epoch, &message_id)
-        {
-            Ok(welcomes) => welcomes,
-            Err(_) => return recovery_failed(),
+        let welcomes = if is_recovery {
+            match self.staged_welcomes_for_evolution(group_id, source_epoch, &message_id) {
+                Ok(welcomes) => welcomes,
+                Err(_) => return recovery_failed(),
+            }
+        } else {
+            Vec::new()
         };
         if let cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers {
             request_ids, ..

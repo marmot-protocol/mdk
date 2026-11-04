@@ -3150,12 +3150,12 @@ async fn stale_validation_marker_forces_revalidation_and_refresh() {
 }
 
 #[tokio::test]
-async fn welcome_load_fallback() {
+async fn self_update_reopens_exactly() {
     let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().unwrap());
     let mut initial = build_flaky_engine(storage.clone());
     let group = create_confirmed_group_flaky(&mut initial).await;
     let before = initial.epoch(&group).unwrap();
-    let SendResult::GroupEvolution { .. } = initial
+    let SendResult::GroupEvolution { msg, .. } = initial
         .send(SendIntent::SelfUpdate {
             group_id: group.clone(),
         })
@@ -3169,27 +3169,13 @@ async fn welcome_load_fallback() {
     // Only frozen Welcome discovery fails; the original commit and the
     // compatibility recovery inputs remain readable.
     storage.fail_next_welcome_read();
-    let mut reopened = build_flaky_engine(storage);
+    let mut reopened = build_flaky_engine(storage.clone());
     reopened.hydrate_all_stored_groups().unwrap();
-    assert!(
-        reopened.quarantined_groups().is_empty(),
-        "ordinary evolution must retain compatibility recovery: {:?}",
-        reopened.quarantined_groups()
-    );
-    assert!(reopened.drain_events().iter().any(|event| matches!(
-        event,
-        GroupEvent::PendingCommitRecovered { group_id, recovered_epoch }
-            if group_id == &group && *recovered_epoch == before
-    )));
-    let SendResult::GroupEvolution { pending, .. } = reopened
-        .send(SendIntent::SelfUpdate {
-            group_id: group.clone(),
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("recovered group accepts a new self-update")
-    };
-    reopened.confirm_published(pending).await.unwrap();
+    let retained = reopened.drain_auto_publish().into_iter().find(|work| work.msg == msg)
+        .expect("ordinary restart must retain its exact publication rather than discard it for an unrelated Welcome read");
+
+    // Restore the backend before acknowledging the retained publication.
+    storage.fail_welcome_read.store(false, Ordering::SeqCst);
+    reopened.confirm_published(retained.pending).await.unwrap();
     assert_eq!(reopened.epoch(&group).unwrap(), EpochId(before.0 + 1));
 }

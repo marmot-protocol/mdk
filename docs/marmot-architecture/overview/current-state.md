@@ -136,8 +136,9 @@ See [invitation recovery](../invitation-recovery.md) for persistence, retry, and
 
 The native engine also supports authenticated `RecoverMembers`: an authorized healthy coordinator replaces exact
 stale device leaves in one Remove+Add Commit, preserving siblings and account roles. Exact Commit/Welcome ownership
-survives restart, and undelivered Welcomes are retired if their Commit loses branch selection. This is the native
-operation, not an automatic account-inbox handshake or account-worker workflow; usable forks still require consent.
+survives restart. Reversible branch loss holds an undelivered Welcome for re-adoption; only terminal loss retires it.
+This is the native operation, not an automatic account-inbox handshake or account-worker workflow; usable forks
+still require consent.
 
 The C3 row completion adds bounded selected draft/message/invitation/empty previews and local
 row-action availability to presented rows. Draft invalidations refresh both list APIs without

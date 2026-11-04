@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Retain exact SelfUpdate publication bytes across compatibility restart even when Welcome storage is unavailable.
+  Ordinary updates have no Welcome artifacts to discover.
 - Allow member recovery past ownerless ordinary Preparing work and obsolete ordinary source records, including
   rollback after a crash during recovery preparation. Current-source prepared/attempted publications and retained
   recovery artifacts still block it.
