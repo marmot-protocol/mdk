@@ -845,6 +845,11 @@ pub trait MemberValidationCacheStorage {
 pub struct AccountDeviceSignerBinding {
     pub marmot_identity: MemberId,
     pub mls_signature_public_key: Vec<u8>,
+    /// Current-profile account identity proof component, validated by the engine
+    /// against this binding and the selected ciphersuite before every reuse.
+    /// Older records have no proof and acquire one on their next current open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identity_proof: Option<Vec<u8>>,
 }
 
 pub trait AccountDeviceSignerStorage {
@@ -1266,6 +1271,18 @@ pub trait StorageProvider:
     /// Reference to the OpenMLS storage side. Used by the engine to construct
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
+
+    /// Monotonic high-water covering every persisted, restorable pending-send
+    /// reference in outbound fanouts or group evolutions. Writers must raise this account-device bound
+    /// atomically with those artifacts, preserve all `u64` values, and never
+    /// lower it on deletion or snapshot restoration. Construction reserves it
+    /// before any group hydrates or stages new work.
+    ///
+    /// This metadata must be independent of artifact decoding so a malformed
+    /// group payload can be quarantined without blocking unrelated groups.
+    /// Missing, corrupt, or unestablishable legacy bounds must return an error,
+    /// not zero or an estimate. Zero is valid only for a known empty history.
+    fn pending_ref_high_water(&self) -> StorageResult<u64>;
 
     /// Count of writes to the OpenMLS state store, when the backend tracks
     /// them. The engine keeps loaded `MlsGroup`s across calls and reuses one

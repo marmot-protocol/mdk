@@ -140,6 +140,7 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         record.payload = StoredMessagePayload::outbound_welcome(
             message.clone(),
+            Some(staged_origin_commit_id.clone()),
             payload.welcome_key_package_ref().map(<[u8]>::to_vec),
             payload.welcome_deliver_until(),
         )

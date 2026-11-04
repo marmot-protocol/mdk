@@ -5101,3 +5101,147 @@ fn debug_output_hides_avatar_keys_and_cursor_positions() {
     let shown = format!("{cursor:?}");
     assert!(!shown.contains(&group_id), "{shown}");
 }
+
+/// mdk#1291: a peer's reaction delivers a failed send in the chat list, and
+/// the delivered send keeps its failed-send rank. It does not jump ahead of
+/// newer history as a pending send would, nor through the optimistic-head
+/// order class a send that failed before its commit (no source epoch) has.
+#[test]
+fn peer_reaction_delivers_a_failed_preview_without_outranking_newer_history() {
+    let store = setup_store().app_storage();
+    let preview = |store: &SqliteAppStorage| {
+        store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row")
+            .last_message
+            .expect("preview")
+    };
+    let failed_send = |store: &SqliteAppStorage, id: &str, at: u64, epoch: Option<u64>| {
+        let mut send = chat(id, LOCAL, at, "hello");
+        send.direction = "sent".to_owned();
+        send.source_message_id_hex = None;
+        send.source_epoch = epoch;
+        store.record_app_event(&send).unwrap();
+        store
+            .invalidate_app_event_by_message_id(GROUP, id, "local_publish_failed")
+            .unwrap();
+    };
+    failed_send(&store, "mine", 10, Some(1));
+    assert_eq!(
+        preview(&store).delivery_state,
+        ChatListMessageDeliveryState::Failed
+    );
+    store
+        .record_app_event(&reaction("seen", REMOTE, "mine", 20))
+        .unwrap();
+    let delivered = preview(&store);
+    assert_eq!(delivered.message_id_hex, "mine");
+    assert_eq!(
+        delivered.delivery_state,
+        ChatListMessageDeliveryState::Delivered
+    );
+
+    let mut newer = chat("newer", REMOTE, 30, "later");
+    newer.source_epoch = Some(1);
+    store.record_app_event(&newer).unwrap();
+    failed_send(&store, "late", 15, Some(1));
+    store
+        .record_app_event(&reaction("seen_late", REMOTE, "late", 40))
+        .unwrap();
+    assert_eq!(preview(&store).message_id_hex, "newer");
+
+    failed_send(&store, "uncommitted", 16, None);
+    store
+        .record_app_event(&reaction("seen_uncommitted", REMOTE, "uncommitted", 41))
+        .unwrap();
+    assert_eq!(preview(&store).message_id_hex, "newer");
+}
+
+/// mdk#1291: a settled send stays delivered after retention prunes the peer
+/// reaction that confirmed it, as for a send made before disappearing messages
+/// were turned on. The kept receipt goes when the send itself goes.
+#[test]
+fn pruning_the_confirming_reaction_keeps_the_send_delivered() {
+    let store = retention_store();
+    let app = store.app_storage();
+    let mut mine = chat("mine", LOCAL, 10, "hello");
+    mine.direction = "sent".to_owned();
+    mine.source_message_id_hex = None;
+    app.record_app_event(&mine).unwrap();
+    app.invalidate_app_event_by_message_id(GROUP, "mine", "local_publish_failed")
+        .unwrap();
+    app.record_app_event_with_retention(
+        &reaction("seen", REMOTE, "mine", 20),
+        Some(AppMessageRetentionDecision::new(20, 30)),
+    )
+    .unwrap();
+    let delivery = |app: &SqliteAppStorage| {
+        let row = app.timeline_message(GROUP, "mine").unwrap().unwrap();
+        (row.invalidation_status, row.recipient_confirmed)
+    };
+    assert_eq!(delivery(&app), (None, true));
+
+    app.secure_prune_expired_app_events(GROUP, 60, LOCAL, &no_mentions)
+        .unwrap();
+    assert_eq!(
+        delivery(&app),
+        (None, true),
+        "the receipt outlives the reaction"
+    );
+    app.rebuild_message_timeline_for_group(GROUP).unwrap();
+    assert_eq!(delivery(&app), (None, true), "and survives a rebuild");
+    assert!(app.timeline_message(GROUP, "seen").unwrap().is_none());
+}
+
+/// Only a pruned reaction that was the peer's evidence keeps a receipt. Pruning
+/// the account's own reaction, or a peer reaction already retracted, keeps
+/// nothing, so retracting the live evidence afterwards still unsettles the send.
+#[test]
+fn pruning_a_reaction_that_was_not_evidence_keeps_no_receipt() {
+    for (pruned, pruned_sender, retract_pruned) in [("own", LOCAL, false), ("taken", REMOTE, true)]
+    {
+        let store = retention_store();
+        let app = store.app_storage();
+        let mut mine = chat("mine", LOCAL, 10, "hello");
+        mine.direction = "sent".to_owned();
+        mine.source_message_id_hex = None;
+        app.record_app_event(&mine).unwrap();
+        app.invalidate_app_event_by_message_id(GROUP, "mine", "local_publish_failed")
+            .unwrap();
+        app.record_app_event_with_retention(
+            &reaction(pruned, pruned_sender, "mine", 20),
+            Some(AppMessageRetentionDecision::new(20, 30)),
+        )
+        .unwrap();
+        if retract_pruned {
+            let mut undo = chat("undo-taken", pruned_sender, 21, "");
+            undo.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_DELETE;
+            undo.tags = vec![vec![EVENT_REF_TAG.to_owned(), pruned.to_owned()]];
+            app.record_app_event(&undo).unwrap();
+        }
+        app.record_app_event(&reaction("evidence", REMOTE, "mine", 22))
+            .unwrap();
+        let delivery = |app: &SqliteAppStorage| {
+            let row = app.timeline_message(GROUP, "mine").unwrap().unwrap();
+            (row.invalidation_status, row.recipient_confirmed)
+        };
+        assert_eq!(
+            delivery(&app),
+            (None, true),
+            "{pruned}: the live peer reaction settles it"
+        );
+
+        app.secure_prune_expired_app_events(GROUP, 60, LOCAL, &no_mentions)
+            .unwrap();
+        let mut retract = chat("undo-evidence", REMOTE, 70, "");
+        retract.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_DELETE;
+        retract.tags = vec![vec![EVENT_REF_TAG.to_owned(), "evidence".to_owned()]];
+        app.record_app_event(&retract).unwrap();
+        assert_eq!(
+            delivery(&app),
+            (Some("local_publish_failed".to_owned()), false),
+            "{pruned}: pruning it kept no receipt"
+        );
+    }
+}

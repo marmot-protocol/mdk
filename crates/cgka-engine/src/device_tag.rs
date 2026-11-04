@@ -308,8 +308,9 @@ impl<S: StorageProvider> Engine<S> {
         own.filter(|own| !own.reads_as_own(leaf))
     }
 
-    /// Whether this device's selected own leaf carries its target-roster tag
-    /// on an actual own Commit path. A Welcome-installed KeyPackage leaf is
+    /// Whether the target roster names this device's selected own Commit leaf.
+    /// Later own updates can retag it before the trust cut without undoing
+    /// participation. A Welcome-installed KeyPackage leaf is
     /// not Made proof, even if another device prefilled its public key.
     pub fn own_device_tag_commit_landed(
         &self,
@@ -323,7 +324,12 @@ impl<S: StorageProvider> Engine<S> {
             let Some(leaf) = group.own_leaf_node() else {
                 return Ok(false);
             };
-            if device_tag_claim(leaf, roster) != DeviceTagClaim::Device(*slot) {
+            if roster
+                .devices
+                .get(slot)
+                .and_then(|entry| entry.tag_signature_key.as_deref())
+                != Some(leaf.signature_key().as_slice())
+            {
                 return Ok(false);
             }
             let source = leaf

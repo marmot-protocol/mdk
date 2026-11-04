@@ -849,6 +849,24 @@ impl AppClient {
     /// Check a found KeyPackage against the device group and answer its
     /// request, or say why it can't be linked.
     fn check_and_answer(&mut self, session_id: &SessionId, now: u64) -> Result<(), AppError> {
+        // A restart drops the in-memory new-device session, not its pending
+        // move. It still must not answer as an approver before Made.
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_group_moves()?
+            .iter()
+            .any(|movement| {
+                matches!(
+                    movement.phase,
+                    storage_sqlite::DeviceGroupMovePhase::Waiting
+                        | storage_sqlite::DeviceGroupMovePhase::Joined
+                )
+            })
+        {
+            return Ok(());
+        }
         let own_slot = self.own_slot()?;
         let account_id_hex = self
             .app

@@ -83,6 +83,23 @@ pub fn classify_staged_commit(
         .class(|| crate::app_components::group_requires_account_devices(parent))
 }
 
+/// Preflight a by-value membership edit using the staged classifier's rule.
+/// The actual Commit must still pass `authorize_own_staged_commit`: a source
+/// query cannot establish its proposal shape or authorize additional changes.
+pub(crate) fn classify_member_edit(
+    parent: &MlsGroup,
+    committer: &MemberId,
+    target: &MemberId,
+) -> Result<CommitClass, EngineError> {
+    CommitShape {
+        has_update_path: false,
+        proposals: 1,
+        self_removes: 0,
+        same_account: usize::from(committer == target),
+    }
+    .class(|| crate::app_components::group_requires_account_devices(parent))
+}
+
 /// Why [`authorize_staged_commit`] refuses a Commit.
 #[derive(Debug)]
 pub enum CommitAuthorityError {

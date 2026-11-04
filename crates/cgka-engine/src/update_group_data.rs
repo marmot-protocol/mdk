@@ -324,6 +324,7 @@ impl<S: StorageProvider> Engine<S> {
         removals: Vec<AppComponentId>,
         purpose: AppDataCommitPurpose,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         if updates.is_empty() {
             return Err(EngineError::Other(
                 "UpdateAppComponents requires at least one component update".into(),
@@ -580,7 +581,7 @@ impl<S: StorageProvider> Engine<S> {
                 "group-data update produced no pending commit".into(),
             ));
         }
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(

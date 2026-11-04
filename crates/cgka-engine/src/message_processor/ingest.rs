@@ -2044,6 +2044,7 @@ impl<S: StorageProvider> Engine<S> {
         if queued_proposals.is_empty() {
             return Ok(false);
         }
+        self.epoch_manager.ensure_pending_space()?;
         for queued in &queued_proposals {
             let decision_report = crate::auto_committer::decide_with_reason(mls_group, queued);
             let decision_str = match &decision_report.decision {
@@ -2181,7 +2182,7 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(group_id);
@@ -2257,6 +2258,7 @@ impl<S: StorageProvider> Engine<S> {
         self.auto_publish_buf.push_back(AutoPublish {
             msg: wrapped,
             pending: pending_ref,
+            welcomes: Vec::new(),
         });
         pending_commit_guard.disarm();
         Ok(true)

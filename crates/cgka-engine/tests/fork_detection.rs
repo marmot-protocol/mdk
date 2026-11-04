@@ -1948,7 +1948,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     let (mut x, x_storage) = build_client_with_storage(x_id); // rolls back onto B, must later reorg onto A
     let mut rival = build_client(rival_id); //                   authors the equal-depth-winning B
     let (mut y, _y_storage) = build_client_with_storage(b"cwin-y"); // applied A, never sees B
-    let mut david = build_client(b"cwin-david");
+    let (mut david, david_storage) = build_client_with_storage(b"cwin-david");
     let mut eve = build_client(b"cwin-eve");
     let mut frank = build_client(b"cwin-frank");
 
@@ -1995,7 +1995,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     // the same epoch without seeing A.
     let david_kp = david.fresh_key_package().await.unwrap();
     let eve_kp = eve.fresh_key_package().await.unwrap();
-    let commit_a = match x
+    let (commit_a, david_welcome) = match x
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
@@ -2004,9 +2004,13 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         .await
         .unwrap()
     {
-        SendResult::GroupEvolution { msg, pending, .. } => {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } => {
             x.confirm_published(pending).await.unwrap();
-            msg
+            (msg, welcomes.remove(0))
         }
         _ => unreachable!(),
     };
@@ -2077,6 +2081,15 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         EpochId(1),
         "the parked incumbent must be keyed by its source epoch for the convergence rewind target"
     );
+    assert!(
+        matches!(
+            x.outbound_welcome_status(&david_welcome.id, cgka_traits::Timestamp(0))
+                .unwrap(),
+            cgka_engine::engine::OutboundWelcomeStatus::Waiting
+        ),
+        "a reversible own Commit loss must hold its Welcome, not retire it"
+    );
+    assert!(!x.sent_welcome_withdrawn(&david_welcome.id).unwrap());
 
     // (3) Y applied A (and never sees B), then extends the A-branch with a
     // follow-on invite from ITS epoch 2 — the A-branch is now depth 2. Y never
@@ -2110,7 +2123,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     // it — the same branch every convergence-only node picks. Before the fix
     // A's root was `EpochInvalidated` and could never be materialized, so X
     // stayed on the B lineage forever.
-    let follow_on_outcome = x.ingest(route(follow_on)).await.unwrap();
+    let follow_on_outcome = x.ingest(route(follow_on.clone())).await.unwrap();
     assert!(
         matches!(follow_on_outcome, IngestOutcome::Buffered { .. }),
         "the A-branch follow-on must enter the convergence pass, got {follow_on_outcome:?}"
@@ -2163,6 +2176,41 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
             b
         },
         "X and Y must end on the identical branch"
+    );
+    assert!(
+        x.outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, welcome)| welcome == &david_welcome)
+    );
+    david.join_welcome(david_welcome.clone()).await.unwrap();
+    david.ingest(route(follow_on)).await.unwrap();
+    david
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(david.epoch(&group_id).unwrap(), x.epoch(&group_id).unwrap());
+    let crypto = RustCrypto::default();
+    let mls_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let canonical_provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, x_storage.mls_storage());
+    let canonical = MlsGroup::load(canonical_provider.storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    let joined_provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, david_storage.mls_storage());
+    let joined = MlsGroup::load(joined_provider.storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        joined.epoch_authenticator().as_slice(),
+        canonical.epoch_authenticator().as_slice()
+    );
+    x.mark_sent_welcome_delivered(&david_welcome.id).unwrap();
+    assert!(
+        !x.outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, welcome)| welcome.id == david_welcome.id)
     );
 }
 
@@ -3318,28 +3366,62 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
             if group_id == f.group_id
     ));
 
-    // (2) The verified repair: the sibling author removes the wedged device
-    // from the fleet's branch and re-invites it with a fresh key package.
+    // (2) The verified repair: refresh the exact wedged leaf atomically on
+    // the fleet's branch using a fresh source-bound recovery grant.
     let device_id = MemberId::new(pad32(&f.local_seed));
-    match creator
-        .send(SendIntent::RemoveMembers {
-            group_id: f.group_id.clone(),
-            members: vec![device_id],
-        })
-        .await
-        .unwrap()
-    {
-        SendResult::GroupEvolution { pending, .. } => {
-            creator.confirm_published(pending).await.unwrap();
-        }
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    }
+    let source = creator
+        .group_recovery_source(
+            &f.group_id,
+            &device_id,
+            &local.own_recovery_key_hash(&f.group_id).unwrap(),
+        )
+        .unwrap();
     let fresh_kp = local.fresh_key_package().await.unwrap();
+    let request_id = [7; 32];
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let grant = cgka_traits::group_recovery::GroupRecoveryMessage {
+        group_id: f.group_id.clone(),
+        request_id,
+        expires_at,
+        body: cgka_traits::group_recovery::GroupRecoveryBody::Grant {
+            source: source.clone(),
+            key_package: fresh_kp.clone(),
+            device_signature: vec![],
+        },
+    };
+    let mut invalid = grant.clone();
+    invalid.expires_at = 1;
+    assert!(matches!(
+        local.sign_group_recovery(&f.group_id, &creator.self_id(), &invalid),
+        Err(cgka_traits::EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let mut invalid = grant.clone();
+    if let cgka_traits::group_recovery::GroupRecoveryBody::Grant { source, .. } = &mut invalid.body
+    {
+        source.device_key_hash[0] ^= 1;
+    }
+    assert!(matches!(
+        local.sign_group_recovery(&f.group_id, &creator.self_id(), &invalid),
+        Err(cgka_traits::EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let device_signature = local
+        .sign_group_recovery(&f.group_id, &creator.self_id(), &grant)
+        .unwrap();
     let welcome = match creator
-        .send(SendIntent::Invite {
+        .send(SendIntent::RecoverMembers {
             group_id: f.group_id.clone(),
-            key_packages: vec![fresh_kp],
-            initial_admins: vec![],
+            members: vec![cgka_traits::group_recovery::GroupMemberRecovery {
+                member: device_id,
+                source,
+                key_package: fresh_kp,
+                request_id,
+                expires_at,
+                device_signature,
+            }],
         })
         .await
         .unwrap()
@@ -3365,7 +3447,7 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
     );
     assert_eq!(
         local.epoch(&f.group_id).unwrap(),
-        EpochId(4),
+        EpochId(3),
         "the repaired device joins the fleet's branch at the re-invite epoch"
     );
     assert_eq!(
@@ -3402,7 +3484,7 @@ async fn verified_welcome_repair_survives_the_next_convergence_drain() {
     );
     assert_eq!(
         local.epoch(&f.group_id).unwrap(),
-        EpochId(4),
+        EpochId(3),
         "the drain must not move the repaired tip"
     );
     assert_ne!(

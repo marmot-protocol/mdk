@@ -149,9 +149,10 @@ impl AppClient {
                 }
             }
             DeviceGroupMovePhase::Joined => {
-                if self
-                    .stored_group(&movement.destination_id)?
-                    .is_some_and(|group| group.is_terminal())
+                if account.is_group_forgotten(&movement.destination_id)?
+                    || self
+                        .stored_group(&movement.destination_id)?
+                        .is_some_and(|group| group.is_terminal())
                 {
                     self.finish_move_before_made(movement).await?;
                     return Ok(());
