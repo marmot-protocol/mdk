@@ -62,6 +62,12 @@ const OWED_BURSTS: usize = 4;
 const LIVE_HELD_AT_MOST: Duration = Duration::from_secs(60);
 const UPGRADE_MESSAGES: usize = 2_000;
 const BEFORE_UPGRADE: Duration = Duration::from_secs(60);
+/// Past every member's push join window: two minutes it could fetch, which
+/// the worker counts every 15 seconds, plus the 15 seconds it watches a
+/// catch-up settle. Each member announces once when its window ends.
+const JOIN_ANNOUNCES: Duration = Duration::from_secs(3 * 60);
+/// No group message on the relay for this long: none is still going out.
+const GROUP_QUIET: Duration = Duration::from_secs(15);
 const COUNTED_MESSAGES: usize = 30;
 const FENCE_STALL: Duration = Duration::from_secs(12);
 const FENCE_RELEASE: Duration = Duration::from_secs(30);
@@ -295,6 +301,30 @@ async fn wait_lanes_published(
         wait_published(subject, group, sender, &payloads, limit).await?;
     }
     Ok(())
+}
+
+/// How many group messages the relay holds.
+async fn group_messages(subject: &AppRuntimeHarness) -> TestResult<usize> {
+    let ids = subject.relay_publication_ids().await?;
+    Ok(ids.into_iter().filter(|(_, kind)| *kind == 445).count())
+}
+
+/// Wait until no group message has reached the relay for [`GROUP_QUIET`],
+/// returning how many it holds.
+async fn wait_group_quiet(subject: &AppRuntimeHarness, limit: Duration) -> TestResult<usize> {
+    let deadline = Instant::now() + limit;
+    let (mut held, mut since) = (group_messages(subject).await?, Instant::now());
+    while since.elapsed() < GROUP_QUIET {
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for group traffic to go quiet".into());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = group_messages(subject).await?;
+        if now != held {
+            (held, since) = (now, Instant::now());
+        }
+    }
+    Ok(held)
 }
 
 fn payloads(sent: &[Sent]) -> Vec<String> {
@@ -2060,18 +2090,26 @@ pub(super) async fn upgrade() {
         let started = Instant::now();
         let clients = clients();
         let busy = create(subject, "busy", &clients).await?;
+        let created = Instant::now();
         settle_maintenance(subject, &clients, std::slice::from_ref(&busy)).await?;
         note(started, "group created and settled");
 
         // Before the upgrade: the earlier owner plans the debt, against
-        // history no endpoint answers.
+        // history no endpoint answers. Any group message that reaches it
+        // then is live input ahead of that history: once it opens one more
+        // than 100 generations past a sender's oldest owed message, that
+        // sender's older messages can never be opened, by any owner. The
+        // earlier owner takes such input after its page times out, so the
+        // fixture lets no group traffic reach it: every member's push
+        // announce goes out first, and the whole backlog is on the relay
+        // before bob opens.
+        tokio::time::sleep(JOIN_ANNOUNCES.saturating_sub(created.elapsed())).await;
+        wait_group_quiet(subject, SETTLEMENT).await?;
+        note(started, "every member announced");
         subject.set_online("bob", false).await?;
         let mut expected = payloads(&publish(subject, &busy, "owed-", UPGRADE_MESSAGES).await?);
-        // The whole backlog is on the relay before bob opens. A tail still
-        // going out would reach the earlier owner as live input ahead of its
-        // unanswered history and move each sender's ratchet past the
-        // out-of-order window, so it could never open the older messages.
         wait_lanes_published(subject, &busy, "owed-", UPGRADE_MESSAGES, SETTLEMENT).await?;
+        let backlog = wait_group_quiet(subject, SETTLEMENT).await?;
         for endpoint in 0..2 {
             subject.stall_relay_history(endpoint, true).await?;
         }
@@ -2081,6 +2119,13 @@ pub(super) async fn upgrade() {
         let (_, chat) = bob.chat_view(&busy, None).await?;
         let owed_at_upgrade = UPGRADE_MESSAGES.saturating_sub(chat.iter().filter(|text| text.starts_with("owed-")).count());
         subject.set_online("bob", false).await?;
+        let reached_earlier_owner = group_messages(subject).await?.saturating_sub(backlog);
+        if reached_earlier_owner > 0 {
+            return Err(format!(
+                "{reached_earlier_owner} group messages reached the earlier owner ahead of its unanswered history"
+            )
+            .into());
+        }
         for endpoint in 0..2 {
             subject.stall_relay_history(endpoint, false).await?;
         }
