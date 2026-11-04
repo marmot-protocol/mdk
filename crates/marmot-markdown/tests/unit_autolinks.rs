@@ -399,6 +399,16 @@ fn schemeless_domain_preserves_label_and_url_components() {
             "ExAmPlE.CHAT:8443/a_(b)?q=1&x=2#part",
             "https://example.chat:8443/a_(b)?q=1&x=2#part",
         ),
+        (
+            "example.chat/search?q=a,b",
+            "https://example.chat/search?q=a,b",
+        ),
+        ("example.chat/a;b", "https://example.chat/a;b"),
+        ("example.chat/a~b", "https://example.chat/a~b"),
+        (
+            "example.chat/search?q=a*b",
+            "https://example.chat/search?q=a*b",
+        ),
         ("2nd-site.network", "https://2nd-site.network"),
         ("example.photography", "https://example.photography"),
     ] {

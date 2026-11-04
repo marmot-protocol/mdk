@@ -35,11 +35,8 @@ pub(crate) fn scan(raw: &str, start: usize) -> (Option<(Inline, usize)>, usize) 
     let mut suffix = false;
     for (offset, c) in raw[start..].char_indices() {
         if c.is_whitespace()
-            || matches!(
-                c,
-                '<' | '>' | '`' | '"' | '\'' | ',' | ';' | '[' | ']' | '*' | '~'
-            )
-            || (c == '(' && !suffix)
+            || matches!(c, '<' | '>' | '`' | '"' | '\'' | '[' | ']')
+            || (!suffix && matches!(c, '(' | ',' | ';' | '*' | '~'))
         {
             break;
         }

@@ -2,6 +2,8 @@
 """Validate and install an explicitly downloaded IANA root snapshot, offline."""
 import argparse
 import hashlib
+import os
+import tempfile
 import re
 from pathlib import Path
 
@@ -32,10 +34,21 @@ def main():
     target = Path(__file__).resolve().parents[1] / "src" / "iana-tlds.txt"
     previous = validated(target.read_bytes())
     print("SHA256", hashlib.sha256(data).hexdigest())
+    print(f"Roots: {len(previous)} -> {len(proposed)}")
     print("Added:", ", ".join(sorted(proposed - previous)) or "none")
     print("Removed:", ", ".join(sorted(previous - proposed)) or "none")
     if target.read_bytes() != data:
-        target.write_bytes(data)
+        fd, temporary = tempfile.mkstemp(prefix=".iana-tlds-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), target.stat().st_mode & 0o777)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 if __name__ == "__main__":
