@@ -286,6 +286,14 @@ pub struct TimelineMessageRecord {
     /// tombstone instead of silently disappearing. Carries the engine invalidation
     /// reason (e.g. `LosingBranch`, `BeyondAnchor`). `None` for delivered messages.
     pub invalidation_status: Option<String>,
+    /// True for a failed locally-sent row with no relay acceptance on record
+    /// that a peer has reacted to: the reaction proves the peer received it
+    /// (mdk#1291). It stays true if retention later prunes that reaction. Such
+    /// a row is delivered, so `invalidation_status` is `None`, while
+    /// `source_message_id_hex` stays `None` because the peer's reaction does
+    /// not say which published event carried the message.
+    #[serde(default)]
+    pub recipient_confirmed: bool,
     /// The device this row came from in a chat history it sent (mdk#2628
     /// 4.2d). This legacy sibling-only field is `None` for live or backup
     /// rows; `app_event_import_provenance` identifies the complete source.
@@ -507,6 +515,7 @@ struct TimelineRow {
     deletion_source: DeletionSource,
     deleted_by_message_id_hex: Option<String>,
     invalidation_status: Option<String>,
+    recipient_confirmed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -726,6 +735,8 @@ impl SqliteAppStorage {
             };
             let mut affected_message_ids = new_affected_message_ids.clone();
             affected_message_ids.extend(existing_affected_message_ids.iter().cloned());
+            let confirmed_before =
+                recipient_confirmed_ids_tx(&conn, &event.group_id_hex, &affected_message_ids)?;
             conn.execute_cached(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -838,13 +849,19 @@ impl SqliteAppStorage {
                 &event.group_id_hex,
                 affected_message_ids.clone(),
             )?;
-            let changes = timeline_changes_for_event(
+            let mut changes = timeline_changes_for_event(
                 &event.message_id_hex,
                 event.kind,
                 &event.tags,
                 existing_event.as_ref(),
                 &new_affected_message_ids,
                 &messages,
+            );
+            mark_recipient_confirmation_changes(
+                &mut changes,
+                &confirmed_before,
+                &event.message_id_hex,
+                &event.tags,
             );
             Ok(TimelineProjectionUpdate {
                 group_id_hex: event.group_id_hex.clone(),
@@ -1710,7 +1727,12 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
         .filter(|event| event.kind == MARMOT_APP_EVENT_KIND_CHAT)
         .map(|event| event.message_id_hex.clone())
         .collect();
-    let (rows, stream_starts) = project_group_events(events);
+    let (mut rows, stream_starts) = project_group_events(events);
+    let kept_receipts = kept_recipient_receipts_tx(tx, group_id_hex)?;
+    for row in &mut rows {
+        let receipt_kept = kept_receipts.contains(&row.message_id_hex);
+        settle_recipient_confirmed_send(row, receipt_kept);
+    }
     tx.execute_cached(
         "DELETE FROM message_timeline WHERE group_id_hex = ?1",
         params![group_id_hex],
@@ -1866,6 +1888,7 @@ fn secure_prune_selected_app_events_tx(
             reports::retain_expired_target(tx, group_id_hex, &event.message_id_hex)?;
         }
     }
+    keep_receipts_of_pruned_reactions_tx(tx, group_id_hex, &pruned_events, &pruned_message_ids)?;
     retain_pruned_chat_activity_tx(tx, group_id_hex, &pruned_message_ids)?;
     scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it
@@ -1995,16 +2018,12 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     let preview_order = crate::app::chat_list::chat_list_preview_order_desc("preview.");
     let preview_eligibility =
         crate::app::chat_list::chat_list_preview_eligibility_sql("preview.", "?1");
+    let delivery_state = crate::app::chat_list::chat_list_delivery_state_sql("preview.");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.tags_json, preview.timeline_at, preview.deleted,
                 preview.media_json,
-                CASE
-                    WHEN preview.direction != 'sent' THEN 'not_applicable'
-                    WHEN preview.invalidation_status = 'local_publish_failed' THEN 'failed'
-                    WHEN preview.source_message_id_hex IS NULL THEN 'pending'
-                    ELSE 'delivered'
-                END
+                {delivery_state}
          FROM message_timeline AS preview NOT INDEXED
          WHERE preview.group_id_hex = ?1
            AND {activity_filter}
@@ -2292,6 +2311,8 @@ fn project_single_message_timeline_tx(
         row.invalidation_status = Some(invalidation_status(&event));
     }
     apply_targeted_modifiers_tx(tx, &mut row)?;
+    let receipt_kept = recipient_receipt_kept_tx(tx, group_id_hex, message_id_hex)?;
+    settle_recipient_confirmed_send(&mut row, receipt_kept);
     Ok(Some((row, stream_start)))
 }
 
@@ -2576,9 +2597,10 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
             reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-            deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source
+            deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source,
+            recipient_confirmed
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2597,7 +2619,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
             invalidation_status = excluded.invalidation_status,
             edit_json = excluded.edit_json,
-            deletion_source = excluded.deletion_source",
+            deletion_source = excluded.deletion_source,
+            recipient_confirmed = excluded.recipient_confirmed",
         params![
             &row.group_id_hex,
             &row.message_id_hex,
@@ -2619,6 +2642,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             &row.invalidation_status,
             row.edit.as_ref().map(serde_json::to_string).transpose().map_err(|e| StorageError::Serialization(e.to_string()))?,
             row.deletion_source.as_str(),
+            row.recipient_confirmed,
         ],
     )
     .storage()?;
@@ -2996,7 +3020,8 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                      edit_json = NULL,
                      deleted_by_message_id_hex = NULL,
                      deletion_source = 'unknown',
-                     invalidation_status = NULL
+                     invalidation_status = NULL,
+                     recipient_confirmed = 0
                  WHERE group_id_hex = ?
                    AND message_id_hex IN ({placeholders})"
             ),
@@ -3229,6 +3254,15 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         }
     }
     if include_reply_preview_dependents {
+        // A reaction, its retraction, or either one's invalidation can settle
+        // or unsettle a failed own send no relay accepted (mdk#1291). That changes
+        // the `invalidation_status` replies quoting the send carry in their
+        // preview, so any such send this event reprojects pulls its replies.
+        for message_id_hex in &ids {
+            if failed_unaccepted_send_tx(tx, group_id_hex, message_id_hex)? {
+                reply_preview_targets.insert(message_id_hex.clone());
+            }
+        }
         let reply_targets = reply_preview_targets.into_iter().collect::<Vec<_>>();
         ids.extend(reply_message_ids_for_targets_tx(
             tx,
@@ -3320,6 +3354,17 @@ fn timeline_changes_for_invalidation(
             message: Box::new(message),
         })
         .collect::<Vec<_>>();
+    let confirmed_before = before
+        .iter()
+        .filter(|message| message.recipient_confirmed)
+        .map(|message| message.message_id_hex.clone())
+        .collect();
+    mark_recipient_confirmation_changes(
+        &mut changes,
+        &confirmed_before,
+        event_message_id_hex,
+        tags,
+    );
     changes.extend(
         before
             .iter()
@@ -3589,7 +3634,7 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -3856,7 +3901,7 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -4091,6 +4136,216 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
     (rows, stream_starts)
 }
 
+/// Whether `message_id_hex` is an own send that failed and no relay accepted,
+/// the only row a peer's reaction can settle (mdk#1291).
+fn failed_unaccepted_send_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    tx.query_row_cached(
+        "SELECT EXISTS(
+             SELECT 1 FROM app_events
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2
+               AND direction = 'sent' AND source_message_id_hex IS NULL
+               AND invalidated = 1 AND invalidation_reason = ?3
+         )",
+        params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// The rows among `message_ids` whose projection is recipient-confirmed, read
+/// before a write so [`mark_recipient_confirmation_changes`] can tell which
+/// rows the write confirmed or unconfirmed.
+fn recipient_confirmed_ids_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<BTreeSet<String>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT 1 FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND recipient_confirmed = 1",
+        )
+        .storage()?;
+    let mut confirmed = BTreeSet::new();
+    for message_id_hex in message_ids {
+        if stmt
+            .exists(params![group_id_hex, message_id_hex])
+            .storage()?
+        {
+            confirmed.insert(message_id_hex.clone());
+        }
+    }
+    Ok(confirmed)
+}
+
+/// Report a row whose recipient confirmation changed as a delivery update.
+///
+/// A peer's reaction (or its retraction, invalidation or revalidation) is what
+/// flips the flag, and its own trigger would describe only the reaction. A
+/// host that redraws send state on
+/// [`TimelineUpdateTrigger::DeliveryOrSendStateChanged`] must hear that the
+/// row is now delivered, or no longer confirmed, and replies quoting it are
+/// reported as [`TimelineUpdateTrigger::ReplyPreviewChanged`]. A reply the
+/// event itself names (`event_message_id_hex` or an `e` target) changed in
+/// its own right — a deletion, say — and keeps the trigger that says so.
+fn mark_recipient_confirmation_changes(
+    changes: &mut [TimelineMessageChange],
+    confirmed_before: &BTreeSet<String>,
+    event_message_id_hex: &str,
+    tags: &[Vec<String>],
+) {
+    let flipped = changes
+        .iter()
+        .filter_map(|change| match change {
+            // A deleted send loses its confirmation with its content: its
+            // upsert keeps `MessageDeleted`.
+            TimelineMessageChange::Upsert { message, .. }
+                if !message.deleted
+                    && message.recipient_confirmed
+                        != confirmed_before.contains(&message.message_id_hex) =>
+            {
+                Some(message.message_id_hex.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for change in changes {
+        let TimelineMessageChange::Upsert { trigger, message } = change else {
+            continue;
+        };
+        if flipped.contains(&message.message_id_hex) {
+            *trigger = TimelineUpdateTrigger::DeliveryOrSendStateChanged;
+        } else if message
+            .reply_to_message_id_hex
+            .as_ref()
+            .is_some_and(|target| flipped.contains(target))
+            && message.message_id_hex != event_message_id_hex
+            && !tag_values(tags, EVENT_REF_TAG).any(|target| target == message.message_id_hex)
+        {
+            // Its quote of the send changed delivery, not the reply itself.
+            *trigger = TimelineUpdateTrigger::ReplyPreviewChanged;
+        }
+    }
+}
+
+/// Settle a locally-sent row that a peer has reacted to (mdk#1291).
+///
+/// A reaction from another account names this row's exact inner event id, and
+/// only a member who decrypted the row could have learned that id, so it proves
+/// that peer received the row. That is stronger than a relay acknowledgement,
+/// and it is the only receipt evidence a row whose own publish was judged to
+/// have reached no one can still gain. Such a row is delivered: clear a
+/// `local_publish_failed` projection and mark the row confirmed. The stored
+/// `app_events` row keeps its retraction, so a fresh resend, the terminal-group
+/// sweep and every convergence reason behave exactly as before, and the
+/// projection re-derives this whenever it is rebuilt.
+///
+/// Only a failed send with no relay acceptance settles: a pending send keeps
+/// its pending state until its own publish settles, and a row a relay accepted
+/// keeps whatever verdict it has. Runs after modifiers apply, so a reaction its
+/// sender deleted, an invalidated reaction and a deleted send never count.
+/// Convergence withdrawals (`LosingBranch` and the rest) stay as they are: a
+/// peer reacting does not make non-canonical history canonical. A receipt
+/// retention kept after pruning the reaction (`receipt_kept`) counts as the
+/// reaction did.
+fn settle_recipient_confirmed_send(row: &mut TimelineRow, receipt_kept: bool) {
+    let failed_unaccepted_send = row.direction == "sent"
+        && !row.deleted
+        && row.source_message_id_hex.is_none()
+        && row.invalidation_status.as_deref() == Some(LOCAL_PUBLISH_FAILED_REASON);
+    let peer_reacted = row
+        .reactions
+        .user_reactions
+        .iter()
+        .any(|reaction| reaction.sender != row.sender);
+    if failed_unaccepted_send && (peer_reacted || receipt_kept) {
+        row.invalidation_status = None;
+        row.recipient_confirmed = true;
+    }
+}
+
+/// Whether retention kept this send's receipt after pruning the peer reaction
+/// that confirmed it (`kept_recipient_receipts`, migration 0173).
+fn recipient_receipt_kept_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    tx.query_row_cached(
+        "SELECT EXISTS(
+             SELECT 1 FROM kept_recipient_receipts
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2
+         )",
+        params![group_id_hex, message_id_hex],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// Every send in the group whose receipt retention kept.
+fn kept_recipient_receipts_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<HashSet<String>> {
+    let mut stmt = tx
+        .prepare_cached(
+            "SELECT message_id_hex FROM kept_recipient_receipts WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex], |row| row.get::<_, String>(0))
+        .storage()?
+        .collect::<Result<HashSet<_>, _>>()
+        .storage()
+}
+
+/// Keep the receipt of each retained send a pruned reaction confirmed.
+///
+/// A settled send is delivered for good: a peer received it. Retention can
+/// prune the reaction that proved it while the send itself stays (a send from
+/// before disappearing messages were turned on), so before the reaction goes,
+/// record the receipt on the send. A pruned reaction can no longer be retracted
+/// or invalidated, so nothing can contradict the kept receipt, and it is
+/// deleted with the send.
+fn keep_receipts_of_pruned_reactions_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    pruned_events: &[PrunedAppEvent],
+    pruned_message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    for event in pruned_events
+        .iter()
+        .filter(|event| event.kind == MARMOT_APP_EVENT_KIND_REACTION)
+    {
+        for target in tag_values(&event.tags, EVENT_REF_TAG) {
+            if pruned_message_ids.contains(target) {
+                continue;
+            }
+            // Only a reaction the projection counted as the peer's evidence
+            // keeps a receipt: not the account's own, and not one retracted
+            // or invalidated, which the projection already left out.
+            tx.execute_cached(
+                "INSERT OR IGNORE INTO kept_recipient_receipts (group_id_hex, message_id_hex)
+                 SELECT t.group_id_hex, t.message_id_hex FROM message_timeline AS t
+                 WHERE t.group_id_hex = ?1 AND t.message_id_hex = ?2
+                   AND t.recipient_confirmed = 1
+                   AND json_valid(t.reactions_json)
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(t.reactions_json, '$.user_reactions') AS r
+                       WHERE json_extract(r.value, '$.reaction_message_id_hex') = ?3
+                         AND json_extract(r.value, '$.sender') != t.sender
+                   )",
+                params![group_id_hex, target, event.message_id_hex],
+            )
+            .storage()?;
+        }
+    }
+    Ok(())
+}
+
 fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
     TimelineRow {
         message_id_hex: event.message_id_hex.clone(),
@@ -4115,6 +4370,7 @@ fn timeline_row_from_chat(event: &RawAppEvent) -> TimelineRow {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        recipient_confirmed: false,
     }
 }
 
@@ -4140,6 +4396,7 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        recipient_confirmed: false,
     }
 }
 
@@ -4176,6 +4433,7 @@ fn timeline_row_from_stream_start(event: &RawAppEvent) -> TimelineRow {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        recipient_confirmed: false,
     }
 }
 
@@ -4282,7 +4540,7 @@ fn visible_timeline_record(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.recipient_confirmed,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token,
                     {TIMELINE_IMPORT_PROVENANCE_SQL},
@@ -4369,6 +4627,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         deleted_by_message_id_hex: row.get(18)?,
         deletion_source: DeletionSource::from_storage(&row.get::<_, String>("deletion_source")?),
         invalidation_status: row.get(19)?,
+        recipient_confirmed: row.get("recipient_confirmed")?,
         edit: row
             .get::<_, Option<String>>(20)?
             .map(|json| serde_json::from_str(&json))

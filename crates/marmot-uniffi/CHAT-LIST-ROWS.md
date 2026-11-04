@@ -145,7 +145,9 @@ Existing lower-level row and management APIs remain supported.
 ## Delivery and adoption checks
 
 `row.last_message.delivery_state == Delivered` means local source-backed publication
-state, **not** recipient delivery or a read receipt. Existing discriminants and
+state, or a failed send a peer has since reacted to (`recipient_confirmed`,
+mdk#1291), which has no source. It is **not** a general recipient-delivery or
+read receipt. Existing discriminants and
 transport semantics are unchanged; richer delivery diagnostics remain separate work.
 
 Before replacing client-side selection, verify text/attachment-only drafts,

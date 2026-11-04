@@ -13,6 +13,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Timeline JSON rows (`messages timeline list`, `messages timeline search`, and daemon timeline snapshots and upserts)
+  carry `recipient_confirmed` and `invalidation_status` (mdk#1291). `recipient_confirmed` is `true` for an own send
+  that no relay accepted but another member reacted to; such a row has no `source_message_id` and reads as delivered.
+  `invalidation_status` names why a row was withdrawn or failed, and a row with it set is not delivered even when it
+  keeps its `source_message_id`.
+
 - Errors for an account whose device group unlinked this device carry `code=account_unlinked` and its `account_ref`
   (mdk#2628 item 3.6b). Such an account stays signed out; wiping it skips leaving its chats and deleting its slot.
 

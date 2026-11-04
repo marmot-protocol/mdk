@@ -35,6 +35,11 @@
   constructing `MediaAttachmentOutcome::Accepted` box its `reference`; the
   Swift, Kotlin, and C outcome shapes are unchanged.
 
+- A peer's reaction settles a send whose publish was judged to have reached
+  no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`; a
+  confirmed row is delivered, with no `invalidation_status`, and its change
+  arrives with `TimelineUpdateTrigger::DeliveryOrSendStateChanged`.
+
 - `sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b, D67(2)) when this device trusts a device group, its
   link is made and the roster lists another device that is not leaving. It
