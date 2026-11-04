@@ -1103,6 +1103,10 @@ another code comparison can begin, but if the earlier move is still pending at c
 before this device sends its Confirm (`LinkFailed` locally, `CannotLink` on the answering device). The earlier link
 and any still-live expectation stay unchanged; no second link approval or Add is made.
 
+If this device moves while another device's link it approved is still pending, its old local prompt can end as failed
+and its automatic chat additions can be skipped even if the other device joined. Finish that link before moving when
+its completion and chat additions matter. Moving does not undo the other device's admitted membership.
+
 Each move has an opaque `move_id`. `old_siblings` names recognized devices left in the old group; while
 `question_suppressed` is true, offer to link that device here rather than treating its sign-in as unknown.
 `dismiss_device_group_move_sibling(account_ref, move_id, slot_id_hex)` ends only that local recognition hint; it does
