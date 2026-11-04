@@ -131,4 +131,4 @@ and teardown; mark unexecuted recipes as unvalidated.
 
 Adapted from PStack's
 [create-verification-skill](https://github.com/cursor/plugins/blob/bb68f2365eceafa0cb2d253112f675acf5f144cc/pstack/skills/create-verification-skill/SKILL.md).
-The upstream copyright and permission notice are retained in [LICENSE](LICENSE).
+The upstream copyright and permission notice are retained in [PSTACK_LICENSE.md](../PSTACK_LICENSE.md).

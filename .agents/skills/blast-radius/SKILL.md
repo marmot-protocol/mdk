@@ -134,4 +134,4 @@ and [land-change](../land-change/SKILL.md) owns the delivery gates and queue.
 
 Adapted from PStack's
 [blast-radius](https://github.com/cursor/plugins/blob/bb68f2365eceafa0cb2d253112f675acf5f144cc/pstack/skills/blast-radius/SKILL.md).
-The upstream copyright and permission notice are retained in [LICENSE](LICENSE).
+The upstream copyright and permission notice are retained in [PSTACK_LICENSE.md](../PSTACK_LICENSE.md).

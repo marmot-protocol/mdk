@@ -153,4 +153,4 @@ result as "MDK is formally verified."
 
 Adapted from PStack's formal-verification creation and maintenance skills at
 [revision bb68f236](https://github.com/cursor/plugins/tree/bb68f2365eceafa0cb2d253112f675acf5f144cc/pstack/skills).
-The upstream copyright and permission notice are retained in [LICENSE](LICENSE).
+The upstream copyright and permission notice are retained in [PSTACK_LICENSE.md](../PSTACK_LICENSE.md).
