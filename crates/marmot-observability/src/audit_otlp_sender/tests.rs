@@ -348,6 +348,8 @@ async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
 #[tokio::test]
 async fn rejected_resolution_keeps_the_prepared_range_replayable() {
     crate::collector_host_safety::hand_in_direct_http_builder();
+    // This owns the sender's Unknown/replay mapping. The address classifier's
+    // rejection proof lives in literal_ips_use_the_same_classifier_without_dns.
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
     let bodies = batch.bodies.clone();
@@ -369,7 +371,12 @@ async fn rejected_resolution_keeps_the_prepared_range_replayable() {
 async fn rejected_client_policy_keeps_the_prepared_range_replayable() {
     const CHILD: &str = "MDK_AUDIT_SENDER_REJECTED_POLICY_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        crate::collector_host_safety::hand_in_http_builder(|_| Err("private proxy policy"));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUILDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        crate::collector_host_safety::hand_in_http_builder(|_| {
+            BUILDER_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err("private proxy policy")
+        });
         let (_dir, active, state, batch) = prepared();
         let token = batch.token.clone();
         let bodies = batch.bodies.clone();
@@ -377,7 +384,15 @@ async fn rejected_client_policy_keeps_the_prepared_range_replayable() {
         let endpoint = format!("http://{}/v1/logs", listener.local_addr().unwrap());
         let sender =
             AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-        let outcome = sender.send(batch).await;
+        let outcome = tokio::select! {
+            _ = listener.accept() => panic!("a rejected client policy must not connect"),
+            outcome = sender.send(batch) => outcome,
+        };
+        assert_eq!(
+            BUILDER_CALLS.load(Ordering::SeqCst),
+            1,
+            "the rejecting process policy must be consulted exactly once"
+        );
         assert_eq!(outcome, AuditOtlpSendResult::Unknown);
         assert_eq!(outcome.for_finish(), None);
         let mut owner = LocalAuditDelivery::open(&active, &state, TEST_DESTINATION).unwrap();
@@ -483,14 +498,12 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
 #[tokio::test(flavor = "current_thread")]
 async fn timeout_after_acceptance_is_unknown() {
     crate::collector_host_safety::hand_in_direct_http_builder();
-    // Keep the default client deadline and independently exercise the enclosing
-    // attempt deadline while the client's thirty-second budget is still open.
+    // Keep untouched constructor/client defaults in the first case. The second
+    // attempt budget exceeds the real-I/O readiness bound, but expires while
+    // the client's thirty-second request budget is still open.
     for (attempt_timeout, elapsed) in [
-        (
-            collector_host_safety::REQUEST_TIMEOUT,
-            Duration::from_secs(31),
-        ),
-        (Duration::from_secs(1), Duration::from_secs(2)),
+        (None, Duration::from_secs(31)),
+        (Some(Duration::from_secs(10)), Duration::from_secs(11)),
     ] {
         let (_dir, active, state, batch) = prepared();
         let token = batch.token.clone();
@@ -508,7 +521,9 @@ async fn timeout_after_acceptance_is_unknown() {
         });
         let mut sender =
             AuditOtlpSender::for_loopback_dev(TEST_DESTINATION, endpoint, "token").unwrap();
-        sender.timeout = attempt_timeout;
+        if let Some(attempt_timeout) = attempt_timeout {
+            sender.timeout = attempt_timeout;
+        }
         let send = tokio::spawn(async move { sender.send(batch).await });
         let ready = tokio::time::timeout(Duration::from_secs(5), observed).await;
         if !matches!(ready, Ok(Ok(()))) {

@@ -283,6 +283,9 @@ async fn connect_timeout_bounds_a_stalled_tls_handshake() {
             // validation is fabricated by this connection-deadline fixture.
             released.await.unwrap();
         });
+        // The real connect timer starts no earlier than this instant. Its
+        // socket/TLS setup still runs on real time until complete ClientHello.
+        let request_started = tokio::time::Instant::now();
         let mut request = tokio::spawn(async move { client.get(pin.url).send().await });
         tokio::time::timeout(Duration::from_secs(5), hello_received)
             .await
@@ -292,8 +295,27 @@ async fn connect_timeout_bounds_a_stalled_tls_handshake() {
             !request.is_finished(),
             "the TLS handshake must still be pending"
         );
+        let hello_observed = tokio::time::Instant::now();
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(11)).await;
+        // Leave a margin for the bounded pending probe; readiness time must
+        // not make a healthy ten-second connect timer look prematurely short.
+        let pending_at = request_started + CONNECT_TIMEOUT - Duration::from_millis(10);
+        tokio::time::advance(pending_at.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+        if tokio::time::timeout(Duration::from_millis(1), &mut request)
+            .await
+            .is_ok()
+        {
+            release.send(()).unwrap();
+            collector.await.unwrap();
+            tokio::time::resume();
+            panic!("connect timeout must retain its configured budget after ClientHello");
+        }
+        tokio::time::advance(
+            (hello_observed + Duration::from_secs(11))
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
         let error = tokio::time::timeout(Duration::from_millis(1), &mut request)
             .await
             .expect("connect timeout must fire before the thirty-second request deadline")
