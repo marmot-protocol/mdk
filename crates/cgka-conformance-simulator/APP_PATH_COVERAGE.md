@@ -198,8 +198,9 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   both groups returns at least 30 raw events; the journey first checks that all 30 sent messages are on the relay.
   A restart asks from the saved cursor less the 120-second rebuild lookback, and only an ingested group event moves
   that cursor, so before the second restart the groups age past the lookback and Alice removes Bob from a third
-  group. Her commit is Bob's newest group event, its route retires, and Bob's own EOSE wire replies for the two
-  groups must then contain zero stored events; the journey also requires the forensic cursor advance. During the
+  group. Her commit is Bob's newest group event. Bob may park it until that group is stable, so the journey waits for
+  the forensic cursor advance and for his live REQs on both endpoints to drop the group's route. Bob's own EOSE wire
+  replies for the two groups must then contain zero stored events. During the
   12-second history stall, any visible live message must already have its complete known backlog. Unreachable
   sources keep their debt when they leave the active frontier, so a fixed stall is not a backlog hold. Both live
   messages must arrive during the empty phase, within 30 seconds overall, with exact timelines.

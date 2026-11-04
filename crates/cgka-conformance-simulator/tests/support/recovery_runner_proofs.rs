@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgka_conformance_simulator::app_runtime::{
-    ConnectionTrafficV1, HistoryRequestV1, RelayDeliveryPath,
+    ConnectionTrafficV1, HistoryRequestV1, LiveGroupReplyV1, RelayDeliveryPath,
 };
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
@@ -2102,33 +2102,16 @@ async fn packed_live_replies(
     routes: &[String],
     nonempty: bool,
 ) -> TestResult<Vec<Value>> {
-    let own = subject.account_identity("bob")?.to_owned();
-    let others = clients()
-        .into_iter()
-        .filter(|member| member != "bob")
-        .map(|member| subject.account_identity(&member).map(str::to_owned))
-        .collect::<Result<BTreeSet<_>, _>>()?;
     let started = Instant::now();
     loop {
-        let traffic = subject.relay_traffic(&[0, 0], true).await?;
-        let replies = traffic
-            .iter()
-            .zip(clocks)
-            .map(|(relay, clock)| {
-                relay
-                    .live_group_replies
-                    .iter()
+        let replies = own_live_replies(subject, clocks)
+            .await?
+            .into_iter()
+            .map(|replies| {
+                replies
+                    .into_iter()
                     .rev()
-                    .find(|reply| {
-                        reply.at_ms >= *clock
-                            && routes.iter().all(|route| reply.routes.contains(route))
-                            && relay.connection_inboxes.get(&reply.connection).is_some_and(
-                                |inboxes| {
-                                    inboxes.contains(&own)
-                                        && inboxes.iter().all(|inbox| !others.contains(inbox))
-                                },
-                            )
-                    })
+                    .find(|reply| routes.iter().all(|route| reply.routes.contains(route)))
                     .map(|reply| {
                         json!({"raw_events": reply.raw_events,
                     "packed_routes": reply.routes.len(), "at_ms": reply.at_ms})
@@ -2158,6 +2141,44 @@ async fn packed_live_replies(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Bob's packed live group replies through their EOSE that each endpoint
+/// logged at or after its clock, oldest first. The other participants share
+/// the endpoints, so only connections carrying Bob's inbox and no other
+/// participant's count.
+async fn own_live_replies(
+    subject: &AppRuntimeHarness,
+    clocks: &[u64],
+) -> TestResult<Vec<Vec<LiveGroupReplyV1>>> {
+    let own = subject.account_identity("bob")?.to_owned();
+    let others = clients()
+        .into_iter()
+        .filter(|member| member != "bob")
+        .map(|member| subject.account_identity(&member).map(str::to_owned))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let traffic = subject.relay_traffic(&[0, 0], true).await?;
+    Ok(traffic
+        .into_iter()
+        .zip(clocks)
+        .map(|(relay, clock)| {
+            let owned = |reply: &LiveGroupReplyV1| {
+                relay
+                    .connection_inboxes
+                    .get(&reply.connection)
+                    .is_some_and(|inboxes| {
+                        inboxes.contains(&own)
+                            && inboxes.iter().all(|inbox| !others.contains(inbox))
+                    })
+            };
+            relay
+                .live_group_replies
+                .iter()
+                .filter(|reply| reply.at_ms >= *clock && owned(reply))
+                .cloned()
+                .collect()
+        })
+        .collect())
 }
 
 async fn watch_live_until(
@@ -2198,17 +2219,25 @@ async fn watch_live_until(
 /// shares one REQ, so the reply is empty only when Bob's newest group event
 /// belongs to a group he no longer subscribes to. Here Alice removes him
 /// from `exit` after the measured groups aged past the lookback; her commit
-/// is his newest event, and its route retires with the membership.
+/// is his newest event, and its route retires with the membership. Bob may
+/// park that commit while `exit` is not yet stable (`Buffered`) and still
+/// move the cursor past it, so the route retires only once his convergence
+/// drain applies it: wait until his live REQs on both endpoints drop it.
 async fn advance_fence_fixture_cursor(
     subject: &mut AppRuntimeHarness,
     out: &Path,
     exit: &str,
 ) -> TestResult {
     let bob = subject.probe("bob")?;
+    let exit_route = bob
+        .nostr_route(&subject.scenario_group_id(exit)?)
+        .await?
+        .ok_or("no exit route")?;
     bob.start_audit_log().await?;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
+    let clocks = relay_clocks(subject).await?;
     let pair = clients()[..2].to_vec();
     subject.select_scenario_group(exit, false)?;
     subject
@@ -2221,19 +2250,37 @@ async fn advance_fence_fixture_cursor(
         .await?;
     subject.tick(&pair).await?;
     let started = Instant::now();
+    let mut audit = Vec::new();
+    let mut advanced = false;
     loop {
-        let audit = bob.finish_audit_log().await?;
-        if audit.iter().any(|row| {
-            row["event"]["type"] == "transport_cursor_advanced"
-                && row["event"]["cursor_after_secs"]
-                    .as_u64()
-                    .is_some_and(|cursor| cursor >= at)
-        }) {
+        audit.extend(bob.finish_audit_log().await?);
+        advanced = advanced
+            || audit.iter().any(|row| {
+                row["event"]["type"] == "transport_cursor_advanced"
+                    && row["event"]["cursor_after_secs"]
+                        .as_u64()
+                        .is_some_and(|cursor| cursor >= at)
+            });
+        let retired = own_live_replies(subject, &clocks)
+            .await?
+            .iter()
+            .all(|replies| {
+                replies
+                    .last()
+                    .is_some_and(|reply| !reply.routes.contains(&exit_route))
+            });
+        if advanced && retired {
             save(out, "empty-cursor-audit.json", &audit)?;
             return Ok(());
         }
         if started.elapsed() >= SETTLEMENT {
-            return Err("the removal commit did not advance Bob's saved transport cursor".into());
+            save(out, "empty-cursor-audit.json", &audit)?;
+            return Err(if advanced {
+                "Bob's live REQs still carry the group he was removed from"
+            } else {
+                "the removal commit did not advance Bob's saved transport cursor"
+            }
+            .into());
         }
         bob.start_audit_log().await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
