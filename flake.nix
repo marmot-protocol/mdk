@@ -29,6 +29,7 @@
           git
           curl
           jq
+          ripgrep
           python3
           uv
           tamarin-prover
