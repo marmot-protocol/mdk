@@ -90,6 +90,8 @@ pub(crate) struct AccountRunnerHost {
     /// The account's relay pool. An account whose transport has not
     /// registered yet has none, so each debt turn looks again until it does.
     relay_client: Mutex<Option<NostrSdkRelayClient>>,
+    /// The runner's unit policy, whose account breaker also lifts its fences.
+    policy: RecoveryUnitPolicy,
 }
 
 impl AccountRunnerHost {
@@ -182,6 +184,7 @@ impl RunnerHost for AccountRunnerHost {
         // once the account's transport has registered one.
         self.find_relay_client().await;
         let inbox = self.inbox;
+        let policy = self.policy;
         self.on_client(false, move |client| {
             Box::pin(async move {
                 let app = runner_storage(client)?;
@@ -207,7 +210,7 @@ impl RunnerHost for AccountRunnerHost {
                 };
                 let result = turn(&debt);
                 if result.is_ok() {
-                    let fences = match super::admission::live_fences(&debt) {
+                    let fences = match super::admission::live_fences(&debt, &policy) {
                         Ok(fences) => fences,
                         Err(error) => return Some(Err(error)),
                     };
@@ -411,6 +414,7 @@ impl AppClient {
         self.routing.track_route_changes();
         let (turns_tx, turns) = mpsc::channel(1);
         let account_id = self.adapter.account_id().clone();
+        let policy = RecoveryRunnerPolicy::default();
         let host = AccountRunnerHost {
             turns: turns_tx,
             relay_caps: self.app.relay_caps.clone(),
@@ -424,8 +428,8 @@ impl AppClient {
             inbox: <[u8; 32]>::try_from(account_id.as_slice()).ok(),
             account_id,
             catching_up: self.routing.recovery_runner_catching_up(),
+            policy: policy.unit,
         };
-        let policy = RecoveryRunnerPolicy::default();
         let (runner, handle) = RecoveryRunner::waking_on(
             Arc::new(host),
             policy,

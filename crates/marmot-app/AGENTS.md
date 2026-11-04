@@ -733,7 +733,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences;
   fetched staging inside that capture keeps it fenced until admission, even after acquisition coverage completes.
   Staging outside a capture never turns empty-count or restart-gap debt into a fence. The fence is a query
-  (`live_fences`) over each unit's durable capture ranges, and the runner reads live counts through its own
+  (`live_fences`) over each unit's durable capture ranges, empty while the account breaker pauses the runner (no
+  fetch could move it; the range stays owed), and the runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it
   with the adapter's fence ticket and held routes; the host answers `fence_live_frames` with that ticket after a
   successful debt turn. Runner-owned startup completes fallible conversion and installs `delegate_replay_recovery`

@@ -164,9 +164,12 @@ async fn restart_goal_survey(client: &mut AppClient) -> super::super::select::Su
                     ..*turn
                 };
                 assert!(
-                    super::super::admission::live_fences(&turn)
-                        .unwrap()
-                        .is_empty(),
+                    super::super::admission::live_fences(
+                        &turn,
+                        &RecoveryRunnerPolicy::default().unit
+                    )
+                    .unwrap()
+                    .is_empty(),
                     "restart debt and an empty live count never fence"
                 );
                 super::super::select::survey(

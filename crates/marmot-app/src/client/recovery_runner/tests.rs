@@ -20,8 +20,8 @@ use cgka_traits::{
 use nostr::prelude::{Event, EventId, Keys, Kind, PublicKey, Signature, Tag, Timestamp};
 use storage_sqlite::{
     RecoveryCoverageProof, RecoveryCoverageRange, RecoveryCoverageSlice, RecoveryRelayCaps,
-    RecoveryStagedSlice, RecoveryUnit, RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitState,
-    SqlCipherKey, SqliteAccountStorage, SqliteAppStorage, StoredAccountState,
+    RecoveryStagedSlice, RecoveryUnit, RecoveryUnitBreak, RecoveryUnitOutcome, RecoveryUnitPolicy,
+    RecoveryUnitState, SqlCipherKey, SqliteAccountStorage, SqliteAppStorage, StoredAccountState,
     TransportReconciliationRoute,
 };
 use tokio::sync::Notify;
@@ -1073,7 +1073,13 @@ impl TestHost {
 
     /// Each fenced group's release point, as one debt turn reads it.
     async fn fences(&self) -> Vec<(Vec<Route>, u64)> {
-        self.debt_turn(live_fences)
+        self.fences_under(test_policy().unit).await
+    }
+
+    /// [`Self::fences`] under the given unit policy, whose account breaker
+    /// lifts every fence while it pauses the runner.
+    async fn fences_under(&self, unit: RecoveryUnitPolicy) -> Vec<(Vec<Route>, u64)> {
+        self.debt_turn(move |turn| live_fences(turn, &unit))
             .await
             .unwrap()
             .unwrap()
@@ -3470,6 +3476,65 @@ async fn capture_fence_waits_for_fetched_history_admission() {
         host.fences().await.is_empty(),
         "seen staging retires the capture fence"
     );
+}
+
+/// While the account breaker pauses the runner no fetch can move a fence, so
+/// none holds live frames: they go out as late input, the range stays owed,
+/// and the fence returns once the hour's window rolls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_lifts_fences_while_the_account_breaker_pauses() {
+    let account = account();
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (fenced, spender) = (group(1), group(2));
+    let floor = t0 - HOUR;
+    let since = t0 - 30 * 60;
+    let oldest = t0 - 25 * 60;
+    let requested = t0 - 20 * 60;
+    let relay = ModelRelay::new(RELAY, caps(500, true)).build();
+    account.goal(&fenced, floor);
+    account.live_boundary(&fenced, RELAY, floor, since - 1);
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&fenced, &[RELAY])],
+        &[&relay],
+    );
+    host.tails.stand(&fenced, RELAY, requested);
+    host.set_counts(vec![LiveCount {
+        routes: vec![fenced.clone()],
+        relay: RELAY.to_owned(),
+        since,
+        oldest_seen: Some(oldest),
+    }]);
+    let mut unit = test_policy().unit;
+    unit.max_attempts_per_hour = 1;
+    let fence = host.fences_under(unit).await;
+    assert_eq!(fence.len(), 1, "the non-empty count fences its group");
+    let owed = account.debt(&fenced, RELAY, requested - 1);
+    assert!(!owed.is_empty());
+
+    account
+        .app
+        .begin_recovery_unit_attempt(&spender, RELAY, None, clock.now())
+        .unwrap();
+    let until = account
+        .app
+        .recovery_account_paused_until(&unit, clock.now())
+        .unwrap()
+        .expect("one attempt reaches the cap");
+    assert!(
+        host.fences_under(unit).await.is_empty(),
+        "a paused runner holds no live frames"
+    );
+    assert_eq!(
+        account.debt(&fenced, RELAY, requested - 1),
+        owed,
+        "lifting the fence settles nothing"
+    );
+
+    clock.advance_to(until);
+    assert_eq!(host.fences_under(unit).await, fence);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
