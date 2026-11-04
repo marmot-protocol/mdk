@@ -177,6 +177,11 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
+On x86-64 Linux with Nix, [`flake.nix`](flake.nix) provides rustup, `just`, nextest, cargo-audit, cargo-llvm-cov,
+cbindgen, valgrind, Python with uv, Tamarin and Java for TLC. Enter it with
+`nix --extra-experimental-features 'nix-command flakes' develop`. The relay recipes need a separate `docker compose`
+(Docker or rootless Podman with Docker compatibility).
+
 Pull requests run a pre-check of a few minutes: formatting, the static and
 contract gates (the tracing audit among them), dependency audit, workspace
 clippy, the WASM build, and the workspace tests with the `precheck` nextest
