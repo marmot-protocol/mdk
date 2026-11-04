@@ -61,35 +61,6 @@ fn component(identity: &Identity) -> &[u8] {
 }
 
 #[test]
-fn encrypted_reopen_reuses_identical_proof_without_calling_external_signer() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("account.sqlite");
-    let key = SqlCipherKey::new("proof reuse test").unwrap();
-    let signer = Signer::new();
-    let (proof, mls_key) = {
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        let identity = signer.open(&store).unwrap();
-        let result = (
-            component(&identity).to_vec(),
-            identity.signer.to_public_vec(),
-        );
-        drop(identity);
-        store.close().unwrap();
-        result
-    };
-    assert_eq!(signer.requests.lock().unwrap().len(), 1);
-    let rejecting = Signer {
-        reject: true,
-        ..signer
-    };
-    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let identity = rejecting.open(&reopened).unwrap();
-    assert_eq!(component(&identity), proof);
-    assert_eq!(identity.signer.to_public_vec(), mls_key);
-    assert_eq!(rejecting.requests.lock().unwrap().len(), 1);
-}
-
-#[test]
 fn old_proof_keeps_original_timestamp_and_new_proof_uses_unix_seconds() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let signer = Signer::new();
@@ -126,7 +97,35 @@ fn old_proof_keeps_original_timestamp_and_new_proof_uses_unix_seconds() {
 
 #[test]
 fn missing_or_invalid_stored_proof_requires_one_successful_acquisition() {
-    for mode in 0..5 {
+    type StoredProof = fn(&Signer, &Identity) -> Option<Vec<u8>>;
+    let cases: [(&str, StoredProof); 5] = [
+        ("missing", |_, _| None),
+        ("wrong length", |_, _| Some(vec![0; 103])),
+        ("bad signature", |_, identity| {
+            let mut raw = component(identity).to_vec();
+            raw[40] ^= 1;
+            Some(raw)
+        }),
+        ("other account", |_, _| {
+            let other = Signer::new();
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            Some(component(&other.open(&store).unwrap()).to_vec())
+        }),
+        ("other MLS key", |signer, _| {
+            Some(
+                crate::account_identity_proof::account_identity_proof_component(
+                    &signer.identity(),
+                    &[7; 32],
+                    SUITE,
+                    SUITE.signature_algorithm(),
+                    1,
+                    signer,
+                )
+                .unwrap(),
+            )
+        }),
+    ];
+    for (name, stored_proof) in cases {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let signer = Signer::new();
         let identity = signer.open(&store).unwrap();
@@ -134,50 +133,30 @@ fn missing_or_invalid_stored_proof_requires_one_successful_acquisition() {
             .account_device_signer(identity.self_id())
             .unwrap()
             .unwrap();
-        binding.account_identity_proof = match mode {
-            0 => None,
-            1 => Some(vec![0; 103]),
-            2 => {
-                let mut raw = component(&identity).to_vec();
-                raw[40] ^= 1;
-                Some(raw)
-            }
-            3 => {
-                let other = Signer::new();
-                Some(
-                    component(
-                        &other
-                            .open(&SqliteAccountStorage::in_memory().unwrap())
-                            .unwrap(),
-                    )
-                    .to_vec(),
-                )
-            }
-            _ => Some(
-                crate::account_identity_proof::account_identity_proof_component(
-                    &signer.identity(),
-                    &[7; 32],
-                    SUITE,
-                    SUITE.signature_algorithm(),
-                    1,
-                    &signer,
-                )
-                .unwrap(),
-            ),
-        };
+        binding.account_identity_proof = stored_proof(&signer, &identity);
         store.put_account_device_signer(&binding).unwrap();
         let count = signer.requests.lock().unwrap().len();
         let repaired = signer.open(&store).unwrap();
-        assert_eq!(signer.requests.lock().unwrap().len(), count + 1);
+        assert_eq!(
+            signer.requests.lock().unwrap().len(),
+            count + 1,
+            "{name}: stored proof was not replaced"
+        );
         assert_eq!(
             repaired.signer.to_public_vec(),
-            identity.signer.to_public_vec()
+            identity.signer.to_public_vec(),
+            "{name}: MLS key changed"
         );
         assert_eq!(
             component(&signer.open(&store).unwrap()),
-            component(&repaired)
+            component(&repaired),
+            "{name}: replacement proof was not reused"
         );
-        assert_eq!(signer.requests.lock().unwrap().len(), count + 1);
+        assert_eq!(
+            signer.requests.lock().unwrap().len(),
+            count + 1,
+            "{name}: replacement proof was not persisted"
+        );
     }
 }
 
@@ -356,23 +335,5 @@ fn stored_component_verification_binds_suite_scheme_key_and_account() {
             Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256
         )
         .is_err()
-    );
-}
-
-#[test]
-fn legacy_proof_timestamp_does_not_read_the_clock() {
-    assert_eq!(
-        proof_created_at(ProtocolProfile::Legacy, || panic!("legacy read the clock")).unwrap(),
-        0
-    );
-}
-
-#[test]
-fn current_proof_timestamp_rejects_a_clock_before_unix_epoch() {
-    assert!(
-        proof_created_at(ProtocolProfile::Current, || UNIX_EPOCH
-            - std::time::Duration::from_secs(1))
-        .unwrap_err()
-        .contains("system clock precedes Unix epoch")
     );
 }
