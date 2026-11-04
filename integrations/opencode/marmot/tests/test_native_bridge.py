@@ -154,6 +154,14 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(server.history_reads, 0)
         self.assertTrue(any(e['type'] == 'stopping' for e in events))
 
+    def test_startup_error_closes_admission_before_error_event(self):
+        import subprocess
+        result = subprocess.run([bridge.sys.executable, str(Path(bridge.__file__))],
+                                input=b'not-json\n', capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual([bridge.json.loads(line)['type'] for line in result.stdout.splitlines()],
+                         ['stopping', 'error'])
+
     def test_message_ids_sort_in_generation_order(self):
         values=[bridge.message_id() for _ in range(200)]
         self.assertEqual(values,sorted(values))

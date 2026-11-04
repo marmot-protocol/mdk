@@ -325,6 +325,12 @@ turn's `MARMOT_*` route and token for `wn-agent group-profile`; permission to
 launch a shell alone does not ensure that these values reach it. Without a turn
 token, the CLI retains its normal connector-home `control.token` fallback.
 
+A full per-group queue rejects the incoming message and asks for a new message
+later. The original ID stays in the bounded deduplication window, so reconnect replay
+does not retry it during that window. Accepted queued work
+retains admission order through serial-lock acquisition, including session,
+workdir and goal changes.
+
 ## Chat Commands
 
 Terminal backends run through their non-interactive machine interfaces, which do
