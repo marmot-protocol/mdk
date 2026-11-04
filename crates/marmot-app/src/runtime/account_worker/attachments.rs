@@ -73,9 +73,26 @@ pub(super) struct Admission {
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A blocking-pool batch timed as one runtime operation (mdk#2923): it ends as
+/// a success however the batch returns, and the dropped task records nothing.
+struct TimedBatch(Option<Observation>);
+
+impl Drop for TimedBatch {
+    fn drop(&mut self) {
+        if let Some(observation) = self.0.take() {
+            observation.finish(TelemetryOutcome::Success);
+        }
+    }
+}
+
 /// Starts a media sweep on the blocking pool unless one is still running:
 /// to completion when the worker takes ownership, otherwise one batch.
-fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_complete: bool) {
+fn spawn_media_sweep(
+    admission: &mut Admission,
+    media: AccountMediaStore,
+    until_complete: bool,
+    telemetry: &marmot_observability::PerformanceRecorder,
+) {
     if admission
         .media_sweep
         .as_ref()
@@ -83,7 +100,9 @@ fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_
     {
         return;
     }
+    let batch = TimedBatch(Some(telemetry.observe(RuntimeOp::WorkerMediaSweep)));
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
+        let _batch = batch;
         loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
@@ -106,6 +125,7 @@ fn spawn_upload_promotion(
     storage: SqliteAccountStorage,
     media: AccountMediaStore,
     updates: AttachmentUpdates,
+    telemetry: &marmot_observability::PerformanceRecorder,
 ) {
     if admission
         .upload_promotion
@@ -115,7 +135,9 @@ fn spawn_upload_promotion(
         return;
     }
     let cursor = admission.upload_cursor.clone();
+    let batch = TimedBatch(Some(telemetry.observe(RuntimeOp::WorkerUploadPromotion)));
     admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
+        let _batch = batch;
         let after = cursor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -178,7 +200,14 @@ pub(super) fn spawn_legacy_migration(
         admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
     }
     let keep_media_more = admission.keep_media_more.clone();
+    let batch = TimedBatch(Some(
+        shared
+            .observer
+            .performance()
+            .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch),
+    ));
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
+        let _batch = batch;
         let started = (|| {
             let storage = app.account_storage(&label)?;
             let media = app.account_media_store(&label, &storage)?;
@@ -559,6 +588,7 @@ pub(super) fn schedule(
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             true,
+            shared.observer.performance(),
         );
     } else {
         spawn_media_sweep(
@@ -567,6 +597,7 @@ pub(super) fn schedule(
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             false,
+            shared.observer.performance(),
         );
     }
     let expired = storage
@@ -592,6 +623,7 @@ pub(super) fn schedule(
             .app
             .account_media_store(&client.state.label, &storage)?,
         shared.attachment_updates.clone(),
+        shared.observer.performance(),
     );
     let resumed = if policy.automatic {
         storage.app_storage().resume_permitted_attachments(
