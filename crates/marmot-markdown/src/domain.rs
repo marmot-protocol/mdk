@@ -9,7 +9,9 @@ static ROOT_LABELS: OnceLock<Vec<&'static str>> = OnceLock::new();
 
 /// Only these ambiguous file endings override IANA membership. This is display
 /// policy, not a statement about whether the corresponding domains exist.
-const FILE_ENDINGS: &[&str] = &["md", "pdf", "zip"];
+const FILE_ENDINGS: &[&str] = &[
+    "java", "md", "mov", "pdf", "pl", "py", "rs", "sh", "so", "zip",
+];
 
 /// Necessary raw-source condition shared with explicit-label precedence handling.
 pub(crate) fn has_host_separator(text: &str) -> bool {

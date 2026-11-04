@@ -136,8 +136,8 @@ preserves the source spelling and `dest` contains an HTTPS URL with an IDNA-vali
 ASCII host. Root recognition is an offline display heuristic, not evidence that a
 site exists or is safe. Explicit Markdown links, code and escapes take precedence.
 
-Bare `.pdf`, `.md` and `.zip` names remain text, case-insensitively, even when the
-ending is a delegated root. This applies to bare inference only: an explicit
+Bare `.pdf`, `.md`, `.zip`, `.mov`, `.py`, `.rs`, `.sh`, `.pl`, `.java` and `.so`
+names remain text, case-insensitively, even when the ending is a delegated root. This applies to bare inference only: an explicit
 `https://` URL, `www.` address or Markdown link still expresses navigation intent.
 Other ordinary file extensions absent from the root list also remain text.
 
@@ -153,6 +153,7 @@ The bundled [root snapshot](src/iana-tlds.txt) comes from
 Its header records the data version/date. Update it through reviewed source
 maintenance; builds and message parsing never fetch registry data. Download a
 candidate to a local file and run `python3 scripts/update_tlds.py CANDIDATE` from
-this crate. The updater validates the complete sorted input and prints its digest
-and added/removed roots for review. Explicit links remain usable for newly
+this crate. The updater checks the header, label syntax and ordering, then prints root counts,
+a digest and added/removed roots for review. Compare the candidate with IANA before
+committing; syntax checks alone cannot establish a complete registry snapshot. Explicit links remain usable for newly
 delegated roots before the next snapshot update.
