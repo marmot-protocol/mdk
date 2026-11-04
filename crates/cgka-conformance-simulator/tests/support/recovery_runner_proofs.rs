@@ -236,6 +236,67 @@ async fn publish(
     Ok(sent)
 }
 
+/// Wait until every one of `payloads` that `sender` sent to `group` is on
+/// the relay. A send returns once the app accepts it, and it may still be
+/// queued; a member that comes online while a backlog's tail is still going
+/// out takes that tail as live input ahead of the older history.
+async fn wait_published(
+    subject: &AppRuntimeHarness,
+    group: &GroupId,
+    sender: &str,
+    payloads: &[String],
+    limit: Duration,
+) -> TestResult {
+    let probe = subject.probe(sender)?;
+    let wanted = payloads.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    wait_for(
+        &format!("{sender}'s backlog published"),
+        limit,
+        async || {
+            let ids = probe
+                .chat_message_ids(group)
+                .await?
+                .into_iter()
+                .filter(|(text, _)| wanted.contains(text.as_str()))
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>();
+            if ids.len() != wanted.len() {
+                return Ok(false);
+            }
+            let sources = probe.message_sources(group, ids).await?;
+            let published = subject
+                .relay_publication_ids()
+                .await?
+                .into_iter()
+                .filter(|(_, kind)| *kind == 445)
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>();
+            Ok(sources
+                .iter()
+                .all(|source| source.as_ref().is_some_and(|id| published.contains(id))))
+        },
+    )
+    .await
+}
+
+/// [`wait_published`] for every lane [`publish`] sent.
+async fn wait_lanes_published(
+    subject: &AppRuntimeHarness,
+    group: &GroupId,
+    prefix: &str,
+    count: usize,
+    limit: Duration,
+) -> TestResult {
+    for (lane, sender) in SENDERS.iter().enumerate() {
+        let payloads = (lane..count)
+            .step_by(SENDERS.len())
+            .map(|index| format!("{prefix}{index:05}"))
+            .collect::<Vec<_>>();
+        wait_published(subject, group, sender, &payloads, limit).await?;
+    }
+    Ok(())
+}
+
 fn payloads(sent: &[Sent]) -> Vec<String> {
     sent.iter().map(|sent| sent.payload.clone()).collect()
 }
@@ -506,8 +567,18 @@ mod runner_trace {
             STARTED.get_or_init(Instant::now);
             let only = Targets::new().with_target(TARGET, tracing::Level::DEBUG);
             let capture = Capture.with_filter(only);
+            // Opt-in logs for the in-process subject, for example
+            // `MDK_PROOF_TRACE=marmot_app::recovery_runner=debug`. Other
+            // participants run in their own processes and are not traced.
+            let logs = std::env::var("MDK_PROOF_TRACE").ok().map(|filter| {
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr)
+                    .with_filter(tracing_subscriber::EnvFilter::new(filter))
+            });
             tracing_subscriber::registry()
                 .with(capture)
+                .with(logs)
                 .try_init()
                 .is_ok()
         });
@@ -1996,6 +2067,11 @@ pub(super) async fn upgrade() {
         // history no endpoint answers.
         subject.set_online("bob", false).await?;
         let mut expected = payloads(&publish(subject, &busy, "owed-", UPGRADE_MESSAGES).await?);
+        // The whole backlog is on the relay before bob opens. A tail still
+        // going out would reach the earlier owner as live input ahead of its
+        // unanswered history and move each sender's ratchet past the
+        // out-of-order window, so it could never open the older messages.
+        wait_lanes_published(subject, &busy, "owed-", UPGRADE_MESSAGES, SETTLEMENT).await?;
         for endpoint in 0..2 {
             subject.stall_relay_history(endpoint, true).await?;
         }
@@ -2033,6 +2109,8 @@ pub(super) async fn upgrade() {
         let (live_sent, live_visibility) = live.finish().await?;
         expected.extend(live_sent);
         let exact = holds_exactly(&bob, &busy, &expected).await?;
+        let (_, chat) = bob.chat_view(&busy, None).await?;
+        let owed_visible_at_end = chat.iter().filter(|text| text.starts_with("owed-")).count();
         let history = history_since(subject, &clocks).await?;
         let trace = runner_trace::since(trace_from);
         let capture_pages = native_pages(&history);
@@ -2050,6 +2128,7 @@ pub(super) async fn upgrade() {
             "old_owner_control": control,
             "owed_at_upgrade": owed_at_upgrade,
             "owed_visible_seconds": drained,
+            "owed_visible_at_end": owed_visible_at_end,
             "runner_caught_up_seconds": reported_caught_up,
             "timeline_exact": exact,
             "live_visibility_ms": live_visibility,
@@ -2331,20 +2410,10 @@ pub(super) async fn fence_control() {
                     send(&alice, &counted, &payload).await?;
                     counted_expected.push(payload);
                 }
-                // An accepted send may still be queued. Establish the real
-                // relay backlog before restarting Bob, rather than sleeping
-                // until the sender happens to finish its initial catch-up.
-                wait_for("all counted backlog published", QUIET_AGE + FENCE_RELEASE, async || {
-                    let messages = alice.chat_message_ids(&counted).await?;
-                    let ids = messages.into_iter()
-                        .filter(|(text, _)| counted_expected.contains(text))
-                        .map(|(_, id)| id).collect::<Vec<_>>();
-                    if ids.len() != COUNTED_MESSAGES { return Ok(false); }
-                    let sources = alice.message_sources(&counted, ids).await?;
-                    let published = subject.relay_publication_ids().await?.into_iter()
-                        .filter(|(_, kind)| *kind == 445).map(|(id, _)| id).collect::<BTreeSet<_>>();
-                    Ok(sources.iter().all(|source| source.as_ref().is_some_and(|id| published.contains(id))))
-                }).await?;
+                // Establish the real relay backlog before restarting Bob,
+                // rather than sleeping until the sender happens to finish
+                // its initial catch-up.
+                wait_published(subject, &counted, "alice", &counted_expected, QUIET_AGE + FENCE_RELEASE).await?;
             }
             for endpoint in 0..2 { subject.stall_relay_history(endpoint, true).await?; }
             let clocks = relay_clocks(subject).await?;
