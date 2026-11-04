@@ -239,10 +239,15 @@ impl BracketDelim {
 
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
-    tokenize_inner(raw, refs, true)
+    tokenize_inner(raw, refs, true, None)
 }
 
-fn tokenize_inner(raw: &str, refs: &HashMap<String, LinkRef>, infer_domains: bool) -> Vec<Inline> {
+fn tokenize_inner(
+    raw: &str,
+    refs: &HashMap<String, LinkRef>,
+    infer_domains: bool,
+    edges: Option<(u8, u8)>,
+) -> Vec<Inline> {
     let bytes = raw.as_bytes();
     let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
@@ -391,7 +396,7 @@ fn tokenize_inner(raw: &str, refs: &HashMap<String, LinkRef>, infer_domains: boo
             }
             b'*' | b'_' | b'~' => {
                 flush_text(&mut out, &mut buf, &delims);
-                let (run_len, can_open, can_close) = classify_delim_run(bytes, i, c);
+                let (run_len, can_open, can_close) = classify_delim_run(bytes, i, c, edges);
                 let out_pos = out.len();
                 out.push(Inline::Text(
                     std::str::from_utf8(&bytes[i..i + run_len])
@@ -867,7 +872,16 @@ fn try_close_bracket(
         let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
         // No inferred domain can occur without a raw host separator. Keep
         // already parsed ordinary labels rather than tokenize them twice.
-        crate::domain::has_host_separator(source).then(|| tokenize_inner(source, refs, false))
+        crate::domain::has_host_separator(source).then(|| {
+            // A label is surrounded by bracket punctuation, not paragraph-edge
+            // whitespace. Preserve those bytes for emphasis flanking rules.
+            tokenize_inner(
+                source,
+                refs,
+                false,
+                Some((bytes[opener.input_pos], bytes[i])),
+            )
+        })
     };
 
     // 1. Inline link: `](dest "title")`
@@ -1482,14 +1496,23 @@ fn try_nostr_uri(bytes: &[u8], i: usize) -> Option<(NostrEntity, usize)> {
 // Emphasis / strong / strikethrough — the spec's process_emphasis algorithm.
 // ---------------------------------------------------------------------------
 
-fn classify_delim_run(bytes: &[u8], i: usize, ch: u8) -> (usize, bool, bool) {
+fn classify_delim_run(
+    bytes: &[u8],
+    i: usize,
+    ch: u8,
+    edges: Option<(u8, u8)>,
+) -> (usize, bool, bool) {
     let mut j = i;
     while j < bytes.len() && bytes[j] == ch {
         j += 1;
     }
     let len = j - i;
-    let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
-    let next = bytes.get(j).copied();
+    let prev = if i == 0 {
+        edges.map(|(left, _)| left)
+    } else {
+        Some(bytes[i - 1])
+    };
+    let next = bytes.get(j).copied().or(edges.map(|(_, right)| right));
     let prev_is_ws = prev.is_none_or(is_ascii_ws_for_flank);
     let next_is_ws = next.is_none_or(is_ascii_ws_for_flank);
     let prev_is_punct = prev.is_some_and(scanner::is_ascii_punct);

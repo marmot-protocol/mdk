@@ -597,3 +597,23 @@ fn schemeless_domain_url_suffixes_keep_entities_and_math_literal() {
         assert_eq!(parse_inlines(&qualified), vec![uri(&qualified)]);
     }
 }
+
+#[test]
+fn schemeless_domain_label_reparse_preserves_bracket_flanking() {
+    for label in ["**.a.b*", "*.a.b**", "**.example.chat*", "*.example.chat**"] {
+        for source in [
+            format!("[{label}](x)"),
+            format!("![{label}](x)"),
+            format!("[{label}][ref]\n\n[ref]: x"),
+            format!("![{label}][ref]\n\n[ref]: x"),
+        ] {
+            let inlines = parse_inlines(&source);
+            let children = match &inlines[..] {
+                [Inline::Link { children, .. }] => children,
+                [Inline::Image { alt, .. }] => alt,
+                other => panic!("unexpected tree for {source:?}: {other:?}"),
+            };
+            assert_eq!(children, &vec![t(label)], "{source:?}");
+        }
+    }
+}
