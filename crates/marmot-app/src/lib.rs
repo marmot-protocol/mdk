@@ -2234,6 +2234,7 @@ impl MarmotApp {
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
+            saved_transport_timestamp: checkpointed_transport_timestamp,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]

@@ -6755,6 +6755,22 @@ impl AppClient {
         let pending_inputs = self.pending_seen_event_count;
         let pending_acks = self.pending_application_event_acks.len();
         let pending_frontiers = self.pending_local_group_deletion_frontier_clears.len();
+        // Nothing to persist: maintenance saves after every tick. Skipping the
+        // write also skips the chat-list stale mark and presentation wake,
+        // which would otherwise force a full chat-list rebuild and set off
+        // another attachment pass (mdk#2923). Receipts synchronize first, as
+        // the save below would: released receipts can add seen events, and
+        // closed storage still fails the save.
+        if changed_groups == 0
+            && pending_acks == 0
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none()
+            && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
+            && self.transport_receipts()?.pending_seen_events().is_empty()
+        {
+            self.flush_live_v5_events();
+            return Ok(None);
+        }
         let message_ref = (pending_acks == 1)
             .then(|| self.pending_application_event_acks.iter().next())
             .flatten()
@@ -6855,6 +6871,7 @@ impl AppClient {
                 )?;
                 None
             };
+            self.saved_transport_timestamp = self.checkpointed_transport_timestamp;
             self.pending_seen_event_count = 0;
             self.pending_group_projection_updates.clear();
             self.pending_local_group_deletion_frontier_clears.clear();

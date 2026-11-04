@@ -1040,6 +1040,10 @@ pub struct AppClient {
     /// the router spills an arrival that falls below the floor it raised:
     /// during the commit's save, and after a live one.
     pub(crate) checkpointed_transport_timestamp: Option<u64>,
+    /// The transport cursor this client last saved, or the one it opened
+    /// with. A checkpoint with nothing else pending and this cursor unchanged
+    /// has nothing to persist and is skipped (mdk#2923).
+    pub(crate) saved_transport_timestamp: Option<u64>,
     /// Runs at every transport-cursor seal, before and after, so a test can
     /// land a delivery on either side of the decision.
     #[cfg(test)]

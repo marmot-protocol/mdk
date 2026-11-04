@@ -12414,6 +12414,48 @@ async fn register_external_signer_requires_matching_external_account() {
     assert!(app.has_external_signer(&account.account_id_hex));
 }
 
+/// A checkpoint with nothing pending writes nothing and leaves the chat list
+/// warm; a moved transport cursor or a pending frontier clear still writes
+/// (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let stale = |app: &MarmotApp| {
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice")
+    };
+    let saves = |client: &mut crate::AppClient| {
+        app.chat_list_projection_stale.lock().unwrap().clear();
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        stale(&app)
+    };
+    // Settle whatever the open left pending.
+    saves(&mut client);
+
+    assert!(!saves(&mut client), "nothing pending: no write");
+
+    client.checkpointed_transport_timestamp =
+        Some(client.checkpointed_transport_timestamp.unwrap_or(0) + 1);
+    assert!(saves(&mut client), "a moved transport cursor is persisted");
+    assert!(!saves(&mut client), "and saved only once");
+
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("aa".repeat(32), 1);
+    assert!(saves(&mut client), "a pending frontier clear is persisted");
+    assert!(!saves(&mut client), "and cleared by that save");
+}
+
 #[test]
 fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
     // Regression for mdk#220: removing an account (or rolling back a
