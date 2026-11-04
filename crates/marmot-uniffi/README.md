@@ -1007,6 +1007,32 @@ reports. The C ABI mirrors these calls. See the
 
 ## Linked devices
 
+Experimental updated clients also share invitation decisions through MDK for one authenticated admission generation
+and its inherited sibling Adds. Older unidentified invitations remain local-only; a separate external Add batch or
+fork can prompt again. Accept never joins/rejoins or resets explicit archive intent. Decline requests each matching
+local leaf's existing Leave; later acceptance cannot cancel already-requested Leave. A decline does not reach a copy
+this device already deleted locally. Private KeyPackage requests follow the ordinary stock rules. A zero-publication
+`CompletionUnknown` is pending work, not proof every device departed. Keep rendering the returned invitation and
+membership state. Explicit user Leave, including declining an invitation, records the same current-generation Decline
+before departure publication when this device trusts a device group; archive, local deletion, sign-out and removal do
+not create that choice. Unknown admissions or absent trust keep departure leaf-only. A held maximum version skips the new choice, allowing ordinary
+Leave without replacing the retained winner. Invitation decisions use the existing host APIs. Released builds cannot
+enable device groups or provide working linking controls. Custom experimental peers must update together before using
+V2 sibling Welcomes; there is no capability negotiation or mixed-old-receiver guarantee.
+
+User Leave automatically demotes a nonlast active admin account before SelfRemove. The last active admin account is
+refused on all its devices before any new choice or departure publication. `can_leave` includes eligible admin Leave;
+`requires_self_demote_before_leave` remains in the DTO and is false because core performs that step. The coarse
+chat-list Leave action opens the authoritative command and need not imply last-admin eligibility. Sign-out stays
+leaf-only and does not demote the account. A recorded Decline remains if a later eligibility check refuses departure;
+a committed demotion remains if the following Leave fails. Already admitted native work retains its ordinary retry
+owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
+repair does not promise to recover that attribution retroactively.
+
+At the maximum decision version, an opposite invitation choice is refused and the held winner remains; ordinary User
+Leave still proceeds without writing another version. Retained invitation generations have no expiry or count cap:
+a malicious currently linked device can inflate stored decisions and broadcast pages.
+
 `linked_devices(account_ref)` returns this account's own devices as `LinkedDeviceFfi` records, read from the roster of
 the device group this device trusts, for a Devices screen:
 

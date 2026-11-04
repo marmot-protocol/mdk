@@ -8,6 +8,8 @@ description = "OpenMLS-backed CGKA engine implementation."
 
 [features]
 default = []
+# Explicit dev dogfood capability; never enables test-policy timing overrides.
+dev-device-groups = []
 # Explicit escape hatch for engine/session integration tests that need custom
 # settlement or rewind policies. Production/app consumers must not enable it.
 test-policy-overrides = []

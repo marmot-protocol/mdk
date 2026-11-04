@@ -112,6 +112,16 @@ while resolving complete intent instead of deriving it from visible rows.
 
 ## Migrations
 
+Migration0170 adds native local-copy admission metadata and app invitation-decision rows; no existing group is seeded.
+It runs for every account database, including builds with device groups disabled, creating two tables and two partial
+indexes. Native creation/join writes the local admission association transactionally; it adds no per-message writes.
+The admission generation and exact successful local Welcome association are captured in the native join transaction;
+founding records a local origin instead. They remain fixed across ordinary epoch changes, are replaced only by a new
+successful native admission, and are deleted with local group data. Decision rows are keyed by raw MLS chat id and
+generation and retain their winning value, owed publication and pending application/Leave handoff atomically. Unknown
+admissions create no membership work; the actual matching native join re-arms them. Full broadcasts enumerate retained
+generations, including after a local chat is forgotten. There is no clock-based generation eviction.
+
 Account/session schema changes are Rust migrations: the ordered registry lives in `src/base/migrations.rs` and bodies in
 numbered files like `src/base/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
 padded name, and an `apply` function run inside a SQLite transaction, which can execute DDL, rewrite rows, or perform
@@ -304,7 +314,7 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   prune parks only from that mark up, so a goal widened back below it parks nothing twice; loss lowers the mark to its
   floor. A released receipt below the window changes nothing in the ledger (its coverage stays until the prune), so only loss parks debt from below it. The ledger is in
   shadow mode: no obligation, retry, fence or schedule reads it.
-- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0172).** An unresolved missing epoch has a durable
+- **Epoch-gap return visits (`recovery_epoch_gap.rs`, migration 0150).** An unresolved missing epoch has a durable
   visit count, active-visit marker, exhaustion state and next retry time. Beginning a visit and reopening its
   retained goals commit together. Restart resumes ledger progress; observations and revised tickets at the same
   epoch preserve the budget. A higher missing epoch or explicit repair can start a fresh budget. Exhaustion

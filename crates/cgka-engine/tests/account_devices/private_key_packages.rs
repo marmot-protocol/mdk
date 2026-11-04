@@ -602,6 +602,7 @@ fn sibling_welcome(
     SiblingWelcome {
         from,
         to: OTHER_SLOT,
+        invitation_generation: None,
         key_package_ref: key_package_ref.to_vec(),
         welcome: welcome.payload.clone(),
         relays: vec![],
@@ -678,6 +679,10 @@ async fn a_sibling_welcome_joins_with_the_private_key_package_issued_to_its_send
         Settled(IngestOutcome::Processed)
     );
     assert!(laptop.engine.epoch(&gid).is_ok());
+    assert!(
+        laptop.storage.invitation_admission(&gid).unwrap().is_none(),
+        "V1 does not invent an inherited generation"
+    );
     let joined: Vec<_> = laptop
         .engine
         .drain_events()
@@ -841,7 +846,11 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
     );
 
     let (remove, welcome) = remove_and_add_back(&mut phone, &laptop, &gid, private(1)).await;
-    let sibling = sibling_welcome(&welcome, SLOT, &issued[1].key_package_ref);
+    let original = phone.storage.invitation_admission(&gid).unwrap().unwrap();
+    let sibling = SiblingWelcome {
+        invitation_generation: Some(original.generation),
+        ..sibling_welcome(&welcome, SLOT, &issued[1].key_package_ref)
+    };
     let before = laptop.engine.group_record(&gid).unwrap();
     let keys = laptop.storage.stored_key_package_bundles().unwrap().len();
     for _ in 0..2 {
@@ -852,6 +861,7 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
             }
         );
         assert_held_wrote_nothing(&laptop, &gid, &sibling, &before, keys);
+        assert!(laptop.storage.invitation_admission(&gid).unwrap().is_none());
     }
 
     remove_laptop(&mut laptop, &gid, remove).await;
@@ -860,6 +870,24 @@ async fn a_sibling_welcome_into_a_chat_still_held_waits_for_its_removal() {
         Settled(IngestOutcome::Processed)
     );
     assert!(!laptop.engine.group_record(&gid).unwrap().removed);
+    assert_eq!(
+        laptop.storage.invitation_admission(&gid).unwrap(),
+        laptop
+            .engine
+            .drain_events()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                GroupEvent::GroupJoined { via_welcome, .. } =>
+                    Some(cgka_traits::group::InvitationAdmission {
+                        generation: original.generation,
+                        created_locally: false,
+                        via_welcome: Some(via_welcome.clone()),
+                    }),
+                _ => None,
+            }),
+        "later native context inherits the original admission instead of reseeding"
+    );
     assert_eq!(
         laptop.engine.epoch(&gid).unwrap(),
         phone.engine.epoch(&gid).unwrap()
@@ -992,12 +1020,32 @@ async fn a_sibling_welcome_decodes_only_its_exact_encoding() {
         ..sibling_welcome(&welcomes[0], SLOT, &[1; 32])
     };
     let bytes = sibling.encode().unwrap();
+    assert_eq!(bytes[0], 1);
     assert_eq!(SiblingWelcome::decode(&bytes).unwrap(), sibling);
+    let inherited = SiblingWelcome {
+        invitation_generation: Some([0xa5; 32]),
+        ..sibling.clone()
+    };
+    let inherited_bytes = inherited.encode().unwrap();
+    assert_eq!(inherited_bytes[0], 2);
+    assert_eq!(&inherited_bytes[1..33], &SLOT);
+    assert_eq!(&inherited_bytes[33..65], &OTHER_SLOT);
+    assert_eq!(&inherited_bytes[65..97], &[0xa5; 32]);
+    assert_eq!(&inherited_bytes[97..], &bytes[65..]);
+    assert_eq!(SiblingWelcome::decode(&inherited_bytes).unwrap(), inherited);
+    let mut inherited_trailing = inherited_bytes.clone();
+    inherited_trailing.push(0);
+    assert!(
+        matches!(SiblingWelcome::decode(&inherited_trailing), Err(EngineError::Serialize(reason)) if reason == "invalid sibling Welcome")
+    );
+    assert!(
+        matches!(SiblingWelcome::decode(&inherited_bytes[..96]), Err(EngineError::Serialize(reason)) if reason == "invalid sibling Welcome")
+    );
 
     let mut trailing = bytes.clone();
     trailing.push(0);
     let mut version = bytes.clone();
-    version[0] = 2;
+    version[0] = 3;
     for refused in [&bytes[..bytes.len() - 1], &trailing, &version, &bytes[..65]] {
         assert_serialize_error(SiblingWelcome::decode(refused), "invalid sibling Welcome");
     }

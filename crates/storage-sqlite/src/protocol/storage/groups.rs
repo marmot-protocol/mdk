@@ -7,6 +7,57 @@ use cgka_traits::types::{EpochId, GroupId};
 use rusqlite::{OptionalExtension, params};
 
 impl GroupStorage for SqliteAccountStorage {
+    fn invitation_admission(
+        &self,
+        id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::group::InvitationAdmission>> {
+        let row: Option<(Vec<u8>, bool, Option<Vec<u8>>)> = self.lock()?.query_row_cached(
+            "SELECT generation, created_locally, via_welcome FROM cgka_invitation_admissions WHERE group_id = ?1",
+            params![id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().storage()?;
+        row.map(|(generation, created_locally, via_welcome)| {
+            Ok(cgka_traits::group::InvitationAdmission {
+                generation: generation
+                    .try_into()
+                    .map_err(|_| StorageError::Backend("invalid invitation admission".into()))?,
+                created_locally,
+                via_welcome: via_welcome.map(cgka_traits::MessageId::new),
+            })
+        })
+        .transpose()
+    }
+
+    fn put_invitation_admission(
+        &self,
+        id: &GroupId,
+        admission: Option<&cgka_traits::group::InvitationAdmission>,
+    ) -> StorageResult<()> {
+        let conn = self.lock()?;
+        if let Some(admission) = admission {
+            conn.execute_cached(
+                "INSERT INTO cgka_invitation_admissions(group_id, generation, created_locally, via_welcome)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(group_id) DO UPDATE SET
+                 generation = excluded.generation, created_locally = excluded.created_locally,
+                 via_welcome = excluded.via_welcome",
+                params![
+                    id.as_slice(),
+                    admission.generation.as_slice(),
+                    admission.created_locally,
+                    admission.via_welcome.as_ref().map(|message| message.as_slice()),
+                ],
+            )
+            .storage()?;
+        } else {
+            conn.execute_cached(
+                "DELETE FROM cgka_invitation_admissions WHERE group_id = ?1",
+                params![id.as_slice()],
+            )
+            .storage()?;
+        }
+        Ok(())
+    }
+
     fn forget_group_local(&self, id: &GroupId, at: cgka_traits::Timestamp) -> StorageResult<bool> {
         self.forget_group_local_data(&hex::encode(id.as_slice()), at)
     }
@@ -209,6 +260,54 @@ mod tests {
         assert!(records.contains(&first));
         assert!(records.contains(&second));
         assert_eq!(store.list_groups().unwrap(), vec![gid(1), gid(2)]);
+    }
+
+    #[test]
+    fn invitation_admission_changes_join_the_callers_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        let admission = cgka_traits::group::InvitationAdmission {
+            generation: [7; 32],
+            created_locally: true,
+            via_welcome: None,
+        };
+        store.lock().unwrap().execute_batch("CREATE TRIGGER refuse_admission_transaction BEFORE UPDATE ON cgka_groups BEGIN SELECT RAISE(ABORT, 'admission transaction rollback'); END;").unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_invitation_admission(&group.id, Some(&admission))?;
+            storage.put_group(&group)
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(reason)) if reason.contains("admission transaction rollback")),
+            "{result:?}"
+        );
+        assert!(store.invitation_admission(&group.id).unwrap().is_none());
+
+        store
+            .put_invitation_admission(&group.id, Some(&admission))
+            .unwrap();
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_invitation_admission(&group.id, None)?;
+            storage.put_group(&group)
+        });
+        assert!(
+            matches!(&result, Err(StorageError::Backend(reason)) if reason.contains("admission transaction rollback")),
+            "{result:?}"
+        );
+        assert_eq!(
+            store.invitation_admission(&group.id).unwrap(),
+            Some(admission)
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_admission_transaction")
+            .unwrap();
+        store
+            .with_transaction(|storage| storage.put_invitation_admission(&group.id, None))
+            .unwrap();
+        assert!(store.invitation_admission(&group.id).unwrap().is_none());
     }
 
     fn route(

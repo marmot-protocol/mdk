@@ -16,13 +16,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // Deliberate test-only internal import: OpenClaw exposes neither its plugin
 // loader nor generic message-action runner through a supported SDK subpath.
 // Re-verify this stable loader entry whenever the pinned SDK is bumped.
-import * as openClawPluginLoader from "../node_modules/openclaw/dist/plugins/loader.js";
+import * as openClawPluginLoader from "./openclaw-loader.js";
 
 import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
 import { createMarmotChannelPlugin } from "../src/channel.js";
 import {
   createMarmotInboundDispatcher,
   type MarmotDispatchClient,
+  type ReplyPayloadLike,
   type OpenClawChannelRuntime,
 } from "../src/dispatch.js";
 import {
@@ -59,7 +60,7 @@ type RunMessageAction = (input: {
 async function loadInstalledRunMessageAction(): Promise<RunMessageAction> {
   const distDir = join(import.meta.dirname, "..", "node_modules", "openclaw", "dist");
   const runnerFile = (await readdir(distDir)).find(
-    (entry) => entry.startsWith("message-action-runner-") && entry.endsWith(".js"),
+    (entry) => entry.startsWith("message-action-runner-") && /\.m?js$/.test(entry),
   );
   if (!runnerFile) {
     throw new Error("installed OpenClaw has no message-action runner chunk");
@@ -150,6 +151,7 @@ async function closeServer(server: Server): Promise<void> {
 /** Run the installed generic message action through the loaded Marmot plugin. */
 async function runPublicSend(
   buildParams: (workspaceDir: string) => Promise<Record<string, unknown>>,
+  options: { inboundFinal?: boolean } = {},
 ): Promise<RecordedControlSend> {
   const root = await mkdtemp(join(tmpdir(), "marmot-host-media-contract-"));
   const workspaceDir = join(root, "workspace");
@@ -198,13 +200,55 @@ async function runPublicSend(
         `Marmot plugin registration required; diagnostics=${JSON.stringify(registry.diagnostics)}`,
       );
     }
-    await runMessageAction({
-      cfg,
-      action: "send",
-      params: await buildParams(workspaceDir),
-      agentId: "main",
-      senderIsOwner: true,
-    });
+    const params = await buildParams(workspaceDir);
+    if (options.inboundFinal) {
+      const payload: ReplyPayloadLike = {
+        text: String(params.message ?? ""),
+        ...(typeof params.media === "string" ? { mediaUrl: params.media } : {}),
+      };
+      const dispatch = createMarmotInboundDispatcher({
+        cfg,
+        runtimeChannel: {
+          routing: {
+            resolveAgentRoute: () => ({
+              agentId: "main", accountId: "default", sessionKey: "agent:main:marmot:host-contract",
+            }),
+          },
+          session: {
+            resolveStorePath: (_store, context) => {
+              if (!(context as { agentId?: string })?.agentId) {
+                throw new Error("Session store requires an explicit agent id");
+              }
+              return join(workspaceDir, "sessions.json");
+            },
+            recordInboundSession: async () => undefined,
+          },
+          reply: {
+            dispatchReplyWithBufferedBlockDispatcher: async (input: unknown) => {
+              const { dispatcherOptions } = input as {
+                dispatcherOptions: {
+                  deliver: (payload: ReplyPayloadLike, info: { kind: "final" }) => Promise<void>;
+                };
+              };
+              await dispatcherOptions.deliver(payload, { kind: "final" });
+            },
+          },
+        },
+        client: {
+          timelineList: async () => ({ messages: [], has_more_before: false, has_more_after: false }),
+        } as unknown as MarmotDispatchClient,
+        channelAccountId: "default", groupActivation: "always", mentionPatterns: [],
+        authorizer: testAllowlistAuthorizer(HEX32("aa"), [HEX32("bb")]),
+      });
+      await dispatch({
+        accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc"), messageIdHex: HEX32("dd"),
+        senderAccountIdHex: HEX32("bb"), sender: testInboundActor(), text: "host contract",
+      });
+    } else {
+      await runMessageAction({
+        cfg, action: "send", params, agentId: "main", senderIsOwner: true,
+      });
+    }
     expect(recorded).toHaveLength(1);
     const sent = recorded[0]!;
     if (sent.stagedPath) {
@@ -227,21 +271,17 @@ async function runPublicSend(
 afterEach(() => {
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
-  openClawPluginLoader.clearActivatedPluginRuntimeState();
   openClawPluginLoader.clearPluginRegistryLoadCache();
-  const clearPluginLoaderCache = (
-    openClawPluginLoader as typeof openClawPluginLoader & {
-      clearPluginLoaderCache?: () => void;
-    }
-  ).clearPluginLoaderCache;
-  clearPluginLoaderCache?.();
 });
 
 /**
  * Exercise Marmot's production adapters against the installed OpenClaw host.
- * This file is also run by openclaw-host-compat.sh against the supported beta.
+ * This file is also run by openclaw-host-compat.sh against the pinned beta host.
  */
 describe("installed OpenClaw inbound host contract", () => {
+  // This first full-host action includes the SDK's cold SQLite worker startup.
+  // It owns the loader -> generic message action -> registered adapter -> socket
+  // contract, which adapter-only tests cannot cover.
   it("sends an authorized workspace image through the public message action", async () => {
     const imageBytes = Buffer.from("workspace-image-bytes");
     const sent = await runPublicSend(async (workspaceDir) => {
@@ -263,7 +303,7 @@ describe("installed OpenClaw inbound host contract", () => {
       caption: "workspace image",
       attachments: [{ media_type: "image/png", file_name: "generated.png" }],
     });
-  });
+  }, 10_000);
 
   it("sends a buffer and filename through the public message action", async () => {
     const imageBytes = Buffer.from("buffer-image-bytes");
@@ -313,79 +353,30 @@ describe("installed OpenClaw inbound host contract", () => {
     }
   });
 
-  it("runs Marmot's real dispatcher through the installed turn kernel", async () => {
-    const deliverInboundReply = vi.fn(async () => ({
-      status: "handled_visible" as const,
-      delivery: {},
-    }));
-    const runDispatch = vi.fn(async (params: unknown) => {
-      const deliver = (params as {
-        dispatcherOptions: {
-          deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
-        };
-      }).dispatcherOptions.deliver;
-      await deliver({ text: "host-compatible reply" }, { kind: "final" });
-      return { counts: {} };
-    });
-    const resolveStorePath = vi.fn((_store?: string, options?: unknown) => {
-      const agentId = (options as { agentId?: string } | undefined)?.agentId;
-      if (!agentId) {
-        const error = new Error("Session store path requires an explicit agent id.");
-        error.name = "SessionStoreAgentIdRequiredError";
-        throw error;
+  it.each(["text", "media"] as const)(
+    "delivers an inbound %s final through the real host and registered adapter", async (kind) => {
+      const bytes = Buffer.from("inbound-final-image");
+      const sent = await runPublicSend(async (workspaceDir) => {
+        if (kind === "text") return { message: "queued text reply" };
+        const media = join(workspaceDir, "final.png");
+        await writeFile(media, bytes);
+        return { message: "image reply", media };
+      }, { inboundFinal: true });
+      expect(sent.request).toMatchObject({
+        type: kind === "text" ? "send_final" : "send_media",
+        account_id_hex: HEX32("aa"), group_id_hex: HEX32("cc"),
+      });
+      if (kind === "text") {
+        expect(sent.request).toMatchObject({
+          text: "queued text reply", reply_to_message_id_hex: HEX32("dd"),
+          idempotency_key: expect.stringMatching(/^marmot-final-v1:[0-9a-f]{64}$/),
+        });
+      } else {
+        expect(sent.stagedBytes).toEqual(bytes);
+        expect(sent.request.caption).toBe("image reply");
       }
-      return "/tmp/openclaw-marmot-host-contract";
-    });
-    const runtimeChannel: OpenClawChannelRuntime = {
-      routing: {
-        resolveAgentRoute: () => ({
-          agentId: "agent",
-          accountId: "default",
-          sessionKey: "agent:marmot:host-contract",
-        }),
-      },
-      session: {
-        resolveStorePath,
-        recordInboundSession: vi.fn(async () => undefined),
-      },
-      reply: { dispatchReplyWithBufferedBlockDispatcher: runDispatch },
-    };
-    const client = {
-      timelineList: vi.fn(async (accountIdHex: string, groupIdHex: string) => ({
-        type: "timeline_page" as const,
-        account_id_hex: accountIdHex,
-        group_id_hex: groupIdHex,
-        messages: [],
-        has_more_before: false,
-        has_more_after: false,
-      })),
-    } as unknown as MarmotDispatchClient;
-    const dispatch = createMarmotInboundDispatcher({
-      cfg: {},
-      runtimeChannel,
-      client,
-      channelAccountId: "default",
-      groupActivation: "always",
-      mentionPatterns: [],
-      authorizer: testAllowlistAuthorizer(),
-      deliverInboundReply: deliverInboundReply as never,
-    });
-
-    await expect(
-      dispatch({
-        accountIdHex: HEX32("aa"),
-        groupIdHex: HEX32("cc"),
-        messageIdHex: HEX32("dd"),
-        senderAccountIdHex: HEX32("bb"),
-        sender: testInboundActor(),
-        text: "host contract",
-      }),
-    ).resolves.toBe(true);
-
-    expect(runDispatch).toHaveBeenCalledOnce();
-    expect(deliverInboundReply).toHaveBeenCalledOnce();
-    expect(resolveStorePath).toHaveBeenCalledWith(undefined, { agentId: "agent" });
-  });
+    },
+  );
 
   it("leaves generic sends to beta's durable core while owning delete", () => {
     const actions = createMarmotChannelPlugin().actions;
@@ -492,8 +483,7 @@ describe("installed OpenClaw inbound host contract", () => {
     }
   });
 
-  const betaContract = process.env.OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR === "1" ? it : it.skip;
-  betaContract("dispatches a debounced batch through beta's lifecycle contract", async () => {
+  it("dispatches a debounced batch through the host lifecycle contract", async () => {
     const events: AgentControlEvent[] = ["first", "second"].map((text, index) => ({
       type: "inbound_message",
       account_id_hex: HEX32("aa"),
@@ -547,7 +537,7 @@ describe("installed OpenClaw inbound host contract", () => {
     }
   });
 
-  betaContract("releases a debounce key when the group queue adopts the batch", async () => {
+  it("releases a debounce key when the group queue adopts the batch", async () => {
     const events: AgentControlEvent[] = Array.from({ length: 33 }, (_, index) => ({
       type: "inbound_message",
       account_id_hex: HEX32("aa"),

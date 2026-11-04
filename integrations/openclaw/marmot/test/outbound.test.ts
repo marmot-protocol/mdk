@@ -1,4 +1,4 @@
-import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -641,6 +641,36 @@ describe("createMarmotMessageAdapter", () => {
       await rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["symlink", "hardlink"] as const)(
+    "rejects an in-root %s to bytes outside the allowed root", async (kind) => {
+      const root = await mkdtemp(join(tmpdir(), "marmot-outbound-link-"));
+      try {
+        const allowed = join(root, "allowed");
+        await mkdir(allowed, { mode: 0o700 });
+        const outside = join(root, "private.png");
+        const linked = join(allowed, "linked.png");
+        await writeFile(outside, Buffer.from("private-bytes"), { mode: 0o600 });
+        await (kind === "symlink" ? symlink(outside, linked) : link(outside, linked));
+        const calls = emptyClientCalls();
+        const adapter = createMarmotMessageAdapter({
+          resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+          outboundMediaDir: join(root, "staging"),
+        });
+        const ctx = {
+          cfg: {}, to: HEX32("cc"), text: "attachment", mediaUrl: linked,
+          mediaLocalRoots: [allowed],
+        } as unknown as ChannelMessageSendMediaContext;
+        await expect(adapter.send!.media!(ctx)).rejects.toMatchObject({
+          name: "LocalMediaAccessError",
+        });
+        expect(calls.sendMedia).toHaveLength(0);
+        await expect(access(join(root, "staging"))).rejects.toThrow();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("fails closed when an in-root media path does not exist", async () => {
     // `readLocalFileFromRoots` returns null for an allowlist miss *and* for a

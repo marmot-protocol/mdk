@@ -309,6 +309,8 @@ mod migration_0147_device_removed_membership;
 mod migration_0148_compromise_warning;
 #[path = "migrations/0149_history_deliveries.rs"]
 mod migration_0149_history_deliveries;
+#[path = "migrations/0150_epoch_gap_retries.rs"]
+mod migration_0150_epoch_gap_retries;
 #[path = "migrations/0160_sibling_welcomes.rs"]
 mod migration_0160_sibling_welcomes;
 #[path = "migrations/0161_small_state.rs"]
@@ -327,6 +329,10 @@ mod migration_0166_blossom_history_deliveries;
 mod migration_0168_backup_restore;
 #[path = "migrations/0169_sibling_welcome_resends.rs"]
 mod migration_0169_sibling_welcome_resends;
+#[path = "migrations/0170_invitation_decisions.rs"]
+mod migration_0170_invitation_decisions;
+#[path = "migrations/0172_group_rejoin.rs"]
+mod migration_0172_group_rejoin;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -348,8 +354,6 @@ pub(crate) struct Migration {
 mod migration_0167_reaction_attachment_sources;
 #[path = "migrations/0171_device_edit_settings.rs"]
 mod migration_0171_device_edit_settings;
-#[path = "migrations/0172_epoch_gap_retries.rs"]
-mod migration_0172_epoch_gap_retries;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1250,6 +1254,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0149_history_deliveries::apply,
     },
     Migration {
+        version: 150,
+        name: "0150_epoch_gap_retries",
+        suspend_foreign_keys: &[],
+        apply: migration_0150_epoch_gap_retries::apply,
+    },
+    Migration {
         version: 160,
         name: "0160_sibling_welcomes",
         suspend_foreign_keys: &[],
@@ -1310,6 +1320,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0169_sibling_welcome_resends::apply,
     },
     Migration {
+        version: 170,
+        name: "0170_invitation_decisions",
+        suspend_foreign_keys: &[],
+        apply: migration_0170_invitation_decisions::apply,
+    },
+    Migration {
         version: 171,
         name: "0171_device_edit_settings",
         suspend_foreign_keys: &[],
@@ -1317,9 +1333,9 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 172,
-        name: "0172_epoch_gap_retries",
+        name: "0172_group_rejoin",
         suspend_foreign_keys: &[],
-        apply: migration_0172_epoch_gap_retries::apply,
+        apply: migration_0172_group_rejoin::apply,
     },
 ];
 

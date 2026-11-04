@@ -9,6 +9,20 @@ use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 use serde::{Deserialize, Serialize};
 
+/// The immutable invitation associated with this installed local copy.
+///
+/// Derived from a validated admission context, or inherited from an
+/// authenticated sibling Welcome. Older unidentified copies have no record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvitationAdmission {
+    pub generation: [u8; 32],
+    /// This device founded the group rather than joining a Welcome.
+    pub created_locally: bool,
+    /// Exact local successful join output; never a shared generation seed.
+    /// None only for native founding.
+    pub via_welcome: Option<crate::MessageId>,
+}
+
 /// Marmot application-profile generation for a group or KeyPackage.
 ///
 /// This is the strict-cutover classification used for decisions that differ
@@ -108,6 +122,12 @@ pub struct Group {
     /// `join_epoch`.
     #[serde(default)]
     pub local_copy_install_epoch: EpochId,
+    /// Sibling slots whose authenticated own SelfRemove this copy applied.
+    /// Kept for this local membership, including across anchor rewind; cleared
+    /// only when a selected leaf reads as that slot again, or by a fresh Welcome.
+    /// Unknown legacy tags and ordinary Remove proposals create no entry.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub self_removed_sibling_slots: std::collections::BTreeSet<crate::app_components::DeviceSlotId>,
     /// When the Welcome that installed this local copy was created, in Unix
     /// seconds, clamped at join to no later than the joining device's own
     /// clock. `None` on a copy this device created itself, on transports that
@@ -257,6 +277,7 @@ mod tests {
             disbanded: None,
             join_epoch: EpochId(4),
             local_copy_install_epoch: EpochId(4),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: welcome.map(Timestamp),
         }
     }

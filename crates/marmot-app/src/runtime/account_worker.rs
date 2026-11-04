@@ -470,6 +470,7 @@ pub(crate) enum AccountWorkerCommand {
     },
     LeaveGroup {
         group_id: GroupId,
+        for_sign_out: bool,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     ForgetGroupLocal {
@@ -4265,6 +4266,44 @@ async fn run_startup_hydration_pipeline(
                 break;
             }
         };
+        // Naming can hydrate its target. Only name an already-live trusted
+        // group here: never move it ahead of the ordinary hydration order.
+        // The following drain may confirm an accepted SelfRemove, so use the
+        // available tag context before that confirmation consumes its leaf.
+        let tag_context = (|| -> Result<(), AppError> {
+            if !client.app.device_groups_enabled() {
+                return Ok(());
+            }
+            let Some(group) = client.trusted_device_group()? else {
+                return Ok(());
+            };
+            if client.runtime.device_tag_group() == Some(&group) {
+                return Ok(());
+            }
+            match client.runtime.group_record(&group) {
+                Ok(_) => client.sync_device_tag_group(),
+                Err(error)
+                    if matches!(
+                        error.as_engine_error(),
+                        Some(
+                            cgka_traits::EngineError::UnknownGroup(_)
+                                | cgka_traits::EngineError::GroupNotHydrated(_)
+                        )
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        })();
+        if let Err(error) = tag_context {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "startup_hydration_tag_context",
+                error_kind = error.privacy_safe_kind(),
+                "available device tag context could not be named"
+            );
+        }
         // Surface this batch's recovery events (PendingCommitRecovered,
         // hydration quarantines, restored leave requests) exactly as a live
         // drain would, so the projection updates incrementally.
@@ -6232,8 +6271,16 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
-        AccountWorkerCommand::LeaveGroup { group_id, respond } => Box::pin(async move {
-            let result = client.leave_group(&group_id).await;
+        AccountWorkerCommand::LeaveGroup {
+            group_id,
+            for_sign_out,
+            respond,
+        } => Box::pin(async move {
+            let result = if for_sign_out {
+                client.leave_group_for_sign_out(&group_id).await
+            } else {
+                client.leave_group(&group_id).await
+            };
             // Drain the kind-1210 "member left" row this commit queued. Sibling
             // mutators (invite/remove/profile) already flush
             // `pending_projection_updates`; without this the live timeline stays

@@ -21,11 +21,9 @@ import {
   type MessageReceipt,
   type MessageReceiptPart,
 } from "openclaw/plugin-sdk/channel-outbound";
-// `readLocalFileFromRoots` (allowlist check + hardened read) and the local media
-// access types are imported from the subpaths that export them on both the
-// `latest` and `beta` OpenClaw channels. The `plugin-sdk/media-runtime` barrel
-// dropped `assertLocalMediaAllowed`/`getDefaultLocalRoots` in 2026.7.2-beta.
-import { readLocalFileFromRoots } from "openclaw/plugin-sdk/infra-runtime";
+// The root-confined reader moved to this public runtime export in 2026.10.10.
+// Its missing upstream declarations are described in openclaw-file-access.d.ts.
+import { readLocalFileFromRoots } from "openclaw/plugin-sdk/file-access-runtime";
 import { extractOriginalFilename, getMediaDir } from "openclaw/plugin-sdk/media-runtime";
 import { getDefaultLocalRoots, LocalMediaAccessError } from "openclaw/plugin-sdk/web-media";
 

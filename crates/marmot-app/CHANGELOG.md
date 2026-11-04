@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
+
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
   writer work, with replacement workers closed by default. Admitted passes settle after conditions change; manual
   restore stays independent. Add an opaque restore-operation host codec and zeroizing queued confirmation answers.
@@ -133,6 +135,14 @@
   matching device participation, expiry or terminal origin. Each successful
   generation needs fresh activity; legacy unknown timing stays held. Only
   behind `dev_device_groups`.
+
+- Experimental device groups synchronize invitation decisions for one validated admission generation and its
+  inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline
+  wins; no automatic join/rejoin or cancellation of an already-requested Leave. Existing host APIs and release
+  feature gates stay unchanged; custom experimental peers must adopt V2 sibling Welcomes together.
+  A known current-generation decline holds new automatic sibling Adds; private stock follows ordinary rules. A decline
+  does not reach a copy this device already deleted locally. A higher
+  acceptance wakes existing opt-in work without recalling admitted traffic or changing another generation.
 
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
@@ -1305,6 +1315,8 @@
 
 ### Maintenance
 
+- Use `AtomicU64::try_update` for runtime telemetry duration totals to remove
+  the `fetch_update` deprecation warning; saturation and memory ordering are unchanged.
 - Removed the 41 Delete/wiring tests identified in #2413 across the Rust crates
   and Hermes/OpenClaw integrations. Runtime behavior and public contracts are unchanged.
 

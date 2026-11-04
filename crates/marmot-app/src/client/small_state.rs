@@ -23,8 +23,8 @@ use storage_sqlite::{SmallStateItem, SmallStateItemName};
 use super::AppClient;
 use crate::small_state::{
     BROADCAST_REQUEST, KIND_SMALL_STATE_BROADCAST_REQUEST, KIND_SMALL_STATE_UPDATE,
-    SmallStateMergeRule, broadcast_due, decode_broadcast_request, decode_small_state_update,
-    encode_small_state_update,
+    SmallStateMergeRule, broadcast_due, decode_broadcast_request, decode_invitation_decisions,
+    decode_small_state_update, encode_invitation_decision_updates, encode_small_state_update,
 };
 use crate::{AppError, AppProjectionUpdate, ChatListUpdateTrigger, MarmotApp, unix_now_seconds};
 
@@ -81,6 +81,18 @@ impl AppClient {
                 return Ok(());
             }
             storage.mark_small_state_sent(&carried)?;
+            sent += 1;
+        }
+        for (content, carried) in
+            encode_invitation_decision_updates(&storage.unsent_invitation_decisions()?)
+        {
+            if !self
+                .send_device_group_message(&group_id, KIND_SMALL_STATE_UPDATE, content)
+                .await?
+            {
+                return Ok(());
+            }
+            storage.mark_invitation_decisions_sent(&carried)?;
             sent += 1;
         }
         let requested = schedule.request_owed
@@ -285,6 +297,11 @@ impl AppClient {
     ) -> Result<(), AppError> {
         self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_update(content)?;
+        let invitations = decode_invitation_decisions(content)?;
+        self.app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .merge_invitation_decisions(&invitations)?;
         self.sync_small_state(&items)
     }
 

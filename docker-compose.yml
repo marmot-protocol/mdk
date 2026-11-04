@@ -102,7 +102,7 @@ services:
       context: .
       dockerfile: Dockerfile.openclaw-marmot
       args:
-        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.6.8}
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.10.10}
     environment:
       MARMOT_HOME: /data/marmot-agent
       OPENCLAW_HOME: /data/openclaw-home
@@ -147,7 +147,7 @@ services:
       context: .
       dockerfile: Dockerfile.openclaw-marmot
       args:
-        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.6.8}
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.10.10}
     environment:
       MARMOT_HOME: /data/marmot-agent
       OPENCLAW_HOME: /data/openclaw-home

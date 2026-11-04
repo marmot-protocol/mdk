@@ -598,6 +598,8 @@ async fn execute_inner(
             marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
             usage_diagnostics_command(&runtime, command)
         }
+        #[cfg(feature = "dev-device-groups")]
+        Command::Devices { .. } => Err(WnError::DevicesRequireDaemon),
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
         }
@@ -1303,7 +1305,8 @@ fn app_for_role(
     let mut config = MarmotAppConfig::white_noise()
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
-        .with_directory_relay_urls(directory_relays);
+        .with_directory_relay_urls(directory_relays)
+        .with_dev_device_groups(cfg!(feature = "dev-device-groups"));
     config.usage_diagnostics_silent = silent;
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).

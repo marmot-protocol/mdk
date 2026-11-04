@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 
 import { MarmotAgentControlClient } from "../src/client.js";
 import type { ResolvedMarmotAccount } from "../src/config.js";
@@ -40,7 +40,7 @@ const lifecycleByAccount = new Map<
   { started: Promise<void>; stop: () => Promise<void> }
 >();
 
-vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
+vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createAccountStatusSink: ({ setStatus }: { setStatus: (next: unknown) => void }) => {
     return (patch: Record<string, unknown>) => {
       statusPatches.push({ ...patch, subscribeCalls: recordedSubscribeCalls });

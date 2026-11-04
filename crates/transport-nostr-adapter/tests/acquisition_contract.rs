@@ -109,6 +109,51 @@ impl NostrRelayClient for FakeRelay {
 
 #[test]
 fn request_validation_rejects_invalid_inputs() {
+    for invalidate in [
+        (|r: &mut NostrAcquisitionRequest| r.endpoints.clear()) as fn(&mut NostrAcquisitionRequest),
+        |r| r.endpoints[0].0.clear(),
+        |r| r.limits.max_endpoints = 0,
+        |r| r.limits.max_endpoints = 1,
+        |r| r.limits.max_serialized_event_bytes_per_endpoint = 0,
+        |r| r.limits.max_duration = Duration::ZERO,
+        |r| r.scope = NostrAcquisitionScope::KnownEventIds(vec![]),
+        |r| r.scope = NostrAcquisitionScope::KnownEventIds(vec![[1; 32], [1; 32]]),
+    ] {
+        let mut invalid = request();
+        invalidate(&mut invalid);
+        assert_eq!(
+            invalid.validate(),
+            Err(NostrAcquisitionError::InvalidRequest)
+        );
+    }
+    for routes in [
+        vec![],
+        vec![[1; 32], [1; 32]],
+        (0..=transport_nostr_adapter::GROUP_BATCH_ROUTES)
+            .map(|index| [index as u8; 32])
+            .collect(),
+    ] {
+        let mut invalid = request();
+        invalid.scope = NostrAcquisitionScope::GroupsWindow {
+            transport_group_ids: routes,
+            since: 9,
+            until: 10,
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(NostrAcquisitionError::InvalidRequest)
+        );
+    }
+    let mut groups = request();
+    groups.scope = NostrAcquisitionScope::GroupsWindow {
+        transport_group_ids: (0..transport_nostr_adapter::GROUP_BATCH_ROUTES)
+            .map(|index| [index as u8; 32])
+            .collect(),
+        since: 10,
+        until: 10,
+    };
+    groups.limits.max_requested_event_ids = 0;
+    assert_eq!(groups.validate(), Ok(()));
     let mut invalid = request();
     invalid.limits.max_received_items_per_endpoint = 0;
     assert_eq!(

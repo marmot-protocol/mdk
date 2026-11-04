@@ -26,6 +26,705 @@ use cgka_traits::storage::{GroupStorage as _, OutboundIntentStorage as _};
 use cgka_traits::types::EpochId;
 use std::sync::{Arc, Mutex};
 
+/// A sibling's applied voluntary departure is not a missing-device gap.
+/// The commit's authenticated SelfRemove, rather than account disappearance,
+/// must hold another private Add while the observing device keeps this copy.
+#[tokio::test]
+async fn an_applied_sibling_self_remove_holds_private_adds() {
+    use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sibling-departures.sqlite");
+    let key = SqlCipherKey::raw([0x57; 32]);
+    let clock = manual_convergence_clock();
+    let phone = build_device(
+        SqliteAccountStorage::open_encrypted(&path, &key).unwrap(),
+        b"bob",
+        &[
+            ACCOUNT_DEVICES_COMPONENT_ID,
+            DEVICE_ROSTER_COMPONENT_ID,
+            cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
+        ],
+        Box::<MockPeeler>::default(),
+        Some(&clock),
+    );
+    let (mut phone, mut siblings, device_group) =
+        tag_devices(vec![phone, roster_device(b"bob"), roster_device(b"bob")]).await;
+    let mut laptop = siblings.remove(0);
+    let mut tablet = siblings.remove(0);
+    let mut alice = chat_device(b"alice");
+    let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut laptop, &mut tablet]).await;
+
+    // Ordinary Remove carries no voluntary-departure fact, even when its
+    // committer is another leaf of the same account. Re-adding is permitted.
+    let laptop_key = signature_key(&laptop, &gid);
+    let remove = send_commit(&mut phone, remove_own_devices(&gid, vec![laptop_key]), &gid).await;
+    for receiver in [&mut alice, &mut laptop, &mut tablet] {
+        assert_accepted(receiver, &remove, &gid).await;
+    }
+    let replacement = handed(&mut laptop, slot(2), slot(1));
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        tablet
+            .engine
+            .sibling_add_refusal(&gid, &handed(&mut laptop, slot(2), slot(3)))
+            .unwrap(),
+        None
+    );
+    let add = send_commit(&mut phone, add_own_devices(&gid, vec![replacement]), &gid).await;
+    for receiver in [&mut alice, &mut tablet] {
+        assert_accepted(receiver, &add, &gid).await;
+    }
+    let welcome = owed(&phone).remove(0);
+    laptop.engine.drain_events();
+    assert_joins_from(&mut laptop, &welcome, &gid, &phone).await;
+    let replacement = handed(&mut laptop, slot(2), slot(1));
+    let tablet_replacement = handed(&mut laptop, slot(2), slot(3));
+    // A readable trusted roster can recognize the departing sibling while
+    // this observer's own tag key is not ready. This is a valid non-user edit,
+    // preserving its entry and user marker, not a corrupt roster fixture.
+    let original_entry =
+        super::device_roster::roster_of(&phone, &device_group).devices[&slot(1)].clone();
+    let mut unready = original_entry.clone();
+    unready.tag_signature_key = None;
+    let edit = super::device_roster::roster_update(
+        &device_group,
+        vec![cgka_traits::app_components::DeviceRosterOperationV1::SetDevice(slot(1), unready)],
+    );
+    let edit = send_commit(&mut phone, edit, &device_group).await;
+    for receiver in [&mut laptop, &mut tablet] {
+        assert_accepted(receiver, &edit, &device_group).await;
+    }
+    let roster = super::device_roster::roster_of(&phone, &device_group);
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&phone, &gid).own_leaf_node().unwrap(),
+            &roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Unclaimed
+    );
+
+    let SendResult::Proposal { msg } = laptop
+        .engine
+        .send(SendIntent::Leave {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary SelfRemove proposal")
+    };
+    phone
+        .engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty(),
+        "a proposal is not applied departure"
+    );
+    let delay = phone
+        .engine
+        .scheduled_self_remove_auto_commit_delay_ms(&gid)
+        .unwrap()
+        .unwrap();
+    clock.advance_ms(delay);
+    phone.engine.advance_convergence(&gid).await.unwrap();
+    let publications = phone.engine.drain_auto_publish();
+    assert_eq!(publications.len(), 1);
+    let publication = &publications[0];
+    let epoch = load_group(&phone, &gid).epoch().as_u64();
+    let pending_epoch = phone.engine.epoch(&gid).unwrap();
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    // A source-roster storage/decode failure is not an unclaimed tag.
+    // Swallowing it would consume the source leaf without its required fact.
+    let dg_key = serde_json::to_vec(&openmls::group::GroupId::from_slice(
+        device_group.as_slice(),
+    ))
+    .unwrap();
+    let context: Vec<u8> = observer
+        .query_row(
+            "SELECT value FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &dg_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![b"{".as_slice(), b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
+    let error = phone
+        .engine
+        .confirm_published(publication.pending)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::Backend(ref message) if message.starts_with("load device group:")),
+        "{error}"
+    );
+    assert_eq!(load_group(&phone, &gid).epoch().as_u64(), epoch);
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty()
+    );
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![&context, b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
+    observer.execute_batch("CREATE TRIGGER reject_sibling_fact BEFORE INSERT ON cgka_groups BEGIN SELECT RAISE(ABORT, 'sibling fact commit held'); END;").unwrap();
+    let error = phone
+        .engine
+        .confirm_published(publication.pending)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("sibling fact commit held"),
+        "{error}"
+    );
+    assert_eq!(load_group(&phone, &gid).epoch().as_u64(), epoch);
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), pending_epoch);
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty()
+    );
+    observer
+        .execute_batch("DROP TRIGGER reject_sibling_fact")
+        .unwrap();
+    phone
+        .engine
+        .confirm_published(publication.pending)
+        .await
+        .unwrap();
+    assert_eq!(phone.engine.members(&gid).unwrap().len(), 3);
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2)),
+        "a recognized sibling departure is independent of observer tag readiness"
+    );
+    let restore = super::device_roster::roster_update(
+        &device_group,
+        vec![
+            cgka_traits::app_components::DeviceRosterOperationV1::SetDevice(
+                slot(1),
+                original_entry,
+            ),
+        ],
+    );
+    let restore = send_commit(&mut phone, restore, &device_group).await;
+    for receiver in [&mut laptop, &mut tablet] {
+        assert_accepted(receiver, &restore, &device_group).await;
+    }
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft)
+    );
+    // Selected remote replay, not just the own-confirmation path, records the
+    // authenticated proposal sender's slot before consuming its source leaf.
+    tablet
+        .engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    assert_accepted(&mut tablet, &route_to_group(&publication.msg, &gid), &gid).await;
+    assert_eq!(
+        tablet
+            .engine
+            .sibling_add_refusal(&gid, &tablet_replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft)
+    );
+
+    // The hold survives a physical encrypted-store close/reopen and engine
+    // hydration. The per-commit checkpoint was written by real confirmation.
+    let checkpoint = phone
+        .storage
+        .list_group_state_checkpoints(&gid)
+        .unwrap()
+        .into_iter()
+        .find(|checkpoint| checkpoint.resulting_epoch == phone.engine.epoch(&gid).unwrap())
+        .unwrap();
+    let failed_probe: Result<(), cgka_traits::StorageError> =
+        phone
+            .storage
+            .with_group_savepoint(&gid, "departure-checkpoint-read", |storage| {
+                storage.restore_group_state_checkpoint(&gid, &checkpoint.id)?;
+                assert!(
+                    storage
+                        .get_group(&gid)?
+                        .self_removed_sibling_slots
+                        .contains(&slot(2))
+                );
+                Err(cgka_traits::StorageError::Backend(
+                    "rollback checkpoint read".into(),
+                ))
+            });
+    assert!(
+        matches!(failed_probe, Err(cgka_traits::StorageError::Backend(message)) if message == "rollback checkpoint read")
+    );
+    let Device { engine, storage } = phone;
+    drop(engine);
+    drop(observer);
+    storage.close().unwrap();
+    drop(storage);
+    let mut phone = super::device_roster::roster_device_on(
+        SqliteAccountStorage::open_encrypted(&path, &key).unwrap(),
+        b"bob",
+    );
+    // The same real encrypted reopen can find only the device group corrupt.
+    // Its optional attribution context must not block an ordinary chat Commit.
+    let observer = rusqlite::Connection::open(&path).unwrap();
+    open_hardened_sqlcipher(&observer, &key, SqlCipherHardening::live_cache()).unwrap();
+    let reopened_context: Vec<u8> = observer
+        .query_row(
+            "SELECT value FROM openmls_values WHERE label = ?1 AND group_key = ?2",
+            rusqlite::params![b"GroupContext".as_slice(), &dg_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![b"{".as_slice(), b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
+    phone.engine.hydrate_all_stored_groups().unwrap();
+    assert!(
+        phone
+            .engine
+            .quarantined_groups()
+            .iter()
+            .any(|(id, _)| id == &device_group)
+    );
+    let error = phone
+        .engine
+        .set_device_tag_group(Some(device_group.clone()))
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::UnknownGroup(ref id) if id == &device_group),
+        "{error}"
+    );
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2))
+    );
+    let before_update = load_group(&phone, &gid).epoch().as_u64();
+    let SendResult::GroupEvolution {
+        msg: post_quarantine_update,
+        pending,
+        ..
+    } = phone
+        .engine
+        .send(SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary chat SelfUpdate stages");
+    };
+    phone
+        .engine
+        .confirm_published(pending)
+        .await
+        .expect("unavailable sibling attribution must not block the chat's ordinary Commit");
+    assert_eq!(load_group(&phone, &gid).epoch().as_u64(), before_update + 1);
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2)),
+        "unavailable context must preserve previously applied knowledge"
+    );
+    observer
+        .execute(
+            "UPDATE openmls_values SET value = ?1 WHERE label = ?2 AND group_key = ?3",
+            rusqlite::params![&reopened_context, b"GroupContext".as_slice(), &dg_key],
+        )
+        .unwrap();
+    assert!(
+        phone
+            .engine
+            .retry_hydrate_quarantined_group(&device_group)
+            .unwrap()
+    );
+    drop(observer);
+    phone
+        .engine
+        .set_device_tag_group(Some(device_group))
+        .unwrap();
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft)
+    );
+    // Both actual preparation and advisory admission use the same refusal.
+    let error = phone
+        .engine
+        .send(add_own_devices(&gid, vec![replacement.clone()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EngineError::Other(reason) if reason == "adding a sibling: the sibling left this chat"
+    ));
+
+    // A fresh authenticated Welcome starts a new membership, even though
+    // this device retains the removed prior copy and its departure knowledge.
+    alice
+        .engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    assert_accepted(&mut alice, &route_to_group(&publication.msg, &gid), &gid).await;
+    assert_accepted(
+        &mut alice,
+        &route_to_group(&post_quarantine_update, &gid),
+        &gid,
+    )
+    .await;
+    let fresh = phone.engine.fresh_key_package().await.unwrap();
+    let remove_account = send_commit(
+        &mut alice,
+        SendIntent::RemoveMembers {
+            group_id: gid.clone(),
+            members: vec![phone.engine.self_id()],
+        },
+        &gid,
+    )
+    .await;
+    assert_accepted(&mut phone, &remove_account, &gid).await;
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .contains(&slot(2))
+    );
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = alice
+        .engine
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![fresh],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("fresh invitation");
+    };
+    alice.engine.confirm_published(pending).await.unwrap();
+    phone.engine.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty()
+    );
+    let Device { engine, storage } = phone;
+    drop(engine);
+    storage.close().unwrap();
+}
+
+/// A historical anchor cannot undo current-membership knowledge. Only a
+/// target leaf in the final selected tree ends the hold; a losing candidate
+/// SelfRemove creates no hold of its own.
+#[tokio::test]
+async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns() {
+    let clock = manual_convergence_clock();
+    let (mut phone, mut siblings, _) = tag_devices(vec![
+        clocked_roster_device(b"bob", &clock),
+        roster_device(b"bob"),
+        roster_device(b"bob"),
+    ])
+    .await;
+    let mut laptop = siblings.remove(0);
+    let mut tablet = siblings.remove(0);
+    let mut alice = chat_device(b"alice");
+    let mut dave = chat_device(b"dave");
+    let gid = found_routed_group(
+        &mut alice,
+        &mut [&mut phone, &mut laptop, &mut tablet, &mut dave],
+    )
+    .await;
+    let replacement = handed(&mut laptop, slot(2), slot(1));
+    let tablet_replacement = handed(&mut laptop, slot(2), slot(3));
+    let key = signature_key(&laptop, &gid);
+    let ordinary = send_commit(&mut tablet, remove_own_devices(&gid, vec![key]), &gid).await;
+    let child = send_commit(
+        &mut tablet,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    // A real other account follows the original selected Remove branch.
+    // It will later author the longer branch that contains no returning leaf.
+    assert_accepted(&mut alice, &ordinary, &gid).await;
+    assert_accepted(&mut alice, &child, &gid).await;
+    let SendResult::Proposal { msg } = laptop
+        .engine
+        .send(SendIntent::Leave {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary SelfRemove");
+    };
+    phone
+        .engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    let delay = phone
+        .engine
+        .scheduled_self_remove_auto_commit_delay_ms(&gid)
+        .unwrap()
+        .unwrap();
+    clock.advance_ms(delay);
+    phone.engine.advance_convergence(&gid).await.unwrap();
+    let publication = phone.engine.drain_auto_publish().remove(0);
+    phone
+        .engine
+        .confirm_published(publication.pending)
+        .await
+        .unwrap();
+    // Dave follows this real SelfRemove branch, then extends it while phone
+    // observes other branches. Its later depth will reselect phone's own C1.
+    dave.engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    assert_accepted(&mut dave, &route_to_group(&publication.msg, &gid), &gid).await;
+    let mut departing_branch = Vec::new();
+    for _ in 0..4 {
+        departing_branch.push(
+            send_commit(
+                &mut dave,
+                SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                },
+                &gid,
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft)
+    );
+    phone.engine.ingest(ordinary).await.unwrap();
+    phone.engine.ingest(child).await.unwrap();
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        tablet.engine.epoch(&gid).unwrap()
+    );
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft)
+    );
+    // Tablet only probes the losing SelfRemove. A candidate must not persist
+    // a fact, or its otherwise legitimate Add below would be refused.
+    tablet
+        .engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    tablet
+        .engine
+        .ingest(route_to_group(&publication.msg, &gid))
+        .await
+        .unwrap();
+    tablet
+        .engine
+        .converge_stored_openmls_messages_at(&gid, 1_000_000)
+        .unwrap();
+    assert!(
+        tablet
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty()
+    );
+    assert_eq!(
+        tablet
+            .engine
+            .sibling_add_refusal(&gid, &tablet_replacement)
+            .unwrap(),
+        None
+    );
+    let before_return_epoch = phone.engine.epoch(&gid).unwrap();
+    assert_eq!(before_return_epoch, alice.engine.epoch(&gid).unwrap());
+    let without_return = send_commit(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    let without_return_child = send_commit(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    let added = send_commit(
+        &mut tablet,
+        add_own_devices(&gid, vec![tablet_replacement]),
+        &gid,
+    )
+    .await;
+    phone.engine.ingest(added).await.unwrap();
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        tablet.engine.epoch(&gid).unwrap()
+    );
+    assert!(
+        phone
+            .storage
+            .get_group(&gid)
+            .unwrap()
+            .self_removed_sibling_slots
+            .is_empty()
+    );
+    // The selected return above has ended the current-membership hold.
+    // A longer real fork starts before it and removes that leaf from the
+    // selected tree, but contains no newly applied SelfRemove.
+    phone.engine.ingest(without_return).await.unwrap();
+    phone.engine.ingest(without_return_child).await.unwrap();
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        alice.engine.epoch(&gid).unwrap(),
+        "the longer branch must really be selected"
+    );
+    assert_eq!(
+        load_group(&phone, &gid).epoch_authenticator().as_slice(),
+        load_group(&alice, &gid).epoch_authenticator().as_slice(),
+        "matching epochs alone do not prove matching selected trees"
+    );
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        None,
+        "a historical anchor must not revive a hold ended by a selected return"
+    );
+
+    // The older own C1 really becomes selected again, now with its deeper
+    // descendants. This is a newly selected authenticated SelfRemove effect,
+    // not permission to restore unrelated holds from its historical record.
+    for commit in departing_branch {
+        phone.engine.ingest(commit).await.unwrap();
+    }
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        dave.engine.epoch(&gid).unwrap(),
+        "the deeper own-SelfRemove branch must really be selected"
+    );
+    assert_eq!(
+        load_group(&phone, &gid).epoch_authenticator().as_slice(),
+        load_group(&dave, &gid).epoch_authenticator().as_slice(),
+        "own-C1 reselection must match the follower's selected tree"
+    );
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft),
+        "a reselected own SelfRemove must apply the same sibling-departure effect"
+    );
+}
+
 struct AtTime(u64);
 impl cgka_traits::maintenance::WallClock for AtTime {
     fn now(&self) -> Timestamp {

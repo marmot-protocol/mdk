@@ -285,6 +285,9 @@ impl AppClient {
                 Ok(false) => {}
             }
         }
+        if self.remember_founding_invitation(group_id).is_err() {
+            return;
+        }
         let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let Ok(projection) = self.event_group_projection(group_id, group_metadata.as_ref()) else {
@@ -302,6 +305,7 @@ impl AppClient {
     }
 
     pub(crate) fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        self.remember_founding_invitation(group_id)?;
         let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
         let projection = self.event_group_projection(group_id, group_metadata.as_ref())?;

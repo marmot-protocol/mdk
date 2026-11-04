@@ -10,6 +10,10 @@ between engine, peeler, transport adapter, storage, and caller imports from here
   `wrap_welcome`, plus `wrap_group_message_with_metadata` / `wrap_welcome_with_metadata` (default to the plain wraps).
 - `TransportAdapter` — account-aware network boundary for activation, subscription refresh, publish receipts, and
   inbound deliveries.
+- `InvitationAdmission` — the installed local copy's original validated invitation generation and exact local Welcome
+  association, or founding origin. `GroupStorage::invitation_admission` and `put_invitation_admission` are required
+  backend methods; creation/join writes join the native transaction. Legacy copies remain unidentified. This local
+  source association is not the shared generation seed and never comes from the group's latest epoch.
 - `StorageProvider` and the Marmot storage traits it aggregates (groups, messages, outbound intents and fanouts,
   leave/disband requests and tombstones, Welcomes, capabilities, convergence policy and passes, deferred-peel
   generations, member-validation cache, account-device signer, KeyPackage bundles, maintenance) — plus an accessor for
@@ -48,6 +52,11 @@ after the owning outer transaction commits, discarding them when a transaction o
 supports it. The default drops observations, so an alternate backend or wrapper that has not implemented the complete
 boundary omits positive stored-message audit rows; other forensic observations remain available. Missing audit rows
 never prove that a mutation did not happen.
+
+**Current-membership sibling departures.** `Group.self_removed_sibling_slots` records authenticated sibling
+SelfRemoves applied by this local copy. Storage and snapshots preserve it; an empty set is omitted from JSON, and
+older records read as empty. Selected leaf return clears the corresponding slot, and fresh Welcome admission starts a
+new membership without prior holds. This is local metadata, not a replicated invitation choice or another journal.
 
 **Publish-before-apply.** `AutoPublish` follows the same contract as explicit group evolution: callers publish the
 message, then confirm or fail the attached `PendingStateRef`.
