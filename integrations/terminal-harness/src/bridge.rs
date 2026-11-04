@@ -481,7 +481,7 @@ async fn dispatch_authorized(
             crate::SteerOutcome::Uncertain => {
                 let _ = send_reply(&ctx, &account_id_hex, &group_id_hex,
                             &inbound.message_ref,
-                            &format!("[{}] Follow-up delivery is unconfirmed. It may already be steering the active turn; it has not been queued or retried.", ctx.cfg.spec.reply_prefix), 0).await;
+                            &format!("[{}] Follow-up delivery is unconfirmed. It may already have reached the backend; it has not been queued or retried.", ctx.cfg.spec.reply_prefix), 0).await;
                 return;
             }
             crate::SteerOutcome::Unavailable => {}

@@ -401,9 +401,11 @@ The default remains the existing CLI transport.
 
 Native HTTP responses have a separate bounded budget: the configured aggregate
 attachment limit after base64 expansion, plus 4 MiB for JSON, text and metadata.
-The JSONL control-input limit remains 4 MiB. A response exceeding its budget
-(for example, a history page containing multiple large batches) fails the turn;
-an uncertain submission is never replayed.
+The JSONL control-input limit remains 4 MiB. Initial persistence reads only the
+submitted message; completion uses the original prompt response, so earlier
+attachment batches are never loaded. A response exceeding its budget fails the
+turn. An uncertain follow-up stops the native turn and preserves its session for
+inspection; the follow-up is never queued or replayed automatically.
 
 Native mode currently requires Linux, Python 3 at `/usr/bin/python3`, OpenCode 1.18.32 and a protected
 loopback port range. Set `WN_OPENCODE_NATIVE_PASSWORD_FILE` to a nonempty, private

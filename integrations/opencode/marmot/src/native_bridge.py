@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -129,6 +130,7 @@ class Server:
                 break
             except Exception:
                 if time.monotonic() > deadline:
+                    emit('stopping')
                     self.close()
                     raise
                 time.sleep(.1)
@@ -178,10 +180,11 @@ def run():
         wanted = parts(config['prompt'], config.get('files', []))
         done = threading.Event()
         failure = []
+        completed = []
         def start():
             """Keep the initial model call alive until it completes or the runner stops."""
             try:
-                server.call('POST', route + '/message', {'messageID': first, 'parts': wanted}, timeout=None)
+                completed.append(server.call('POST', route + '/message', {'messageID': first, 'parts': wanted}, timeout=None))
             except Exception:
                 failure.append(True)
             finally:
@@ -190,8 +193,12 @@ def run():
         # Do not append follow-ups before the initial user message is persisted.
         deadline = time.monotonic() + 15
         while True:
-            messages = server.call('GET', route + '/message?limit=10')
-            observed = next((m for m in messages if m.get('info', {}).get('id') == first), None)
+            try:
+                observed = server.call('GET', route + '/message/' + first)
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+                observed = None
             if observed is not None and persisted_message(observed, first, config['prompt'], wanted):
                 break
             if observed is not None and any(p.get('synthetic') and p.get('text', '').startswith('Read tool failed to read ') for p in observed.get('parts', [])):
@@ -275,13 +282,16 @@ def run():
             elif kind == 'finish':
                 if not done.is_set() or failure:
                     raise ValueError('Native completion failed')
-                messages = server.call('GET', route + '/message?limit=20')
-                answers = [m for m in messages if m.get('info', {}).get('role') == 'assistant' and m['info'].get('parentID') == latest and m['info'].get('time', {}).get('completed') and m['info'].get('finish') not in (None, 'tool-calls', 'unknown')]
-                if not answers:
+                # The original prompt POST returns the loop's final assistant
+                # message. Reuse it rather than loading unrelated media history.
+                answer = completed[0] if completed else None
+                info = answer.get('info', {}) if isinstance(answer, dict) else {}
+                if (info.get('role') != 'assistant' or info.get('parentID') != latest
+                        or not info.get('time', {}).get('completed')
+                        or info.get('finish') in (None, 'tool-calls', 'unknown')):
                     # A native late-append race must never silently lose/replay
                     # the saved follow-up. Preserve session and fail explicitly.
                     raise ValueError('Saved follow-up has no completed answer')
-                answer = max(answers, key=lambda m: m['info']['id'])
                 if answer['info'].get('error'):
                     raise ValueError('Native model error')
                 for part in answer.get('parts', []):
@@ -289,6 +299,8 @@ def run():
                         emit('text', text=part['text'])
                 return
     finally:
+        # Pending controls have not been processed once this loop exits.
+        emit('stopping')
         server.close()
 
 if __name__ == '__main__':
