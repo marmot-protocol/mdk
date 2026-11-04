@@ -349,6 +349,28 @@ pub(crate) struct RecoverySelectionWitnessTarget {
     pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
 }
 
+/// Result of awaiting one existing or newly admitted due background backup pass.
+/// A finished attempt may have failed and does not prove pointer publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundBackupOutcome {
+    /// Current conditions, due state, role or capacity admitted no pass.
+    NotStarted,
+    /// The admitted pass and its serialized settlement attempt finished.
+    FinishedAttempt,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BackupBackgroundConditions {
+    wifi: bool,
+    charging: bool,
+}
+
+impl BackupBackgroundConditions {
+    fn allowed(self) -> bool {
+        self.wifi && self.charging
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
     /// Every production runtime points at the same process capacity. The
@@ -375,6 +397,8 @@ pub struct RuntimeSharedServices {
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: attachment_controls::AttachmentUpdates,
     attachment_cancellations: watch::Sender<()>,
+    /// Latest platform facts survive an interval with no workers/receivers.
+    backup_background_conditions: watch::Sender<BackupBackgroundConditions>,
     attachment_permissions: attachment_permission::Permissions,
     /// The recording handle: the app's product collector, shared, and this runtime's own
     /// performance recorder.
@@ -492,6 +516,7 @@ impl Default for RuntimeSharedServices {
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: Default::default(),
             attachment_cancellations: watch::channel(()).0,
+            backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             observer: marmot_observability::Observer::default(),
@@ -520,6 +545,17 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    fn report_backup_background_conditions(
+        &self,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.lifecycle.ensure_running()?;
+        self.backup_background_conditions
+            .send_replace(BackupBackgroundConditions { wifi, charging });
+        Ok(())
+    }
+
     fn local_submission_gate(&self, account: &str) -> Arc<Mutex<()>> {
         self.local_submission_queue
             .lock()
@@ -592,6 +628,7 @@ impl RuntimeSharedServices {
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_cancellations: watch::channel(()).0,
+            backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
             observer: marmot_observability::Observer::sharing(&app.product_analytics),
@@ -2828,12 +2865,23 @@ impl MarmotAppRuntime {
         self.accounts.turn_off_backups(account_ref).await
     }
 
-    /// Report the host's current Wi-Fi and charging facts for background
-    /// backup admission. Both must be true. Default closed on each worker
-    /// start/replacement: report on start and changes; no environment is kept
-    /// across restart. Existing role/due/backoff/media-credit checks still apply.
-    /// An already-admitted pass settles even after false; subsequent passes
-    /// (including retry/cleanup) wait. Manual restore is unaffected.
+    /// Report platform facts once for this runtime, including before workers
+    /// exist. Both facts must be true for new background backup admission.
+    /// Reports survive account-worker replacement; a new runtime starts closed.
+    /// Admitted work settles after false. Manual restore is unaffected.
+    /// This performs no account, worker-start or network work.
+    pub fn set_runtime_backup_background_conditions(
+        &self,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.shared
+            .report_backup_background_conditions(wifi, charging)
+    }
+
+    /// Compatibility wrapper for runtime-wide platform facts. The account
+    /// must be active, signable and fully onboarded; validation precedes the
+    /// report and never starts its worker. Prefer the runtime-wide setter.
     pub async fn set_backup_background_conditions(
         &self,
         account_ref: &str,
@@ -2843,6 +2891,19 @@ impl MarmotAppRuntime {
         self.accounts
             .set_backup_background_conditions(account_ref, wifi, charging)
             .await
+    }
+
+    /// Join an admitted background backup pass or try existing due admission
+    /// once. This waits outside the account worker through serialized finish
+    /// and credit release. It does not force a backup, wait for future due work,
+    /// or prove publication; cancellation detaches only this caller's wait.
+    /// Worker stop/replacement closes the wait with TransportClosed. Disabled
+    /// device-group builds return NotStarted without acquiring a worker.
+    pub async fn run_due_backup_pass(
+        &self,
+        account_ref: &str,
+    ) -> Result<BackgroundBackupOutcome, AppError> {
+        self.accounts.run_due_backup_pass(account_ref).await
     }
 
     /// Begin an ephemeral, history-only restore with user-supplied words.
@@ -4371,7 +4432,9 @@ impl MarmotAppRuntime {
     }
 
     /// Linking a new device of this account (mdk#2628 item 3.3b), on the new
-    /// device: ask a device already signed in to link this one. Refused unless
+    /// device: ask a device already signed in to link this one. When this
+    /// device already trusts a group, the confirmed link moves only this
+    /// device to the answering group, keeping old trust until Made. Refused unless
     /// the build has `unreleased-device-pairing` and device groups are on.
     pub async fn start_device_link(
         &self,
@@ -4427,6 +4490,24 @@ impl MarmotAppRuntime {
             account_ref,
             crate::DeviceLinkOp::Decline {
                 prompt_id: prompt_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Dismiss one private old-sibling recognition hint from a made move.
+    /// This changes only local presentation; it never links or rejects a slot.
+    pub async fn dismiss_device_group_move_sibling(
+        &self,
+        account_ref: &str,
+        move_id: &str,
+        slot_id_hex: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::DismissMoveSibling {
+                move_id: move_id.to_owned(),
+                slot_id_hex: slot_id_hex.to_owned(),
             },
         )
         .await

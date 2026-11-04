@@ -454,6 +454,12 @@ fn staying_siblings<'a>(
     roster
         .devices
         .iter()
-        .filter(move |(slot, entry)| *slot != own_slot && entry.status != DeviceStatusV1::Leaving)
+        .filter(move |(slot, entry)| {
+            *slot != own_slot
+                && matches!(
+                    entry.status,
+                    DeviceStatusV1::Active | DeviceStatusV1::Inactive
+                )
+        })
         .map(|(slot, _)| *slot)
 }

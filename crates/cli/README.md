@@ -674,6 +674,13 @@ their own distinct slots. `devices link cancel` cancels on the new device. Appro
 adding to existing chats and bringing history; `--no-add-to-all-chats` and `--no-bring-history` opt out individually.
 No command creates or authenticates a device by its account key alone.
 
+Running the same `devices link start` flow on an already linked device moves only that device to the destination's
+device group. `link status` adds `moves[]`: Joining still trusts the old group; Made is the trust switch after the new
+device's first selected change. Old siblings remain local recognition hints, not automatic links. A pre-Made failure
+keeps old trust and forgets only the destination. The move leaves existing chat membership intact and does not promise
+traffic between device groups; admitted old-group traffic can finish normally. If completion cannot be recovered, use
+a fresh compared-code link from the unlinked state. See [move behavior and limits](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
+
 For this dev-testing build, run **all account commands through a persistent matching daemon**. Select it explicitly
 with `--socket` or exported `WN_SOCKET`, so connection failure is reported instead of falling back to local execution.
 The `devices` commands themselves refuse local execution: without an auto-discovered daemon, their JSON error is

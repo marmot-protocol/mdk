@@ -353,6 +353,11 @@ mod migration_0167_reaction_attachment_sources;
 #[path = "migrations/0171_device_edit_settings.rs"]
 mod migration_0171_device_edit_settings;
 
+#[path = "migrations/0174_heartbeat_welcome_repair.rs"]
+mod migration_0174_heartbeat_welcome_repair;
+#[path = "migrations/0175_device_group_moves.rs"]
+mod migration_0175_device_group_moves;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1328,6 +1333,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "0172_group_rejoin",
         suspend_foreign_keys: &[],
         apply: migration_0172_group_rejoin::apply,
+    },
+    Migration {
+        version: 174,
+        name: "0174_heartbeat_welcome_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0174_heartbeat_welcome_repair::apply,
+    },
+    Migration {
+        version: 175,
+        name: "0175_device_group_moves",
+        suspend_foreign_keys: &[],
+        apply: migration_0175_device_group_moves::apply,
     },
 ];
 

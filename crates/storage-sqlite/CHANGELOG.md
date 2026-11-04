@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Migration 0174 retires D90/D91 observation indexes and local ordering clock, preserving processed-wrapper dedup,
+  known publication times and carrier high-water. Repair uses existing current-incarnation D35 heartbeat activity;
+  unused nullable legacy columns remain inert. Replace the old due-deadline query with heartbeat eligibility (D100).
+
 ### Breaking changes
 
 - Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).

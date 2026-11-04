@@ -1361,17 +1361,49 @@ impl AccountManager {
         wifi: bool,
         charging: bool,
     ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        self.require_onboarding_complete_for(&account)?;
+        if !account.can_sign() {
+            return Err(
+                marmot_account::AccountHomeError::SecretNotFound(account.account_id_hex).into(),
+            );
+        }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
+        self.shared
+            .report_backup_background_conditions(wifi, charging)
+    }
+
+    pub async fn run_due_backup_pass(
+        &self,
+        account_ref: &str,
+    ) -> Result<super::BackgroundBackupOutcome, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        if !self.app.device_groups_enabled() {
+            return Ok(super::BackgroundBackupOutcome::NotStarted);
+        }
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::SetBackupBackgroundConditions {
-                wifi,
-                charging,
-                respond,
-            })
+            .send(AccountWorkerCommand::RunDueBackupPass { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        // Bound command admission, not the admitted pass's outer wait.
+        let Some(mut completion) = local_account_worker_response(response).await? else {
+            return Ok(super::BackgroundBackupOutcome::NotStarted);
+        };
+        loop {
+            let finished = *completion.borrow_and_update();
+            if finished {
+                return Ok(super::BackgroundBackupOutcome::FinishedAttempt);
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+        }
     }
 
     pub async fn begin_backup_restore(

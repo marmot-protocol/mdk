@@ -977,6 +977,7 @@ fn snapshot_group_and_member() {
             local_copy_install_epoch: EpochId(2),
             self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         }
     );
 }

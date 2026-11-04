@@ -27,31 +27,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroizing;
 
-/// Immutable authenticated source identity from an accepted device-roster-group
-/// message. Missing leaf proof is pending, never permission to use a later tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedDeviceGroupSource {
-    /// Stable authenticated inner-content identity; application aliases share it.
-    pub identity: MessageId,
-    /// Valid inner application identity, retained to hold ambiguous aliases
-    /// while an earlier accepted source leaf is genuinely unavailable.
-    pub application_id: Option<MessageId>,
-    pub epoch: EpochId,
-    pub sender: MemberId,
-    pub leaf_index: u32,
-    pub leaf: Option<AuthenticatedDeviceGroupLeaf>,
-}
-
-/// The exact sending epoch's authenticated leaf material, independent of snapshots.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedDeviceGroupLeaf {
-    pub signature_key: Vec<u8>,
-    pub device_tag: Option<Vec<u8>>,
-    /// Source-roster decrypted slot used only to defer current-key-unready work.
-    /// Attribution must still verify the sealed tag under the current roster.
-    pub slot_hint: Option<crate::app_components::DeviceSlotId>,
-}
-
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
 /// string-parse.
@@ -472,46 +447,6 @@ pub trait MessageStorage {
         group_id: &GroupId,
         transport_id: &MessageId,
     ) -> StorageResult<()>;
-    /// Associate the admitted content id with an exact processed wrapper.
-    /// Backends may keep only the wrapper marker; unavailable local observation
-    /// provenance must remain unavailable rather than being reconstructed.
-    fn put_processed_transport_content(
-        &self,
-        group_id: &GroupId,
-        transport_id: &MessageId,
-        _content_id: &MessageId,
-    ) -> StorageResult<()> {
-        self.put_processed_transport_id(group_id, transport_id)
-    }
-
-    /// Stamp accepted native content in the same transaction as receive/apply.
-    /// Reauthentication may fill missing proof but must preserve the first stamp.
-    /// Providers without this optional observation owner remain fail-closed.
-    fn observe_authenticated_device_group_source(
-        &self,
-        _group_id: &GroupId,
-        _content_id: &MessageId,
-        _source: &AuthenticatedDeviceGroupSource,
-        _now_ms: u64,
-    ) -> StorageResult<()> {
-        Ok(())
-    }
-
-    /// Bounded pending facts with (or without) exact source-leaf proof. Keeping
-    /// these scans separate prevents unavailable old proof from starving traffic.
-    /// Partial-proof pages use ascending content ids strictly after `after`;
-    /// proof-present attribution keeps first-observation order and passes None.
-    fn pending_authenticated_device_group_sources(
-        &self,
-        _group_id: &GroupId,
-        _with_leaf: bool,
-        _key_unready_slots: Option<&[crate::app_components::DeviceSlotId]>,
-        _after: Option<&MessageId>,
-        _limit: usize,
-    ) -> StorageResult<Vec<(MessageId, AuthenticatedDeviceGroupSource)>> {
-        Ok(Vec::new())
-    }
-
     fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
@@ -998,6 +933,25 @@ pub trait DeviceGroupWelcomeStorage {
     fn device_group_welcome_expectations(
         &self,
     ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>>;
+    /// Consume an exact expectation after authenticated native Welcome validation,
+    /// in the same transaction as the join. Providers may compose local admission
+    /// bookkeeping here. The default preserves ordinary expectation consumption;
+    /// device-group move support requires the provider's local move owner.
+    fn accept_device_group_welcome(
+        &self,
+        expected: &DeviceGroupWelcomeExpectation,
+        _joined_at: crate::Timestamp,
+    ) -> StorageResult<bool> {
+        if self
+            .device_group_welcome_expectation(&expected.group_id)?
+            .as_ref()
+            != Some(expected)
+        {
+            return Ok(false);
+        }
+        self.delete_device_group_welcome_expectation(&expected.group_id)
+    }
+
     /// Whether an expectation for `group_id` was there to delete.
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
 }

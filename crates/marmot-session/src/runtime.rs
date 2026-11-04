@@ -806,30 +806,6 @@ where
     /// read as [`Self::member_device_tag_claim`] does, but a past epoch from
     /// its own retained anchor. `None` when `epoch` is neither current nor
     /// retained, or no leaf sat at that index. See
-    /// Recover immutable accepted source proof without changing its first observation.
-    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> AccountResult<()> {
-        Ok(self
-            .session
-            .recover_pending_device_group_sources(group_id)?)
-    }
-
-    /// Attribute accepted native DG sources under the current trusted roster.
-    pub fn pending_device_group_activity(
-        &self,
-        group_id: &GroupId,
-        roster: &DeviceRosterV1,
-    ) -> AccountResult<
-        Vec<(
-            cgka_traits::MessageId,
-            EpochId,
-            Option<cgka_traits::app_components::DeviceSlotId>,
-        )>,
-    > {
-        Ok(self
-            .session
-            .pending_device_group_activity(group_id, roster)?)
-    }
-
     /// [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
@@ -964,6 +940,26 @@ where
     /// This device's MLS signature key (`CgkaEngine::own_signature_key`).
     pub fn own_signature_key(&self) -> Vec<u8> {
         self.session.own_signature_key()
+    }
+
+    /// Pin original trust and destination expectation before a move Confirm.
+    pub fn prepare_device_group_move(
+        &mut self,
+        expectation: &cgka_traits::storage::DeviceGroupWelcomeExpectation,
+        own_slot: [u8; 32],
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session
+            .prepare_device_group_move(expectation, own_slot, now)
+    }
+
+    /// Apply the present selected Made cut on the session's own connection.
+    pub fn record_device_group_move_made(
+        &mut self,
+        destination: &GroupId,
+        now: u64,
+    ) -> crate::session::SessionResult<bool> {
+        self.session.record_device_group_move_made(destination, now)
     }
 
     /// See `CgkaEngine::expect_device_group_welcome`.
@@ -6847,6 +6843,8 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }
+            | SendIntent::ImportDeviceGroupRejections { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
     )
 }
 

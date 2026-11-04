@@ -67,6 +67,8 @@ use storage_sqlite::{
     MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
 };
 
+mod device_group_moves;
+
 const TRACE_TARGET: &str = "marmot_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
@@ -1040,28 +1042,6 @@ impl AccountDeviceSession {
         Ok(self
             .engine
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
-    }
-
-    /// Recover immutable accepted source proof without changing its first observation.
-    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> SessionResult<()> {
-        Ok(self.engine.recover_pending_device_group_sources(group_id)?)
-    }
-
-    /// Attribute accepted native DG sources under the current trusted roster.
-    pub fn pending_device_group_activity(
-        &self,
-        group_id: &GroupId,
-        roster: &DeviceRosterV1,
-    ) -> SessionResult<
-        Vec<(
-            MessageId,
-            EpochId,
-            Option<cgka_traits::app_components::DeviceSlotId>,
-        )>,
-    > {
-        Ok(self
-            .engine
-            .pending_device_group_activity(group_id, roster)?)
     }
 
     /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
@@ -2176,6 +2156,8 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::ImportDeviceGroupRejections { .. } => "import_device_group_rejections",
+        SendIntent::MarkDeviceGroupMoved { .. } => "mark_device_group_moved",
         SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }

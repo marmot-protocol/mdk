@@ -1858,6 +1858,7 @@ fn dummy_group(group_id: GroupId) -> Group {
         local_copy_install_epoch: EpochId(0),
         self_removed_sibling_slots: Default::default(),
         local_copy_welcome_created_at: None,
+        device_roster_departures: Vec::new(),
     }
 }
 

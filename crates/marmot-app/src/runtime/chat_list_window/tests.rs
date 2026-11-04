@@ -1511,6 +1511,7 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
             local_copy_install_epoch: cgka_traits::EpochId(0),
             self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         })
         .unwrap();
     let intent = QueuedOutboundIntent {

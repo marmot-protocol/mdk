@@ -209,9 +209,19 @@ impl<S: StorageProvider> Engine<S> {
                     }
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                    let roster_before = crate::device_roster_departures::capture(&mls_group)?;
                     mls_group
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+                    if let Some(commit_id) = origin_commit_id.as_ref() {
+                        crate::device_roster_departures::record(
+                            storage,
+                            &group_id,
+                            roster_before,
+                            &mls_group,
+                            commit_id,
+                        )?;
+                    }
                     crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
                     crate::roster_tag_keys::record_roster_tag_keys(
                         storage,

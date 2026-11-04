@@ -95,6 +95,8 @@ pub enum DeviceStatusV1 {
     Inactive,
     /// Recorded that it is signing out.
     Leaving,
+    /// Moved to another device group; old cleanup leaves chats intact.
+    Moved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +425,7 @@ fn encode_device(device: &DeviceEntryV1, out: &mut Vec<u8>) {
         DeviceStatusV1::Active => 0,
         DeviceStatusV1::Inactive => 1,
         DeviceStatusV1::Leaving => 2,
+        DeviceStatusV1::Moved => 3,
     });
     encode_optional_bytes(device.announced_key_package.as_deref(), out);
     encode_optional_bytes(device.tag_signature_key.as_deref(), out);
@@ -577,6 +580,7 @@ fn decode_device(cursor: &mut &[u8]) -> Result<DeviceEntryV1, String> {
         0 => DeviceStatusV1::Active,
         1 => DeviceStatusV1::Inactive,
         2 => DeviceStatusV1::Leaving,
+        3 => DeviceStatusV1::Moved,
         _ => return Err("device roster status is unknown".into()),
     };
     let announced_key_package = decode_optional(cursor, "announced KeyPackageRef", |cursor| {
@@ -961,6 +965,11 @@ mod tests {
         assert!(decode_device_roster_v1(&reserved_bit).is_err());
         let mut unknown_status = one.clone();
         unknown_status[settings_at + 1] = 3;
+        assert_eq!(
+            decode_device_roster_v1(&unknown_status).unwrap().devices[&slot(1)].status,
+            DeviceStatusV1::Moved
+        );
+        unknown_status[settings_at + 1] = 4;
         assert!(decode_device_roster_v1(&unknown_status).is_err());
         let mut bad_presence = one.clone();
         bad_presence[settings_at - 1] = 2;
