@@ -3,11 +3,13 @@
 When a locally published invite loses branch selection, its Welcome may already have installed the losing branch
 on the recipient. The inviter's success report does not prove that the invitation survived convergence (#1735).
 
-New existing-group Welcomes retain their origin Commit after confirmation. Native supersession retires still-owed
-Welcomes in the same transaction that records the losing Commit's disposition. Reopen and missed runtime events
-cannot restart those deliveries. Already acknowledged delivery records are unchanged; a transport attempt already
-underway cannot be recalled. Founding and historical originless records retain their previous handling; provenance
-is never guessed.
+New existing-group Welcomes retain their origin Commit after confirmation. A `ConvergenceDeferred` origin holds
+its exact Welcome and retry owner without starting another delivery; re-adoption can release the same artifact
+under its original delivery deadline. Only terminal `EpochInvalidated` or `Failed` origins retire still-owed
+Welcomes, in the same transaction as
+the native disposition. Reopen and missed runtime events preserve that distinction. Already acknowledged delivery
+records are unchanged; a transport attempt already underway cannot be recalled. Founding and historical
+originless records retain their previous handling; provenance is never guessed.
 
 Native `RecoverMembers` operations do not blindly reissue superseded grants. A still-Unrecoverable recipient needs
 fresh source-bound grants for the selected branch. A recipient that already installed a losing Welcome and now has

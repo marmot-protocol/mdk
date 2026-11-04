@@ -365,7 +365,10 @@ async fn mixed_welcome_retry_cutoff() {
             let attempts = adapter.publishes();
             assert_eq!(attempts.len(), prior + 1);
             assert_eq!(attempts[prior].message, rejected);
-            assert!(retried.pending.is_empty(), "the parent Commit already confirmed");
+            assert!(
+                retried.pending.is_empty(),
+                "the parent Commit already confirmed"
+            );
             assert_eq!(
                 runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
                 Some(30_000)

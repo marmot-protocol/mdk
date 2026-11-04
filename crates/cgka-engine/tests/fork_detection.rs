@@ -1948,7 +1948,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     let (mut x, x_storage) = build_client_with_storage(x_id); // rolls back onto B, must later reorg onto A
     let mut rival = build_client(rival_id); //                   authors the equal-depth-winning B
     let (mut y, _y_storage) = build_client_with_storage(b"cwin-y"); // applied A, never sees B
-    let mut david = build_client(b"cwin-david");
+    let (mut david, david_storage) = build_client_with_storage(b"cwin-david");
     let mut eve = build_client(b"cwin-eve");
     let mut frank = build_client(b"cwin-frank");
 
@@ -1995,7 +1995,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     // the same epoch without seeing A.
     let david_kp = david.fresh_key_package().await.unwrap();
     let eve_kp = eve.fresh_key_package().await.unwrap();
-    let commit_a = match x
+    let (commit_a, david_welcome) = match x
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
             key_packages: vec![david_kp],
@@ -2004,9 +2004,13 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         .await
         .unwrap()
     {
-        SendResult::GroupEvolution { msg, pending, .. } => {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } => {
             x.confirm_published(pending).await.unwrap();
-            msg
+            (msg, welcomes.remove(0))
         }
         _ => unreachable!(),
     };
@@ -2077,6 +2081,15 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
         EpochId(1),
         "the parked incumbent must be keyed by its source epoch for the convergence rewind target"
     );
+    assert!(
+        matches!(
+            x.outbound_welcome_status(&david_welcome.id, cgka_traits::Timestamp(0))
+                .unwrap(),
+            cgka_engine::engine::OutboundWelcomeStatus::Waiting
+        ),
+        "a reversible own Commit loss must hold its Welcome, not retire it"
+    );
+    assert!(!x.sent_welcome_withdrawn(&david_welcome.id).unwrap());
 
     // (3) Y applied A (and never sees B), then extends the A-branch with a
     // follow-on invite from ITS epoch 2 — the A-branch is now depth 2. Y never
@@ -2110,7 +2123,7 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
     // it — the same branch every convergence-only node picks. Before the fix
     // A's root was `EpochInvalidated` and could never be materialized, so X
     // stayed on the B lineage forever.
-    let follow_on_outcome = x.ingest(route(follow_on)).await.unwrap();
+    let follow_on_outcome = x.ingest(route(follow_on.clone())).await.unwrap();
     assert!(
         matches!(follow_on_outcome, IngestOutcome::Buffered { .. }),
         "the A-branch follow-on must enter the convergence pass, got {follow_on_outcome:?}"
@@ -2163,6 +2176,41 @@ async fn rival_win_leaves_displaced_own_commit_reconsiderable() {
             b
         },
         "X and Y must end on the identical branch"
+    );
+    assert!(
+        x.outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, welcome)| welcome == &david_welcome)
+    );
+    david.join_welcome(david_welcome.clone()).await.unwrap();
+    david.ingest(route(follow_on)).await.unwrap();
+    david
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert_eq!(david.epoch(&group_id).unwrap(), x.epoch(&group_id).unwrap());
+    let crypto = RustCrypto::default();
+    let mls_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let canonical_provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, x_storage.mls_storage());
+    let canonical = MlsGroup::load(canonical_provider.storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    let joined_provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, david_storage.mls_storage());
+    let joined = MlsGroup::load(joined_provider.storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        joined.epoch_authenticator().as_slice(),
+        canonical.epoch_authenticator().as_slice()
+    );
+    x.mark_sent_welcome_delivered(&david_welcome.id).unwrap();
+    assert!(
+        !x.outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, welcome)| welcome.id == david_welcome.id)
     );
 }
 

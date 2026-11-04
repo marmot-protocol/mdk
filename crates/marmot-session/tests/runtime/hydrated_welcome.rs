@@ -1,12 +1,16 @@
 // Native preparation deliberately stops before transport publication, then reopens
 // the encrypted account as the runtime's first user operation.
+#[derive(Clone, Copy)]
 enum RecoveryFixtureMode {
     Staged,
     Confirmed,
     Superseded,
+    Terminal,
 }
 
-async fn hydrated_recovery_fixture(mode: RecoveryFixtureMode) -> (
+async fn hydrated_recovery_fixture(
+    mode: RecoveryFixtureMode,
+) -> (
     tempfile::TempDir,
     AccountDeviceSession,
     GroupId,
@@ -96,7 +100,11 @@ async fn hydrated_recovery_fixture(mode: RecoveryFixtureMode) -> (
             .unwrap(),
         )
         .unwrap();
-    let SendResult::GroupEvolution { mut welcomes, pending, msg } = alice
+    let SendResult::GroupEvolution {
+        mut welcomes,
+        pending,
+        msg,
+    } = alice
         .send(SendIntent::RecoverMembers {
             group_id: b.clone(),
             members: vec![grant],
@@ -109,7 +117,13 @@ async fn hydrated_recovery_fixture(mode: RecoveryFixtureMode) -> (
     let welcome = welcomes.remove(0);
     if !matches!(mode, RecoveryFixtureMode::Staged) {
         alice.confirm_published(pending).await.unwrap();
-        assert!(alice.outstanding_sent_welcomes().unwrap().iter().any(|(_, owed)| owed.id == welcome.id));
+        assert!(
+            alice
+                .outstanding_sent_welcomes()
+                .unwrap()
+                .iter()
+                .any(|(_, owed)| owed.id == welcome.id)
+        );
         drop(alice);
         // A real failed delivery owns a durable retry before the fork. It must
         // not publish later merely because it retained the exact old bytes.
@@ -119,33 +133,79 @@ async fn hydrated_recovery_fixture(mode: RecoveryFixtureMode) -> (
             current_session(&path, &key, b"hydrated-alice"),
             adapter,
             StaticTransportRouting::new(vec![]).with_inbox_route(
-                bob.self_id(), vec![TransportEndpoint("wss://recovery-inbox.example".into())]),
+                bob.self_id(),
+                vec![TransportEndpoint("wss://recovery-inbox.example".into())],
+            ),
             RecordingKeyPackages::default(),
         );
-        runtime.publish_welcome_messages_with_audit_context(vec![welcome.clone()], Some(b.clone()), Default::default()).await.unwrap();
-        assert!(runtime.session().transport_fanout(&welcome.id).unwrap().is_some());
+        runtime
+            .publish_welcome_messages_with_audit_context(
+                vec![welcome.clone()],
+                Some(b.clone()),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .session()
+                .transport_fanout(&welcome.id)
+                .unwrap()
+                .is_some()
+        );
         drop(runtime);
         alice = build(b"hydrated-alice", storage.clone());
         alice.hydrate_all_stored_groups().unwrap();
     }
-    if matches!(mode, RecoveryFixtureMode::Superseded) {
+    if matches!(
+        mode,
+        RecoveryFixtureMode::Superseded | RecoveryFixtureMode::Terminal
+    ) {
         use cgka_traits::MessageStorage;
         // Bob never saw the recovery Commit. His longer authenticated branch
         // wins even though the recovery is an admin Commit.
-        for _ in 0..2 {
-            let SendResult::GroupEvolution { msg: rival, pending, .. } = bob
-                .send(SendIntent::SelfUpdate { group_id: b.clone() })
-                .await.unwrap() else { panic!("rival self-update") };
+        let rounds = match mode {
+            RecoveryFixtureMode::Terminal => 2 + cgka_engine::convergence::V1_MAX_REWIND_COMMITS,
+            _ => 2,
+        };
+        for _ in 0..rounds {
+            let SendResult::GroupEvolution {
+                msg: rival,
+                pending,
+                ..
+            } = bob
+                .send(SendIntent::SelfUpdate {
+                    group_id: b.clone(),
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("rival self-update")
+            };
             bob.confirm_published(pending).await.unwrap();
-            alice.buffer_openmls_convergence_message_at(&b, rival, 500).unwrap();
+            alice
+                .buffer_openmls_convergence_message_at(&b, rival, 500)
+                .unwrap();
+            let selected = alice
+                .converge_stored_openmls_messages_at(&b, 1_000_000)
+                .unwrap();
+            assert_eq!(
+                selected.convergence_status,
+                cgka_engine::canonicalization::ConvergenceStatus::Settled
+            );
         }
-        let selected = alice.converge_stored_openmls_messages_at(&b, 1_000_000).unwrap();
-        assert_eq!(selected.convergence_status, cgka_engine::canonicalization::ConvergenceStatus::Settled);
         assert_eq!(alice.epoch(&b).unwrap(), bob.epoch(&b).unwrap());
         // This peeler's transport id differs from its MLS content digest.
         // Own confirmation and convergence update the returned exact id.
         let commit = storage.get_message(&msg.id).unwrap();
-        assert!(matches!(commit.state, cgka_traits::MessageState::ConvergenceDeferred | cgka_traits::MessageState::EpochInvalidated), "recovery must actually lose: {:?}", commit.state);
+        let expected = match mode {
+            RecoveryFixtureMode::Terminal => cgka_traits::MessageState::EpochInvalidated,
+            _ => cgka_traits::MessageState::ConvergenceDeferred,
+        };
+        assert_eq!(
+            commit.state, expected,
+            "the native branch must reach the requested loss boundary"
+        );
         // Drop the native event queue rather than synthesizing a withdrawal:
         // session reopen must derive the Welcome's eligibility from storage.
     }
@@ -159,7 +219,8 @@ async fn hydrated_recovery_fixture(mode: RecoveryFixtureMode) -> (
 
 #[tokio::test]
 async fn hydrated_welcome_stays_owned() {
-    let (_dir, session, a, b, welcome) = hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
+    let (_dir, session, a, b, welcome) =
+        hydrated_recovery_fixture(RecoveryFixtureMode::Staged).await;
     let adapter = RecordingAdapter::default();
     let a_endpoint = TransportEndpoint("wss://hydrated-a.example".into());
     let b_endpoint = TransportEndpoint("wss://hydrated-b.example".into());
@@ -219,44 +280,133 @@ async fn hydrated_welcome_stays_owned() {
 
 #[tokio::test]
 async fn lost_recovery_hides_welcome() {
-    let (_dir, session, _a, b, welcome) = hydrated_recovery_fixture(RecoveryFixtureMode::Superseded).await;
-    let adapter = RecordingAdapter::default();
-    let wall = Arc::new(TestWallClock::new(unix_now()));
-    let mut runtime = AccountDeviceRuntime::new(
-        session,
-        adapter.clone(),
-        StaticTransportRouting::new(vec![])
-            .with_inbox_route(MemberId::new(pad32(b"hydrated-bob")), vec![TransportEndpoint("wss://recovery-inbox.example".into())])
-            .with_group_route(b.clone(), b.as_slice().to_vec(), vec![TransportEndpoint("wss://recovery-group.example".into())]),
-        RecordingKeyPackages::default(),
-    ).with_maintenance_sources(wall.clone(), Arc::new(TestMonotonicClock::default()), Arc::new(TestRandom::new(0)));
-    // Both exact stale continuations and state-derived automatic delivery must
-    // refuse a Welcome whose confirmed recovery lost while it was still owed.
-    runtime.publish_welcome_messages_with_audit_context(vec![welcome.clone()], Some(b), Default::default()).await.unwrap();
-    runtime.retry_welcome_messages_with_audit_context(vec![welcome.clone()], Default::default()).await.unwrap();
-    wall.set(wall.now().0 + 100);
-    runtime.run_due_maintenance().await.unwrap();
-    assert!(!adapter.publishes().iter().any(|request| request.message.id == welcome.id), "a losing recovery's owed Welcome must never reach transport after reopen");
-    assert!(runtime.session().outstanding_sent_welcomes().unwrap().iter().all(|(_, owed)| owed.id != welcome.id), "a losing recovery's Welcome must not escape through the owed-work index");
-    assert!(runtime.session().transport_fanout(&welcome.id).unwrap().is_none(), "supersession retires the undelivered retry");
-    assert!(runtime.prepare_welcome_retry_task_with_audit_context(vec![welcome], Default::default()).unwrap().message_ids().is_empty());
+    for mode in [
+        RecoveryFixtureMode::Superseded,
+        RecoveryFixtureMode::Terminal,
+    ] {
+        let (_dir, session, _a, b, welcome) = hydrated_recovery_fixture(mode).await;
+        let adapter = RecordingAdapter::default();
+        let wall = Arc::new(TestWallClock::new(unix_now()));
+        let mut runtime = AccountDeviceRuntime::new(
+            session,
+            adapter.clone(),
+            StaticTransportRouting::new(vec![])
+                .with_inbox_route(
+                    MemberId::new(pad32(b"hydrated-bob")),
+                    vec![TransportEndpoint("wss://recovery-inbox.example".into())],
+                )
+                .with_group_route(
+                    b.clone(),
+                    b.as_slice().to_vec(),
+                    vec![TransportEndpoint("wss://recovery-group.example".into())],
+                ),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        // Both exact stale continuations and state-derived automatic delivery must
+        // refuse a Welcome whose confirmed recovery lost while it was still owed.
+        runtime
+            .publish_welcome_messages_with_audit_context(
+                vec![welcome.clone()],
+                Some(b),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .retry_welcome_messages_with_audit_context(vec![welcome.clone()], Default::default())
+            .await
+            .unwrap();
+        wall.set(wall.now().0 + 100);
+        runtime.run_due_maintenance().await.unwrap();
+        assert!(
+            !adapter
+                .publishes()
+                .iter()
+                .any(|request| request.message.id == welcome.id),
+            "a losing recovery's owed Welcome must never reach transport after reopen"
+        );
+        assert!(
+            runtime
+                .session()
+                .outstanding_sent_welcomes()
+                .unwrap()
+                .iter()
+                .all(|(_, owed)| owed.id != welcome.id),
+            "a losing recovery's Welcome must not escape through the owed-work index"
+        );
+        match mode {
+            RecoveryFixtureMode::Terminal => assert!(
+                runtime
+                    .session()
+                    .transport_fanout(&welcome.id)
+                    .unwrap()
+                    .is_none(),
+                "terminal loss retires the undelivered retry"
+            ),
+            _ => assert!(
+                runtime
+                    .session()
+                    .transport_fanout(&welcome.id)
+                    .unwrap()
+                    .is_some(),
+                "a parked branch retains its retry owner across reopen and maintenance"
+            ),
+        }
+        assert!(
+            runtime
+                .prepare_welcome_retry_task_with_audit_context(vec![welcome], Default::default())
+                .unwrap()
+                .message_ids()
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
 async fn recovery_welcome_reopens() {
-    let (_dir, session, _a, _b, welcome) = hydrated_recovery_fixture(RecoveryFixtureMode::Confirmed).await;
+    let (_dir, session, _a, _b, welcome) =
+        hydrated_recovery_fixture(RecoveryFixtureMode::Confirmed).await;
     let adapter = RecordingAdapter::default();
     let mut runtime = AccountDeviceRuntime::new(
-        session, adapter.clone(),
+        session,
+        adapter.clone(),
         StaticTransportRouting::new(vec![]).with_inbox_route(
-            MemberId::new(pad32(b"hydrated-bob")), vec![TransportEndpoint("wss://recovery-inbox.example".into())]),
+            MemberId::new(pad32(b"hydrated-bob")),
+            vec![TransportEndpoint("wss://recovery-inbox.example".into())],
+        ),
         RecordingKeyPackages::default(),
     );
-    assert!(runtime.session().outstanding_sent_welcomes().unwrap().iter().any(|(_, owed)| owed.id == welcome.id));
+    assert!(
+        runtime
+            .session()
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .any(|(_, owed)| owed.id == welcome.id)
+    );
     // Explicit redelivery bypasses automatic backoff but still requires the
     // native origin guard. Its successful ACK alone settles this Welcome.
     let delivered = runtime.redeliver_welcome(&welcome.id).await.unwrap();
     assert!(delivered.welcome_failures.is_empty());
-    assert_eq!(adapter.publishes().iter().filter(|request| request.message.id == welcome.id).count(), 1);
-    assert!(runtime.session().outstanding_sent_welcomes().unwrap().iter().all(|(_, owed)| owed.id != welcome.id));
+    assert_eq!(
+        adapter
+            .publishes()
+            .iter()
+            .filter(|request| request.message.id == welcome.id)
+            .count(),
+        1
+    );
+    assert!(
+        runtime
+            .session()
+            .outstanding_sent_welcomes()
+            .unwrap()
+            .iter()
+            .all(|(_, owed)| owed.id != welcome.id)
+    );
 }

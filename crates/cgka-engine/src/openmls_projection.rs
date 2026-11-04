@@ -2860,37 +2860,38 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
 ) -> Result<(), OpenMlsProjectionError> {
     let dispositions = openmls_canonicalization_dispositions(result)?;
     storage.with_transaction(|storage| {
-        let mut withdrawn: HashMap<GroupId, HashSet<MessageId>> = HashMap::new();
+        let mut withdrawn: HashMap<GroupId, (EpochId, HashSet<MessageId>)> = HashMap::new();
         for disposition in dispositions {
             if matches!(
                 disposition.state,
-                MessageState::ConvergenceDeferred
-                    | MessageState::EpochInvalidated
-                    | MessageState::Failed
+                MessageState::EpochInvalidated | MessageState::Failed
             ) {
                 let record = storage.get_message(&disposition.message_id)?;
-                withdrawn
+                let (source_epoch, origins) = withdrawn
                     .entry(record.group_id)
-                    .or_default()
-                    .insert(disposition.message_id.clone());
+                    .or_insert_with(|| (record.epoch, HashSet::new()));
+                if record.epoch.0 < source_epoch.0 {
+                    *source_epoch = record.epoch;
+                }
+                origins.insert(disposition.message_id.clone());
             }
             storage.update_message_state(&disposition.message_id, disposition.state)?;
         }
-        // A confirmed Commit losing selection permanently retires only its
-        // undelivered outputs. Already delivered copies remain usable and need
-        // explicit replacement consent; no transport attempt is recalled here.
-        for (group_id, origins) in withdrawn {
+        // Deferred branches may win later: hold their outputs. Only terminal
+        // origins retire undelivered outputs; delivered copies stay usable.
+        for (group_id, (source_epoch, origins)) in withdrawn {
             for record in
-                storage.list_messages_in_states(&group_id, &[MessageState::Sent], EpochId(0))?
+                storage.list_messages_in_states(&group_id, &[MessageState::Sent], source_epoch)?
             {
-                let payload = StoredMessagePayload::decode(&record.payload)
-                    .map_err(|error| OpenMlsProjectionError::Serialize(format!("{error:?}")))?;
-                if let StoredMessagePayload::OutboundWelcome {
+                let Ok(StoredMessagePayload::OutboundWelcome {
                     origin_commit_id: Some(origin),
                     ..
-                } = payload
-                    && origins.contains(&origin)
-                {
+                }) = StoredMessagePayload::decode(&record.payload)
+                else {
+                    // Opaque rows cannot pass the delivery guard; leave them held.
+                    continue;
+                };
+                if origins.contains(&origin) {
                     storage.update_message_state(&record.id, MessageState::Failed)?;
                 }
             }

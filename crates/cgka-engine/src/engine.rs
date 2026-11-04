@@ -3726,9 +3726,7 @@ impl<S: StorageProvider> Engine<S> {
                 {
                     match origin_state {
                         MessageState::Processed => work.owed.push((group_id.clone(), message)),
-                        MessageState::ConvergenceDeferred
-                        | MessageState::EpochInvalidated
-                        | MessageState::Failed => {}
+                        MessageState::EpochInvalidated | MessageState::Failed => {}
                         _ => work.staged.push(id),
                     }
                 }
@@ -3772,9 +3770,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         match self.welcome_origin_state(&record.group_id, &payload)? {
             MessageState::Processed => {}
-            MessageState::ConvergenceDeferred
-            | MessageState::EpochInvalidated
-            | MessageState::Failed => {
+            MessageState::EpochInvalidated | MessageState::Failed => {
                 return Ok(OutboundWelcomeStatus::Settled);
             }
             _ => return Ok(OutboundWelcomeStatus::Waiting),
@@ -4003,9 +3999,7 @@ impl<S: StorageProvider> Engine<S> {
                 && matches!(payload, StoredMessagePayload::OutboundWelcome { .. })
                 && matches!(
                     self.welcome_origin_state(&record.group_id, &payload)?,
-                    MessageState::ConvergenceDeferred
-                        | MessageState::EpochInvalidated
-                        | MessageState::Failed
+                    MessageState::EpochInvalidated | MessageState::Failed
                 ));
         }
         Ok(match &payload {
