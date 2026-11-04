@@ -87,7 +87,9 @@ impl<S: StorageProvider> Engine<S> {
                 ))
             }
             // The intent carries its own baseline: the entry it replaces.
-            SendIntent::ReplaceDeviceEntry { .. } | SendIntent::ReplaceAccountEntry { .. } => {
+            SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
+            | SendIntent::ReplaceAccountEntry { .. } => {
                 Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
             }
             SendIntent::AppMessage { .. }
@@ -101,6 +103,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::LinkDevice { .. }
             | SendIntent::UnlinkDevice { .. }
             | SendIntent::RecordRemovedSlot { .. }
+            | SendIntent::ImportDeviceGroupRejections { .. }
             | SendIntent::Disband { .. } => None,
         })
     }
@@ -168,6 +171,7 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
             SendIntent::UpdateAppComponents { .. }
             | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
             | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
@@ -315,6 +319,11 @@ impl<S: StorageProvider> Engine<S> {
                 slot,
                 expected,
                 ..
+            }
+            | SendIntent::MarkDeviceGroupMoved {
+                group_id,
+                slot,
+                expected,
             } => {
                 let mls_group = self.load_mls_group(group_id)?;
                 if crate::app_components::device_entry_of_group(&mls_group, slot).as_ref()

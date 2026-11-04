@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Experimental `devices link start` can move an already linked device; status adds move progress and old-sibling hints,
+  and device status includes `moved`. Ordinary chat membership remains in place.
+
 - Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged; ordinary releases keep it off.
 
 ### Added

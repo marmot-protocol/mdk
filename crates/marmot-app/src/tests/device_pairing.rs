@@ -20,6 +20,7 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::SendIntent;
 use storage_sqlite::{DeviceGroupTrust, DeviceLinkOutcome};
 
+mod device_group_moves;
 mod linked_device_chats;
 
 /// One of Alice's devices, with its own cursor over the shared relay.

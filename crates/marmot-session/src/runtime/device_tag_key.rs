@@ -112,10 +112,23 @@ where
         let Some(group_id) = self.device_tag_group.clone() else {
             return Ok(AccountDeviceEffects::default());
         };
+        self.set_device_tag_key_in_group_holding(&group_id, held)
+            .await
+    }
+
+    /// Set this device's own roster key in an explicit link destination,
+    /// without naming it as the trusted tag group. A move uses this for its
+    /// first own Commit before Made; ordinary tags still use the named group.
+    /// All readiness, current-entry and withdrawn-slot checks are unchanged.
+    pub async fn set_device_tag_key_in_group_holding(
+        &mut self,
+        group_id: &GroupId,
+        held: &[GroupId],
+    ) -> AccountResult<AccountDeviceEffects> {
         if self.key_package_slot_withdrawn {
             return Ok(AccountDeviceEffects::default());
         }
-        let slot = match self.device_tag_key(&group_id)? {
+        let slot = match self.device_tag_key(group_id)? {
             TagKey::Set => return Ok(AccountDeviceEffects::default()),
             TagKey::Due(slot) => slot,
             TagKey::Blocked(reason) => {
@@ -133,7 +146,7 @@ where
         // can be read; the tag signature key never waits for it.
         let history_key = self.own_history_key("set_device_tag_key");
         match self
-            .edit_device_roster_entry(&group_id, &slot, held, |entry| {
+            .edit_device_roster_entry(group_id, &slot, held, |entry| {
                 entry.tag_signature_key = Some(own_key);
                 if let Some(history_key) = history_key {
                     entry.history_key = Some(history_key);

@@ -50,7 +50,12 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     rename id (D86); other edits must preserve it. Validate before staging, and never generate an id behind a caller's
     write-ahead journal. The engine stages it only while the slot still holds
     that entry, so an entry is never replaced from a stale read (`DeviceEntryChanged` maps to `Busy`). Announcements,
-    the tag signature key and the host's device edits all go through it; don't add another device-entry commit. Each
+    the tag signature key and the host's device edits all go through it; don't add another general device-entry commit.
+    The sole D102 exception is the completed move's explicit old-group `MarkDeviceGroupMoved`, an own complete-entry
+    CAS changing only status, preserving label/settings/rename id and the original group's tag; it is not a generic
+    entry writer. `set_device_tag_key_in_group_holding` still uses the existing entry-edit path for the destination's
+    first own key Commit and never changes the globally named group. Only the outer App pairing drive authorizes the
+    session's present-proof Made transaction, not generic sync/projection/recovery callbacks. Each
     announcement also writes the host's `DeviceSelfReport` (this device's client and platform) and this device's
     history key (4.1) into its own entry; the tag-key commit carries the history key too. Only this device's own
     entry ever gets its history key. The account entry (backup writer and recovery key, 4.4a) has one write path

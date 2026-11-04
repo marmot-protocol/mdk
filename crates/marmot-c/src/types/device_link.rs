@@ -4,8 +4,9 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    DeviceLinkEmojiFfi, DeviceLinkEndReasonFfi, DeviceLinkPromptFfi, DeviceLinkPromptStateFfi,
-    DeviceLinkSnapshotFfi, NewDeviceLinkStateFfi,
+    DeviceGroupMoveSiblingFfi, DeviceGroupMoveStateFfi, DeviceGroupMoveViewFfi, DeviceLinkEmojiFfi,
+    DeviceLinkEndReasonFfi, DeviceLinkPromptFfi, DeviceLinkPromptStateFfi, DeviceLinkSnapshotFfi,
+    NewDeviceLinkStateFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -212,6 +213,35 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Local move progress; admission alone is Joining, not Made.
+    MarmotDeviceGroupMoveState from DeviceGroupMoveStateFfi {
+        WaitingForWelcome,
+        Joining,
+        Made,
+        Failed,
+    }
+}
+
+c_mirror! {
+    /// Private old-sibling guidance, never authority to Add or trust it.
+    MarmotDeviceGroupMoveSibling from DeviceGroupMoveSiblingFfi {
+        str slot_id_hex,
+        str label,
+        copy question_suppressed: bool,
+    }
+}
+
+c_mirror! {
+    /// Local move progress. Freed with the containing link snapshot.
+    MarmotDeviceGroupMoveView from DeviceGroupMoveViewFfi {
+        str move_id,
+        copy state: MarmotDeviceGroupMoveState,
+        vec old_siblings/old_siblings_len: MarmotDeviceGroupMoveSibling,
+        str_vec overridden_rejection_slots/overridden_rejection_slots_len,
+    }
+}
+
 c_mirror! {
     /// Linking as this device shows it. `new_device` is NULL unless this
     /// device asked to be linked; `prompts` lists the sign-ins it can link.
@@ -219,6 +249,7 @@ c_mirror! {
     free marmot_device_link_snapshot_free {
         opt_rec new_device: MarmotNewDeviceLinkState,
         vec prompts/prompts_len: MarmotDeviceLinkPrompt,
+        vec moves/moves_len: MarmotDeviceGroupMoveView,
     }
 }
 
@@ -264,6 +295,7 @@ mod tests {
             let snapshot = boxed(MarmotDeviceLinkSnapshot::from(DeviceLinkSnapshotFfi {
                 new_device: Some(new_device),
                 prompts: Vec::new(),
+                moves: Vec::new(),
             }));
             unsafe {
                 assert!(!(*snapshot).new_device.is_null());
@@ -292,10 +324,31 @@ mod tests {
                     reason: Reason::CodesDiffer,
                 }),
             ],
+            moves: vec![DeviceGroupMoveViewFfi {
+                move_id: "move".into(),
+                state: DeviceGroupMoveStateFfi::Made,
+                old_siblings: vec![DeviceGroupMoveSiblingFfi {
+                    slot_id_hex: "ab".repeat(32),
+                    label: "Old tablet".into(),
+                    question_suppressed: true,
+                }],
+                overridden_rejection_slots: vec!["cd".repeat(32)],
+            }],
         }));
         unsafe {
             assert!((*snapshot).new_device.is_null());
             assert_eq!((*snapshot).prompts_len, 10);
+            assert_eq!((*snapshot).moves_len, 1);
+            let movement = &*(*snapshot).moves;
+            assert_eq!(movement.old_siblings_len, 1);
+            assert_eq!(movement.overridden_rejection_slots_len, 1);
+            assert!((*movement.old_siblings).question_suppressed);
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*movement.old_siblings).label)
+                    .to_str()
+                    .unwrap(),
+                "Old tablet"
+            );
             let comparing = &*(*snapshot).prompts.add(1);
             let MarmotDeviceLinkPromptState::Comparing { code, code_len } = &comparing.state else {
                 panic!("unexpected prompt state");
