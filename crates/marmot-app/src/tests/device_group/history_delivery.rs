@@ -887,112 +887,119 @@ async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn_
 /// message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_history_too_long_to_send_inline_goes_through_blossom() {
-    let (mut devices, group, chat, _first) = history_devices().await;
-    let phone_storage = storage(&devices.phone_app);
-    let blossom = local_blossom();
-    // Two of these overflow one inline bundle, so each takes its own; the
-    // first shares its bundle with the short message before it. Each differs,
-    // so none shares another's id.
-    let long = "x".repeat(15_000);
-    for index in 0..MAX_INLINE_BUNDLES {
-        send_text(&mut devices.phone, &chat, &format!("{index}{long}")).await;
-    }
-    add_laptop(&mut devices, &chat).await;
-    let before = published_count(&devices.relay);
-    devices.phone.drive_history_deliveries().await;
-    assert_eq!(published_count(&devices.relay), before + MAX_INLINE_BUNDLES);
-    assert!(
-        phone_storage
-            .unsent_history_deliveries()
-            .unwrap()
-            .is_empty()
-    );
+    // Keep this composed future's construction frame outside its polling frame.
+    fn scenario() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+        Box::pin(async {
+            let (mut devices, group, chat, _first) = history_devices().await;
+            let phone_storage = storage(&devices.phone_app);
+            let blossom = local_blossom();
+            // Two of these overflow one inline bundle, so each takes its own; the
+            // first shares its bundle with the short message before it. Each differs,
+            // so none shares another's id.
+            let long = "x".repeat(15_000);
+            for index in 0..MAX_INLINE_BUNDLES {
+                send_text(&mut devices.phone, &chat, &format!("{index}{long}")).await;
+            }
+            add_laptop(&mut devices, &chat).await;
+            let before = published_count(&devices.relay);
+            devices.phone.drive_history_deliveries().await;
+            assert_eq!(published_count(&devices.relay), before + MAX_INLINE_BUNDLES);
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
 
-    let longer = devices.phone.create_group("longer", &[]).await.unwrap();
-    let longer_hex = hex::encode(longer.as_slice());
-    use_blossom(
-        &mut devices.phone,
-        &longer,
-        BLOSSOM_LOCATOR_KIND_V1,
-        &blossom.url,
-    )
-    .await;
-    let mut sent = Vec::new();
-    for index in 0..=MAX_INLINE_BUNDLES {
-        sent.push(send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await);
-    }
-    add_laptop(&mut devices, &longer).await;
-    let before = published_count(&devices.relay);
-    devices.phone.drive_history_deliveries().await;
-    assert_eq!(published_count(&devices.relay), before, "none goes inline");
-    assert!(blossom.blobs.lock().unwrap().is_empty());
-    let upload = devices.phone.prepare_history_upload().unwrap().unwrap();
-    let outcome = upload.run().await;
-    assert_eq!(
-        blossom.blobs.lock().unwrap().len(),
-        1,
-        "one uploaded bundle"
-    );
-    lose_phone_edit(&mut devices, &group, Some(false)).await;
-    assert!(
-        devices.phone.prepare_history_upload().unwrap().is_none(),
-        "a pending history toggle holds new uploads without forgetting debt"
-    );
-    let before_completion = published_count(&devices.relay);
-    assert!(
-        devices.phone.finish_history_upload(outcome).await,
-        "the upload completion settles independently of its held new carrier"
-    );
-    assert_eq!(published_count(&devices.relay), before_completion);
-    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
-    // Choosing the current true value cancels this lost disable before replay.
-    devices
-        .phone
-        .update_linked_device_settings(
-            &hex::encode(slot_of(&devices.laptop)),
-            None,
-            Some(true),
-            None,
-        )
-        .await
-        .unwrap();
-    let before_carrier = published_count(&devices.relay);
-    devices.phone.drive_history_blobs().await;
-    assert_eq!(
-        blossom.blobs.lock().unwrap().len(),
-        2,
-        "one bundle per attempt; the held upload had no carrier"
-    );
-    assert_eq!(published_count(&devices.relay), before_carrier + 1);
-    assert!(
-        phone_storage
-            .unsent_history_deliveries()
-            .unwrap()
-            .is_empty()
-    );
+            let longer = devices.phone.create_group("longer", &[]).await.unwrap();
+            let longer_hex = hex::encode(longer.as_slice());
+            use_blossom(
+                &mut devices.phone,
+                &longer,
+                BLOSSOM_LOCATOR_KIND_V1,
+                &blossom.url,
+            )
+            .await;
+            let mut sent = Vec::new();
+            for index in 0..=MAX_INLINE_BUNDLES {
+                sent.push(send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await);
+            }
+            add_laptop(&mut devices, &longer).await;
+            let before = published_count(&devices.relay);
+            devices.phone.drive_history_deliveries().await;
+            assert_eq!(published_count(&devices.relay), before, "none goes inline");
+            assert!(blossom.blobs.lock().unwrap().is_empty());
+            let upload = devices.phone.prepare_history_upload().unwrap().unwrap();
+            let outcome = upload.run().await;
+            assert_eq!(
+                blossom.blobs.lock().unwrap().len(),
+                1,
+                "one uploaded bundle"
+            );
+            lose_phone_edit(&mut devices, &group, Some(false)).await;
+            assert!(
+                devices.phone.prepare_history_upload().unwrap().is_none(),
+                "a pending history toggle holds new uploads without forgetting debt"
+            );
+            let before_completion = published_count(&devices.relay);
+            assert!(
+                devices.phone.finish_history_upload(outcome).await,
+                "the upload completion settles independently of its held new carrier"
+            );
+            assert_eq!(published_count(&devices.relay), before_completion);
+            assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+            // Choosing the current true value cancels this lost disable before replay.
+            devices
+                .phone
+                .update_linked_device_settings(
+                    &hex::encode(slot_of(&devices.laptop)),
+                    None,
+                    Some(true),
+                    None,
+                )
+                .await
+                .unwrap();
+            let before_carrier = published_count(&devices.relay);
+            devices.phone.drive_history_blobs().await;
+            assert_eq!(
+                blossom.blobs.lock().unwrap().len(),
+                2,
+                "one bundle per attempt; the held upload had no carrier"
+            );
+            assert_eq!(published_count(&devices.relay), before_carrier + 1);
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
 
-    deliver_all(&mut devices.laptop, &devices.relay).await;
-    let laptop_storage = storage(&devices.laptop_app);
-    assert_eq!(
-        laptop_storage.parked_history_delivery_chats().unwrap(),
-        std::slice::from_ref(&longer_hex),
-        "a Blossom delivery parks until its blob is fetched"
-    );
-    devices.laptop.drive_history_blobs().await;
-    for id in &sent {
-        assert!(
-            laptop_storage
-                .timeline_message(&longer_hex, id)
-                .unwrap()
-                .is_some()
-        );
+            deliver_all(&mut devices.laptop, &devices.relay).await;
+            let laptop_storage = storage(&devices.laptop_app);
+            assert_eq!(
+                laptop_storage.parked_history_delivery_chats().unwrap(),
+                std::slice::from_ref(&longer_hex),
+                "a Blossom delivery parks until its blob is fetched"
+            );
+            devices.laptop.drive_history_blobs().await;
+            for id in &sent {
+                assert!(
+                    laptop_storage
+                        .timeline_message(&longer_hex, id)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert!(
+                laptop_storage
+                    .parked_history_delivery_chats()
+                    .unwrap()
+                    .is_empty()
+            );
+        })
     }
-    assert!(
-        laptop_storage
-            .parked_history_delivery_chats()
-            .unwrap()
-            .is_empty()
-    );
+
+    scenario().await;
 }
 
 /// Through the runtime, the account worker's maintenance pass fetches a

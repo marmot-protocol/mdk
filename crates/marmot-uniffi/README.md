@@ -1233,7 +1233,8 @@ land:
 - Each emoji carries an English `description` for screen readers. Users compare the pictures, not the descriptions.
 - `device_link_snapshot(account_ref)` reads linking without changing it. Re-read on `MarmotEventFfi::DeviceLinkChanged`,
   which carries no device, session or group identities. It also fires once each time the account's worker opens or
-  reconnects, which ends any link in progress.
+  reconnects. Live comparison sessions are lost then; admitted moves resume from durable progress. Inspect `moves`
+  rather than assuming an interrupted comparison undid an admitted move.
 
 ## Backup recovery and background conditions
 

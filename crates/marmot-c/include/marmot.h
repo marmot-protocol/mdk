@@ -6138,9 +6138,10 @@ typedef enum MarmotEvent_Tag {
   /**
    * Linking a new device may have changed as this device shows it;
    * re-read `marmot_device_link_snapshot`. Also fires once each time the
-   * account's worker opens or reconnects, which ends any link in
-   * progress. Carries no device, session or group identities, and may
-   * fire with no visible change.
+   * account's worker opens or reconnects. Live comparison sessions are
+   * lost then; admitted moves resume from durable progress. Carries no
+   * device, session or group identities, and may fire with no visible
+   * change.
    */
   MARMOT_EVENT_DEVICE_LINK_CHANGED,
   /**
