@@ -5073,8 +5073,9 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotPollProjection *poll;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
-   * while committed-but-undelivered (render as pending/failed),
-   * the published source event id once delivered. Always set for
+   * while committed-but-undelivered (render as pending/failed,
+   * unless `recipient_confirmed` is set), the published source event
+   * id once delivered. Always set for
    * received messages.
    */
   char *source_message_id_hex;
@@ -5149,6 +5150,12 @@ typedef struct MarmotTimelineMessageRecord {
    * for delivered messages.
    */
   char *invalidation_status;
+  /**
+   * True when a peer reacted to this own send after it failed with
+   * no relay acceptance on record, which proves the peer received
+   * it: render it as delivered. `source_message_id_hex` stays NULL.
+   */
+  bool recipient_confirmed;
   char *client_token;
   /**
    * The device this row came from in a chat history it sent; NULL

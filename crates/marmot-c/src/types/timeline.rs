@@ -220,8 +220,9 @@ c_mirror! {
         copy has_reports: bool,
         opt_rec poll: MarmotPollProjection,
         /// Delivery marker for own (`direction == "sent"`) messages: NULL
-        /// while committed-but-undelivered (render as pending/failed),
-        /// the published source event id once delivered. Always set for
+        /// while committed-but-undelivered (render as pending/failed,
+        /// unless `recipient_confirmed` is set), the published source event
+        /// id once delivered. Always set for
         /// received messages.
         opt_str source_message_id_hex,
         /// Authenticated MLS source epoch behind this message's pinned
@@ -265,6 +266,10 @@ c_mirror! {
         /// Convergence invalidation reason (e.g. `LosingBranch`); NULL
         /// for delivered messages.
         opt_str invalidation_status,
+        /// True when a peer reacted to this own send after it failed with
+        /// no relay acceptance on record, which proves the peer received
+        /// it: render it as delivered. `source_message_id_hex` stays NULL.
+        copy recipient_confirmed: bool,
         opt_str client_token,
         /// The device this row came from in a chat history it sent; NULL
         /// for a row that arrived live. Draw "Imported from <device>"
