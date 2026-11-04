@@ -21,6 +21,29 @@ fn status_of(client: &AppClient, group: &GroupId, device: &AppClient) -> DeviceS
     roster(client, group).devices[&slot_of(device)].status
 }
 
+fn startup_retries_suppressed(runtime: &MarmotAppRuntime) -> u64 {
+    runtime
+        .app_performance_snapshot()
+        .runtime_operations
+        .iter()
+        .find(|operation| {
+            operation.operation == crate::RuntimePerformanceOperation::AccountStartupRetrySuppressed
+        })
+        .map_or(0, |operation| operation.not_ready)
+}
+
+/// Observe the real worker acquisition backoff, rather than guessing when
+/// the wipe's first lookup has happened or injecting an acquisition error.
+async fn wait_for_startup_retry(runtime: &MarmotAppRuntime, before: u64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while startup_retries_suppressed(runtime) == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the wipe encounters the real failed-start backoff");
+}
+
 /// Run `phone`'s maintenance until it has decided a removal, passing its
 /// random delay.
 async fn decide_after_delay(phone: &mut AppClient, phone_app: &MarmotApp, laptop_slot: [u8; 32]) {
@@ -377,7 +400,10 @@ async fn a_leaving_entry_without_its_key_is_not_removed() {
 
 /// `sign_out_and_wipe` on a running laptop: its `leaving` commit is
 /// confirmed, so it leaves the chat both are in to the phone, deletes its
-/// slot and wipes. The phone then removes it.
+/// slot and wipes. A real competing client initially holds the account
+/// session: the failed worker start is retried after that client closes,
+/// rather than being mistaken for an account that never runs a worker.
+/// The phone then removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
     let (mut devices, group) = tagging_devices().await;
@@ -392,7 +418,6 @@ async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
         ..
     } = devices;
     let laptop_slot = slot_of(&laptop);
-    drop(laptop);
     let mut phone_cursor = published_count(&relay);
     let _eose = scripted_eose_pump(
         laptop_app.relay_plane.clone(),
@@ -400,10 +425,20 @@ async fn sign_out_and_wipe_leaves_a_shared_chat_to_the_sibling() {
         every_subscription,
     );
     let runtime = MarmotAppRuntime::new(laptop_app.clone());
-    runtime.reconcile_accounts().await.unwrap();
-    runtime.catch_up_accounts().await.unwrap();
+    assert!(matches!(
+        runtime.reconcile_accounts().await,
+        Err(AppError::AccountSessionBusy)
+    ));
+    let before = startup_retries_suppressed(&runtime);
+    let mut wipe = Box::pin(runtime.sign_out_and_wipe("alice"));
+    tokio::select! {
+        biased;
+        () = wait_for_startup_retry(&runtime, before) => {}
+        outcome = &mut wipe => panic!("a temporary acquisition failure skipped sibling sign-out: {outcome:?}"),
+    }
+    drop(laptop);
 
-    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
+    let outcome = wipe.await.unwrap();
     assert_eq!(outcome.groups_left_to_siblings, 1);
     assert_eq!(outcome.groups_left, 0);
     assert!(outcome.group_leave_failures.is_empty());
@@ -587,6 +622,49 @@ async fn a_worker_still_opening_at_the_deadline_counts_as_not_reached() {
     );
     assert!(outcome.local_cleanup.completed);
     runtime.shutdown().await;
+}
+
+/// A real failed worker start is still being retried when the public runtime
+/// shuts down. The sibling wait ends promptly rather than keeping shutdown
+/// behind its ordinary 30-second deadline, and the account is kept for retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutting_down_ends_a_wipes_worker_retry_without_waiting_for_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = device_group_app_at(&dir, relay.clone());
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let held_client = app.client("alice").await.unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    assert!(matches!(
+        runtime.reconcile_accounts().await,
+        Err(AppError::AccountSessionBusy)
+    ));
+    let before = startup_retries_suppressed(&runtime);
+    let mut wipe = Box::pin(runtime.sign_out_and_wipe("alice"));
+    tokio::select! {
+        biased;
+        () = wait_for_startup_retry(&runtime, before) => {}
+        outcome = &mut wipe => panic!("the eligible account's failed start was not retried: {outcome:?}"),
+    }
+    // Keep polling both public operations: pausing a wipe while it owns a
+    // lifecycle transaction would itself prevent shutdown from completing.
+    let ((), outcome) = tokio::join!(runtime.shutdown(), async {
+        tokio::time::timeout(Duration::from_secs(5), &mut wipe)
+            .await
+            .expect("runtime shutdown ends the sibling wait before its 30-second deadline")
+            .unwrap()
+    });
+    assert!(outcome.siblings_not_reached);
+    assert!(!outcome.local_cleanup.completed);
+    assert_eq!(
+        outcome.local_cleanup.reason.as_deref(),
+        Some("runtime is shutting down")
+    );
+    assert!(app.account_home().account("alice").is_ok());
+    drop(held_client);
 }
 
 /// The laptop's `sign_out_and_wipe` sends its `leaving` commit, and the
@@ -804,33 +882,133 @@ async fn an_account_signs_out_until_its_last_sign_out_ends() {
     assert!(!app.signing_out(&account_id_hex));
 }
 
-/// An account signed out without a wipe has no worker to ask its siblings
-/// through, so wiping it signs out on its own at once instead of waiting out
-/// the `leaving` deadline and reporting its siblings not reached.
+/// Accounts without permission to request sibling sign-out finish immediately:
+/// this includes an admitted worker whose unfinished onboarding permits setup
+/// traffic but still rejects ordinary commands. No sibling request is reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wiping_a_signed_out_account_does_not_wait_on_siblings() {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = device_group_app_at(&dir, relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
-    let runtime = MarmotAppRuntime::new(app.clone());
-    runtime.reconcile_accounts().await.unwrap();
-    runtime
-        .sign_out(
-            "alice",
-            crate::runtime::SignOutOptions {
-                delete_key_packages: false,
-            },
-        )
-        .await
-        .unwrap();
-    app.set_sign_out_leaving_wait(Duration::from_secs(1));
+async fn accounts_without_sibling_signout_commands_are_wiped_immediately() {
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        SignedOut,
+        MissingSigner,
+        OnboardingGated,
+        OnboardingWorkerCommandGated,
+    }
+    for case in [
+        Case::SignedOut,
+        Case::MissingSigner,
+        Case::OnboardingGated,
+        Case::OnboardingWorkerCommandGated,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = match case {
+            Case::MissingSigner => home
+                .add_external_signer_account(
+                    &nostr::prelude::Keys::generate().public_key().to_hex(),
+                )
+                .unwrap(),
+            Case::SignedOut | Case::OnboardingGated => home.create_account("alice").unwrap(),
+            Case::OnboardingWorkerCommandGated => {
+                use nostr::prelude::ToBech32;
+                home.import_nostr_account_for_onboarding(
+                    &nostr::prelude::Keys::generate()
+                        .secret_key()
+                        .to_bech32()
+                        .unwrap(),
+                )
+                .unwrap()
+                .account()
+                .clone()
+            }
+        };
+        if matches!(case, Case::OnboardingGated) {
+            home.begin_account_setup_with(
+                &account,
+                false,
+                marmot_account::AccountSetupKind::InteractiveIdentity,
+                marmot_account::AccountSetupPhase::LocalStateCreated,
+            )
+            .unwrap();
+        }
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = device_group_app_at(&dir, relay.clone());
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let runtime = MarmotAppRuntime::new(app.clone());
+        if matches!(case, Case::OnboardingWorkerCommandGated) {
+            use crate::{OnboardingOptions, OnboardingStatus, OnboardingStep};
+            use nostr::prelude::ToBech32;
+            // Initialize a real attempt through the public runtime, then retain
+            // the durable shape left if its final KeyPackage publication was
+            // interrupted. Earlier checks are done, but ready is still false.
+            let keys = home.load_signing_keys(&account.label).unwrap();
+            let mut snapshot = runtime
+                .accounts()
+                .begin_onboarding(
+                    zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                    OnboardingOptions {
+                        default_relays: vec!["wss://relay.example".into()],
+                        discovery_relays: vec!["wss://relay.example".into()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!snapshot.ready);
+            for step in &mut snapshot.steps {
+                step.status = if step.step == OnboardingStep::KeyPackage {
+                    OnboardingStatus::Checking
+                } else {
+                    OnboardingStatus::Passed
+                };
+            }
+            let mut checkpoint: serde_json::Value =
+                serde_json::from_slice(&home.account_onboarding(&account.label).unwrap().unwrap())
+                    .unwrap();
+            checkpoint["snapshot"] = serde_json::to_value(snapshot).unwrap();
+            home.set_account_onboarding(&account.label, &serde_json::to_vec(&checkpoint).unwrap())
+                .unwrap();
+            home.set_account_setup_phase(
+                &account.label,
+                marmot_account::AccountSetupPhase::KeyPackagePublicationStarted,
+            )
+            .unwrap();
+        }
+        runtime.reconcile_accounts().await.unwrap();
+        if matches!(case, Case::SignedOut) {
+            runtime
+                .sign_out(
+                    &account.label,
+                    crate::runtime::SignOutOptions {
+                        delete_key_packages: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let managed = runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|managed| managed.account_id_hex == account.account_id_hex)
+            .unwrap();
+        assert_eq!(
+            managed.running,
+            matches!(case, Case::OnboardingWorkerCommandGated),
+            "{case:?} has its expected real worker admission"
+        );
+        if matches!(case, Case::OnboardingWorkerCommandGated) {
+            assert!(matches!(
+                runtime.start_device_link(&account.label).await,
+                Err(AppError::OnboardingRequired)
+            ));
+        }
+        app.set_sign_out_leaving_wait(Duration::from_secs(1));
 
-    let outcome = runtime.sign_out_and_wipe("alice").await.unwrap();
-    assert!(!outcome.siblings_not_reached);
-    assert!(outcome.local_cleanup.completed);
-    runtime.shutdown().await;
+        let outcome = runtime.sign_out_and_wipe(&account.label).await.unwrap();
+        assert!(!outcome.siblings_not_reached, "{case:?}");
+        assert!(outcome.local_cleanup.completed, "{case:?}");
+        runtime.shutdown().await;
+    }
 }
