@@ -247,11 +247,21 @@ mod tests {
     #[test]
     fn recording_views_preserve_operation_samples_and_share_revocation() {
         let (collector, clock) = configured();
-        grant(&collector);
-        clock.mono.store(1000, Ordering::Relaxed);
         let product = ProductRecorder::from(collector.clone());
         let first = Observer::sharing(&product);
         let second = Observer::sharing(&product);
+        let ungranted_admission = first.product().permit();
+        assert!(ungranted_admission.is_none());
+        first
+            .product()
+            .storage_failure(ungranted_admission.as_ref(), StorageFailureKind::Busy);
+        assert!(collector.test_payloads().is_empty());
+        grant(&collector);
+        clock.mono.store(1000, Ordering::Relaxed);
+        // Completion keeps the admission decision captured before the grant.
+        first
+            .product()
+            .storage_failure(ungranted_admission.as_ref(), StorageFailureKind::Busy);
         let permit = first.product().permit().unwrap();
 
         first.performance().record(
@@ -387,6 +397,11 @@ mod tests {
         assert_eq!(
             find("mdk_storage_summary", "busy", "attempt")["props"]["outcome"],
             "failure"
+        );
+        assert_eq!(
+            find("mdk_storage_summary", "busy", "attempt")["props"]["count_bucket"],
+            "1",
+            "only the failure admitted under the current grant is counted"
         );
         assert_eq!(
             find("mdk_maintenance_summary", "pending", "backlog")["props"]["count_bucket"],
