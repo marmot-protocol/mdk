@@ -8052,8 +8052,8 @@ MarmotStatus marmot_remove_members(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Leave as the active account. Core demotes an eligible nonlast admin
- * before departure; the last admin is refused. Free with `marmot_send_summary_free`.
+ * Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused.
+ * Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
