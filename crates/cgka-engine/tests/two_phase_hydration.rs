@@ -222,6 +222,7 @@ fn insert_marmot_group_without_openmls_state(
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
         })
         .expect("insert marmot group record without openmls state");

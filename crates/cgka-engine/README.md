@@ -6,6 +6,10 @@ for Marmot. Read this if you are building on the engine directly or changing how
 The engine sits above OpenMLS, governs commit sequencing, adjudicates forks through distributed convergence, enforces
 MIP-03 admin rules, and returns typed outcomes for every ingest path.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Contents
 
 - [What this crate does](#what-this-crate-does)
@@ -71,6 +75,18 @@ GroupContext. Use two published commits:
 The upgrade fails closed without staging a commit when required state is missing. MDK does not currently expose an
 atomic require-and-populate API.
 
+## Voluntary sibling departures
+
+When this device applies a sibling's authenticated SelfRemove, its local group record keeps that sibling's slot for
+this membership. Private sibling Add admission refuses it with `SiblingAddRefusal::SiblingLeft` before preparing an
+Add; another KeyPackage does not bypass the hold. Ordinary Remove is independent. A selected leaf that reads as the
+slot again clears the hold, and a fresh Welcome starts a new membership. A selected return ends the local hold even
+if a later branch no longer contains that return. Selecting an authenticated SelfRemove again records the departure
+again. This uses existing group snapshots and transactions, with no additional table or wire item. Unclaimed tags identify no slot; genuine source-roster storage
+errors on a live device group keep the commit retryable rather than consume a recognized departure without its record.
+An unavailable device group supplies no attribution context and does not block a chat's Commit. A departure applied
+without a readable sibling tag establishes no new hold; later repair does not promise retroactive attribution.
+
 ## Background recovery
 
 **Experimental sibling Welcome delivery.** A retained sibling Welcome records the exact confirmed Add that produced
@@ -83,18 +99,13 @@ Exact existing-carrier outcomes still settle while its origin is held. Older dev
 are retired rather than guessed; re-add the sibling to affected chats to recreate pending old delivery work after
 upgrading.
 
-**Authenticated device-group activity.** Native accepted member application, Commit and Proposal traffic retains
-its source epoch and exact member leaf proof in the existing processed-wrapper ledger. The first local observation is
-captured with receive/apply; candidate probes never capture it. Later app attribution under a trusted current roster
-reuses that stamp. Missing historical source proof can be filled by exact ciphertext reauthentication against a retained
-anchor, without guessing a current leaf or making earlier content fresh. Recovery pages past unavailable old facts;
-a bounded in-memory fingerprint cache avoids repeating failed work against unchanged anchors.
-`sibling_welcome_resend_has_ended` checks unarmed repair work too and durably terminalizes expiry before its timing
-metadata is retired, so a backward host clock cannot make that original sendable again. Native valid-app aliases bind the authenticated
-source leaf key/tag, so two devices can send the same account event id independently. Current-roster tag verification
-attests each source leaf key and provides the stable device principal for coalescing aliases across MLS leaf rekeys;
-a different roster tag key remains a different incarnation. Bounded proof-present work stays independent of unavailable
-source recovery and key-unready candidates.
+**Delivered Welcome repair.** The app uses the target's authenticated heartbeat activity for its current
+roster incarnation once that activity is at least ten minutes after the latest carrier's actual first accepted
+publication. The engine still checks the retained origin, selected target-device participation, expiry and current
+carrier before rearming the exact Welcome. A tagged KeyPackage leaf alone is not participation. Unknown publication
+time holds repair. `sibling_welcome_resend_has_ended` also checks unarmed work and durably terminalizes expiry before
+its timing/high-water metadata is retired, so a backward clock cannot make the original sendable again. No per-message
+source proof journal, historical source-recovery pass or local observation clock is needed for this repair.
 
 **Resumable candidate reconstruction.** Live convergence and background deferred peeling retain candidate-search
 progress between calls. Each evaluator slice admits at most 32 probes and observes the caller's cooperative time
@@ -244,3 +255,9 @@ For the Marmot app-component model used by new groups, see
 
 Single internal consumer; not semver-stable. Versioned with the workspace. For readiness and open production work, see
 [`current-state.md`](../../docs/marmot-architecture/overview/current-state.md).
+
+Invitation-decision metadata is captured on successful native creation/join in all builds, including ordinary chats
+with device groups disabled: it serializes/hashes the validated admission context and persists its local association.
+It adds no per-message observation work. Custom `GroupStorage` providers must implement the transactional
+`invitation_admission` and `put_invitation_admission` methods; an older unidentified copy is never seeded from its
+current epoch. Experimental sibling-Welcome V2 inheritance requires updated receivers; retained V1 bodies stay V1.

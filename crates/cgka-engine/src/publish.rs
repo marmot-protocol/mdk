@@ -97,6 +97,20 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let has_pending_commit = mls_group.pending_commit().is_some();
+        let sibling_context = if has_pending_commit {
+            self.sibling_self_removal_context(&group_id)?
+        } else {
+            None
+        };
+        let self_removed_slots = mls_group
+            .pending_commit()
+            .map(|staged| {
+                sibling_context
+                    .as_ref()
+                    .map(|context| context.proposal_slots(&mls_group, staged.queued_proposals()))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let previous_membership = self.canonical_membership_snapshot(&group_id)?;
         let activity_before =
             crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(&mls_group);
@@ -235,6 +249,13 @@ impl<S: StorageProvider> Engine<S> {
                 // error must roll back the whole transaction and stay retryable,
                 // never commit the merge + `Processed` write with a stale record.
                 let mut g = storage.get_group(&group_id)?;
+                g.self_removed_sibling_slots
+                    .extend(self_removed_slots.iter().copied());
+                if !g.self_removed_sibling_slots.is_empty()
+                    && let Some(context) = sibling_context.as_ref()
+                {
+                    context.clear_present(&mls_group, &mut g);
+                }
                 g.epoch = EpochId(mls_group.epoch().as_u64());
                 if kind != crate::epoch_manager::PendingKind::Disband {
                     g.members = crate::group_lifecycle::marmot_members(&mls_group);
@@ -242,6 +263,16 @@ impl<S: StorageProvider> Engine<S> {
                 g.required_capabilities = required_capabilities_from_group(&mls_group);
                 crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
                 storage.put_group(&g)?;
+                if kind == crate::epoch_manager::PendingKind::CreateGroup {
+                    storage.put_invitation_admission(
+                        &group_id,
+                        Some(&cgka_traits::group::InvitationAdmission {
+                            generation: self.local_invitation_generation(&mls_group)?,
+                            created_locally: true,
+                            via_welcome: None,
+                        }),
+                    )?;
+                }
                 crate::capability_manager::check_own_leaf(
                     &mls_group,
                     self.identity.self_id(),

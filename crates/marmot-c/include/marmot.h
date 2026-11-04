@@ -2742,7 +2742,7 @@ typedef struct MarmotGroupManagementState {
    */
   bool can_leave;
   /**
-   * Whether an admin must self-demote before leaving.
+   * Compatibility field, always false; core demotes eligible admins and refuses the last admin.
    */
   bool requires_self_demote_before_leave;
   /**
@@ -5036,8 +5036,9 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotPollProjection *poll;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
-   * while committed-but-undelivered (render as pending/failed),
-   * the published source event id once delivered. Always set for
+   * while committed-but-undelivered (render as pending/failed,
+   * unless `recipient_confirmed` is set), the published source event
+   * id once delivered. Always set for
    * received messages.
    */
   char *source_message_id_hex;
@@ -5112,6 +5113,12 @@ typedef struct MarmotTimelineMessageRecord {
    * for delivered messages.
    */
   char *invalidation_status;
+  /**
+   * True when a peer reacted to this own send after it failed with
+   * no relay acceptance on record, which proves the peer received
+   * it: render it as delivered. `source_message_id_hex` stays NULL.
+   */
+  bool recipient_confirmed;
   char *client_token;
   /**
    * The device this row came from in a chat history it sent; NULL
@@ -8052,8 +8059,8 @@ MarmotStatus marmot_remove_members(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Leave the group as the active account. Admins must self-demote
- * first. Free with `marmot_send_summary_free`.
+ * Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused.
+ * Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

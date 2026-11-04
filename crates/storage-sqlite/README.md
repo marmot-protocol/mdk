@@ -112,6 +112,16 @@ while resolving complete intent instead of deriving it from visible rows.
 
 ## Migrations
 
+Migration0170 adds native local-copy admission metadata and app invitation-decision rows; no existing group is seeded.
+It runs for every account database, including builds with device groups disabled, creating two tables and two partial
+indexes. Native creation/join writes the local admission association transactionally; it adds no per-message writes.
+The admission generation and exact successful local Welcome association are captured in the native join transaction;
+founding records a local origin instead. They remain fixed across ordinary epoch changes, are replaced only by a new
+successful native admission, and are deleted with local group data. Decision rows are keyed by raw MLS chat id and
+generation and retain their winning value, owed publication and pending application/Leave handoff atomically. Unknown
+admissions create no membership work; the actual matching native join re-arms them. Full broadcasts enumerate retained
+generations, including after a local chat is forgotten. There is no clock-based generation eviction.
+
 Account/session schema changes are Rust migrations: the ordered registry lives in `src/base/migrations.rs` and bodies in
 numbered files like `src/base/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
 padded name, and an `apply` function run inside a SQLite transaction, which can execute DDL, rewrite rows, or perform
@@ -379,36 +389,24 @@ Media upgrades 0104 and 0105 preserve existing payload pages during account open
 
 ### Delivered sibling-Welcome repair
 
-One indexed scheduling row per original Welcome retains the published carrier generation, first durable publication
-observation and first qualifying target-device activity, then a fixed ten-minute deadline. Exact Welcome bytes,
-private KeyPackage reference, expiry and originating Add remain engine-owned. The next successful carrier requires
-new activity after its own publication boundary. A prepared-carrier timestamp high-water prevents reuse of any earlier
-carrier identity after a wall-clock rollback; failed or unexposed exact retries keep their reservation.
+One row per original Welcome retains its latest successfully published carrier's immutable first actual acceptance
+time and a prepared-carrier timestamp high-water. Exact Welcome bytes, private KeyPackage reference, expiry and
+originating Add remain engine-owned. Acceptance time commits with the zero-to-positive fanout receipt transition,
+before replayable publication output; an already-accepted legacy fanout with no time stays unknown. Duplicate
+projection cannot retime a generation, and an older carrier cannot replace the currently prepared carrier. Failed or
+unexposed exact retries keep their reservation; a backward wall clock cannot reuse an earlier prepared identity.
 
-Publication acceptance and native accepted device-group source observations share a durable scalar local observation
-order, so same-millisecond observations and backward clocks do not invent ordering. Direct acceptance and selected
-convergence/application replay capture the authenticated source epoch, member and leaf proof in their native transaction;
-branch probes never observe. The optional versioned proof and immutable first time/order live on the existing lifetime
-processed-wrapper/content ledger outside snapshots. Missing source-leaf proof stays pending; exact ciphertext
-reauthentication may fill it without retiming. App attribution under the current trusted roster reuses that native stamp
-for application, accepted member Commit and Proposal traffic, including empty app-effect batches. Valid application
-aliases retain the inner event id and exact authenticated source binding; malformed application identities include the
-source epoch/member/index and plaintext digest, and accepted Proposals reuse their authenticated ProposalRef. Two device
-leaves sharing an account and the same application id remain independent. An earlier unavailable source holds only
-ambiguous aliases of that event until exact proof resolves; proof never comes from a later occupant of an index.
-Attribution records the current roster tag key actually verified with the slot. That signature attests the source leaf
-key, so aliases from different MLS leaf keys coalesce to the earliest native observation only under the same verified
-(DG, tag key, slot) principal. A changed roster tag key is a different incarnation. Earlier delayed proof can tighten a
-deadline, never postpone it. Separate indexed 32-row scans for proof-present and unavailable work, with source-roster
-slot hints excluding current-key-unready work before the result limit, keep pending sources from starving healthy
-traffic. Hints never grant attribution. Rewrapping,
-message upserts, format promotion, snapshot replay and delayed projection cannot make any old observed content new.
-Existing experimental local groups freeze their selected current epoch at migration 0169; only later-source-epoch
-activity qualifies, after an ordinary committed update. Newly installed local groups qualify immediately. This is
-best-effort activity evidence: queued traffic is not proof of live post-publication activity or Welcome receipt.
+Repair reads existing D35 `device_activity` for the current roster entry's slot and `linked_at`. Only a counted
+heartbeat at least 600 seconds after that publication time qualifies; first sighting, link activity and arbitrary DG
+traffic do not. Unknown publication time never qualifies. The app reuses its bounded 32-row per-Welcome keyset walk;
+there is no new timer, source-proof recovery or per-message observation write. Engine participation and delivery
+checks still decide whether a qualifying Welcome can be sent. Heartbeat cadence and clock skew make repair best
+effort, not a receipt or proof that the target lacks its chat.
 
-Pre-cutoff native facts still retain verified device-principal attribution for alias deduplication. D91 restricts
-arming only; a later-epoch or rekeyed alias of already observed content cannot become fresh activity.
+Migration 0174 drops the obsolete D90/D91 processed-wrapper observation indexes, per-Welcome activity/deadline indexes
+and local ordering-clock table. The permanent processed-wrapper markers remain. Old nullable source-proof/activity
+columns and the old group epoch cutoff remain inert to avoid rebuilding the protocol ledger solely to erase them;
+no runtime path reads or writes them. Known publication times and carrier high-water values survive the upgrade.
 
 ### Backup history provenance and catalog
 

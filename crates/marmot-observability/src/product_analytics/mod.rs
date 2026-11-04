@@ -866,6 +866,9 @@ impl ProductAnalytics {
                 .find(|event| event["name"].as_str() == Some(name))
         });
         let host = config.registry.iter().find(|event| event.name == name);
+        let approved_host = approved_host_product_schemas()
+            .iter()
+            .find(|schema| schema.name == name);
         if builtin.is_none() && host.is_none() {
             return false;
         }
@@ -897,9 +900,7 @@ impl ProductAnalytics {
             if !props.contains_key("launch_reason") {
                 return false;
             }
-        } else if let Some(schema) = approved_host_product_schemas()
-            .iter()
-            .find(|schema| schema.name == name)
+        } else if let Some(schema) = approved_host
             && (schema
                 .properties
                 .iter()
@@ -921,13 +922,12 @@ impl ProductAnalytics {
             if let Some(expected) = common.get(key.as_str()) {
                 return value == *expected;
             }
-            if let Some(event) = builtin {
-                return event["properties"][key].as_array().is_some_and(|choices| {
-                    choices.iter().any(|choice| choice.as_str() == Some(value))
-                });
-            }
-            let Some(host) = host else { return false };
-            if host.mode == ProductEventMode::Aggregate {
+            // Sealing generates these fields for approved and registered host
+            // aggregates; the catalogue lists their input properties only.
+            if host
+                .or(approved_host)
+                .is_some_and(|schema| schema.mode == ProductEventMode::Aggregate)
+            {
                 if key == "partial" {
                     return matches!(value, "true" | "false");
                 }
@@ -935,6 +935,12 @@ impl ProductAnalytics {
                     return valid_property(&ProductPropertyRule::CountBucket, value);
                 }
             }
+            if let Some(event) = builtin {
+                return event["properties"][key].as_array().is_some_and(|choices| {
+                    choices.iter().any(|choice| choice.as_str() == Some(value))
+                });
+            }
+            let Some(host) = host else { return false };
             host.properties
                 .iter()
                 .find(|property| property.name == *key)

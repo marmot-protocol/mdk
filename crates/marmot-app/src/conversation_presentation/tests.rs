@@ -78,6 +78,7 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        recipient_confirmed: false,
         imported_from: None,
         history_import_provenance: None,
     }
@@ -139,6 +140,8 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
     assert!(!input.member_actions(false, true).can_demote);
     input.admin_count = 2;
     assert!(input.member_actions(false, true).can_demote);
+    assert!(input.capabilities().can_leave);
+    assert!(!input.capabilities().requires_self_demote_before_leave);
     for (membership, leaving, pending, lifecycle, expected) in [
         (
             SelfMembership::Member,

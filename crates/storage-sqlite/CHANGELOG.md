@@ -4,6 +4,31 @@
 
 ### Breaking changes
 
+- Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
+  `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
+  `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
+  eligibility. `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs instead of Welcome ids.
+  Rust callers must update and rebuild. Migration 0174 retires D90/D91 observation indexes and local ordering
+  clock, preserving processed-wrapper dedup, known publication times and carrier high-water; unused nullable
+  legacy columns remain inert.
+
+- A peer's reaction settles a send whose publish was judged to have reached
+  no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`:
+  true for a failed own row with no relay acceptance that another account
+  reacted to, which proves that peer received it. A pending send is not
+  settled. Such a row projects as delivered,
+  with no `invalidation_status` and, as before, no `source_message_id_hex`;
+  the chat list reports it `Delivered` and ranks it where it ranked as a
+  failed send, never as a pending one.
+  The stored `app_events` row keeps `local_publish_failed`, so a resend, the
+  terminal-group sweep and convergence withdrawals are unchanged. A peer
+  retracting its reaction returns the row to its failed state. When retention
+  prunes the confirming reaction while the send stays, the receipt is kept in
+  `kept_recipient_receipts` and goes with the send. Migration 0173 adds
+  `message_timeline.recipient_confirmed` and that table, rebuilds the
+  chat-list preview index and settles existing rows from their stored
+  reactions.
+
 - Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
 
 - Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,
@@ -276,6 +301,14 @@
   `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
   `StorageProvider` now requires; `put_account_device_history_key_if_absent`
   never replaces a stored key.
+- Migration 0172 advances account storage to schema 172 after migration 0171.
+  It adds the protocol-owned `cgka_group_rejoin` journal, with one recipient
+  job per group and bounded coordinator jobs. Capacity refusals preserve
+  existing work. A retained nonce cannot change its peer or recipient local
+  state token; refused writes leave the exact outbound artifact and retry
+  evidence intact. Same-job phase, retry and source refreshes remain writable.
+  Group deletion cascades to its recovery jobs. Older binaries reject the
+  upgraded database.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
@@ -438,6 +471,9 @@
   and every copy shared one store epoch and skipped incremental auto-vacuum.
 
 ### Added
+
+- Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
+  publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
 
 - Migration 0167 indexes active kind-7 reaction attachments from retained app
   events without creating timeline rows (mdk#2151), backfilling existing

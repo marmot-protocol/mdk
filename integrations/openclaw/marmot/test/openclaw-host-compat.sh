@@ -2,7 +2,7 @@
 set -euo pipefail
 
 plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-beta_version="2026.7.2-beta.7"
+beta_version="2026.10.10"
 update_lock=false
 case "${1:-}" in
   "") ;;
@@ -26,6 +26,7 @@ fi
 cp "$plugin_dir/package.json" "$compat_root/"
 cp "$plugin_dir/test/pnpm-lock.openclaw-beta.yaml" "$compat_root/pnpm-lock.yaml"
 cp "$plugin_dir/pnpm-workspace.yaml" "$compat_root/"
+cp "$plugin_dir/.npmrc" "$compat_root/"
 cp "$plugin_dir/tsconfig.json" "$compat_root/"
 cp "$plugin_dir/tsconfig.build.json" "$compat_root/"
 cp "$plugin_dir/vitest.config.ts" "$compat_root/"
@@ -52,10 +53,10 @@ if [ "$update_lock" = true ]; then
   exit 0
 fi
 # This dedicated lock fixes the complete beta dependency graph while the
-# compatibility lane exercises the deliberately different host SDK contract.
+# compatibility lane exercises the pinned beta-channel host SDK contract.
 pnpm install --ignore-scripts --frozen-lockfile
 pnpm build
-OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR=1 pnpm vitest run \
+pnpm vitest run \
   --fileParallelism=false \
   --maxWorkers=2 \
   test/openclaw-host-contract.test.ts \

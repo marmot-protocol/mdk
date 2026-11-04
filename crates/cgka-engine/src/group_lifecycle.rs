@@ -175,6 +175,7 @@ pub(crate) enum WelcomeRoute {
     Sibling {
         from: DeviceSlotId,
         key_package_ref: Vec<u8>,
+        invitation_generation: Option<[u8; 32]>,
     },
 }
 
@@ -821,6 +822,7 @@ impl<S: StorageProvider> Engine<S> {
             disbanded: None,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
             local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+            self_removed_sibling_slots: Default::default(),
             // A copy this device created was never installed by a Welcome.
             local_copy_welcome_created_at: None,
         };
@@ -859,6 +861,18 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
+        // Capture the authenticated founding result, not a later epoch. A
+        // founding Add's Welcome names the staged post-Add context.
+        let founding_generation = match mls_group.pending_commit() {
+            Some(staged) => crate::invitation_admission::invitation_generation(
+                self.identity.self_id(),
+                staged.group_context(),
+            )?,
+            None => self.local_invitation_generation(&mls_group)?,
+        };
+        if let Some(plan) = sibling_plan.as_mut() {
+            plan.invitation_generation = Some(founding_generation);
+        }
         let sibling_welcomes = match (&sibling_plan, &welcome_bytes) {
             (Some(plan), Some(bytes)) => crate::own_account_devices::build_sibling_welcomes(
                 plan,
@@ -966,6 +980,14 @@ impl<S: StorageProvider> Engine<S> {
                         canonical_record.epoch = canonical_epoch;
                         canonical_record.members = marmot_members(&mls_group);
                         storage.put_group(&canonical_record)?;
+                        storage.put_invitation_admission(
+                            &group_id,
+                            Some(&cgka_traits::group::InvitationAdmission {
+                                generation: founding_generation,
+                                created_locally: true,
+                                via_welcome: None,
+                            }),
+                        )?;
                         persist_new_group_maintenance(storage, &group_id, enrolled_at, None, None)?;
                         crate::roster_tag_keys::record_roster_tag_keys(
                             storage,
@@ -1545,6 +1567,7 @@ impl<S: StorageProvider> Engine<S> {
                     WelcomeRoute::Sibling {
                         from,
                         key_package_ref,
+                        ..
                     },
                     Some(record),
                 ) if &record.recipient_slot == from
@@ -1699,6 +1722,7 @@ impl<S: StorageProvider> Engine<S> {
             if dated_reset.is_some() && peeled.sender.as_ref() != Some(&welcome_sender_id) {
                 return Err(EngineError::InvalidWelcome);
             }
+            let admission_context = staged.group_context().clone();
             let mls_group = staged
                 .into_group(&provider)
                 .map_err(classify_openmls_welcome_error)?;
@@ -1868,6 +1892,7 @@ impl<S: StorageProvider> Engine<S> {
                 // Unconditional, unlike `join_epoch`: a first join and a
                 // replacement join both install a copy that starts here.
                 local_copy_install_epoch: EpochId(mls_group.epoch().as_u64()),
+                self_removed_sibling_slots: Default::default(),
                 // Clamped to this device's own clock. The value is the welcome
                 // rumor's `created_at`, which no relay validates, so an inviter
                 // running fast — or lying — would otherwise push the floor into
@@ -1877,10 +1902,31 @@ impl<S: StorageProvider> Engine<S> {
                     .map(|created_at| created_at.min(joined_at)),
             };
             mirror_app_components_into_record(&mls_group, &mut group_record);
+            let admission = match &route {
+                WelcomeRoute::Delivery => Some(cgka_traits::group::InvitationAdmission {
+                    generation: crate::invitation_admission::invitation_generation(
+                        self.identity.self_id(),
+                        &admission_context,
+                    )?,
+                    created_locally: false,
+                    via_welcome: Some(welcome_id.clone()),
+                }),
+                WelcomeRoute::Sibling {
+                    invitation_generation,
+                    ..
+                } => invitation_generation.map(|generation| {
+                    cgka_traits::group::InvitationAdmission {
+                        generation,
+                        created_locally: false,
+                        via_welcome: Some(welcome_id.clone()),
+                    }
+                }),
+            };
             if reset_cutoff.is_some() {
                 storage.complete_group_local_reset(&group_id)?;
             }
             storage.put_group(&group_record)?;
+            storage.put_invitation_admission(&group_id, admission.as_ref())?;
             crate::roster_tag_keys::record_roster_tag_keys(
                 storage, &group_id, &mls_group, joined_at,
             )?;

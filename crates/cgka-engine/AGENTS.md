@@ -91,8 +91,9 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `conformance_snapshot.rs` | Feature `test-conformance-snapshot` only: privacy-safe canonical-state and aggregate pending-work projections for the simulator. Structural progress counts completed distinct-context attempts; terminal equality excludes device-local authorship metadata. Never feeds protocol selection or production telemetry |
 | `test_crash_hooks.rs` | Feature `test-crash-hooks` only: subprocess pause points selected by `MDK_CGKA_TEST_CRASH_POINT` |
 
-Features (`Cargo.toml`): `test-policy-overrides`, `test-crash-hooks`, `test-conformance-snapshot`. All three are
-test-only; production/app consumers must not enable them.
+Features (`Cargo.toml`): `test-policy-overrides`, `test-crash-hooks`, `test-conformance-snapshot` are test-only;
+production/app consumers must not enable them. The separate default-off `dev-device-groups` permits only adopted
+roster advertisement for explicit dev CLI builds; it never enables timing overrides.
 
 ## Design deviations
 
@@ -124,8 +125,8 @@ Load-bearing departures from the original plan; each is also documented at its s
    because a group may require what its members advertise. Advertising never changes an existing group: upgrades
    require a component only when asked and never add account-devices (0x800d). Creation requires account-devices,
    unasked, exactly when the creator's leaf and every founding KeyPackage advertise it (`group_lifecycle.rs`). The
-   device roster (0x800e, mdk#2628 3.1) is advertisable only in `test-policy-overrides` builds until its spec is
-   adopted (`DEVICE_ROSTER_ADVERTISABLE`), so no release build creates or joins a device group. The host never lists
+   device roster (0x800e, mdk#2628 3.1) is advertisable with explicit `dev-device-groups` capability or policy tests
+   (`DEVICE_ROSTER_ADVERTISABLE`); ordinary release builds keep the dev capability off. The host never lists
    the device tag (0x800f): the engine advertises it on exactly the leaves it tags, and only a device group gives it
    a roster to tag from.
 
@@ -261,6 +262,17 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   unresolved *commits* below the new copy's `MlsGroup::epoch()`. Bound it by locally derived authenticated epochs only,
   keep it to commits (prior-interval applications may still decrypt, which is why a replacement Welcome records
   `join_epoch = 0`), and never move it to a seam that reads inbound claims.
+- **A sibling's voluntary departure is local current-membership knowledge (mdk#2628 D99).** Only an authenticated
+  `Proposal::SelfRemove` in an actually selected/applied staged commit records its source leaf's own-account tagged
+  slot in `Group.self_removed_sibling_slots`; ordinary Remove, proposal receipt and candidate probes record nothing.
+  Publication writes it before the existing own-commit checkpoint. Selected apply retains known slots through anchor
+  rewind/checkpoint reconstruction and clears only slots present in the final selected tree. Fresh Welcome admission
+  resets the set. Shared private Add admission returns `SiblingLeft` for an absent held slot before stock is spent.
+  Known unavailable context (quarantined/unhydrated or missing MLS group) identifies no slot and never blocks another
+  chat's apply. Source-roster load/decode errors on a live group still propagate through transaction retry; malformed
+  or unclaimed tags identify no slot. Retain prior facts when context is unavailable; do not invent retroactive proof.
+  Owners: `account_devices/sibling_welcomes.rs::an_applied_sibling_self_remove_holds_private_adds` and
+  `::a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns`.
 - **Commit-derived group records are atomic with the MLS apply.** Every durable projection of an accepted commit (the
   Marmot group record and its mirrored required capabilities and components) shares the transaction that mutates
   OpenMLS state, and every projection read/write error propagates. On a failed direct

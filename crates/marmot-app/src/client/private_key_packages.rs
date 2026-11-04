@@ -56,7 +56,9 @@
 //!   before the send, so one Welcome is never carried twice at once. The
 //!   Welcome is delivered once a drain reports that 461 published, and owed
 //!   again once it reached no one, for the next pass to send in a new 461.
-//!   Delivered means one relay took it; nothing sends it again (3.5e).
+//!   Delivered means one relay took the initial carrier, completing initial
+//!   delivery. Under D100, a qualifying later heartbeat can repair the same
+//!   retained Welcome, without another Add or KeyPackage.
 
 use base64::Engine as _;
 use cgka_traits::app_components::{DeviceSlotId, valid_sibling_welcome_relays};
@@ -83,6 +85,9 @@ use super::device_group::Exchange;
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::private_key_packages";
+
+// Original Welcome record ID and its current carrier ID.
+type SiblingWelcomeCarrierIds = (Vec<u8>, Vec<u8>);
 
 /// While a need lasts, a device asks the same sibling again at most this
 /// often.
@@ -875,6 +880,12 @@ impl AppClient {
         sibling: &DeviceSlotId,
         candidate: ReceivedPrivateKeyPackage,
     ) -> Result<(), AppError> {
+        // Candidate selection and claim publication can precede this final
+        // preparation. Re-read the current generation before spending stock.
+        // Already admitted/signed work has its own settlement owner.
+        if !self.invitation_allows_sibling_add(chat)? {
+            return Ok(());
+        }
         if !self.take_private_key_package_exact(sibling, &candidate)? {
             return Err(AppError::DeviceGroupRefused("no_private_key_package"));
         }
@@ -922,7 +933,9 @@ impl AppClient {
         }
     }
 
-    fn retire_ended_sibling_welcome_resends(&mut self) -> Result<(), AppError> {
+    fn retire_ended_sibling_welcome_resends(
+        &mut self,
+    ) -> Result<Vec<SiblingWelcomeCarrierIds>, AppError> {
         // Retirement prepares/sends nothing and remains possible while DG
         // readiness holds new carriers. The engine durably terminalizes expiry
         // before we forget timing/high-water state.
@@ -932,16 +945,19 @@ impl AppClient {
         if batch.is_empty() {
             self.sibling_welcome_retirement_cursor = None;
         }
-        for id in batch {
+        let mut retained = Vec::new();
+        for (id, carrier) in batch {
             self.sibling_welcome_retirement_cursor = Some(id.clone());
             if self.runtime.sibling_welcome_resend_has_ended(
                 &MessageId::new(id.clone()),
                 Timestamp(unix_now_seconds()),
             )? {
                 storage.delete_sibling_welcome_resend(&id)?;
+            } else {
+                retained.push((id, carrier));
             }
         }
-        Ok(())
+        Ok(retained)
     }
 
     /// Nothing goes out until this device's own leaf is tagged, since its
@@ -955,14 +971,14 @@ impl AppClient {
     /// never have left. One from a slot other than this device's, or to a
     /// device the roster no longer lists, waits until it expires.
     async fn try_send_owed_sibling_welcomes(&mut self, held: &[GroupId]) -> Result<(), AppError> {
-        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
-            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
-                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
-        }
-        if let Err(error) = self.retire_ended_sibling_welcome_resends() {
-            tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
-                error_kind = error.privacy_safe_kind(), "could not retire ended sibling Welcome timing");
-        }
+        let resends = match self.retire_ended_sibling_welcome_resends() {
+            Ok(retained) => retained,
+            Err(error) => {
+                tracing::warn!(target: TRACE_TARGET, method = "try_send_owed_sibling_welcomes",
+                    error_kind = error.privacy_safe_kind(), "could not retire ended sibling Welcome timing");
+                Vec::new()
+            }
+        };
         let Some(exchange) = self.device_group_exchange()? else {
             return Ok(());
         };
@@ -980,7 +996,7 @@ impl AppClient {
         let storage = account_storage.app_storage();
         let now_ms = super::recovery::wall_now_ms()?;
         let mut gone = None;
-        for (id, carrier) in storage.due_sibling_welcome_resends(now_ms)? {
+        for (id, carrier) in resends {
             use cgka_traits::message::{MessageState, StoredMessagePayload};
             use cgka_traits::storage::{MessageStorage as _, StorageError};
             let original_id = MessageId::new(id.clone());
@@ -998,6 +1014,11 @@ impl AppClient {
                 Ok(_) | Err(StorageError::NotFound) => None,
                 Err(error) => return Err(error.into()),
             };
+            if let Some(entry) = target.and_then(|slot| exchange.roster.devices.get(&slot))
+                && !storage.sibling_welcome_resend_is_due(&id, entry.linked_at)?
+            {
+                continue;
+            }
             if let Some(target) = target
                 && !exchange.roster.devices.contains_key(&target)
             {

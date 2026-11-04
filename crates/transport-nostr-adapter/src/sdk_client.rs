@@ -1730,6 +1730,7 @@ impl PublishRelayCache {
 struct ScopedPublishRelayLease {
     owner: NostrSdkRelayClient,
     endpoints: Vec<RelayUrl>,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ScopedPublishRelayLease {
@@ -1737,6 +1738,7 @@ impl ScopedPublishRelayLease {
         Self {
             owner,
             endpoints: Vec::new(),
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -1762,7 +1764,12 @@ impl Drop for ScopedPublishRelayLease {
             return;
         }
         let owner = self.owner.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        // Preserve ambient-runtime cleanup, but keep cancellation working when
+        // the host drops this Send publication future outside Tokio.
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.cleanup_runtime.take());
+        if let Some(runtime) = runtime {
             // A dropped batch future is cancellation. Hand cleanup to an
             // independent task so transient write relays do not outlive the
             // cancelled scope.
@@ -6051,6 +6058,102 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn acquisition_account_lookup_obeys_cancellation_and_original_deadline() {
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let mut request = acquisition_request(account_id, endpoint, vec![[1; 32]], 2, 4_096);
+        request
+            .endpoints
+            .push(TransportEndpoint("ws://127.0.0.1:9".into()));
+        request.limits.max_endpoints = 2;
+
+        for end in [
+            NostrAcquisitionEnd::Cancelled,
+            NostrAcquisitionEnd::Deadline,
+        ] {
+            // Registration and removal use this same write lock. Hold that
+            // real contention point across a caller's cancellation/deadline;
+            // no invented account state or readiness flag is involved.
+            let registration = root.account_clients.write().await;
+            let cancellation = NostrAcquisitionCancellation::default();
+            let mut acquisition =
+                Box::pin(root.acquire_history(request.clone(), cancellation.clone()));
+            assert!(futures::poll!(acquisition.as_mut()).is_pending());
+            match end {
+                NostrAcquisitionEnd::Cancelled => cancellation.cancel(),
+                NostrAcquisitionEnd::Deadline => advance(request.limits.max_duration).await,
+                _ => unreachable!(),
+            }
+            let result = timeout(Duration::from_millis(1), acquisition)
+                .await
+                .expect("account lookup must end before the registration lock is released")
+                .unwrap();
+            assert_eq!(result.endpoints.len(), request.endpoints.len());
+            for (outcome, endpoint) in result.endpoints.iter().zip(&request.endpoints) {
+                assert_eq!(&outcome.endpoint, endpoint);
+                assert_eq!(outcome.end, end);
+                assert_eq!(outcome.session_generation, None);
+                assert!(outcome.events.is_empty());
+                assert_eq!(outcome.stats, crate::NostrAcquisitionStats::default());
+            }
+            drop(registration);
+            assert!(account.client().relays().await.is_empty());
+            assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
+        }
+        root.shutdown_accounts().await;
+        root.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquisition_account_lookup_spends_the_original_network_budget() {
+        let mut wire = ReplayWire::new().await;
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        root.register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let mut request = acquisition_request(
+            account_id,
+            RelayUrl::parse(wire.endpoint.as_str()).unwrap(),
+            vec![[1; 32]],
+            2,
+            4_096,
+        );
+        request.limits.max_duration = Duration::from_secs(6);
+        let registration = root.account_clients.write().await;
+        let mut acquisition =
+            Box::pin(root.acquire_history(request, NostrAcquisitionCancellation::default()));
+        assert!(futures::poll!(acquisition.as_mut()).is_pending());
+        advance(Duration::from_secs(3)).await;
+        drop(registration);
+        // Real socket scheduling gets a generous three-second remainder. The
+        // endpoint stays silent so only the carried caller budget can end it.
+        tokio::time::resume();
+        let result = timeout(Duration::from_millis(3_500), acquisition)
+            .await
+            .expect("account lookup must not restart the six-second request budget")
+            .unwrap();
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].end, NostrAcquisitionEnd::Deadline);
+        assert!(result.endpoints[0].events.is_empty());
+        assert!(
+            std::iter::from_fn(|| wire.received.try_recv().ok()).any(|frame| frame[0] == "REQ"),
+            "the remaining budget must exercise a real acquisition REQ"
+        );
+        root.shutdown_accounts().await;
+        root.shutdown().await;
+    }
+
     #[tokio::test]
     async fn production_acquisition_preserves_partial_and_byte_limit_evidence() {
         let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
@@ -6394,6 +6497,161 @@ mod tests {
         root.shutdown_accounts().await;
     }
 
+    #[tokio::test]
+    async fn invalid_account_contexts_reject_before_publication_io() {
+        let root = NostrSdkRelayClient::multi_account();
+        let author = Keys::generate();
+        let other = Keys::generate();
+        let account_id = MemberId::new(author.public_key().to_bytes().to_vec());
+        let other_id = MemberId::new(other.public_key().to_bytes().to_vec());
+        let signer: Arc<dyn MarmotNostrSigner> = Arc::new(author.clone());
+        let wrong = NostrSdkRelayClient::with_account_signer(
+            Client::default(),
+            account_id.clone(),
+            Arc::new(other.clone()),
+        );
+        let non_root = wrong
+            .register_account(account_id.clone(), signer.clone())
+            .await;
+        assert!(
+            matches!(non_root, Err(TransportAdapterError::Subscription(ref reason))
+            if reason == "account registration requires a multi-account client")
+        );
+        let mismatch = root
+            .register_account(account_id.clone(), Arc::new(other))
+            .await;
+        assert!(
+            matches!(mismatch, Err(TransportAdapterError::Subscription(ref reason))
+            if reason == "account signer does not match account identity")
+        );
+        let account = root
+            .register_account(account_id.clone(), signer.clone())
+            .await
+            .unwrap();
+        account.record_notification_gap(3);
+        let loss = root
+            .notification_loss_for_account(&account_id)
+            .await
+            .unwrap();
+        let before = loss.borrow().clone();
+        let changed = root
+            .register_account(account_id.clone(), Arc::new(author))
+            .await;
+        assert!(
+            matches!(changed, Err(TransportAdapterError::Subscription(ref reason))
+            if reason == "account signer changed without removing prior context")
+        );
+        assert_eq!(*loss.borrow(), before);
+        assert!(matches!(
+            account.notification_loss_for_account(&other_id).await,
+            Err(NostrAcquisitionError::InvalidRequest)
+        ));
+        assert_eq!(*loss.borrow(), before);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let requests = (0..2)
+            .map(|_| NostrEventPublishRequest {
+                endpoints: vec![endpoint.clone()],
+                event: signed_group_event_dto(),
+                required_acks: 1,
+            })
+            .collect::<Vec<_>>();
+        for client in [&root, &wrong] {
+            let batch = client.publish_events_with_timings(&requests).await;
+            assert_eq!(batch.outcomes.len(), requests.len());
+            assert_eq!(batch.request_durations.len(), requests.len());
+            for result in batch.outcomes {
+                assert!(
+                    matches!(result, Err(TransportAdapterError::Publish(ref reason))
+                    if reason == "invalid publication account context")
+                );
+            }
+        }
+        for client in [&root, &account] {
+            let batch = client
+                .publish_events_for_account_with_timings(&other_id, &requests)
+                .await;
+            assert_eq!(batch.outcomes.len(), requests.len());
+            assert_eq!(batch.request_durations.len(), requests.len());
+            for result in batch.outcomes {
+                assert!(
+                    matches!(result, Err(TransportAdapterError::Publish(ref reason))
+                    if reason == "publication account has no matching authentication context")
+                );
+            }
+        }
+        for (client, expected) in [
+            (&root, "account has no authentication context"),
+            (&account, "account context does not match requested account"),
+        ] {
+            let result = client
+                .subscribe(NostrSubscription::AccountInbox {
+                    account_id: other_id.clone(),
+                    endpoints: vec![endpoint.clone()],
+                    since: Some(Timestamp(1)),
+                    attempt: SubscriptionAttempt::INITIAL,
+                })
+                .await;
+            assert!(
+                matches!(result, Err(TransportAdapterError::Subscription(ref reason)) if reason == expected)
+            );
+        }
+        let invalid_acquisition = account
+            .acquire_history(
+                acquisition_request(
+                    other_id.clone(),
+                    RelayUrl::parse(endpoint.as_str()).unwrap(),
+                    vec![[1; 32]],
+                    2,
+                    4_096,
+                ),
+                NostrAcquisitionCancellation::default(),
+            )
+            .await;
+        assert!(matches!(
+            invalid_acquisition,
+            Err(NostrAcquisitionError::InvalidRequest)
+        ));
+        let unknown = root
+            .publish_event_for_account(
+                &other_id,
+                std::slice::from_ref(&endpoint),
+                &requests[0].event,
+                1,
+            )
+            .await;
+        assert!(
+            matches!(unknown, Err(TransportAdapterError::Publish(ref reason))
+            if reason == "account has no authentication context")
+        );
+        let mismatched = account
+            .publish_event_for_account(
+                &other_id,
+                std::slice::from_ref(&endpoint),
+                &requests[0].event,
+                1,
+            )
+            .await;
+        assert!(
+            matches!(mismatched, Err(TransportAdapterError::Publish(ref reason))
+            if reason == "publication account does not match authentication context")
+        );
+        for client in [&root, &wrong, &account] {
+            assert!(client.client().relays().await.is_empty());
+        }
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "invalid contexts must never dial the requested endpoint"
+        );
+        assert_eq!(*loss.borrow(), before);
+        root.shutdown_accounts().await;
+        root.shutdown().await;
+        wrong.shutdown().await;
+    }
+
     #[test]
     fn notification_loss_floor_is_the_lowest_live_or_closed_since() {
         use NostrNotificationLossFloor::{Since, Unbounded};
@@ -6592,6 +6850,19 @@ mod tests {
         .unwrap();
         root.subscribe(group(Some(Timestamp(1_000)))).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
+        assert_eq!(
+            account
+                .notification_loss_floor_for_account(&account_id)
+                .await,
+            Since(1_000)
+        );
+        assert_eq!(
+            account
+                .notification_loss_floor_for_account(&MemberId::new(vec![0xEE; 32]))
+                .await,
+            Unbounded,
+            "a direct immutable context must not expose its floor as another account's"
+        );
         let routes = BTreeMap::from([
             (DeliveryRoute::Inbox, 2_000),
             (DeliveryRoute::Group([0xD4; 32]), 1_000),
@@ -7763,7 +8034,7 @@ mod tests {
         adapter
             .activate_account(crate::TransportAccountActivation {
                 account_id: account_id.clone(),
-                inbox_endpoints: vec![endpoint],
+                inbox_endpoints: vec![endpoint.clone()],
                 group_subscriptions: Vec::new(),
                 since: None,
             })
@@ -7776,6 +8047,13 @@ mod tests {
         })
         .await
         .expect("the account's inbox REQ counts its EOSE");
+        assert!(account.relay_connection(&account_id, &endpoint).is_some());
+        assert!(
+            account
+                .relay_connection(&MemberId::new(vec![0xEE; 32]), &endpoint)
+                .is_none(),
+            "an immutable context must not name its live connection for another account"
+        );
         forwarder.abort();
         let _ = forwarder.await;
         root.remove_account(&account_id).await;
@@ -10694,7 +10972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_batch_clients_keep_account_signers_isolated() {
+    async fn concurrent_signing_keeps_account_signers_isolated() {
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();
         let sdk_a = signed_sdk(keys_a.clone());
@@ -10719,6 +10997,41 @@ mod tests {
 
         assert_eq!(signed_a.unwrap().pubkey, keys_a.public_key());
         assert_eq!(signed_b.unwrap().pubkey, keys_b.public_key());
+    }
+
+    #[tokio::test]
+    async fn shared_signing_rejects_a_changed_account_identity() {
+        let author = Keys::generate();
+        let other = Keys::generate();
+        let unsigned = NostrTransportEvent::new_unsigned(
+            author.public_key().to_hex(),
+            10_002,
+            vec![vec!["r".into(), "wss://relay.example".into()]],
+            String::new(),
+        );
+
+        // EventBuilder obtains the signer's public key before constructing
+        // the event. Real Keys B can sign it, so this reaches MDK's identity
+        // check rather than an upstream refusal to sign an A-authored event.
+        let error = sign_transport_event_for_publish(Arc::new(other), &unsigned)
+            .await
+            .expect_err("a different account must not change the event identity");
+        assert!(matches!(
+            error,
+            TransportAdapterError::Publish(ref reason) if reason == "signed event changed identity"
+        ));
+
+        // The same account must also reject a caller-supplied identity that
+        // does not describe the event it actually signs.
+        let mut changed_id = unsigned;
+        changed_id.id = "00".repeat(32);
+        let error = sign_transport_event_for_publish(Arc::new(author), &changed_id)
+            .await
+            .expect_err("the declared event id must survive signing exactly");
+        assert!(matches!(
+            error,
+            TransportAdapterError::Publish(ref reason) if reason == "signed event changed identity"
+        ));
     }
 
     #[test]
@@ -10952,10 +11265,10 @@ mod tests {
             err.publish_message_id().unwrap().as_slice(),
             hex::decode(expected_id).unwrap()
         );
-        assert!(
-            err.publish_endpoint_failures()
-                .iter()
-                .all(|failure| { failure.kind == TransportEndpointFailureKind::PossiblyExposed })
+        assert_eq!(err.publish_endpoint_failures().len(), 1);
+        assert_eq!(
+            err.publish_endpoint_failures()[0].kind,
+            TransportEndpointFailureKind::PossiblyExposed
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
@@ -11017,48 +11330,6 @@ mod tests {
             .expect("the next publish must reconnect through a fresh socket");
         assert_eq!(retry.accepted.len(), 1);
         assert_eq!(*connection_count.lock().await, 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn relay_that_stores_event_but_withholds_ok_is_possibly_exposed() {
-        let stored_ids = Arc::new(Mutex::new(Vec::new()));
-        let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
-        let sdk = signed_sdk(Keys::generate());
-        let dto = signed_group_event_dto();
-        let expected_id = dto.id.clone();
-        let publish_sdk = sdk.clone();
-        let publish_endpoint = endpoint.clone();
-        let publish = tokio::spawn(async move {
-            publish_sdk
-                .publish_event(std::slice::from_ref(&publish_endpoint), &dto, 1)
-                .await
-        });
-
-        for _ in 0..100 {
-            if stored_ids.lock().await.contains(&expected_id) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            stored_ids.lock().await.contains(&expected_id),
-            "the relay must receive and retain the event before withholding OK"
-        );
-
-        advance(SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1)).await;
-        let err = publish
-            .await
-            .expect("publish task must not panic")
-            .expect_err("withheld OK must leave completion unresolved");
-        assert_eq!(
-            err.publish_message_id().unwrap().as_slice(),
-            hex::decode(expected_id).unwrap()
-        );
-        assert_eq!(err.publish_endpoint_failures().len(), 1);
-        assert_eq!(
-            err.publish_endpoint_failures()[0].kind,
-            TransportEndpointFailureKind::PossiblyExposed
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -12046,6 +12317,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fifth_batch_publish_waits_for_a_slot_and_keeps_its_fresh_deadline() {
+        let mut wire = ReplayWire::new().await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let requests = (0..8)
+            .map(|_| NostrEventPublishRequest {
+                endpoints: vec![wire.endpoint.clone()],
+                event: signed_group_event_dto(),
+                required_acks: 1,
+            })
+            .collect::<Vec<_>>();
+        let ids = requests
+            .iter()
+            .map(|request| request.event.id.clone())
+            .collect::<Vec<_>>();
+        let first_cohort = ids[..4].iter().cloned().collect::<BTreeSet<_>>();
+        let publishing = sdk.clone();
+        let started = tokio::time::Instant::now();
+        let mut publish =
+            tokio::spawn(async move { publishing.publish_events_with_timings(&requests).await });
+        let mut attempts = BTreeMap::<String, usize>::new();
+        while attempts.len() < 4 {
+            let frame = wire.recv_kind("EVENT").await;
+            let id = frame[1]["id"].as_str().unwrap().to_owned();
+            assert!(
+                first_cohort.contains(&id),
+                "a fifth EVENT cannot enter a full cohort"
+            );
+            *attempts.entry(id).or_default() += 1;
+        }
+        assert_eq!(
+            attempts.keys().cloned().collect::<BTreeSet<_>>(),
+            first_cohort
+        );
+
+        // The SDK ends its first ACK wait before MDK's twenty-second budget.
+        // Advance that clock, then observe actual retry EVENTs before sending
+        // any OK; an expired first SDK wait is never treated as still active.
+        tokio::time::pause();
+        advance(Duration::from_secs(11)).await;
+        advance(SDK_RELAY_PUBLISH_RETRY_BACKOFF).await;
+        tokio::time::resume();
+        while attempts.values().any(|count| *count < 2) {
+            let frame = wire.recv_kind("EVENT").await;
+            let id = frame[1]["id"].as_str().unwrap().to_owned();
+            assert!(
+                first_cohort.contains(&id),
+                "backpressure holds the fifth EVENT through a real retry"
+            );
+            *attempts.entry(id).or_default() += 1;
+        }
+        assert!(
+            timeout(Duration::from_millis(50), wire.recv_kind("EVENT"))
+                .await
+                .is_err(),
+            "four unacknowledged requests must keep the fifth off the wire"
+        );
+        assert!(!publish.is_finished());
+
+        // Admit the refill late enough that its legitimate ACK can follow the
+        // first cohort's deadline, while its own SDK ACK wait remains live.
+        let release_at = started + Duration::from_secs(17);
+        assert!(tokio::time::Instant::now() < release_at);
+        tokio::time::pause();
+        advance(release_at.saturating_duration_since(tokio::time::Instant::now())).await;
+        tokio::time::resume();
+        for id in &ids[..4] {
+            wire.send(serde_json::json!(["OK", id, true, ""])).await;
+        }
+        let refill_ids = ids[4..].iter().cloned().collect::<BTreeSet<_>>();
+        let mut refilled = BTreeSet::new();
+        while refilled.len() < 4 {
+            let refill = wire.recv_kind("EVENT").await;
+            let id = refill[1]["id"].as_str().unwrap().to_owned();
+            assert!(refill_ids.contains(&id));
+            refilled.insert(id);
+        }
+        assert_eq!(refilled, refill_ids);
+        // All four actual refill EVENTs can exist only once all four prior
+        // requests consumed their OK and freed their production batch slots.
+        // Receiving raw OK notifications alone would be an earlier boundary.
+
+        tokio::time::pause();
+        advance(
+            (started + Duration::from_secs(21))
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+        tokio::time::resume();
+        assert!(
+            timeout(Duration::from_millis(50), &mut publish)
+                .await
+                .is_err(),
+            "the fifth request must still await its ACK after the first cohort deadline"
+        );
+        for id in &ids[4..] {
+            wire.send(serde_json::json!(["OK", id, true, ""])).await;
+        }
+        let batch = timeout(Duration::from_secs(2), publish)
+            .await
+            .expect("the real late refill ACK completes the batch")
+            .unwrap();
+        assert_eq!(batch.outcomes.len(), ids.len());
+        assert_eq!(batch.request_durations.len(), ids.len());
+        for (outcome, id) in batch.outcomes.into_iter().zip(ids) {
+            let outcome = outcome.expect("every actual ACK must retain its request slot");
+            assert_eq!(
+                outcome
+                    .message_id
+                    .as_ref()
+                    .expect("an ACK retains the event identity")
+                    .as_slice(),
+                hex::decode(id).unwrap()
+            );
+            assert_eq!(outcome.accepted.len(), 1);
+            assert_eq!(outcome.accepted[0].endpoint, wire.endpoint);
+            assert!(outcome.failed.is_empty());
+        }
+        assert_eq!(
+            sdk.relay_health().await.total_relays,
+            1,
+            "one warm owned socket survives the shared lease"
+        );
+        sdk.shutdown().await;
+        assert_eq!(sdk.relay_health().await.connected, 0);
+    }
+
+    #[tokio::test]
     async fn publish_batch_deduplicates_mixed_endpoint_sets() {
         let relay_a = MockRelay::run().await.unwrap();
         let relay_b = MockRelay::run().await.unwrap();
@@ -12095,7 +12493,16 @@ mod tests {
             .remove(0)
             .expect_err("unreachable relay must fail");
 
-        assert!(!err.to_string().is_empty());
+        let failures = err.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].endpoint.as_str(), relay_url.as_str());
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::RetryableUnavailable
+        );
+        assert_eq!(failures[0].reason, "connect relay failed");
+        assert_eq!(failures[0].rejection_category, None);
+        assert!(err.publish_message_id().is_some());
         assert_eq!(
             sdk.publish_release_attempts.lock().await.get(&relay_url),
             Some(&1)
@@ -12104,8 +12511,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_publish_batch_cleans_write_only_relay() {
-        assert_cancelled_publish_cleans_write_only_relay(signed_sdk(Keys::generate())).await;
+    async fn cancelled_publication_cleans_inside_runtime_control() {
+        assert_cancelled_publication_cleans_in_drop_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_cleans_outside_runtime() {
+        assert_cancelled_publication_cleans_in_drop_context(true).await;
+    }
+
+    async fn assert_cancelled_publication_cleans_in_drop_context(outside_runtime: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let event = signed_group_event_dto();
+        let expected_event = serde_json::to_value(&event).unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut received_tx = Some(received_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value[0] == "EVENT" {
+                    assert_eq!(value[1], expected_event);
+                    let wire_event: Event = serde_json::from_value(value[1].clone()).unwrap();
+                    wire_event.verify().unwrap();
+                    if let Some(received_tx) = received_tx.take() {
+                        received_tx.send(()).unwrap();
+                    }
+                    // The real SDK remains waiting for this EVENT's OK.
+                    // The fixture does not initiate socket cleanup.
+                }
+            }
+            assert!(
+                received_tx.is_none(),
+                "socket ended before the actual EVENT"
+            );
+            let _ = closed_tx.send(());
+        });
+
+        let publish_sdk = sdk.clone();
+        let endpoints = vec![endpoint];
+        let mut publication: BoxedFuture<
+            'static,
+            Result<NostrPublishOutcome, TransportAdapterError>,
+        > = Box::pin(async move {
+            NostrRelayClient::publish_event(&publish_sdk, &endpoints, &event, 1).await
+        });
+        tokio::select! {
+            result = publication.as_mut() => {
+                panic!("publication completed before the wire receipt: {result:?}");
+            }
+            receipt = timeout(Duration::from_secs(3), received_rx) => {
+                receipt.expect("relay must receive the actual signed EVENT").unwrap();
+            }
+        }
+        assert!(
+            futures::poll!(publication.as_mut()).is_pending(),
+            "the EVENT has no ACK, so the public future must still be pending"
+        );
+        let relay = sdk
+            .client()
+            .relay(relay_url.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert!(relay.capabilities().can_write());
+        assert!(!relay.capabilities().can_read());
+        assert!(relay.subscriptions().await.is_empty());
+        assert_eq!(sdk.relay_health().await.total_relays, 1);
+        drop(relay);
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+
+        if outside_runtime {
+            std::thread::spawn(move || {
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                drop(publication);
+            })
+            .join()
+            .expect("the supported Send future must be droppable on the host thread");
+        } else {
+            drop(publication);
+        }
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+
+        let mut socket_closed_before_shutdown = false;
+        let cleanup = timeout(Duration::from_secs(2), async {
+            let pool_removed = async {
+                while sdk
+                    .client()
+                    .relay(relay_url.clone())
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            };
+            let socket_closed = async {
+                (&mut closed_rx)
+                    .await
+                    .expect("the socket observer must remain alive");
+                socket_closed_before_shutdown = true;
+            };
+            tokio::join!(pool_removed, socket_closed);
+        })
+        .await;
+        let registered_before_shutdown = sdk.client().relay(relay_url).await.unwrap().is_some();
+        let health_before_shutdown = sdk.relay_health().await;
+        // Teardown happens after all observations, including on a failing candidate.
+        sdk.shutdown().await;
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("explicit local teardown must close the fixture socket")
+            .unwrap();
+        assert!(
+            cleanup.is_ok() && !registered_before_shutdown && socket_closed_before_shutdown,
+            "cancelling the pending public publication must remove its transient pool relay and close its socket; outside_runtime={outside_runtime} registered_before_shutdown={registered_before_shutdown} pool_total_before_shutdown={} connected_before_shutdown={} socket_closed_before_shutdown={socket_closed_before_shutdown}",
+            health_before_shutdown.total_relays,
+            health_before_shutdown.connected,
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_setup_cleans_write_only_relay() {
+        assert_cancelled_publish_setup_cleans_write_only_relay(signed_sdk(Keys::generate())).await;
     }
 
     /// Account fallbacks use builder-owned authenticated clients. Cancel only
@@ -12238,7 +12780,7 @@ mod tests {
         sdk.client().shutdown().await;
     }
 
-    async fn assert_cancelled_publish_cleans_write_only_relay(sdk: NostrSdkRelayClient) {
+    async fn assert_cancelled_publish_setup_cleans_write_only_relay(sdk: NostrSdkRelayClient) {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
         let publish_sdk = sdk.clone();
@@ -12263,7 +12805,7 @@ mod tests {
             }
         })
         .await
-        .expect("wire publication must start before cancellation");
+        .expect("publication connection setup must start before cancellation");
         let relay = sdk
             .client()
             .relays()
@@ -12278,7 +12820,7 @@ mod tests {
         );
 
         publish.abort();
-        let _ = publish.await;
+        assert!(publish.await.unwrap_err().is_cancelled());
         timeout(Duration::from_secs(2), async {
             while sdk.relay_health().await.total_relays != 0 {
                 tokio::task::yield_now().await;
@@ -13160,6 +13702,7 @@ mod tests {
     /// with EOSE.
     async fn recording_relay(
         addr: std::net::SocketAddr,
+        flush_marker: String,
     ) -> (JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
         let listener = TcpListener::bind(addr).await.unwrap();
         let received = Arc::new(StdMutex::new(Vec::new()));
@@ -13167,6 +13710,7 @@ mod tests {
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let recorder = recorder.clone();
+                let flush_marker = flush_marker.clone();
                 tokio::spawn(async move {
                     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -13178,6 +13722,10 @@ mod tests {
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                             continue;
                         };
+                        if value[0] == "CLOSE" && value[1].as_str() == Some(flush_marker.as_str()) {
+                            recorder.lock().unwrap().push(flush_marker.clone());
+                            continue;
+                        }
                         if value[0] != "REQ" {
                             continue;
                         }
@@ -13223,7 +13771,8 @@ mod tests {
             .unwrap();
         assert!(sdk.owed.owes(&endpoint), "the kept REQ is still owed");
 
-        let (server, received) = recording_relay(addr).await;
+        let flush_marker = SubscriptionId::generate();
+        let (server, received) = recording_relay(addr, flush_marker.to_string()).await;
         timeout(Duration::from_secs(10), async {
             while !received.lock().unwrap().contains(&kept.subscription_id()) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -13231,10 +13780,32 @@ mod tests {
         })
         .await
         .expect("the recovered relay gets the kept REQ");
-        // Every owed REQ goes out in the same re-send; allow stragglers.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(*received.lock().unwrap(), vec![kept.subscription_id()]);
+        // The re-send lock settles all owed registrations. A CLOSE marker on
+        // that same FIFO socket then proves their frames reached the relay.
+        let resend = sdk.owed.resend.lock().await;
         assert!(!sdk.owed.owes(&endpoint));
+        sdk.client()
+            .relay(endpoint.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .send_msg(nostr_sdk::prelude::ClientMessage::Close(
+                std::borrow::Cow::Owned(flush_marker.clone()),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !received.lock().unwrap().contains(&flush_marker.to_string()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the relay handles the marker after every owed REQ");
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![kept.subscription_id(), flush_marker.to_string()]
+        );
+        drop(resend);
         sdk.shutdown().await;
         server.abort();
     }

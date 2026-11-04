@@ -7,7 +7,8 @@
 //! anything is recorded or published. From the receivers' side, every member
 //! and sibling accepts the Commit, an added device joins through its sibling
 //! Welcome, and a removed one sees its removal. An Add sends a sibling Welcome
-//! through the device group, so it goes through only in test-policy builds. Fair scheduling gives a queued
+//! through the device group; those fixtures use policy-test builds. Explicit dev
+//! builds also permit that adopted capability. Fair scheduling gives a queued
 //! same-account intent the one preparation attempt an admin intent gets, and
 //! never a self-update or a Leave.
 

@@ -56,6 +56,7 @@ const REMOVE: &str = "RemoveOwnAccountDevices";
 pub(crate) struct SiblingWelcomePlan {
     from: DeviceSlotId,
     relays: Vec<String>,
+    pub(crate) invitation_generation: Option<[u8; 32]>,
 }
 
 /// A sibling Welcome plan, or why the Add is refused and the reason it gives.
@@ -496,6 +497,17 @@ impl<S: StorageProvider> Engine<S> {
                 "this device is not tagged in a trusted device group",
             );
         };
+        // Creation uses this same admission before its first Group record is
+        // inserted. A fresh membership has no departure history. All other
+        // read failures remain errors; no historical hold is guessed.
+        let departed = match self
+            .storage
+            .get_group(&GroupId::new(mls_group.group_id().as_slice().to_vec()))
+        {
+            Ok(group) => group.self_removed_sibling_slots,
+            Err(StorageError::NotFound) => Default::default(),
+            Err(error) => return Err(error.into()),
+        };
         let mut slots = HashSet::new();
         for sibling in siblings {
             if sibling.key_package.source.is_some() {
@@ -553,6 +565,9 @@ impl<S: StorageProvider> Engine<S> {
                     "the chat already holds the sibling",
                 );
             }
+            if departed.contains(&sibling.slot) {
+                return refused(SiblingAddRefusal::SiblingLeft, "the sibling left this chat");
+            }
         }
         let Some(relays) = sibling_welcome_relays(mls_group)? else {
             return refused(
@@ -563,6 +578,10 @@ impl<S: StorageProvider> Engine<S> {
         Ok(Ok(SiblingWelcomePlan {
             from: own.slot(),
             relays,
+            invitation_generation: self
+                .storage
+                .invitation_admission(&GroupId::new(mls_group.group_id().as_slice().to_vec()))?
+                .map(|admission| admission.generation),
         }))
     }
 
@@ -701,8 +720,8 @@ impl<S: StorageProvider> Engine<S> {
         Ok(SiblingWelcomeResendOutcome::Rearmed)
     }
 
-    /// Whether retained repair metadata has ended, even before activity arms
-    /// its deadline. Expiry becomes terminal in the engine row before callers
+    /// Whether retained repair metadata has ended, even before a heartbeat
+    /// qualifies repair. Expiry becomes terminal in the engine row before callers
     /// drop the carrier high-water, so clock rollback cannot make it owed again.
     /// This does not cancel already-handed-off transport fanout settlement.
     pub fn sibling_welcome_resend_has_ended(
@@ -1036,6 +1055,7 @@ pub(crate) fn build_sibling_welcomes(
             let content = SiblingWelcome {
                 from: plan.from,
                 to: sibling.slot,
+                invitation_generation: plan.invitation_generation,
                 key_package_ref: key_package_ref.clone(),
                 welcome: welcome.to_vec(),
                 relays: plan.relays.clone(),

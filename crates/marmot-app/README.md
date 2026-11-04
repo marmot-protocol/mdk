@@ -5,6 +5,10 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Contents
 
 - [Runtime overview](#runtime-overview)
@@ -255,6 +259,28 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
+**Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
+one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
+or admission fork can prompt again; older unidentified invites stay local-only. Higher version wins, with decline
+winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
+records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
+Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by
+all devices. An explicit user Leave, including declining an invitation, also records Decline for the current identified
+admission before departure publication when this device trusts a device group. Archive, local deletion, sign-out and removal never create that
+choice. Unknown admissions, absent device-group trust and a held maximum decision version keep ordinary leaf Leave
+independent; a maximum skips a new choice rather than preventing departure.
+
+A known decline for the current admission also holds new automatic sibling Adds, even before ordinary Leave can be
+requested. Private KeyPackage requests follow the ordinary stock rules. A decline does not reach a copy this device
+already deleted locally. A later winning accept can resume an existing opted-in
+flow; it creates no Add or join obligation. Other generations and new founding admissions stay independent, and
+already admitted or signed traffic follows its ordinary settlement rules.
+
+This uses kind475 plus versioned sibling Welcomes, with no new host command or capability negotiation. Custom
+experimental senders and receivers must update together before using invitation sync; V1 Welcomes and their retries
+are not retrofitted. Released builds still cannot enable device groups. Hosts continue to render MDK's invitation
+and membership projections and must not infer broader account-wide departure across unrelated generations.
+
 `AppCreateGroupOptions::initial_admins` names invited account references to grant admin in the founding group state.
 The creator remains an admin. Omitting this option preserves creator-only admin authority.
 
@@ -291,6 +317,15 @@ the recipient retains the private package, or that every relay disclosed all rep
 **Routing.** New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
+
+**Leaving.** User Leave automatically demotes this account when another active administrator account remains, then
+requests its own leaf's SelfRemove. The last active administrator account is refused on all its devices before a
+choice or departure is published. Queued work is pending, not completed departure; native Leave owns its retry.
+Sign-out uses leaf-only departure and never demotes the account or records a shared Decline. Detailed conversation
+capabilities allow eligible admin Leave without a separate demotion prompt; the coarse chat-list action only opens
+this authoritative flow. A recorded Decline remains if a later eligibility check refuses departure. An admin demotion
+that committed is not undone when the following Leave fails; without a trusted device group there is no new shared
+departure obligation. Already admitted native work follows its ordinary retry rules.
 
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a

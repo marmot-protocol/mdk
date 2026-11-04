@@ -192,6 +192,7 @@ fn insert_marmot_group_without_openmls_state(
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
         })
         .expect("insert marmot group record without openmls state");
@@ -498,6 +499,19 @@ impl FlakyGroupRecordStorage {
 }
 
 impl GroupStorage for FlakyGroupRecordStorage {
+    fn invitation_admission(
+        &self,
+        id: &GroupId,
+    ) -> StorageResult<Option<cgka_traits::group::InvitationAdmission>> {
+        self.inner.invitation_admission(id)
+    }
+    fn put_invitation_admission(
+        &self,
+        id: &GroupId,
+        admission: Option<&cgka_traits::group::InvitationAdmission>,
+    ) -> StorageResult<()> {
+        self.inner.put_invitation_admission(id, admission)
+    }
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.inner.put_group(group)
     }

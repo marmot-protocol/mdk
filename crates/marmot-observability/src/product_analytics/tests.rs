@@ -651,6 +651,22 @@ fn serialization_rechecks_closed_schema_and_uuid() {
     let (collector, _) = configured();
     grant(&collector);
     collector.activity(ProductAnalyticsActivity::Foreground);
+    for event in [
+        ProductEvent {
+            name: "app_test_view".into(),
+            properties: BTreeMap::new(),
+        },
+        ProductEvent {
+            name: "app_screen_viewed".into(),
+            properties: BTreeMap::from([("screen".into(), "inbox".into())]),
+        },
+    ] {
+        assert_eq!(
+            collector.record(event).unwrap(),
+            ProductRecordResult::Recorded
+        );
+    }
+    let rows = collector.test_payloads();
     let state = collector.lock();
     let payload = state.queue.front().unwrap().payload.clone();
     assert!(collector.valid_payload(&state.config, &payload));
@@ -718,6 +734,18 @@ fn serialization_rechecks_closed_schema_and_uuid() {
             _ => unreachable!(),
         }
         assert!(!collector.valid_payload(&state.config, &invalid), "{case}");
+    }
+    for name in ["mdk_session_started", "app_screen_viewed", "app_test_view"] {
+        let row = rows.iter().find(|row| row["eventName"] == name).unwrap();
+        assert!(collector.valid_payload(&state.config, row), "{name}");
+        for (key, value) in [("count_bucket", "1"), ("partial", "true")] {
+            let mut invalid = row.clone();
+            invalid["props"][key] = serde_json::json!(value);
+            assert!(
+                !collector.valid_payload(&state.config, &invalid),
+                "{name}: {key} must remain Aggregate-only"
+            );
+        }
     }
 }
 
@@ -1373,6 +1401,145 @@ fn host_event_admission_checks_each_rule_before_queueing() {
             .iter()
             .all(|row| row.payload["eventName"] != "app_test_view")
     );
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn host_aggregate_events_preserve_approved_properties_when_sealed() {
+    let (collector, _) = configured();
+    let mut config = collector.lock().config.clone();
+    config.registry[0].mode = ProductEventMode::Aggregate;
+    config.registry[0].properties = vec![ProductPropertySchema {
+        name: "visible".into(),
+        rule: ProductPropertyRule::Boolean,
+    }];
+    collector.configure(config, String::new()).unwrap();
+    grant(&collector);
+    assert_eq!(
+        collector.status().product_analytics,
+        DiagnosticsExporterStatus::Ready
+    );
+    assert_eq!(
+        collector.status().consent,
+        UsageDiagnosticsDecision::Granted
+    );
+    let cases = [
+        (
+            "app_compose",
+            BTreeMap::from([("action".into(), "open".into())]),
+        ),
+        (
+            "app_message_search",
+            BTreeMap::from([("outcome".into(), "success".into())]),
+        ),
+        (
+            "app_attachment",
+            BTreeMap::from([
+                ("action".into(), "picker".into()),
+                ("outcome".into(), "success".into()),
+            ]),
+        ),
+        (
+            "app_settings",
+            BTreeMap::from([("section".into(), "appearance".into())]),
+        ),
+        (
+            "app_notification_permission",
+            BTreeMap::from([("outcome".into(), "granted".into())]),
+        ),
+        (
+            "app_test_view",
+            BTreeMap::from([("visible".into(), "true".into())]),
+        ),
+    ];
+    for (name, properties) in &cases {
+        assert_eq!(
+            collector
+                .record(ProductEvent {
+                    name: (*name).into(),
+                    properties: properties.clone(),
+                })
+                .unwrap(),
+            ProductRecordResult::Recorded,
+            "{name} must pass host admission"
+        );
+    }
+    assert_eq!(collector.status().queued_events, 0);
+    assert_eq!(collector.status().dropped_events, 0);
+    let rows = collector.test_payloads();
+    let config = collector.lock().config.clone();
+    let custom = rows
+        .iter()
+        .find(|row| row["eventName"] == "app_test_view")
+        .expect("the registered Aggregate control must survive sealing");
+    assert_eq!(custom["props"]["visible"], "true");
+    assert_eq!(custom["props"]["count_bucket"], "1");
+    assert_eq!(custom["props"]["partial"], "true");
+    let mut actual_names: Vec<_> = rows
+        .iter()
+        .filter_map(|row| row["eventName"].as_str())
+        .filter(|name| name.starts_with("app_"))
+        .collect();
+    actual_names.sort_unstable();
+    let mut expected_names: Vec<_> = cases.iter().map(|(name, _)| *name).collect();
+    expected_names.sort_unstable();
+    assert_eq!(
+        (actual_names, collector.status().dropped_events),
+        (expected_names, 0),
+        "valid host aggregates must survive sealing without drops; payloads: {rows:?}"
+    );
+    assert_eq!(rows.len(), cases.len() + 1, "one runtime coverage row");
+    for (name, properties) in cases {
+        let row = rows.iter().find(|row| row["eventName"] == name).unwrap();
+        let props = row["props"].as_object().unwrap();
+        assert_eq!(props.len(), properties.len() + 6, "{name}");
+        assert_eq!(props["count_bucket"], "1", "{name}");
+        assert_eq!(props["partial"], "true", "{name}");
+        for (key, value) in &properties {
+            assert_eq!(props[key], value.as_str(), "{name}: {key}");
+        }
+        assert!(collector.valid_payload(&config, row), "{name}");
+        let mut complete = row.clone();
+        complete["props"]["count_bucket"] = serde_json::json!("1001_plus");
+        complete["props"]["partial"] = serde_json::json!("false");
+        assert!(collector.valid_payload(&config, &complete), "{name}");
+        for key in properties
+            .keys()
+            .map(String::as_str)
+            .chain(["count_bucket", "partial"])
+        {
+            let mut invalid = row.clone();
+            invalid["props"].as_object_mut().unwrap().remove(key);
+            assert!(
+                !collector.valid_payload(&config, &invalid),
+                "{name}: missing {key}"
+            );
+        }
+        for key in properties.keys() {
+            let mut invalid = row.clone();
+            invalid["props"][key] = serde_json::json!("unreviewed");
+            assert!(
+                !collector.valid_payload(&config, &invalid),
+                "{name}: invalid {key}"
+            );
+        }
+        for (key, value) in [
+            ("count_bucket", serde_json::json!("3")),
+            ("count_bucket", serde_json::json!(true)),
+            ("partial", serde_json::json!("maybe")),
+            ("partial", serde_json::json!(true)),
+            ("raw_error", serde_json::json!("unreviewed")),
+            ("account_id", serde_json::json!("unreviewed")),
+            ("raw value", serde_json::json!("unreviewed")),
+        ] {
+            let mut invalid = row.clone();
+            invalid["props"][key] = value;
+            assert!(
+                !collector.valid_payload(&config, &invalid),
+                "{name}: invalid {key}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "product-analytics-export")]

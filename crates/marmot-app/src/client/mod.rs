@@ -92,6 +92,8 @@ pub(crate) mod history_imports;
 pub(crate) use backup_writer::BackupPassOutcome;
 pub(crate) use history_delivery::{HistoryFetchOutcome, HistoryUploadOutcome};
 pub(crate) mod history_notices;
+mod invitation_decisions;
+use invitation_decisions::AccountLeaveReason;
 mod invite_recovery;
 pub(crate) mod linked_device_chats;
 mod private_key_packages;
@@ -1604,6 +1606,7 @@ impl AppClient {
         );
         self.drive_sign_ins().await;
         self.drive_small_state().await;
+        self.drive_invitation_decisions().await;
         self.drive_backup_takeover().await;
         self.drive_device_removals().await;
         self.device_rename_upkeep().await;
@@ -3494,6 +3497,23 @@ impl AppClient {
     }
 
     pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        self.leave_group_for_reason(group_id, AccountLeaveReason::User)
+            .await
+    }
+
+    pub(crate) async fn leave_group_for_sign_out(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.leave_group_for_reason(group_id, AccountLeaveReason::SignOut)
+            .await
+    }
+
+    async fn leave_group_for_reason(
+        &mut self,
+        group_id: &GroupId,
+        reason: AccountLeaveReason<'_>,
+    ) -> Result<SendSummary, AppError> {
         let observed = self.app.product_analytics.observed(
             crate::ProductFamily::Group,
             "leave",
@@ -3506,7 +3526,7 @@ impl AppClient {
                 Vec::new(),
                 Some(1),
             );
-            self.leave_group_with_audit_context(group_id, audit_context)
+            self.leave_group_with_audit_context(group_id, audit_context, reason)
                 .await
         };
         observed
@@ -3883,8 +3903,40 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         audit_context: AuditEventContext,
+        reason: AccountLeaveReason<'_>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        let initially_admin = if matches!(reason, AccountLeaveReason::SignOut) {
+            false
+        } else {
+            self.account_leave_needs_demotion(group_id)?
+        };
+        if initially_admin {
+            self.ensure_group_change_admitted(group_id)?;
+        }
+        let local_invitation = if matches!(reason, AccountLeaveReason::User) {
+            self.record_user_leave_decision(group_id)?
+        } else {
+            None
+        };
+        let invitation = match reason {
+            AccountLeaveReason::ReceivedDecline(decision) => Some(decision),
+            _ => local_invitation.as_ref(),
+        };
+        if let Some(invitation) = invitation
+            && !self.invitation_decline_is_current(invitation)?
+        {
+            return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
+        }
+
+        if initially_admin {
+            Box::pin(self.demote_admitted_account_for_leave(
+                group_id,
+                audit_context.clone(),
+                invitation,
+            ))
+            .await?;
+        }
 
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
@@ -3900,6 +3952,26 @@ impl AppClient {
         };
         let effects = match async {
             self.sync_runtime_groups_for_send("leave_group").await?;
+            if let Some(invitation) = invitation
+                && !self.invitation_decline_is_current(invitation)?
+            {
+                return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
+            }
+            if !matches!(reason, AccountLeaveReason::SignOut)
+                && self.account_leave_needs_demotion(group_id)?
+                && !initially_admin
+            {
+                self.ensure_group_change_admitted(group_id)?;
+                Box::pin(self.demote_admitted_account_for_leave(
+                    group_id,
+                    audit_context.clone(),
+                    invitation,
+                ))
+                .await?;
+            }
+            // A pending admin update may put this intent in the ordinary
+            // durable queue. Only native preparation can create SelfRemove,
+            // after its selected admin policy permits it.
             let effects = sign_out_step
                 .run(self.runtime.send_with_audit_context(
                     SendIntent::Leave {
@@ -4140,6 +4212,8 @@ impl AppClient {
             return Err(AppError::GroupInviteNotPending);
         }
 
+        self.record_local_invitation_decision(group_id, false)?;
+
         // Departure projection effects are persisted through `MarmotApp` and
         // can be newer than this worker's in-memory snapshot. Adopt that exact
         // authoritative row before confirming so validation and mutation stay
@@ -4183,7 +4257,7 @@ impl AppClient {
                 Some(1),
             );
             let summary = self
-                .leave_group_with_audit_context(group_id, audit_context)
+                .leave_group_with_audit_context(group_id, audit_context, AccountLeaveReason::User)
                 .await?;
             let group = self.set_group_invite_confirmation(group_id, false, true)?;
             Ok(GroupInviteDeclineResult { group, summary })
@@ -4297,6 +4371,45 @@ impl AppClient {
 
         self.sync_runtime_groups_for_send("update_admin_policy")
             .await?;
+        self.send_admin_policy_component(group_id, component, audit_context, wake_targets)
+            .await
+    }
+
+    // Both callers have already admitted this account-policy change. The
+    // delivery acknowledgment is one-shot and must not be consumed again.
+    async fn demote_admitted_account_for_leave(
+        &mut self,
+        group_id: &GroupId,
+        audit_context: AuditEventContext,
+        invitation: Option<&storage_sqlite::InvitationDecision>,
+    ) -> Result<(), AppError> {
+        self.sync_runtime_groups_for_send("leave_admin_demotion")
+            .await?;
+        if let Some(invitation) = invitation
+            && !self.invitation_decline_is_current(invitation)?
+        {
+            return Err(AppError::DeviceGroupRefused("invitation_decision_changed"));
+        }
+        if !self.account_leave_needs_demotion(group_id)? {
+            return Ok(());
+        }
+        let own = self.runtime.self_id();
+        let mut admins = self.runtime.admin_pubkeys(group_id)?;
+        admins.retain(|admin| admin.as_slice() != own.as_slice());
+        let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
+        let target = hex::encode(own.as_slice());
+        self.send_admin_policy_component(group_id, component, audit_context, &[target])
+            .await?;
+        Ok(())
+    }
+
+    async fn send_admin_policy_component(
+        &mut self,
+        group_id: &GroupId,
+        component: cgka_traits::app_components::AppComponentData,
+        audit_context: AuditEventContext,
+        wake_targets: &[String],
+    ) -> Result<SendSummary, AppError> {
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, wake_targets);
         let effects = self
             .runtime

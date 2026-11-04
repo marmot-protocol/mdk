@@ -8,6 +8,8 @@ publish.workspace = true
 [features]
 product-analytics-export = ["marmot-app/product-analytics-export"]
 default = []
+# Explicit dev dogfood capability; never enables test-policy timing overrides.
+dev-device-groups = ["marmot-app/dev-device-groups"]
 otlp-export = ["marmot-app/otlp-export"]
 test-policy-overrides = ["marmot-app/test-policy-overrides"]
 
