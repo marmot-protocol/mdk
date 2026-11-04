@@ -2717,6 +2717,38 @@ mod otlp {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn initial_shutdown_finishes_before_connecting() {
+            host_safety::hand_in_direct_http_builder();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/metrics", listener.local_addr().unwrap());
+            let product = crate::ProductAnalytics::default();
+            crate::grant(&product);
+            let mut exporter = exporter(endpoint, product.permit().unwrap());
+            exporter.config.interval = std::time::Duration::from_millis(500);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+
+            let stopped_without_connection =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        biased;
+                        accepted = listener.accept() => {
+                            drop(accepted.expect("the collector accept must succeed"));
+                            false
+                        }
+                        () = exporter.run(shutdown_rx) => true,
+                    }
+                })
+                .await
+                .expect("an exporter with initial shutdown set must finish");
+
+            assert!(
+                stopped_without_connection,
+                "an exporter with initial shutdown set connected to the collector"
+            );
+            drop(shutdown_tx);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn periodic_export_stops_after_shutdown_channel_close_or_consent_revocation() {
             for stop in ["shutdown", "closed", "revoked", "plain"] {
                 let (endpoint, mut requests, server) = collector(&[200]).await;
@@ -3253,16 +3285,18 @@ impl RelayTelemetryExporter {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         app_performance: Option<AppPerformanceTelemetry>,
     ) {
-        if !*shutdown.borrow()
-            && self
-                .export_once_with_retries_and_app_performance(
-                    None,
-                    app_performance
-                        .as_ref()
-                        .map(AppPerformanceTelemetry::snapshot),
-                )
-                .await
-                .is_err()
+        if *shutdown.borrow() {
+            return;
+        }
+        if self
+            .export_once_with_retries_and_app_performance(
+                None,
+                app_performance
+                    .as_ref()
+                    .map(AppPerformanceTelemetry::snapshot),
+            )
+            .await
+            .is_err()
         {
             tracing::warn!(
                 target: "marmot_observability::relay_telemetry_export",
