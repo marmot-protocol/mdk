@@ -29,7 +29,7 @@ pub use artifacts::{
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
-pub use group_profile::{GroupProfileContext, with_group_profile_context};
+pub use group_profile::{GroupProfileContext, current_group_id, with_group_profile_context};
 pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.
@@ -237,9 +237,43 @@ impl fmt::Debug for RunnerEvent {
     }
 }
 
+/// Whether a follow-up reached an active backend turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    Accepted,
+    Unavailable,
+    /// Delivery may have committed; never enqueue or retry automatically.
+    Uncertain,
+}
+
 /// Backend-specific command construction and event parsing boundary.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// Whether this group currently has a backend turn that accepts steering.
+    fn has_active_turn(&self, _group: &str) -> bool {
+        false
+    }
+
+    /// Steer with validated files and retain their private staging lease.
+    async fn steer_with_attachments(
+        &self,
+        group: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        _lease: Box<dyn Send + Sync>,
+    ) -> SteerOutcome {
+        if attachments.is_empty() {
+            self.steer(group, text).await
+        } else {
+            SteerOutcome::Unavailable
+        }
+    }
+
+    /// Add text to a group-owned active turn, if supported.
+    async fn steer(&self, _group: &str, _text: &str) -> SteerOutcome {
+        SteerOutcome::Unavailable
+    }
+
     /// Privacy-safe capability state emitted when the harness starts.
     fn execution_support(&self) -> ExecutionSupport {
         ExecutionSupport::INHERITED

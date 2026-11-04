@@ -383,3 +383,43 @@ OpenCode build, such as the 1.18.18 minimum:
 ```sh
 cargo test -p wn-opencode real_opencode_run_file_contract -- --ignored --nocapture
 ```
+
+## Active-turn steering (opt-in native transport)
+
+`WN_OPENCODE_TRANSPORT=native` uses a per-turn `opencode serve` process and
+OpenCode's native session API. A follow-up is saved in the same session while
+the current model/tool loop runs; it becomes available at the next step rather
+than waiting in the harness queue. A running tool is not interrupted.
+
+This uses the shared terminal harness's `Backend::steer` contract, sender checks,
+attachment leases, group routing, session map, process cleanup and uncertain
+outcome handling. The connector continues to own durable message delivery.
+The default remains the existing CLI transport.
+
+Native mode currently requires Linux, Python 3, OpenCode 1.18.32 and a protected
+loopback port range. Set `WN_OPENCODE_NATIVE_PASSWORD_FILE` to a nonempty, private
+0600 file owned by the service user; the same password must reach the spawned
+OpenCode server. Set `WN_OPENCODE_NATIVE_USERNAME` if it differs from `opencode`.
+The default range is 700–799, configurable with
+`WN_OPENCODE_NATIVE_PORT_FIRST` / `WN_OPENCODE_NATIVE_PORT_LAST`. All ports must
+be below the host's unprivileged-port threshold. Grant the service only
+`CAP_NET_BIND_SERVICE` for listening, and run the harness as its ordinary user.
+The API credential is available to tools running as the same service user;
+native mode provides cross-user protection, not a tool sandbox.
+Private per-port locks prevent concurrent rooms from sharing a server. Each
+server inherits only its own invocation's connector route.
+
+A follow-up is acknowledged only after OpenCode confirms its saved message.
+An ambiguous submission is never queued or automatically retried. If OpenCode
+finishes just as a follow-up is saved and leaves it unanswered, the harness
+reports failure and preserves the session. An older answer or replay cannot
+count as successful steering. Only completed assistant text is published; reasoning,
+tool arguments and transcript history remain private. Autonomous mode grants
+native permission requests once while preserving native hard denies; inherited
+interactive requests fail with the session preserved.
+
+Development also runs:
+
+```sh
+python3 -m unittest discover -s integrations/opencode/marmot/tests -p test_native_bridge.py
+```
