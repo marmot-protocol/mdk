@@ -497,6 +497,17 @@ impl<S: StorageProvider> Engine<S> {
                 "this device is not tagged in a trusted device group",
             );
         };
+        // Creation uses this same admission before its first Group record is
+        // inserted. A fresh membership has no departure history. All other
+        // read failures remain errors; no historical hold is guessed.
+        let departed = match self
+            .storage
+            .get_group(&GroupId::new(mls_group.group_id().as_slice().to_vec()))
+        {
+            Ok(group) => group.self_removed_sibling_slots,
+            Err(StorageError::NotFound) => Default::default(),
+            Err(error) => return Err(error.into()),
+        };
         let mut slots = HashSet::new();
         for sibling in siblings {
             if sibling.key_package.source.is_some() {
@@ -553,6 +564,9 @@ impl<S: StorageProvider> Engine<S> {
                     SiblingAddRefusal::KeyPackage,
                     "the chat already holds the sibling",
                 );
+            }
+            if departed.contains(&sibling.slot) {
+                return refused(SiblingAddRefusal::SiblingLeft, "the sibling left this chat");
             }
         }
         let Some(relays) = sibling_welcome_relays(mls_group)? else {

@@ -4907,7 +4907,11 @@ impl MarmotAppRuntime {
                 }) {
                     continue;
                 }
-                match self.leave_group(account_ref, &group_id).await {
+                match self
+                    .accounts
+                    .leave_group_for_sign_out(account_ref, &group_id)
+                    .await
+                {
                     Ok(_) => outcome.groups_left += 1,
                     Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
                         group_id_hex,

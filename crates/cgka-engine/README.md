@@ -75,6 +75,18 @@ GroupContext. Use two published commits:
 The upgrade fails closed without staging a commit when required state is missing. MDK does not currently expose an
 atomic require-and-populate API.
 
+## Voluntary sibling departures
+
+When this device applies a sibling's authenticated SelfRemove, its local group record keeps that sibling's slot for
+this membership. Private sibling Add admission refuses it with `SiblingAddRefusal::SiblingLeft` before preparing an
+Add; another KeyPackage does not bypass the hold. Ordinary Remove is independent. A selected leaf that reads as the
+slot again clears the hold, and a fresh Welcome starts a new membership. A selected return ends the local hold even
+if a later branch no longer contains that return. Selecting an authenticated SelfRemove again records the departure
+again. This uses existing group snapshots and transactions, with no additional table or wire item. Unclaimed tags identify no slot; genuine source-roster storage
+errors on a live device group keep the commit retryable rather than consume a recognized departure without its record.
+An unavailable device group supplies no attribution context and does not block a chat's Commit. A departure applied
+without a readable sibling tag establishes no new hold; later repair does not promise retroactive attribution.
+
 ## Background recovery
 
 **Experimental sibling Welcome delivery.** A retained sibling Welcome records the exact confirmed Add that produced

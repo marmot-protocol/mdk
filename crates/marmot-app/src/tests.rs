@@ -6407,12 +6407,64 @@ async fn failed_leave_push_compensation_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
-    runtime.reconcile_accounts().await.unwrap();
-    let group_id = runtime
-        .create_group("alice", "alpha", &[], None)
+    let alice = app.account_home().account("alice").unwrap().account_id_hex;
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
+    let mut alice_client = app
+        .client_with_relay_plane("alice", &plane, None)
         .await
         .unwrap();
+    alice_client.publish_key_package().await.unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let group_id = bob.create_group("alpha", &[alice.as_str()]).await.unwrap();
+    assert!(
+        alice_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "Alice must really join as a nonadmin before the compensation phase"
+    );
+    alice_client.accept_group_invite(&group_id).unwrap();
+    // The external inviter has completed its only task. Release its client
+    // and close its separately owned account store before the worker phase.
+    drop(bob);
+    bob_app.close_storage().unwrap();
+    drop(bob_app);
+    assert!(
+        !alice_client
+            .runtime
+            .admin_pubkeys(&group_id)
+            .unwrap()
+            .iter()
+            .any(|key| hex::encode(key) == alice)
+    );
+    drop(alice_client);
+    drop(eose);
+    drop(plane);
+    use cgka_traits::storage::GroupStorage as _;
+    let store = app.account_storage("alice").unwrap();
+    let admission = store.invitation_admission(&group_id).unwrap().unwrap();
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none()
+    );
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -6428,20 +6480,50 @@ async fn failed_leave_push_compensation_body() {
         .await
         .unwrap();
 
-    relay.block_next_publish();
+    // Startup or maintenance may publish before the Leave command runs.
+    // Hold every publication until the departure's real removal row exists,
+    // releasing only earlier work rather than assuming the first send is it.
+    relay.block_next_publishes(usize::MAX);
     let runtime_for_leave = runtime.clone();
     let group_id_for_leave = group_id.clone();
-    let leave = tokio::spawn(async move {
+    let mut leave = tokio::spawn(async move {
         runtime_for_leave
             .leave_group("alice", &group_id_for_leave)
             .await
     });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publish(),
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut blocked_count = 1;
+        loop {
+            tokio::select! {
+                result = &mut leave => {
+                    panic!("Leave ended before its held token removal: {result:?}");
+                }
+                _ = relay.wait_for_blocked_publishes(blocked_count) => {}
+            }
+            if !app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            blocked_count = relay
+                .blocked_publish_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            relay.release_publish();
+        }
+    })
     .await
-    .unwrap();
+    .expect("the departure must queue its removal while publication is held");
+    // Earlier setup traffic must not count as removal or compensation.
+    let before_group_publications = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .count();
     assert_eq!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -6457,15 +6539,49 @@ async fn failed_leave_push_compensation_body() {
         "the local projection must remain intact until removal publishes"
     );
 
+    // A real native persistence failure after successful token removal must
+    // retain the compensation contract independently of admin refusal policy.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &db,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    db.execute_batch("CREATE TRIGGER reject_native_leave BEFORE INSERT ON openmls_values WHEN NEW.label = CAST('ProposalQueueRefs' AS BLOB) BEGIN SELECT RAISE(FAIL, 'native leave proposal checkpoint held'); END;").unwrap();
+    relay.block_next_publishes(0);
     relay.release_publish();
-    assert!(matches!(
-        leave.await.unwrap(),
-        Err(AppError::Account(marmot_session::AccountError::Session(
-            marmot_session::SessionError::Engine(
-                cgka_traits::EngineError::AdminCannotSelfRemove { .. }
-            )
-        )))
-    ));
+    let error = leave.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native leave proposal checkpoint held"),
+        "{error}"
+    );
+    db.execute_batch("DROP TRIGGER reject_native_leave")
+        .unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM cgka_leave_requests", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM openmls_values WHERE label = CAST('QueuedProposal' AS BLOB)",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the failed proposal queue transaction must not admit a departure"
+    );
+    drop(db);
     assert!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -6477,6 +6593,25 @@ async fn failed_leave_push_compensation_body() {
             .len(),
         1,
         "a failed leave must compensate by re-publishing the current registration"
+    );
+    assert!(
+        relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count()
+            >= before_group_publications + 2,
+        "token removal and compensation must both actually publish"
+    );
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none(),
+        "without a trusted device group, UserLeave creates no replicated decline"
     );
     runtime.shutdown().await;
 }

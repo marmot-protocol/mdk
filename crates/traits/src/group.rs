@@ -122,6 +122,12 @@ pub struct Group {
     /// `join_epoch`.
     #[serde(default)]
     pub local_copy_install_epoch: EpochId,
+    /// Sibling slots whose authenticated own SelfRemove this copy applied.
+    /// Kept for this local membership, including across anchor rewind; cleared
+    /// only when a selected leaf reads as that slot again, or by a fresh Welcome.
+    /// Unknown legacy tags and ordinary Remove proposals create no entry.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub self_removed_sibling_slots: std::collections::BTreeSet<crate::app_components::DeviceSlotId>,
     /// When the Welcome that installed this local copy was created, in Unix
     /// seconds, clamped at join to no later than the joining device's own
     /// clock. `None` on a copy this device created itself, on transports that
@@ -271,6 +277,7 @@ mod tests {
             disbanded: None,
             join_epoch: EpochId(4),
             local_copy_install_epoch: EpochId(4),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: welcome.map(Timestamp),
         }
     }
