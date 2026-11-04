@@ -96,8 +96,8 @@ that origin from stored state. A deferred Add holds delivery because its branch 
 invalidation or a terminal chat retires the old Welcome. The association and terminal condition survive restart.
 An already handed-off carrier finishes under its transport's publication rules and may arrive after branch loss.
 Exact existing-carrier outcomes still settle while its origin is held. Older development rows without an origin
-are retired rather than guessed; re-add the sibling to affected chats to recreate pending old delivery work after
-upgrading.
+are retired rather than guessed and have no automatic upgrade recovery. If the chat already holds that sibling,
+another Add is refused and cannot recreate the missing Welcome.
 
 **Authenticated device-group activity.** Native accepted member application, Commit and Proposal traffic retains
 its source epoch and exact member leaf proof in the existing processed-wrapper ledger. The first local observation is
