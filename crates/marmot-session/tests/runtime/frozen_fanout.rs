@@ -347,43 +347,6 @@ async fn mixed_welcome_retry_cutoff() {
             );
         }
 
-        // Stage real newer work without publishing it. The mixed parent, unlike
-        // a Welcome-only continuation, remains the group's ordering barrier.
-        let staged = runtime
-            .session_mut()
-            .send(SendIntent::SelfUpdate {
-                group_id: group.clone(),
-            })
-            .await
-            .unwrap();
-        let PublishWork::GroupEvolution { msg, pending, .. } = &staged.publish[0] else {
-            panic!("expected staged self-update");
-        };
-        let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
-            panic!("expected group Commit");
-        };
-        let newer = OutboundFanout::stage(
-            TransportPublishRequest {
-                account_id: runtime.session().self_id(),
-                message: msg.clone(),
-                target: TransportPublishTarget::Group {
-                    group_id: group.clone(),
-                    transport_group_id: transport_group_id.clone(),
-                    endpoints: fanouts[0].request().target.endpoints().to_vec(),
-                },
-                required_acks: 1,
-            },
-            Some(*pending),
-            Some(group.clone()),
-            wall.now().0 * 1_000 + 1,
-        )
-        .unwrap();
-        runtime.session().put_outbound_fanout(&newer).unwrap();
-        assert_eq!(
-            runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
-            Some(if welcome_first { 30_000 } else { 50_000 }),
-            "a later NotAttempted fanout cannot accelerate the mixed parent"
-        );
         let cutoff = if welcome_first { 160 } else { 190 };
         wall.set(cutoff - 1);
         assert_eq!(
@@ -402,7 +365,7 @@ async fn mixed_welcome_retry_cutoff() {
             let attempts = adapter.publishes();
             assert_eq!(attempts.len(), prior + 1);
             assert_eq!(attempts[prior].message, rejected);
-            assert!(retried.pending.is_empty(), "the newer Commit stays blocked");
+            assert!(retried.pending.is_empty(), "the parent Commit already confirmed");
             assert_eq!(
                 runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
                 Some(30_000)
@@ -419,14 +382,9 @@ async fn mixed_welcome_retry_cutoff() {
         }
         let attempts = adapter.publishes();
         let target_index = prior + usize::from(welcome_first);
-        assert_eq!(attempts.len(), target_index + 3);
+        assert_eq!(attempts.len(), target_index + 1);
         assert_eq!(attempts[target_index].message, commit);
         assert_eq!(attempts[target_index].target.endpoints(), &[secondary]);
-        assert!(
-            attempts[target_index + 1..]
-                .iter()
-                .all(|attempt| attempt.message == *msg)
-        );
         assert!(!runtime.has_pending_outbound_fanouts(&group).unwrap());
         if !welcome_first {
             assert!(

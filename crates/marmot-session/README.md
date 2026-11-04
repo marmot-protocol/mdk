@@ -41,7 +41,8 @@ the default.
   from the adapter's publish reports.
 - Keeps a confirmed fanout scheduler-visible while linked Welcomes still await publication bookkeeping. Its retry
   cutoff follows the Welcomes' durable endpoint backoff; work without a stored cutoff uses the ordinary retry delay.
-  Welcome backoff does not postpone earlier-ready group work; an incomplete group publication still orders later ones.
+  Welcome backoff does not postpone earlier-ready group work. Unmet quorum or pending MLS confirmation blocks later
+  group publications; secondary replication after quorum does not.
 - Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
   session or engine crates.
 
