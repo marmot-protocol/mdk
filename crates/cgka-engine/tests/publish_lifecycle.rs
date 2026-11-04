@@ -2425,6 +2425,10 @@ impl StorageProvider for FaultStorage {
         self.inner.mls_storage()
     }
 
+    fn pending_ref_high_water(&self) -> StorageResult<u64> {
+        self.inner.pending_ref_high_water()
+    }
+
     fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
         Some(self)
     }

@@ -273,6 +273,14 @@ enum MarmotStatus
    * account stays signed out here: wipe it, then link the device again.
    */
   MARMOT_STATUS_ACCOUNT_UNLINKED = 116,
+  /**
+   * Recovery waits for the source group to settle.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 117,
+  /**
+   * Restart the authenticated recovery challenge; do not retry the grant.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

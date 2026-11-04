@@ -70,6 +70,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
@@ -219,7 +220,7 @@ impl<S: StorageProvider> Engine<S> {
         evolution.phase = GroupEvolutionPhase::Prepared;
         evolution.signed_message_id = Some(wrapped.id.clone());
 
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         evolution.pending_ref = Some(pending_ref);
         self.maintenance_storage()?
             .put_group_evolution(&evolution)?;

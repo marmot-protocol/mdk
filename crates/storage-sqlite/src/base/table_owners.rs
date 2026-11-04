@@ -44,6 +44,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_messages", Side::Protocol),
     ("cgka_outbound_fanout", Side::Protocol),
     ("cgka_own_commit_intents", Side::Protocol),
+    ("cgka_pending_ref_watermark", Side::Protocol),
     ("cgka_private_key_packages", Side::Protocol),
     ("cgka_processed_transport_ids", Side::Protocol),
     ("cgka_queued_outbound", Side::Protocol),
