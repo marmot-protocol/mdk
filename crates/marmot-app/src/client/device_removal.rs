@@ -166,6 +166,14 @@ impl AppClient {
                 "could not carry out a device removal; retrying"
             );
         }
+        if let Err(error) = self.remove_moved_siblings().await {
+            tracing::warn!(
+                target: TARGET,
+                method = "remove_moved_siblings",
+                error_kind = error.privacy_safe_kind(),
+                "could not clean up old moved membership; retrying"
+            );
+        }
         if let Err(error) = self.clean_up_removed_devices().await {
             tracing::warn!(
                 target: TARGET,
@@ -174,6 +182,43 @@ impl AppClient {
                 "could not clean up after a removed device; retrying"
             );
         }
+    }
+
+    /// A selected Moved status ends only the old DG membership. It never
+    /// creates a rejected slot, public-slot deletion or chat-removal decision.
+    async fn remove_moved_siblings(&mut self) -> Result<(), AppError> {
+        let Some((group_id, roster)) = self.trusted_device_roster()? else {
+            return Ok(());
+        };
+        if !self.group_quiet(&group_id)? {
+            return Ok(());
+        }
+        let own = self.own_slot()?;
+        let removals = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_removals()?;
+        let Some((slot, _)) = roster.devices.iter().find(|(slot, entry)| {
+            **slot != own
+                && entry.status == cgka_traits::app_components::DeviceStatusV1::Moved
+                && !removals.iter().any(|removal| {
+                    removal.group_id_hex == hex::encode(group_id.as_slice())
+                        && removal.slot_hex == hex::encode(slot)
+                })
+        }) else {
+            return Ok(());
+        };
+        let leaf = self
+            .runtime
+            .own_account_leaf_claims(&group_id, &roster)?
+            .into_iter()
+            .find_map(|(key, claim)| (claim == DeviceTagClaim::Device(*slot)).then_some(key))
+            .unwrap_or_default();
+        self.unlink_moved_device_from_group(&group_id, leaf, *slot)
+            .await?;
+        self.linked_devices_changed = true;
+        Ok(())
     }
 
     /// Each recorded removal is carried on its own: one that fails, such as
@@ -510,8 +555,28 @@ impl AppClient {
             return Ok(gone);
         };
         if self.device_group_settled(group_id) {
+            let selected = self
+                .stored_group(group_id)?
+                .ok_or(AppError::DeviceGroupRefused("roster_unavailable"))?;
+            let removals = self
+                .app
+                .account_storage(&self.state.label)?
+                .app_storage()
+                .device_removals()?;
             for key in self.remembered_tag_keys(group_id)? {
-                if !roster.devices.contains_key(&key.slot) && key.slot != own_slot {
+                let explicitly_removed = removals.iter().any(|removal| {
+                    removal.group_id_hex == hex::encode(group_id.as_slice())
+                        && removal.slot_hex == hex::encode(key.slot)
+                });
+                let moved = !explicitly_removed
+                    && !roster.rejected_slots.contains_key(&key.slot)
+                    && selected.device_roster_departures.iter().any(|departure| {
+                        departure.slot == key.slot
+                            && departure.cause
+                                == cgka_traits::group::DeviceRosterDepartureCause::Moved
+                            && departure.tag_signature_key.as_ref() == Some(&key.tag_signature_key)
+                    });
+                if !roster.devices.contains_key(&key.slot) && key.slot != own_slot && !moved {
                     gone.slots.insert(key.slot);
                     gone.keys.insert(key);
                 }

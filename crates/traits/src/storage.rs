@@ -933,6 +933,25 @@ pub trait DeviceGroupWelcomeStorage {
     fn device_group_welcome_expectations(
         &self,
     ) -> StorageResult<Vec<DeviceGroupWelcomeExpectation>>;
+    /// Consume an exact expectation after authenticated native Welcome validation,
+    /// in the same transaction as the join. Providers may compose local admission
+    /// bookkeeping here. The default preserves ordinary expectation consumption;
+    /// device-group move support requires the provider's local move owner.
+    fn accept_device_group_welcome(
+        &self,
+        expected: &DeviceGroupWelcomeExpectation,
+        _joined_at: crate::Timestamp,
+    ) -> StorageResult<bool> {
+        if self
+            .device_group_welcome_expectation(&expected.group_id)?
+            .as_ref()
+            != Some(expected)
+        {
+            return Ok(false);
+        }
+        self.delete_device_group_welcome_expectation(&expected.group_id)
+    }
+
     /// Whether an expectation for `group_id` was there to delete.
     fn delete_device_group_welcome_expectation(&self, group_id: &GroupId) -> StorageResult<bool>;
 }

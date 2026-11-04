@@ -163,12 +163,42 @@ impl DeviceLinkChoices {
     }
 }
 
+/// Local progress of an explicitly compared link that moves this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceGroupMoveState {
+    WaitingForWelcome,
+    Joining,
+    Made,
+    Failed,
+}
+
+/// A previously linked sibling to recognize privately, never an Add target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceGroupMoveSibling {
+    pub slot_id_hex: String,
+    pub label: String,
+    /// Suppress the unrecognized-sign-in question until this sibling joins
+    /// the current destination or the user dismisses this guidance.
+    pub question_suppressed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceGroupMoveView {
+    /// Opaque local handle; no MLS or routing id.
+    pub move_id: String,
+    pub state: DeviceGroupMoveState,
+    pub old_siblings: Vec<DeviceGroupMoveSibling>,
+    /// Destination device entries override a captured old rejection.
+    pub overridden_rejection_slots: Vec<String>,
+}
+
 /// Linking as this device shows it: its own new-device session, if any, and
 /// the prompts for sign-ins it can link.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceLinkSnapshot {
     pub new_device: Option<NewDeviceLinkState>,
     pub prompts: Vec<DeviceLinkPrompt>,
+    pub moves: Vec<DeviceGroupMoveView>,
 }
 
 impl DeviceLinkSnapshot {
@@ -184,7 +214,8 @@ impl DeviceLinkSnapshot {
 /// What the user asked of linking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceLinkOp {
-    /// On a new device: ask a device already signed in to link this one.
+    /// Ask another device to link this one. With an existing trusted device
+    /// group this begins a move; trust changes only after the new own Commit.
     Start,
     /// On the new device: "They match".
     ConfirmMatch,
@@ -198,6 +229,11 @@ pub enum DeviceLinkOp {
     /// On a device already signed in: Not now. The sign-in stays listed
     /// with the unrecognized ones.
     Decline { prompt_id: String },
+    /// Dismiss one old-sibling recognition hint after a made move.
+    DismissMoveSibling {
+        move_id: String,
+        slot_id_hex: String,
+    },
     /// Change nothing.
     Read,
 }

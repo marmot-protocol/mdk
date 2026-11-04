@@ -329,6 +329,8 @@ mod migration_0168_backup_restore;
 mod migration_0169_sibling_welcome_resends;
 #[path = "migrations/0170_invitation_decisions.rs"]
 mod migration_0170_invitation_decisions;
+#[path = "migrations/0172_group_rejoin.rs"]
+mod migration_0172_group_rejoin;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -353,6 +355,8 @@ mod migration_0171_device_edit_settings;
 
 #[path = "migrations/0174_heartbeat_welcome_repair.rs"]
 mod migration_0174_heartbeat_welcome_repair;
+#[path = "migrations/0175_device_group_moves.rs"]
+mod migration_0175_device_group_moves;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1325,10 +1329,22 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0171_device_edit_settings::apply,
     },
     Migration {
+        version: 172,
+        name: "0172_group_rejoin",
+        suspend_foreign_keys: &[],
+        apply: migration_0172_group_rejoin::apply,
+    },
+    Migration {
         version: 174,
         name: "0174_heartbeat_welcome_repair",
         suspend_foreign_keys: &[],
         apply: migration_0174_heartbeat_welcome_repair::apply,
+    },
+    Migration {
+        version: 175,
+        name: "0175_device_group_moves",
+        suspend_foreign_keys: &[],
+        apply: migration_0175_device_group_moves::apply,
     },
 ];
 

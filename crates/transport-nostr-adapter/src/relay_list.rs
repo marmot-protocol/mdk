@@ -206,34 +206,25 @@ impl NostrNip65RelayListPublication {
 mod tests {
     use super::*;
 
+    // Owns NIP-65 (10002/r) and Inbox (10050/relay) literal kind/tag contracts.
     #[test]
     fn nip65_relay_list_uses_kind_10002_and_r_tags() {
-        let publication = sample_publication(NostrAccountRelayListKind::Nip65);
-
-        let event = publication.to_event().unwrap();
-
-        assert_eq!(event.kind, KIND_NIP65_RELAY_LIST);
-        assert_eq!(event.content, "");
-        assert_eq!(
-            event.tags,
-            vec![
-                vec!["r".to_string(), "wss://relay1.example".to_string()],
-                vec!["r".to_string(), "wss://relay2.example".to_string()]
-            ]
-        );
-    }
-
-    #[test]
-    fn marmot_inbox_relay_list_uses_kind_10050_and_relay_tags() {
-        let publication = sample_publication(NostrAccountRelayListKind::Inbox);
-
-        let event = publication.to_event().unwrap();
-
-        assert_eq!(event.kind, KIND_MARMOT_INBOX_RELAY_LIST);
-        assert_eq!(
-            event.tags[0],
-            vec!["relay".to_string(), "wss://relay1.example".to_string()]
-        );
+        for (kind, expected_kind, tag) in [
+            (NostrAccountRelayListKind::Nip65, 10002, "r"),
+            (NostrAccountRelayListKind::Inbox, 10050, "relay"),
+        ] {
+            let event = sample_publication(kind).to_event().unwrap();
+            assert_eq!(event.kind, expected_kind);
+            assert_eq!(event.pubkey, "a1".repeat(32));
+            assert_eq!(event.content, "");
+            assert_eq!(
+                event.tags,
+                vec![
+                    vec![tag.to_string(), "wss://relay1.example".to_string()],
+                    vec![tag.to_string(), "wss://relay2.example".to_string()],
+                ]
+            );
+        }
     }
 
     #[test]

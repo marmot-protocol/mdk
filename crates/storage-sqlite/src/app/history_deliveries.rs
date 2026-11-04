@@ -157,6 +157,47 @@ fn parked_delivery(
 }
 
 impl SqliteAppStorage {
+    /// Whether this exact unsent obligation still owns a detached upload.
+    /// A newer add or withdrawal has a different revision.
+    pub fn history_delivery_is_current(&self, owed: &OwedHistoryDelivery) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM history_deliveries_owed
+             WHERE group_id_hex = ?1 AND receiver_slot_hex = ?2
+               AND revision = ?3 AND sent_at IS NULL)",
+                params![
+                    owed.group_id_hex,
+                    owed.receiver_slot_hex,
+                    u64_to_i64(owed.revision)?
+                ],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
+    /// Whether the immutable received delivery still owns a detached fetch.
+    /// Retry timing is not part of its identity.
+    pub fn parked_history_delivery_is_current(
+        &self,
+        parked: &ParkedHistoryDelivery,
+    ) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM history_deliveries_parked
+             WHERE app_event_id = ?1 AND group_id_hex = ?2 AND sender_slot_hex = ?3
+               AND sealed = ?4 AND received_at = ?5)",
+                params![
+                    parked.app_event_id,
+                    parked.group_id_hex,
+                    parked.sender_slot_hex,
+                    parked.sealed,
+                    u64_to_i64(parked.received_at)?
+                ],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// Owe the sibling at `receiver_slot_hex` the history of the chat
     /// `group_id_hex` from `now`, whether or not it was owed or sent before,
     /// inline until it is found too long.
@@ -681,7 +722,13 @@ mod tests {
             .unwrap();
         let again = store.due_blossom_history_deliveries(90).unwrap().remove(0);
         assert_eq!(again.revision, deferred.revision + 1);
+        assert!(
+            !store.history_delivery_is_current(&deferred).unwrap(),
+            "a detached upload cannot take a newer obligation"
+        );
+        assert!(store.history_delivery_is_current(&again).unwrap());
         store.mark_history_delivery_sent(&again, 95).unwrap();
+        assert!(!store.history_delivery_is_current(&again).unwrap());
         assert!(
             store
                 .due_blossom_history_deliveries(1_000)
@@ -693,6 +740,8 @@ mod tests {
         store.owe_history_delivery("aa", "s1", 100).unwrap();
         let fresh = store.unsent_history_deliveries().unwrap().remove(0);
         assert_eq!((fresh.blossom_due_at, fresh.blossom_attempts), (None, 0));
+        assert!(store.history_delivery_is_current(&fresh).unwrap());
+        assert!(!store.history_delivery_is_current(&again).unwrap());
     }
 
     #[test]
@@ -725,7 +774,13 @@ mod tests {
         };
         assert_eq!(store.parked_history_chats().unwrap(), chats([false; 2]));
 
+        let prepared = located("e2", "aa", 12);
+        assert!(store.parked_history_delivery_is_current(&prepared).unwrap());
         store.defer_parked_history_fetch("e2", 70).unwrap();
+        assert!(
+            store.parked_history_delivery_is_current(&prepared).unwrap(),
+            "retry timing does not replace the received delivery"
+        );
         // An inline delivery has no fetch to defer.
         store.defer_parked_history_fetch("e1", 70).unwrap();
         // One deferred fetch marks its chat as retrying.
@@ -770,7 +825,22 @@ mod tests {
             store.parked_history_deliveries("aa").unwrap(),
             [parked("e1", "aa", 10), parked("e3", "aa", 13)]
         );
+        assert!(
+            store
+                .parked_history_delivery_is_current(&parked("e1", "aa", 10))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .parked_history_delivery_is_current(&duplicate)
+                .unwrap()
+        );
         store.drop_parked_history_delivery("e1").unwrap();
+        assert!(
+            !store
+                .parked_history_delivery_is_current(&parked("e1", "aa", 10))
+                .unwrap()
+        );
         assert_eq!(
             store.parked_history_deliveries("aa").unwrap(),
             [parked("e3", "aa", 13)]

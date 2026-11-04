@@ -67,6 +67,8 @@ use storage_sqlite::{
     MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
 };
 
+mod device_group_moves;
+
 const TRACE_TARGET: &str = "marmot_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
@@ -2154,6 +2156,8 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::LinkDevice { .. } => "link_device",
         SendIntent::UnlinkDevice { .. } => "unlink_device",
+        SendIntent::ImportDeviceGroupRejections { .. } => "import_device_group_rejections",
+        SendIntent::MarkDeviceGroupMoved { .. } => "mark_device_group_moved",
         SendIntent::RecordRemovedSlot { .. } => "record_removed_slot",
         SendIntent::Disband { .. } => "disband",
     }

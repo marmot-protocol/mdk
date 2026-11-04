@@ -15,6 +15,7 @@ pub mod engine_state;
 pub mod error;
 pub mod group;
 pub mod group_context;
+pub mod group_recovery;
 pub mod ingest;
 pub mod maintenance;
 pub mod message;
@@ -83,6 +84,11 @@ pub use engine_state::{
 pub use error::{EngineError, PeelerError};
 pub use group::{DisbandTombstone, Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
+pub use group_recovery::{
+    AuthenticatedGroupRecovery, GroupMemberRecovery, GroupRecoveryBody, GroupRecoveryMessage,
+    GroupRecoverySource, MAX_GROUP_RECOVERY_BODY_BYTES, MAX_GROUP_RECOVERY_GROUP_ID_BYTES,
+    MAX_GROUP_RECOVERY_KEY_PACKAGE_BYTES, group_recovery_grant_bytes,
+};
 pub use ingest::{
     DeferredStallEvidence, DeferredStallRow, IngestOutcome, InputRejectionCategory,
     LocalIngestState, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
