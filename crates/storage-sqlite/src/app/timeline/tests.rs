@@ -4493,3 +4493,512 @@ fn reply_preview_without_tags_still_deserializes() {
     assert!(preview.tags.is_empty());
     assert_eq!(preview.deletion_source, DeletionSource::default());
 }
+
+/// An own send that has not been accepted by a relay.
+fn own_send(id: &str, at: u64) -> StoredAppEvent {
+    let mut event = chat(id, "me", at, "hello");
+    event.direction = "sent".to_owned();
+    event.source_message_id_hex = None;
+    event
+}
+
+/// The trigger an update reported for one row, if it reported the row.
+fn trigger_for(
+    update: &TimelineProjectionUpdate,
+    message_id_hex: &str,
+) -> Option<TimelineUpdateTrigger> {
+    update.changes.iter().find_map(|change| match change {
+        TimelineMessageChange::Upsert { trigger, message }
+            if message.message_id_hex == message_id_hex =>
+        {
+            Some(trigger.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The row's delivery fields: invalidation reason and recipient confirmation.
+fn delivery(store: &SqliteAppStorage, message_id_hex: &str) -> (Option<String>, bool) {
+    let row = store
+        .timeline_message(&"11".repeat(32), message_id_hex)
+        .unwrap()
+        .expect("timeline row");
+    (row.invalidation_status, row.recipient_confirmed)
+}
+
+const FAILED: Option<&str> = Some(LOCAL_PUBLISH_FAILED_REASON);
+
+/// mdk#1291: a peer reaction to an old failed send, ingested after a reopen,
+/// settles the send durably, says so as a delivery update, and keeps the raw
+/// retraction that only a fresh resend may clear.
+#[test]
+fn peer_reaction_settles_a_failed_send_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("receipt.sqlite");
+    let key = crate::SqlCipherKey::raw([0x51; 32]);
+    let group = "11".repeat(32);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            source_epoch: Some(1),
+            ..own_send("mine", 1)
+        })
+        .unwrap();
+    store
+        .app_storage()
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            source_epoch: Some(2),
+            ..chat("later", "peer", 50, "later")
+        })
+        .unwrap();
+    store.close().unwrap();
+
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    let older_page = |app: &SqliteAppStorage| {
+        app.message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group.clone()),
+            pagination: TimelinePagination {
+                before: Some(50),
+                before_message_id: Some("later".to_owned()),
+                limit: Some(1),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap()
+        .messages
+    };
+    let page = older_page(&app);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].message_id_hex, "mine");
+    assert_eq!(page[0].invalidation_status.as_deref(), FAILED);
+    let update = app
+        .record_app_event(&reaction("r1", "peer", "mine", 2, "+"))
+        .unwrap();
+    assert_eq!(
+        trigger_for(&update, "mine"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+    let settled = app.timeline_message(&group, "mine").unwrap().unwrap();
+    assert_eq!(older_page(&app), vec![settled.clone()]);
+    assert!(settled.recipient_confirmed);
+    assert_eq!(settled.invalidation_status, None);
+    assert_eq!(
+        settled.source_message_id_hex, None,
+        "no transport id is invented"
+    );
+    assert!(
+        app.local_publish_failure_is_clearable(&group, "mine")
+            .unwrap()
+    );
+
+    let update = app
+        .record_app_event(&reaction("r2", "peer2", "mine", 3, "!"))
+        .unwrap();
+    assert_eq!(
+        trigger_for(&update, "mine"),
+        Some(TimelineUpdateTrigger::ReactionAdded)
+    );
+    let settled = app.timeline_message(&group, "mine").unwrap().unwrap();
+    store.close().unwrap();
+
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    assert_eq!(
+        app.timeline_message(&group, "mine").unwrap().unwrap(),
+        settled
+    );
+    app.rebuild_message_timeline_for_group(&group).unwrap();
+    assert_eq!(
+        app.timeline_message(&group, "mine").unwrap().unwrap(),
+        settled
+    );
+    store.close().unwrap();
+}
+
+/// Only a live reaction from another account on the exact send settles it.
+/// Own, unrelated, untagged, invalidated and retracted reactions do not, a
+/// deleted send stays as it is, and a convergence withdrawal stays withdrawn.
+#[test]
+fn only_a_live_peer_reaction_on_the_exact_send_settles_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    for (id, reason) in [
+        ("failed", LOCAL_PUBLISH_FAILED_REASON),
+        ("losing", "LosingBranch"),
+        ("retracted", LOCAL_PUBLISH_FAILED_REASON),
+        ("gone", LOCAL_PUBLISH_FAILED_REASON),
+    ] {
+        store.record_app_event(&own_send(id, 1)).unwrap();
+        store
+            .invalidate_app_event_by_message_id(&group, id, reason)
+            .unwrap();
+    }
+    let failed = (FAILED.map(str::to_owned), false);
+
+    store
+        .record_app_event(&reaction("own", "me", "failed", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("elsewhere", "peer", "unrelated", 3, "+"))
+        .unwrap();
+    let mut untagged = reaction("untagged", "peer", "failed", 4, "+");
+    untagged.tags.clear();
+    store.record_app_event(&untagged).unwrap();
+    let mut malformed = reaction("malformed", "peer", "failed", 4, "+");
+    malformed.tags = vec![vec![EVENT_REF_TAG.to_owned()]];
+    store.record_app_event(&malformed).unwrap();
+    assert_eq!(delivery(&store, "failed"), failed);
+
+    store
+        .record_app_event(&reaction("lost", "peer", "failed", 5, "+"))
+        .unwrap();
+    assert_eq!(delivery(&store, "failed"), (None, true));
+    let update = store
+        .invalidate_app_event_by_message_id(&group, "lost", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+    assert_eq!(
+        trigger_for(&update, "failed"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+    assert_eq!(delivery(&store, "failed"), failed);
+
+    store
+        .record_app_event(&reaction("on_losing", "peer", "losing", 6, "+"))
+        .unwrap();
+    assert_eq!(
+        delivery(&store, "losing"),
+        (Some("LosingBranch".to_owned()), false)
+    );
+
+    store
+        .record_app_event(&reaction("taken_back", "peer", "retracted", 7, "+"))
+        .unwrap();
+    assert_eq!(delivery(&store, "retracted"), (None, true));
+    let update = store
+        .record_app_event(&delete("undo", "peer", "taken_back", 8))
+        .unwrap();
+    assert_eq!(
+        trigger_for(&update, "retracted"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+    assert_eq!(delivery(&store, "retracted"), failed);
+
+    store
+        .record_app_event(&delete("erase", "me", "gone", 9))
+        .unwrap();
+    store
+        .record_app_event(&reaction("late", "peer", "gone", 10, "+"))
+        .unwrap();
+    assert_eq!(delivery(&store, "gone"), failed);
+}
+
+/// A pending send a peer reacted to is delivered, and the terminal-group sweep
+/// that fails pending sends does not fail it again.
+#[test]
+fn terminal_sweep_settles_a_pending_send_a_peer_reacted_to() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("pending", 1)).unwrap();
+    store
+        .record_app_event(&reaction("seen", "peer", "pending", 2, "+"))
+        .unwrap();
+    assert_eq!(
+        delivery(&store, "pending"),
+        (None, false),
+        "pending stays pending"
+    );
+
+    store
+        .invalidate_pending_sent_app_events_for_group(&group, LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    assert_eq!(delivery(&store, "pending"), (None, true));
+}
+
+/// A failed row a relay accepted afterwards (a late acceptance in a terminal
+/// group keeps the retraction) is not settled: it has a transport id, and the
+/// contract says a confirmed row has none.
+#[test]
+fn a_relay_accepted_failed_send_is_not_settled() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .finalize_app_event_source_retention(
+            &group,
+            "mine",
+            Some("source-mine"),
+            1,
+            AppMessageRetentionDecision::new(1, 0),
+        )
+        .unwrap();
+    store
+        .record_app_event(&reaction("seen", "peer", "mine", 2, "+"))
+        .unwrap();
+    let row = store.timeline_message(&group, "mine").unwrap().unwrap();
+    assert_eq!(row.source_message_id_hex.as_deref(), Some("source-mine"));
+    assert_eq!(row.invalidation_status.as_deref(), FAILED);
+    assert!(!row.recipient_confirmed);
+}
+
+/// Deleting a settled send reports the deletion, not a delivery change.
+#[test]
+fn deleting_a_settled_send_reports_the_deletion() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&reaction("seen", "peer", "mine", 2, "+"))
+        .unwrap();
+    assert_eq!(delivery(&store, "mine"), (None, true));
+    let update = store
+        .record_app_event(&delete("gone", "me", "mine", 3))
+        .unwrap();
+    assert_eq!(
+        trigger_for(&update, "mine"),
+        Some(TimelineUpdateTrigger::MessageDeleted)
+    );
+}
+
+/// Migration 0173's frozen backfill settles exactly the rows the live
+/// projector settles, so an upgraded database reads like a fresh one.
+#[test]
+fn migration_backfill_matches_the_live_projection() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    for (id, reason) in [
+        ("peer", Some(LOCAL_PUBLISH_FAILED_REASON)),
+        ("own", Some(LOCAL_PUBLISH_FAILED_REASON)),
+        ("losing", Some("LosingBranch")),
+        ("retracted", Some(LOCAL_PUBLISH_FAILED_REASON)),
+        ("pending", None),
+        ("quiet", Some(LOCAL_PUBLISH_FAILED_REASON)),
+    ] {
+        store.record_app_event(&own_send(id, 1)).unwrap();
+        if let Some(reason) = reason {
+            store
+                .invalidate_app_event_by_message_id(&group, id, reason)
+                .unwrap();
+        }
+    }
+    store
+        .record_app_event(&reaction("r_peer", "peer", "peer", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("r_own", "me", "own", 3, "+"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("r_losing", "peer", "losing", 4, "+"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("r_retracted", "peer", "retracted", 5, "+"))
+        .unwrap();
+    store
+        .record_app_event(&delete("d_retracted", "peer", "r_retracted", 6))
+        .unwrap();
+    store
+        .record_app_event(&reaction("r_pending", "peer", "pending", 7, "+"))
+        .unwrap();
+    let live = list(&store);
+    assert_eq!(
+        live.iter().filter(|row| row.recipient_confirmed).count(),
+        1,
+        "only the peer-reacted failed send"
+    );
+
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "UPDATE message_timeline
+             SET recipient_confirmed = 0,
+                 invalidation_status = (
+                     SELECT CASE WHEN source.invalidated = 1 THEN source.invalidation_reason END
+                     FROM app_events AS source
+                     WHERE source.group_id_hex = message_timeline.group_id_hex
+                       AND source.message_id_hex = message_timeline.message_id_hex
+                 )",
+        )
+        .unwrap();
+        let pre_fix = timeline_records_by_ids_tx(
+            &conn,
+            &group,
+            BTreeSet::from(["peer".to_owned(), "pending".to_owned()]),
+        )
+        .unwrap();
+        assert!(
+            pre_fix.iter().all(|row| !row.recipient_confirmed),
+            "rows are back in the pre-0173 shape"
+        );
+        crate::base::migrations::rerun_recipient_confirmed_settle(&conn).unwrap();
+    }
+    assert_eq!(list(&store), live);
+}
+
+/// Replies quoting a send carry its delivery in their preview, so settling the
+/// send updates them in the same projection update.
+#[test]
+fn settling_a_send_updates_the_replies_that_quote_it() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&reply("answer", "peer", "mine", 2, "ok"))
+        .unwrap();
+    let quoted_status = |message: &TimelineMessageRecord| {
+        message
+            .reply_preview
+            .as_ref()
+            .expect("reply preview")
+            .invalidation_status
+            .clone()
+    };
+    let answer = store.timeline_message(&group, "answer").unwrap().unwrap();
+    assert_eq!(quoted_status(&answer).as_deref(), FAILED);
+
+    let update = store
+        .record_app_event(&reaction("seen", "peer", "mine", 3, "+"))
+        .unwrap();
+    let answer = update
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "answer")
+        .expect("the quoting reply is in the update");
+    assert_eq!(quoted_status(answer), None);
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged)
+    );
+
+    // The peer retracts the reaction: the send is unconfirmed again, and so is
+    // every quote of it.
+    let update = store
+        .record_app_event(&delete("undo", "peer", "seen", 4))
+        .unwrap();
+    let answer = update
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "answer")
+        .expect("the quoting reply is in the retraction's update");
+    assert_eq!(quoted_status(answer).as_deref(), FAILED);
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged)
+    );
+    assert_eq!(
+        trigger_for(&update, "mine"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+
+    // Convergence withdraws the retraction: the reaction stands again.
+    let update = store
+        .invalidate_app_event_by_message_id(&group, "undo", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+    let answer = update
+        .messages
+        .iter()
+        .find(|message| message.message_id_hex == "answer")
+        .expect("the quoting reply is in the invalidation's update");
+    assert_eq!(quoted_status(answer), None);
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged)
+    );
+}
+
+/// One delete that retracts the confirming reaction and also deletes a reply
+/// quoting the send reports that reply as deleted, not as a preview change,
+/// and so does withdrawing that delete.
+#[test]
+fn deleting_the_reaction_and_a_quoting_reply_together_keeps_the_deletion() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let group = "11".repeat(32);
+    store.record_app_event(&own_send("mine", 1)).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group, "mine", LOCAL_PUBLISH_FAILED_REASON)
+        .unwrap();
+    store
+        .record_app_event(&reaction("seen", "peer", "mine", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&reply("answer", "peer", "mine", 3, "ok"))
+        .unwrap();
+    assert!(
+        store
+            .timeline_message(&group, "mine")
+            .unwrap()
+            .unwrap()
+            .recipient_confirmed
+    );
+
+    let mut both = delete("undo", "peer", "seen", 4);
+    both.tags
+        .push(vec![EVENT_REF_TAG.to_owned(), "answer".to_owned()]);
+    let update = store.record_app_event(&both).unwrap();
+    assert_eq!(
+        trigger_for(&update, "mine"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+    assert_eq!(
+        trigger_for(&update, "answer"),
+        Some(TimelineUpdateTrigger::MessageDeleted)
+    );
+
+    let restored = store
+        .invalidate_app_event_by_message_id(&group, "undo", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+    assert_eq!(
+        trigger_for(&restored, "mine"),
+        Some(TimelineUpdateTrigger::DeliveryOrSendStateChanged)
+    );
+    assert_ne!(
+        trigger_for(&restored, "answer"),
+        Some(TimelineUpdateTrigger::ReplyPreviewChanged),
+        "the restored reply keeps the trigger for its own change"
+    );
+}
+
+/// A reaction on a message whose delivery it cannot change leaves the replies
+/// quoting that message alone.
+#[test]
+fn reactions_that_settle_nothing_leave_replies_alone() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let mut accepted = own_send("accepted", 1);
+    accepted.source_message_id_hex = Some("source-accepted".to_owned());
+    store.record_app_event(&accepted).unwrap();
+    store
+        .record_app_event(&chat("theirs", "peer", 2, "hi"))
+        .unwrap();
+    for target in ["accepted", "theirs"] {
+        store
+            .record_app_event(&reply(&format!("re-{target}"), "peer", target, 3, "ok"))
+            .unwrap();
+        let update = store
+            .record_app_event(&reaction(&format!("r-{target}"), "peer", target, 4, "+"))
+            .unwrap();
+        assert!(
+            update
+                .messages
+                .iter()
+                .all(|message| message.message_id_hex != format!("re-{target}")),
+            "a reaction on {target} must not re-emit its replies"
+        );
+    }
+}

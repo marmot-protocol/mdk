@@ -447,6 +447,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: Some("delete-1".to_owned()),
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         };
@@ -560,6 +561,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         };
@@ -614,6 +616,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         };
