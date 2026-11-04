@@ -39,6 +39,7 @@ def target_rustflags():
 with open(os.environ["BUILD_TEST_LOG"], "a") as log:
     log.write(json.dumps({"tool": name, "args": args,
         "strip": os.environ.get("CARGO_PROFILE_RELEASE_STRIP"),
+        "target_dir": os.environ.get("CARGO_TARGET_DIR"),
         "macos_flags": os.environ.get("CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS"),
         "rustflags": os.environ.get("RUSTFLAGS"),
         "encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS"),
@@ -64,8 +65,10 @@ elif name == "cargo":
         root = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target"))
         if "--target" in args:
             root /= args[args.index("--target") + 1]
+        package = args[args.index("-p") + 1]
+        basename = package.replace("-", "_")
         for suffix in ["a", "dylib", "so"]:
-            path = root / "release" / ("libmarmot_uniffi." + suffix)
+            path = root / "release" / ("lib" + basename + "." + suffix)
             put(path)
             if suffix == "a":
                 path.write_bytes(pathlib.Path(os.environ["BUILD_TEST_ARCHIVE"]).read_bytes())
@@ -262,6 +265,61 @@ class BuildPhases(unittest.TestCase):
             self.run_phase(script)
         for path in ["MarmotKit.swift", "macos/MarmotKit.swift", "android/jniLibs/armeabi-v7a/libmarmot_uniffi.so"]:
             self.assertTrue((self.crate / "output" / path).exists())
+
+    def test_experimental_artifacts_isolate_outputs_and_match_native_generator_features(self):
+        # Ordinary output must survive an opt-in build. The fake tools prove
+        # script orchestration only; real exported linking owns the capability.
+        self.run_phase("xcframework.sh", "generate")
+        ordinary_swift = self.crate / "build/ios/swift/marmot_uniffi.swift"
+        ordinary_swift.write_text("ordinary output stays put")
+        self.log.write_text("")
+        for script in ["xcframework.sh", "xcframework-macos.sh", "kotlin-bindings.sh"]:
+            self.run_phase(script, "--dev-device-groups")
+        commands = [c for c in self.commands() if c["tool"] == "cargo"]
+        self.assertTrue(commands)
+        for command in commands:
+            args = command["args"]
+            self.assertTrue(command["target_dir"].endswith("/target/dev-device-groups"))
+            features = {feature for i, arg in enumerate(args) if arg == "--features"
+                for feature in args[i + 1].split(",")}
+            self.assertIn("dev-device-groups", features)
+            self.assertNotIn("test-policy-overrides", features)
+        self.assertEqual(ordinary_swift.read_text(), "ordinary output stays put")
+        for path in ["MarmotKit.swift", "macos/MarmotKit.swift", "android/jniLibs/armeabi-v7a/libmarmot_uniffi.so"]:
+            self.assertTrue((self.crate / "output-dev-device-groups" / path).exists())
+        self.log.write_text("")
+        self.run_phase("kotlin-bindings.sh", "generate")
+        for command in self.commands():
+            self.assertNotIn("dev-device-groups", " ".join(command["args"]))
+        self.assertTrue((self.crate / "output-dev-device-groups/MarmotKit.swift").exists())
+        # The C packager clears its output root, so experimental output must
+        # be a sibling rather than a child of ordinary output.
+        c_crate = self.root / "crates/marmot-c"
+        (c_crate / "include").mkdir(parents=True)
+        (c_crate / "include/marmot.h").write_text("header fixture")
+        c_tools = TOOLS.parent / "marmot-c"
+        for name in ["c-bindings.sh", "marmot-c.pc.in"]:
+            shutil.copyfile(c_tools / name, c_crate / name)
+        (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.0.0"\n')
+        def c_build(*args):
+            result = subprocess.run(["bash", str(c_crate / "c-bindings.sh"), *args],
+                env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        c_build()
+        ordinary = c_crate / "output/include/marmot.h"
+        ordinary.write_text("ordinary header stays put")
+        self.log.write_text("")
+        c_build("--dev-device-groups")
+        self.assertEqual(ordinary.read_text(), "ordinary header stays put")
+        experimental = c_crate / "output-dev-device-groups/include/marmot.h"
+        self.assertTrue(experimental.exists())
+        commands = [c for c in self.commands() if c["tool"] == "cargo"]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("dev-device-groups", commands[0]["args"])
+        self.assertNotIn("test-policy-overrides", commands[0]["args"])
+        self.assertTrue(commands[0]["target_dir"].endswith("/target/dev-device-groups"))
+        c_build()
+        self.assertTrue(experimental.exists(), "ordinary cleaning preserves experimental artifacts")
 
     def test_invalid_phases_and_targets_do_not_start_builds(self):
         for script, args in [("xcframework.sh", ["native", "bogus"]),

@@ -16,7 +16,8 @@ per feature.
 - [Lifecycle and teardown](#lifecycle-and-teardown)
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
-- Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
+- Feature notes: [runtime construction](#runtime-construction),
+  [experimental device-group test builds](#experimental-device-group-test-builds), [local sends](#local-sends),
   [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
   [custom reaction artwork](#custom-reaction-artwork),
   [file-backed media upload](#file-backed-media-upload),
@@ -208,8 +209,9 @@ Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just 
 deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client
 preference, moderation label namespace and keychain service. Create one with `marmot_deployment_white_noise` or
 `marmot_deployment_neutral`, adjust it with the `marmot_deployment_set_*` functions, construct, then free it with
-`marmot_deployment_free`; the client keeps its own copy. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
-before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`. The
+`marmot_deployment_free`; the client keeps its own copy. For an available constructor, a NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
+before anything opens. The unavailable experimental constructor checks its capability immediately after
+required output preflight, before reading the remaining arguments. White Noise hosts pass `marmot_deployment_white_noise()`. The
 [shared contract](../marmot-uniffi/README.md#deployment) covers what neutral means and the keychain caveat.
 
 For private integration fixtures, `marmot_client_new_with_options` accepts
@@ -217,6 +219,18 @@ an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
+
+## Experimental device-group test builds
+
+Follow the [shared build and constructor guidance](../marmot-uniffi/README.md#experimental-device-group-test-builds).
+`marmot_client_new_with_experimental_device_groups` takes the same arguments and unchanged `MarmotClientOptions`
+layout as `marmot_client_new_with_configuration`. Required output validation and clearing happen first. An incapable
+library returns `MARMOT_STATUS_RUNTIME` with `experimental_device_groups_unavailable` before opening the root or
+taking secret-store callback ownership; ownership transfers only on successful construction.
+
+Build the C library/header with `./crates/marmot-c/c-bindings.sh --dev-device-groups`. It stages
+`crates/marmot-c/output-dev-device-groups/` using a `dev-device-groups/` child of the selected Cargo target directory.
+Ordinary output cleaning preserves this sibling directory.
 
 ## Attachment handoff leases
 
@@ -515,7 +529,7 @@ the account's slots now, over the network, and writes the list after the check. 
 its `slot_id_hex` handle, `client` (empty when none), `appeared_at`, `last_seen_at`, `before_this_device`,
 `signed_in`, a `MarmotUnrecognizedSignInState`, and a `linked_by_slot_id_hex` set only for `LinkedElsewhere`.
 `marmot_answer_sign_in` takes a `MarmotSignInResponse` discriminant as `uint32_t`; an out-of-range value is
-`MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in every release build until the roster's spec lands. Re-read it on
+`MARMOT_STATUS_INVALID_ARGUMENT`. The list is empty in ordinary opens without explicit experimental intent. Re-read it on
 `MARMOT_EVENT_UNRECOGNIZED_SIGN_INS_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#unrecognized-sign-ins).
 
 `marmot_start_fresh` answers every sign-in from before this device Not now, now and when one is listed later, without
@@ -531,7 +545,7 @@ has its `reason`, the `slot_id_hex` the item names, a `key_package_ref_hex` set 
 `MARMOT_COMPROMISE_WARNING_REASON_FOREIGN_OWN_SLOT_KEY_PACKAGE`, and `occurred_at`. `reason` is a
 `MarmotCompromiseWarningReason` discriminant carried as `uint32_t`: later releases add values, so show one the host
 does not know as a generic reason. `marmot_dismiss_compromise_warning` closes the warning on this device only. Re-read
-it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in every release build until the roster's spec lands. See
+it on `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED`. It is empty in ordinary opens without explicit experimental intent. See
 the [shared contract](../marmot-uniffi/README.md#compromise-warning).
 
 ## Linking a new device
@@ -543,7 +557,7 @@ with `marmot_device_link_snapshot_free`. `new_device` is NULL unless this device
 `MarmotNewDeviceLinkState` and each prompt's `MarmotDeviceLinkPromptState` are tagged unions: `Comparing` carries
 `code`/`code_len` emoji with screen-reader descriptions, `CannotLink` carries `missing`/`missing_len`, and
 `AddedElsewhere` carries both labels. `marmot_link_device` takes the label and two `uint8_t` setting flags. Every call
-is refused in release builds until the pairing and device-group specs land. Re-read on
+requires the explicit experimental build and constructor described above. Re-read on
 `MARMOT_EVENT_DEVICE_LINK_CHANGED`. See the [shared contract](../marmot-uniffi/README.md#linking-a-new-device).
 
 ## History may be incomplete notices

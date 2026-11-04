@@ -7015,6 +7015,23 @@ MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   struct MarmotClient **out_client);
 
 /**
+ * Open an explicitly experimental device-group test build, with the same
+ * options and ownership as marmot_client_new_with_configuration. Requires a
+ * library built with `dev-device-groups`; unavailable builds return
+ * MARMOT_STATUS_RUNTIME before opening the root or taking callback ownership.
+ * Normal constructors remain disabled even in a capable library.
+ *
+ * # Safety
+ * Same pointer contracts as marmot_client_new_with_configuration.
+ */
+MarmotStatus marmot_client_new_with_experimental_device_groups(const char *root_path,
+                                                               const char *const *relay_urls,
+                                                               uintptr_t relay_urls_len,
+                                                               const struct MarmotClientOptions *options,
+                                                               const struct MarmotDeployment *deployment,
+                                                               struct MarmotClient **out_client);
+
+/**
  * Start the runtime (reconcile accounts, start workers, subscribe
  * transport). Must be called before subscribing.
  *
@@ -8290,8 +8307,7 @@ MarmotStatus marmot_dismiss_history_notice(const struct MarmotClient *client,
 /**
  * List this account's own devices from the roster of the device group
  * this device trusts: this device first, then by when each was linked.
- * Empty until this device trusts a device group, and always empty in
- * release builds until the roster's spec lands. Re-read on the
+ * Empty until this device trusts a device group, and always empty without explicit dev capability and runtime intent. Re-read on the
  * `LinkedDevicesChanged` event. Free with
  * `marmot_linked_device_list_free`.
  *
@@ -8495,7 +8511,7 @@ MarmotStatus marmot_backup_history_availability(const struct MarmotClient *clien
  * Whether this device's KeyPackage refresh is overdue because its device
  * group can't take the announcement that must come first; warn the user
  * while it is. Always false until this device trusts a device group,
- * and in release builds until the device group's spec lands. Re-read on
+ * and without explicit dev capability and runtime intent. Re-read on
  * the `KeyPackageRefreshOverdueChanged` event.
  *
  * # Safety
@@ -8619,8 +8635,7 @@ MarmotStatus marmot_chats_closed_to_linked_devices(const struct MarmotClient *cl
 
 /**
  * List the sign-ins of this account that this device does not
- * recognize, the earliest to appear first. Always empty in release
- * builds until the roster's spec lands. Re-read on the
+ * recognize, the earliest to appear first. Always empty without explicit dev capability and runtime intent. Re-read on the
  * `UnrecognizedSignInsChanged` event. Free with
  * `marmot_unrecognized_sign_in_list_free`.
  *
@@ -8667,7 +8682,7 @@ MarmotStatus marmot_start_fresh(const struct MarmotClient *client, const char *a
 /**
  * Whether this device started fresh and still has no device group, so
  * the host can say that only chats it is invited to from now on are
- * here. Always false in release builds until the roster's spec lands.
+ * here. Always false without explicit dev capability and runtime intent.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8684,7 +8699,7 @@ MarmotStatus marmot_started_fresh(const struct MarmotClient *client,
  * rejection the user has not seen here, the earliest gathered first.
  * Empty when no warning is open. The host writes the wording, and never
  * says the account's devices stopped whoever holds the key. Always empty
- * in release builds until the roster's spec lands. Re-read on the
+ * without explicit dev capability and runtime intent. Re-read on the
  * `CompromiseWarningChanged` event. Free with
  * `marmot_compromise_warning_item_list_free`.
  *

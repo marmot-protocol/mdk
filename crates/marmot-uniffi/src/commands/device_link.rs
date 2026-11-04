@@ -1,6 +1,6 @@
 //! Linking a new device of this account: the code both screens show, then
-//! joining the account's device group. Every call is refused in release
-//! builds until the pairing and device-group specs land.
+//! joining the account's device group. Requires an explicitly capable
+//! experimental library and the experimental constructor; normal opens refuse it.
 
 use crate::Marmot;
 use crate::conversions::DeviceLinkSnapshotFfi;
