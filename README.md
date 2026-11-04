@@ -70,6 +70,9 @@ cargo install --path crates/cli --locked --bins
 
 The [`wn` guide](crates/cli/README.md) covers configuration, a two-account quick start against local relays, the full
 command map, the daemon, the TUI, and JSON output for scripting.
+Explicit dev builds can [link and list account devices](crates/cli/README.md#device-linking-dev-builds) through
+`wn devices` and persistent `wnd`, using `--features dev-device-groups` independently of policy-test timing.
+Ordinary release builds keep this off.
 
 ## Build an app on MDK
 
@@ -143,7 +146,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
-| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages |
+| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages; [tests](crates/marmot-session/README.md#tests) |
 | | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |

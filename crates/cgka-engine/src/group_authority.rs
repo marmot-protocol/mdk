@@ -32,7 +32,8 @@ pub struct GroupAuthorityFacts {
     /// Canonical admin policy membership gated by `is_member`. A staged
     /// membership change can suppress this before the admin policy changes.
     pub is_admin: bool,
-    /// Canonical policy count, or zero when terminal; not gated by self membership.
+    /// Distinct active administrator accounts in the canonical tree, or zero
+    /// when terminal; not gated by self membership.
     pub admin_count: usize,
     pub removed: bool,
     pub unrecoverable: bool,
@@ -150,6 +151,14 @@ impl<S: StorageProvider> Engine<S> {
             let mut admins = crate::app_components::admins_of_group(mls_group)?;
             admins.sort();
             admins.dedup();
+            let active_accounts: std::collections::BTreeSet<_> = mls_group
+                .members()
+                .filter_map(|member| {
+                    openmls::prelude::BasicCredential::try_from(member.credential).ok()
+                })
+                .map(|credential| credential.identity().to_vec())
+                .collect();
+            admins.retain(|admin| active_accounts.contains(admin.as_slice()));
             facts.admin_count = admins.len();
             facts.is_admin = facts.is_member
                 && admins

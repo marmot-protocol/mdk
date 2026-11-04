@@ -112,6 +112,16 @@ while resolving complete intent instead of deriving it from visible rows.
 
 ## Migrations
 
+Migration0170 adds native local-copy admission metadata and app invitation-decision rows; no existing group is seeded.
+It runs for every account database, including builds with device groups disabled, creating two tables and two partial
+indexes. Native creation/join writes the local admission association transactionally; it adds no per-message writes.
+The admission generation and exact successful local Welcome association are captured in the native join transaction;
+founding records a local origin instead. They remain fixed across ordinary epoch changes, are replaced only by a new
+successful native admission, and are deleted with local group data. Decision rows are keyed by raw MLS chat id and
+generation and retain their winning value, owed publication and pending application/Leave handoff atomically. Unknown
+admissions create no membership work; the actual matching native join re-arms them. Full broadcasts enumerate retained
+generations, including after a local chat is forgotten. There is no clock-based generation eviction.
+
 Account/session schema changes are Rust migrations: the ordered registry lives in `src/base/migrations.rs` and bodies in
 numbered files like `src/base/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
 padded name, and an `apply` function run inside a SQLite transaction, which can execute DDL, rewrite rows, or perform

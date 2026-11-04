@@ -214,6 +214,10 @@ impl SiblingChatGaps {
 }
 
 impl AppClient {
+    pub(super) fn invitation_decision_changes_sibling_gaps(&mut self, chat: &GroupId) {
+        self.sibling_chat_gaps.schedule(chat.clone(), 0);
+    }
+
     pub(crate) fn note_sibling_chat_gap_event(&mut self, event: &GroupEvent) {
         if !self.app.device_groups_enabled() {
             return;
@@ -466,6 +470,11 @@ impl AppClient {
         budget: &mut usize,
         selection: &mut PrivateKeyPackageSelection,
     ) -> Result<(), AppError> {
+        // A semantic hold does not retire advisory claims or stock waiters.
+        // Their original deadlines and ordinary pruning remain independent.
+        if !self.invitation_allows_sibling_add(chat)? {
+            return Ok(());
+        }
         if !self.group_quiet(chat)? {
             self.sibling_chat_gaps.schedule(chat.clone(), 0);
             return Ok(());
@@ -547,6 +556,7 @@ impl AppClient {
                 || !claimant_is_eligible(&current, &current.own_slot)
                 || !current.tagged
                 || !self.group_quiet(&current.group_id)?
+                || !self.invitation_allows_sibling_add(chat)?
                 || !self.group_quiet(chat)?
                 || !self.gap_is_missing(&current, chat, *slot)?
             {

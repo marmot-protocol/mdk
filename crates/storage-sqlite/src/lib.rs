@@ -178,6 +178,10 @@ pub use protocol::handle::SqliteAccountStorage;
 #[allow(deprecated)]
 pub use protocol::handle::SqliteStorage;
 pub use protocol::openmls_storage::SqliteOpenMlsStorageError;
+pub use protocol::storage::group_recovery::{
+    GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole,
+    MAX_GROUP_RECOVERY_COORDINATOR_JOBS, MAX_GROUP_RECOVERY_COORDINATOR_JOBS_PER_GROUP,
+};
 pub use protocol::storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use protocol::storage::messages::StorageFormatBenchSizes;
@@ -215,6 +219,7 @@ pub use app::chat_list::{
     SelectionBaseScope, SelectionContextRequest, SelectionPresentation,
     SelectionSearchPreviewInput, SelectionSourceContext, SelectionTitleInputs,
 };
+pub use app::invitation_decisions::{InvitationDecision, InvitationDecisionWork};
 pub use cross::selection_roster::{
     MAX_SELECTED_MEMBER_KEYS, PeerInputs, ProjectedRosterEvidence, RosterReadError,
     SelectedMemberKeys, SelectedRosterPresentation,

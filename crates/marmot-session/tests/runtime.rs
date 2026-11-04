@@ -5785,6 +5785,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
                 disbanded: None,
                 join_epoch: EpochId(0),
                 local_copy_install_epoch: EpochId(0),
+                self_removed_sibling_slots: Default::default(),
                 local_copy_welcome_created_at: None,
             })
             .unwrap();

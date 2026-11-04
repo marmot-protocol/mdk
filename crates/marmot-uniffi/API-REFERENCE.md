@@ -5284,7 +5284,7 @@ Guarded departure self-demotion using the existing role policy. Exact same-step 
 pub async fn apply( &self, operation_id: u64, attempt_id: u64, revision: u64, context: ChatSelectionContextFfi, mutation: ChatSelectionMutationFfi, ) -> Result<ChatSelectionMutationReportFfi, MarmotKitError>
 ```
 
-Freshly admit at most200 remaining original IDs for archive or local deletion. Keep operation/attempt identity across presentation refresh and abandoned waits; exact retries read retained results and uncertainty blocks further effects. Group departure uses the guarded steps instead.
+Freshly admit at most 200 remaining original IDs for archive or local deletion. Keep operation/attempt identity across presentation refresh and abandoned waits; exact retries read retained results and uncertainty blocks further effects. Group departure uses the guarded steps instead.
 
 [Source](src/subscriptions/chat_selection.rs#L133)
 
@@ -5334,7 +5334,7 @@ Return the resolved complete native count and revision. While presentation is in
 pub async fn exclude( &self, revision: u64, group_ids: Vec<String>, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
 ```
 
-Explicitly remove at most200 IDs from the resolved original set. Never adds IDs. Revision and unresolved-effect/departure guards prevent deselection from disguising a retry.
+Explicitly remove at most 200 IDs from the resolved original set. Never adds IDs. Revision and unresolved-effect/departure guards prevent deselection from disguising a retry.
 
 [Source](src/subscriptions/chat_selection.rs#L55)
 
@@ -5382,7 +5382,7 @@ Read the retained last archive/local-delete result after an abandoned wait. Abse
 pub async fn membership( &self, revision: u64, group_ids: Vec<String>, ) -> Result<Vec<bool>, MarmotKitError>
 ```
 
-Display-only membership for at most200 visible IDs, preserving input order. Visible rows cannot nominate candidates or grant action authority.
+Display-only membership for at most 200 visible IDs, preserving input order. Visible rows cannot nominate candidates or grant action authority.
 
 [Source](src/subscriptions/chat_selection.rs#L48)
 
@@ -5394,7 +5394,7 @@ Display-only membership for at most200 visible IDs, preserving input order. Visi
 pub async fn page( &self, revision: u64, offset: u64, limit: u32, ) -> Result<ChatSelectionPageFfi, MarmotKitError>
 ```
 
-Page at most200 IDs from the frozen resolved original set. Offset is into this selection, not the moving display window. These IDs are display data; effects and folder preferences need their fresh admission APIs.
+Page at most 200 IDs from the frozen resolved original set. Offset is into this selection, not the moving display window. These IDs are display data; effects and folder preferences need their fresh admission APIs.
 
 [Source](src/subscriptions/chat_selection.rs#L23)
 

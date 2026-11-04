@@ -10,6 +10,10 @@ The crate root is the facade: the runtime, its effects, `SessionConfig`, the err
 exposes. The session itself is a private module; the `test-support` feature re-exports it for tests that drive it
 directly.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Opening a session
 
 `SessionConfig::new(database_path, database_key, identity, peeler)` takes the SQLCipher database path and key, the
@@ -210,17 +214,27 @@ cargo test -p marmot-session
   upgrade to advertising account-devices replaces the published KeyPackage in its slot and refreshes each existing
   leaf at its own random time.
 - `tests/session_lifecycle.rs` — encrypted open/create/confirm/close/reopen, Welcome and app-message ingest,
-  auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work, disband requests, compact authority
-  capture, the account records' liveness gate and closed-store failures, KeyPackage cutover on open, and the legacy-row
-  promotion facade (using
+  auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work with its original intent,
+  bounded deferred hydration and quarantine continuation, recorder delivery-source contexts, disband requests, compact
+  authority capture, the account records' liveness gate and closed-store failures, KeyPackage cutover on open, and the
+  legacy-row promotion facade (using
   [`fixtures/session-promotion-v1.bin`](fixtures/README.md)).
 - `tests/nostr_stack.rs` — the production-shaped non-relay stack: SQLCipher storage, the real `NostrMlsPeeler`, and
   `NostrTransportAdapter` over an in-memory relay client. Covers inbox and group subscription routing, NIP-59 Welcome
   and kind `445` group delivery, routing-component-driven `h` tags and publish targets (the transport id is not the MLS
   group id), publish ack/insufficient-ack/error resolution, duplicate and out-of-order delivery, and invite evolution
-  with commit and Welcome outputs.
-- `tests/nostr_stack_chaos.rs` — seeded no-network delivery-chaos scripts against the same stack, including invite
+  with commit and Welcome outputs. Its `tests/nostr_stack/chaos.rs` module adds seeded delivery scripts and invite
   lifecycle chaos (wrong-route drops, Welcome replay, shared commit fanout, Welcome/commit ordering). Reports go to
   `target/session-stack-chaos/`.
 
 Test placement rules: [`tests/AGENTS.md`](tests/AGENTS.md).
+
+The ignored `send_skips_slow_relay` diagnostic prints send timings for its member-count matrix. Run it alone with the default features so its process keeps the storage defaults:
+
+```sh
+cargo nextest run -p marmot-session --locked --test runtime --profile default \
+  --run-ignored only -E 'test(=send_skips_slow_relay)' \
+  --retries 0 --test-threads 2 --no-fail-fast --success-output final
+```
+
+Keep this separate from a Rust harness run using `--include-ignored`: the runnable fixtures opt their process into relaxed test-storage settings. This command selects only the diagnostic in its own process and leaves policy timing overrides off.

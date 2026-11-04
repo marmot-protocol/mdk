@@ -86,11 +86,14 @@ const ADVERTISABLE_PROTOCOL_APP_COMPONENTS: [AppComponentId; 13] = [
 ];
 
 /// Whether this build may advertise `marmot.account.device-roster.v1`. Its
-/// wire format is unreleased until its spec lands (mdk#2628 3.1), so only
-/// test-policy builds, which production never enables, implement it. A build
-/// that cannot advertise it can never create or join a device group, and
-/// treats roster bytes in other groups as unknown data.
-const DEVICE_ROSTER_ADVERTISABLE: bool = cfg!(feature = "test-policy-overrides");
+/// capability is default-off. Explicit `dev-device-groups` builds and policy
+/// tests may advertise the adopted roster; the app still requires runtime
+/// intent. Other builds cannot create or join a device group and treat its
+/// roster bytes in other groups as unknown data.
+const DEVICE_ROSTER_ADVERTISABLE: bool = cfg!(any(
+    feature = "dev-device-groups",
+    feature = "test-policy-overrides"
+));
 
 /// Refuse to advertise a protocol-owned component this engine does not
 /// implement. Application-owned ids (at or above
@@ -2440,10 +2443,12 @@ mod tests {
     }
 
     #[test]
-    fn the_device_roster_is_advertisable_only_in_test_policy_builds() {
-        // Its wire format is unreleased until its spec lands (mdk#2628 3.1).
+    fn the_device_roster_requires_an_explicit_build_capability() {
         let supported = AppComponentSet::new([DEVICE_ROSTER_COMPONENT_ID]);
-        if cfg!(feature = "test-policy-overrides") {
+        if cfg!(any(
+            feature = "dev-device-groups",
+            feature = "test-policy-overrides"
+        )) {
             validate_supported_app_components(&supported).unwrap();
         } else {
             assert!(matches!(validate_supported_app_components(&supported),

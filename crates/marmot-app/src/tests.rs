@@ -5171,21 +5171,22 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     tokio::time::timeout(std::time::Duration::from_secs(5), pin.wait())
         .await
         .expect("inviting-account catch-up should start after publication");
-    tokio::time::timeout(std::time::Duration::from_millis(250), invite)
-        .await
-        .expect("confirmed invite must return before read-side catch-up finishes")
-        .expect("invite task should not panic")
-        .expect("invite should succeed");
-
+    // The second rendezvous stays unpolled until every response is complete.
+    // The held catch-up, rather than an elapsed-time window, proves ordering;
+    // this outer timeout only bounds a hang.
     let (members, mls_state, roster) =
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            invite
+                .await
+                .expect("invite task should not panic")
+                .expect("invite should succeed");
             let members = runtime.group_members("alice", &group_id).await?;
             let mls_state = runtime.group_mls_state("alice", &group_id).await?;
             let roster = runtime.group_roster("alice", &group_id).await?;
             Ok::<_, AppError>((members, mls_state, roster))
         })
         .await
-        .expect("same-account post-invite projection reads must not queue behind catch-up")
+        .expect("the invite response and projection reads must finish while catch-up is held")
         .expect("same-account post-invite projection reads should succeed");
     assert_eq!(members.len(), 2);
     assert_eq!(mls_state.member_count, 2);
@@ -5391,38 +5392,36 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
             .await
             .expect("explicit catch-up should reach its hold");
 
-        let accept_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.accept_group_invite("bob", &group_id),
-        )
+        // Keep the second rendezvous unpolled while all three real commands
+        // answer. Their typed results and unchanged durable invite state are
+        // the proof; the outer timeout only bounds a hang.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let accept_error = runtime
+                .accept_group_invite("bob", &group_id)
+                .await
+                .expect_err("accept cannot start while catch-up owns the account client");
+            assert!(matches!(accept_error, AppError::AccountWorkerBusy));
+            let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
+            let confirm_error = runtime
+                .confirm_group_rejoin("bob", &unknown_offer, &[0; 32])
+                .await
+                .expect_err("confirm must not start during catch-up");
+            assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
+            let decline_error = runtime
+                .decline_group_rejoin("bob", &unknown_offer)
+                .await
+                .expect_err("decline must not start during catch-up");
+            assert!(matches!(decline_error, AppError::AccountWorkerBusy));
+            assert!(
+                app.group("bob", &group_id_hex)
+                    .unwrap()
+                    .expect("invite remains visible")
+                    .pending_confirmation,
+                "busy means the accept mutation definitely did not run"
+            );
+        })
         .await
-        .expect("accept must answer promptly while catch-up is pinned")
-        .expect_err("accept cannot start while catch-up owns the account client");
-        assert!(matches!(accept_error, AppError::AccountWorkerBusy));
-        let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
-        let confirm_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.confirm_group_rejoin("bob", &unknown_offer, &[0; 32]),
-        )
-        .await
-        .expect("confirm must answer promptly during catch-up")
-        .expect_err("confirm must not start during catch-up");
-        assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
-        let decline_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.decline_group_rejoin("bob", &unknown_offer),
-        )
-        .await
-        .expect("decline must answer promptly during catch-up")
-        .expect_err("decline must not start during catch-up");
-        assert!(matches!(decline_error, AppError::AccountWorkerBusy));
-        assert!(
-            app.group("bob", &group_id_hex)
-                .unwrap()
-                .expect("invite remains visible")
-                .pending_confirmation,
-            "busy means the accept mutation definitely did not run"
-        );
+        .expect("invite decisions must answer while catch-up remains held");
 
         tokio::time::timeout(Duration::from_secs(5), pin.wait())
             .await
@@ -5460,13 +5459,28 @@ async fn concurrent_invites_keep_projections_readable_body() {
         .create_group("bob", "bob invite", &[], None)
         .await
         .unwrap();
+    // A create catch-up must not consume either invite's one-shot hold.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .group_create_post_mutation_catch_up
+            .attempts
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both group creation catch-ups should finish before the invites");
     // Hold each invite at its first publication so both mutations overlap
     // before either detached catch-up can start.
     relay.block_next_publishes(2);
     let alice_runtime = runtime.clone();
     let alice_group_for_invite = alice_group.clone();
     let bob_account_id = bob.account_id_hex.clone();
-    let alice_invite = tokio::spawn(async move {
+    let alice_invite = async {
         alice_runtime
             .invite_members(
                 "alice",
@@ -5474,11 +5488,12 @@ async fn concurrent_invites_keep_projections_readable_body() {
                 std::slice::from_ref(&bob_account_id),
             )
             .await
-    });
+    };
+    tokio::pin!(alice_invite);
     let bob_runtime = runtime.clone();
     let bob_group_for_invite = bob_group.clone();
     let alice_account_id = alice.account_id_hex.clone();
-    let bob_invite = tokio::spawn(async move {
+    let bob_invite = async {
         bob_runtime
             .invite_members(
                 "bob",
@@ -5486,59 +5501,75 @@ async fn concurrent_invites_keep_projections_readable_body() {
                 std::slice::from_ref(&alice_account_id),
             )
             .await
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publishes(2),
-    )
+    };
+    tokio::pin!(bob_invite);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut alice_invite => panic!("alice invite must wait for its held publication"),
+            _ = &mut bob_invite => panic!("bob invite must wait for its held publication"),
+            _ = relay.wait_for_blocked_publishes(2) => {},
+        }
+    })
     .await
     .expect("both concurrent invites should reach publication");
+
+    let alice_pin = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_catch_up_barrier(&alice.account_id_hex, alice_pin.clone());
     relay.release_publish();
-    let (alice_result, bob_result) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(alice_invite, bob_invite)
+
+    // Both worker mutations have overlapped. Only poll Alice's public response
+    // until her detached catch-up consumes the single hold slot. Bob's worker
+    // can finish, but his unpolled response cannot dispatch its catch-up yet.
+    let (alice_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut alice_invite, alice_pin.wait())
+    })
+    .await
+    .expect("alice invite must return while its detached catch-up is held");
+    alice_result.expect("alice invite should succeed");
+    let bob_pin = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_catch_up_barrier(&bob.account_id_hex, bob_pin.clone());
+    let (bob_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut bob_invite, bob_pin.wait())
+    })
+    .await
+    .expect("bob invite must return while its detached catch-up is held");
+    bob_result.expect("bob invite should succeed");
+
+    // Neither second rendezvous is polled until all reads have completed.
+    // The real held catch-ups prove ordering; this timeout only bounds a hang.
+    let (alice_members, alice_state, bob_members, bob_state) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let alice_members = runtime.group_members("alice", &alice_group).await?;
+            let alice_state = runtime.group_mls_state("alice", &alice_group).await?;
+            let bob_members = runtime.group_members("bob", &bob_group).await?;
+            let bob_state = runtime.group_mls_state("bob", &bob_group).await?;
+            Ok::<_, AppError>((alice_members, alice_state, bob_members, bob_state))
         })
         .await
-        .expect("both confirmed invites should return while detached catch-up is coordinated");
-    alice_result
-        .expect("alice invite task should not panic")
-        .expect("alice invite should succeed");
-    bob_result
-        .expect("bob invite task should not panic")
-        .expect("bob invite should succeed");
-
-    let alice_members = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_members("alice", &alice_group),
-    )
-    .await
-    .expect("alice members must not queue behind concurrent invite catch-up")
-    .expect("alice members should succeed");
-    let alice_state = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_mls_state("alice", &alice_group),
-    )
-    .await
-    .expect("alice MLS state must not queue behind concurrent invite catch-up")
-    .expect("alice MLS state should succeed");
-    let bob_members = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_members("bob", &bob_group),
-    )
-    .await
-    .expect("bob members must not queue behind concurrent invite catch-up")
-    .expect("bob members should succeed");
-    let bob_state = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_mls_state("bob", &bob_group),
-    )
-    .await
-    .expect("bob MLS state must not queue behind concurrent invite catch-up")
-    .expect("bob MLS state should succeed");
+        .expect("both accounts must answer projection reads while both catch-ups are held")
+        .expect("both accounts' projection reads should succeed");
     assert_eq!(alice_members.len(), 2);
     assert_eq!(alice_state.member_count, 2);
     assert_eq!(bob_members.len(), 2);
     assert_eq!(bob_state.member_count, 2);
+    let before_release = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(before_release.group_invite_members.successes, 2);
+    assert_eq!(
+        before_release.group_invite_post_mutation_catch_up.successes,
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(alice_pin.wait(), bob_pin.wait())
+    })
+    .await
+    .expect("both held catch-ups should accept their release");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if runtime
@@ -6376,12 +6407,64 @@ async fn failed_leave_push_compensation_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
-    runtime.reconcile_accounts().await.unwrap();
-    let group_id = runtime
-        .create_group("alice", "alpha", &[], None)
+    let alice = app.account_home().account("alice").unwrap().account_id_hex;
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
+    let mut alice_client = app
+        .client_with_relay_plane("alice", &plane, None)
         .await
         .unwrap();
+    alice_client.publish_key_package().await.unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let group_id = bob.create_group("alpha", &[alice.as_str()]).await.unwrap();
+    assert!(
+        alice_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "Alice must really join as a nonadmin before the compensation phase"
+    );
+    alice_client.accept_group_invite(&group_id).unwrap();
+    // The external inviter has completed its only task. Release its client
+    // and close its separately owned account store before the worker phase.
+    drop(bob);
+    bob_app.close_storage().unwrap();
+    drop(bob_app);
+    assert!(
+        !alice_client
+            .runtime
+            .admin_pubkeys(&group_id)
+            .unwrap()
+            .iter()
+            .any(|key| hex::encode(key) == alice)
+    );
+    drop(alice_client);
+    drop(eose);
+    drop(plane);
+    use cgka_traits::storage::GroupStorage as _;
+    let store = app.account_storage("alice").unwrap();
+    let admission = store.invitation_admission(&group_id).unwrap().unwrap();
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none()
+    );
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -6397,20 +6480,50 @@ async fn failed_leave_push_compensation_body() {
         .await
         .unwrap();
 
-    relay.block_next_publish();
+    // Startup or maintenance may publish before the Leave command runs.
+    // Hold every publication until the departure's real removal row exists,
+    // releasing only earlier work rather than assuming the first send is it.
+    relay.block_next_publishes(usize::MAX);
     let runtime_for_leave = runtime.clone();
     let group_id_for_leave = group_id.clone();
-    let leave = tokio::spawn(async move {
+    let mut leave = tokio::spawn(async move {
         runtime_for_leave
             .leave_group("alice", &group_id_for_leave)
             .await
     });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publish(),
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut blocked_count = 1;
+        loop {
+            tokio::select! {
+                result = &mut leave => {
+                    panic!("Leave ended before its held token removal: {result:?}");
+                }
+                _ = relay.wait_for_blocked_publishes(blocked_count) => {}
+            }
+            if !app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            blocked_count = relay
+                .blocked_publish_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            relay.release_publish();
+        }
+    })
     .await
-    .unwrap();
+    .expect("the departure must queue its removal while publication is held");
+    // Earlier setup traffic must not count as removal or compensation.
+    let before_group_publications = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .count();
     assert_eq!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -6426,15 +6539,49 @@ async fn failed_leave_push_compensation_body() {
         "the local projection must remain intact until removal publishes"
     );
 
+    // A real native persistence failure after successful token removal must
+    // retain the compensation contract independently of admin refusal policy.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &db,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    db.execute_batch("CREATE TRIGGER reject_native_leave BEFORE INSERT ON openmls_values WHEN NEW.label = CAST('ProposalQueueRefs' AS BLOB) BEGIN SELECT RAISE(FAIL, 'native leave proposal checkpoint held'); END;").unwrap();
+    relay.block_next_publishes(0);
     relay.release_publish();
-    assert!(matches!(
-        leave.await.unwrap(),
-        Err(AppError::Account(marmot_session::AccountError::Session(
-            marmot_session::SessionError::Engine(
-                cgka_traits::EngineError::AdminCannotSelfRemove { .. }
-            )
-        )))
-    ));
+    let error = leave.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native leave proposal checkpoint held"),
+        "{error}"
+    );
+    db.execute_batch("DROP TRIGGER reject_native_leave")
+        .unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM cgka_leave_requests", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM openmls_values WHERE label = CAST('QueuedProposal' AS BLOB)",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the failed proposal queue transaction must not admit a departure"
+    );
+    drop(db);
     assert!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -6446,6 +6593,25 @@ async fn failed_leave_push_compensation_body() {
             .len(),
         1,
         "a failed leave must compensate by re-publishing the current registration"
+    );
+    assert!(
+        relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count()
+            >= before_group_publications + 2,
+        "token removal and compensation must both actually publish"
+    );
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none(),
+        "without a trusted device group, UserLeave creates no replicated decline"
     );
     runtime.shutdown().await;
 }
@@ -10993,6 +11159,19 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
     );
 }
 
+fn sign_directory_fixture(keys: &Keys, event: NostrTransportEvent) -> NostrTransportEvent {
+    assert_eq!(event.pubkey, keys.public_key().to_hex());
+    let signed = EventBuilder::new(
+        Kind::from(u16::try_from(event.kind).unwrap()),
+        event.content,
+    )
+    .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+    .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+    .finalize(keys)
+    .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
 #[test]
 fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
     let dir = tempfile::tempdir().unwrap();
@@ -11000,7 +11179,8 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "22".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let record = |created_at, tags| {
         let mut event = NostrTransportEvent::new_unsigned(
             account_id.clone(),
@@ -11009,6 +11189,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             String::new(),
         );
         event.created_at = created_at;
+        let event = sign_directory_fixture(&keys, event);
         transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://source.example".into())],
             event,
@@ -11052,7 +11233,8 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "23".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
 
     for (kind, tag_name) in [
         (KIND_NIP65_RELAY_LIST, "r"),
@@ -11066,6 +11248,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 String::new(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(&keys, event);
             transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event,
@@ -11103,7 +11286,8 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "24".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         account_id.clone(),
         KIND_MARMOT_INBOX_RELAY_LIST,
@@ -11111,6 +11295,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         String::new(),
     );
     event.created_at = 0;
+    let event = sign_directory_fixture(&keys, event);
 
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
@@ -11639,14 +11824,14 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
     // replaces it, for peers and for accounts held on this device alike.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let alice = home.create_account("alice").unwrap();
+    home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let peer = format!("{:064x}", 1973);
+    let peer_keys = Keys::generate();
+    let alice_keys = home.load_signing_keys("alice").unwrap();
     let created_at = 1_700_001_973;
-    for (account_id, local) in [
-        (peer.as_str(), false),
-        (alice.account_id_hex.as_str(), true),
-    ] {
+    for (keys, local) in [(&peer_keys, false), (&alice_keys, true)] {
+        let account_id_hex = keys.public_key().to_hex();
+        let account_id = account_id_hex.as_str();
         app.directory()
             .remember_directory_profile(
                 account_id,
@@ -11666,6 +11851,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(keys, event);
             app.directory()
                 .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
                     endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -11756,7 +11942,8 @@ fn directory_entry_reconciles_nostr_components_independently() {
     let account = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let contact = format!("{:064x}", 920);
+    let keys = Keys::generate();
+    let contact = keys.public_key().to_hex();
 
     let mut cached = test_directory_record(&contact, "new-profile", 100);
     cached.relay_lists.nip65.created_at = 10;
@@ -11829,6 +12016,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
+    let stale_event = sign_directory_fixture(&keys, stale_event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             event: stale_event,
@@ -12583,7 +12771,8 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
     // A remote, non-local user whose contact list arrives over a relay.
-    let author = format!("{:064x}", 42);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     app.directory()
         .remember_directory_user_with_reason_for_test(&author, "message")
         .unwrap();
@@ -12595,7 +12784,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
         .collect::<Vec<_>>();
     let record = transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
-        event: contact_list_event(&author, &follows),
+        event: sign_directory_fixture(&keys, contact_list_event(&author, &follows)),
     };
 
     app.directory()
@@ -12658,7 +12847,8 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 867);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
         KIND_NOSTR_METADATA,
@@ -12676,6 +12866,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -12760,7 +12951,8 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 868);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
@@ -12781,6 +12973,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],

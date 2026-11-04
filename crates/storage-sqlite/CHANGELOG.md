@@ -276,6 +276,14 @@
   `cgka_traits::storage::AccountDeviceHistoryKeyStorage`, which
   `StorageProvider` now requires; `put_account_device_history_key_if_absent`
   never replaces a stored key.
+- Migration 0172 advances account storage to schema 172 after migration 0171.
+  It adds the protocol-owned `cgka_group_rejoin` journal, with one recipient
+  job per group and bounded coordinator jobs. Capacity refusals preserve
+  existing work. A retained nonce cannot change its peer or recipient local
+  state token; refused writes leave the exact outbound artifact and retry
+  evidence intact. Same-job phase, retry and source refreshes remain writable.
+  Group deletion cascades to its recovery jobs. Older binaries reject the
+  upgraded database.
 - Migration 0134 advances account storage to schema 134 (mdk#2660 phase 4).
   It adds `recheck_revision` to `account_recovery_units`, which existing rows
   start at 0. Every request that makes a re-check pass due bumps it
@@ -438,6 +446,9 @@
   and every copy shared one store epoch and skipped incremental auto-vacuum.
 
 ### Added
+
+- Migration0170 adds native admission metadata and per-generation invitation decisions with atomic owed
+  publication/application/Leave work (mdk#2628 D96). No legacy group is seeded from its current epoch.
 
 - Migration 0167 indexes active kind-7 reaction attachments from retained app
   events without creating timeline rows (mdk#2151), backfilling existing

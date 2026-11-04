@@ -6,6 +6,10 @@ for Marmot. Read this if you are building on the engine directly or changing how
 The engine sits above OpenMLS, governs commit sequencing, adjudicates forks through distributed convergence, enforces
 MIP-03 admin rules, and returns typed outcomes for every ingest path.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Contents
 
 - [What this crate does](#what-this-crate-does)
@@ -70,6 +74,18 @@ GroupContext. Use two published commits:
 
 The upgrade fails closed without staging a commit when required state is missing. MDK does not currently expose an
 atomic require-and-populate API.
+
+## Voluntary sibling departures
+
+When this device applies a sibling's authenticated SelfRemove, its local group record keeps that sibling's slot for
+this membership. Private sibling Add admission refuses it with `SiblingAddRefusal::SiblingLeft` before preparing an
+Add; another KeyPackage does not bypass the hold. Ordinary Remove is independent. A selected leaf that reads as the
+slot again clears the hold, and a fresh Welcome starts a new membership. A selected return ends the local hold even
+if a later branch no longer contains that return. Selecting an authenticated SelfRemove again records the departure
+again. This uses existing group snapshots and transactions, with no additional table or wire item. Unclaimed tags identify no slot; genuine source-roster storage
+errors on a live device group keep the commit retryable rather than consume a recognized departure without its record.
+An unavailable device group supplies no attribution context and does not block a chat's Commit. A departure applied
+without a readable sibling tag establishes no new hold; later repair does not promise retroactive attribution.
 
 ## Background recovery
 
@@ -244,3 +260,9 @@ For the Marmot app-component model used by new groups, see
 
 Single internal consumer; not semver-stable. Versioned with the workspace. For readiness and open production work, see
 [`current-state.md`](../../docs/marmot-architecture/overview/current-state.md).
+
+Invitation-decision metadata is captured on successful native creation/join in all builds, including ordinary chats
+with device groups disabled: it serializes/hashes the validated admission context and persists its local association.
+It adds no per-message observation work. Custom `GroupStorage` providers must implement the transactional
+`invitation_admission` and `put_invitation_admission` methods; an older unidentified copy is never seeded from its
+current epoch. Experimental sibling-Welcome V2 inheritance requires updated receivers; retained V1 bodies stay V1.

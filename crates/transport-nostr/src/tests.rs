@@ -5770,6 +5770,60 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_forwarder_verifies_each_notification_independently() {
+    let keys = Keys::generate();
+    let id = "directory_identity";
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    let directory =
+        directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
+            .await;
+    directory
+        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .await;
+    let valid = EventBuilder::new(Kind::Metadata, r#"{"name":"authentic"}"#)
+        .finalize(&keys)
+        .unwrap();
+    let mut tampered = valid.clone();
+    tampered.content = r#"{"name":"forged"}"#.into();
+    let mut invalid_signature = valid.clone();
+    invalid_signature.sig = nostr::event::Signature::from_byte_array([0; 64]);
+    assert!(!tampered.verify_id());
+    assert!(invalid_signature.verify_id());
+    assert!(!invalid_signature.verify_signature());
+    // Exercise the real forwarder after SDK admission, so the SDK's own
+    // verification cannot mask removal of MDK's independent check (mdk#2521).
+    let notifications = [valid.clone(), tampered, invalid_signature, valid.clone()]
+        .into_iter()
+        .map(|event| {
+            NotificationUpdate::Notification(ClientNotification::Event {
+                relay_url: endpoint.clone(),
+                subscription_id: SubscriptionId::new(id),
+                event: Box::new(event),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (sender, mut events) = broadcast::channel(8);
+    let forwarder = spawn_directory_notification_forwarder(
+        Box::pin(futures::stream::iter(notifications)),
+        sender,
+        directory,
+    );
+    timeout(Duration::from_secs(2), forwarder)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut forwarded = Vec::new();
+    while let Ok(DirectoryRelayPlaneEvent::Record(record)) = events.try_recv() {
+        forwarded.push(record.event);
+    }
+    assert_eq!(
+        forwarded,
+        vec![NostrTransportEvent::from_nostr_event(&valid).unwrap(); 2],
+        "only authentic copies may cross the directory notification boundary"
+    );
+}
+
 async fn directory_live_auth_challenge(deny_read: bool) {
     use futures::{SinkExt, StreamExt};
     use nostr::prelude::{EventBuilder, Keys};
@@ -7042,4 +7096,133 @@ async fn live_notification_consumer_reports_relay_closed() {
     assert!(!progress.complete());
     supervisor.abort();
     let _ = supervisor.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_wire_rejects_forgery_when_verified_ids_outlive_seen_state() {
+    use futures::SinkExt;
+    use nostr_sdk::prelude::{DatabaseEventStatus, Event};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let keys = Keys::generate();
+    let seed = EventBuilder::new(Kind::Metadata, r#"{"name":"authentic"}"#)
+        .finalize(&keys)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let (frames, mut batches) = mpsc::channel::<Vec<Event>>(4);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if request[0] == "REQ" {
+                break request[1].as_str().unwrap().to_owned();
+            }
+        };
+        socket
+            .send(Message::Text(
+                serde_json::json!(["EOSE", subscription]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        while let Some(batch) = batches.recv().await {
+            for event in batch {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!(["EVENT", subscription, event])
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = plane.subscribe_directory_events();
+    plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: vec![endpoint],
+                watched_user_count: 1,
+                batches: vec![DirectorySyncBatch {
+                    subscription_id: "directory_cache_divergence".into(),
+                    authors: vec![keys.public_key().to_hex()],
+                    kinds: vec![0],
+                    since: None,
+                }],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    frames.send(vec![seed.clone()]).await.unwrap();
+    let DirectoryRelayPlaneEvent::Record(record) = timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected initial profile")
+    };
+    assert_eq!(record.event.id, seed.id.to_hex());
+    let client = plane.inner.transport.directory_client.as_ref().unwrap();
+    assert_eq!(
+        client.database().check_id(&seed.id).await.unwrap(),
+        DatabaseEventStatus::Saved
+    );
+    for clear_seen in [false, true] {
+        if clear_seen {
+            // The production default tracker has 35,000 IDs, versus 128,000
+            // verification entries. Its public wipe gives the same lost-seen,
+            // retained-verification state as eviction, without 35,000 fillers.
+            client.database().wipe().await.unwrap();
+            assert_eq!(
+                client.database().check_id(&seed.id).await.unwrap(),
+                DatabaseEventStatus::NotExistent
+            );
+        }
+        let mut tampered = seed.clone();
+        tampered.content = r#"{"name":"forged"}"#.into();
+        let mut invalid_signature = seed.clone();
+        invalid_signature.sig = nostr::event::Signature::from_byte_array([0; 64]);
+        let fence = EventBuilder::new(Kind::Metadata, format!("fence-{clear_seen}"))
+            .finalize(&keys)
+            .unwrap();
+        frames
+            .send(vec![
+                tampered,
+                invalid_signature,
+                seed.clone(),
+                fence.clone(),
+            ])
+            .await
+            .unwrap();
+        let expected = if clear_seen {
+            vec![&seed, &fence]
+        } else {
+            vec![&fence]
+        };
+        for event in expected {
+            let DirectoryRelayPlaneEvent::Record(record) =
+                timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected authenticated profile")
+            };
+            assert_eq!(
+                record.event,
+                NostrTransportEvent::from_nostr_event(event).unwrap()
+            );
+        }
+    }
+    plane.shutdown().await;
+    server.abort();
+    let _ = server.await;
 }

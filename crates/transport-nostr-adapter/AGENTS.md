@@ -27,14 +27,14 @@ for reconnect/backoff and relay status mechanics.
 | `src/key_package.rs` | Marmot kind `30443` KeyPackage event building/publishing (`NostrKeyPackagePublication`, `NostrKeyPackagePublisher`). |
 | `src/pairing.rs` | Device-pairing messages as rumors gift-wrapped to the account's own key. Built only with `unreleased-device-pairing` and in this crate's tests. |
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
-| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Not yet scheduled by anything. |
-| `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. `SdkSweepRelay` implements its `CompareRelay`. Not yet scheduled by anything. |
+| `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Called by `marmot-app`'s recovery runner `quantum.rs`, behind its internal `runner_owns_debt` gate (off by default). |
+| `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
 | `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, the one-deadline expiry. Nothing enables it before the switch-over (PR 5g). |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
 | `tests/acquisition_contract.rs` | Request validation and optional-boundary shape tests. |
-| `tests/publish_accounting.rs` | `sdk`-gated direct-adapter publish admission, classification, and cancellation tests. |
+| `tests/publish_accounting.rs` | Direct-adapter publish admission, classification, and cancellation tests, with or without `sdk`. |
 | `tests/selective_history_acquisition_tests.rs` | `sdk`-gated bounded history acquisition and reconciliation-cursor tests. |
 | `tests/time_sliced_sweep.rs` | `sdk`-gated sweep over the wire through `limit_relay.rs`: 500 clamp, NIP-77 saturated second, resume, rate-limited CLOSED, NIP-67 hints (the proxy's wok mode): `more` splits, `finish` changes nothing; replies cut mid-stream (the proxy's stall) report every byte read, a comparison's fetch included. |
 | `tests/relay_limit_subscriptions.rs` | `sdk`-gated subscription behavior against `tests/support/limit_relay.rs`, a proxy enforcing strfry 1.1.3's per-connection limits (REQ and NEG caps, filter shape, 500 limit clamp). |
@@ -301,15 +301,32 @@ for reconnect/backoff and relay status mechanics.
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
   Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.
   Only recovery installs use the scoped client API; preserve the legacy maintenance subscribe/cleanup path.
-- Keep `pairing` behind `unreleased-device-pairing` (and `cfg(test)`) until the pairing spec merges, and never enable
-  that feature from a crate that ships. A pairing reader accepts only rumors the account authored; that proves the
+- Keep `pairing` behind `unreleased-device-pairing` (and `cfg(test)`). The explicit default-off `dev-device-groups`
+  CLI capability forwards it with production timing; ordinary releases do not enable it. A pairing reader accepts only rumors the account authored; that proves the
   account, never a device.
 - Use Marmot kind `30443` for KeyPackages; never substitute deprecated NIP-104 key package kinds. There is no dedicated
   KeyPackage relay list; KeyPackages go to the NIP-65 kind `10002` relays.
 
 ## Verification
 
+History driver tests own admission, saved cursors, budgets and certification. Keep real SDK wire tests for request
+limits, byte-cut splitting, hint binding and interruption reports; a model reply does not prove those boundaries.
+Script only replies supported producers can deliver: optional SDK filter verification is off by default, but its
+acquisition set already deduplicates identical events. A proxy's outbound FIFO marker does not prove the SDK processed
+inbound bytes, so it cannot replace the third-chunk cancellation test's receipt premise.
+
+Keep the native ingress public-registration and local-publication tests at the adapter boundary; the app's real-MLS
+local-publication journey separately owns plaintext and durable message preservation. Pausing an in-process fixture's
+Tokio clock must preserve its production replay leases and bounds. The signature/delivery proofs at the 32k replay
+bound run in nextest's `adapter-replay-bounds` group; do not reduce those bounds to cut their CPU cost.
+
 ```sh
 cargo test -p transport-nostr-adapter
 cargo test -p transport-nostr-adapter --features sdk
+```
+
+Run the ignored unchanged-subscription latency diagnostic manually, outside the ordinary suite:
+
+```sh
+cargo test -p transport-nostr-adapter --locked --test inbound_routing unchanged_sync_latency -- --ignored --exact --nocapture
 ```

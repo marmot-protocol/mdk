@@ -1377,7 +1377,7 @@ async fn complete_handle_departure_generic_engine_refusal_is_retained_and_never_
             .refusal
             .as_ref()
             .and_then(|error| error.as_engine_error()),
-        Some(cgka_traits::error::EngineError::AdminCannotSelfRemove { .. })
+        Some(cgka_traits::error::EngineError::AdminDepletion { .. })
     ));
     // Generic engine errors are conservatively unresolved; only the explicit
     // two advisory next-change errors authorize an acknowledged higher attempt.
@@ -2397,5 +2397,131 @@ async fn complete_archive_projection_failure_retains_known_commit_and_dirty_reco
     assert_eq!(retained.applied_group_ids, report.applied_group_ids);
     assert!(!retained.uncertain);
     handle.close();
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+// Pauses reconnect time, which requires the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn production_reconnect_backoff_keeps_selection_commands_retryable() {
+    use crate::chat_selection::capture::{CaptureError, SelectionMutation};
+    use crate::runtime::ChatSelectionDepartureStep;
+    use crate::runtime::account_worker::AccountWorkerCommand;
+    use std::time::Duration;
+
+    let f = Fixture::new(0);
+    f.runtime.accounts().catch_up_accounts().await.unwrap();
+    let commands = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .get(&f.account_id)
+        .unwrap()
+        .commands
+        .clone();
+    let owner_epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
+    tokio::time::pause();
+    f.runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_consumer_exit_for_test();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match f.runtime.unhydrated_group_count_for_test("alice").await {
+            Err(AppError::TransportClosed) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not enter reconnect backoff"
+        );
+    }
+    let selection_commands = || {
+        let (respond, capture) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::CaptureSelection {
+                request: complete_capture_request(&f.account_id),
+                respond,
+            })
+            .unwrap();
+        let (respond, apply) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ApplySelection {
+                request: complete_capture_request(&f.account_id),
+                proof: None,
+                owner: f.store.clone(),
+                owner_epoch: owner_epoch.clone(),
+                attempt_id: 1,
+                operation_id: 1,
+                mutation: SelectionMutation::Archive { archived: true },
+                respond,
+            })
+            .unwrap();
+        let (respond, depart) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::DepartSelection {
+                request: complete_capture_request(&f.account_id),
+                proof: None,
+                owner: f.store.clone(),
+                owner_epoch: owner_epoch.clone(),
+                group_id: "0000".into(),
+                step: ChatSelectionDepartureStep::Leave,
+                admitted: false,
+                respond,
+            })
+            .unwrap();
+        (capture, apply, depart)
+    };
+    // All three commands reach the ordinary backoff receive arm.
+    let (capture, apply, depart) = selection_commands();
+    assert!(matches!(
+        capture.await.expect("capture responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+    assert!(matches!(
+        apply.await.expect("apply responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+    assert!(matches!(
+        depart.await.expect("departure responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+
+    let (respond, recovery) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::CatchUp { respond })
+        .unwrap();
+    // No yield occurs before the burst is queued behind CatchUp: the real
+    // recovery coalescing loop must reject these three commands too.
+    let (capture, apply, depart) = selection_commands();
+    assert!(matches!(
+        capture
+            .await
+            .expect("coalesced capture responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+    assert!(matches!(
+        apply.await.expect("coalesced apply responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+    assert!(matches!(
+        depart
+            .await
+            .expect("coalesced departure responder preserved"),
+        Err(CaptureError::NotReady)
+    ));
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(10), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     f.runtime.shutdown_and_close().await.unwrap();
 }

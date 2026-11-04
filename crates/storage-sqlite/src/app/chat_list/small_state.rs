@@ -286,6 +286,11 @@ impl SqliteAppStorage {
                     [],
                 )
                 .storage()?;
+                conn.execute_cached(
+                    "UPDATE invitation_decisions SET unsent = 1 WHERE unsent = 0",
+                    [],
+                )
+                .storage()?;
             }
             Ok(())
         })
@@ -381,12 +386,22 @@ impl SqliteAppStorage {
     /// change id: an update it sent or merged was withdrawn. Returns how many
     /// are owed again.
     pub fn owe_all_small_state_items(&self) -> StorageResult<usize> {
-        self.lock()?
-            .execute_cached(
-                "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
-                [],
-            )
-            .storage()
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let ordinary = conn
+                .execute_cached(
+                    "UPDATE small_state_items SET unsent = 1 WHERE unsent = 0",
+                    [],
+                )
+                .storage()?;
+            let invitations = conn
+                .execute_cached(
+                    "UPDATE invitation_decisions SET unsent = 1 WHERE unsent = 0",
+                    [],
+                )
+                .storage()?;
+            Ok(ordinary + invitations)
+        })
     }
 }
 
