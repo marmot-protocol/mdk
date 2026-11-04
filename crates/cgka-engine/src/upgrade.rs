@@ -26,6 +26,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         // Must be Stable to upgrade.
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -269,7 +270,7 @@ impl<S: StorageProvider> Engine<S> {
                 "upgrade produced no pending commit".into(),
             ));
         }
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(

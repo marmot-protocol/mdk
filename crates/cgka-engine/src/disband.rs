@@ -316,6 +316,7 @@ impl<S: StorageProvider> Engine<S> {
             ))),
         ];
 
+        self.epoch_manager.ensure_pending_space()?;
         let guard = PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
         let context = crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let commit = self
@@ -382,7 +383,7 @@ impl<S: StorageProvider> Engine<S> {
         })?;
 
         let target_epoch = EpochId(source_epoch.0.saturating_add(1));
-        let pending = self.epoch_manager.next_pending_ref();
+        let pending = self.epoch_manager.next_pending_ref()?;
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),

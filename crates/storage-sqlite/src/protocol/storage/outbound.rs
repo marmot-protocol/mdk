@@ -222,6 +222,9 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
                     )
                 })?;
             }
+            if let Some(pending) = fanout.pending_ref() {
+                crate::protocol::provider::raise_pending_ref(&conn, pending.as_u64())?;
+            }
             conn.execute_cached(
                 "INSERT INTO cgka_outbound_fanout (message_id, group_id, record)
                  VALUES (?1, ?2, ?3)
@@ -365,6 +368,126 @@ mod tests {
             99,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pending_artifacts_atomic() {
+        use cgka_traits::maintenance::{
+            DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic, MaintenanceTrigger,
+        };
+        use cgka_traits::storage::{
+            MaintenanceStorage, MessageStorage, StorageError, StorageProvider,
+        };
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .create_group_snapshot(&gid(1), "before-pending")
+            .unwrap();
+        for evolution in [false, true] {
+            let expected = if evolution {
+                u64::MAX
+            } else {
+                i64::MAX as u64 + 1
+            };
+            let previous = store.pending_ref_high_water().unwrap();
+            let table = if evolution {
+                "cgka_group_evolutions"
+            } else {
+                "cgka_outbound_fanout"
+            };
+            let fanout = OutboundFanout::stage(
+                sample_fanout(17).request().clone(),
+                Some(PendingStateRef::new(expected)),
+                Some(gid(1)),
+                99,
+            )
+            .unwrap();
+            let record = DurableGroupEvolution {
+                id: mid(18),
+                group_id: gid(1),
+                source_epoch: EpochId(0),
+                target_epoch: EpochId(1),
+                phase: GroupEvolutionPhase::Prepared,
+                semantic: GroupEvolutionSemantic::SelfUpdate {
+                    trigger: MaintenanceTrigger::Manual,
+                    obligation_id: None,
+                },
+                own_leaf_before_hash: None,
+                removal_members: vec![],
+                signed_message_id: None,
+                pending_ref: Some(PendingStateRef::new(expected)),
+            };
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER refuse_pending BEFORE INSERT ON {table}
+                 BEGIN SELECT RAISE(ABORT, 'pending artifact fault'); END;"
+                ))
+                .unwrap();
+            let write = || {
+                if evolution {
+                    store.put_group_evolution(&record)
+                } else {
+                    store.put_outbound_fanout(&fanout)
+                }
+            };
+            // A caller may catch this operation's error and still commit its
+            // outer transaction. Neither half of the failed write may escape.
+            store.with_transaction(|_| {
+                let error = write().unwrap_err();
+                assert!(matches!(error, StorageError::Backend(message) if message.contains("pending artifact fault")));
+                Ok::<_, StorageError>(())
+            }).unwrap();
+            assert_eq!(store.pending_ref_high_water().unwrap(), previous);
+            assert_eq!(store.outbound_fanout(fanout.message_id()).unwrap(), None);
+            assert_eq!(store.group_evolution(&record.id).unwrap(), None);
+            store
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TRIGGER refuse_pending")
+                .unwrap();
+            write().unwrap();
+            assert_eq!(store.pending_ref_high_water().unwrap(), expected);
+            store.delete_outbound_fanout(fanout.message_id()).unwrap();
+            store.delete_group_evolution(&record.id).unwrap();
+            store
+                .rollback_group_to_snapshot(&gid(1), "before-pending")
+                .unwrap();
+            assert_eq!(store.pending_ref_high_water().unwrap(), expected);
+        }
+        store.put_outbound_fanout(&sample_fanout(20)).unwrap();
+        assert_eq!(store.pending_ref_high_water().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn pending_metadata_fails_closed() {
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        for malformed in [true, false] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(if malformed {
+                    "PRAGMA ignore_check_constraints = ON;
+                 UPDATE cgka_pending_ref_watermark SET high_water = X'ff';"
+                } else {
+                    "DELETE FROM cgka_pending_ref_watermark;"
+                })
+                .unwrap();
+            for error in [
+                store.pending_ref_high_water().unwrap_err(),
+                store.put_outbound_fanout(&sample_fanout(19)).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, StorageError::Backend(message) if message == "pending reference high-water metadata is missing or corrupt")
+                );
+            }
+            assert_eq!(store.outbound_fanout(&mid(19)).unwrap(), None);
+        }
     }
 
     #[test]

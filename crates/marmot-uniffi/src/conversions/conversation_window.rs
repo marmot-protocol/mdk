@@ -466,6 +466,7 @@ fn presented_timeline_with_tokens(
         deletion_source: row.deletion_source.into(),
         deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
         invalidation_status: row.invalidation_status.clone(),
+        recipient_confirmed: row.recipient_confirmed,
         imported_from: row.imported_from.clone().map(Into::into),
         history_import_provenance: row.history_import_provenance.clone().map(Into::into),
     }
@@ -617,6 +618,7 @@ impl ConversationConversionCache {
             deletion_source: row.deletion_source,
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
+            recipient_confirmed: row.recipient_confirmed,
             imported_from: row.imported_from.clone(),
             history_import_provenance: row.history_import_provenance.clone(),
         };
@@ -682,6 +684,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         deleted_by_message_id_hex,
         deletion_source,
         invalidation_status,
+        recipient_confirmed,
         imported_from,
         history_import_provenance,
     } = row;
@@ -717,6 +720,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             presented_custom_tags(row),
             if trusted { group_system.as_ref() } else { None },
             poll,
+            recipient_confirmed,
             imported_from,
             history_import_provenance,
         ),
@@ -867,6 +871,7 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
             imported_from: None,
             history_import_provenance: None,
         };

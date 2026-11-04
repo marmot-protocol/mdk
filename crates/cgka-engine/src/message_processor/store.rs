@@ -140,6 +140,7 @@ pub(crate) fn transition_staged_invite_welcomes<S: StorageProvider>(
         }
         record.payload = StoredMessagePayload::outbound_welcome(
             message.clone(),
+            Some(staged_origin_commit_id.clone()),
             payload.welcome_key_package_ref().map(<[u8]>::to_vec),
             payload.welcome_deliver_until(),
         )
@@ -885,7 +886,7 @@ impl<S: StorageProvider> Engine<S> {
         }) {
             if let Some(transport_id) = processed_transport_id {
                 self.storage
-                    .put_processed_transport_content(group_id, transport_id, &id)?;
+                    .put_processed_transport_id(group_id, transport_id)?;
             }
             return Ok(());
         }
@@ -900,7 +901,7 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(transport_id) = processed_transport_id {
             self.storage.with_transaction(|storage| {
                 storage.put_message(&record)?;
-                storage.put_processed_transport_content(group_id, transport_id, &record.id)?;
+                storage.put_processed_transport_id(group_id, transport_id)?;
                 Ok::<(), EngineError>(())
             })?;
         } else {

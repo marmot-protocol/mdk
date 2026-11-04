@@ -282,18 +282,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   one that reports it failed, or a send that errs, leaves it owed for the next pass. A carrier leaves the in-flight set
   before the engine settles it. A carrier absent from that set still keeps its Welcome association while its durable
   fanout has outstanding targets; only one with no outstanding fanout is cleared for another send. Never send a
-  delivered one again before D70's fixed wait. `sibling_welcome_resends` owns one indexed timing row per original
-  Welcome: the first durable accepted-publication observation, then the first newly observed target-device DG
-  activity and a fixed 600-second deadline. Application, accepted member Commit and Proposal traffic qualify through immutable
-  authenticated source-epoch leaf proof and current roster keys. Native acceptance owns first local time/order in the
-  existing processed-wrapper ledger outside snapshots; app attribution never allocates or changes a stamp. Missing
-  source proof is recovered from exact ciphertext under a retained anchor, never a later occupant at the same index.
-  Empty-effect batches and ordinary maintenance project bounded proof-present work independently of unavailable proof. Replay, rewrap and later traffic never rearm or slide the wait. Each
-  successful new carrier needs fresh later activity. Persist the current roster tag key actually used to verify the
-  source leaf key with its slot: this verified DG device principal coalesces valid-app aliases across MLS leaf rekeys,
-  while a different tag-key incarnation or another device with the same inner event id remains independent. Unknown
-  earlier source proof holds only aliases of that event; current-key-unready hints never grant attribution. D91 freezes the existing local DG's epoch at upgrade; only
-  later-epoch traffic qualifies, while new local groups qualify immediately and initial delivery is unchanged.
+  delivered one again before D100's heartbeat boundary. `sibling_welcome_resends` owns one timing row per original
+  Welcome: the latest carrier's immutable first actual accepted-publication time and prepared-carrier high-water.
+  Reuse the existing 32-row retirement keyset walk to check repair. Only D35 counted heartbeat `last_active_at` for
+  the current roster entry's slot and `linked_at`, at least 600 seconds after that publication time, qualifies.
+  First sighting, arbitrary DG traffic and old-incarnation activity never qualify. A carrier with unknown acceptance
+  time is not repaired. There is no D90/D91 per-message source-proof journal, alias recovery, local ordering clock or
+  upgrade epoch cutoff. Each newly accepted carrier requires a sufficiently later heartbeat; cadence/skew remain
+  best-effort limits.
   Due work reuses the engine-owned Welcome/ref/expiry/origin, consumes no KeyPackage and makes no Add or history offer.
   A current matching Update/Commit target leaf suppresses repair; the Add's tagged KeyPackage leaf alone does not.
   Reserve the actual generated carrier timestamp and engine carrier association together before handoff, using the

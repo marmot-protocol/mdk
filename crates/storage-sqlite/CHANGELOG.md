@@ -4,6 +4,37 @@
 
 ### Breaking changes
 
+- Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
+  `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
+  `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
+  eligibility. `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs instead of Welcome ids.
+  Rust callers must update and rebuild. Migration 0174 retires D90/D91 observation indexes and local ordering
+  clock, preserving processed-wrapper dedup, known publication times and carrier high-water; unused nullable
+  legacy columns remain inert.
+
+- A peer's reaction settles a send whose publish was judged to have reached
+  no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`:
+  true for a failed own row with no relay acceptance that another account
+  reacted to, which proves that peer received it. A pending send is not
+  settled. Such a row projects as delivered,
+  with no `invalidation_status` and, as before, no `source_message_id_hex`;
+  the chat list reports it `Delivered` and ranks it where it ranked as a
+  failed send, never as a pending one.
+  The stored `app_events` row keeps `local_publish_failed`, so a resend, the
+  terminal-group sweep and convergence withdrawals are unchanged. A peer
+  retracting its reaction returns the row to its failed state. When retention
+  prunes the confirming reaction while the send stays, the receipt is kept in
+  `kept_recipient_receipts` and goes with the send. Migration 0173 adds
+  `message_timeline.recipient_confirmed` and that table, rebuilds the
+  chat-list preview index and settles existing rows from their stored
+  reactions.
+
+- Migration 0175 adds a full-width pending-reference watermark outside group snapshots. Saved fanout/evolution
+  writes raise it atomically; deletion never lowers it. `StorageProvider` implementations must supply
+  `pending_ref_high_water` and preserve that bound. Undecodable pre-index artifacts abort migration rather than
+  guessing a safe handle; malformed artifacts after indexing remain isolated to their group.
+- Stored-message variant 13 retains a confirmed Welcome's origin Commit. Existing originless variants keep their
+  bytes and handling; older binaries refuse schema 175 on open.
 - Migration 0171 adds nullable settings to `device_renames`. `DeviceRenameRecord::settings` retains the three flags for new user edits; legacy NULL records remain label-only. Struct literals add `settings` (mdk#2628 D86).
 
 - Remove `AnnouncedKeyPackageStorage` and its provider accessor (mdk#2863,

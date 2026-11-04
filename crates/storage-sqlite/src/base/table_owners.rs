@@ -16,7 +16,6 @@ pub(crate) enum Side {
 pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     // The migration ledger.
     ("cgka_schema_migrations", Side::Base),
-    ("local_observation_clock", Side::Base),
     // The engine: `cgka_*`, OpenMLS values, the engine-to-app outbox and local forgets.
     ("cgka_account_device_history_keys", Side::Protocol),
     ("cgka_account_device_signers", Side::Protocol),
@@ -45,6 +44,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_messages", Side::Protocol),
     ("cgka_outbound_fanout", Side::Protocol),
     ("cgka_own_commit_intents", Side::Protocol),
+    ("cgka_pending_ref_watermark", Side::Protocol),
     ("cgka_private_key_packages", Side::Protocol),
     ("cgka_processed_transport_ids", Side::Protocol),
     ("cgka_queued_outbound", Side::Protocol),
@@ -178,6 +178,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("history_deliveries_parked", Side::App),
     ("history_delivery_sends", Side::App),
     ("imported_media_file_keys", Side::App),
+    ("kept_recipient_receipts", Side::App),
     ("local_group_deletion_frontiers", Side::App),
     ("local_message_submissions", Side::App),
     ("media_file_refs", Side::App),

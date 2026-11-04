@@ -273,6 +273,14 @@ enum MarmotStatus
    * account stays signed out here: wipe it, then link the device again.
    */
   MARMOT_STATUS_ACCOUNT_UNLINKED = 116,
+  /**
+   * Recovery waits for the source group to settle.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED = 117,
+  /**
+   * Restart the authenticated recovery challenge; do not retry the grant.
+   */
+  MARMOT_STATUS_GROUP_RECOVERY_SOURCE_MISMATCH = 118,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -5036,8 +5044,9 @@ typedef struct MarmotTimelineMessageRecord {
   struct MarmotPollProjection *poll;
   /**
    * Delivery marker for own (`direction == "sent"`) messages: NULL
-   * while committed-but-undelivered (render as pending/failed),
-   * the published source event id once delivered. Always set for
+   * while committed-but-undelivered (render as pending/failed,
+   * unless `recipient_confirmed` is set), the published source event
+   * id once delivered. Always set for
    * received messages.
    */
   char *source_message_id_hex;
@@ -5112,6 +5121,12 @@ typedef struct MarmotTimelineMessageRecord {
    * for delivered messages.
    */
   char *invalidation_status;
+  /**
+   * True when a peer reacted to this own send after it failed with
+   * no relay acceptance on record, which proves the peer received
+   * it: render it as delivered. `source_message_id_hex` stays NULL.
+   */
+  bool recipient_confirmed;
   char *client_token;
   /**
    * The device this row came from in a chat history it sent; NULL
@@ -12041,7 +12056,8 @@ MarmotStatus marmot_nip46_login(const struct MarmotClient *client,
 
 /**
  * Attach a pinned signer and activate its MDK worker. Identity lookup itself
- * is offline, but worker activation requests a fresh identity proof. Restore
+ * is offline; worker activation requests an identity proof only when no usable
+ * current-profile proof is stored. Restore
  * handles before client_start, then run each account's connect/register on an
  * independent background worker after local startup; never run this on UI.
  * # Safety

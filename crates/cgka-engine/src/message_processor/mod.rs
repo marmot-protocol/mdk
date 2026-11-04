@@ -888,6 +888,9 @@ impl<S: StorageProvider> Engine<S> {
             return self.do_request_disband(group_id);
         }
         if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
+            if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             // Retention re-encrypts the payload under the drain-time epoch.
             // A payload pinned to one epoch (an encrypted-media reference,
             // whose key the recipient derives from the delivering message's
@@ -1001,6 +1004,9 @@ impl<S: StorageProvider> Engine<S> {
         // silently un-quarantine it out of band (mdk#364).
         self.ensure_group_live(&group_id)?;
         if self.storage.disband_tombstone(&group_id)?.is_some() {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::NotAMember { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanded",
@@ -1019,8 +1025,16 @@ impl<S: StorageProvider> Engine<S> {
         // no add (including a re-add) may be staged or queued.
         // One record read serves this gate and the two terminal gates below.
         let group = self.stored_group_record(&group_id)?;
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && group.as_ref().is_some_and(|group| group.is_terminal())
+        {
+            return Err(EngineError::NotAMember { group_id });
+        }
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
-            && matches!(intent, SendIntent::Invite { .. })
+            && matches!(
+                intent,
+                SendIntent::Invite { .. } | SendIntent::RecoverMembers { .. }
+            )
         {
             // An Invite needs the record to read its profile; an unknown group
             // fails here with the storage error the direct read used to raise.
@@ -1028,6 +1042,9 @@ impl<S: StorageProvider> Engine<S> {
                 return Err(EngineError::Storage(StorageError::NotFound));
             };
             if group.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy {
+                if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                    return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+                }
                 return Err(EngineError::InvalidTransition(
                     cgka_traits::engine_state::InvalidTransition {
                         from: "LegacyProfile",
@@ -1061,7 +1078,22 @@ impl<S: StorageProvider> Engine<S> {
             // denotes.
             return Err(EngineError::GroupUnrecoverableRepairRequired { group_id });
         }
+        // Recovery replaces a leaf through an Add, but a device group admits
+        // new leaves only through LinkDevice. Refuse permanently before any
+        // settlement gate or transition to Preparing, as the source read does.
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && group.is_some()
+            && self.with_mls_group(
+                &group_id,
+                crate::app_components::group_requires_device_roster,
+            )?
+        {
+            return Err(EngineError::GroupRecoverySourceMismatch { group_id });
+        }
         if self.disbanding_in_progress(&group_id)? {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Disbanding",
@@ -1071,6 +1103,9 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
         if !matches!(intent, SendIntent::Leave { .. }) && self.leave_in_progress(&group_id)? {
+            if matches!(intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Leaving",
@@ -1078,6 +1113,14 @@ impl<S: StorageProvider> Engine<S> {
                     reason: "leave requested",
                 },
             ));
+        }
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && !self
+                .epoch_manager
+                .state(&group_id)
+                .is_some_and(|state| state.is_stable())
+        {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
         }
         // device-group.md, "Linking a device": a device joins the device
         // group only through `LinkDevice`. The sender rule in
@@ -3869,6 +3912,9 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         reissue_attempts: u32,
     ) -> Result<QueuedOutboundIntent, EngineError> {
+        if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
+        }
         let created_at_ms = self.convergence_now_ms();
         let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
         // Refuse before serializing or writing anything. The caller persists
@@ -4202,6 +4248,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
+        | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
@@ -4233,6 +4280,7 @@ pub(crate) fn is_fair_scheduled_intent(
 ) -> bool {
     match intent {
         SendIntent::Invite { .. }
+        | SendIntent::RecoverMembers { .. }
         | SendIntent::RemoveMembers { .. }
         | SendIntent::UpdateAppComponents { .. }
         | SendIntent::ReplaceDeviceEntry { .. }

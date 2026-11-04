@@ -27,31 +27,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroizing;
 
-/// Immutable authenticated source identity from an accepted device-roster-group
-/// message. Missing leaf proof is pending, never permission to use a later tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedDeviceGroupSource {
-    /// Stable authenticated inner-content identity; application aliases share it.
-    pub identity: MessageId,
-    /// Valid inner application identity, retained to hold ambiguous aliases
-    /// while an earlier accepted source leaf is genuinely unavailable.
-    pub application_id: Option<MessageId>,
-    pub epoch: EpochId,
-    pub sender: MemberId,
-    pub leaf_index: u32,
-    pub leaf: Option<AuthenticatedDeviceGroupLeaf>,
-}
-
-/// The exact sending epoch's authenticated leaf material, independent of snapshots.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedDeviceGroupLeaf {
-    pub signature_key: Vec<u8>,
-    pub device_tag: Option<Vec<u8>>,
-    /// Source-roster decrypted slot used only to defer current-key-unready work.
-    /// Attribution must still verify the sealed tag under the current roster.
-    pub slot_hint: Option<crate::app_components::DeviceSlotId>,
-}
-
 /// Marmot-level storage error. Every trait method returns
 /// `Result<_, StorageError>` so the engine can pattern-match rather than
 /// string-parse.
@@ -472,46 +447,6 @@ pub trait MessageStorage {
         group_id: &GroupId,
         transport_id: &MessageId,
     ) -> StorageResult<()>;
-    /// Associate the admitted content id with an exact processed wrapper.
-    /// Backends may keep only the wrapper marker; unavailable local observation
-    /// provenance must remain unavailable rather than being reconstructed.
-    fn put_processed_transport_content(
-        &self,
-        group_id: &GroupId,
-        transport_id: &MessageId,
-        _content_id: &MessageId,
-    ) -> StorageResult<()> {
-        self.put_processed_transport_id(group_id, transport_id)
-    }
-
-    /// Stamp accepted native content in the same transaction as receive/apply.
-    /// Reauthentication may fill missing proof but must preserve the first stamp.
-    /// Providers without this optional observation owner remain fail-closed.
-    fn observe_authenticated_device_group_source(
-        &self,
-        _group_id: &GroupId,
-        _content_id: &MessageId,
-        _source: &AuthenticatedDeviceGroupSource,
-        _now_ms: u64,
-    ) -> StorageResult<()> {
-        Ok(())
-    }
-
-    /// Bounded pending facts with (or without) exact source-leaf proof. Keeping
-    /// these scans separate prevents unavailable old proof from starving traffic.
-    /// Partial-proof pages use ascending content ids strictly after `after`;
-    /// proof-present attribution keeps first-observation order and passes None.
-    fn pending_authenticated_device_group_sources(
-        &self,
-        _group_id: &GroupId,
-        _with_leaf: bool,
-        _key_unready_slots: Option<&[crate::app_components::DeviceSlotId]>,
-        _after: Option<&MessageId>,
-        _limit: usize,
-    ) -> StorageResult<Vec<(MessageId, AuthenticatedDeviceGroupSource)>> {
-        Ok(Vec::new())
-    }
-
     fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
@@ -910,6 +845,11 @@ pub trait MemberValidationCacheStorage {
 pub struct AccountDeviceSignerBinding {
     pub marmot_identity: MemberId,
     pub mls_signature_public_key: Vec<u8>,
+    /// Current-profile account identity proof component, validated by the engine
+    /// against this binding and the selected ciphersuite before every reuse.
+    /// Older records have no proof and acquire one on their next current open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identity_proof: Option<Vec<u8>>,
 }
 
 pub trait AccountDeviceSignerStorage {
@@ -1312,6 +1252,18 @@ pub trait StorageProvider:
     /// Reference to the OpenMLS storage side. Used by the engine to construct
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
+
+    /// Monotonic high-water covering every persisted, restorable pending-send
+    /// reference in outbound fanouts or group evolutions. Writers must raise this account-device bound
+    /// atomically with those artifacts, preserve all `u64` values, and never
+    /// lower it on deletion or snapshot restoration. Construction reserves it
+    /// before any group hydrates or stages new work.
+    ///
+    /// This metadata must be independent of artifact decoding so a malformed
+    /// group payload can be quarantined without blocking unrelated groups.
+    /// Missing, corrupt, or unestablishable legacy bounds must return an error,
+    /// not zero or an estimate. Zero is valid only for a known empty history.
+    fn pending_ref_high_water(&self) -> StorageResult<u64>;
 
     /// Count of writes to the OpenMLS state store, when the backend tracks
     /// them. The engine keeps loaded `MlsGroup`s across calls and reuses one

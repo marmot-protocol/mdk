@@ -135,6 +135,10 @@ pub enum StoredMessagePayload {
         // format, still decodes: its content is the bare transport message.
         #[serde(flatten)]
         message: TransportMessage,
+        /// Confirmed Commit that produced this Welcome; founding and legacy
+        /// payloads have no ordinary Commit origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_commit_id: Option<MessageId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_package_ref: Option<Vec<u8>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,11 +189,13 @@ impl StoredMessagePayload {
 
     pub fn outbound_welcome(
         message: TransportMessage,
+        origin_commit_id: Option<MessageId>,
         key_package_ref: Option<Vec<u8>>,
         deliver_until: Option<Timestamp>,
     ) -> Self {
         Self::OutboundWelcome {
             message,
+            origin_commit_id,
             key_package_ref,
             deliver_until,
         }
@@ -491,9 +497,23 @@ fn encode_stored_message_payload_v2(
         // that adds it, and one with a deadline the variant that adds both.
         StoredMessagePayload::OutboundWelcome {
             message,
+            origin_commit_id,
             key_package_ref,
             deliver_until,
         } => {
+            if let Some(origin) = origin_commit_id {
+                out.push(13);
+                encode_transport_message(message, &mut out)?;
+                encode_var_bytes(origin.as_slice(), &mut out, "Welcome origin commit id")?;
+                encode_option(key_package_ref.as_ref(), &mut out, |value, out| {
+                    encode_var_bytes(value, out, "Welcome KeyPackageRef")
+                })?;
+                encode_option(deliver_until.as_ref(), &mut out, |value, out| {
+                    out.extend_from_slice(&value.0.to_be_bytes());
+                    Ok(())
+                })?;
+                return Ok(out);
+            }
             out.push(match (key_package_ref, deliver_until) {
                 (_, Some(_)) => 8,
                 (Some(_), None) => 6,
@@ -608,6 +628,7 @@ fn decode_stored_message_payload_v2(
         0 => StoredMessagePayload::RawTransport(decoder.transport_message()?),
         1 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
+            origin_commit_id: None,
             key_package_ref: None,
             deliver_until: None,
         },
@@ -632,6 +653,7 @@ fn decode_stored_message_payload_v2(
         },
         6 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
+            origin_commit_id: None,
             key_package_ref: Some(decoder.var_bytes("Welcome KeyPackageRef")?),
             deliver_until: None,
         },
@@ -643,6 +665,7 @@ fn decode_stored_message_payload_v2(
         },
         8 => StoredMessagePayload::OutboundWelcome {
             message: decoder.transport_message()?,
+            origin_commit_id: None,
             key_package_ref: decoder
                 .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
             deliver_until: Some(Timestamp(decoder.u64("Welcome delivery deadline")?)),
@@ -679,6 +702,16 @@ fn decode_stored_message_payload_v2(
                 )),
                 value => return Err(invalid(format!("unknown sibling Welcome origin {value}"))),
             },
+        },
+        13 => StoredMessagePayload::OutboundWelcome {
+            message: decoder.transport_message()?,
+            origin_commit_id: Some(MessageId::new(
+                decoder.var_bytes("Welcome origin commit id")?,
+            )),
+            key_package_ref: decoder
+                .option(|decoder| decoder.var_bytes("Welcome KeyPackageRef"))?,
+            deliver_until: decoder
+                .option(|decoder| Ok(Timestamp(decoder.u64("Welcome delivery deadline")?)))?,
         },
         variant => {
             return Err(invalid(format!(
@@ -1142,14 +1175,20 @@ mod stored_payload_codec_tests {
         };
         let values = [
             StoredMessagePayload::RawTransport(group_message.clone()),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), Some(vec![0x57; 32]), None),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None, None),
             StoredMessagePayload::outbound_welcome(
                 welcome.clone(),
+                None,
+                Some(vec![0x57; 32]),
+                None,
+            ),
+            StoredMessagePayload::outbound_welcome(
+                welcome.clone(),
+                None,
                 Some(vec![0x57; 32]),
                 Some(Timestamp(1_700_000_600)),
             ),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), None, Some(Timestamp(9))),
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None, Some(Timestamp(9))),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55, 0x56]),
@@ -1236,6 +1275,67 @@ mod stored_payload_codec_tests {
         );
     }
 
+    /// Historical ordinary variants keep their exact bytes; a confirmed
+    /// Commit origin uses a distinct variant with independent optional tails.
+    #[test]
+    fn welcome_origin_keeps_bytes() {
+        let body = "01aa02bbcc00000000000000070001780101dd";
+        for (variant, tail) in [(1, ""), (6, "01ee"), (8, "0101ee0000000000000009")] {
+            let bytes = hex::decode(format!("4d444b4d500002{variant:02x}{body}{tail}")).unwrap();
+            let payload = StoredMessagePayload::decode(&bytes).unwrap();
+            assert!(matches!(
+                &payload,
+                StoredMessagePayload::OutboundWelcome {
+                    origin_commit_id: None,
+                    ..
+                }
+            ));
+            assert_eq!(
+                payload.encode().unwrap(),
+                bytes,
+                "historical bytes must not migrate implicitly"
+            );
+        }
+        for (reference, deadline, tail) in [
+            (None, None, "0000"),
+            (Some(vec![0xee]), None, "0101ee00"),
+            (None, Some(Timestamp(9)), "00010000000000000009"),
+            (
+                Some(vec![0xee]),
+                Some(Timestamp(9)),
+                "0101ee010000000000000009",
+            ),
+        ] {
+            let value = StoredMessagePayload::outbound_welcome(
+                TransportMessage {
+                    id: MessageId::new([0xaa]),
+                    payload: vec![0xbb, 0xcc],
+                    timestamp: Timestamp(7),
+                    causal_deps: vec![],
+                    source: TransportSource("x".into()),
+                    envelope: TransportEnvelope::Welcome {
+                        recipient: MemberId::new([0xdd]),
+                    },
+                },
+                Some(MessageId::new([0xcc])),
+                reference,
+                deadline,
+            );
+            let expected = hex::decode(format!("4d444b4d5000020d{body}01cc{tail}")).unwrap();
+            assert_eq!(value.encode().unwrap(), expected);
+            assert_eq!(StoredMessagePayload::decode(&expected).unwrap(), value);
+            let json = serde_json::to_value(&value).unwrap();
+            assert_eq!(
+                json["message"]["origin_commit_id"],
+                serde_json::json!([204])
+            );
+            assert_eq!(
+                StoredMessagePayload::decode(&serde_json::to_vec(&json).unwrap()).unwrap(),
+                value
+            );
+        }
+    }
+
     /// Old development rows retain their exact bytes but cannot establish
     /// canonical provenance. New rows distinguish founding from a real Add.
     #[test]
@@ -1299,11 +1399,16 @@ mod stored_payload_codec_tests {
         let legacy = serde_json::json!({ "kind": "outbound_welcome", "message": &welcome });
         assert_eq!(
             StoredMessagePayload::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
-            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None)
+            StoredMessagePayload::outbound_welcome(welcome.clone(), None, None, None)
         );
         let key_package_ref = Some(vec![0x44; 32]);
         for value in [
-            StoredMessagePayload::outbound_welcome(welcome.clone(), key_package_ref.clone(), None),
+            StoredMessagePayload::outbound_welcome(
+                welcome.clone(),
+                None,
+                key_package_ref.clone(),
+                None,
+            ),
             StoredMessagePayload::staged_invite_welcome(
                 welcome.clone(),
                 MessageId::new([0x55]),
@@ -1317,9 +1422,9 @@ mod stored_payload_codec_tests {
             );
             assert_eq!(value.welcome_key_package_ref(), key_package_ref.as_deref());
         }
-        let without = StoredMessagePayload::outbound_welcome(welcome.clone(), None, None);
+        let without = StoredMessagePayload::outbound_welcome(welcome.clone(), None, None, None);
         assert_eq!(without.encode().unwrap()[7], 1);
-        let with = StoredMessagePayload::outbound_welcome(welcome, key_package_ref, None);
+        let with = StoredMessagePayload::outbound_welcome(welcome, None, key_package_ref, None);
         assert_eq!(with.encode().unwrap()[7], 6);
     }
 
@@ -1336,6 +1441,7 @@ mod stored_payload_codec_tests {
         let deadline = Some(Timestamp(1_700_000_600));
         let outbound = StoredMessagePayload::outbound_welcome(
             welcome.clone(),
+            None,
             key_package_ref.clone(),
             deadline,
         );
@@ -1362,6 +1468,7 @@ mod stored_payload_codec_tests {
                 outbound,
                 StoredMessagePayload::outbound_welcome(
                     welcome.clone(),
+                    None,
                     key_package_ref.clone(),
                     None,
                 ),
@@ -1388,9 +1495,11 @@ mod stored_payload_codec_tests {
             assert_eq!(without.welcome_deliver_until(), None);
         }
         assert!(
-            !serde_json::to_string(&StoredMessagePayload::outbound_welcome(welcome, None, None))
-                .unwrap()
-                .contains("deliver_until")
+            !serde_json::to_string(&StoredMessagePayload::outbound_welcome(
+                welcome, None, None, None
+            ))
+            .unwrap()
+            .contains("deliver_until")
         );
     }
 
