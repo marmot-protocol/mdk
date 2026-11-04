@@ -31,6 +31,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   or a changed upload branch requires a fresh upload; downloads remain supported.
   Use matching regenerated headers and libraries.
 
+- `MarmotTimelineMessageRecord` adds `bool recipient_confirmed` after
+  `invalidation_status` (mdk#1291): a peer reacted to this own send, so render
+  it as delivered although `source_message_id_hex` is NULL. Use matching
+  regenerated headers and libraries.
+
 - `marmot_sign_out_and_wipe` signs out through the account's other devices
   (mdk#2628 item 3.6b): with a linked device that is not signing out too, it
   first asks them to take it out, which can block for about 30 seconds, and
