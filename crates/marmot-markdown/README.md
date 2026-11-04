@@ -156,7 +156,8 @@ The bundled [root snapshot](src/iana-tlds.txt) comes from
 Its header records the data version/date. Update it through reviewed source
 maintenance; builds and message parsing never fetch registry data. Download a
 candidate to a local file and run `python3 scripts/update_tlds.py CANDIDATE` from
-this crate. The updater checks the header, label syntax and ordering, then prints root counts,
+this crate. The updater installs the candidate in place after validating it; review the resulting
+diff before committing. It checks the header, label syntax and ordering, then prints root counts,
 a digest and added/removed roots for review. Compare the candidate with IANA before
 committing; syntax checks alone cannot establish a complete registry snapshot. Explicit links remain usable for newly
 delegated roots before the next snapshot update.
