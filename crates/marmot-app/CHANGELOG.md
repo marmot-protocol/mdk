@@ -131,6 +131,13 @@
 
 ### Added
 
+- Runtime performance snapshots time each phase of a maintenance tick
+  (`worker_maintenance_*`), the passes and blocking batches a tick sets off
+  (`worker_presentation_pass`, `worker_avatar_pass`, `worker_attachment_pass`,
+  `worker_media_sweep`, `worker_upload_promotion`), and each full native replay
+  synchronization by its trigger (`replay_sync_*`), so a profile of an idle
+  account can name where its CPU goes (mdk#2923).
+
 - Add `MarmotAppRuntime::update_linked_device_settings` with optional settings, resolved against the current roster. Rename and settings edits share D37 recovery; an earlier lost edit is recovered before accepting another. History remains limited to future sibling Adds and remaining owed transfers (mdk#2628 D86).
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
@@ -699,6 +706,14 @@
   event keeps its fields, level, message and `method`.
 
 ### Fixed
+
+- An idle account's maintenance tick does less work (mdk#2923). The
+  attachment pass no longer compiles the trigger-heavy expired-acquisition and
+  expired-partial `DELETE`s when nothing has expired; on an idle Pixel 9a that
+  one call was about a third of the app's CPU. A projection checkpoint with
+  nothing to persist is skipped, so a tick no longer commits an empty delta,
+  marks the chat list stale and re-runs the presentation, avatar and attachment
+  passes.
 
 - Received media sources and available decryption keys commit together, so a
   failed key write remains retryable after restart instead of acknowledging
