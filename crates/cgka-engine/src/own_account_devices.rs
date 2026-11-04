@@ -257,6 +257,7 @@ impl<S: StorageProvider> Engine<S> {
         leaf_signature_keys: Vec<Vec<u8>>,
         intent: &'static str,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(
             provider.storage(),
@@ -424,7 +425,7 @@ impl<S: StorageProvider> Engine<S> {
         self.storage.put_group(&group_record)?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),

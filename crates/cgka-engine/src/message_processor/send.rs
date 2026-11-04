@@ -236,6 +236,7 @@ impl<S: StorageProvider> Engine<S> {
         initial_admins: Vec<MemberId>,
         recovery_sources: Vec<cgka_traits::group_recovery::GroupMemberRecovery>,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         // Load group + require Stable.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -612,7 +613,7 @@ impl<S: StorageProvider> Engine<S> {
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         if let Some(evolution) = recovery_evolution.as_mut() {
@@ -752,6 +753,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         members: Vec<MemberId>,
     ) -> Result<SendResult, EngineError> {
+        self.epoch_manager.ensure_pending_space()?;
         let mut target_set = HashSet::new();
         let mut unique_targets = Vec::new();
         for member in members {
@@ -963,7 +965,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);

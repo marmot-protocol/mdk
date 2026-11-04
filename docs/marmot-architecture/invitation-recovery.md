@@ -3,6 +3,16 @@
 When a locally published invite loses branch selection, its Welcome may already have installed the losing branch
 on the recipient. The inviter's success report does not prove that the invitation survived convergence (#1735).
 
+New existing-group Welcomes retain their origin Commit after confirmation. Native supersession retires still-owed
+Welcomes in the same transaction that records the losing Commit's disposition. Reopen and missed runtime events
+cannot restart those deliveries. Already acknowledged delivery records are unchanged; a transport attempt already
+underway cannot be recalled. Founding and historical originless records retain their previous handling; provenance
+is never guessed.
+
+Native `RecoverMembers` operations do not blindly reissue superseded grants. A still-Unrecoverable recipient needs
+fresh source-bound grants for the selected branch. A recipient that already installed a losing Welcome and now has
+a usable copy follows the explicit-consent path below; supersession does not automatically re-halt or replace it.
+
 The engine retains the original invitation intent with a durable recovery record. The app resolves fresh KeyPackages
 using the ordinary safe directory-discovery path. Every invite fetches fresh packages; recovery additionally
 refreshes relay discovery instead of reusing prewarmed routes. The engine rejects

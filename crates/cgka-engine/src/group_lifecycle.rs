@@ -377,6 +377,9 @@ impl<S: StorageProvider> Engine<S> {
         siblings: Vec<cgka_traits::engine::SiblingKeyPackage>,
         chosen: Option<ChosenGroup>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            self.epoch_manager.ensure_pending_space()?;
+        }
         if let Some(chosen) = &chosen {
             // A legacy create holds its Welcomes with its pending commit,
             // which keeps no delivery deadline (D40).
@@ -999,6 +1002,7 @@ impl<S: StorageProvider> Engine<S> {
                         for (welcome, parsed_kp) in welcomes.iter().zip(&parsed_kps) {
                             let payload = StoredMessagePayload::outbound_welcome(
                                 welcome.clone(),
+                                None,
                                 Some(
                                     crate::key_package::key_package_ref(parsed_kp)?
                                         .as_slice()
@@ -1129,7 +1133,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             EpochId(0)
         };
-        let pending_ref = self.epoch_manager.next_pending_ref();
+        let pending_ref = self.epoch_manager.next_pending_ref()?;
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.invalidate_deferred_peel_candidate_cache(&group_id);

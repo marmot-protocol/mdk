@@ -172,6 +172,245 @@ async fn create_confirmed_group(engine: &mut Engine<SqliteAccountStorage>) -> Gr
     group_id
 }
 
+async fn freeze_group_update(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    name: &str,
+) -> OutboundFanout {
+    let result = engine
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some(name.into()),
+            description: None,
+        })
+        .await
+        .expect("stage update");
+    let SendResult::GroupEvolution { msg, pending, .. } = result else {
+        panic!("expected pending group evolution");
+    };
+    let TransportEnvelope::GroupMessage { transport_group_id } = &msg.envelope else {
+        panic!("expected group message");
+    };
+    let fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: engine.self_id(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![TransportEndpoint("wss://watermark.example".into())],
+            },
+            message: msg,
+            required_acks: 1,
+        },
+        Some(pending),
+        Some(group_id.clone()),
+        0,
+    )
+    .expect("freeze update");
+    engine.put_outbound_fanout(&fanout).expect("persist fanout");
+    fanout
+}
+
+enum PendingArtifact {
+    Fanout,
+    Evolution,
+}
+
+async fn corrupt_pending_isolated(artifact: PendingArtifact) {
+    use cgka_traits::maintenance::{
+        DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic,
+    };
+    use storage_sqlite::SqlCipherKey;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pending-watermark.sqlite");
+    let key = SqlCipherKey::raw([0x69; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut initial = build_engine(storage.clone());
+    let healthy = create_confirmed_group(&mut initial).await;
+    let deferred = create_confirmed_group(&mut initial).await;
+    let broken = create_confirmed_group(&mut initial).await;
+    let deferred_fanout = freeze_group_update(&mut initial, &deferred, "deferred update").await;
+    let broken_fanout = freeze_group_update(&mut initial, &broken, "broken update").await;
+    let saved_high = broken_fanout.pending_ref().unwrap();
+    if matches!(artifact, PendingArtifact::Evolution) {
+        storage
+            .put_group_evolution(&DurableGroupEvolution {
+                id: broken_fanout.message_id().clone(),
+                group_id: broken.clone(),
+                source_epoch: EpochId(0),
+                target_epoch: EpochId(1),
+                phase: GroupEvolutionPhase::Prepared,
+                semantic: GroupEvolutionSemantic::SelfUpdate {
+                    trigger: cgka_traits::maintenance::MaintenanceTrigger::Manual,
+                    obligation_id: None,
+                },
+                own_leaf_before_hash: None,
+                removal_members: vec![],
+                signed_message_id: Some(broken_fanout.message_id().clone()),
+                pending_ref: Some(saved_high),
+            })
+            .unwrap();
+    }
+    drop(initial);
+    drop(storage);
+
+    let corrupt = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &corrupt,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    let update = match artifact {
+        PendingArtifact::Fanout => {
+            "UPDATE cgka_outbound_fanout SET record = X'ff' WHERE group_id = ?1"
+        }
+        PendingArtifact::Evolution => {
+            "UPDATE cgka_group_evolutions SET record = X'ff' WHERE group_id = ?1"
+        }
+    };
+    corrupt
+        .execute(update, rusqlite::params![broken.as_slice()])
+        .unwrap();
+    drop(corrupt);
+
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut reopened = build_engine(storage.clone());
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    // Allocate before either saved publication has been hydrated. A skipped
+    // corrupt row must not let another group's ref alias retained recovery.
+    let fresh = freeze_group_update(&mut reopened, &healthy, "fresh update").await;
+    assert!(fresh.pending_ref().unwrap().as_u64() > saved_high.as_u64());
+    reopened
+        .confirm_published(fresh.pending_ref().unwrap())
+        .await
+        .unwrap();
+    reopened.ensure_hydrated(&deferred).unwrap();
+    reopened
+        .confirm_published(deferred_fanout.pending_ref().unwrap())
+        .await
+        .unwrap();
+    reopened.hydrate_all_stored_groups().unwrap();
+    let reason = match artifact {
+        PendingArtifact::Evolution => GroupHydrationQuarantineReason::PendingCommitRecoveryFailed,
+        PendingArtifact::Fanout => GroupHydrationQuarantineReason::GroupRecordLoadFailed,
+    };
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(broken.clone(), reason)]
+    );
+    assert!(reopened.epoch(&healthy).is_ok());
+    assert!(reopened.epoch(&deferred).is_ok());
+
+    for fanout in [&fresh, &deferred_fanout, &broken_fanout] {
+        storage.delete_outbound_fanout(fanout.message_id()).unwrap();
+    }
+    storage
+        .delete_group_evolution(broken_fanout.message_id())
+        .unwrap();
+    drop(reopened);
+    drop(storage);
+    let mut reopened = build_engine(SqliteAccountStorage::open_encrypted(&path, &key).unwrap());
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    let later = freeze_group_update(&mut reopened, &healthy, "later update").await;
+    assert!(later.pending_ref().unwrap().as_u64() > fresh.pending_ref().unwrap().as_u64());
+    reopened
+        .confirm_published(later.pending_ref().unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_fanout_is_isolated() {
+    corrupt_pending_isolated(PendingArtifact::Fanout).await;
+}
+
+#[tokio::test]
+async fn corrupt_evolution_is_isolated() {
+    corrupt_pending_isolated(PendingArtifact::Evolution).await;
+}
+
+#[tokio::test]
+async fn exhausted_refs_do_not_stage() {
+    use storage_sqlite::SqlCipherKey;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("exhausted-pending.sqlite");
+    let key = SqlCipherKey::raw([0x68; 32]);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let before = storage.get_group(&group_id).unwrap();
+    let messages = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let (mut invitee, _) = build_named_client(b"exhaustion-invitee");
+    let package = invitee.fresh_key_package().await.unwrap();
+    drop(initial);
+    drop(storage);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    connection
+        .execute(
+            "UPDATE cgka_pending_ref_watermark SET high_water = ?1",
+            rusqlite::params![u64::MAX.to_be_bytes().as_slice()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut engine = build_engine(storage.clone());
+    engine.hydrate_all_stored_groups().unwrap();
+    for intent in [
+        SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("must not stage".into()),
+            description: None,
+        },
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+        SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![package.clone()],
+            initial_admins: vec![],
+        },
+    ] {
+        assert!(matches!(engine.send(intent).await,
+            Err(EngineError::Backend(message)) if message == "pending reference space exhausted"));
+    }
+    assert!(matches!(engine.create_group(CreateGroupRequest {
+        name: "must not create".into(), description: String::new(), members: vec![package],
+        required_features: vec![], app_components: vec![], initial_admins: vec![],
+    }).await, Err(EngineError::Backend(message)) if message == "pending reference space exhausted"));
+    assert_eq!(storage.list_groups().unwrap(), vec![group_id.clone()]);
+    assert_eq!(storage.get_group(&group_id).unwrap(), before);
+    assert_eq!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap(),
+        messages
+    );
+    assert!(storage.list_welcomes().unwrap().is_empty());
+    assert!(storage.list_group_evolutions().unwrap().is_empty());
+    assert!(storage.list_outbound_fanouts().unwrap().is_empty());
+    drop(engine);
+    drop(storage);
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let mut engine = build_engine(storage.clone());
+    engine.hydrate_all_stored_groups().unwrap();
+    assert_eq!(engine.epoch(&group_id).unwrap(), before.epoch);
+    assert_eq!(storage.get_group(&group_id).unwrap(), before);
+    assert!(
+        !engine
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::PendingCommitRecovered { .. }))
+    );
+}
+
 fn insert_marmot_group_without_openmls_state(
     storage: &SqliteAccountStorage,
     group_id: &GroupId,
@@ -964,6 +1203,10 @@ impl cgka_traits::storage::DeferredPeelGenerationStorage for FlakyGroupRecordSto
 
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
+
+    fn pending_ref_high_water(&self) -> StorageResult<u64> {
+        self.inner.pending_ref_high_water()
+    }
 
     fn mls_storage(&self) -> &Self::Mls {
         self.inner.mls_storage()

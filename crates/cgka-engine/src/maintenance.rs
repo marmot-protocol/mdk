@@ -231,16 +231,29 @@ impl<S: StorageProvider> Engine<S> {
                     .list_group_evolutions_for_group(group_id)?
                     .iter()
                     .any(|record| {
-                        matches!(
+                        if !matches!(
                             record.phase,
                             GroupEvolutionPhase::Preparing
                                 | GroupEvolutionPhase::Prepared
                                 | GroupEvolutionPhase::Attempting
-                        ) && (matches!(
+                        ) {
+                            return false;
+                        }
+                        if matches!(
                             &record.semantic,
                             GroupEvolutionSemantic::RecoverMembers { .. }
-                        ) || (record.source_epoch == evolution.source_epoch
-                            && record.own_leaf_before_hash == evolution.own_leaf_before_hash))
+                        ) {
+                            return true;
+                        }
+                        // Native validation proved there is no pending commit.
+                        // Without a signed artifact, ordinary Preparing owns nothing.
+                        if record.phase == GroupEvolutionPhase::Preparing
+                            && record.signed_message_id.is_none()
+                        {
+                            return false;
+                        }
+                        record.source_epoch == evolution.source_epoch
+                            && record.own_leaf_before_hash == evolution.own_leaf_before_hash
                     })
             {
                 return Err(EngineError::GroupRecoveryUnsettled {

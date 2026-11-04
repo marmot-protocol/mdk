@@ -43,6 +43,13 @@ session-chaos = { max-threads = 2 }
 # These two adapter cases verify signatures and delivery at the real 32k
 # replay bound. Paused time removes waiting, but their CPU work exceeds 30s.
 adapter-replay-bounds = { max-threads = 1 }
+# Native recovery cases close encrypted stores and replay real MLS state.
+# Keep their setup from multiplying across every nextest worker.
+engine-recovery = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'package(cgka-engine) & ((binary(crash_recovery_sqlite) & (test(recovery) | test(orphan_pending))) | (binary(invite_leave) & (test(recovery_batch::) | test(=recovery_departure_refusal))) | (binary(hydration_quarantine) & (test(=corrupt_fanout_is_isolated) | test(=corrupt_evolution_is_isolated))))'
+test-group = 'engine-recovery'
 
 [[profile.default.overrides]]
 filter = 'package(transport-nostr-adapter) & binary(inbound_routing) & (test(=live_suffix_reuses_budget) | test(=oversized_replay_is_withheld))'

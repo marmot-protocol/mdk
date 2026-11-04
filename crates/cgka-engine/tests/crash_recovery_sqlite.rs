@@ -1572,17 +1572,27 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
     coordinator
         .validate_member_recovery(&group_id, &grant)
         .unwrap();
-    assert!(
-        matches!(
-            coordinator.send(SendIntent::RecoverMembers {
-                group_id: group_id.clone(),
-                members: vec![grant.clone()],
-            }).await,
-            Err(cgka_traits::EngineError::GroupRecoveryUnsettled { group_id: refused })
-                if refused == group_id
-        ),
-        "a current-source ordinary publication still owns its source"
-    );
+    let staged = coordinator
+        .send(SendIntent::RecoverMembers {
+            group_id: group_id.clone(),
+            members: vec![grant.clone()],
+        })
+        .await;
+    if phase == GroupEvolutionPhase::Preparing {
+        let (_, pending) =
+            evolution(staged.expect("an ownerless ordinary Preparing row cannot block recovery"));
+        assert!(coordinator.outstanding_sent_welcomes().unwrap().is_empty());
+        coordinator.publish_failed(pending).await.unwrap();
+    } else {
+        assert!(
+            matches!(
+                staged,
+                Err(cgka_traits::EngineError::GroupRecoveryUnsettled { group_id: refused })
+                    if refused == group_id
+            ),
+            "a current-source ordinary publication still owns its source"
+        );
+    }
     assert_eq!(
         storage.group_evolution(&orphan.id).unwrap(),
         Some(orphan.clone())
@@ -1622,7 +1632,7 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
     coordinator
         .validate_member_recovery(&group_id, &grant)
         .unwrap();
-    let SendResult::GroupEvolution { welcomes, .. } = coordinator
+    let SendResult::GroupEvolution { msg, welcomes, .. } = coordinator
         .send(SendIntent::RecoverMembers {
             group_id: group_id.clone(),
             members: vec![grant.clone()],
@@ -1639,12 +1649,7 @@ async fn run_stale_ordinary_recovery(phase: GroupEvolutionPhase) {
         .list_group_evolutions_for_group(&group_id)
         .unwrap()
         .into_iter()
-        .find(|record| {
-            matches!(
-                &record.semantic,
-                GroupEvolutionSemantic::RecoverMembers { .. }
-            )
-        })
+        .find(|record| record.signed_message_id.as_ref() == Some(&msg.id))
         .unwrap();
     preparing.phase = GroupEvolutionPhase::Preparing;
     preparing.pending_ref = None;

@@ -74,8 +74,8 @@ pub struct OutboundWelcomeWork {
     /// Delivery-aware Welcomes still awaiting acknowledgement, as
     /// [`Engine::outstanding_sent_welcomes`] lists them.
     pub owed: Vec<(GroupId, TransportMessage)>,
-    /// Welcomes staged with an unconfirmed commit. Each becomes owed if its
-    /// commit confirms, or is retired if it rolls back.
+    /// Welcomes waiting for a Commit: staged with an unconfirmed one, or
+    /// holding while their retained origin is temporarily unavailable.
     pub staged: Vec<MessageId>,
     /// Groups the pass did not read because they are not live (unhydrated
     /// or quarantined). [`Engine::outbound_welcome_work_in`] reads one once
@@ -86,8 +86,8 @@ pub struct OutboundWelcomeWork {
 /// Where one retained outbound Welcome stands for delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutboundWelcomeStatus {
-    /// Not deliverable yet: staged with its unconfirmed commit, or in a
-    /// group that is not live (unhydrated or quarantined).
+    /// Not deliverable yet: its Commit is unconfirmed or unavailable, or its
+    /// group is not live (unhydrated or quarantined).
     Waiting,
     /// Owed and deliverable now.
     Owed {
@@ -662,23 +662,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
         .map_err(EngineError::Other)?;
 
         // Pending handles are account-wide, while hydration is per group and
-        // may be deferred. Reserve every durable handle before exposing the
+        // may be deferred. Reserve the durable high-water before exposing the
         // engine: an ordinary evolution hydrated (or newly staged) first must
         // not take a recovery's saved handle. Keep those handles unchanged so
         // frozen fanouts retain their exact commit/Welcome correlation.
         let mut epoch_manager = crate::epoch_manager::EpochManager::new();
-        for fanout in self.storage.list_outbound_fanouts()? {
-            if let Some(pending) = fanout.pending_ref() {
-                epoch_manager.reserve_pending_ref(pending);
-            }
-        }
-        if let Some(maintenance) = self.storage.maintenance_storage() {
-            for evolution in maintenance.list_group_evolutions()? {
-                if let Some(pending) = evolution.pending_ref {
-                    epoch_manager.reserve_pending_ref(pending);
-                }
-            }
-        }
+        epoch_manager
+            .reserve_pending_ref(PendingStateRef::new(self.storage.pending_ref_high_water()?));
 
         let pending_application_events = self.storage.list_pending_application_events()?;
         // Upgrade pending outputs from older databases onto the minimal
@@ -2622,7 +2612,10 @@ impl<S: StorageProvider> Engine<S> {
             );
             return Ok(true);
         }
-        let pending = self.epoch_manager.next_pending_ref();
+        let pending = self
+            .epoch_manager
+            .next_pending_ref()
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
         let mut evolution = evolution;
         evolution.pending_ref = Some(pending);
         if maintenance.put_group_evolution(&evolution).is_err() {
@@ -3612,6 +3605,11 @@ impl<S: StorageProvider> Engine<S> {
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        if self.welcome_origin_state(&record.group_id, &payload)? != MessageState::Processed {
+            return Err(EngineError::Backend(
+                "stored Welcome origin is not canonical".into(),
+            ));
+        }
         let message = match &payload {
             StoredMessagePayload::OutboundWelcome { message, .. } => Some(message),
             // `RawTransport` is the explicit legacy representation used before
@@ -3658,6 +3656,12 @@ impl<S: StorageProvider> Engine<S> {
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
             return Ok(true);
         };
+        if self.ensure_group_live(&record.group_id).is_err() {
+            return Ok(true);
+        }
+        if self.welcome_origin_state(&record.group_id, &payload)? != MessageState::Processed {
+            return Ok(true);
+        }
         Ok(matches!(
             payload,
             StoredMessagePayload::StagedInviteWelcome { .. }
@@ -3715,15 +3719,23 @@ impl<S: StorageProvider> Engine<S> {
         work: &mut OutboundWelcomeWork,
     ) -> Result<(), EngineError> {
         self.visit_group_welcome_records(group_id, &[MessageState::Sent], |id, _, payload| {
+            let origin_state = self.welcome_origin_state(group_id, &payload)?;
             match payload {
                 StoredMessagePayload::OutboundWelcome { message, .. }
                     if matches!(message.envelope, TransportEnvelope::Welcome { .. }) =>
                 {
-                    work.owed.push((group_id.clone(), message));
+                    match origin_state {
+                        MessageState::Processed => work.owed.push((group_id.clone(), message)),
+                        MessageState::ConvergenceDeferred
+                        | MessageState::EpochInvalidated
+                        | MessageState::Failed => {}
+                        _ => work.staged.push(id),
+                    }
                 }
                 StoredMessagePayload::StagedInviteWelcome { .. } => work.staged.push(id),
                 _ => {}
             }
+            Ok(())
         })
     }
 
@@ -3758,6 +3770,15 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(OutboundWelcomeStatus::Settled);
         }
+        match self.welcome_origin_state(&record.group_id, &payload)? {
+            MessageState::Processed => {}
+            MessageState::ConvergenceDeferred
+            | MessageState::EpochInvalidated
+            | MessageState::Failed => {
+                return Ok(OutboundWelcomeStatus::Settled);
+            }
+            _ => return Ok(OutboundWelcomeStatus::Waiting),
+        }
         Ok(match payload {
             StoredMessagePayload::StagedInviteWelcome { .. } => OutboundWelcomeStatus::Waiting,
             StoredMessagePayload::OutboundWelcome { message, .. }
@@ -3790,6 +3811,7 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 ids.push(id);
             }
+            Ok(())
         })?;
         Ok(ids)
     }
@@ -3798,18 +3820,19 @@ impl<S: StorageProvider> Engine<S> {
     pub fn welcome_delivery_index(&self) -> Result<WelcomeDeliveryIndex, EngineError> {
         let mut index = WelcomeDeliveryIndex::default();
         self.visit_welcome_records(TRACKED_WELCOME_STATES, |group_id, id, state, payload| {
+            let ready = state == MessageState::Sent
+                && self.welcome_origin_state(group_id, &payload)? == MessageState::Processed;
             match payload {
                 StoredMessagePayload::OutboundWelcome { message, .. } => {
                     index.tracked_ids.push(id);
-                    if state == MessageState::Sent
-                        && matches!(message.envelope, TransportEnvelope::Welcome { .. })
-                    {
+                    if ready && matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
                         index.outstanding.push((group_id.clone(), message));
                     }
                 }
                 StoredMessagePayload::StagedInviteWelcome { .. } => index.tracked_ids.push(id),
                 _ => {}
             }
+            Ok(())
         })?;
         Ok(index)
     }
@@ -3817,7 +3840,12 @@ impl<S: StorageProvider> Engine<S> {
     fn visit_welcome_records(
         &self,
         states: &[MessageState],
-        mut visit: impl FnMut(&GroupId, MessageId, MessageState, StoredMessagePayload),
+        mut visit: impl FnMut(
+            &GroupId,
+            MessageId,
+            MessageState,
+            StoredMessagePayload,
+        ) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             if self.ensure_group_live(&group_id).is_err() {
@@ -3834,7 +3862,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
         states: &[MessageState],
-        mut visit: impl FnMut(MessageId, MessageState, StoredMessagePayload),
+        mut visit: impl FnMut(MessageId, MessageState, StoredMessagePayload) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
         for record in self
             .storage
@@ -3843,7 +3871,7 @@ impl<S: StorageProvider> Engine<S> {
             let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                 continue;
             };
-            visit(record.id, record.state, payload);
+            visit(record.id, record.state, payload)?;
         }
         Ok(())
     }
@@ -3965,14 +3993,21 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => return Ok(false),
             Err(error) => return Err(EngineError::Storage(error)),
         };
-        if record.state != MessageState::Failed {
-            return Ok(false);
-        }
         // The caller is about to publish a Welcome under this id. A `Failed`
         // row it cannot read still forbids that, so fail closed.
         let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-            return Ok(true);
+            return Ok(record.state == MessageState::Failed);
         };
+        if record.state != MessageState::Failed {
+            return Ok(record.state == MessageState::Sent
+                && matches!(payload, StoredMessagePayload::OutboundWelcome { .. })
+                && matches!(
+                    self.welcome_origin_state(&record.group_id, &payload)?,
+                    MessageState::ConvergenceDeferred
+                        | MessageState::EpochInvalidated
+                        | MessageState::Failed
+                ));
+        }
         Ok(match &payload {
             StoredMessagePayload::OutboundWelcome { message, .. }
             | StoredMessagePayload::StagedInviteWelcome { message, .. }
@@ -3987,6 +4022,29 @@ impl<S: StorageProvider> Engine<S> {
             | StoredMessagePayload::StagedSiblingWelcome { .. }
             | StoredMessagePayload::OutboundSiblingWelcome { .. } => false,
         })
+    }
+
+    /// Founding and legacy Welcomes have no ordinary Commit origin. A known
+    /// origin must still be canonical before a new delivery starts; missing
+    /// state holds ownership rather than guessing that it is deliverable.
+    fn welcome_origin_state(
+        &self,
+        group_id: &GroupId,
+        payload: &StoredMessagePayload,
+    ) -> Result<MessageState, EngineError> {
+        let StoredMessagePayload::OutboundWelcome {
+            origin_commit_id: Some(origin),
+            ..
+        } = payload
+        else {
+            return Ok(MessageState::Processed);
+        };
+        match self.storage.get_message(origin) {
+            Ok(commit) if commit.group_id != *group_id => Ok(MessageState::Failed),
+            Ok(commit) => Ok(commit.state),
+            Err(StorageError::NotFound) => Ok(MessageState::Sent),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Liveness-gated read-only access to the group's `MlsGroup`, served from

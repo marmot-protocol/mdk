@@ -302,7 +302,7 @@ impl<S: StorageProvider> Engine<S> {
                     )?;
                     if let Some(maintenance) = storage.maintenance_storage()
                         && let Some(mut evolution) = maintenance
-                            .list_group_evolutions()?
+                            .list_group_evolutions_for_group(&group_id)?
                             .into_iter()
                             .find(|evolution| {
                                 evolution.signed_message_id.as_ref() == Some(message_id)
