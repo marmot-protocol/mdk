@@ -1130,34 +1130,6 @@ pub(crate) fn help_card_lines() -> Vec<String> {
     .collect()
 }
 
-/// The exact admin-leave-guard messages, kept as constants so the guard branches
-/// and the tests reference one source of truth (verbatim from wn-tui's final
-/// commit).
-pub(crate) const CANNOT_LEAVE_TITLE: &str = "Cannot Leave Group";
-pub(crate) const LEAVE_SOLE_ADMIN_MESSAGE: &str =
-    "You're the only admin. Promote another member to admin before you can leave.";
-pub(crate) const LEAVE_CO_ADMIN_MESSAGE: &str =
-    "You're an admin of this group. Step down as admin before leaving.";
-
-/// The client-side leave guard: an admin cannot leave. `Blocked` carries the
-/// exact info-card body; a non-admin gets the normal confirm.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LeaveDecision {
-    Blocked(&'static str),
-    Confirm,
-}
-
-pub(crate) fn leave_group_decision(account_is_admin: bool, admin_count: usize) -> LeaveDecision {
-    if !account_is_admin {
-        return LeaveDecision::Confirm;
-    }
-    if admin_count <= 1 {
-        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
-    } else {
-        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
-    }
-}
-
 /// The loaded group-detail screen state. Owned as `Option<GroupDetailView>` and
 /// dropped when leaving the screen (no per-view subscriptions to tear down; the
 /// data is a one-shot load).
@@ -1169,7 +1141,6 @@ pub(crate) struct GroupDetailView {
     pub(crate) members: Vec<GroupMemberRow>,
     pub(crate) relays: Vec<String>,
     pub(crate) account_is_admin: bool,
-    pub(crate) admin_count: usize,
     pub(crate) selected: usize,
 }
 
@@ -1199,7 +1170,7 @@ impl GroupDetailView {
 
 /// Combine a group's members with its admin set into the group-detail view,
 /// tagging each member with admin/self flags and deriving the account's own
-/// admin status and the admin count that the leave guard needs.
+/// admin badge. Leave permission is checked by the core command.
 ///
 /// `self_is_member` is this device's own membership. Another device of the
 /// account keeps its roster entry after this device's removal, so a removed
@@ -1232,7 +1203,6 @@ pub(crate) fn build_group_detail(
         members,
         relays: relays.to_vec(),
         account_is_admin: admin_ids.iter().any(|admin| is_self(admin)),
-        admin_count: admin_ids.len(),
         selected: 0,
     }
 }

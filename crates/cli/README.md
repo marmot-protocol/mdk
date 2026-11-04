@@ -315,7 +315,13 @@ grants admin to an invitee inside the same invite commit. An `--admin` that is n
 `initial_admin_not_invited` before anything is published. Invite results carry an `initial_admins` list.
 `groups management` mirrors the MarmotKit management state (`is_self_admin`, `can_invite`, `can_leave`,
 `requires_self_demote_before_leave`, `can_enable_disbanding`, `can_disband`, `disbanding_blockers`, per-member
-`member_actions`) from one runtime read.
+`member_actions`). Leave hints use the shared core capability selector and remain advisory; the command rechecks
+current authority. `requires_self_demote_before_leave` is false: `groups leave` automatically demotes an eligible
+nonlast admin account before its ordinary departure. The last active admin account is refused before a new shared
+invitation choice or departure publication; promote another account first. TUI `L` confirms and invokes this same
+command, including its last-admin refusal, rather than requiring manual demotion. The independent `groups self-demote`
+command remains available. A committed demotion remains if a later departure fails. An admitted Leave can still be
+settling; success is not proof every device departed.
 
 **Retention.** `groups retention <group-hex>` shows the disappearing-message policy (`disappearing_message_secs`,
 `enabled`, and the full `message_retention` component). `--set <duration>` publishes a component update: a bare integer

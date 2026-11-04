@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Use core Leave capability hints in group-management output and allow TUI Leave confirmation for admins. Core
+  automatically demotes an eligible nonlast admin account and refuses the last active admin before departure effects;
+  manual self-demotion remains supported. Existing JSON fields and command spellings are unchanged.
+
 - Add dev-only `devices list` and `devices link` start/status/confirm-match/approve/cancel commands over the persistent daemon, enabled by the separate default-off `dev-device-groups` Cargo feature. Production timing stays unchanged; ordinary releases keep it off.
 
 ### Added

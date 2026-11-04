@@ -1161,9 +1161,8 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Leave the group and return to the main view. On success the chat is gone
-    /// from the list, so the group-detail state is dropped and the chats are
-    /// re-listed before the screen shows again.
+    /// Request Leave through the core command, then reload the chat list.
+    /// Admitted work can still be settling; command refusals remain errors.
     pub(crate) fn leave_group(&mut self, group_id: &str) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         let result = self

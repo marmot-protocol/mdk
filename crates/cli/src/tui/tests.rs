@@ -7082,28 +7082,6 @@ fn popup_key_group_picker_navigates_and_chains_into_the_add_confirm() {
 }
 
 #[test]
-fn leave_group_decision_covers_sole_admin_co_admin_and_non_admin() {
-    assert_eq!(
-        leave_group_decision(true, 1),
-        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
-    );
-    assert_eq!(
-        leave_group_decision(true, 3),
-        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
-    );
-    assert_eq!(leave_group_decision(false, 3), LeaveDecision::Confirm);
-    // The exact wn-tui messages, pinned so a reword is a deliberate change.
-    assert_eq!(
-        LEAVE_SOLE_ADMIN_MESSAGE,
-        "You're the only admin. Promote another member to admin before you can leave."
-    );
-    assert_eq!(
-        LEAVE_CO_ADMIN_MESSAGE,
-        "You're an admin of this group. Step down as admin before leaving."
-    );
-}
-
-#[test]
 fn build_group_detail_tags_admins_and_self() {
     let members = vec![
         ("aa".to_owned(), "npubself".to_owned()),
@@ -7123,7 +7101,6 @@ fn build_group_detail_tags_admins_and_self() {
     assert!(view.members[0].is_admin && view.members[0].is_self);
     assert!(!view.members[1].is_admin && !view.members[1].is_self);
     assert!(view.account_is_admin);
-    assert_eq!(view.admin_count, 1);
     assert_eq!(view.relays, vec!["wss://relay.example".to_owned()]);
 }
 
@@ -7191,7 +7168,6 @@ fn open_group_detail_loads_state_and_esc_returns_to_main() {
     let view = app.group_detail.as_ref().expect("group detail loaded");
     assert_eq!(view.members.len(), 2);
     assert!(view.account_is_admin);
-    assert_eq!(view.admin_count, 1);
     assert!(view.members[0].is_self);
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -7261,7 +7237,7 @@ fn self_membership_absent_from_group_show_reads_as_member() {
 }
 
 #[test]
-fn group_detail_leave_guard_blocks_admins_and_confirms_non_admins() {
+fn group_detail_leave_confirms_before_the_authoritative_command() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::GroupDetail;
     app.group_detail = Some(GroupDetailView {
@@ -7271,37 +7247,25 @@ fn group_detail_leave_guard_blocks_admins_and_confirms_non_admins() {
         members: Vec::new(),
         relays: Vec::new(),
         account_is_admin: true,
-        admin_count: 1,
         selected: 0,
     });
 
-    app.handle_key(char_key('L')).expect("L (sole admin)");
-    match &app.popup {
-        Some(Popup::Card { title, body }) => {
-            assert_eq!(title, CANNOT_LEAVE_TITLE);
-            assert_eq!(body[0], LEAVE_SOLE_ADMIN_MESSAGE);
-        }
-        other => panic!("expected sole-admin info card, got {other:?}"),
+    // The confirmation is a coarse entry to the real command. Core owns
+    // demotion and last-admin refusal; the TUI must not block eligible admins.
+    for is_admin in [true, false] {
+        let view = app.group_detail.as_mut().unwrap();
+        view.account_is_admin = is_admin;
+        app.popup = None;
+        app.handle_key(char_key('L'))
+            .expect("L opens Leave confirmation");
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Confirm {
+                purpose: ConfirmPurpose::LeaveGroup { group_id },
+                ..
+            }) if group_id == "g1"
+        ));
     }
-
-    app.popup = None;
-    app.group_detail.as_mut().unwrap().admin_count = 2;
-    app.handle_key(char_key('L')).expect("L (co-admin)");
-    match &app.popup {
-        Some(Popup::Card { body, .. }) => assert_eq!(body[0], LEAVE_CO_ADMIN_MESSAGE),
-        other => panic!("expected co-admin info card, got {other:?}"),
-    }
-
-    app.popup = None;
-    app.group_detail.as_mut().unwrap().account_is_admin = false;
-    app.handle_key(char_key('L')).expect("L (non-admin)");
-    assert!(matches!(
-        app.popup,
-        Some(Popup::Confirm {
-            purpose: ConfirmPurpose::LeaveGroup { .. },
-            ..
-        })
-    ));
 }
 
 /// A group-detail view with two members, for the search-and-add flow.
@@ -7320,7 +7284,6 @@ fn app_on_group_detail(client: WnClient) -> TuiApp {
         }],
         relays: Vec::new(),
         account_is_admin: true,
-        admin_count: 1,
         selected: 0,
     });
     app
@@ -7485,7 +7448,6 @@ fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
         }],
         relays: Vec::new(),
         account_is_admin: false,
-        admin_count: 1,
         selected: 0,
     });
 
@@ -7546,7 +7508,6 @@ fn question_mark_in_group_detail_opens_the_help_card() {
         members: Vec::new(),
         relays: Vec::new(),
         account_is_admin: false,
-        admin_count: 1,
         selected: 0,
     });
 
@@ -7576,7 +7537,6 @@ fn promote_yourself_is_blocked_with_a_status_not_a_confirm() {
         }],
         relays: Vec::new(),
         account_is_admin: false,
-        admin_count: 1,
         selected: 0,
     });
 
@@ -7734,7 +7694,6 @@ fn accepting_an_invite_from_group_detail_returns_to_main() {
         members: Vec::new(),
         relays: Vec::new(),
         account_is_admin: false,
-        admin_count: 1,
         selected: 0,
     });
 
@@ -7809,7 +7768,6 @@ fn group_detail_frame_shows_members_with_badges_and_relays() {
         ],
         relays: vec!["wss://relay.example".to_owned()],
         account_is_admin: true,
-        admin_count: 1,
         selected: 0,
     });
 
@@ -7845,7 +7803,6 @@ fn group_detail_pane_scrolls_the_selected_member_into_view() {
         members,
         relays: vec!["wss://relay.example".to_owned()],
         account_is_admin: true,
-        admin_count: 1,
         selected,
     });
 
@@ -7884,7 +7841,6 @@ fn group_detail_reveals_the_relay_section_at_the_end_of_a_long_member_list() {
             "wss://last.example".to_owned(),
         ],
         account_is_admin: true,
-        admin_count: 1,
         selected,
     });
 
