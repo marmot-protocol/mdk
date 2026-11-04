@@ -195,9 +195,11 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   per-cause conversion counts before the first pre-network `attempt_started` event, exact/live/caught-up results, and no native pages.
   Storage owns the actual released0.14 schema116 fixtures; this journey owns real runtime upgrade integration.
 - `public_app_runner_fences_nonempty_reqs_but_not_empty_ones` has two restarts: a packed REQ containing both groups
-  first returns at least30 raw events, then, after the real rebuild-window age, returns zero. Bob's own EOSE wire
-  replies establish the precondition. During a12-second history stall both groups must be held in the first phase
-  and both must arrive in the second. Every hold must end within30seconds and both timelines must be exact.
+  first returns at least30 raw events. Before the empty restart, a real unaccepted Welcome advances Bob's saved
+  account cursor beyond the aged groups; Bob's own EOSE wire replies must then contain zero stored events.
+  During the12-second history stall, any visible live message must already have its complete known backlog.
+  Unreachable sources retain their debt when leaving the active frontier; a fixed stall is not a backlog hold.
+  Both live messages must arrive during the empty phase, within30seconds overall, with exact timelines.
 
 Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
 `runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids:

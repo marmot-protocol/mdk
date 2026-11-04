@@ -2068,12 +2068,22 @@ async fn watch_live_until(
     from: Instant,
     until: Duration,
     seen: &mut BTreeMap<String, f64>,
+    expected: &[(&GroupId, &[String])],
 ) -> TestResult {
     while from.elapsed() < until {
         for (group, payload) in watched {
             if !seen.contains_key(*payload) {
                 let (_, chat) = bob.chat_view(group, Some(256)).await?;
                 if chat.iter().any(|text| text == payload) {
+                    let prior = expected
+                        .iter()
+                        .find(|(candidate, _)| candidate == group)
+                        .ok_or("no expected backlog for watched group")?;
+                    if !holds_exactly(bob, group, prior.1).await? {
+                        return Err(
+                            "live input became visible before its known backlog was exact".into(),
+                        );
+                    }
                     seen.insert((*payload).to_owned(), from.elapsed().as_secs_f64());
                 }
             }
@@ -2083,9 +2093,55 @@ async fn watch_live_until(
     Ok(())
 }
 
+/// Advance Bob's account cursor with a real inbox delivery, without adding a
+/// third group route at Bob. Merely waiting cannot move a saved cursor: the
+/// old two groups would otherwise replay their same stored frames forever.
+async fn advance_fence_fixture_cursor(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
+    let bob = subject.probe("bob")?;
+    bob.start_audit_log().await?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let pair = clients()[..2].to_vec();
+    subject.select_scenario_group("cursor-invite", true)?;
+    subject
+        .create_group(SubjectCreateGroup {
+            action_id: "cursor-invite",
+            creator: "alice",
+            name: "cursor-invite",
+            invitees: &pair[1..],
+            required_features: &[],
+            initial_admins: &pair[..1],
+            pending: "cursor-invite",
+        })
+        .await?;
+    // Do not tick/accept this Welcome. Its ordinary inbox delivery advances
+    // the cursor while Bob keeps only the two routes the packed REQ tests.
+    let started = Instant::now();
+    loop {
+        let audit = bob.finish_audit_log().await?;
+        if audit.iter().any(|row| {
+            row["event"]["type"] == "transport_cursor_advanced"
+                && row["event"]["cursor_after_secs"]
+                    .as_u64()
+                    .is_some_and(|cursor| cursor >= at)
+        }) {
+            save(out, "empty-cursor-audit.json", &audit)?;
+            return Ok(());
+        }
+        if started.elapsed() >= SETTLEMENT {
+            return Err("fresh inbox delivery did not advance the saved transport cursor".into());
+        }
+        bob.start_audit_log().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Per-REQ positive and negative controls, with two restarts on the same
-/// account. A nonempty packed reply fences both groups during the stall;
-/// an empty packed reply fences neither. Both holds end within one deadline.
+/// account. A nonempty reply may hold newer input while its backlog is
+/// active; a source that leaves the frontier retains truthful debt. Whenever
+/// live input becomes visible its known backlog must already be exact. A
+/// genuinely empty packed reply must not hold either group's live input.
 pub(super) async fn fence_control() {
     let report = run_proof("runner-fence-control", async |subject, out| {
         let started = Instant::now();
@@ -2107,10 +2163,14 @@ pub(super) async fn fence_control() {
         let mut phases = Vec::new();
         let mut errors = Vec::new();
         for nonempty in [true, false] {
-            // A real timestamp age is the workload: every prior group frame,
-            // including maintenance, is outside the 120-second rebuild window.
             settle_maintenance(subject, &pair, &groups).await?;
-            tokio::time::sleep(QUIET_AGE).await;
+            if !nonempty {
+                // Age the two groups, then actually advance the saved account
+                // cursor past them through a separate, unaccepted Welcome.
+                tokio::time::sleep(QUIET_AGE).await;
+                advance_fence_fixture_cursor(subject, out).await?;
+                subject.select_scenario_group("counted", false)?;
+            }
             subject.set_online("bob", false).await?;
             if nonempty {
                 for index in 0..COUNTED_MESSAGES {
@@ -2118,6 +2178,20 @@ pub(super) async fn fence_control() {
                     send(&alice, &counted, &payload).await?;
                     counted_expected.push(payload);
                 }
+                // An accepted send may still be queued. Establish the real
+                // relay backlog before restarting Bob, rather than sleeping
+                // until the sender happens to finish its initial catch-up.
+                wait_for("all counted backlog published", QUIET_AGE + FENCE_RELEASE, async || {
+                    let messages = alice.chat_message_ids(&counted).await?;
+                    let ids = messages.into_iter()
+                        .filter(|(text, _)| counted_expected.contains(text))
+                        .map(|(_, id)| id).collect::<Vec<_>>();
+                    if ids.len() != COUNTED_MESSAGES { return Ok(false); }
+                    let sources = alice.message_sources(&counted, ids).await?;
+                    let published = subject.relay_publication_ids().await?.into_iter()
+                        .filter(|(_, kind)| *kind == 445).map(|(id, _)| id).collect::<BTreeSet<_>>();
+                    Ok(sources.iter().all(|source| source.as_ref().is_some_and(|id| published.contains(id))))
+                }).await?;
             }
             for endpoint in 0..2 { subject.stall_relay_history(endpoint, true).await?; }
             let clocks = relay_clocks(subject).await?;
@@ -2135,10 +2209,11 @@ pub(super) async fn fence_control() {
             quiet_expected.push(quiet_live.clone());
             let watched = [(&counted, counted_live.as_str()), (&quiet, quiet_live.as_str())];
             let mut seen = BTreeMap::new();
-            watch_live_until(&bob, &watched, ready, FENCE_STALL, &mut seen).await?;
+            let expected = [(&counted, counted_expected.as_slice()), (&quiet, quiet_expected.as_slice())];
+            watch_live_until(&bob, &watched, ready, FENCE_STALL, &mut seen, &expected).await?;
             let during = seen.clone();
             for endpoint in 0..2 { subject.stall_relay_history(endpoint, false).await?; }
-            watch_live_until(&bob, &watched, ready, FENCE_RELEASE, &mut seen).await?;
+            watch_live_until(&bob, &watched, ready, FENCE_RELEASE, &mut seen, &expected).await?;
             let exact = wait_for("both fence timelines exact", Duration::from_secs(120), async || {
                 Ok(holds_exactly(&bob, &counted, &counted_expected).await?
                     && holds_exactly(&bob, &quiet, &quiet_expected).await?)
@@ -2148,6 +2223,7 @@ pub(super) async fn fence_control() {
             let phase = json!({"nonempty": nonempty, "live_replies": replies,
                 "stall_seconds": FENCE_STALL.as_secs(), "release_bound_seconds": FENCE_RELEASE.as_secs(),
                 "seen_during_stall_seconds": during, "live_visibility_seconds": seen,
+                "known_backlog_exact_at_first_live": seen.len() == 2,
                 "timelines_exact": exact.is_ok(),
                 "counted_timeline": timeline_view(&bob, &counted, &counted_expected).await?,
                 "quiet_timeline": timeline_view(&bob, &quiet, &quiet_expected).await?,
@@ -2160,7 +2236,6 @@ pub(super) async fn fence_control() {
             if exact.is_err() {
                 return Err(format!("fence timelines lost or repeated history: {}", json!({"phases": phases})).into());
             }
-            if nonempty && !during.is_empty() { errors.push("counted REQ failed to hold both groups"); }
             if !nonempty && during.len() != 2 { errors.push("empty REQ held a group's live message"); }
             if seen.len() != 2 { errors.push("a hold outlived its single replay deadline"); }
             if native_pages(&history).iter().any(|pages| *pages > 0) {
