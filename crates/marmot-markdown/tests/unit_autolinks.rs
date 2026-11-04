@@ -370,3 +370,166 @@ fn malformed_bare_nostr_stays_text() {
     // back to a generic bare-URL autolink — it stays literal.
     assert_eq!(parse_inlines("nostr:foo"), vec![t("nostr:foo")]);
 }
+
+#[test]
+fn schemeless_domain_has_https_destination_and_original_label() {
+    for source in ["example.network", "example.chat", "example.photography"] {
+        let inlines = parse_inlines(source);
+        assert!(
+            matches!(inlines.as_slice(), [Inline::Link { dest, children, classification: LinkDestinationKind::Web, .. }]
+                if dest == &format!("https://{source}") && children == &vec![t(source)]),
+            "expected typed HTTPS destination and authored label for {source}: {inlines:?}"
+        );
+    }
+}
+
+fn domain_link(label: &str, dest: &str) -> Inline {
+    Inline::Link {
+        dest: dest.into(),
+        title: None,
+        children: vec![t(label)],
+        classification: LinkDestinationKind::Web,
+    }
+}
+
+#[test]
+fn schemeless_domain_preserves_label_and_url_components() {
+    for (source, expected) in [
+        (
+            "ExAmPlE.CHAT:8443/a_(b)?q=1&x=2#part",
+            "https://example.chat:8443/a_(b)?q=1&x=2#part",
+        ),
+        ("2nd-site.network", "https://2nd-site.network"),
+        ("example.photography", "https://example.photography"),
+    ] {
+        assert_eq!(parse_inlines(source), vec![domain_link(source, expected)]);
+    }
+    assert_eq!(
+        parse_inlines("See (example.chat)."),
+        vec![
+            t("See ("),
+            domain_link("example.chat", "https://example.chat"),
+            t(").")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("*example.chat*"),
+        vec![Inline::Emph(vec![domain_link(
+            "example.chat",
+            "https://example.chat"
+        )])]
+    );
+}
+
+#[test]
+fn schemeless_domain_file_endings_and_invalid_contexts_remain_inert() {
+    for source in [
+        "report.pdf",
+        "README.md",
+        "archive.zip",
+        "ARCHIVE.ZIP",
+        "notes.md/path",
+        "photo.jpg",
+        "config.json",
+        "app.js",
+        "example.notarealtld",
+        "3.14",
+        "1.2.3",
+        "bad_label.example.chat",
+        "-bad.example.chat",
+        "bad-.chat",
+        "a..example.chat",
+        "user@example.chat",
+        "user:pass@example.chat",
+        "custom:example.chat",
+        "javascript:example.chat",
+        "./example.chat",
+        "../example.chat",
+        "/example.chat",
+        "dir/example.chat",
+        "C:\\example.chat",
+        "example.chat:70000",
+        "example.chat:abc",
+        "xn--.chat",
+        "nsec1qqqqqq.chat",
+        "ncryptsec1qqqqqq.chat",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source}");
+    }
+}
+
+#[test]
+fn schemeless_domain_does_not_override_authored_links_code_or_escapes() {
+    let expected = vec![domain_link("example.chat", "https://other.example")];
+    assert_eq!(
+        parse_inlines("[example.chat](https://other.example)"),
+        expected
+    );
+    assert_eq!(
+        parse_inlines("[example.chat][target]\n\n[target]: https://other.example"),
+        expected
+    );
+    for source in ["`example.chat`", "example\\.chat", "example&#46;chat"] {
+        let expected = if source.starts_with('`') {
+            Inline::Code("example.chat".into())
+        } else {
+            t("example.chat")
+        };
+        assert_eq!(parse_inlines(source), vec![expected], "{source}");
+    }
+    assert_eq!(
+        parse_inlines("[example.chat]"),
+        vec![
+            t("["),
+            domain_link("example.chat", "https://example.chat"),
+            t("]")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("![example.chat](image.png)"),
+        vec![Inline::Image {
+            dest: "image.png".into(),
+            title: None,
+            alt: vec![t("example.chat")],
+            classification: LinkDestinationKind::Relative
+        }]
+    );
+    assert_eq!(
+        parse_inlines("https://example.zip"),
+        vec![uri("https://example.zip")]
+    );
+    assert_eq!(
+        parse_inlines("www.example.zip"),
+        vec![www("www.example.zip")]
+    );
+}
+
+#[test]
+fn schemeless_domain_idna_exposes_actual_host_without_rewriting_the_label() {
+    for (source, dest) in [
+        ("еxample.chat", "https://xn--xample-2of.chat"), // Cyrillic e, not Latin e.
+        ("bücher.de", "https://xn--bcher-kva.de"),
+        ("пример.рф", "https://xn--e1afmkfd.xn--p1ai"),
+        ("ｅxample.chat", "https://example.chat"),
+    ] {
+        assert_eq!(parse_inlines(source), vec![domain_link(source, dest)]);
+    }
+    for source in [
+        "ex\u{200b}ample.chat",
+        "ex\u{00ad}ample.chat",
+        "ex\u{202e}ample.chat",
+        "example.chat/\u{2066}hidden",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source:?}");
+    }
+}
+
+#[test]
+fn schemeless_domain_rejects_whole_overlong_tokens_without_suffix_rescue() {
+    for source in [
+        format!("{}.example.chat", "a".repeat(64)),
+        format!("{}example.chat", "a.".repeat(10000)),
+    ] {
+        assert_eq!(parse_inlines(&source), vec![t(&source)]);
+    }
+}

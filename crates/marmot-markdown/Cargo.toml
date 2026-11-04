@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 serde = { workspace = true }
+idna = "1.1"
 
 [dev-dependencies]
 # `serde_json` is used **only** by the test suite to round-trip the AST

@@ -239,6 +239,10 @@ impl BracketDelim {
 
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
+    tokenize_inner(raw, refs, true)
+}
+
+fn tokenize_inner(raw: &str, refs: &HashMap<String, LinkRef>, infer_domains: bool) -> Vec<Inline> {
     let bytes = raw.as_bytes();
     let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
@@ -251,6 +255,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     let mut open_bracket_delims = 0usize;
     let mut i = 0;
     let mut inline_math_closer_exhausted = false;
+    let mut domain_attempted_until = 0;
 
     // Try a "consume an Inline or fall back to a literal byte" recognizer.
     // Used for the recognizers whose only failure mode is "didn't match —
@@ -273,6 +278,16 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
 
     while i < bytes.len() {
         let c = bytes[i];
+        if infer_domains && i >= domain_attempted_until && crate::domain::eligible_start(raw, i) {
+            let (candidate, attempted_end) = crate::domain::scan(raw, i);
+            domain_attempted_until = attempted_end;
+            if let Some((link, end)) = candidate {
+                flush_text(&mut out, &mut buf, &delims);
+                out.push(link);
+                i = end;
+                continue;
+            }
+        }
         match c {
             b'\\' => {
                 if i + 1 < bytes.len() {
@@ -406,6 +421,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     &mut last_bracket_delim,
                     &mut open_bracket_delims,
                     refs,
+                    infer_domains,
                 ) {
                     i = end;
                 } else {
@@ -508,6 +524,12 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     while i < bytes.len() {
                         let cc = bytes[i];
                         if cc >= 0x80 {
+                            break;
+                        }
+                        if infer_domains
+                            && i >= domain_attempted_until
+                            && crate::domain::eligible_start(raw, i)
+                        {
                             break;
                         }
                         if INLINE_SPECIAL[cc as usize] {
@@ -816,6 +838,7 @@ fn deactivate_bracket_delim(
 
 /// Handle a `]` byte at position `i`. Returns the byte index past the close
 /// on success, or `None` if the `]` should be emitted as literal text.
+#[allow(clippy::too_many_arguments)] // Shares the existing delimiter state; no second parser state owner.
 fn try_close_bracket(
     bytes: &[u8],
     i: usize,
@@ -824,6 +847,7 @@ fn try_close_bracket(
     last_bracket_delim: &mut Option<usize>,
     open_bracket_delims: &mut usize,
     refs: &HashMap<String, LinkRef>,
+    infer_domains: bool,
 ) -> Option<usize> {
     // Find the most recent active opener (`[` or `![`) through the bracket-only
     // chain. This is the bracket analogue of the emphasis openers-bottom
@@ -832,6 +856,16 @@ fn try_close_bracket(
     let opener_idx = previous_active_bracket_delim(delims, *last_bracket_delim)?;
     *last_bracket_delim = Some(opener_idx);
     let opener = delims[opener_idx];
+    // Resolve explicit labels from their original source with fuzzy inference
+    // disabled. This preserves escapes/entities without nesting generated links.
+    // The replacement pass never reparses labels again. Work is bounded by the
+    // existing bracket/depth cap, including nested image labels.
+    let explicit_label = || {
+        infer_domains.then(|| {
+            let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
+            tokenize_inner(source, refs, false)
+        })
+    };
 
     // 1. Inline link: `](dest "title")`
     if bytes.get(i + 1) == Some(&b'(')
@@ -843,6 +877,7 @@ fn try_close_bracket(
             opener_idx,
             dest,
             title,
+            explicit_label(),
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -868,6 +903,7 @@ fn try_close_bracket(
                 opener_idx,
                 dest,
                 title,
+                explicit_label(),
                 last_bracket_delim,
                 open_bracket_delims,
             ) {
@@ -888,6 +924,7 @@ fn try_close_bracket(
                     opener_idx,
                     dest,
                     title,
+                    explicit_label(),
                     last_bracket_delim,
                     open_bracket_delims,
                 ) {
@@ -916,6 +953,7 @@ fn try_close_bracket(
             opener_idx,
             dest,
             title,
+            explicit_label(),
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -1010,12 +1048,14 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 /// [`MAX_INLINE_NESTING_DEPTH`] (mdk#208). On refusal `out`/`delims`
 /// are left untouched so the caller can fall back to literal-text handling
 /// of the closing `]` after deactivating the refused opener.
+#[allow(clippy::too_many_arguments)] // Optional source-derived label avoids generated nested targets.
 fn absorb_link(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     opener_idx: usize,
     dest: String,
     title: Option<String>,
+    replacement_children: Option<Vec<Inline>>,
     last_bracket_delim: &mut Option<usize>,
     open_bracket_delims: &mut usize,
 ) -> bool {
@@ -1035,14 +1075,20 @@ fn absorb_link(
     // cap, refuse it and leave the delimiters as literal text. The probe is the
     // same iterative, early-pruning O(cap) walk used by process_emphasis, so it
     // neither overflows nor costs anything on ordinary input.
-    if nesting_depth_at_least(&out[opener.out_pos + 1..], MAX_INLINE_NESTING_DEPTH) {
+    if nesting_depth_at_least(
+        replacement_children
+            .as_deref()
+            .unwrap_or(&out[opener.out_pos + 1..]),
+        MAX_INLINE_NESTING_DEPTH,
+    ) {
         return false;
     }
 
     let kind_is_image = opener.kind == b'!';
     let classification = classify_link_destination(&dest);
     // Children = items after the placeholder.
-    let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
+    let original_children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
+    let children = replacement_children.unwrap_or(original_children);
     // Drop the placeholder Text("[" / "![").
     out.pop();
     if kind_is_image {
@@ -1222,7 +1268,7 @@ fn try_bare_url(bytes: &[u8], i: usize) -> Option<(String, AutolinkKind, usize)>
 /// - Always strip `.`, `,`, `;`, `:`, `!`, `?`, `*`, `_`, `~`.
 /// - Strip `)` only when the body has more `)` than `(` (so balanced parens
 ///   inside the URL — e.g. Wikipedia disambiguation links — are kept).
-fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
+pub(crate) fn trim_trailing_punct(bytes: &[u8], start: usize, mut end: usize) -> usize {
     let mut opens = 0usize;
     let mut closes = 0usize;
     for &b in &bytes[start..end] {

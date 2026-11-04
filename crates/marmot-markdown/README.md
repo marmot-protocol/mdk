@@ -13,7 +13,7 @@ engine behavior.
 - Parses local-time timestamps into `Inline::Timestamp` with Unix seconds and a typed display style.
 - Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.
-- Keeps dependencies minimal (`serde` only in normal builds).
+- Keeps dependencies scoped to `serde` and strict host validation through `idna`.
 
 ```rust
 use marmot_markdown::{Block, parse};
@@ -128,3 +128,31 @@ Golden fixtures under `tests/golden/` lock parser output. After an intentional o
 `MARMOT_MD_UPDATE_GOLDEN=1 cargo test -p marmot-markdown --test golden`, review the diff, and re-run without the variable.
 
 See [`AGENTS.md`](AGENTS.md) for scope and invariants.
+
+## Scheme-less web domains
+
+Bare domains with a delegated IANA root become `Inline::Link` nodes: the label
+preserves the source spelling and `dest` contains an HTTPS URL with an IDNA-validated
+ASCII host. Root recognition is an offline display heuristic, not evidence that a
+site exists or is safe. Explicit Markdown links, code and escapes take precedence.
+
+Bare `.pdf`, `.md` and `.zip` names remain text, case-insensitively, even when the
+ending is a delegated root. This applies to bare inference only: an explicit
+`https://` URL, `www.` address or Markdown link still expresses navigation intent.
+Other ordinary file extensions absent from the root list also remain text.
+
+Controls, bidirectional formatting controls and default-ignorable formatting
+characters are rejected in inferred destinations rather than silently removed.
+IDNA does not detect all lookalike domains. Renderers must retain their labelled-link
+confirmation policy, show the actual ASCII authority when confirming an IDN, and
+never replace confusable characters with a guessed Latin destination. Existing
+explicit URLs retain their original parsing/classification contract.
+
+The bundled [root snapshot](src/iana-tlds.txt) comes from
+[IANA's delegated-TLD list](https://data.iana.org/TLD/tlds-alpha-by-domain.txt).
+Its header records the data version/date. Update it through reviewed source
+maintenance; builds and message parsing never fetch registry data. Download a
+candidate to a local file and run `python3 scripts/update_tlds.py CANDIDATE` from
+this crate. The updater validates the complete sorted input and prints its digest
+and added/removed roots for review. Explicit links remain usable for newly
+delegated roots before the next snapshot update.

@@ -5,8 +5,8 @@
 //!
 //! 1. **Simplicity.** Straight-line parsing, no clever abstractions, no
 //!    speculative generality.
-//! 2. **Near-zero dependencies.** The only library dependency is `serde`
-//!    for AST (de)serialization.
+//! 2. **Near-zero dependencies.** `serde` handles AST (de)serialization and
+//!    `idna` validates internationalized bare-domain hosts.
 //! 3. **First-class nostr.** Two extra inline node types —
 //!    [`Inline::NostrMention`] for bare `@npub1…` handles, and
 //!    [`Inline::NostrUri`] for explicit `nostr:<hrp>1…` references —
@@ -63,6 +63,7 @@ pub mod ast;
 mod block;
 mod destination;
 mod details;
+mod domain;
 mod entity;
 mod inline;
 mod nostr;

@@ -658,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn bridges_bare_idn_label_and_ascii_destination_without_reclassification() {
+        let document = parse_markdown_document("еxample.chat README.md archive.zip report.pdf");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            &inlines[0],
+            MarkdownInlineFfi::Link { dest, children, classification: MarkdownLinkDestinationKindFfi::Web, .. }
+                if dest == "https://xn--xample-2of.chat"
+                    && matches!(children.as_slice(), [MarkdownInlineFfi::Text { content }] if content == "еxample.chat")
+        ));
+        assert!(matches!(&inlines[1], MarkdownInlineFfi::Text { content }
+            if content == " README.md archive.zip report.pdf"));
+        assert_eq!(inlines.len(), 2);
+    }
+
+    #[test]
     fn bridges_www_autolink_kind() {
         let document = parse_markdown_document("See www.example.com/path.");
         let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
