@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_registration_rejects_invalid_retained_input_atomically() {
+    async fn fresh_public_registration_rejects_invalid_retained_input() {
         for case in 0..5 {
             let adapter = NostrTransportAdapter::new(Arc::new(NoNetwork));
             let account = MemberId::new(vec![0xA1; 32]);
@@ -1081,7 +1081,7 @@ mod tests {
             assert_eq!(
                 ingress.shared.held(),
                 (1, 1),
-                "rejection queued no prefix; duplicate input owns one copy"
+                "rejected fresh registration retains no prefix; duplicate input owns one copy"
             );
             assert_eq!(
                 ingress.shared.queue.lock().unwrap().retained,
