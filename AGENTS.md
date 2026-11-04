@@ -53,6 +53,10 @@ before adding behavior or bindings.
 | Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
+| Formal verification method, proof coverage, and model-to-code correspondence | `.agents/skills/formal-verification/SKILL.md` |
+| Runtime verification, acceptance journeys, and execution evidence | `.agents/skills/verify-mdk/SKILL.md` |
+| Change impact, downstream contracts, and compatibility risks | `.agents/skills/blast-radius/SKILL.md` |
+| Restate the last response in plain language | `.agents/skills/bro/SKILL.md` |
 | Releases | `release.md` |
 | Writing, reviewing, or pruning tests | `.agents/skills/test-audit/SKILL.md` |
 | Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
