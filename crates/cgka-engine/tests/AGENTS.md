@@ -53,6 +53,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `invite_leave.rs`
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
+- **File:** `invite_leave/recovery_batch.rs`
+  - **Owns:** Atomic native recovery for two and 32 distinct recipients, exact artifacts and pending references
+    through encrypted reopen, ACK-gated Welcome release, recipient authenticators, and malformed recovery-artifact
+    quarantine. Source/authority/refusal cases remain in `invite_leave.rs`; crash ownership remains in
+    `crash_recovery_sqlite.rs`.
+
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
     included), KeyPackage-based `constructable_capabilities`, capability matrix. Pure OpenMLS carrier codecs live in

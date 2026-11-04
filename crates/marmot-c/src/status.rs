@@ -193,6 +193,10 @@ pub enum MarmotStatus {
     /// This device was unlinked from the account by its other devices. The
     /// account stays signed out here: wipe it, then link the device again.
     AccountUnlinked = 116,
+    /// Recovery waits for the source group to settle.
+    GroupRecoveryUnsettled = 117,
+    /// Restart the authenticated recovery challenge; do not retry the grant.
+    GroupRecoverySourceMismatch = 118,
 }
 
 thread_local! {
@@ -357,6 +361,10 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::GroupUnrecoverableRepairRequired
         }
         MarmotKitError::AccountWorkerBusy => MarmotStatus::AccountWorkerBusy,
+        MarmotKitError::GroupRecoveryUnsettled { .. } => MarmotStatus::GroupRecoveryUnsettled,
+        MarmotKitError::GroupRecoverySourceMismatch { .. } => {
+            MarmotStatus::GroupRecoverySourceMismatch
+        }
         MarmotKitError::AccountWorkerResponseTimedOut => {
             MarmotStatus::AccountWorkerResponseTimedOut
         }
@@ -611,6 +619,12 @@ mod tests {
             MarmotKitError::AccountUnlinked {
                 account_ref: "a".into(),
             },
+            MarmotKitError::GroupRecoveryUnsettled {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupRecoverySourceMismatch {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -619,7 +633,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            107,
+            109,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -671,6 +685,18 @@ mod tests {
                 reason: marmot_uniffi::AccountDevicesActivationFfi::NotAdmin,
             }) as i32,
             110
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupRecoveryUnsettled {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            117
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            118
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

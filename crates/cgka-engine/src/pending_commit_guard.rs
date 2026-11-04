@@ -8,8 +8,9 @@
 //! handed off, `Drop` clears the OpenMLS pending commit best-effort.
 
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::error::EngineError;
 use cgka_traits::storage::{StorageError, StorageProvider};
-use cgka_traits::types::GroupId;
+use cgka_traits::types::{GroupId, MessageId};
 use openmls::ciphersuite::hash_ref::ProposalRef;
 use openmls::group::{MlsGroup, RemoveProposalError};
 use openmls_traits::OpenMlsProvider as _;
@@ -33,6 +34,7 @@ pub(crate) struct PendingCommitCleanupGuard<S: StorageProvider> {
     // remove from the OpenMLS proposal store on Drop. Empty for send paths,
     // which commit proposals they did not store themselves.
     stored_proposal_refs: Vec<ProposalRef>,
+    recovery_evolution: Option<MessageId>,
     armed: bool,
 }
 
@@ -52,6 +54,7 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
             mls_storage: provider.storage() as *const S::Mls,
             group_id,
             stored_proposal_refs: Vec::new(),
+            recovery_evolution: None,
             armed: true,
         }
     }
@@ -65,6 +68,24 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
         self.stored_proposal_refs.push(proposal_ref);
     }
 
+    /// Own the pre-staging descriptor until the exact Prepared publication is
+    /// handed off. Cancellation must rewind the projection and Welcomes too.
+    pub(crate) fn set_recovery_evolution(&mut self, id: MessageId) {
+        self.recovery_evolution = Some(id);
+    }
+
+    /// Synchronous compensation when persisting Prepared fails. Keep the guard
+    /// armed on failure so Drop can retry, and hydration retains Preparing.
+    pub(crate) fn rollback_recovery(&mut self) -> Result<(), EngineError> {
+        if let Some(id) = &self.recovery_evolution {
+            // SAFETY: same lifetime guarantee as Drop below.
+            let storage = unsafe { &*self.storage };
+            crate::maintenance::rollback_recovery_stage(storage, &self.group_id, id)?;
+            self.armed = false;
+        }
+        Ok(())
+    }
+
     /// The staged commit is now tracked by `EpochManager` and can be cleaned
     /// up by the normal `publish_failed` path. Leave it attached to
     /// OpenMLS / storage.
@@ -76,6 +97,17 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
 impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+
+        if self.recovery_evolution.is_some() {
+            if self.rollback_recovery().is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "drop",
+                    "pending recovery guard could not compensate unpublished evolution"
+                );
+            }
             return;
         }
 

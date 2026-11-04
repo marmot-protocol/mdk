@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-10-30
+updated: 2026-11-04
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -100,6 +100,24 @@ coexist at different versions.
   partially decoded value.
 - Golden byte fixtures pin each binary artifact. Schema migration tests pin
   old-row reads and downgrade refusal.
+
+## Pending publication references
+
+Schema 0175 stores the account-device pending-reference high-water in
+`cgka_pending_ref_watermark.high_water`, an eight-byte big-endian unsigned value.
+Saving a fanout or group evolution raises it in the same transaction as the artifact.
+Deletion and group snapshot restoration do not lower it. Engine construction reserves
+this bound before any group hydrates or stages new work, without decoding artifact rows.
+
+The migration seeds the bound from legacy artifacts once. If an existing artifact cannot
+be decoded, migration fails: its historical handle cannot safely be guessed. After the
+bound exists, a malformed artifact can quarantine its group without blocking unrelated
+groups. Missing or malformed watermark metadata remains an account-wide failure; allocation
+at `u64::MAX` fails before staging rather than wrapping.
+
+Migration 0175 also gates origin-bearing Welcome variant 13. As with other numbered
+migrations, this is an open-time compatibility check, not fencing of an older writer
+that already holds an open connection.
 
 ## Binary grammar
 
@@ -218,12 +236,22 @@ Variant values are stable:
 | `5` | one `TransportMessage`, origin commit id, `StagedInviteWelcome` |
 | `6` | one `TransportMessage`, `KeyPackageRef`, `OutboundWelcome` |
 | `7` | one `TransportMessage`, origin commit id, `KeyPackageRef`, `StagedInviteWelcome` |
+| `8` | one `TransportMessage`, optional `KeyPackageRef`, required delivery deadline, `OutboundWelcome` |
+| `9` | one `TransportMessage`, origin commit id, optional `KeyPackageRef`, required delivery deadline, `StagedInviteWelcome` |
+| `10` | encoded sibling Welcome, origin commit id, `KeyPackageRef`, delivery deadline, `StagedSiblingWelcome` |
+| `11` | encoded sibling Welcome, `KeyPackageRef`, delivery deadline, optional carrier id; legacy unproven origin |
+| `12` | variant 11 fields followed by explicit sibling origin: `1` canonical founding, or `2` confirmed Commit plus id |
+| `13` | one `TransportMessage`, origin commit id, optional `KeyPackageRef`, optional delivery deadline, `OutboundWelcome` |
 
 A Welcome keeps the `KeyPackageRef` of the KeyPackage it answers, so a
 device can find a Welcome by its KeyPackage after losing the Welcome's id
-(mdk#2628 item 3.3b). A Welcome stored before that has no ref and is written
-as `1` or `5`, byte for byte as before; one with a ref is written as `6` or
-`7`. Ids and refs are length-prefixed opaque values.
+(mdk#2628 item 3.3b). Originless, deadline-free outbound Welcomes retain `1`
+or `6`; staged Welcomes without a deadline retain `5` or `7`. A deadline adds
+`8` or `9`. Promotion of an existing-group Welcome preserves its confirmed
+origin using `13`, even without a ref or deadline. Founding and historical
+originless Welcomes retain their previous bytes and handling; missing origins
+are not inferred. Ids, refs and encoded sibling Welcomes are length-prefixed;
+deadlines are unsigned 64-bit timestamps. Optional fields use the binary grammar above.
 
 A stored `TransportMessage` contains, in order:
 

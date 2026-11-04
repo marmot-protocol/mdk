@@ -881,6 +881,10 @@ impl StorageProvider for FaultStorage {
         self.inner.mls_storage()
     }
 
+    fn pending_ref_high_water(&self) -> StorageResult<u64> {
+        self.inner.pending_ref_high_water()
+    }
+
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         Self: Sized,
