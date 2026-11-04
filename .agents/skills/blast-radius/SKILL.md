@@ -34,9 +34,13 @@ assessment. Do not weaken a documented invariant to make the proposal safe.
 Keep the assessment non-mutating for product code and external state unless
 the user also authorized implementation. Existing focused checks and isolated
 scratch probes may produce local evidence; they do not authorize fixes,
-migrations of user data, or public posting. Preserve any stricter reviewer
-restrictions: a `review-local` seat reports a proposed executable check to the
-author rather than writing a probe or building in its protected checkout.
+migrations of user data, or public posting. Before a destructive, irreversible,
+or external-state probe, verify that the user's authorization covers the exact
+operation, target, and scope; general implementation authorization alone is
+insufficient. If that authorization is missing, obtain confirmation before
+executing. Preserve any stricter reviewer restrictions: a `review-local` seat
+reports a proposed executable check to the author rather than writing a probe
+or building in its protected checkout.
 
 ## Follow the changed contract
 

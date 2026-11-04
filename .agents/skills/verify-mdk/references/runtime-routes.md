@@ -12,13 +12,13 @@ source-checked starting points, not recipes exercised by that validation.
 
 | Requested behavior | Starting point | Acceptance evidence and limits |
 | --- | --- | --- |
-| Public messaging, invite, removal, and continuing communication | `crates/cgka-conformance-simulator/tests/app_runtime_journeys.rs`; `APP_SCENARIO_INVENTORY.md` in that crate | Public journeys 01, 03, and 04. Default app harness uses separate participant processes, private SQLCipher roots, and a separate local relay. This does not exercise CLI parsing, native app UI, or public-relay deployment limits. |
-| Orderly restart and small offline backlog | Same binary, journeys 05 and 06; `APP_PATH_COVERAGE.md` | Inspect exact timelines/state and continued communication across the selected offline/reopen sequence. Read the actual steps: do not describe orderly shutdown as an abrupt crash or a repair-driven journey as autonomous recovery. |
-| Abrupt process kills or scheduled relay faults | `RUNNING_CAMPAIGNS.md`, `tests/app_generated_variance.rs`, `tests/process_orchestrator.rs` | Select the documented fault-capable route and inspect kill/reopen or socket-cut observations. Action-boundary kills do not establish mid-transaction crash behavior. Broader campaigns remain subject to local-run limits. |
+| Public messaging, invite, removal, and continuing communication | `crates/cgka-conformance-simulator/tests/app_runtime_journeys.rs`; `crates/cgka-conformance-simulator/APP_SCENARIO_INVENTORY.md` in that crate | Public journeys 01, 03, and 04. Default app harness uses separate participant processes, private SQLCipher roots, and a separate local relay. This does not exercise CLI parsing, native app UI, or public-relay deployment limits. |
+| Orderly restart and small offline backlog | Same binary, journeys 05 and 06; `crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md` | Inspect exact timelines/state and continued communication across the selected offline/reopen sequence. Read the actual steps: do not describe orderly shutdown as an abrupt crash or a repair-driven journey as autonomous recovery. |
+| Abrupt process kills or scheduled relay faults | `crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md`, `crates/cgka-conformance-simulator/tests/app_generated_variance.rs`, `crates/cgka-conformance-simulator/tests/process_orchestrator.rs` | Select the documented fault-capable route and inspect kill/reopen or socket-cut observations. Action-boundary kills do not establish mid-transaction crash behavior. Broader campaigns remain subject to local-run limits. |
 | CLI commands, JSON, and daemon lifecycle/forwarding | `crates/cli/AGENTS.md`, `crates/cli/tests/cli.rs`, `crates/cli/README.md` | Actual `wn`/`wnd` commands and their effects. The quick CLI smoke uses test-policy overrides and a mock relay; it is not production-timing or native-app acceptance. |
-| Exact engine-private state, persistence, or wire contracts | Nearest engine/storage/peeler `AGENTS.md`; simulator `SCENARIOS.md` and `PROPERTY_TESTS.md` | Use the real owner and the cheapest adequate harness. Public projections cannot stand in for private dispositions, wire-byte assertions, or exact MLS state. |
+| Exact engine-private state, persistence, or wire contracts | Nearest engine/storage/peeler `AGENTS.md`; simulator `crates/cgka-conformance-simulator/SCENARIOS.md` and `crates/cgka-conformance-simulator/PROPERTY_TESTS.md` | Use the real owner and the cheapest adequate harness. Public projections cannot stand in for private dispositions, wire-byte assertions, or exact MLS state. |
 | C ABI or generated-language behavior | `crates/marmot-c/AGENTS.md`, `crates/marmot-uniffi/AGENTS.md`, their binding smoke recipes | Execute the binding boundary relevant to the claim. A Rust conversion test does not establish a generated Swift/Kotlin ABI or device lifecycle. Follow platform prerequisites and existing bindings documentation. |
-| Container/VM host boundaries | `crates/convergence-campaign-runner/AGENTS.md`, simulator `RUNNING_CAMPAIGNS.md` and `SCALING_CAMPAIGNS.md` | Use only when the host/kernel/network boundary answers a stated question and the requested scope allows it. Larger execution layers do not increase semantic coverage on their own. |
+| Container/VM host boundaries | `crates/convergence-campaign-runner/AGENTS.md`, simulator `crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md` and `crates/cgka-conformance-simulator/SCALING_CAMPAIGNS.md` | Use only when the host/kernel/network boundary answers a stated question and the requested scope allows it. Larger execution layers do not increase semantic coverage on their own. |
 
 The maintained feature/scenario descriptions remain in the linked owners.
 Do not copy their counts, complete commands, or coverage claims into another
@@ -28,7 +28,7 @@ scenarios between adapters without dropping expectations.
 ## Public journey recipe
 
 Run from the repository root. Choose one of these exact test names after
-reading its acceptance conditions in `tests/app_runtime_journeys.rs`:
+reading its acceptance conditions in `crates/cgka-conformance-simulator/tests/app_runtime_journeys.rs`:
 
 - `public_app_01_bidirectional_messaging`
 - `public_app_03_late_join_and_messaging`
@@ -37,21 +37,34 @@ reading its acceptance conditions in `tests/app_runtime_journeys.rs`:
 - `public_app_06_small_offline_backlog`
 
 For a targeted development check, this example selects the orderly-restart
-journey, retains its artifacts, and runs no other test:
+journey, requires a clean worktree, retains its artifacts, and runs no other
+test. Keep the checkout unchanged while building and running:
 
 ```sh
+(
+set -e
 umask 077
 MDK_VERIFY_EVIDENCE=$(mktemp -d "${TMPDIR:-/tmp}/mdk-verify.XXXXXX")
 export MDK_APP_JOURNEY_ARTIFACTS="$MDK_VERIFY_EVIDENCE"
 git rev-parse HEAD > "$MDK_VERIFY_EVIDENCE/source-revision.txt"
-git status --porcelain > "$MDK_VERIFY_EVIDENCE/source-status.txt"
+git status --porcelain --untracked-files=all > "$MDK_VERIFY_EVIDENCE/source-status.txt"
+if test -s "$MDK_VERIFY_EVIDENCE/source-status.txt"; then
+  echo "Use a clean worktree for this reproducible-evidence recipe." >&2
+  exit 1
+fi
 cargo nextest run -p cgka-conformance-simulator --locked \
   --test app_runtime_journeys --no-tests=fail --retries 0 --test-threads 1 \
   -E 'test(=public_app_05_restart_and_continue_messaging)'
+)
 ```
 
+The subshell stops on a dirty checkout or failed command without closing the
+caller's shell. For an exploratory dirty run, preserve the relevant staged and
+unstaged patches and untracked source contents privately, and label the
+evidence exploratory; a path-only status record is insufficient.
+
 Retain the exact command and runner output beside the artifacts. The default
-development profile is a development check; follow `APP_PATH_COVERAGE.md`'s
+development profile is a development check; follow `crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md`'s
 release/production-policy recipes when that is the acceptance claim. Never use
 the half-second `precheck` profile as runtime acceptance evidence. Do not
 enable `test-policy-overrides` for this default production-settlement recipe.
@@ -69,7 +82,7 @@ binary hashes and the build configuration. Frozen binaries prevent later
 builds from replacing the helper between participant starts.
 
 Direct report/inventory binaries need an explicitly built matching node;
-follow `APP_SCENARIO_INVENTORY.md`. Do not guess that an older installed helper
+follow `crates/cgka-conformance-simulator/APP_SCENARIO_INVENTORY.md`. Do not guess that an older installed helper
 matches the current runner.
 
 ### Readiness, results, and teardown
@@ -123,7 +136,7 @@ secret handling and loopback guards, and never fall back to the user's daemon.
 
 ## Saved-input recovery and broader evidence
 
-Use `RUNNING_CAMPAIGNS.md` for saved generated input, report replay,
+Use `crates/cgka-conformance-simulator/RUNNING_CAMPAIGNS.md` for saved generated input, report replay,
 failure-capsule replay, strict oracles, and fault evidence. Preserve family and
 generator version, seed/case, input digest, adapter, storage, and exact source
 revision. Saved logical input reproduces the schedule, not randomized MLS
