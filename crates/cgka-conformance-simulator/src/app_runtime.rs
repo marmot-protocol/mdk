@@ -30,8 +30,8 @@ mod process_server;
 #[cfg(test)]
 mod strfry_process_scale;
 pub use crate::relay_fault_proxy::{
-    HistoryRequestV1, LiveGroupReplyV1, PRODUCTION_RELAY_INFORMATION, RelayDeliveryPath,
-    RelayEventDeliveryV1, RelayTrafficV1,
+    ConnectionTrafficV1, HistoryRequestV1, LiveGroupReplyV1, PRODUCTION_RELAY_INFORMATION,
+    RelayDeliveryPath, RelayEventDeliveryV1, RelayTrafficV1,
 };
 pub(crate) use process_backend::{HistoryRepairOutcome, history_repair_outcome};
 use process_backend::{ParticipantApp, ParticipantRuntime};
@@ -886,6 +886,51 @@ impl AppRuntimeHarness {
             let owned =
                 requests.filter(|request| connections.get(&request.connection).is_some_and(theirs));
             owned.collect::<Vec<_>>()
+        });
+        Ok(owned.collect())
+    }
+
+    /// Each endpoint's wire cost over `client`'s own connections, from
+    /// connection `since[i]` on, summed: those whose `REQ`s named `client`'s
+    /// inbox and no other participant's, as in
+    /// [`Self::client_history_requests`].
+    pub async fn client_traffic(
+        &self,
+        client: &str,
+        since: &[u64],
+    ) -> Result<Vec<ConnectionTrafficV1>, SubjectError> {
+        let own = self.account_identity(client)?;
+        let others = self
+            .participants
+            .iter()
+            .filter(|(label, _)| label.as_str() != client)
+            .map(|(_, participant)| participant.account_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let traffic = self.relay_traffic(since, true).await?;
+        let owned = traffic.into_iter().map(|relay| {
+            let theirs = |inboxes: &BTreeSet<String>| {
+                inboxes.contains(own)
+                    && inboxes.iter().all(|inbox| !others.contains(inbox.as_str()))
+            };
+            let mut total = ConnectionTrafficV1::default();
+            for (connection, traffic) in relay.connection_traffic {
+                if !relay
+                    .connection_inboxes
+                    .get(&connection)
+                    .is_some_and(theirs)
+                {
+                    continue;
+                }
+                total.upstream_bytes += traffic.upstream_bytes;
+                total.downstream_bytes += traffic.downstream_bytes;
+                for (path, frames) in traffic.event_frames {
+                    *total.event_frames.entry(path).or_default() += frames;
+                }
+                for (path, bytes) in traffic.event_bytes {
+                    *total.event_bytes.entry(path).or_default() += bytes;
+                }
+            }
+            total
         });
         Ok(owned.collect())
     }

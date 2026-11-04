@@ -194,15 +194,22 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   and unanswered history, then reopens the same nightly-shaped account under the runner. It requires nonzero
   per-cause conversion counts before the first pre-network `attempt_started` event, exact/live/caught-up results, and no native pages.
   Storage owns the actual released0.14 schema116 fixtures; this journey owns real runtime upgrade integration.
-- `public_app_runner_fences_nonempty_reqs_but_not_empty_ones` has two restarts: a packed REQ containing both groups
-  first returns at least30 raw events. Before the empty restart, a real unaccepted Welcome advances Bob's saved
-  account cursor beyond the aged groups; Bob's own EOSE wire replies must then contain zero stored events.
-  During the12-second history stall, any visible live message must already have its complete known backlog.
-  Unreachable sources retain their debt when leaving the active frontier; a fixed stall is not a backlog hold.
-  Both live messages must arrive during the empty phase, within30seconds overall, with exact timelines.
+- `public_app_runner_fences_nonempty_reqs_but_not_empty_ones` has two restarts. In the first, a packed REQ containing
+  both groups returns at least 30 raw events; the journey first checks that all 30 sent messages are on the relay.
+  A restart asks from the saved cursor less the 120-second rebuild lookback, and only an ingested group event moves
+  that cursor, so before the second restart the groups age past the lookback and Alice removes Bob from a third
+  group. Her commit is Bob's newest group event, its route retires, and Bob's own EOSE wire replies for the two
+  groups must then contain zero stored events; the journey also requires the forensic cursor advance. During the
+  12-second history stall, any visible live message must already have its complete known backlog. Unreachable
+  sources keep their debt when they leave the active frontier, so a fixed stall is not a backlog hold. Both live
+  messages must arrive during the empty phase, within 30 seconds overall, with exact timelines.
 
 Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
-`runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids:
+`runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids.
+The loop and owed-history reports also carry a report-only `bandwidth` block for each phase, read from the relay
+proxy over bob's own connections: bytes each way, and the `EVENT` frames and bytes the relays sent him, split by the
+shape of the `REQ` that carried them and with the history-request share summed. Both owners' runs record the same
+fields, so a gate-off control run gives the comparison:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \

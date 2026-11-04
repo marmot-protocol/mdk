@@ -1214,9 +1214,10 @@ requests establish runner-only attribution.
 6,000-event failure with competing live traffic and exact history after a full reopen. Busy-group live admission
 waits for older captured history to drain; request deadlines never authorize jumping past it. The upgrade journey additionally requires nonzero conversion before the
 first attempt. The per-REQ fence journey uses two restarts with both groups packed together: counted raw reply then
-empty raw reply, a12-second history stall and a30-second low-volume completion bound. A real unaccepted Welcome
-advances the saved account cursor before the empty reply. First live visibility requires the complete known backlog;
-empty counts must not hold live input. These remain explicit slow manual proofs.
+empty raw reply, a 12-second history stall and a 30-second low-volume completion bound. Before the empty reply, Alice
+removes Bob from a third group, so his newest group event, which sets the saved cursor, leaves the packed REQ. First
+live visibility requires the complete known backlog; empty counts must not hold live input. These remain explicit
+slow manual proofs.
 
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).

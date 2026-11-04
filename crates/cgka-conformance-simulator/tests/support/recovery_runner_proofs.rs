@@ -14,9 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cgka_conformance_simulator::app_runtime::{HistoryRequestV1, RelayDeliveryPath};
+use cgka_conformance_simulator::app_runtime::{
+    ConnectionTrafficV1, HistoryRequestV1, RelayDeliveryPath,
+};
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup, SubjectSelfUpdate,
+    AppRuntimeHarness, AppRuntimeProbe, ConvergenceSubject, SubjectCreateGroup,
+    SubjectRemoveMembers, SubjectSelfUpdate,
 };
 use cgka_traits::GroupId;
 use serde_json::{Value, json};
@@ -235,6 +238,90 @@ async fn publish(
 
 fn payloads(sent: &[Sent]) -> Vec<String> {
     sent.iter().map(|sent| sent.payload.clone()).collect()
+}
+
+/// Each endpoint's next connection index: every connection from here on is
+/// newer, whoever opens it.
+async fn next_sessions(subject: &AppRuntimeHarness) -> TestResult<Vec<u64>> {
+    let traffic = subject.relay_traffic(&[u64::MAX, u64::MAX], false).await?;
+    Ok(traffic.iter().map(|relay| relay.next_session).collect())
+}
+
+/// Bob's wire cost per endpoint over his own connections from `sessions` on.
+async fn bob_traffic(
+    subject: &AppRuntimeHarness,
+    sessions: &[u64],
+) -> TestResult<Vec<ConnectionTrafficV1>> {
+    Ok(subject.client_traffic("bob", sessions).await?)
+}
+
+/// `later` less `earlier`, both read over the same connections.
+fn traffic_delta(
+    later: &[ConnectionTrafficV1],
+    earlier: &[ConnectionTrafficV1],
+) -> Vec<ConnectionTrafficV1> {
+    let minus = |later: &BTreeMap<String, u64>, earlier: &BTreeMap<String, u64>| {
+        later
+            .iter()
+            .map(|(path, value)| {
+                let before = earlier.get(path).copied().unwrap_or(0);
+                (path.clone(), value.saturating_sub(before))
+            })
+            .collect()
+    };
+    later
+        .iter()
+        .zip(earlier)
+        .map(|(later, earlier)| ConnectionTrafficV1 {
+            upstream_bytes: later.upstream_bytes.saturating_sub(earlier.upstream_bytes),
+            downstream_bytes: later
+                .downstream_bytes
+                .saturating_sub(earlier.downstream_bytes),
+            event_frames: minus(&later.event_frames, &earlier.event_frames),
+            event_bytes: minus(&later.event_bytes, &earlier.event_bytes),
+        })
+        .collect()
+}
+
+/// The `REQ` shapes that fetch history; the rest replay a live subscription.
+const HISTORY_PATHS: [&str; 3] = ["ids", "window", "paged_window"];
+
+/// Report-only bandwidth: per endpoint and summed, bytes each way, every
+/// relay-to-Bob `EVENT` frame and its bytes, and the history-request share.
+/// The same fields in both owners' runs make the comparison.
+fn bandwidth_view(traffic: &[ConnectionTrafficV1]) -> Value {
+    let sum = |map: &BTreeMap<String, u64>, history: bool| {
+        map.iter()
+            .filter(|(path, _)| !history || HISTORY_PATHS.contains(&path.as_str()))
+            .map(|(_, value)| value)
+            .sum::<u64>()
+    };
+    let view = |traffic: &ConnectionTrafficV1| {
+        json!({
+            "downstream_bytes": traffic.downstream_bytes,
+            "upstream_bytes": traffic.upstream_bytes,
+            "event_frames": sum(&traffic.event_frames, false),
+            "event_bytes": sum(&traffic.event_bytes, false),
+            "history_event_frames": sum(&traffic.event_frames, true),
+            "history_event_bytes": sum(&traffic.event_bytes, true),
+            "event_frames_by_path": traffic.event_frames,
+        })
+    };
+    let mut total = ConnectionTrafficV1::default();
+    for endpoint in traffic {
+        total.upstream_bytes += endpoint.upstream_bytes;
+        total.downstream_bytes += endpoint.downstream_bytes;
+        for (path, frames) in &endpoint.event_frames {
+            *total.event_frames.entry(path.clone()).or_default() += frames;
+        }
+        for (path, bytes) in &endpoint.event_bytes {
+            *total.event_bytes.entry(path.clone()).or_default() += bytes;
+        }
+    }
+    json!({
+        "per_endpoint": traffic.iter().map(view).collect::<Vec<_>>(),
+        "total": view(&total),
+    })
 }
 
 /// Each endpoint's proxy clock now.
@@ -1473,6 +1560,8 @@ async fn stalled_relay_loop_case(case: LoopCase) {
         save(out, "bob-audit.json", &records)?;
         let refusals = refusals_view(subject, out).await;
         let history = history_since(subject, &clocks).await?;
+        // Report-only: Bob's whole window, healthy and stalled endpoints.
+        let bandwidth = bob_traffic(subject, &bob_sessions).await;
         let route = bob.nostr_route(&group).await?.ok_or("bob holds no route")?;
         let labels = BTreeMap::from([(route.clone(), "loop".to_owned())]);
         let stalled = &history[1];
@@ -1503,6 +1592,7 @@ async fn stalled_relay_loop_case(case: LoopCase) {
             "timeline_exact": complete,
             "timeline": timeline,
             "delivery": delivery.unwrap_or_else(|error| json!({"error": error.to_string()})),
+            "bandwidth": bandwidth.map_or_else(|error| json!({"error": error.to_string()}), |traffic| bandwidth_view(&traffic)),
             "bob_audit": audit.as_deref().map_or_else(|error| json!({"error": error}), audit_summary),
             "refusals": refusals.unwrap_or_else(|error| json!({"error": error.to_string()})),
             "live_visibility_ms": live_visibility,
@@ -1600,6 +1690,7 @@ pub(super) async fn owed_history() {
 
         // Restart: every route owes its gap since its last durable proof.
         let restart_clocks = relay_clocks(subject).await?;
+        let restart_sessions = next_sessions(subject).await?;
         let t0 = Instant::now();
         let trace_restart = runner_trace::now_ms();
         subject.set_online("bob", true).await?;
@@ -1636,6 +1727,7 @@ pub(super) async fn owed_history() {
         let busy_exact = holds_exactly(&bob, &busy, &expected).await?;
         let busy_timeline = timeline_view(&bob, &busy, &expected).await?;
         let after_restart = history_since(subject, &restart_clocks).await?;
+        let restart_traffic = bob_traffic(subject, &restart_sessions).await?;
         let trace_idle = runner_trace::now_ms();
         let restart_trace = trace_between(trace_restart, trace_idle);
 
@@ -1651,6 +1743,7 @@ pub(super) async fn owed_history() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         let idle = history_since(subject, &idle_clocks).await?;
+        let idle_traffic = traffic_delta(&bob_traffic(subject, &restart_sessions).await?, &restart_traffic);
         let trace_cut = runner_trace::now_ms();
         let idle_trace = trace_between(trace_idle, trace_cut);
 
@@ -1660,6 +1753,7 @@ pub(super) async fn owed_history() {
         // interruption returns once the relay is back; only what follows
         // counts as the reconnect's re-proof.
         let reconnect_clocks = relay_clocks(subject).await?;
+        let reconnect_sessions = next_sessions(subject).await?;
         subject.interrupt_relay("reconnect", "relay:shared", OUTAGE_MS).await?;
         let reconnected = Instant::now();
         let trace_reconnect = runner_trace::now_ms();
@@ -1678,6 +1772,7 @@ pub(super) async fn owed_history() {
         let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
         let resweep_seconds = reconnected.elapsed().as_secs_f64();
         let after_reconnect = history_since(subject, &reconnect_clocks).await?;
+        let reconnect_traffic = bob_traffic(subject, &reconnect_sessions).await?;
         let reconnect_trace = runner_trace::since(trace_reconnect);
         let outage_trace = trace_between(trace_cut, trace_reconnect);
         let quiet_exact = holds_exactly(&bob, &quiet, &quiet_expected).await?;
@@ -1715,8 +1810,10 @@ pub(super) async fn owed_history() {
                 "runner": runner_summary(&restart_trace),
                 "runner_wasted": wasted(&restart_trace),
                 "history": summaries(&after_restart),
+                "bandwidth": bandwidth_view(&restart_traffic),
             },
-            "idle": {"seconds": QUIET_AGE.as_secs(), "history": summaries(&idle), "runner": runner_summary(&idle_trace)},
+            "idle": {"seconds": QUIET_AGE.as_secs(), "history": summaries(&idle), "runner": runner_summary(&idle_trace),
+                "bandwidth": bandwidth_view(&idle_traffic)},
             "reconnect": {
                 "native_paging_requests_per_endpoint": native_pages(&after_reconnect),
                 "outage_ms": OUTAGE_MS,
@@ -1727,6 +1824,7 @@ pub(super) async fn owed_history() {
                 "quiet_timeline_exact": quiet_exact,
                 "repeated_window_requests_per_endpoint": reconnect_repeats,
                 "history": summaries(&after_reconnect),
+                "bandwidth": bandwidth_view(&reconnect_traffic),
                 "runner": runner_summary(&reconnect_trace),
                 "runner_during_outage": runner_summary(&outage_trace),
             },
@@ -2093,30 +2191,35 @@ async fn watch_live_until(
     Ok(())
 }
 
-/// Advance Bob's account cursor with a real inbox delivery, without adding a
-/// third group route at Bob. Merely waiting cannot move a saved cursor: the
-/// old two groups would otherwise replay their same stored frames forever.
-async fn advance_fence_fixture_cursor(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
+/// Move Bob's saved cursor past both measured groups the way production
+/// does. A restart asks each packed group REQ from that cursor less the
+/// rebuild lookback, and only an ingested group event (kind 445) moves it:
+/// a Welcome or elapsed time never does. Every group on the same relays
+/// shares one REQ, so the reply is empty only when Bob's newest group event
+/// belongs to a group he no longer subscribes to. Here Alice removes him
+/// from `exit` after the measured groups aged past the lookback; her commit
+/// is his newest event, and its route retires with the membership.
+async fn advance_fence_fixture_cursor(
+    subject: &mut AppRuntimeHarness,
+    out: &Path,
+    exit: &str,
+) -> TestResult {
     let bob = subject.probe("bob")?;
     bob.start_audit_log().await?;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let pair = clients()[..2].to_vec();
-    subject.select_scenario_group("cursor-invite", true)?;
+    subject.select_scenario_group(exit, false)?;
     subject
-        .create_group(SubjectCreateGroup {
-            action_id: "cursor-invite",
-            creator: "alice",
-            name: "cursor-invite",
-            invitees: &pair[1..],
-            required_features: &[],
-            initial_admins: &pair[..1],
-            pending: "cursor-invite",
+        .remove_members(SubjectRemoveMembers {
+            action_id: "remove-bob-from-exit",
+            remover: "alice",
+            members: &pair[1..],
+            pending: "remove-bob-from-exit",
         })
         .await?;
-    // Do not tick/accept this Welcome. Its ordinary inbox delivery advances
-    // the cursor while Bob keeps only the two routes the packed REQ tests.
+    subject.tick(&pair).await?;
     let started = Instant::now();
     loop {
         let audit = bob.finish_audit_log().await?;
@@ -2130,7 +2233,7 @@ async fn advance_fence_fixture_cursor(subject: &mut AppRuntimeHarness, out: &Pat
             return Ok(());
         }
         if started.elapsed() >= SETTLEMENT {
-            return Err("fresh inbox delivery did not advance the saved transport cursor".into());
+            return Err("the removal commit did not advance Bob's saved transport cursor".into());
         }
         bob.start_audit_log().await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2165,10 +2268,13 @@ pub(super) async fn fence_control() {
         for nonempty in [true, false] {
             settle_maintenance(subject, &pair, &groups).await?;
             if !nonempty {
-                // Age the two groups, then actually advance the saved account
-                // cursor past them through a separate, unaccepted Welcome.
+                // Join a third group, age the two measured groups past the
+                // rebuild lookback, then leave Bob's newest group event in
+                // that third group as Alice removes him from it.
+                let exit = create(subject, "exit", &pair).await?;
+                settle_maintenance(subject, &pair, std::slice::from_ref(&exit)).await?;
                 tokio::time::sleep(QUIET_AGE).await;
-                advance_fence_fixture_cursor(subject, out).await?;
+                advance_fence_fixture_cursor(subject, out, "exit").await?;
                 subject.select_scenario_group("counted", false)?;
             }
             subject.set_online("bob", false).await?;
