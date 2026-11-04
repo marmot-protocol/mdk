@@ -63,6 +63,13 @@ const COUNTED_MESSAGES: usize = 30;
 const FENCE_STALL: Duration = Duration::from_secs(12);
 const FENCE_RELEASE: Duration = Duration::from_secs(30);
 
+/// The frozen comparison driver sets this only for the signed old-owner
+/// control. Missing runner evidence never selects control behavior by itself:
+/// default/new-owner runs must still obtain every positive runner verdict.
+fn old_owner_control() -> bool {
+    std::env::var("MDK_RECOVERY_PROOF_CONTROL").as_deref() == Ok("old-owner")
+}
+
 fn clients() -> Vec<String> {
     let named = ["alice", "bob"].into_iter().chain(SENDERS);
     named.map(String::from).collect()
@@ -1557,6 +1564,7 @@ async fn stalled_relay_loop_case(case: LoopCase) {
 ///   the quiet group are never held behind it.
 pub(super) async fn owed_history() {
     let report = run_proof("runner-owed-history", async |subject, out| {
+        let control = old_owner_control();
         let started = Instant::now();
         let clients = clients();
         let pair = clients[..2].to_vec();
@@ -1606,7 +1614,7 @@ pub(super) async fn owed_history() {
         // Visible history and the runner's own surveyed verdict must both
         // finish; neither the initial empty status nor a prior survey proves it.
         let (mut drained, mut reported_caught_up) = (None, None);
-        while drained.is_none() || reported_caught_up.is_none() {
+        while drained.is_none() || (!control && reported_caught_up.is_none()) {
             if t0.elapsed() >= RECOVERY_DEADLINE {
                 break;
             }
@@ -1663,7 +1671,8 @@ pub(super) async fn owed_history() {
         let resweeps = async || {
             let history = history_since(subject, &reconnect_clocks).await?;
             resweep = history[0].iter().filter_map(|request| request.route.clone()).collect();
-            Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route) && caught_up(&bob, trace_reconnect).await?)
+            Ok(resweep.contains(&busy_route) && resweep.contains(&quiet_route)
+                && (control || caught_up(&bob, trace_reconnect).await?))
         };
         let left = RESWEEP_DEADLINE.saturating_sub(reconnected.elapsed());
         let resweep_result = wait_for("the reconnect's re-sweep", left, resweeps).await;
@@ -1687,6 +1696,7 @@ pub(super) async fn owed_history() {
         let restart_bursts = per_endpoint(&after_restart, |requests| bursts(requests).len() as u64);
         let proof = json!({
             "owed_messages": OWED_MESSAGES,
+            "old_owner_control": control,
             "backlog_publish_seconds": backlog_seconds,
             "restart": {
                 "native_paging_requests_per_endpoint": native_pages(&after_restart),
@@ -1877,6 +1887,7 @@ pub(super) async fn ordered_backlog_regression() {
 /// cannot finish it.
 pub(super) async fn upgrade() {
     let report = run_proof_with_owner_mode("runner-upgrade", false, async |subject, out| {
+        let control = old_owner_control();
         let started = Instant::now();
         let clients = clients();
         let busy = create(subject, "busy", &clients).await?;
@@ -1909,7 +1920,7 @@ pub(super) async fn upgrade() {
         let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
         let live = Live::start(alice, bob.clone(), busy.clone(), Duration::from_secs(3), "live-");
         let (mut drained, mut reported_caught_up) = (None, None);
-        while (drained.is_none() || reported_caught_up.is_none()) && t0.elapsed() < RECOVERY_DEADLINE {
+        while (drained.is_none() || (!control && reported_caught_up.is_none())) && t0.elapsed() < RECOVERY_DEADLINE {
             if drained.is_none() {
                 let (_, chat) = bob.chat_view(&busy, None).await?;
                 if chat.iter().filter(|text| text.starts_with("owed-")).count() == UPGRADE_MESSAGES {
@@ -1938,6 +1949,7 @@ pub(super) async fn upgrade() {
             "conversion_before_first_attempt": conversion,
             "converted_obligations": converted_rows,
             "owed_messages": UPGRADE_MESSAGES,
+            "old_owner_control": control,
             "owed_at_upgrade": owed_at_upgrade,
             "owed_visible_seconds": drained,
             "runner_caught_up_seconds": reported_caught_up,

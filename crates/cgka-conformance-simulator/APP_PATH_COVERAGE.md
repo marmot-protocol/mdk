@@ -129,6 +129,12 @@ debug events, captured in process; they carry aggregate fields only. A live mess
 succeeded, at least half the sends the interval allows must have been made, and none may fail; each has up to 60
 seconds after the last send to arrive.
 
+The frozen comparison driver sets `MDK_RECOVERY_PROOF_CONTROL=old-owner` only for the signed old-owner
+control. Its owed-history and upgrade runs stop waiting once history is visible, rather than waiting for a
+survey from the deliberately disabled runner. New-owner runs keep the fresh caught-up requirement. Both modes
+still collect exact history, live delivery and reconnect/wire evidence; runner-only assertions remain strict and
+expected old-owner contract failures are classified separately. Missing runner evidence never selects control mode.
+
 The runner-enabled proofs require both native backward-paging entry points off. Gate-off builds retain them
 as alternating controls. Bob's bounded window/by-id requests and aggregate runner work together witness the
 replacement: both native pager paths issue unlimited history-window REQs, which every runner-enabled proof
