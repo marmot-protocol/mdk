@@ -931,9 +931,9 @@ relay plane's cursor seal stops at the oldest one its restart floor does not cov
 queue holds it yet. A fresh activation replaces the adapter's replay coverage, but held frames
 have no other copy, so they move to the new coverage, held from the same point until the
 runner's next plan answers; only a frame whose group the new REQs no longer route, or that the
-buffer has no room for, is lost. While the account breaker pauses the runner no fetch can move
-a fence before the hour's window rolls, so the runner fences nothing: held frames go in as
-late input and their ranges stay owed.
+buffer has no room for, is lost. A fence holds through an account breaker pause too: a live
+frame opened ahead of its sender's owed messages moves that sender's ratchet, and once it is
+more than the out-of-order window (100 generations) past them, no owner can open them.
 
 The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
 never swept, admission takes its events as a group of their own and never fences them, and

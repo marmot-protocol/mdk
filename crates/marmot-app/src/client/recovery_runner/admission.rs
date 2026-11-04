@@ -55,8 +55,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
-    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnitPolicy, RecoveryUnitState,
-    StagedRecoveryEvent, TransportReconciliationRoute,
+    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnitState, StagedRecoveryEvent,
+    TransportReconciliationRoute,
 };
 
 use super::policy::RecoveryStagingBounds;
@@ -660,22 +660,11 @@ fn bounded(mut fences: Vec<RecoveryCoverageRange>, per_unit: usize) -> Vec<Recov
 
 /// Where each fenced group's held live frames may be released up to, as of
 /// `turn`. PR 5's adapter hold reads this in place of owner capture; like the
-/// live tails it is a query, never a value to keep across a wait.
-///
-/// While the account breaker pauses the runner, no fetch can move a fence
-/// until the hour's window rolls, so nothing is fenced: held frames go out as
-/// late input rather than wait out the pause, and their ranges stay owed.
-pub(crate) fn live_fences(
-    turn: &DebtTurn<'_>,
-    unit: &RecoveryUnitPolicy,
-) -> StorageResult<Vec<LiveFence>> {
-    if turn
-        .app
-        .recovery_account_paused_until(unit, turn.now)?
-        .is_some()
-    {
-        return Ok(Vec::new());
-    }
+/// live tails it is a query, never a value to keep across a wait. It holds
+/// while the account breaker pauses the runner: a live frame opened ahead of
+/// its sender's owed messages can put them past the ratchet's out-of-order
+/// window, where no owner can open them.
+pub(crate) fn live_fences(turn: &DebtTurn<'_>) -> StorageResult<Vec<LiveFence>> {
     Admission::new(turn).live_fences()
 }
 
