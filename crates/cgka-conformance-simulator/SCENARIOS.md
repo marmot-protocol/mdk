@@ -1201,15 +1201,18 @@ commit. After a cold restart it records latency, traffic and recovery time under
 within 600 seconds, the commit is applied and the later messages decrypt, and that every gap chat message is present
 exactly once. `public_app_large_account_recovery_scorecard_runner_owns_debt` runs it with the recovery runner owning
 history debt.
-`public_app_runner_stalled_relay_does_not_loop` and `public_app_runner_finishes_tens_of_thousands_of_owed_events` are
+`public_app_runner_stalled_relay_does_not_loop` and `public_app_runner_finishes_five_thousand_owed_events` are
 the recovery-runner proofs. In the first, one relay endpoint never answers history while live traffic flows; the
 account must recover from the other endpoint, and attempts on the stalled one must thin out. That entry forces a
 sender's own-leaf maintenance commit while bob is stopped; `public_app_runner_stalled_relay_does_not_loop_bob_current`
 forces all members to agree on the epoch before bob stops. Both preserve the same exact-timeline, live-delivery and
-attempt bounds, and save the case/epochs and whether the epoch-stall arm fired. In the owed-history journey, 20,000
+attempt bounds, and save the case/epochs and whether the epoch-stall arm fired. In the owed-history journey, 5,000
 owed events and a quiet group must finish exactly after a restart, with no history window asked twice during that
 restart recovery. Reconnect re-proof also rejects repeated windows. Positive runner work and zero native paging
-requests establish runner-only attribution. The upgrade journey additionally requires nonzero conversion before the
+requests establish runner-only attribution.
+`public_app_runner_orders_six_thousand_backlog_messages_before_live_input` preserves the captured three-sender
+6,000-event failure with competing live traffic and exact history after a full reopen. Busy-group live admission
+waits for older captured history to drain; request deadlines never authorize jumping past it. The upgrade journey additionally requires nonzero conversion before the
 first attempt. The per-REQ fence journey uses two restarts with both groups packed together: counted raw reply then
 empty raw reply, a12-second history stall and a30-second release bound. These remain explicit slow manual proofs.
 

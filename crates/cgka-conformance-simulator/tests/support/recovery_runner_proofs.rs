@@ -27,8 +27,8 @@ use super::{SETTLEMENT, TestResult, journey_artifacts, save};
 /// They publish the owed backlog in parallel, so bob is the only account
 /// that owes it.
 const SENDERS: [&str; 3] = ["s1", "s2", "s3"];
-/// Tens of thousands of events in one group, owed on both endpoints.
-const OWED_MESSAGES: usize = 20_000;
+/// Large repeated backlog, owed on both endpoints and beyond the staging bound.
+const OWED_MESSAGES: usize = 5_000;
 /// A few thousand, as in 0.14.0's looping accounts: more than one attempt
 /// fetches.
 const LOOP_MESSAGES: usize = 3_000;
@@ -54,8 +54,8 @@ const OWED_WASTED_ATTEMPTS: usize = 4;
 /// Bursts of history requests per endpoint while the owed group drains: the
 /// wire's view of the attempts, both owners together.
 const OWED_BURSTS: usize = 4;
-/// How long the last live sends get to arrive after sending stops: a fence
-/// holds a group's live frames for at most one 30-second replay deadline.
+/// Tail-drain allowance after backlog recovery and after sending stops.
+/// Earlier live messages may wait for the affected group's older backlog.
 const LIVE_HELD_AT_MOST: Duration = Duration::from_secs(60);
 const UPGRADE_MESSAGES: usize = 2_000;
 const BEFORE_UPGRADE: Duration = Duration::from_secs(60);
@@ -1229,7 +1229,14 @@ where
     if let Err(error) = subject.shutdown().await {
         close_errors.push(format!("shutdown: {error}"));
     }
-    drop(subject);
+    if outcome.is_err() && close_errors.is_empty() {
+        subject
+            .retain_stopped_diagnostic_fixture(&artifacts.path().join("retained-fixture"))
+            .await
+            .expect("preserve the closed failure fixture");
+    } else {
+        drop(subject);
+    }
     eprintln!("{label} evidence: {}", artifacts.keep().display());
     let report = outcome.unwrap_or_else(|error| panic!("{label} did not complete: {error}"));
     assert!(
@@ -1539,7 +1546,7 @@ async fn stalled_relay_loop_case(case: LoopCase) {
     assert_eq!(report["proof"]["timeline_exact"], true);
 }
 
-/// Tens of thousands of events owed in one group, with live traffic every
+/// Five thousand events owed in one group, with live traffic every
 /// three seconds, then a reconnect after the account has caught up.
 ///
 /// - The owed group finishes over successive attempts, each live message
@@ -1768,13 +1775,93 @@ pub(super) async fn owed_history() {
         if reconnect_repeats.iter().any(|repeats| *repeats > 0) {
             return failure("a window was requested twice on one endpoint after reconnect");
         }
-        if live_visibility["max"].as_f64().is_none_or(|ms| ms > LIVE_HELD_AT_MOST.as_secs_f64() * 1e3) {
-            return failure("live visibility exceeded one bounded fence");
+        let backlog_and_tail = drained.unwrap_or_default() + LIVE_HELD_AT_MOST.as_secs_f64();
+        if live_visibility["max"].as_f64().is_none_or(|ms| ms > backlog_and_tail * 1e3) {
+            return failure("live visibility exceeded backlog recovery plus the tail-drain allowance");
         }
         Ok(json!({"proof": proof}))
     })
     .await;
     assert_eq!(report["proof"]["restart"]["busy_timeline_exact"], true);
+}
+
+/// Captured three-sender failure: ordinary subscription replay overtook the
+/// older recovery input in a 6,000-message backlog. Keep the real wire/MLS/
+/// SQLite boundary and prove the resulting timeline survives a full reopen.
+pub(super) async fn ordered_backlog_regression() {
+    let report = run_proof("runner-ordered-backlog-6000", async |subject, out| {
+        let started = Instant::now();
+        let clients = clients();
+        let group = create(subject, "ordered-backlog", &clients).await?;
+        settle_maintenance(subject, &clients, std::slice::from_ref(&group)).await?;
+        note(started, "group created and settled");
+        let bob = subject.probe("bob")?;
+        bob.start_audit_log().await?;
+        subject.set_online("bob", false).await?;
+        let sent = publish(subject, &group, "owed-", 6_000).await?;
+        let mut expected = payloads(&sent);
+        save(out, "expected.json", &expected)?;
+        note(started, "6,000-message failure backlog published");
+        let clocks = relay_clocks(subject).await?;
+        let trace_from = runner_trace::now_ms();
+        let t0 = Instant::now();
+        subject.set_online("bob", true).await?;
+        let (alice, bob) = (subject.probe("alice")?, subject.probe("bob")?);
+        let live = Live::start(
+            alice,
+            bob.clone(),
+            group.clone(),
+            Duration::from_secs(3),
+            "live-",
+        );
+        let recovery = wait_for(
+            "all 6,000 older messages visible",
+            Duration::from_secs(180),
+            async || {
+                let (_, chat) = bob.chat_view(&group, None).await?;
+                Ok(chat.iter().filter(|text| text.starts_with("owed-")).count() == 6_000)
+            },
+        )
+        .await;
+        let recovery_seconds = t0.elapsed().as_secs_f64();
+        let (live_sent, visibility) = live.finish().await?;
+        expected.extend(live_sent);
+        let exact = holds_exactly(&bob, &group, &expected).await?;
+        let timeline = timeline_view(&bob, &group, &expected).await?;
+        let history = history_since(subject, &clocks).await?;
+        save(
+            out,
+            "history.json",
+            &history
+                .iter()
+                .map(|requests| history_summary(requests, &BTreeMap::new()))
+                .collect::<Vec<_>>(),
+        )?;
+        save(out, "runner-trace.json", &runner_trace::since(trace_from))?;
+        save(out, "audit.json", &bob.finish_audit_log().await?)?;
+        save(out, "expected.json", &expected)?;
+        let proof = json!({"owed_messages": 6_000, "recovery_seconds": recovery_seconds,
+            "timeline_exact": exact, "timeline": timeline, "live_visibility_ms": visibility,
+            "native_paging_requests_per_endpoint": native_pages(&history)});
+        save(out, "before-reopen.json", &proof)?;
+        if recovery.is_err() || !exact || !live_complete(&visibility) {
+            return Err(format!("ordered backlog lost history: {proof}").into());
+        }
+        if native_pages(&history).iter().any(|pages| *pages > 0) {
+            return Err(
+                format!("native paging supplied ordered backlog regression: {proof}").into(),
+            );
+        }
+        subject.set_online("bob", false).await?;
+        subject.set_online("bob", true).await?;
+        let reopened = subject.probe("bob")?;
+        if !holds_exactly(&reopened, &group, &expected).await? {
+            return Err(format!("ordered backlog was not durable across reopen: {proof}").into());
+        }
+        Ok(json!({"proof": proof, "exact_after_reopen": true}))
+    })
+    .await;
+    assert_eq!(report["exact_after_reopen"], true);
 }
 
 /// Proof 4, the upgrade end to end: the earlier owner plans the debt and

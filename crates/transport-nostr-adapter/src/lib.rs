@@ -2026,7 +2026,8 @@ impl NostrTransportAdapter {
     /// Fence the account's groups' live frames from now on (mdk#2660): a live
     /// count that leaves part of its REQ's range unproven holds the groups its
     /// REQ routes until the owner's [`Self::fence_replay`] answers it, or one
-    /// replay deadline passes. Call it before activating the account, so its
+    /// replay deadline passes for a non-delegated owner. Delegated holds last until
+    /// their owner releases the backlog. Call it before activating the account, so its
     /// first counts are held too. It lasts the adapter's life.
     pub async fn enable_replay_fencing(&self, account_id: &MemberId) {
         let mut state = self.state.write().await;
@@ -2063,9 +2064,9 @@ impl NostrTransportAdapter {
     /// Apply the account owner's fences: each group `plan` names releases its
     /// held live frames sent before the plan's point and keeps the rest, the
     /// counts its ticket covers are answered, and a group neither fences nor
-    /// an unanswered count holds goes free. A fence holds at most one replay
-    /// deadline, however often a plan names its group; then its frames go out
-    /// as late input. Enables fencing ([`Self::enable_replay_fencing`]).
+    /// an unanswered count holds goes free. Delegated recovery releases only by
+    /// this plan, independently of network request deadlines. A non-delegated
+    /// fence holds at most one replay deadline, then releases as late input. Enables fencing ([`Self::enable_replay_fencing`]).
     pub async fn fence_replay(&self, account_id: &MemberId, plan: &ReplayFencePlan) {
         let mut state = self.state.write().await;
         state.replay_fencing.insert(account_id.clone());

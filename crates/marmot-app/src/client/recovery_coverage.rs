@@ -393,8 +393,8 @@ impl AppClient {
     }
 
     /// Have the adapter hold each counted group's live frames until the
-    /// runner answers with [`Self::fence_live_frames`], for at most one
-    /// replay deadline. Nothing calls this until the switch-over (5g), so
+    /// runner answers with [`Self::fence_live_frames`]. Delegated backlog holds
+    /// follow durable admission progress, independently of request deadlines. Nothing calls this until the switch-over (5g), so
     /// owner capture keeps every behavior; no call undoes it.
     pub(crate) async fn enable_live_fences(&self) {
         self.adapter.enable_replay_fencing().await;

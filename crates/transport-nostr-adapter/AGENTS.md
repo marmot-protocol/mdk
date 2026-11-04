@@ -29,7 +29,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Not yet scheduled by anything. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. `SdkSweepRelay` implements its `CompareRelay`. Not yet scheduled by anything. |
-| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, the one-deadline expiry. Nothing enables it before the switch-over (PR 5g). |
+| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed delegated holds and legacy one-deadline expiry. Nothing enables it before the switch-over (PR 5g). |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -183,8 +183,10 @@ for reconnect/backoff and relay status mechanics.
   belongs to its own count: `ReplayEndpoint::count_id` moves whenever a live count is installed or ends, and only an
   arming whose count is still current can be admitted or kept unanswered, so a count that ends or is replaced (an empty
   or natively paged recount) before admission drops its arming. Delegated accounts also fence nonempty full replies,
-  without counting them as complete coverage. A fence holds at most one `REPLAY_PAGE_LIMITS.max_duration`;
-  then its frames go out as late input and plans are ignored until a new count arms the group; a plan older than the
+  without counting them as complete coverage. Only non-delegated fences expire after one `REPLAY_PAGE_LIMITS.max_duration`, releasing late input and
+  ignoring plans until a new count arms the group. Delegated holds have no request deadline: their owner advances or
+  releases them as durable backlog admission permits; no expired timer authorizes newer input. Unanswered armings
+  still retire with their unadmitted count. A plan older than the
   last applied is ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin

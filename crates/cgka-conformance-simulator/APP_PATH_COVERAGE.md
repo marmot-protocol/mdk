@@ -158,7 +158,7 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   reflect recovery, or be null if unavailable. The report also records bounded by-id group
   requests separately from aggregate runner traces; traces alone do not identify a route. Both loops are selected
   by the manual command below, or run either exact test name separately for alternating gate-on/control series.
-- `public_app_runner_finishes_tens_of_thousands_of_owed_events` owes 20,000 events in one group, published while bob
+- `public_app_runner_finishes_five_thousand_owed_events` owes 5,000 events in one group, published while bob
   is stopped. A second group stays quiet: its messages are older than the restart's rebuild lookback. After the
   restart alice sends a live message to the busy group every three seconds. It asserts:
   - both timelines are exact within 30 minutes;
@@ -176,7 +176,14 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   that a quiet-group message sent after the reconnect arrives. The aggregate includes inbox comparisons; it does
   proves group re-proof by route-specific wire requests with native paging excluded. Reconnect windows may not
   repeat. The restart requires at least two advancing runner attempts, at most four wasted attempts, a fresh
-  caught-up survey and at most 60 seconds' live visibility. Idle traffic remains measured separately.
+  caught-up survey. Busy-group live messages may wait for older backlog admission; their maximum delay is bounded
+  by the measured backlog recovery plus the 60-second tail-drain allowance. Quiet-group visibility retains its
+  independent bound. Idle traffic remains measured separately.
+- `public_app_runner_orders_six_thousand_backlog_messages_before_live_input` retains the captured three-sender
+  6,000-event admission-order failure. Live subscription traffic competes with older recovery. It requires every
+  owed/live message exactly once, zero native paging and the exact timeline after closing/reopening Bob. The
+  adapter owner test advances a controlled clock past the former 30-second deadline; this journey checks the real
+  wire, MLS and SQLite assembly. Failed journeys preserve their closed account roots and relay publications.
 - `public_app_runner_owns_debt_after_the_upgrade_conversion` starts Bob under the old owner with 2,000 owed events
   and unanswered history, then reopens the same nightly-shaped account under the runner. It requires nonzero
   per-cause conversion counts before the first pre-network `attempt_started` event, exact/live/caught-up results, and no native pages.
