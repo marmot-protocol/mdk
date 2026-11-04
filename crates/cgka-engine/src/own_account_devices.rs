@@ -656,7 +656,7 @@ impl<S: StorageProvider> Engine<S> {
                 )?;
                 // The visitor may hold the storage connection lock.
                 for id in pending {
-                    store.update_message_state(&id, MessageState::Failed)?;
+                    self.update_stored_message_state(&id, MessageState::Failed)?;
                 }
             }
             Ok::<_, EngineError>(())

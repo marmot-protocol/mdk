@@ -1113,7 +1113,9 @@ applies; it may stay pending indefinitely and need manual local recovery. Corrup
 fail progress/status reads and need manual local recovery or reset followed by a fresh compared-code link. Do not
 infer an unlinked state or expect an unlink notification for those errors, and never reconstruct old trust.
 Recognition hints suppress questions only on the mover. Old siblings can ask “Was this you?” after cleanup; the user
-can dismiss that prompt.
+can dismiss that prompt. An old in-flight chat Add can leave a membership leaf whose Welcome no longer reaches this
+device. Automatic gap filling may not replace that leaf; manual chat membership repair can be needed. Moving adds no
+duplicate-leaf cleanup or recall of admitted Adds.
 
 ### This device unlinked
 
