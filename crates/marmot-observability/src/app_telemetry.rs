@@ -1367,15 +1367,32 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(
-        expected = "classified operations must use record_classified_result with a bounded failure classification"
-    )]
     fn generic_record_rejects_classified_sync_operations() {
-        AppPerformanceTelemetry::default().record(
+        for operation in [
             AppPerformanceOperation::AccountSync,
-            Duration::from_millis(1),
-            false,
-        );
+            AppPerformanceOperation::AccountCatchUp,
+            AppPerformanceOperation::GroupAcceptInvite,
+        ] {
+            let panic = std::panic::catch_unwind(|| {
+                AppPerformanceTelemetry::default().record(
+                    operation,
+                    Duration::from_millis(1),
+                    false,
+                );
+            })
+            .expect_err("generic recording must reject a classified operation");
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(
+                message,
+                Some(
+                    "classified operations must use record_classified_result with a bounded failure classification"
+                ),
+                "wrong rejection for {operation:?}",
+            );
+        }
     }
 
     #[test]
@@ -2145,14 +2162,36 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bounded_advisory_step_caps_a_stalled_future_and_records_the_cap() {
+        use std::future::Future;
+        use std::task::Poll;
+
         let telemetry = AppPerformanceTelemetry::default();
-        let value: Option<()> = bounded_advisory_step(
+        let step = bounded_advisory_step(
             &telemetry,
             Duration::from_millis(50),
             "test_step",
-            std::future::pending(),
-        )
-        .await;
+            std::future::pending::<()>(),
+        );
+        tokio::pin!(step);
+        // Poll first so the timeout starts before the paused clock advances.
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(telemetry.snapshot().account_setup_advisory_step.attempts, 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let Poll::Ready(value) =
+            std::future::poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx))).await
+        else {
+            panic!("the selected 50ms cap must complete the pending step");
+        };
         assert_eq!(value, None);
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
