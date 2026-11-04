@@ -196,10 +196,10 @@ mod tests {
     }
 
     #[test]
-    fn group_management_state_marks_last_admin_self_demote_requirement() {
+    fn group_management_state_leaves_admin_demotion_to_core() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
-        let details = GroupDetailsFfi {
+        let mut details = GroupDetailsFfi {
             group: group(vec![self_id]),
             members: vec![member(self_id, true, true), member(bob_id, false, false)],
             mls_state: mls_state(),
@@ -211,7 +211,7 @@ mod tests {
         assert!(state.is_last_admin);
         assert!(state.can_invite);
         assert!(!state.can_leave);
-        assert!(state.requires_self_demote_before_leave);
+        assert!(!state.requires_self_demote_before_leave);
         let self_action = state
             .member_actions
             .iter()
@@ -227,6 +227,15 @@ mod tests {
         assert!(bob_action.can_remove);
         assert!(bob_action.can_promote);
         assert!(!bob_action.can_demote);
+
+        // A coadmin may leave directly; core performs the account demotion.
+        details.group.admins.push(bob_id.to_owned());
+        details.members[1].is_admin = true;
+        let state = group_management_state_ffi(self_id, &details);
+        assert!(state.is_self_admin);
+        assert!(!state.is_last_admin);
+        assert!(state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
     }
 
     #[test]
@@ -245,7 +254,8 @@ mod tests {
         assert_eq!(snapshot.details.members.len(), 2);
         assert!(snapshot.management_state.is_self_admin);
         assert!(snapshot.management_state.is_last_admin);
-        assert!(snapshot.management_state.requires_self_demote_before_leave);
+        assert!(!snapshot.management_state.can_leave);
+        assert!(!snapshot.management_state.requires_self_demote_before_leave);
         assert_eq!(
             snapshot.management_state.member_actions.len(),
             snapshot.details.members.len()
@@ -256,8 +266,8 @@ mod tests {
     fn group_management_state_suppresses_leave_while_a_request_is_pending() {
         // A non-admin member normally has `can_leave`. Once a leave is durable the
         // engine rejects a second same-epoch request, so the affordance has to go
-        // away — but `requires_self_demote_before_leave` must stay false, since
-        // that is how hosts tell "demote first" from "already leaving".
+        // away. The compatibility demotion flag stays false: core performs
+        // any eligible account demotion rather than asking the host to do it.
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let mut leaving = group(vec![bob_id]);
