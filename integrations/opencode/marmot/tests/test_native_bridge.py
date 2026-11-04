@@ -1,6 +1,7 @@
 """Native transport regressions with a deterministic model/HTTP boundary."""
 import importlib.util
 import io
+import os
 from pathlib import Path
 import queue
 import threading
@@ -10,7 +11,8 @@ from unittest.mock import patch, MagicMock
 
 spec = importlib.util.spec_from_file_location('native_bridge', Path(__file__).parents[1] / 'src/native_bridge.py')
 bridge = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bridge)
+with patch.dict(os.environ, {'WN_OPENCODE_MAX_ATTACHMENT_BYTES': str(64 * 1024 * 1024)}):
+    spec.loader.exec_module(bridge)
 
 class Input:
     def __init__(self):
@@ -172,7 +174,7 @@ class NativeTests(unittest.TestCase):
             process=MagicMock();process.poll.return_value=None
             def stop(): process.poll.return_value=0
             process.terminate.side_effect=stop
-            with patch.dict(bridge.os.environ, {'WN_OPENCODE_NATIVE_PASSWORD_FILE':str(auth)}),patch.object(bridge.subprocess,'Popen',return_value=process),patch.object(bridge.Server,'call',return_value={'healthy':True}),patch.object(bridge.socket,'socket') as sockets:
+            with patch.dict(bridge.os.environ, {'WN_OPENCODE_NATIVE_PASSWORD_FILE':str(auth), 'WN_OPENCODE_NATIVE_PORT_FIRST':'700', 'WN_OPENCODE_NATIVE_PORT_LAST':'799'}),patch.object(bridge.Path,'read_text',return_value='1024'),patch.object(bridge.subprocess,'Popen',return_value=process),patch.object(bridge.Server,'call',return_value={'healthy':True}),patch.object(bridge.socket,'socket') as sockets:
                 sockets.return_value.__enter__.return_value.bind.return_value=None
                 first=bridge.Server('fixture');second=bridge.Server('fixture')
                 try:self.assertNotEqual(first.base,second.base)
