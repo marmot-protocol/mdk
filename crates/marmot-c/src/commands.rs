@@ -39,8 +39,8 @@ use crate::types::audit::{
     MarmotAuditLogTrackerUpdateResultV5, MarmotAuditLogUploadResult, MarmotAuditOtlpConfigV5,
 };
 use crate::types::backups::{
-    MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus, MarmotBackupSettings,
-    MarmotRecoveryWords,
+    MarmotBackgroundBackupOutcome, MarmotBackupHistoryAvailabilityList, MarmotBackupRestoreStatus,
+    MarmotBackupSettings, MarmotRecoveryWords,
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
@@ -824,10 +824,16 @@ c_cmd! {
     async fn marmot_turn_off_backups(account_ref: str) -> unit = turn_off_backups;
     /// Current account settings; free with marmot_backup_settings_free.
     async fn marmot_backup_settings(account_ref: str) -> rec(MarmotBackupSettings) = backup_settings;
-    /// Report Wi-Fi/charging on worker start and changes; both are required
-    /// for new background passes. A replacement worker defaults closed.
+    /// Report Wi-Fi/charging once per runtime, before workers and on changes.
+    /// Worker replacement retains facts; a new runtime is closed. Starts no worker.
+    async fn marmot_set_runtime_backup_background_conditions(wifi: flag, charging: flag) -> unit = set_runtime_backup_background_conditions;
+    /// Compatibility runtime-wide report: validates an active account first.
     /// Admitted work settles after false; manual restoration is unaffected.
     async fn marmot_set_backup_background_conditions(account_ref: str, wifi: flag, charging: flag) -> unit = set_backup_background_conditions;
+    /// Block for one current/newly admitted due backup pass through settlement.
+    /// FinishedAttempt is not publication success. Worker stop is transport-closed;
+    /// caller/host lifetime bounds remain its responsibility.
+    async fn marmot_run_due_backup_pass(account_ref: str) -> enum_ret(MarmotBackgroundBackupOutcome) = run_due_backup_pass;
     /// Begin manual history-only restore. Words borrowed, never retained by
     /// C; clear host copies. Free status with marmot_backup_restore_status_free.
     async fn marmot_begin_backup_restore(account_ref: str, words: str) -> rec(MarmotBackupRestoreStatus) = begin_backup_restore;

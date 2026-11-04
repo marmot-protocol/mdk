@@ -549,13 +549,23 @@ device group's roster holds them now. Two devices changing backups at once can d
 only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
 are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. The selected
 writer writes bounded backup passes during maintenance; only an accepted pointer publication counts as a backup.
-The account worker requires reported Wi-Fi and charging conditions before preparing background writer work. Call
-`set_backup_background_conditions(account_ref, wifi, charging)` on worker start and condition changes; a replacement
-worker defaults closed. Already admitted passes finish and settle after conditions become false, while later passes
-wait. Manual restore is unaffected. This worker scheduling gate does not redefine supported lower-level `AppClient`
-backup APIs or grant a host indefinite OS background execution.
-These experimental flows require `dev_device_groups` (off by default), and builds without experimental device-group
-support refuse them as `DeviceGroupRefused("roster_unsupported")`.
+Report `set_runtime_backup_background_conditions(wifi, charging)` once per runtime, before workers exist and
+when either fact changes. Background writer work requires both facts. Same-runtime worker restarts retain the report;
+a new runtime starts closed. Already admitted passes finish and settle after false, while later work waits.
+The account-shaped `set_backup_background_conditions` remains a compatibility wrapper: it validates an active,
+signable, fully onboarded account before updating the same runtime-wide facts, without starting a worker.
+External-signing accounts may report before the host registers its signer; signed worker work still requires that signer.
+
+An OS background task can await `run_due_backup_pass(account_ref)`. It joins a pass already running, or tries existing
+due/writer/backoff/media-credit admission once. `NotStarted` means none was admitted; `FinishedAttempt` means the
+pass and serialized settlement attempt ended, including credit release. It does not prove successful pointer publication,
+force a backup, wait for future due work or establish global idle state. Cancelling that caller detaches its wait;
+worker stop/replacement returns `TransportClosed`. The host bounds its OS execution opportunity. Manual restore and
+supported lower-level `AppClient` APIs remain independent.
+
+Backup setup and manual restore require `dev_device_groups` (off by default) and a build with experimental
+device-group support; unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
 
 ### Manual backup history restore
 

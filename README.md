@@ -149,7 +149,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages; [tests](crates/marmot-session/README.md#tests) |
 | | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-pairing`](crates/marmot-pairing/README.md) | Device pairing: the code both screens show before a new device links (unreleased) |
-| | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |
+| | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime, projections and host background controls used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
 | | [`marmot-observability`](crates/marmot-observability/README.md) | Diagnostics exporters: relay telemetry, product analytics and its consent state, audit delivery |
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
