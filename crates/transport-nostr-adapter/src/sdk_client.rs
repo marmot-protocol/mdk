@@ -12637,13 +12637,11 @@ mod tests {
             .await
             .expect("explicit local teardown must close the fixture socket")
             .unwrap();
-        eprintln!(
-            "outside_runtime={outside_runtime} registered_before_shutdown={registered_before_shutdown} pool_total_before_shutdown={} connected_before_shutdown={} socket_closed_before_shutdown={socket_closed_before_shutdown}",
-            health_before_shutdown.total_relays, health_before_shutdown.connected,
-        );
         assert!(
             cleanup.is_ok() && !registered_before_shutdown && socket_closed_before_shutdown,
-            "cancelling the pending public publication must remove its transient pool relay and close its socket; outside_runtime={outside_runtime}"
+            "cancelling the pending public publication must remove its transient pool relay and close its socket; outside_runtime={outside_runtime} registered_before_shutdown={registered_before_shutdown} pool_total_before_shutdown={} connected_before_shutdown={} socket_closed_before_shutdown={socket_closed_before_shutdown}",
+            health_before_shutdown.total_relays,
+            health_before_shutdown.connected,
         );
     }
 
