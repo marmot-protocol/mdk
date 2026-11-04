@@ -188,7 +188,7 @@ fn configuration_admission_is_closed_and_failed_changes_preserve_the_grant() {
 #[cfg(feature = "product-analytics-export")]
 #[test]
 fn no_preconsent_backlog_and_idempotent_background() {
-    let (c, _) = configured();
+    let (c, clock) = configured();
     c.observe(
         ProductFamily::Maintenance,
         "retention",
@@ -214,9 +214,202 @@ fn no_preconsent_backlog_and_idempotent_background() {
     }));
     c.activity(ProductAnalyticsActivity::Background);
     assert_eq!(count, c.lock().queue.len());
+
+    clock.mono.store(1000, Ordering::Relaxed);
+    clock.wall.store(1801, Ordering::Relaxed);
+    c.observe(
+        ProductFamily::Maintenance,
+        "deferred",
+        "success",
+        ProductUnit::Attempt,
+        None,
+    );
+    let backlog = c.backlog_source();
+    backlog.sample(
+        &c.permit().unwrap(),
+        ProductFamily::Maintenance,
+        "pending",
+        2,
+    );
+    c.activity(ProductAnalyticsActivity::Foreground);
+    let resumed = c.test_payloads();
+    let background = &resumed[count..];
+    assert_eq!(background.len(), 4);
+    let tuples: BTreeSet<_> = background
+        .iter()
+        .map(|row| {
+            (
+                row["eventName"].as_str().unwrap(),
+                row["props"]["operation"].as_str().unwrap(),
+                row["props"]["unit"].as_str().unwrap(),
+                row["props"]["outcome"].as_str().unwrap_or(""),
+                row["props"]["count_bucket"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tuples,
+        BTreeSet::from([
+            (
+                "mdk_maintenance_summary",
+                "deferred",
+                "attempt",
+                "success",
+                "1"
+            ),
+            ("mdk_maintenance_summary", "pending", "backlog", "", "2"),
+            ("mdk_runtime_summary", "resume", "action", "success", "1"),
+            ("mdk_runtime_summary", "coverage", "coverage", "", "1"),
+        ])
+    );
+    assert!(background.iter().all(|row| {
+        row["props"]["partial"] == "true" && row["sessionId"] == background[0]["sessionId"]
+    }));
+    let coverage = background
+        .iter()
+        .find(|row| row["props"]["operation"] == "coverage")
+        .unwrap();
+    assert_eq!(coverage["props"]["activity"], "background");
+
+    c.observe(
+        ProductFamily::Maintenance,
+        "sweep",
+        "performed",
+        ProductUnit::Transition,
+        None,
+    );
+    c.activity(ProductAnalyticsActivity::Foreground);
+    c.activity(ProductAnalyticsActivity::Background);
+    let rows = c.test_payloads();
+    let foreground = &rows[resumed.len()..];
+    assert_eq!(foreground.len(), 3);
+    let foreground_tuples: BTreeSet<_> = foreground
+        .iter()
+        .map(|row| {
+            (
+                row["eventName"].as_str().unwrap(),
+                row["props"]["operation"].as_str().unwrap(),
+                row["props"]["unit"].as_str().unwrap(),
+                row["props"]["outcome"].as_str().unwrap_or(""),
+                row["props"]["count_bucket"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        foreground_tuples,
+        BTreeSet::from([
+            (
+                "mdk_maintenance_summary",
+                "sweep",
+                "transition",
+                "performed",
+                "1"
+            ),
+            ("mdk_runtime_summary", "coverage", "coverage", "", "1"),
+            ("mdk_maintenance_summary", "pending", "backlog", "", "2"),
+        ])
+    );
+    assert!(foreground.iter().any(|row| {
+        row["eventName"] == "mdk_maintenance_summary"
+            && row["props"]["operation"] == "sweep"
+            && row["props"]["outcome"] == "performed"
+            && row["props"]["count_bucket"] == "1"
+    }));
+    assert!(foreground.iter().any(|row| {
+        row["props"]["operation"] == "coverage" && row["props"]["activity"] == "foreground"
+    }));
+    assert!(foreground.iter().all(|row| {
+        row["sessionId"] != background[0]["sessionId"] && row["props"]["partial"] == "true"
+    }));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["props"]["operation"] == "resume")
+            .count(),
+        1,
+        "repeated Foreground must not add another resume"
+    );
     c.revoke_memory();
     assert!(c.lock().queue.is_empty());
     assert!(c.lock().cells.is_empty());
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn unsealed_windows_expire_at_the_ttl_without_emitting_old_observations() {
+    for expired in [false, true] {
+        let (collector, clock) = configured();
+        grant(&collector);
+        for operation in ["retention", "retention", "self_update"] {
+            collector.observe(
+                ProductFamily::Maintenance,
+                operation,
+                "success",
+                ProductUnit::Attempt,
+                None,
+            );
+        }
+        clock.mono.store(
+            EVENT_TTL.as_millis() as u64 - u64::from(!expired),
+            Ordering::Relaxed,
+        );
+        clock
+            .wall
+            .store(if expired { 5400 } else { 5399 }, Ordering::Relaxed);
+        let rows = collector.test_payloads();
+        if expired {
+            assert!(
+                rows.is_empty(),
+                "an expired unsealed window emits no coverage or observations"
+            );
+            assert_eq!(
+                collector.status().dropped_events,
+                2,
+                "expiry counts distinct cells rather than the three observations"
+            );
+            collector.observe(
+                ProductFamily::Maintenance,
+                "deferred",
+                "success",
+                ProductUnit::Attempt,
+                None,
+            );
+            let fresh = collector.test_payloads();
+            assert_eq!(
+                fresh.len(),
+                2,
+                "a fresh window records normally after expiry"
+            );
+            let row = fresh
+                .iter()
+                .find(|row| row["eventName"] == "mdk_maintenance_summary")
+                .unwrap();
+            assert_eq!(row["props"]["operation"], "deferred");
+            assert_eq!(row["props"]["count_bucket"], "1");
+            assert_eq!(row["timestamp"], "1970-01-01T01:30:00Z");
+            assert_eq!(collector.status().dropped_events, 2);
+        } else {
+            assert_eq!(
+                rows.len(),
+                3,
+                "the window is valid one millisecond before expiry"
+            );
+            let counts: BTreeMap<_, _> = rows
+                .iter()
+                .filter(|row| row["eventName"] == "mdk_maintenance_summary")
+                .map(|row| {
+                    (
+                        row["props"]["operation"].as_str().unwrap(),
+                        row["props"]["count_bucket"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                counts,
+                BTreeMap::from([("retention", "2"), ("self_update", "1")])
+            );
+            assert_eq!(collector.status().dropped_events, 0);
+        }
+    }
 }
 #[cfg(feature = "product-analytics-export")]
 #[test]
@@ -597,12 +790,46 @@ fn stale_operation_completion_after_regrant_is_discarded() {
             ProductUnit::Attempt,
         )
         .unwrap();
+    let counts = c
+        .begin(
+            ProductFamily::Maintenance,
+            "retention",
+            ProductUnit::Attempt,
+        )
+        .unwrap()
+        .counts_only();
     clock.mono.store(100, Ordering::Relaxed);
     c.revoke_memory();
     grant(&c);
     clock.mono.store(1000, Ordering::Relaxed);
     ticket.finish("failure");
     assert!(c.lock().cells.is_empty());
+    counts.count("success", ProductUnit::Transition, 50);
+    assert!(c.lock().cells.is_empty());
+    let current = c
+        .begin(
+            ProductFamily::Maintenance,
+            "retention",
+            ProductUnit::Attempt,
+        )
+        .unwrap()
+        .counts_only();
+    current.count("success", ProductUnit::Transition, 0);
+    current.count("raw_outcome", ProductUnit::Transition, 1001);
+    assert!(c.lock().cells.is_empty());
+    current.count("success", ProductUnit::Transition, 3);
+    let rows = c.test_payloads();
+    let observations: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "mdk_maintenance_summary")
+        .collect();
+    assert_eq!(observations.len(), 1);
+    let row = observations[0];
+    assert_eq!(row["props"]["operation"], "retention");
+    assert_eq!(row["props"]["outcome"], "success");
+    assert_eq!(row["props"]["unit"], "transition");
+    assert_eq!(row["props"]["count_bucket"], "3_5");
+    assert!(row["props"].get("duration_bucket").is_none());
 }
 
 #[cfg(feature = "product-analytics-export")]
@@ -1174,6 +1401,81 @@ fn non_media_measurements_do_not_depend_on_optional_product_analytics() {
     }
 }
 
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn media_measurements_must_fit_entirely_within_the_current_grant() {
+    use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+    let (collector, clock) = configured();
+    clock.mono.store(1000, Ordering::Relaxed);
+    grant(&collector);
+    let telemetry = AppPerformanceTelemetry::with_product_analytics(collector.clone());
+    let recorder = crate::PerformanceRecorder::from(&telemetry);
+    clock.mono.store(1100, Ordering::Relaxed);
+    for (duration, success) in [
+        (Duration::from_millis(100), true),
+        (Duration::from_millis(100) + Duration::from_nanos(1), false),
+    ] {
+        recorder.record_media(
+            AppPerformanceOperation::MediaUpload,
+            duration,
+            success,
+            "image/png",
+        );
+    }
+    let rows = collector.test_payloads();
+    let media: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "mdk_media_summary")
+        .collect();
+    assert_eq!(
+        media.len(),
+        1,
+        "only the exact-age measurement fits the grant"
+    );
+    assert_eq!(media[0]["props"]["operation"], "upload");
+    assert_eq!(media[0]["props"]["outcome"], "success");
+    assert_eq!(media[0]["props"]["duration_bucket"], "le_100ms");
+    assert_eq!(media[0]["props"]["count_bucket"], "1");
+    let local = telemetry.snapshot().media_upload;
+    assert_eq!((local.attempts, local.successes, local.failures), (2, 1, 1));
+    assert_eq!(local.duration_ms.sample_count(), 2);
+    assert_eq!(local.duration_ms.sum_ms, 200);
+
+    clock.mono.store(2000, Ordering::Relaxed);
+    collector.revoke_memory();
+    grant(&collector);
+    clock.mono.store(2010, Ordering::Relaxed);
+    recorder.record_media(
+        AppPerformanceOperation::MediaUpload,
+        Duration::from_millis(100),
+        true,
+        "image/png",
+    );
+    assert!(
+        collector.test_payloads().is_empty(),
+        "a measurement spanning regrant stays local"
+    );
+    recorder.record_media(
+        AppPerformanceOperation::MediaUpload,
+        Duration::from_millis(10),
+        true,
+        "image/png",
+    );
+    let rows = collector.test_payloads();
+    let media: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "mdk_media_summary")
+        .collect();
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0]["props"]["operation"], "upload");
+    assert_eq!(media[0]["props"]["duration_bucket"], "le_10ms");
+    assert_eq!(media[0]["props"]["count_bucket"], "1");
+    let local = telemetry.snapshot().media_upload;
+    assert_eq!((local.attempts, local.successes, local.failures), (4, 3, 1));
+    assert_eq!(local.duration_ms.sample_count(), 4);
+    assert_eq!(local.duration_ms.sum_ms, 310);
+}
+
 #[cfg(not(feature = "product-analytics-export"))]
 #[test]
 fn consent_without_product_feature_cannot_collect_activity() {
@@ -1636,7 +1938,7 @@ fn aggregate_capacity_reserves_coverage_and_counts_overflow_without_losing_exist
                 &collector.permit().unwrap(),
                 ProductFamily::Maintenance,
                 "pending",
-                2,
+                0,
             );
         }
         let event = |index: usize| ProductEvent {
@@ -1651,6 +1953,13 @@ fn aggregate_capacity_reserves_coverage_and_counts_overflow_without_losing_exist
                 collector.record(event(index)).unwrap(),
                 ProductRecordResult::Recorded
             );
+            if index + 1 + usize::from(with_backlog) == MAX_CELLS - 3 {
+                let permit = collector.permit().unwrap();
+                source.sample(&permit, ProductFamily::Maintenance, "ambiguous", 1001);
+                if with_backlog {
+                    source.sample(&permit, ProductFamily::Maintenance, "pending", 2);
+                }
+            }
         }
         assert_eq!(
             collector.record(event(0)).unwrap(),
@@ -1677,10 +1986,14 @@ fn aggregate_capacity_reserves_coverage_and_counts_overflow_without_losing_exist
         assert_eq!(overflow["props"]["count_bucket"], "3_5");
         assert_eq!(overflow["props"]["outcome"], "capacity");
         assert!(rows.iter().any(|row| row["props"]["unit"] == "coverage"));
+        let backlog: Vec<_> = rows
+            .iter()
+            .filter(|row| row["props"]["unit"] == "backlog")
+            .collect();
+        assert_eq!(backlog.len(), usize::from(with_backlog));
         if with_backlog {
-            assert!(rows.iter().any(
-                |row| row["props"]["unit"] == "backlog" && row["props"]["count_bucket"] == "2"
-            ));
+            assert_eq!(backlog[0]["props"]["operation"], "pending");
+            assert_eq!(backlog[0]["props"]["count_bucket"], "2");
         }
     }
 }
