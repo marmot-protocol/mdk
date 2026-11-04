@@ -541,6 +541,19 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
             .own_device_tag_commit_landed(&chosen(), &before_first, &slot(2))
             .unwrap()
     );
+    let mut prefilled = before_first.clone();
+    prefilled
+        .devices
+        .get_mut(&slot(2))
+        .unwrap()
+        .tag_signature_key = Some(moving.engine.own_signature_key());
+    assert!(
+        !moving
+            .engine
+            .own_device_tag_commit_landed(&chosen(), &prefilled, &slot(2))
+            .unwrap(),
+        "a prefilled matching key does not turn a KeyPackage-source leaf into own Commit proof"
+    );
     let expected_entry = before_first.devices[&slot(2)].clone();
     let mut own_entry = expected_entry.clone();
     own_entry.tag_signature_key = Some(moving.engine.own_signature_key());
@@ -591,6 +604,59 @@ async fn a_move_welcome_joins_without_cutting_original_trust() {
     assert_eq!(
         app.device_group(&original_hex).unwrap().unwrap().trust,
         DeviceGroupTrust::Linked
+    );
+    // A long Joined retry can retain original trust while ordinary native
+    // maintenance updates the destination leaf. This is a permitted native
+    // state witness, not an automatic-worker timing reproduction.
+    let updated = send_commit(
+        &mut moving,
+        SendIntent::SelfUpdate { group_id: chosen() },
+        &chosen(),
+    )
+    .await;
+    assert_accepted(&mut destination_creator, &updated, &chosen()).await;
+    assert_eq!(
+        app.device_group_move(&chosen()).unwrap().unwrap().phase,
+        DeviceGroupMovePhase::Joined
+    );
+    assert_eq!(
+        app.device_group(&original_hex).unwrap().unwrap().trust,
+        DeviceGroupTrust::Linked
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &chosen()).own_leaf_node().unwrap(),
+            &original_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Device(slot(2)),
+        "ordinary preparation still follows original trust before Made"
+    );
+    assert_eq!(
+        cgka_engine::device_tag::device_tag_claim(
+            load_group(&moving, &chosen()).own_leaf_node().unwrap(),
+            &destination_roster
+        ),
+        cgka_traits::app_components::DeviceTagClaim::Unclaimed
+    );
+    assert!(
+        moving
+            .engine
+            .own_device_tag_commit_landed(&chosen(), &destination_roster, &slot(2))
+            .unwrap(),
+        "a later authenticated own Commit does not undo first-Commit participation"
+    );
+    let mut mismatching = destination_roster.clone();
+    mismatching
+        .devices
+        .get_mut(&slot(2))
+        .unwrap()
+        .tag_signature_key = Some(destination_creator.engine.own_signature_key());
+    assert!(
+        !moving
+            .engine
+            .own_device_tag_commit_landed(&chosen(), &mismatching, &slot(2))
+            .unwrap(),
+        "a current own Commit cannot prove a different roster leaf key"
     );
     // The Made cut is local storage bookkeeping here; the Session/App owner
     // separately owns authorizing this call from its selected-state proof.

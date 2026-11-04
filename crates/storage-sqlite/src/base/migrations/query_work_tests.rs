@@ -665,7 +665,7 @@ fn retention_indexes_upgrade() {
                 .filter(|&i| {
                     !matches!(
                         stmt.column_name(i).unwrap(),
-                        "edit_json" | "deletion_source"
+                        "edit_json" | "deletion_source" | "recipient_confirmed"
                     )
                 })
                 .collect::<Vec<_>>();

@@ -1267,6 +1267,7 @@ pub(crate) fn chat_list_preview_eligibility_sql(
                   AND candidate.direction = 'sent'
                   AND candidate.source_message_id_hex IS NULL
                   AND candidate.invalidation_status IS NULL
+                  AND candidate.recipient_confirmed = 0
                   AND {activity_filter}
                 ORDER BY {preview_order}
                 LIMIT 1
@@ -1310,16 +1311,36 @@ pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
     )
 }
 
-/// Keep this row-local rank aligned with migration 0062's preview index.
+/// Keep this row-local rank aligned with migration 0173's preview index.
+/// A recipient-confirmed send (mdk#1291) keeps the rank it had as a failed
+/// send: it is delivered, but it still has no accepted-history position, and
+/// a send that failed before its commit has no source epoch, so its canonical
+/// order would place it above newer accepted history.
 fn preview_rank_sql(column_prefix: &str) -> String {
     format!(
         "CASE
             WHEN {column_prefix}direction = 'sent'
-             AND {column_prefix}invalidation_status = 'local_publish_failed' THEN 0
+             AND ({column_prefix}invalidation_status = 'local_publish_failed'
+                  OR {column_prefix}recipient_confirmed = 1) THEN 0
             WHEN {column_prefix}direction = 'sent'
              AND {column_prefix}source_message_id_hex IS NULL
              AND {column_prefix}invalidation_status IS NULL THEN 2
             ELSE 1
+         END"
+    )
+}
+
+/// A `message_timeline` row's delivery state, spelled as
+/// [`ChatListMessageDeliveryState::as_str`]. A recipient-confirmed send
+/// (mdk#1291) is delivered although no relay acceptance names it.
+pub(crate) fn chat_list_delivery_state_sql(column_prefix: &str) -> String {
+    format!(
+        "CASE
+            WHEN {column_prefix}direction != 'sent' THEN 'not_applicable'
+            WHEN {column_prefix}recipient_confirmed = 1 THEN 'delivered'
+            WHEN {column_prefix}invalidation_status = 'local_publish_failed' THEN 'failed'
+            WHEN {column_prefix}source_message_id_hex IS NULL THEN 'pending'
+            ELSE 'delivered'
          END"
     )
 }
@@ -1478,6 +1499,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
     )? {
         return Ok(false);
     }
+    let delivery_state = chat_list_delivery_state_sql("mt.");
     if projection_has_rows_tx(
         tx,
         &format!(
@@ -1535,12 +1557,7 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                         WHERE mt.group_id_hex = ag.group_id_hex AND mt.message_id_hex = row.last_message_id_hex
                      ), 'unknown')
                    OR row.last_message_delivery_state IS NOT COALESCE((
-                        SELECT CASE
-                            WHEN mt.direction != 'sent' THEN 'not_applicable'
-                            WHEN mt.invalidation_status = 'local_publish_failed' THEN 'failed'
-                            WHEN mt.source_message_id_hex IS NULL THEN 'pending'
-                            ELSE 'delivered'
-                        END
+                        SELECT {delivery_state}
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND mt.message_id_hex = row.last_message_id_hex
@@ -2318,7 +2335,8 @@ fn latest_chat_list_activity_tx(
                 preview.source_message_id_hex, preview.invalidation_status,
                 preview.timeline_order_class, preview.timeline_order_primary,
                 preview.timeline_order_phase, preview.timeline_order_at, preview.deletion_source,
-                source.retention_seconds, source.retention_expires_at
+                source.retention_seconds, source.retention_expires_at,
+                preview.recipient_confirmed
          FROM message_timeline AS preview NOT INDEXED
          LEFT JOIN app_events AS source
            ON source.group_id_hex = preview.group_id_hex
@@ -2410,8 +2428,11 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
     let direction = row.get::<_, String>(8)?;
     let source_message_id_hex = row.get::<_, Option<String>>(9)?;
     let invalidation_status = row.get::<_, Option<String>>(10)?;
+    let recipient_confirmed = row.get::<_, bool>("recipient_confirmed")?;
     let delivery_state = if direction != "sent" {
         ChatListMessageDeliveryState::NotApplicable
+    } else if recipient_confirmed {
+        ChatListMessageDeliveryState::Delivered
     } else if invalidation_status.as_deref() == Some("local_publish_failed") {
         ChatListMessageDeliveryState::Failed
     } else if source_message_id_hex.is_some() {

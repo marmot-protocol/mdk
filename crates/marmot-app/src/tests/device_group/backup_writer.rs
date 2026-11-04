@@ -637,57 +637,60 @@ async fn new_words_mid_pass_abandon_the_run_before_its_pointer() {
 /// A sibling takes over writing from a writer that listed nothing for a
 /// week since the sibling first saw it named, and at once from a writer
 /// that is leaving. A writer just named is not taken over.
+/// Quiet, leaving and moved writers release the role to a staying sibling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_takes_over_a_quiet_or_leaving_writer() {
-    let blossom = local_blossom();
-    let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
-    let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
-    let writer = |device: &AppClient| roster(device, &group).account.backup_writer;
-    let start = devices.relay.published_events.lock().unwrap().len();
-    let mut cursors = (start, start);
+    for status in [DeviceStatusV1::Leaving, DeviceStatusV1::Moved] {
+        let blossom = local_blossom();
+        let (mut devices, group, _chat, words) = linked_writer(&blossom).await;
+        let (phone_slot, laptop_slot) = (slot_of(&devices.phone), slot_of(&devices.laptop));
+        let writer = |device: &AppClient| roster(device, &group).account.backup_writer;
+        let start = devices.relay.published_events.lock().unwrap().len();
+        let mut cursors = (start, start);
 
-    devices.laptop.drive_backup_pass().await;
-    assert_eq!(writer(&devices.laptop), Some(phone_slot));
+        devices.laptop.drive_backup_pass().await;
+        assert_eq!(writer(&devices.laptop), Some(phone_slot));
 
-    let ledger = storage(&devices.laptop_app);
-    ledger
-        .note_backup_writer(&words.public, &laptop_slot, 0)
-        .unwrap();
-    ledger
-        .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
-        .unwrap();
-    due_now(&devices.laptop);
-    devices.laptop.drive_backup_pass().await;
-    assert_eq!(writer(&devices.laptop), Some(laptop_slot));
-    exchange(
-        &mut devices.phone,
-        &mut devices.laptop,
-        &devices.relay,
-        &group,
-        &mut cursors,
-    )
-    .await;
-    assert_eq!(writer(&devices.phone), Some(laptop_slot));
+        let ledger = storage(&devices.laptop_app);
+        ledger
+            .note_backup_writer(&words.public, &laptop_slot, 0)
+            .unwrap();
+        ledger
+            .note_backup_writer(&words.public, &phone_slot, unix_now_seconds() - 8 * DAY)
+            .unwrap();
+        due_now(&devices.laptop);
+        devices.laptop.drive_backup_pass().await;
+        assert_eq!(writer(&devices.laptop), Some(laptop_slot));
+        exchange(
+            &mut devices.phone,
+            &mut devices.laptop,
+            &devices.relay,
+            &group,
+            &mut cursors,
+        )
+        .await;
+        assert_eq!(writer(&devices.phone), Some(laptop_slot));
 
-    let edit = devices
-        .laptop
-        .runtime
-        .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
-            entry.status = DeviceStatusV1::Leaving;
-        })
-        .await
-        .unwrap();
-    assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
-    exchange(
-        &mut devices.phone,
-        &mut devices.laptop,
-        &devices.relay,
-        &group,
-        &mut cursors,
-    )
-    .await;
-    devices.phone.drive_backup_takeover().await;
-    assert_eq!(writer(&devices.phone), Some(phone_slot));
+        let edit = devices
+            .laptop
+            .runtime
+            .edit_device_roster_entry(&group, &laptop_slot, &[], |entry| {
+                entry.status = status;
+            })
+            .await
+            .unwrap();
+        assert!(matches!(edit, DeviceRosterEdit::Committed(_)));
+        exchange(
+            &mut devices.phone,
+            &mut devices.laptop,
+            &devices.relay,
+            &group,
+            &mut cursors,
+        )
+        .await;
+        devices.phone.drive_backup_takeover().await;
+        assert_eq!(writer(&devices.phone), Some(phone_slot));
+    }
 }
 
 /// A writer named again after this device wrote gets a fresh week: the
@@ -941,6 +944,12 @@ async fn the_runtime_writes_a_due_backup() {
     runtime
         .set_runtime_backup_background_conditions(false, false)
         .unwrap();
+    // A caller arriving after admission closes still joins this held pass.
+    let mut after_false = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut after_false).is_pending());
+    runtime.backup_settings("alice").await.unwrap();
+    assert!(futures::poll!(&mut after_false).is_pending());
+    relay.fail_publishes_of_kind(KIND_BACKUP_POINTER);
     upload.release();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), completion)
@@ -949,6 +958,41 @@ async fn the_runtime_writes_a_due_backup() {
             .unwrap(),
         FinishedAttempt
     );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), after_false)
+            .await
+            .expect("the later caller joins the failed attempt")
+            .unwrap(),
+        FinishedAttempt
+    );
+    assert_eq!(ledger.backup_schedule().unwrap().failed_passes, 1);
+    assert!(pointer_event(&relay, &words.public).is_none());
+    // Retry the retained backup through ordinary due admission. Consume the
+    // eligible report while not due, so the explicit call owns admission.
+    relay.allow_all_publish_kinds();
+    ledger
+        .schedule_backup_pass(BackupSchedule {
+            next_pass_at: ANY_TIME,
+            failed_passes: 0,
+        })
+        .unwrap();
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted
+    );
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        FinishedAttempt
+    );
+    runtime
+        .set_runtime_backup_background_conditions(false, false)
+        .unwrap();
     let listed = pointer(&relay, &words.public);
     assert_eq!(listed.len(), 1);
     assert_eq!(
@@ -1023,13 +1067,16 @@ async fn the_runtime_writes_a_due_backup() {
         .unwrap();
     let mut stopped_upload = blossom.hold_upload();
     runtime
-        .set_runtime_backup_background_conditions(true, true)
-        .unwrap();
-    let mut stopped_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
-    assert!(futures::poll!(&mut stopped_waiter).is_pending());
-    tokio::time::timeout(Duration::from_secs(10), stopped_upload.entered())
+        .set_backup_background_conditions("alice", true, true)
         .await
         .unwrap();
+    // Only the platform report precedes this real upload: the due-pass call
+    // below must join, rather than supplying an alternate admission path.
+    tokio::time::timeout(Duration::from_secs(10), stopped_upload.entered())
+        .await
+        .expect("eligible compatibility reports wake the existing worker");
+    let mut stopped_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut stopped_waiter).is_pending());
     runtime.backup_settings("alice").await.unwrap();
     assert!(futures::poll!(&mut stopped_waiter).is_pending());
     runtime.shutdown().await;

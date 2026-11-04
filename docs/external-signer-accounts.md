@@ -52,8 +52,10 @@ call `registerExternalSigner` before expecting the account to publish, decrypt,
 receive welcomes, or start its worker. MDK lists the account before the callback
 is registered, but runtime work remains paused until registration succeeds.
 
-Registration activates the worker and can request a fresh account-identity proof.
-Keep it off the UI thread. Start local accounts first, then connect and register
+Registration activates the worker and reuses its validated, stored current-profile
+account-identity proof. A missing or unusable proof requires a new signature; a
+successful acquisition is persisted for subsequent process restarts. Keep
+registration off the UI thread. Start local accounts first, then connect and register
 each external account independently so an unavailable signer does not hold up
 other accounts. Replacing a callback updates the existing per-account signer slot;
 SDK clients and workers keep the same pinned identity.

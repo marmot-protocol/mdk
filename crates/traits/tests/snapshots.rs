@@ -94,6 +94,15 @@ fn snapshot_transport_message_group() {
 }
 
 #[test]
+fn snapshot_recovery_evolution() {
+    let semantic = cgka_traits::GroupEvolutionSemantic::RecoverMembers {
+        request_ids: vec![[51; 32]],
+        source_authenticator_hash: [17; 32],
+    };
+    insta::assert_snapshot!(serde_json::to_string(&semantic).unwrap(), @r###"{"kind":"recover_members","request_ids":[[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51]],"source_authenticator_hash":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17]}"###);
+}
+
+#[test]
 fn snapshot_recovery_dtos() {
     let source = cgka_traits::GroupRecoverySource {
         epoch: EpochId(7),
@@ -306,7 +315,7 @@ fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() 
 
     let raw_payload = StoredMessagePayload::raw_transport(raw);
     let outbound_welcome_payload =
-        StoredMessagePayload::outbound_welcome(outbound_welcome, None, None);
+        StoredMessagePayload::outbound_welcome(outbound_welcome, None, None, None);
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls);
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
@@ -977,7 +986,28 @@ fn snapshot_group_and_member() {
             local_copy_install_epoch: EpochId(2),
             self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
-            device_roster_departures: Vec::new(),
+            device_roster_departures: vec![
+                cgka_traits::group::DeviceRosterDeparture {
+                    label: "Moving laptop".into(),
+                    slot: [0x11; 32],
+                    tag_signature_key: Some(vec![0x12; 4]),
+                    linked_at: 10,
+                    entry_rename_id: Some([0x13; 16]),
+                    source_epoch: EpochId(2),
+                    commit_id: mid(),
+                    cause: cgka_traits::group::DeviceRosterDepartureCause::Moved,
+                },
+                cgka_traits::group::DeviceRosterDeparture {
+                    label: "Old phone".into(),
+                    slot: [0x21; 32],
+                    tag_signature_key: None,
+                    linked_at: 8,
+                    entry_rename_id: None,
+                    source_epoch: EpochId(1),
+                    commit_id: MessageId::new(vec![0x22; 4]),
+                    cause: cgka_traits::group::DeviceRosterDepartureCause::Ordinary,
+                },
+            ],
         }
     );
 }

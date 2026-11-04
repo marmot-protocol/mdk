@@ -16,8 +16,12 @@ again when delivery completes.
 3. Replace the optimistic bubble when a timeline row has the exact same
    `client_token`. Both raw timeline records and prepared conversation-window
    records expose the token. Do not match by content or timestamp.
-4. Follow ordinary timeline updates for delivery (`source_message_id_hex`) and
-   invalidation/failure. `local_send_status` can recover the admission/attempt
+4. Follow ordinary timeline updates for delivery and invalidation/failure. A
+   send is delivered when `source_message_id_hex` is set or when
+   `recipient_confirmed` is true: a failed send a peer reacted to is delivered
+   with a null source id (mdk#1291). Its change arrives as
+   `DeliveryOrSendStateChanged`, which can also carry the reaction, so
+   recompute that row's reactions too. `local_send_status` can recover the admission/attempt
    status after an interrupted call or restart. `Completed` includes a send
    summary: its disposition may still be pending or completion-unknown.
 

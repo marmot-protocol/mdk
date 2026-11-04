@@ -71,13 +71,19 @@ impl MaintenanceStorage for SqliteAccountStorage {
     }
 
     fn put_group_evolution(&self, record: &DurableGroupEvolution) -> StorageResult<()> {
-        write_ordered_record(
-            self,
-            "cgka_group_evolutions",
-            &record.id,
-            Some(&record.group_id),
-            record,
-        )
+        self.connection.with_savepoint(|| {
+            if let Some(pending) = record.pending_ref {
+                let connection = self.lock()?;
+                crate::protocol::provider::raise_pending_ref(&connection, pending.as_u64())?;
+            }
+            write_ordered_record(
+                self,
+                "cgka_group_evolutions",
+                &record.id,
+                Some(&record.group_id),
+                record,
+            )
+        })
     }
 
     fn group_evolution(&self, id: &MessageId) -> StorageResult<Option<DurableGroupEvolution>> {

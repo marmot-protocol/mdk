@@ -6,7 +6,7 @@
 //! snapshot-and-replay messages for candidate materialization or apply a
 //! selected canonical branch to retained storage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::RewindSite;
@@ -2858,13 +2858,46 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
 ) -> Result<(), OpenMlsProjectionError> {
-    for disposition in openmls_canonicalization_dispositions(result)? {
-        storage
-            .update_message_state(&disposition.message_id, disposition.state)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    }
-
-    Ok(())
+    let dispositions = openmls_canonicalization_dispositions(result)?;
+    storage.with_transaction(|storage| {
+        let mut withdrawn: HashMap<GroupId, (EpochId, HashSet<MessageId>)> = HashMap::new();
+        for disposition in dispositions {
+            if matches!(
+                disposition.state,
+                MessageState::EpochInvalidated | MessageState::Failed
+            ) {
+                let record = storage.get_message(&disposition.message_id)?;
+                let (source_epoch, origins) = withdrawn
+                    .entry(record.group_id)
+                    .or_insert_with(|| (record.epoch, HashSet::new()));
+                if record.epoch.0 < source_epoch.0 {
+                    *source_epoch = record.epoch;
+                }
+                origins.insert(disposition.message_id.clone());
+            }
+            storage.update_message_state(&disposition.message_id, disposition.state)?;
+        }
+        // Deferred branches may win later: hold their outputs. Only terminal
+        // origins retire undelivered outputs; delivered copies stay usable.
+        for (group_id, (source_epoch, origins)) in withdrawn {
+            for record in
+                storage.list_messages_in_states(&group_id, &[MessageState::Sent], source_epoch)?
+            {
+                let Ok(StoredMessagePayload::OutboundWelcome {
+                    origin_commit_id: Some(origin),
+                    ..
+                }) = StoredMessagePayload::decode(&record.payload)
+                else {
+                    // Opaque rows cannot pass the delivery guard; leave them held.
+                    continue;
+                };
+                if origins.contains(&origin) {
+                    storage.update_message_state(&record.id, MessageState::Failed)?;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

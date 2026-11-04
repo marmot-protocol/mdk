@@ -291,6 +291,33 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
             "the ordinary gap Add consumed real private stock"
         );
         fault.execute_batch("CREATE TRIGGER fail_app_move_made BEFORE UPDATE OF phase ON device_group_moves WHEN NEW.phase = 2 BEGIN SELECT RAISE(ABORT, 'app move Made checkpoint failed'); END;").unwrap();
+        // Reopening loses the in-memory new-device pairing session, not the
+        // joined move. A real new request must still stay unanswered until Made.
+        moving = reopen(moving).await;
+        published_key_package(&mut destination.client, &relay).await;
+        assert_eq!(
+            destination.op(DeviceLinkOp::Start).await.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer)
+        );
+        let waiting = moving.step(&relay).await;
+        let requesting = destination.step(&relay).await;
+        assert_eq!(
+            requesting.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer),
+            "the real requester must receive no Answer from the reopened Joined mover"
+        );
+        assert_eq!(
+            waiting
+                .prompt_for_slot(&destination.slot_hex())
+                .expect("the actual new request reached the reopened mover")
+                .state,
+            DeviceLinkPromptState::Preparing,
+            "a reopened Joined mover must not answer a pairing request"
+        );
+        assert_eq!(
+            moving.client.trusted_device_group().unwrap(),
+            Some(old.clone())
+        );
         let error = moving
             .client
             .drive_device_group_moves(unix_now_seconds())
@@ -392,6 +419,122 @@ fn a_move_keeps_old_trust_until_made_and_retries_its_atomic_cut_after_reopen() {
                 .unwrap()
                 .is_none()
         }));
+        // Destination failure must not block the separately available old
+        // status Commit. Use the same real hydration-quarantine boundary as
+        // the gap-recovery owner, then repair it before the captured assertion.
+        {
+            use cgka_traits::storage::GroupStorage;
+            deliver_new(&mut moving.client, &relay, &mut moving.cursor).await;
+            let target_record = store.get_group(&target).unwrap();
+            let mut damaged = target_record.clone();
+            damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+            store.put_group(&damaged).unwrap();
+            moving = reopen(moving).await;
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .quarantined_groups()
+                    .iter()
+                    .any(|(group, _)| group == &target)
+            );
+            assert!(matches!(
+                moving.client.trusted_device_roster(),
+                Err(AppError::DeviceGroupRefused("roster_unavailable"))
+            ));
+            assert_eq!(
+                moving.client.trusted_device_group().unwrap(),
+                Some(target.clone())
+            );
+            assert!(moving.client.runtime.ensure_group_hydrated(&old).unwrap());
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .canonical_group_membership(&old)
+                    .unwrap()
+                    .local_leaf_active
+            );
+            assert!(
+                moving
+                    .client
+                    .runtime
+                    .device_group_takes_commit(&old, &[])
+                    .unwrap()
+            );
+            assert_eq!(
+                moving.roster(&old).devices[&slot].status,
+                cgka_traits::app_components::DeviceStatusV1::Active
+            );
+            // The ordinary pairing drive catches destination errors; its old
+            // cleanup must still get its independent attempt in the same pass.
+            moving
+                .client
+                .drive_device_pairing_at(unix_now_seconds())
+                .await;
+            let status = moving.roster(&old).devices[&slot].status;
+            store.put_group(&target_record).unwrap();
+            assert!(
+                moving
+                    .client
+                    .retry_hydrate_quarantined_group(&target)
+                    .unwrap()
+            );
+            moving.client.drain_pending_session_events().await.unwrap();
+            assert_eq!(
+                status,
+                cgka_traits::app_components::DeviceStatusV1::Moved,
+                "destination quarantine must not prevent the available old status Commit"
+            );
+        }
+        // Ordinary native old-group work may still finish after Made. A
+        // post-status SelfUpdate follows destination tagging, so cleanup must
+        // identify the actual leaf by the selected old entry's signature key.
+        assert_eq!(
+            moving.roster(&old).devices[&slot].status,
+            cgka_traits::app_components::DeviceStatusV1::Moved
+        );
+        let effects = moving
+            .client
+            .runtime
+            .send(SendIntent::SelfUpdate {
+                group_id: old.clone(),
+            })
+            .await
+            .unwrap();
+        moving
+            .client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        deliver_new(&mut original.client, &relay, &mut original.cursor).await;
+        assert!(original.roster(&old).devices.contains_key(&slot));
+        assert!(
+            !original
+                .client
+                .runtime
+                .own_account_leaf_claims(&old, &original.roster(&old))
+                .unwrap()
+                .iter()
+                .any(|(_, claim)| *claim
+                    == cgka_traits::app_components::DeviceTagClaim::Device(slot)),
+            "the still-member mover no longer tags against the old roster"
+        );
+        assert!(
+            moving
+                .client
+                .runtime
+                .canonical_group_membership(&old)
+                .unwrap()
+                .local_leaf_active
+        );
+        original.client.drive_device_removals().await;
+        assert!(!original.roster(&old).devices.contains_key(&slot));
+        deliver_new(&mut moving.client, &relay, &mut moving.cursor).await;
+        assert!(
+            moving.client.runtime.group_record(&old).unwrap().removed,
+            "moved cleanup removes the actual MLS leaf, not only its roster entry"
+        );
         for _ in 0..8 {
             moving.step(&relay).await;
             original.step(&relay).await;
@@ -556,6 +699,37 @@ fn a_failed_move_forgets_only_the_destination_without_restoring_old_trust() {
             "actual native join preceded its authenticated removal"
         );
         assert!(moving.client.runtime.group_record(&target).unwrap().removed);
+        let fault = linked_device_chats::account_database(&moving.app);
+        fault.execute_batch("CREATE TRIGGER fail_move_end AFTER UPDATE OF phase ON device_group_moves WHEN NEW.phase = 3 BEGIN SELECT RAISE(ABORT, 'move end after forget failed'); END;").unwrap();
+        let failed = moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await;
+        assert!(
+            matches!(failed, Err(ref error) if error.to_string().contains("move end after forget failed")),
+            "{failed:?}"
+        );
+        assert!(
+            store.is_group_forgotten(&target).unwrap(),
+            "real native forget committed before the later phase-end fault"
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .device_group_move(&target)
+                .unwrap()
+                .unwrap()
+                .phase,
+            storage_sqlite::DeviceGroupMovePhase::Joined
+        );
+        fault.execute_batch("DROP TRIGGER fail_move_end").unwrap();
+        drop(fault);
+        moving = reopen(moving).await;
+        moving
+            .client
+            .drive_device_group_moves(unix_now_seconds())
+            .await
+            .unwrap();
         let view = moving.op(DeviceLinkOp::Read).await;
         assert_eq!(
             view.moves.last().unwrap().state,

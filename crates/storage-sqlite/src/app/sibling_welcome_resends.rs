@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, params};
 impl SqliteAppStorage {
     /// Before a new carrier is sent, retain its association with the original
     /// Welcome. Preparing a carrier does not invent a successful generation or
-    /// erase the preceding generation's armed deadline.
+    /// erase the preceding generation's accepted-publication time.
     pub(crate) fn prepare_sibling_welcome_resend(
         &self,
         welcome_id: &[u8],
@@ -119,7 +119,7 @@ impl SqliteAppStorage {
     }
 
     /// Retire completed, expired or terminal repair work. A held origin keeps
-    /// its original fixed deadline.
+    /// its retained publication time and engine-owned delivery expiry.
     pub fn delete_sibling_welcome_resend(&self, welcome_id: &[u8]) -> StorageResult<()> {
         self.lock()?
             .execute_cached(

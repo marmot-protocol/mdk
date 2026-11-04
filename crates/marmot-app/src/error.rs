@@ -856,10 +856,8 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
 /// D5 field investigations blind, so the name always comes from the engine.
 fn engine_error_kind(error: &cgka_traits::error::EngineError) -> &'static str {
     match error {
-        // Reuse the nine storage kinds. That keeps the one transient kind
-        // (`storage_busy`, the sole case `SessionError::is_transient` reports)
-        // distinguishable from the eight durable ones without a second
-        // transient/permanent axis to keep in sync.
+        // Reuse the storage kinds. Other transient engine failures, such as
+        // unsettled recovery, retain their own privacy-safe kind.
         cgka_traits::error::EngineError::Storage(error) => storage_error_kind(error),
         // Engine names come from the engine so an app tracing field and an
         // engine forensic audit row say the same word for the same failure.
@@ -1060,25 +1058,6 @@ mod tests {
         assert_eq!(direct.privacy_safe_kind(), "invalid_welcome");
         assert_eq!(via_account_session.privacy_safe_kind(), "invalid_welcome");
         assert_eq!(via_account_engine.privacy_safe_kind(), "invalid_welcome");
-    }
-
-    // `is_transient` and the kind are two views of one fact. Pin them together
-    // so a future kind edit cannot silently make a retryable failure read as
-    // durable (or the reverse).
-    #[test]
-    fn session_kind_agrees_with_is_transient() {
-        for error in [
-            marmot_session::SessionError::from(StorageError::Busy("locked".into())),
-            marmot_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
-                "locked".into(),
-            ))),
-            marmot_session::SessionError::from(StorageError::Closed("shut".into())),
-            marmot_session::SessionError::Engine(EngineError::InvalidWelcome),
-        ] {
-            let transient = error.is_transient();
-            let kind = AppError::Session(error).privacy_safe_kind();
-            assert_eq!(transient, kind == "storage_busy", "kind {kind}");
-        }
     }
 }
 

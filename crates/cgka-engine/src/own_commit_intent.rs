@@ -93,6 +93,7 @@ impl<S: StorageProvider> Engine<S> {
                 Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
             }
             SendIntent::AppMessage { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::AddOwnAccountDevices { .. }
@@ -170,6 +171,7 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::UpdateGroupData { .. } => SupersededIntentKind::GroupProfile,
             SendIntent::UpdateAppComponents { .. }
             | SendIntent::ReplaceDeviceEntry { .. }
+            | SendIntent::MarkDeviceGroupMoved { .. }
             | SendIntent::ReplaceAccountEntry { .. } => SupersededIntentKind::AppComponents,
             _ => return Ok(None),
         };
