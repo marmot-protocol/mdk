@@ -355,6 +355,9 @@ mod migration_0171_device_edit_settings;
 #[path = "migrations/0173_recipient_confirmed_sends.rs"]
 mod migration_0173_recipient_confirmed_sends;
 
+#[path = "migrations/0174_heartbeat_welcome_repair.rs"]
+mod migration_0174_heartbeat_welcome_repair;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1336,6 +1339,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0173_recipient_confirmed_sends",
         suspend_foreign_keys: &[],
         apply: migration_0173_recipient_confirmed_sends::apply,
+    },
+    Migration {
+        version: 174,
+        name: "0174_heartbeat_welcome_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0174_heartbeat_welcome_repair::apply,
     },
 ];
 

@@ -2573,10 +2573,6 @@ impl AppClient {
         received_at: u64,
         drained: bool,
     ) {
-        if let Err(error) = self.observe_pending_sibling_welcome_activity() {
-            tracing::warn!(target: "marmot_app::client::sync", method = "retain_effect_projection",
-                error_kind = error.privacy_safe_kind(), "could not project accepted device-group activity");
-        }
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
