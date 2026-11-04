@@ -6926,6 +6926,13 @@ impl AdapterState {
         account_id: &MemberId,
         subscriptions: &[NostrSubscription],
     ) {
+        // Live frames a fence holds have no other copy: they move to the new
+        // coverage, still held, rather than being lost with the old one.
+        let held = self
+            .account_replay_coverage
+            .get_mut(account_id)
+            .map(AccountReplayCoverage::take_fence_held)
+            .unwrap_or_default();
         let mut coverage = AccountReplayCoverage::new(
             account_id.clone(),
             self.replay_losses.clone(),
@@ -6941,6 +6948,7 @@ impl AdapterState {
         self.stage_replay_batches(account_id, subscriptions);
         if let Some(coverage) = self.account_replay_coverage.get_mut(account_id) {
             coverage.admit_retained();
+            coverage.restore_fence_held(held);
         }
     }
 

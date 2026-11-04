@@ -731,3 +731,108 @@ async fn a_reconnect_mid_quantum_gives_the_preempted_attempt_back() {
         .unwrap()
         .unwrap();
 }
+
+/// Each group the account joins gets a fresh activation, which replaces the
+/// account's replay coverage while the runner's fences hold the group's live
+/// frames. Those frames move to the new coverage, so no join costs recovery
+/// loss: nothing un-covers every route, and the joined groups and the inbox
+/// catch up at a cost that grows with the joins. Losing the held frames made
+/// each join account-wide loss, every route owed again, and on a relay that
+/// cannot compare, the inbox never caught up.
+///
+/// The relay publishes no caps, so a sweep proves a second only when it holds
+/// fewer events than a fuller reply did: each group's message goes out in a
+/// later second than its creating commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successive_group_joins_lose_nothing_and_catch_up() {
+    const GROUPS: u64 = 6;
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let creator = home.create_account("creator").unwrap();
+    let joiner = home.create_account("joiner").unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config)
+        .with_recovery_runner_ownership_for_test(true);
+    crate::tests::remember_test_member_inbox(&app, &joiner.account_id_hex, &url);
+    let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    let _credits = runtime
+        .shared_services()
+        .use_private_recovery_credit_pool_for_test();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package(&joiner.label).await.unwrap();
+    let storage = app.account_storage(&joiner.label).unwrap().app_storage();
+    let before = storage.recovery_coverage_mark().unwrap();
+    let mut groups = Vec::new();
+    for index in 0..GROUPS {
+        let group = runtime
+            .create_group_with_options(
+                &creator.label,
+                &format!("join {index}"),
+                std::slice::from_ref(&joiner.account_id_hex),
+                AppCreateGroupOptions {
+                    relays: Some(vec![url.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let created = crate::unix_now_seconds();
+        while crate::unix_now_seconds() <= created {
+            sleep(Duration::from_millis(20)).await;
+        }
+        runtime
+            .send_message(
+                &creator.label,
+                &group,
+                format!("hello {index}").into_bytes(),
+            )
+            .await
+            .unwrap();
+        groups.push(hex::encode(&group));
+    }
+    timeout(Duration::from_secs(40), async {
+        loop {
+            let joined = groups
+                .iter()
+                .all(|group| app.group(&joiner.label, group).unwrap().is_some());
+            let status = runtime.account_recovery_status(&joiner.label).await;
+            if joined
+                && status.is_ok_and(|status| {
+                    status.catching_up_group_ids_hex.is_empty() && !status.inbox_catching_up
+                })
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every joined group and the inbox catch up");
+    let lost = storage
+        .recovery_coverage_lost_since(before)
+        .unwrap()
+        .expect("no join un-covered every route");
+    assert!(
+        lost.iter()
+            .all(|route| matches!(route, TransportReconciliationRoute::Group(_))),
+        "only joined groups owe their post-join history"
+    );
+    let attempts = storage
+        .recovery_account_usage(crate::unix_now_seconds())
+        .unwrap()
+        .attempts;
+    // A joined route's goal and its post-join history, plus the inbox, with
+    // slack: a route that keeps owing the seconds up to now costs more.
+    assert!(
+        attempts <= 4 * GROUPS,
+        "{attempts} attempts for {GROUPS} successive joins"
+    );
+    timeout(SETTLE, runtime.shutdown_and_close())
+        .await
+        .unwrap()
+        .unwrap();
+}

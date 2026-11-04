@@ -29,7 +29,7 @@ for reconnect/backoff and relay status mechanics.
 | `src/relay_list.rs` | NIP-65 kind `10002` and Marmot inbox kind `10050` relay-list event building. |
 | `src/sweep/` | Time-sliced resumable history sweep (#2660 phase 3): engine over `SweepRelay`, caller-owned sink and cursor store; `sdk.rs` is the SDK-backed relay, `hint_tap.rs` reads NIP-67 `more` off the wire for it. Called by `marmot-app`'s recovery runner `quantum.rs`, which owns account history debt by default since PR 5g. |
 | `src/compare/` | NIP-77 comparison of one (route, relay, range) against the caller's held ids (#2660 phase 4): windows under the relay's set limit, differences fetched by id oldest first, each window certified once every id the relay holds there is fetched or held. Called by the same recovery runner's `compare.rs`; its `host.rs` builds `SdkSweepRelay` from the account's existing pool. |
-| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed delegated holds and legacy one-deadline expiry. Enabled by the recovery runner from PR 5g. |
+| `src/replay_fence.rs` | Fences on a group's live frames (#2660 phase 4): arming at a counted EOSE, the owner's `ReplayFencePlan` answers, partial release, owner-completed delegated holds, legacy one-deadline expiry, and held frames moving to the coverage a fresh activation installs. Enabled by the recovery runner from PR 5g. |
 | `src/sdk_client.rs` | Optional `nostr-sdk` relay client implementation and SDK planning tests. |
 | `src/telemetry.rs` | Relay delivery telemetry: cross-relay arrival spread (phase 1) and subscription sync timing / initial-sync gate (phase 2); local-time, aggregate, privacy-safe. |
 | `tests/inbound_routing.rs` | Public behavior tests for group delivery, welcome delivery, group sync, and publish. |
@@ -187,7 +187,9 @@ for reconnect/backoff and relay status mechanics.
   ignoring plans until a new count arms the group. Delegated holds have no request deadline: their owner advances or
   releases them as durable backlog admission permits; no expired timer authorizes newer input. Unanswered armings
   still retire with their unadmitted count. A plan older than the
-  last applied is ignored, and a fence nothing holds ends at once. A fence holds only what is still in the replay
+  last applied is ignored, and a fence nothing holds ends at once. A fresh activation (`record_account_replay_start`)
+  moves the live frames fences hold into the new coverage, held from the same point under the old plan ticket; only
+  frames for groups its REQs no longer route, or past the buffer bounds, become replay loss. A fence holds only what is still in the replay
   buffer: never call back a frame already handed off (a queued or borrowed native batch, a draining hand-off); it goes
   on as late input, as at expiry, and the range stays owed. A hand-off that rejoins the buffer keeps its placement pin
   until its next hand-off; while a fence holds it there, that pin is exempt (`held_pins`), but a pin on a copy still out
