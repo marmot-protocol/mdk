@@ -193,23 +193,27 @@ pub enum MarmotStatus {
     /// This device was unlinked from the account by its other devices. The
     /// account stays signed out here: wipe it, then link the device again.
     AccountUnlinked = 116,
-    ChatSelectionUncertain = 117,
-    ChatSelectionNoLongerEligible = 118,
-    ChatSelectionProjectionNotReady = 119,
-    ChatSelectionInvalidPage = 120,
-    ChatSelectionOwnerChanged = 121,
-    ChatSelectionClosed = 122,
-    ChatSelectionStale = 123,
-    ChatSelectionIncomplete = 124,
-    ChatSelectionUnsupportedScope = 125,
-    ChatSelectionNotReady = 126,
-    ChatSelectionCancelled = 127,
-    ChatSelectionUnsupportedRuntime = 128,
-    ChatSelectionInvalidScope = 129,
-    ChatSelectionResourceExhausted = 130,
-    ChatSelectionTimedOut = 131,
-    ChatSelectionInvalidSlots = 132,
-    ChatSelectionQuery = 133,
+    /// Recovery waits for the source group to settle.
+    GroupRecoveryUnsettled = 117,
+    /// Restart the authenticated recovery challenge; do not retry the grant.
+    GroupRecoverySourceMismatch = 118,
+    ChatSelectionUncertain = 119,
+    ChatSelectionNoLongerEligible = 120,
+    ChatSelectionProjectionNotReady = 121,
+    ChatSelectionInvalidPage = 122,
+    ChatSelectionOwnerChanged = 123,
+    ChatSelectionClosed = 124,
+    ChatSelectionStale = 125,
+    ChatSelectionIncomplete = 126,
+    ChatSelectionUnsupportedScope = 127,
+    ChatSelectionNotReady = 128,
+    ChatSelectionCancelled = 129,
+    ChatSelectionUnsupportedRuntime = 130,
+    ChatSelectionInvalidScope = 131,
+    ChatSelectionResourceExhausted = 132,
+    ChatSelectionTimedOut = 133,
+    ChatSelectionInvalidSlots = 134,
+    ChatSelectionQuery = 135,
 }
 
 thread_local! {
@@ -401,6 +405,10 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::GroupUnrecoverableRepairRequired
         }
         MarmotKitError::AccountWorkerBusy => MarmotStatus::AccountWorkerBusy,
+        MarmotKitError::GroupRecoveryUnsettled { .. } => MarmotStatus::GroupRecoveryUnsettled,
+        MarmotKitError::GroupRecoverySourceMismatch { .. } => {
+            MarmotStatus::GroupRecoverySourceMismatch
+        }
         MarmotKitError::AccountWorkerResponseTimedOut => {
             MarmotStatus::AccountWorkerResponseTimedOut
         }
@@ -655,6 +663,12 @@ mod tests {
             MarmotKitError::AccountUnlinked {
                 account_ref: "a".into(),
             },
+            MarmotKitError::GroupRecoveryUnsettled {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupRecoverySourceMismatch {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::Runtime {
                 details: "d".into(),
             },
@@ -680,7 +694,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            124,
+            126,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -734,6 +748,18 @@ mod tests {
             110
         );
         assert_eq!(
+            status_from_error(&MarmotKitError::GroupRecoveryUnsettled {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            117
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupRecoverySourceMismatch {
+                group_id_hex: "aa".into(),
+            }) as i32,
+            118
+        );
+        assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79
         );
@@ -751,6 +777,28 @@ mod tests {
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
             80
         );
+        // These integers are the external C ABI, after mainline recovery 117/118.
+        for (error, expected_code) in [
+            (MarmotKitError::ChatSelectionUncertain, 119),
+            (MarmotKitError::ChatSelectionNoLongerEligible, 120),
+            (MarmotKitError::ChatSelectionProjectionNotReady, 121),
+            (MarmotKitError::ChatSelectionInvalidPage, 122),
+            (MarmotKitError::ChatSelectionOwnerChanged, 123),
+            (MarmotKitError::ChatSelectionClosed, 124),
+            (MarmotKitError::ChatSelectionStale, 125),
+            (MarmotKitError::ChatSelectionIncomplete, 126),
+            (MarmotKitError::ChatSelectionUnsupportedScope, 127),
+            (MarmotKitError::ChatSelectionNotReady, 128),
+            (MarmotKitError::ChatSelectionCancelled, 129),
+            (MarmotKitError::ChatSelectionUnsupportedRuntime, 130),
+            (MarmotKitError::ChatSelectionInvalidScope, 131),
+            (MarmotKitError::ChatSelectionResourceExhausted, 132),
+            (MarmotKitError::ChatSelectionTimedOut, 133),
+            (MarmotKitError::ChatSelectionInvalidSlots, 134),
+            (MarmotKitError::ChatSelectionQuery, 135),
+        ] {
+            assert_eq!(status_from_error(&error) as i32, expected_code);
+        }
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
             let status = status_from_error(err);

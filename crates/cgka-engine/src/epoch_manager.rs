@@ -115,9 +115,31 @@ impl EpochManager {
 
     // ── Mutation: pending-ref allocation ────────────────────────────────────
 
-    pub(crate) fn next_pending_ref(&mut self) -> PendingStateRef {
-        self.pending_counter += 1;
-        PendingStateRef::new(self.pending_counter)
+    /// Staging paths check before any durable or MLS mutation. The allocation
+    /// remains fallible as a final guard, but must not introduce a late failure
+    /// after a commit and its Welcomes have been written.
+    pub(crate) fn ensure_pending_space(&self) -> Result<(), EngineError> {
+        if self.pending_counter == u64::MAX {
+            return Err(EngineError::Backend(
+                "pending reference space exhausted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_pending_ref(&mut self) -> Result<PendingStateRef, EngineError> {
+        self.pending_counter = self
+            .pending_counter
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Backend("pending reference space exhausted".into()))?;
+        Ok(PendingStateRef::new(self.pending_counter))
+    }
+
+    /// Reserve a durable handle without installing a group's pending state.
+    /// Construction must reserve every restorable handle before any group
+    /// hydrates or stages new work; per-group restoration alone is too late.
+    pub(crate) fn reserve_pending_ref(&mut self, pending_ref: PendingStateRef) {
+        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
     }
 
     // ── Mutation: state transitions ────────────────────────────────────────
@@ -227,7 +249,7 @@ impl EpochManager {
         pending_ref: PendingStateRef,
         kind: PendingKind,
     ) -> Result<(), EngineError> {
-        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
+        self.reserve_pending_ref(pending_ref);
         self.begin_pending(
             group_id,
             pre_commit_epoch,
@@ -439,6 +461,33 @@ mod tests {
         StagedCommitHandle::from_bytes(vec![0xCD; 4])
     }
 
+    #[test]
+    fn pending_ref_does_not_wrap() {
+        let mut manager = EpochManager::new();
+        manager.reserve_pending_ref(PendingStateRef::new(u64::MAX - 1));
+        assert_eq!(manager.next_pending_ref().unwrap().as_u64(), u64::MAX);
+        for _ in 0..2 {
+            assert!(matches!(manager.next_pending_ref(),
+                Err(EngineError::Backend(message)) if message == "pending reference space exhausted"));
+        }
+        // Exhaustion prevents new allocations, not restoration/confirmation of
+        // the exact final handle that was already persisted.
+        manager
+            .restore_pending(
+                gid(),
+                EpochId(0),
+                EpochId(1),
+                handle(),
+                PendingStateRef::new(u64::MAX),
+                PendingKind::GroupEvolution,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.group_for_pending(PendingStateRef::new(u64::MAX)),
+            Some(gid())
+        );
+    }
+
     /// Regression for mdk#146: `begin_pending` from a non-Stable state
     /// must be atomic. A failing inner transition (Unrecoverable →
     /// InvalidTransition) must leave `states` and `pending` untouched so the
@@ -455,7 +504,7 @@ mod tests {
         assert!(em.is_unrecoverable(&group_id));
         assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
 
-        let pending_ref = em.next_pending_ref();
+        let pending_ref = em.next_pending_ref().unwrap();
         let result = em.begin_pending(
             group_id.clone(),
             EpochId(3),
@@ -489,7 +538,7 @@ mod tests {
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
 
-        let pending_ref = em.next_pending_ref();
+        let pending_ref = em.next_pending_ref().unwrap();
         em.begin_pending(
             group_id.clone(),
             EpochId(7),
@@ -517,7 +566,7 @@ mod tests {
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
 
-        let pending_ref = em.next_pending_ref();
+        let pending_ref = em.next_pending_ref().unwrap();
         em.begin_pending(
             group_id.clone(),
             EpochId(7),
@@ -564,7 +613,7 @@ mod tests {
         let mut em = EpochManager::new();
         let group_id = gid();
         em.set_stable(group_id.clone(), EpochId(7));
-        let pending_ref = em.next_pending_ref();
+        let pending_ref = em.next_pending_ref().unwrap();
         em.begin_pending(
             group_id.clone(),
             EpochId(7),

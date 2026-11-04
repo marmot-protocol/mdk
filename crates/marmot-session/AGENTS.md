@@ -84,6 +84,10 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
     Whichever attempt meets a Welcome's acknowledgement policy marks it delivered, maintenance's retry of its stored
     fanout included. A host that names Welcomes by id (the app's invite drive) publishes them through
     `deliver_owed_welcomes_with_audit_context`, which sends only those the engine says are owed now.
+    A confirmed recovery Welcome also waits while its native origin is `ConvergenceDeferred`: keep its exact bytes,
+    watch and retry fanout, including across reopen and missed events. Only terminal origin loss retires that debt;
+    native re-adoption can make it owed again under its original deadline. `tests/runtime/hydrated_welcome.rs` owns
+    encrypted recovery continuation, unrelated-group cancellation, parked retry retention and terminal pruning.
   - `runtime/private_key_packages.rs` — issue, list, mark and discard private KeyPackages (mdk#2628 3.4b), and join a
     chat from a sibling Welcome the app admitted (3.5b); like a confirmed rejoin, that join's events wait for the
     caller's drain. It also lists the sibling Welcomes this device owes and records a carrier's outcome on one

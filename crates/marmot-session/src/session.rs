@@ -96,10 +96,9 @@ impl SessionError {
         }
     }
 
-    /// Whether this error reflects transient backend contention worth retrying
-    /// (a `SQLITE_BUSY` that survived the backend's own retries) rather than a
-    /// durable failure. Used by the account layer to retry the retry-safe
-    /// `confirm_published` path instead of surfacing a lock blip as fatal.
+    /// Whether backend contention or unsettled group recovery makes this
+    /// failure transient. The account layer uses this for retry-safe
+    /// `confirm_published` retries rather than surfacing a lock blip as fatal.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         self.as_engine_error().is_transient()
@@ -405,6 +404,8 @@ pub enum PublishWork {
     AutoPublish {
         msg: TransportMessage,
         pending: PendingStateRef,
+        /// Automatic work owns its Welcomes through its own commit ACK.
+        welcomes: Vec<TransportMessage>,
     },
 }
 
@@ -2132,6 +2133,7 @@ impl AccountDeviceSession {
             effects.publish.push(PublishWork::AutoPublish {
                 msg: auto.msg,
                 pending: auto.pending,
+                welcomes: auto.welcomes,
             });
         }
         for msg in self.engine.drain_auto_proposals() {
@@ -2160,6 +2162,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
+        SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
         SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",

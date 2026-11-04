@@ -59,8 +59,9 @@ impl StagedCommitHandle {
 /// Opaque handle referencing a pending outbound send. Passed back to
 /// `CgkaEngine::confirm_published` after the transport confirms publish.
 ///
-/// Intentionally a `u64` newtype: the engine generates and owns these; no
-/// cross-process stability required.
+/// Intentionally a `u64` newtype: the engine generates and owns these. A
+/// persisted publication restores its exact reference across restart; storage
+/// retains an independent high-water so later work cannot reuse a saved handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PendingStateRef(u64);
 

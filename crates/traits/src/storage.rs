@@ -1253,6 +1253,18 @@ pub trait StorageProvider:
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
 
+    /// Monotonic high-water covering every persisted, restorable pending-send
+    /// reference in outbound fanouts or group evolutions. Writers must raise this account-device bound
+    /// atomically with those artifacts, preserve all `u64` values, and never
+    /// lower it on deletion or snapshot restoration. Construction reserves it
+    /// before any group hydrates or stages new work.
+    ///
+    /// This metadata must be independent of artifact decoding so a malformed
+    /// group payload can be quarantined without blocking unrelated groups.
+    /// Missing, corrupt, or unestablishable legacy bounds must return an error,
+    /// not zero or an estimate. Zero is valid only for a known empty history.
+    fn pending_ref_high_water(&self) -> StorageResult<u64>;
+
     /// Count of writes to the OpenMLS state store, when the backend tracks
     /// them. The engine keeps loaded `MlsGroup`s across calls and reuses one
     /// only while this value equals the value observed when it was stored;
