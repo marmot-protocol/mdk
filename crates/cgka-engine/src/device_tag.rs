@@ -163,8 +163,9 @@ impl<S: StorageProvider> Engine<S> {
     /// `group_id`, its device group, or stop tagging with `None`. The host
     /// names a device group only once it trusts it: holding the account key
     /// never authenticates a device, so an untrusted group's `leaf_tag_key`
-    /// must never seal a tag. Kept in memory; the host sets it again after
-    /// every open.
+    /// must never seal an ordinary tag. The one destination-first-own
+    /// roster-key Commit tags its own UpdatePath there before Made (D102).
+    /// Kept in memory; the host sets it again after every open.
     ///
     /// Naming a group the session only seeded hydrates it, so its roster is
     /// read only once hydration has validated it. A group that fails
@@ -255,6 +256,33 @@ impl<S: StorageProvider> Engine<S> {
         OwnDeviceTag::find(roster, own_slot, self.identity.signer.public())
     }
 
+    /// The first Commit setting this device's own key in a destination
+    /// roster tags only its UpdatePath there (D102). This does not name the
+    /// destination for ordinary leaves or KeyPackages before Made.
+    pub(crate) fn first_own_roster_tag(
+        &self,
+        group: &MlsGroup,
+        proposals: &[Proposal],
+    ) -> Option<OwnDeviceTag> {
+        if self
+            .device_tag_group
+            .as_ref()
+            .is_some_and(|named| named.as_slice() == group.group_id().as_slice())
+        {
+            return None;
+        }
+        if !proposals.iter().any(|proposal| matches!(proposal,
+            Proposal::AppDataUpdate(update) if update.component_id() == DEVICE_ROSTER_COMPONENT_ID
+        )) {
+            return None;
+        }
+        let own_slot = own_device_slot(&self.storage).ok().flatten();
+        if self.own_device_tag_after(group, &[], own_slot).is_some() {
+            return None;
+        }
+        self.own_device_tag_after(group, proposals, own_slot)
+    }
+
     /// The entry to tag this device's leaf in `mls_group` from, when a Commit
     /// carrying `proposals` replaces that leaf and its tag does not read as
     /// this device's; `None` when the leaf keeps its tag or the device cannot
@@ -274,9 +302,36 @@ impl<S: StorageProvider> Engine<S> {
             let own_slot = own_device_slot(&self.storage).ok().flatten();
             self.own_device_tag_after(mls_group, proposals, own_slot)
         } else {
-            self.own_device_tag(&self.storage).ok().flatten()
+            self.first_own_roster_tag(mls_group, proposals)
+                .or_else(|| self.own_device_tag(&self.storage).ok().flatten())
         };
         own.filter(|own| !own.reads_as_own(leaf))
+    }
+
+    /// Whether this device's selected own leaf carries its target-roster tag
+    /// on an actual own Commit path. A Welcome-installed KeyPackage leaf is
+    /// not Made proof, even if another device prefilled its public key.
+    pub fn own_device_tag_commit_landed(
+        &self,
+        group_id: &GroupId,
+        roster: &DeviceRosterV1,
+        slot: &DeviceSlotId,
+    ) -> Result<bool, EngineError> {
+        use tls_codec::Serialize as _;
+        self.ensure_group_live(group_id)?;
+        self.with_mls_group(group_id, |group| {
+            let Some(leaf) = group.own_leaf_node() else {
+                return Ok(false);
+            };
+            if device_tag_claim(leaf, roster) != DeviceTagClaim::Device(*slot) {
+                return Ok(false);
+            }
+            let source = leaf
+                .leaf_node_source()
+                .tls_serialize_detached()
+                .map_err(|_| EngineError::Other("selected own leaf source unavailable".into()))?;
+            Ok(source.first() == Some(&3))
+        })
     }
 
     /// The roster slots of this account's other devices whose leaves `staged`

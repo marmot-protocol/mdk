@@ -1125,6 +1125,28 @@ remains unsettled. A successful no-op never leaves an opposite lost intention to
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
+### Moving this device to another device group
+
+In an experimental device-group build, start the same compared-code linking flow on a device that already trusts a
+device group to move only that device. Keep showing the existing group while `DeviceLinkSnapshotFfi.moves` is
+`WaitingForWelcome` or `Joining`. Joining the destination alone does not switch trust: `Made` requires this device's
+first selected authenticated change there. Its trust then switches once, with ordinary full small-state synchronization
+at unchanged versions. Chats and chat membership stay in place; the move does not promise delivery between the two
+device groups. Released binding builds still provide no working linking entry.
+
+Each move has an opaque `move_id`. `old_siblings` names recognized devices left in the old group; while
+`question_suppressed` is true, offer to link that device here rather than treating its sign-in as unknown.
+`dismiss_device_group_move_sibling(account_ref, move_id, slot_id_hex)` ends only that local recognition hint; it does
+not remove or link a device. A later confirmed link or selected departure ends the hint too. Slots in
+`overridden_rejection_slots` were already devices in the destination, so that destination entry took precedence over
+an old rejection. Moves carry rejected slots with their original ages, never rejected KeyPackages.
+
+`LinkedDeviceStatusFfi::Moved` is the old group's own status for a moving device; its cleanup leaves the device's
+ordinary chats alone. Already admitted old-group traffic may finish through normal delivery rules before local old-group
+storage is forgotten; there is no immediate-quiet deadline or cancellation promise. A move that fails before Made
+forgets only the destination and keeps the old trust. If the facts needed to finish cannot be recovered, show the
+device as unlinked and offer a fresh compared-code link, rather than guessing or restoring an old trust.
+
 ### This device unlinked
 
 When another of the account's devices removes this one with `remove_linked_device`, the account stops on this device

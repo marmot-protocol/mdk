@@ -6480,6 +6480,43 @@ async fn failed_leave_push_compensation_body() {
         .await
         .unwrap();
 
+    // Startup or maintenance may publish before the Leave command runs.
+    // Hold every publication until the departure's real removal row exists,
+    // releasing only earlier work rather than assuming the first send is it.
+    relay.block_next_publishes(usize::MAX);
+    let runtime_for_leave = runtime.clone();
+    let group_id_for_leave = group_id.clone();
+    let mut leave = tokio::spawn(async move {
+        runtime_for_leave
+            .leave_group("alice", &group_id_for_leave)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut blocked_count = 1;
+        loop {
+            tokio::select! {
+                result = &mut leave => {
+                    panic!("Leave ended before its held token removal: {result:?}");
+                }
+                _ = relay.wait_for_blocked_publishes(blocked_count) => {}
+            }
+            if !app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            blocked_count = relay
+                .blocked_publish_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            relay.release_publish();
+        }
+    })
+    .await
+    .expect("the departure must queue its removal while publication is held");
+    // Earlier setup traffic must not count as removal or compensation.
     let before_group_publications = relay
         .published_events
         .lock()
@@ -6487,20 +6524,6 @@ async fn failed_leave_push_compensation_body() {
         .iter()
         .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
         .count();
-    relay.block_next_publish();
-    let runtime_for_leave = runtime.clone();
-    let group_id_for_leave = group_id.clone();
-    let leave = tokio::spawn(async move {
-        runtime_for_leave
-            .leave_group("alice", &group_id_for_leave)
-            .await
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publish(),
-    )
-    .await
-    .unwrap();
     assert_eq!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -6531,6 +6554,7 @@ async fn failed_leave_push_compensation_body() {
     )
     .unwrap();
     db.execute_batch("CREATE TRIGGER reject_native_leave BEFORE INSERT ON openmls_values WHEN NEW.label = CAST('ProposalQueueRefs' AS BLOB) BEGIN SELECT RAISE(FAIL, 'native leave proposal checkpoint held'); END;").unwrap();
+    relay.block_next_publishes(0);
     relay.release_publish();
     let error = leave.await.unwrap().unwrap_err();
     assert!(

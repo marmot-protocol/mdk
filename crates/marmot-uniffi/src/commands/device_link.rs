@@ -1,5 +1,5 @@
 //! Linking a new device of this account: the code both screens show, then
-//! joining the account's device group. Requires an explicitly capable
+//! joining or moving to the answering device's group. Requires an explicitly capable
 //! experimental library and the experimental constructor; normal opens refuse it.
 
 use crate::Marmot;
@@ -10,7 +10,9 @@ use crate::errors::MarmotKitError;
 #[uniffi::export]
 impl Marmot {
     /// On a new device: ask a device of this account already signed in to
-    /// link this one. Show "waiting" until the snapshot's `new_device` shows
+    /// link this one. With existing trust, this moves only this device;
+    /// `snapshot.moves` distinguishes Joining from Made. Show "waiting"
+    /// until the snapshot's `new_device` shows
     /// the code. Refresh on `DeviceLinkChanged`.
     pub async fn start_device_link(
         &self,
@@ -72,6 +74,21 @@ impl Marmot {
         Ok(self
             .runtime
             .decline_device_link(&account_ref, &prompt_id)
+            .await?
+            .into())
+    }
+
+    /// Dismiss one old-sibling recognition hint from `snapshot.moves`.
+    /// Local presentation only; never links or rejects that slot.
+    pub async fn dismiss_device_group_move_sibling(
+        &self,
+        account_ref: String,
+        move_id: String,
+        slot_id_hex: String,
+    ) -> Result<DeviceLinkSnapshotFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .dismiss_device_group_move_sibling(&account_ref, &move_id, &slot_id_hex)
             .await?
             .into())
     }

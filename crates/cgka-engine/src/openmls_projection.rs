@@ -3841,6 +3841,22 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             ) else {
                 return Err(OpenMlsProjectionError::MissingOwnCommitCheckpoint);
             };
+            if retain_replayed_anchors.is_some()
+                && let Some(context) = sibling_context
+            {
+                // The authenticated own commit consumes these exact source
+                // proposals. Derive its existing departure effect before the
+                // checkpoint replaces the source tree/proposal store, just as
+                // a normally staged selected commit does below.
+                let mut consumed = Vec::new();
+                for proposal in mls_group.pending_proposals() {
+                    let proposal_ref = tls_hex(proposal.proposal_reference_ref())?;
+                    if stamp.consumed_proposal_refs.contains(&proposal_ref) {
+                        consumed.push(proposal);
+                    }
+                }
+                self_removed_slots.extend(context.proposal_slots(&mls_group, consumed));
+            }
             if let Some(max_rewind) = retain_replayed_anchors {
                 // Keep applications and referenced proposals replayed at the
                 // source epoch before installing its post-commit checkpoint.
@@ -4167,6 +4183,12 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
+                let roster_before = if retain_replayed_anchors.is_some() {
+                    crate::device_roster_departures::capture(&mls_group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                } else {
+                    None
+                };
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));
                 let additions = group_activity::staged_additions(&staged)?;
@@ -4174,13 +4196,24 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 if retain_replayed_anchors.is_some()
                     && let Some(context) = sibling_context
                 {
-                    self_removed_slots.extend(context.staged_slots(&mls_group, &staged));
+                    self_removed_slots
+                        .extend(context.proposal_slots(&mls_group, staged.queued_proposals()));
                 }
                 mls_group
                     .merge_staged_commit(&provider, *staged)
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                if retain_replayed_anchors.is_some() {
+                    crate::device_roster_departures::record(
+                        storage,
+                        group_id,
+                        roster_before,
+                        &mls_group,
+                        &message.id,
+                    )
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+                }
                 observations.push(OpenMlsReplayObservation::CommitStaged {
                     message_id: message_id.clone(),
                     source_epoch,

@@ -485,7 +485,12 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
     let mut laptop = siblings.remove(0);
     let mut tablet = siblings.remove(0);
     let mut alice = chat_device(b"alice");
-    let gid = found_routed_group(&mut alice, &mut [&mut phone, &mut laptop, &mut tablet]).await;
+    let mut dave = chat_device(b"dave");
+    let gid = found_routed_group(
+        &mut alice,
+        &mut [&mut phone, &mut laptop, &mut tablet, &mut dave],
+    )
+    .await;
     let replacement = handed(&mut laptop, slot(2), slot(1));
     let tablet_replacement = handed(&mut laptop, slot(2), slot(3));
     let key = signature_key(&laptop, &gid);
@@ -530,6 +535,26 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
         .confirm_published(publication.pending)
         .await
         .unwrap();
+    // Dave follows this real SelfRemove branch, then extends it while phone
+    // observes other branches. Its later depth will reselect phone's own C1.
+    dave.engine
+        .ingest(route_to_group(&msg, &gid))
+        .await
+        .unwrap();
+    assert_accepted(&mut dave, &route_to_group(&publication.msg, &gid), &gid).await;
+    let mut departing_branch = Vec::new();
+    for _ in 0..4 {
+        departing_branch.push(
+            send_commit(
+                &mut dave,
+                SendIntent::SelfUpdate {
+                    group_id: gid.clone(),
+                },
+                &gid,
+            )
+            .await,
+        );
+    }
     assert_eq!(
         phone
             .engine
@@ -664,6 +689,39 @@ async fn a_sibling_departure_hold_survives_rewind_until_a_selected_leaf_returns(
             .unwrap(),
         None,
         "a historical anchor must not revive a hold ended by a selected return"
+    );
+
+    // The older own C1 really becomes selected again, now with its deeper
+    // descendants. This is a newly selected authenticated SelfRemove effect,
+    // not permission to restore unrelated holds from its historical record.
+    for commit in departing_branch {
+        phone.engine.ingest(commit).await.unwrap();
+    }
+    clock.advance_ms(1_000_000);
+    phone
+        .engine
+        .converge_stored_openmls_messages_at(
+            &gid,
+            cgka_engine::ConvergenceClock::now(&clock).monotonic_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        phone.engine.epoch(&gid).unwrap(),
+        dave.engine.epoch(&gid).unwrap(),
+        "the deeper own-SelfRemove branch must really be selected"
+    );
+    assert_eq!(
+        load_group(&phone, &gid).epoch_authenticator().as_slice(),
+        load_group(&dave, &gid).epoch_authenticator().as_slice(),
+        "own-C1 reselection must match the follower's selected tree"
+    );
+    assert_eq!(
+        phone
+            .engine
+            .sibling_add_refusal(&gid, &replacement)
+            .unwrap(),
+        Some(SiblingAddRefusal::SiblingLeft),
+        "a reselected own SelfRemove must apply the same sibling-departure effect"
     );
 }
 

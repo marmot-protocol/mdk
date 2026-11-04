@@ -722,8 +722,8 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_remove_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotSendSummary) = remove_members;
 
-    /// Leave the group as the active account. Admins must self-demote
-    /// first. Free with `marmot_send_summary_free`.
+    /// Leave as the active account, including matching linked copies. Core demotes eligible admins; the last admin is refused.
+    /// Failure can retain a recorded Decline or committed demotion. Free with `marmot_send_summary_free`.
     async fn marmot_leave_group(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = leave_group;
 
     /// Delete this group's local app data without an MLS leave. Cancel
@@ -938,8 +938,9 @@ c_cmd! {
     async fn marmot_dismiss_compromise_warning(account_ref: str) -> unit = dismiss_compromise_warning;
 
     /// On a new device: ask a device of this account already signed in to
-    /// link this one. Refused in release builds until the pairing and
-    /// device-group specs land. Re-read on the `DeviceLinkChanged` event.
+    /// link this one, or move this already-linked device to that group.
+    /// Explicit experimental build and runtime gates are required. Re-read
+    /// on the `DeviceLinkChanged` event; inspect `moves` for Joining/Made.
     /// Free with `marmot_device_link_snapshot_free`.
     async fn marmot_start_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = start_device_link;
 
@@ -950,6 +951,10 @@ c_cmd! {
     /// On the new device: cancel the link. Free with
     /// `marmot_device_link_snapshot_free`.
     async fn marmot_cancel_device_link(account_ref: str) -> rec(MarmotDeviceLinkSnapshot) = cancel_device_link;
+
+    /// Dismiss one local old-sibling recognition hint. Free the returned
+    /// snapshot with `marmot_device_link_snapshot_free`.
+    async fn marmot_dismiss_device_group_move_sibling(account_ref: str, move_id: str, slot_id_hex: str) -> rec(MarmotDeviceLinkSnapshot) = dismiss_device_group_move_sibling;
 
     /// On a device already signed in: Link device. `label` is the name the
     /// user gave the new device, at most 64 bytes. Offer both settings on

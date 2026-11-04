@@ -1026,10 +1026,12 @@ impl AppClient {
             return Ok(());
         }
         let gone = writer.is_none_or(|writer| {
-            roster
-                .devices
-                .get(&writer)
-                .is_none_or(|device| device.status == DeviceStatusV1::Leaving)
+            roster.devices.get(&writer).is_none_or(|device| {
+                matches!(
+                    device.status,
+                    DeviceStatusV1::Leaving | DeviceStatusV1::Moved
+                )
+            })
         });
         if gone {
             self.take_over_backups(&group_id, entry).await?;
