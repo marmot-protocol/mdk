@@ -941,6 +941,12 @@ async fn the_runtime_writes_a_due_backup() {
     runtime
         .set_runtime_backup_background_conditions(false, false)
         .unwrap();
+    // A caller arriving after admission closes still joins this held pass.
+    let mut after_false = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut after_false).is_pending());
+    runtime.backup_settings("alice").await.unwrap();
+    assert!(futures::poll!(&mut after_false).is_pending());
+    relay.fail_publishes_of_kind(KIND_BACKUP_POINTER);
     upload.release();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), completion)
@@ -949,6 +955,41 @@ async fn the_runtime_writes_a_due_backup() {
             .unwrap(),
         FinishedAttempt
     );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), after_false)
+            .await
+            .expect("the later caller joins the failed attempt")
+            .unwrap(),
+        FinishedAttempt
+    );
+    assert_eq!(ledger.backup_schedule().unwrap().failed_passes, 1);
+    assert!(pointer_event(&relay, &words.public).is_none());
+    // Retry the retained backup through ordinary due admission. Consume the
+    // eligible report while not due, so the explicit call owns admission.
+    relay.allow_all_publish_kinds();
+    ledger
+        .schedule_backup_pass(BackupSchedule {
+            next_pass_at: ANY_TIME,
+            failed_passes: 0,
+        })
+        .unwrap();
+    runtime
+        .set_runtime_backup_background_conditions(true, true)
+        .unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        NotStarted
+    );
+    ledger
+        .schedule_backup_pass(BackupSchedule::default())
+        .unwrap();
+    assert_eq!(
+        runtime.run_due_backup_pass("alice").await.unwrap(),
+        FinishedAttempt
+    );
+    runtime
+        .set_runtime_backup_background_conditions(false, false)
+        .unwrap();
     let listed = pointer(&relay, &words.public);
     assert_eq!(listed.len(), 1);
     assert_eq!(
@@ -1023,13 +1064,16 @@ async fn the_runtime_writes_a_due_backup() {
         .unwrap();
     let mut stopped_upload = blossom.hold_upload();
     runtime
-        .set_runtime_backup_background_conditions(true, true)
-        .unwrap();
-    let mut stopped_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
-    assert!(futures::poll!(&mut stopped_waiter).is_pending());
-    tokio::time::timeout(Duration::from_secs(10), stopped_upload.entered())
+        .set_backup_background_conditions("alice", true, true)
         .await
         .unwrap();
+    // Only the platform report precedes this real upload: the due-pass call
+    // below must join, rather than supplying an alternate admission path.
+    tokio::time::timeout(Duration::from_secs(10), stopped_upload.entered())
+        .await
+        .expect("eligible compatibility reports wake the existing worker");
+    let mut stopped_waiter = Box::pin(runtime.run_due_backup_pass("alice"));
+    assert!(futures::poll!(&mut stopped_waiter).is_pending());
     runtime.backup_settings("alice").await.unwrap();
     assert!(futures::poll!(&mut stopped_waiter).is_pending());
     runtime.shutdown().await;

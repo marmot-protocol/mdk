@@ -554,6 +554,7 @@ when either fact changes. Background writer work requires both facts. Same-runti
 a new runtime starts closed. Already admitted passes finish and settle after false, while later work waits.
 The account-shaped `set_backup_background_conditions` remains a compatibility wrapper: it validates an active,
 signable, fully onboarded account before updating the same runtime-wide facts, without starting a worker.
+External-signing accounts may report before the host registers its signer; signed worker work still requires that signer.
 
 An OS background task can await `run_due_backup_pass(account_ref)`. It joins a pass already running, or tries existing
 due/writer/backoff/media-credit admission once. `NotStarted` means none was admitted; `FinishedAttempt` means the
