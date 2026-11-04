@@ -1730,6 +1730,7 @@ impl PublishRelayCache {
 struct ScopedPublishRelayLease {
     owner: NostrSdkRelayClient,
     endpoints: Vec<RelayUrl>,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ScopedPublishRelayLease {
@@ -1737,6 +1738,7 @@ impl ScopedPublishRelayLease {
         Self {
             owner,
             endpoints: Vec::new(),
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -1762,7 +1764,12 @@ impl Drop for ScopedPublishRelayLease {
             return;
         }
         let owner = self.owner.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        // Preserve ambient-runtime cleanup, but keep cancellation working when
+        // the host drops this Send publication future outside Tokio.
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.cleanup_runtime.take());
+        if let Some(runtime) = runtime {
             // A dropped batch future is cancellation. Hand cleanup to an
             // independent task so transient write relays do not outlive the
             // cancelled scope.
@@ -12501,6 +12508,141 @@ mod tests {
             Some(&1)
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_cleans_inside_runtime_control() {
+        assert_cancelled_publication_cleans_in_drop_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_cleans_outside_runtime() {
+        assert_cancelled_publication_cleans_in_drop_context(true).await;
+    }
+
+    async fn assert_cancelled_publication_cleans_in_drop_context(outside_runtime: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let event = signed_group_event_dto();
+        let expected_event = serde_json::to_value(&event).unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut received_tx = Some(received_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value[0] == "EVENT" {
+                    assert_eq!(value[1], expected_event);
+                    let wire_event: Event = serde_json::from_value(value[1].clone()).unwrap();
+                    wire_event.verify().unwrap();
+                    if let Some(received_tx) = received_tx.take() {
+                        received_tx.send(()).unwrap();
+                    }
+                    // The real SDK remains waiting for this EVENT's OK.
+                    // The fixture does not initiate socket cleanup.
+                }
+            }
+            assert!(
+                received_tx.is_none(),
+                "socket ended before the actual EVENT"
+            );
+            let _ = closed_tx.send(());
+        });
+
+        let publish_sdk = sdk.clone();
+        let endpoints = vec![endpoint];
+        let mut publication: BoxedFuture<
+            'static,
+            Result<NostrPublishOutcome, TransportAdapterError>,
+        > = Box::pin(async move {
+            NostrRelayClient::publish_event(&publish_sdk, &endpoints, &event, 1).await
+        });
+        tokio::select! {
+            result = publication.as_mut() => {
+                panic!("publication completed before the wire receipt: {result:?}");
+            }
+            receipt = timeout(Duration::from_secs(3), received_rx) => {
+                receipt.expect("relay must receive the actual signed EVENT").unwrap();
+            }
+        }
+        assert!(
+            futures::poll!(publication.as_mut()).is_pending(),
+            "the EVENT has no ACK, so the public future must still be pending"
+        );
+        let relay = sdk
+            .client()
+            .relay(relay_url.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert!(relay.capabilities().can_write());
+        assert!(!relay.capabilities().can_read());
+        assert!(relay.subscriptions().await.is_empty());
+        assert_eq!(sdk.relay_health().await.total_relays, 1);
+        drop(relay);
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+
+        if outside_runtime {
+            std::thread::spawn(move || {
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                drop(publication);
+            })
+            .join()
+            .expect("the supported Send future must be droppable on the host thread");
+        } else {
+            drop(publication);
+        }
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+
+        let mut socket_closed_before_shutdown = false;
+        let cleanup = timeout(Duration::from_secs(2), async {
+            let pool_removed = async {
+                while sdk
+                    .client()
+                    .relay(relay_url.clone())
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            };
+            let socket_closed = async {
+                (&mut closed_rx)
+                    .await
+                    .expect("the socket observer must remain alive");
+                socket_closed_before_shutdown = true;
+            };
+            tokio::join!(pool_removed, socket_closed);
+        })
+        .await;
+        let registered_before_shutdown = sdk.client().relay(relay_url).await.unwrap().is_some();
+        let health_before_shutdown = sdk.relay_health().await;
+        // Teardown happens after all observations, including on a failing candidate.
+        sdk.shutdown().await;
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("explicit local teardown must close the fixture socket")
+            .unwrap();
+        assert!(
+            cleanup.is_ok() && !registered_before_shutdown && socket_closed_before_shutdown,
+            "cancelling the pending public publication must remove its transient pool relay and close its socket; outside_runtime={outside_runtime} registered_before_shutdown={registered_before_shutdown} pool_total_before_shutdown={} connected_before_shutdown={} socket_closed_before_shutdown={socket_closed_before_shutdown}",
+            health_before_shutdown.total_relays,
+            health_before_shutdown.connected,
+        );
     }
 
     #[tokio::test]
