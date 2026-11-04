@@ -99,6 +99,11 @@ operations! {
     WorkerAttachmentPass => "worker_attachment_pass",
     WorkerMediaSweep => "worker_media_sweep",
     WorkerUploadPromotion => "worker_upload_promotion",
+    // One full native replay synchronization, by trigger (mdk#2923).
+    ReplaySyncSourcesChanged => "replay_sync_sources_changed",
+    ReplaySyncSourcesChangedPending => "replay_sync_sources_changed_pending",
+    ReplaySyncRetry => "replay_sync_retry",
+    ReplaySyncRetryPending => "replay_sync_retry_pending",
     Ingest => "ingest",
     StorageConnectionWait => "storage_connection_wait",
     StorageTransaction => "storage_transaction",
