@@ -92,14 +92,14 @@ pub(crate) struct SiblingSelfRemovalContext {
 }
 
 impl SiblingSelfRemovalContext {
-    pub(crate) fn staged_slots(
+    pub(crate) fn proposal_slots<'a>(
         &self,
         group: &MlsGroup,
-        staged: &openmls::group::StagedCommit,
+        proposals: impl IntoIterator<Item = &'a openmls::prelude::QueuedProposal>,
     ) -> std::collections::BTreeSet<cgka_traits::app_components::DeviceSlotId> {
         use openmls::prelude::{Proposal, Sender};
-        staged
-            .queued_proposals()
+        proposals
+            .into_iter()
             .filter_map(|proposal| {
                 if !matches!(proposal.proposal(), Proposal::SelfRemove) {
                     return None;

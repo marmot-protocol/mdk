@@ -3841,6 +3841,22 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             ) else {
                 return Err(OpenMlsProjectionError::MissingOwnCommitCheckpoint);
             };
+            if retain_replayed_anchors.is_some()
+                && let Some(context) = sibling_context
+            {
+                // The authenticated own commit consumes these exact source
+                // proposals. Derive its existing departure effect before the
+                // checkpoint replaces the source tree/proposal store, just as
+                // a normally staged selected commit does below.
+                let mut consumed = Vec::new();
+                for proposal in mls_group.pending_proposals() {
+                    let proposal_ref = tls_hex(proposal.proposal_reference_ref())?;
+                    if stamp.consumed_proposal_refs.contains(&proposal_ref) {
+                        consumed.push(proposal);
+                    }
+                }
+                self_removed_slots.extend(context.proposal_slots(&mls_group, consumed));
+            }
             if let Some(max_rewind) = retain_replayed_anchors {
                 // Keep applications and referenced proposals replayed at the
                 // source epoch before installing its post-commit checkpoint.
@@ -4180,7 +4196,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 if retain_replayed_anchors.is_some()
                     && let Some(context) = sibling_context
                 {
-                    self_removed_slots.extend(context.staged_slots(&mls_group, &staged));
+                    self_removed_slots
+                        .extend(context.proposal_slots(&mls_group, staged.queued_proposals()));
                 }
                 mls_group
                     .merge_staged_commit(&provider, *staged)

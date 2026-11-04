@@ -27,6 +27,7 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `private_key_packages.rs` | `PrivateKeyPackageStorage`: one issuer record per private KeyPackage handed to a sibling (mdk#2628 item 3.4b); the key itself stays in the OpenMLS bundle store. |
 | `roster_tag_keys.rs` | `RosterTagKeyStorage`: each tag signature key a device-group roster this device held listed, in a device entry or a `removed` record, by group and slot (mdk#2761). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
 | `sibling_adds.rs` | `SiblingAddStorage`: each sibling slot one of this device's own confirmed Commits added to a group, until the app owes it that group's history (mdk#2628 D76). Outside every snapshot, so a rewind keeps them; group deletion drops them. |
+| `group_recovery.rs` | Bounded authenticated recovery jobs in `cgka_group_rejoin`, including exact outbound artifacts and retry evidence. |
 
 ## Rules
 

@@ -283,6 +283,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authenticated_transport_debug_redacts_credentials() {
+        let username = "synthetic-username-sentinel";
+        let password = "synthetic-password-sentinel";
+        let transport = AuthenticatedTransport {
+            config: Arc::new(ProxyConfig {
+                addr: "127.0.0.1:9050".parse().unwrap(),
+                credentials: credentials(
+                    Zeroizing::new(username.to_owned()),
+                    Zeroizing::new(password.to_owned()),
+                )
+                .unwrap(),
+            }),
+        };
+
+        let rendered = format!("{transport:?}");
+        assert!(rendered.starts_with("AuthenticatedTransport"));
+        assert!(!rendered.contains(username), "username must stay redacted");
+        assert!(!rendered.contains(password), "password must stay redacted");
+    }
+
+    #[test]
     fn credential_byte_limits_and_pairing() {
         let parse = |username: &str, password: &str| {
             credentials(
