@@ -12,7 +12,11 @@
 //! - **Leaving the frontier.** A unit stops holding the frontier once its
 //!   last quantum ended without progress (no progress, unreachable, refused),
 //!   and while its relay cools down or it is broken or retired. What it
-//!   stages later is late input.
+//!   stages later is late input. When no unit serves its group (each has
+//!   left, and none is an active one with nothing left to fetch), the group
+//!   is stranded: each of its units that is not broken holds the frontier
+//!   again, so nothing newer opens ahead of history a source may still
+//!   return. A broken unit's debt is parked, so it holds nothing.
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
@@ -34,6 +38,7 @@
 //!   owe in their capture debt or still awaiting admission inside the capture.
 //!   A unit off the frontier does not fence unfetched debt, but an already
 //!   fetched capture prefix still reaches the engine before newer live input.
+//!   A stranded group's units are back on its frontier, so they fence it.
 //!   Each unit keeps every capture range it still owes
 //!   durably, so the hold comes back after a restart, when the counts are
 //!   gone.
@@ -55,8 +60,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{
-    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnitState, StagedRecoveryEvent,
-    TransportReconciliationRoute,
+    RecoveryCoverageRange, RecoveryStagedUsage, RecoveryUnit, RecoveryUnitState,
+    StagedRecoveryEvent, TransportReconciliationRoute,
 };
 
 use super::policy::RecoveryStagingBounds;
@@ -156,6 +161,13 @@ struct Member {
     key: UnitKey,
     /// The first second it owes after its live tail.
     position: Option<u64>,
+    /// Whether it left the frontier as a failed source.
+    left: bool,
+    /// Whether it serves its group: it has not left, or it is active with
+    /// nothing left to fetch, whatever its last answer was.
+    serves: bool,
+    /// Whether its unit still pursues its debt: it is not broken.
+    pursued: bool,
     on_frontier: bool,
     /// The capture ranges it keeps durably.
     stored: Vec<RecoveryCoverageRange>,
@@ -496,7 +508,10 @@ impl<'t> Admission<'t> {
                 let debt = turn
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
-                let left = self.source_left_frontier(&route.route, relay)?;
+                let unit = turn.app.recovery_unit(&route.route, relay)?;
+                let left = self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left);
+                let state = unit.as_ref().map(|unit| unit.state);
+                let pursued = !matches!(state, Some(RecoveryUnitState::Broken(_)));
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -538,13 +553,31 @@ impl<'t> Admission<'t> {
                 members.push(Member {
                     key,
                     position,
-                    on_frontier: position.is_some() && !left,
+                    left,
+                    serves: !left
+                        || (position.is_none()
+                            && state.is_none_or(|state| state == RecoveryUnitState::Active)),
+                    pursued,
+                    on_frontier: false,
                     stored,
                     fences,
                     first_owed,
                     first_staged,
                 });
             }
+        }
+        // A failed source stops holding up its peers. With no source left to
+        // serve the group, each one still pursuing its debt holds instead:
+        // a frame opened ahead of history a source may still return can put
+        // that history past the ratchet's out-of-order window.
+        let stranded = !members.iter().any(|member| member.serves);
+        for member in &mut members {
+            member.on_frontier = member.position.is_some()
+                && if stranded {
+                    member.pursued
+                } else {
+                    !member.left
+                };
         }
         Ok(Group {
             routes: routes.iter().map(|route| route.route.clone()).collect(),
@@ -560,10 +593,7 @@ impl<'t> Admission<'t> {
         relay: &'t str,
     ) -> StorageResult<bool> {
         let unit = self.turn.app.recovery_unit(route, relay)?;
-        Ok(self.relay_left(relay)?
-            || unit.as_ref().is_some_and(|unit| {
-                unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
-            }))
+        Ok(self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left))
     }
 
     /// Whether this group's already fetched prefix can still be admitted.
@@ -598,6 +628,12 @@ impl<'t> Admission<'t> {
         self.relays_left.insert(relay, left);
         Ok(left)
     }
+}
+
+/// Whether a unit's last quantum ended without progress, or it is broken or
+/// retired.
+fn unit_left(unit: &RecoveryUnit) -> bool {
+    unit.no_progress > 0 || unit.state != RecoveryUnitState::Active
 }
 
 /// Admission order: `(created_at, id)`.

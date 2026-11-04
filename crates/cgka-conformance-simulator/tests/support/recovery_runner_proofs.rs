@@ -71,6 +71,10 @@ const GROUP_QUIET: Duration = Duration::from_secs(15);
 const COUNTED_MESSAGES: usize = 30;
 const FENCE_STALL: Duration = Duration::from_secs(12);
 const FENCE_RELEASE: Duration = Duration::from_secs(30);
+/// Both endpoints stall history in the fence proof, so a nonempty phase's
+/// group is stranded: its live message waits for the runner's next attempt
+/// once history returns, 30 seconds after an unreachable one.
+const STRANDED_RELEASE: Duration = Duration::from_secs(60);
 
 /// The frozen comparison driver sets this only for the signed old-owner
 /// control. Missing runner evidence never selects control behavior by itself:
@@ -2416,8 +2420,8 @@ async fn advance_fence_fixture_cursor(
 
 /// Per-REQ positive and negative controls, with two restarts on the same
 /// account. A nonempty reply may hold newer input while its backlog is
-/// active; a source that leaves the frontier retains truthful debt. Whenever
-/// live input becomes visible its known backlog must already be exact. A
+/// active, also while every source has left the frontier. Whenever live
+/// input becomes visible its known backlog must already be exact. A
 /// genuinely empty packed reply must not hold either group's live input.
 pub(super) async fn fence_control() {
     let report = run_proof("runner-fence-control", async |subject, out| {
@@ -2483,7 +2487,7 @@ pub(super) async fn fence_control() {
             watch_live_until(&bob, &watched, ready, FENCE_STALL, &mut seen, &expected).await?;
             let during = seen.clone();
             for endpoint in 0..2 { subject.stall_relay_history(endpoint, false).await?; }
-            watch_live_until(&bob, &watched, ready, FENCE_RELEASE, &mut seen, &expected).await?;
+            watch_live_until(&bob, &watched, ready, STRANDED_RELEASE, &mut seen, &expected).await?;
             let exact = wait_for("both fence timelines exact", Duration::from_secs(120), async || {
                 Ok(holds_exactly(&bob, &counted, &counted_expected).await?
                     && holds_exactly(&bob, &quiet, &quiet_expected).await?)
@@ -2491,7 +2495,7 @@ pub(super) async fn fence_control() {
             let history = history_since(subject, &clocks).await?;
             let trace = runner_trace::since(trace_from);
             let phase = json!({"nonempty": nonempty, "live_replies": replies,
-                "stall_seconds": FENCE_STALL.as_secs(), "release_bound_seconds": FENCE_RELEASE.as_secs(),
+                "stall_seconds": FENCE_STALL.as_secs(), "release_bound_seconds": STRANDED_RELEASE.as_secs(),
                 "seen_during_stall_seconds": during, "live_visibility_seconds": seen,
                 "known_backlog_exact_at_first_live": seen.len() == 2,
                 "timelines_exact": exact.is_ok(),
@@ -2507,7 +2511,7 @@ pub(super) async fn fence_control() {
                 return Err(format!("fence timelines lost or repeated history: {}", json!({"phases": phases})).into());
             }
             if !nonempty && during.len() != 2 { errors.push("empty REQ held a group's live message"); }
-            if seen.len() != 2 { errors.push("a hold outlived its single replay deadline"); }
+            if seen.len() != 2 { errors.push("a hold outlived its release bound"); }
             if native_pages(&history).iter().any(|pages| *pages > 0) {
                 errors.push("native backward paging supplied the fence proof");
             }
@@ -2518,4 +2522,107 @@ pub(super) async fn fence_control() {
         Ok(json!({"proof": proof}))
     }).await;
     assert_eq!(report["proof"]["phases"].as_array().unwrap().len(), 2);
+}
+
+/// Every relay stalls history while Bob owes a large backlog and its senders
+/// go on talking. With no relay left to serve the group, its live messages
+/// wait: opened ahead of the backlog, they would put most of it past the
+/// ratchet's out-of-order window for good. Once history returns, the whole
+/// backlog shows before any live message, and the timeline is exact.
+pub(super) async fn stranded_history() {
+    const OWED: usize = 1_500;
+    /// Long enough for the runner to find both endpoints unreachable.
+    const BEFORE_LIVE: Duration = Duration::from_secs(30);
+    const LIVE_STALL: Duration = Duration::from_secs(30);
+    /// After history returns: the runner's next attempt, which may wait out
+    /// a first relay cooldown, and the sweep.
+    const RECOVERY: Duration = Duration::from_secs(5 * 60);
+    let report = run_proof("runner-stranded-history", async |subject, out| {
+        let started = Instant::now();
+        let clients = clients();
+        let busy = create(subject, "busy", &clients).await?;
+        let created = Instant::now();
+        settle_maintenance(subject, &clients, std::slice::from_ref(&busy)).await?;
+        tokio::time::sleep(JOIN_ANNOUNCES.saturating_sub(created.elapsed())).await;
+        wait_group_quiet(subject, SETTLEMENT).await?;
+        note(started, "every member announced");
+        subject.set_online("bob", false).await?;
+        let mut expected = payloads(&publish(subject, &busy, "owed-", OWED).await?);
+        wait_lanes_published(subject, &busy, "owed-", OWED, SETTLEMENT).await?;
+        wait_group_quiet(subject, SETTLEMENT).await?;
+        for endpoint in 0..2 {
+            subject.stall_relay_history(endpoint, true).await?;
+        }
+        let clocks = relay_clocks(subject).await?;
+        let trace_from = runner_trace::now_ms();
+        subject.set_online("bob", true).await?;
+        let bob = subject.probe("bob")?;
+        let route = bob.nostr_route(&busy).await?.ok_or("no busy route")?;
+        note(started, "bob online against stalled history");
+        tokio::time::sleep(BEFORE_LIVE).await;
+        let live = SENDERS.map(|sender| format!("live-{sender}"));
+        for (sender, payload) in SENDERS.iter().zip(&live) {
+            send(&subject.probe(sender)?, &busy, payload).await?;
+        }
+        expected.extend(live.iter().cloned());
+        let mut sorted = expected.clone();
+        sorted.sort();
+        let ready = Instant::now();
+        let mut owed_at_unstall = None;
+        // When a live message first showed, and how many owed ones had.
+        let mut first_live = None;
+        let exact_after = loop {
+            let (_, mut chat) = bob.chat_view(&busy, None).await?;
+            let owed = chat.iter().filter(|text| text.starts_with("owed-")).count();
+            if first_live.is_none() && chat.iter().any(|text| live.contains(text)) {
+                first_live = Some((ready.elapsed().as_secs_f64(), owed));
+            }
+            if owed_at_unstall.is_none() && ready.elapsed() >= LIVE_STALL {
+                owed_at_unstall = Some(owed);
+                for endpoint in 0..2 {
+                    subject.stall_relay_history(endpoint, false).await?;
+                }
+                note(started, "history answered again");
+            }
+            chat.sort();
+            if owed_at_unstall.is_some() && chat == sorted {
+                break Some(ready.elapsed().as_secs_f64());
+            }
+            if ready.elapsed() >= LIVE_STALL + RECOVERY {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let trace = runner_trace::since(trace_from);
+        let history = history_since(subject, &clocks).await?;
+        save(out, "runner-trace.json", &trace)?;
+        let labels = BTreeMap::from([(route, "busy".to_owned())]);
+        save(out, "history.json", &labeled(&history, &labels))?;
+        let native = native_pages(&history);
+        let proof = json!({
+            "owed": OWED,
+            "native_paging_requests_per_endpoint": native,
+            "live_stall_seconds": LIVE_STALL.as_secs(),
+            "first_live": first_live.map(|(seconds, owed)| json!({
+                "seconds": seconds,
+                "owed_visible": owed,
+            })),
+            "owed_visible_at_unstall": owed_at_unstall,
+            "exact_after_seconds": exact_after,
+            "timeline": timeline_view(&bob, &busy, &expected).await?,
+            "runner": runner_summary(&trace),
+        });
+        if first_live.is_some_and(|(_, owed)| owed < OWED) {
+            return Err(format!("live input showed ahead of its backlog: {proof}").into());
+        }
+        if exact_after.is_none() {
+            return Err(format!("timeline not exact after history returned: {proof}").into());
+        }
+        if native.iter().any(|pages| *pages > 0) {
+            return Err(format!("native backward paging supplied the proof: {proof}").into());
+        }
+        Ok(json!({"proof": proof}))
+    })
+    .await;
+    assert!(report["proof"]["exact_after_seconds"].is_number());
 }

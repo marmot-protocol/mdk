@@ -881,7 +881,10 @@ routes, go to the recovered-ingest path oldest first by `(created_at, id)`, belo
 admission frontier: the first second, after the live tail, that its furthest-behind required
 relay still owes. A relay leaves the frontier after an answer without progress or an
 unreachable or refused end, and while it cools down or is broken or retired; what it staged
-ahead of the others then goes in as late input. An admission turn ingests four events, one
+ahead of the others then goes in as late input. Once every required relay of a group has left,
+the group is stranded: each relay whose unit is not broken holds the frontier again, so nothing
+newer goes ahead of history a relay may still return. A broken unit's debt is parked, so it holds
+nothing; the group's frames go once its last relay answers again or breaks. An admission turn ingests four events, one
 worker command each, so commands and live input go between them. An event the engine keeps no
 trace of stays staged, and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
@@ -905,7 +908,8 @@ Only capture debt fences live frames: the part `[since, oldest seen]` of a live 
 that its relay's non-empty count left unproven. An empty count's range is cold-start debt,
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
 group's held frames may go below the first second its fencing relays still owe in their
-capture (`live_fences`), and a relay off the frontier fences nothing. Each unit keeps every
+capture (`live_fences`), and a relay off the frontier fences nothing unless its group is
+stranded. Each unit keeps every
 capture range it still owes (migration 0135), up to 8, so the hold survives a restart, which
 forgets the counts. Past 8 the newest are joined into one, which can only fence more.
 Once a capture is covered its fence drops, even while its staged events wait behind another
@@ -931,9 +935,10 @@ relay plane's cursor seal stops at the oldest one its restart floor does not cov
 queue holds it yet. A fresh activation replaces the adapter's replay coverage, but held frames
 have no other copy, so they move to the new coverage, held from the same point until the
 runner's next plan answers; only a frame whose group the new REQs no longer route, or that the
-buffer has no room for, is lost. A fence holds through an account breaker pause too: a live
-frame opened ahead of its sender's owed messages moves that sender's ratchet, and once it is
-more than the out-of-order window (100 generations) past them, no owner can open them.
+buffer has no room for, is lost. A fence holds through an account breaker pause too, and
+while its group is stranded: a live frame opened ahead of its sender's owed messages moves that
+sender's ratchet, and once it is more than the out-of-order window (100 generations) past them,
+no owner can open them.
 
 The inbox (PR 5e) is a route of its own: its units compare the account's gift wraps and are
 never swept, admission takes its events as a group of their own and never fences them, and

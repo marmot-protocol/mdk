@@ -748,3 +748,9 @@ async fn public_app_runner_owns_debt_after_the_upgrade_conversion() {
 async fn public_app_runner_fences_nonempty_reqs_but_not_empty_ones() {
     recovery_runner_proofs::fence_control().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery-runner proof; see APP_PATH_COVERAGE.md"]
+async fn public_app_runner_holds_live_input_while_every_relay_stalls_history() {
+    recovery_runner_proofs::stranded_history().await;
+}

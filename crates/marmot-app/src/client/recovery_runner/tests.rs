@@ -3558,8 +3558,8 @@ async fn recovery_runner_fences_live_frames_below_a_non_empty_count_alone() {
         (&fenced, RELAY)
     );
 
-    // B cannot be reached: it leaves the frontier and stops fencing, but
-    // keeps its capture.
+    // B cannot be reached: it leaves the frontier and, while A still serves
+    // the group, stops fencing, but keeps its capture.
     b.set_reachable(false);
     let second = ran(runner.step().await);
     assert_eq!(
@@ -3577,6 +3577,154 @@ async fn recovery_runner_fences_live_frames_below_a_non_empty_count_alone() {
     assert!(account.debt(&quiet, RELAY, requested - 1).is_empty());
     assert!(account.fences().is_empty());
     assert!(host.fences().await.is_empty());
+}
+
+/// One group on A and B. A's live REQ counted nothing from `since`; B's
+/// oldest event came at `oldest`, so B's capture holds the group's frames
+/// from `since`. Times are minutes before now.
+struct TwoSources {
+    account: Account,
+    clock: Clock,
+    route: Route,
+    a: Arc<ModelRelay>,
+    b: Arc<ModelRelay>,
+    host: Arc<TestHost>,
+    since: u64,
+}
+
+impl TwoSources {
+    fn new() -> Self {
+        let account = account();
+        let clock = Clock::new();
+        let t0 = clock.now();
+        let route = group(1);
+        let floor = t0 - HOUR;
+        let since = t0 - 30 * 60;
+        let oldest = t0 - 25 * 60;
+        let requested = t0 - 20 * 60;
+        let a = ModelRelay::new(RELAY, caps(500, true)).build();
+        let b = ModelRelay::new(OTHER_RELAY, caps(500, true)).build();
+        account.goal(&route, floor);
+        account.live_boundary(&route, RELAY, floor, since - 1);
+        account.live_boundary(&route, OTHER_RELAY, floor, since - 1);
+        account.live_boundary(&route, OTHER_RELAY, oldest + 1, requested - 1);
+        let host = TestHost::new(
+            &account,
+            &clock,
+            vec![required(&route, &[RELAY, OTHER_RELAY])],
+            &[&a, &b],
+        );
+        for relay in [RELAY, OTHER_RELAY] {
+            host.tails.stand(&route, relay, requested);
+        }
+        host.set_counts(
+            [(RELAY, None), (OTHER_RELAY, Some(oldest))]
+                .into_iter()
+                .map(|(relay, oldest_seen)| LiveCount {
+                    routes: vec![route.clone()],
+                    relay: relay.to_owned(),
+                    since,
+                    oldest_seen,
+                })
+                .collect(),
+        );
+        Self {
+            account,
+            clock,
+            route,
+            a,
+            b,
+            host,
+            since,
+        }
+    }
+
+    fn held(&self) -> Vec<(Vec<Route>, u64)> {
+        vec![(vec![self.route.clone()], self.since)]
+    }
+
+    fn answer_without_progress(&self, relay: &str) {
+        self.account
+            .app
+            .settle_recovery_unit(
+                &self.route,
+                relay,
+                Outcome::NoProgress,
+                &test_policy().unit,
+                self.clock.now(),
+            )
+            .unwrap();
+    }
+}
+
+/// A group none of whose sources serves it keeps its fence: opening live
+/// frames ahead of history a source may still return can put that history
+/// past the ratchet's out-of-order window. Only a unit that breaks, parking
+/// its debt, lets the frames go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_keeps_a_stranded_groups_fence_until_its_units_break() {
+    let case = TwoSources::new();
+    let policy = test_policy();
+    let (mut runner, _handle) = runner(&case.host, policy);
+    assert!(matches!(
+        runner.admit(None).await,
+        Ok(Drained { due: None, .. })
+    ));
+    assert_eq!(case.host.fences().await, case.held());
+
+    // Neither relay can be reached. With no source left to serve the group,
+    // B's capture still holds its frames, and the runner still serves it
+    // first.
+    case.a.set_reachable(false);
+    case.b.set_reachable(false);
+    for _ in 0..2 {
+        assert_eq!(ran(runner.step().await).outcome, Outcome::Unreachable);
+    }
+    assert_eq!(case.host.fences().await, case.held());
+    assert_eq!(
+        case.host.survey(policy).await.fenced,
+        BTreeSet::from([case.route.clone()])
+    );
+
+    // A, which still owes, answers without progress and B is still
+    // unreachable: still held.
+    case.answer_without_progress(RELAY);
+    assert_eq!(case.host.fences().await, case.held());
+
+    // B answers without progress until it breaks. Its debt is parked, so
+    // nothing holds the frames any more.
+    for answer in 1..=policy.unit.break_after_no_progress {
+        assert_eq!(
+            case.host.fences().await,
+            case.held(),
+            "released before answer {answer}"
+        );
+        case.answer_without_progress(OTHER_RELAY);
+    }
+    assert!(matches!(
+        case.account.unit(&case.route, OTHER_RELAY).state,
+        RecoveryUnitState::Broken(_)
+    ));
+    assert!(case.host.fences().await.is_empty());
+}
+
+/// A source with nothing left to fetch still serves its group, whatever its
+/// last answer, so a failed peer's capture fences nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_runner_lets_a_failed_source_go_while_a_peer_owes_nothing() {
+    let case = TwoSources::new();
+    let (mut runner, _handle) = runner(&case.host, test_policy());
+    case.b.set_reachable(false);
+    run_until_idle(&mut runner, 10).await;
+    assert!(
+        case.account
+            .debt(&case.route, RELAY, case.since + 10 * 60 - 1)
+            .is_empty()
+    );
+    assert!(case.host.fences().await.is_empty());
+
+    case.answer_without_progress(RELAY);
+    assert!(case.host.fences().await.is_empty());
 }
 
 /// Two generations of one relay's live REQ, each with a non-empty count, and

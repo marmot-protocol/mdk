@@ -201,9 +201,16 @@ also records packed live group REQs through EOSE, including raw counts, so the f
   group. Her commit is Bob's newest group event. Bob may park it until that group is stable, so the journey waits for
   the forensic cursor advance and for his live REQs on both endpoints to drop the group's route. Bob's own EOSE wire
   replies for the two groups must then contain zero stored events. During the
-  12-second history stall, any visible live message must already have its complete known backlog. Unreachable
-  sources keep their debt when they leave the active frontier, so a fixed stall is not a backlog hold. Both live
-  messages must arrive during the empty phase, within 30 seconds overall, with exact timelines.
+  12-second history stall, any visible live message must already have its complete known backlog. Both endpoints
+  stall, so in the first phase the group is stranded and its live message waits for the runner's next attempt once
+  history returns, 30 seconds after an unreachable one. Both live messages must arrive during the empty phase, within
+  60 seconds overall, with exact timelines.
+- `public_app_runner_holds_live_input_while_every_relay_stalls_history` owes Bob 1,500 events from three senders and
+  stalls history on both endpoints as he comes back. Thirty seconds later each sender sends one live message, and
+  history stays stalled for thirty more. With no endpoint left to serve the group, its live messages must wait: the
+  whole backlog must show before any of them, and the timeline must be exact within five minutes of history
+  returning. Before stranded groups held, the live messages showed at once and 1,000 owed messages fell past the
+  ratchet's out-of-order window for good.
 
 Each run writes `report.json`, `history.json` (bob's history requests, routes by label) and the runner's
 `runner-trace.json` under `MDK_APP_JOURNEY_ARTIFACTS`, and reports give the recovery status as counts, without ids.
