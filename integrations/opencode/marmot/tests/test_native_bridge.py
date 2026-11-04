@@ -28,12 +28,14 @@ class FakeServer:
     partial = False
     idle = False
     question = False
+    large_history = False
     instances = []
     def __init__(self, binary):
         self.release = threading.Event()
         self.messages = []
         self.posts = []
         self.reads = 0
+        self.history_reads = 0
         self.initial_timeout = "unset"
         self.closed = False
         self.instances.append(self)
@@ -61,6 +63,16 @@ class FakeServer:
             self.messages.append({'info': {'id':'msg_answer','role':'assistant','parentID':parent,'time':{'completed':1},'finish':'stop'},'parts':[{'type':'reasoning','text':'PRIVATE_REASONING','time':{'end':1}},{'type':'text','text':'ANSWER','time':{'end':1}}]})
             return self.messages[-1]
         self.reads+=1
+        if '/message?' in path:
+            self.history_reads += 1
+            if self.large_history:
+                raise ValueError('Response too large: previous attachment batches')
+        if '/message/' in path:
+            mid = path.rsplit('/', 1)[-1]
+            message = next((m for m in self.messages if m['info']['id'] == mid), None)
+            if self.partial and self.reads < 3 and message:
+                return {'info': message['info'], 'parts': []}
+            return message
         if self.partial and self.reads<3 and self.messages:
             return [{'info':self.messages[0]['info'],'parts':[]}]
         return list(self.messages)
@@ -69,7 +81,7 @@ class FakeServer:
         self.release.set()
 
 class NativeTests(unittest.TestCase):
-    def exercise(self, race=False, ambiguous=False, permission=False, partial=False, idle=False, question=False, failure=False):
+    def exercise(self, race=False, ambiguous=False, permission=False, partial=False, idle=False, question=False, failure=False, large_history=False):
         stdin = Input()
         stdin.put({'bin':'fixture','prompt':'FIRST','files':[]})
         stdin.put({'type':'steer','id':7,'prompt':'FOLLOWUP','files':[]})
@@ -77,6 +89,7 @@ class NativeTests(unittest.TestCase):
         def emit(kind, **fields):
             events.append(dict(type=kind, **fields))
             if kind=='finishing':stdin.put({'type':'finish'})
+        FakeServer.large_history=large_history
         FakeServer.race=race;FakeServer.ambiguous=ambiguous;FakeServer.permission=permission;FakeServer.partial=partial;FakeServer.idle=idle;FakeServer.question=question
         with patch.object(bridge,'Server',FakeServer), patch.object(bridge.sys,'stdin',stdin),patch.object(bridge,'emit',emit):
             if race or ambiguous or failure:
@@ -95,6 +108,9 @@ class NativeTests(unittest.TestCase):
         server, events=self.exercise(ambiguous=True)
         self.assertEqual(len(server.posts),2)
         self.assertEqual([e['persisted'] for e in events if e['type']=='ack'],[False])
+        ack = next(i for i, e in enumerate(events) if e['type'] == 'ack')
+        stopping = next(i for i, e in enumerate(events) if e['type'] == 'stopping')
+        self.assertLess(ack, stopping, 'An attempted POST must stay uncertain before unsent controls are released')
         self.assertFalse(any(e['type']=='text' for e in events))
     def test_late_append_cannot_report_old_answer_as_success(self):
         server,events=self.exercise(race=True)
@@ -130,6 +146,14 @@ class NativeTests(unittest.TestCase):
         self.assertGreaterEqual(server.reads,3)
         self.assertEqual([e['text'] for e in events if e['type']=='text'],['ANSWER'])
         self.assertEqual(len(server.posts),1)
+    def test_resumed_turn_avoids_history_pages_with_previous_large_batches(self):
+        # A history page containing two admitted batches exceeds one response
+        # budget. Run the real turn route against that HTTP failure boundary.
+        server, events = self.exercise(large_history=True)
+        self.assertEqual([e['text'] for e in events if e['type'] == 'text'], ['ANSWER'])
+        self.assertEqual(server.history_reads, 0)
+        self.assertTrue(any(e['type'] == 'stopping' for e in events))
+
     def test_message_ids_sort_in_generation_order(self):
         values=[bridge.message_id() for _ in range(200)]
         self.assertEqual(values,sorted(values))
@@ -171,14 +195,13 @@ class NativeTests(unittest.TestCase):
         expected = [{'type': 'text', 'text': 'prompt'},
                     {'filename': 'image.png', 'url': 'file:///image.png'}]
         for method, path, body, result in [
-            ('GET', '/session/ses_fixture/message?limit=10', None, [message]),
+            ('GET', '/session/ses_fixture/message/msg_media', None, message),
             ('POST', '/session/ses_fixture/message', {'noReply': True}, message),
         ]:
             with self.subTest(method=method):
                 response = io.BytesIO(bridge.json.dumps(result).encode())
                 server.http.open.return_value = response
                 observed = server.call(method, path, body)
-                if method == 'GET': observed = observed[0]
                 self.assertTrue(bridge.persisted_message(observed, 'msg_media', 'prompt', expected))
 
     def test_http_budget_still_rejects_oversized_responses_without_retry(self):

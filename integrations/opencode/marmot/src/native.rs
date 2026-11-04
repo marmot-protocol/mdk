@@ -200,6 +200,16 @@ impl Active {
                 }
                 Ok(ParsedEvent::Ignored)
             }
+            Some("stopping") => {
+                let mut state = self.state.lock().unwrap();
+                state.closed = true;
+                // An attempted POST is acknowledged (including uncertainty)
+                // before this terminal event. Remaining inputs were never sent.
+                for (_, waiter) in state.pending.drain() {
+                    let _ = waiter.send(SteerOutcome::Unavailable);
+                }
+                Ok(ParsedEvent::Ignored)
+            }
             Some("text") => Ok(ParsedEvent::Text(value["text"].as_str().ok_or(())?.into())),
             Some("error") => Ok(ParsedEvent::Error {
                 session_id: None,
@@ -271,6 +281,36 @@ mod tests {
             SteerOutcome::Unavailable
         );
         assert!(native.active("second"));
+    }
+
+    #[tokio::test]
+    async fn stopping_queues_only_unsubmitted_followups_and_keeps_uncertain_ack() {
+        let native = Arc::new(Native::default());
+        let (input, mut receive) = mpsc::channel(8);
+        let registration = native.register(Some("room".into()), input);
+        let worker = native.clone();
+        let submitted =
+            tokio::spawn(async move { worker.steer("room", "submitted", vec![], None).await });
+        let request: Value = serde_json::from_str(&receive.recv().await.unwrap().unwrap()).unwrap();
+        registration
+            .active
+            .observe(&json!({"type":"ack","id":request["id"],"persisted":false}).to_string())
+            .unwrap();
+        assert_eq!(submitted.await.unwrap(), SteerOutcome::Uncertain);
+        let worker = native.clone();
+        let unsent =
+            tokio::spawn(async move { worker.steer("room", "not-read", vec![], None).await });
+        receive.recv().await.unwrap();
+        registration
+            .active
+            .observe(r#"{"type":"stopping"}"#)
+            .unwrap();
+        assert!(!native.active("room"));
+        assert_eq!(unsent.await.unwrap(), SteerOutcome::Unavailable);
+        assert_eq!(
+            native.steer("room", "later", vec![], None).await,
+            SteerOutcome::Unavailable
+        );
     }
 
     #[tokio::test]
