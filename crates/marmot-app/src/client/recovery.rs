@@ -900,11 +900,13 @@ impl AppClient {
             .runtime_telemetry
             .as_ref()
             .map(|telemetry| telemetry.observe(reason));
+        // Until the pass takes its own snapshot, the generation seen here is
+        // the best record, so a pass cancelled before then still counts.
+        self.recovery_owner.replay_observed_generation = Some(generation);
         let result = self.synchronize_native_replay_sources().await;
-        // The adapter may have moved on while this ran; judge, and remember,
-        // the generation it holds now.
+        // The adapter may have moved on while this ran; the pass succeeded if
+        // the generation it holds now is authorized.
         let current = self.adapter.replay_admission().await.generation();
-        self.recovery_owner.replay_observed_generation = Some(current);
         if let Some(span) = span {
             span.finish(match &result {
                 Err(_) => marmot_observability::Outcome::Failure,
@@ -922,6 +924,10 @@ impl AppClient {
         let adapter = self.adapter.clone();
         let observation = adapter.replay_admission().await;
         let generation = observation.generation();
+        // The generation this pass synchronizes: the next full pass for a
+        // later one counts as a source change, even if the adapter moves on
+        // before this pass finishes (mdk#2923 telemetry).
+        self.recovery_owner.replay_observed_generation = Some(generation);
         if self.recovery_owner.native_replay_authorizes(generation) {
             return Ok(());
         }
@@ -1017,6 +1023,11 @@ impl AppClient {
             }
         }
         drop(observation);
+        #[cfg(test)]
+        if let Some((reached, release)) = self.test_replay_sync_gate.take() {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
@@ -2654,6 +2665,60 @@ mod tests {
             (retries + 1, retry_successes + 1),
             "an authorized generation records nothing"
         );
+    }
+
+    /// A pass records the generation it synchronized, not one the adapter
+    /// moved to while it ran: the first full pass for the later generation
+    /// still counts as a source change (mdk#2923).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_generation_change_during_a_pass_counts_as_a_source_change() {
+        use crate::RuntimePerformanceOperation as Op;
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        client.runtime_telemetry = Some(telemetry.clone());
+        let changed = || {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == Op::ReplaySyncSourcesChanged)
+                .unwrap()
+                .completed
+        };
+        client.prepare_transport().await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        let first = client.adapter.replay_admission().await.generation();
+        assert!(client.recovery_owner.native_replay_authorizes(first));
+
+        // A full pass on the first generation, which the adapter leaves for
+        // the second while the pass is paused after its snapshot.
+        client.recovery_owner.replay_generation = Some(first.wrapping_sub(1));
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        client.test_replay_sync_gate = Some((reached_tx, release_rx));
+        let adapter = client.adapter.clone();
+        let (pass, ()) = tokio::join!(client.synchronize_native_replay(), async move {
+            reached.await.unwrap();
+            adapter.change_replay_sources_for_test().await;
+            release.send(()).unwrap();
+        });
+        pass.unwrap();
+        let second = client.adapter.replay_admission().await.generation();
+        assert_ne!(second, first, "the adapter moved on during the pass");
+        assert_eq!(
+            client.recovery_owner.replay_observed_generation,
+            Some(first)
+        );
+
+        let before = changed();
+        client.synchronize_native_replay().await.unwrap();
+        assert_eq!(changed(), before + 1, "the second generation's first pass");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -770,6 +770,13 @@ pub(super) struct EpochGapWindow {
 }
 
 pub struct AppClient {
+    /// Pauses the next full native replay pass after its generation snapshot:
+    /// signals the first sender, then waits for the second.
+    #[cfg(test)]
+    pub(crate) test_replay_sync_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,

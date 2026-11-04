@@ -6766,6 +6766,13 @@ impl AppClient {
             && pending_frontiers == 0
             && created_group_id_hex.is_none()
             && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
+            // A saved cursor beyond the allowed future skew (the clock moved
+            // back) still needs the save that clamps it.
+            && self.saved_transport_timestamp.is_none_or(|cursor| {
+                cursor
+                    <= unix_now_seconds()
+                        .saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs())
+            })
             && self.transport_receipts()?.pending_seen_events().is_empty()
         {
             self.flush_live_v5_events();

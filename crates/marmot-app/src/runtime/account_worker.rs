@@ -2254,7 +2254,12 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                         )
                         .await;
+                        let step = shared
+                            .observer
+                            .performance()
+                            .observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
                         dispatch_history_blobs(&mut client, &media_http);
+                        step.finish(TelemetryOutcome::Success);
                     }
                     ComparisonRecoveryOrigin::PostConvergence {
                         audit_tracker_update,
@@ -3505,6 +3510,11 @@ async fn run_app_runtime_account_worker(
                     }
                     PendingRecoveryJob::Settled(result) => result,
                 };
+                let selection = if backfill_result.is_ok() {
+                    TelemetryOutcome::Success
+                } else {
+                    TelemetryOutcome::Failure
+                };
                 let _ = report_pending_epoch_backfill_result(
                     &mut client,
                     backfill_result, backfill_armed,
@@ -3516,7 +3526,7 @@ async fn run_app_runtime_account_worker(
                         shared: &shared,
                     },
                 ).await;
-                step.finish(TelemetryOutcome::Success);
+                step.finish(selection);
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
                     &events,

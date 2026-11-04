@@ -12415,8 +12415,8 @@ async fn register_external_signer_requires_matching_external_account() {
 }
 
 /// A checkpoint with nothing pending writes nothing and leaves the chat list
-/// warm; a moved transport cursor or a pending frontier clear still writes
-/// (mdk#2923).
+/// warm; a moved transport cursor, a pending frontier clear or a cursor
+/// beyond the future skew still writes (mdk#2923).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -12454,6 +12454,14 @@ async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
         .insert("aa".repeat(32), 1);
     assert!(saves(&mut client), "a pending frontier clear is persisted");
     assert!(!saves(&mut client), "and cleared by that save");
+
+    // The clock moved back: a saved cursor beyond the allowed future skew
+    // still needs the save that clamps it, however often it repeats.
+    let future = Some(crate::unix_now_seconds() + 3_600);
+    client.checkpointed_transport_timestamp = future;
+    client.saved_transport_timestamp = future;
+    assert!(saves(&mut client), "a future cursor is clamped");
+    assert!(saves(&mut client), "on every save until it is in range");
 }
 
 #[test]
