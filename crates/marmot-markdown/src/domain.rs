@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use crate::{Inline, LinkDestinationKind};
+use crate::{Inline, LinkDestinationKind, classify_link_destination};
 
 const ROOTS: &str = include_str!("iana-tlds.txt");
 static ROOT_LABELS: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -53,16 +53,19 @@ pub(crate) fn scan(raw: &str, start: usize) -> (Option<(Inline, usize)>, usize) 
     let attempted_end = end;
     end = crate::inline::trim_trailing_punct(raw.as_bytes(), start, end);
     let text = &raw[start..end];
-    let inferred = infer(text).map(|dest| {
-        (
-            Inline::Link {
-                dest,
-                title: None,
-                children: vec![Inline::Text(text.to_owned())],
-                classification: LinkDestinationKind::Web,
-            },
-            end,
-        )
+    let inferred = infer(text).and_then(|dest| {
+        let classification = classify_link_destination(&dest);
+        (classification == LinkDestinationKind::Web).then(|| {
+            (
+                Inline::Link {
+                    dest,
+                    title: None,
+                    children: vec![Inline::Text(text.to_owned())],
+                    classification,
+                },
+                end,
+            )
+        })
     });
     (inferred, attempted_end)
 }
@@ -70,7 +73,7 @@ pub(crate) fn scan(raw: &str, start: usize) -> (Option<(Inline, usize)>, usize) 
 fn infer(text: &str) -> Option<String> {
     // Never silently drop or interpret controls/formatting as part of a host or
     // target. In particular UTS46 maps some default-ignorables away.
-    if text.chars().any(unsafe_character) {
+    if text.contains('\\') || text.chars().any(unsafe_character) {
         return None;
     }
     let authority_end = text.find(['/', '?', '#']).unwrap_or(text.len());
@@ -137,4 +140,31 @@ fn unsafe_character(c: char) -> bool {
             0x2060..=0x206f | 0x3164 | 0xfe00..=0xfe0f | 0xfeff | 0xffa0 |
             0xfff0..=0xfff8 | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a |
             0xe0000..=0xe0fff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ROOTS;
+
+    #[test]
+    fn embedded_root_snapshot_satisfies_lookup_invariants() {
+        let mut lines = ROOTS.lines();
+        let header = lines.next().expect("root data needs provenance");
+        assert!(header.starts_with("# Version ") && header.contains("Last Updated"));
+        let roots: Vec<_> = lines.collect();
+        assert!(!roots.is_empty());
+        assert!(
+            roots.windows(2).all(|pair| pair[0] < pair[1]),
+            "binary lookup requires sorted unique roots"
+        );
+        for root in roots {
+            assert!((1..=63).contains(&root.len()));
+            assert!(root.as_bytes()[0].is_ascii_uppercase());
+            assert!(root.as_bytes()[root.len() - 1].is_ascii_alphanumeric());
+            assert!(
+                root.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+            );
+        }
+    }
 }

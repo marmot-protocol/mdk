@@ -136,6 +136,8 @@ Bare domains with a delegated IANA root become `Inline::Link` nodes: the label
 preserves the source spelling and `dest` contains an HTTPS URL with an IDNA-validated
 ASCII host. Root recognition is an offline display heuristic, not evidence that a
 site exists or is safe. Explicit Markdown links, code and escapes take precedence.
+As with scheme-qualified autolinks, entities and math syntax inside an inferred
+URL suffix remain literal URL data. A token containing a backslash is not inferred.
 
 Bare `.pdf`, `.md`, `.zip`, `.mov`, `.py`, `.rs`, `.sh`, `.pl`, `.java` and `.so`
 names remain text, case-insensitively, even when the ending is a delegated root. This applies to bare inference only: an explicit

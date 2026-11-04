@@ -562,3 +562,38 @@ fn schemeless_domain_rejects_whole_overlong_tokens_without_suffix_rescue() {
         assert_eq!(parse_inlines(&source), vec![t(&source)]);
     }
 }
+
+#[test]
+fn schemeless_domain_backslashes_preserve_markdown_escape_precedence() {
+    for suffix in ["/", "?q=", "#"] {
+        for escaped in ['`', '[', ']', '<', '>', '\"', '\\', '\''] {
+            let source = format!("example.chat{suffix}\\{escaped}x");
+            let expected = format!("example.chat{suffix}{escaped}x");
+            assert_eq!(parse_inlines(&source), vec![t(&expected)], "{source:?}");
+        }
+    }
+    assert_eq!(
+        parse_inlines(r"example.chat/\`x`"),
+        vec![t("example.chat/`x`")]
+    );
+    assert_eq!(
+        parse_inlines(r"example.chat/\[x](https://other.example)"),
+        vec![t("example.chat/[x]("), uri("https://other.example"), t(")")]
+    );
+    assert_eq!(
+        parse_inlines(r"[example.chat/\](https://other.example)"),
+        vec![t("[example.chat/]("), uri("https://other.example"), t(")")]
+    );
+}
+
+#[test]
+fn schemeless_domain_url_suffixes_keep_entities_and_math_literal() {
+    for source in ["example.chat/?a=1&amp;b=2", "example.chat/$x$"] {
+        assert_eq!(
+            parse_inlines(source),
+            vec![domain_link(source, &format!("https://{source}"))]
+        );
+        let qualified = format!("https://{source}");
+        assert_eq!(parse_inlines(&qualified), vec![uri(&qualified)]);
+    }
+}

@@ -10,7 +10,9 @@ from pathlib import Path
 
 def validated(data):
     text = data.decode("ascii")
-    lines = text.splitlines()
+    if any(ord(c) < 32 and c != "\n" for c in text):
+        raise ValueError("root snapshot permits LF line endings only")
+    lines = text.removesuffix("\n").split("\n")
     if not lines or not re.fullmatch(r"# Version \d+, Last Updated .+ UTC", lines[0]):
         raise ValueError("missing IANA version/date header")
     roots = lines[1:]
