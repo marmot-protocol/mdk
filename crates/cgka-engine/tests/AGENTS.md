@@ -414,19 +414,16 @@ Engine-behavior assertions need an `Engine<S>` and a storage backend, so they li
 transitions, diff helpers, policy ordering, codecs, caches) uses in-crate `#[cfg(test)]` modules; `src/` has many, and
 `src/openmls_projection/tests/` and `src/message_processor/tests/` hold `--lib` replay and measurement tests.
 
-`account_devices/device_tag.rs::accepted_device_group_application_commit_and_proposal_retain_their_exact_source`
-owns native accepted source proof for direct application/standalone Proposal and selected Commit replay. It proves
-buffering/probes do not observe, source epoch/leaf/current-roster attribution, and rewrapped duplicate immutability.
-The scalar order, delayed partial-proof attribution, deadline and file restart/snapshot contracts belong to SQLite's
-`cross::sibling_welcome_resends` temporal owner; app orchestration remains in its existing lost-Welcome owner.
+D100 heartbeat timing, current incarnation, unknown legacy time, immutable carrier generations and restart are owned
+by SQLite's `cross::sibling_welcome_resends` tests. App orchestration's real heartbeat/lost-Welcome owner proves
+unchanged private stock and chat epoch, retained bytes and actual target join. Generic tag/source-epoch and native
+admission owners remain independent of repair; D90 source-proof/alias/recovery-only tests retire with that machinery.
 
 `account_devices/device_tag.rs::device_group_proposal_profile_read_failure_keeps_native_receive_retryable`
 owns rollback on a real proposal-admission profile read failure: file-backed SQL trigger, independent group/MLS reads,
-wrapper/source absence and exact retry. Propagate storage errors inside native acceptance; only actual policy
+wrapper absence and exact retry. Propagate storage errors inside native acceptance; only actual policy
 `InvalidTransition` remains the outer terminal rejection path.
 
-`account_devices/device_tag.rs::partial_device_group_source_recovery_pages_past_unavailable_history` owns fair bounded
-source recovery past a genuinely admitted unavailable-history prefix, preserving pending facts and selected state.
 `account_devices/sibling_welcomes.rs::sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire` owns
 terminal expiry before metadata retirement, exact late-outcome handling and clock-rollback re-registration rejection.
 The existing participation owner also proves rearm audit events follow outer commit/savepoint rollback discipline.

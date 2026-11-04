@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- Experimental sibling-Welcome repair uses current-incarnation D35 heartbeats (D100). Remove
+  `SqliteAppStorage::due_sibling_welcome_resends`, `qualify_sibling_welcome_activity` and
+  `ignore_sibling_welcome_activity`; use `sibling_welcome_resend_is_due(welcome_id, linked_at)` for heartbeat
+  eligibility. `sibling_welcome_resend_batch` returns `(welcome_id, carrier)` pairs instead of Welcome ids.
+  Rust callers must update and rebuild. Migration 0174 retires D90/D91 observation indexes and local ordering
+  clock, preserving processed-wrapper dedup, known publication times and carrier high-water; unused nullable
+  legacy columns remain inert.
+
 - A peer's reaction settles a send whose publish was judged to have reached
   no one (mdk#1291). `TimelineMessageRecord` adds `recipient_confirmed`:
   true for a failed own row with no relay acceptance that another account

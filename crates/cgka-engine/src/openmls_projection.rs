@@ -1361,7 +1361,6 @@ pub(crate) fn process_current_openmls_application<S: StorageProvider>(
     group_id: &GroupId,
     message: &TransportMessage,
     profile_policy: ReplayProfilePolicy,
-    clock: &dyn cgka_traits::WallClock,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     let projection = project_mls_message(&message.payload)?;
     if projection.kind != OpenMlsContentKind::Application {
@@ -1377,7 +1376,6 @@ pub(crate) fn process_current_openmls_application<S: StorageProvider>(
         profile_policy,
         Some(ReplayAcceptance {
             retain_anchors: None,
-            clock,
             sibling_context: None,
             known_departures: None,
         }),
@@ -2693,7 +2691,6 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
         result,
         max_retained_anchor_rewind,
         ReplayProfilePolicy::default(),
-        &crate::engine::SystemWallClock,
         None,
     )
     .map(|output| output.observations)
@@ -2707,7 +2704,6 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
     profile_policy: ReplayProfilePolicy,
-    clock: &dyn cgka_traits::WallClock,
     sibling_context: Option<&crate::membership_effects::SiblingSelfRemovalContext>,
 ) -> Result<OpenMlsApplyOutput, OpenMlsProjectionError> {
     let current_record = storage.get_group(group_id)?;
@@ -2774,7 +2770,6 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             &own_commits,
             ReplayAcceptance {
                 retain_anchors: Some(max_retained_anchor_rewind),
-                clock,
                 sibling_context,
                 known_departures: Some(&current_record.self_removed_sibling_slots),
             },
@@ -3133,7 +3128,6 @@ fn oldest_retained_epoch(retained_epoch: u64, max_retained_anchor_rewind: u64) -
 #[derive(Clone, Copy)]
 struct ReplayAcceptance<'a> {
     retain_anchors: Option<u64>,
-    clock: &'a dyn cgka_traits::WallClock,
     sibling_context: Option<&'a crate::membership_effects::SiblingSelfRemovalContext>,
     known_departures: Option<&'a BTreeSet<cgka_traits::app_components::DeviceSlotId>>,
 }
@@ -3979,12 +3973,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
-        let mut source = if accepted.is_some() {
-            crate::device_tag::authenticated_source(&mls_group, &processed, &message.id)
-                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
-        } else {
-            None
-        };
         let sender_leaf_index = match processed.sender() {
             Sender::Member(index) => Some(*index),
             _ => None,
@@ -4007,18 +3995,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         message_id,
                         category: rejection.category,
                     });
-                }
-                if let (Some(source), Some(accepted)) = (source.as_mut(), accepted) {
-                    crate::device_tag::bind_proposal_source_identity(
-                        source,
-                        queued.proposal_reference_ref().as_slice(),
-                    );
-                    storage.observe_authenticated_device_group_source(
-                        group_id,
-                        &message.id,
-                        source,
-                        accepted.clock.now_ms(),
-                    )?;
                 }
                 let proposal_ref = tls_hex(queued.proposal_reference_ref())?;
                 mls_group
@@ -4207,14 +4183,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
-                if let (Some(source), Some(accepted)) = (source.as_ref(), accepted) {
-                    storage.observe_authenticated_device_group_source(
-                        group_id,
-                        &message.id,
-                        source,
-                        accepted.clock.now_ms(),
-                    )?;
-                }
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));
                 let additions = group_activity::staged_additions(&staged)?;
@@ -4290,15 +4258,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();
-                if let (Some(source), Some(accepted)) = (source.as_mut(), accepted) {
-                    crate::device_tag::bind_application_source_identity(source, &payload);
-                    storage.observe_authenticated_device_group_source(
-                        group_id,
-                        &message.id,
-                        source,
-                        accepted.clock.now_ms(),
-                    )?;
-                }
                 // Mirror the direct ingest seam (audit item S3): an
                 // application message whose authenticated source-epoch sender
                 // does not resolve to a validated member id is never surfaced,

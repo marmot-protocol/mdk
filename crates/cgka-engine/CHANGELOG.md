@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Retire D90/D91 device-group source-observation/proof recovery and its unused Engine APIs; sibling-Welcome origin, current tagged participation, expiry and immutable-carrier guards remain (D100).
+
 - Separate explicit dev device-roster advertisement capability from policy-test timing overrides.
 
 ### Fixed

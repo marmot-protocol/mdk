@@ -241,12 +241,10 @@ pub enum FanoutPendingKind {
     Disband,
 }
 
-/// A locally ordered, durable observation. Order is scoped to one account-device
-/// store; wall time measures the wait, while order distinguishes replay and
-/// observations made in the same millisecond or across clock adjustments.
+/// The sender's immutable local time of a carrier's first actual accepted
+/// publication. Legacy accepted fanouts with no retained time stay unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationObservation {
-    pub order: u64,
     pub at_ms: u64,
 }
 
@@ -482,7 +480,7 @@ impl OutboundFanout {
         &mut self,
         observation: PublicationObservation,
     ) -> Result<(), TransportAdapterError> {
-        if self.outcome().accepted_targets == 0 || observation.order == 0 {
+        if self.outcome().accepted_targets == 0 {
             return Err(TransportAdapterError::Other(
                 "invalid publication observation".into(),
             ));

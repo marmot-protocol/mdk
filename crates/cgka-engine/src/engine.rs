@@ -246,8 +246,6 @@ pub struct Engine<S: StorageProvider> {
 
     pub(crate) events_buf: VecDeque<GroupEvent>,
     pub(crate) authority_recovery_cursor: Option<MessageId>,
-    pub(crate) device_group_source_recovery:
-        std::sync::Mutex<crate::device_tag::SourceRecoveryProgress>,
     pub(crate) authority_recovery_attempts: HashMap<MessageId, [u8; 32]>,
     pub(crate) authority_recovery_seen: HashSet<MessageId>,
     pub(crate) auto_publish_buf: VecDeque<AutoPublish>,
@@ -719,7 +717,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             authority_recovery_cursor: None,
-            device_group_source_recovery: std::sync::Mutex::default(),
             authority_recovery_attempts: HashMap::new(),
             authority_recovery_seen: HashSet::new(),
             auto_publish_buf: VecDeque::new(),

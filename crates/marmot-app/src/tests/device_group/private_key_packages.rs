@@ -2083,45 +2083,28 @@ async fn founding_and_initial_welcome_wait_for_the_senders_own_tag() {
             .all(|welcome| welcome.carrier.is_none())
     );
     devices.laptop.set_device_tag_key().await.unwrap();
-    // A damaged optional activity fact must not suppress this INITIAL send.
-    // Real DG selected-state/tag/hold reads above remain independently required.
-    let source_store = account_database(&devices.laptop_app);
-    let damaged = source_store.query_row(
-        "SELECT id, source_proof, source_resolved FROM cgka_processed_transport_ids WHERE source_has_leaf=1 LIMIT 1",
-        [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)),
-    ).unwrap();
-    source_store.execute("UPDATE cgka_processed_transport_ids SET source_proof=x'ff', source_resolved=0 WHERE id=?1", [&damaged.0]).unwrap();
-    let projection_error = devices
-        .laptop
-        .observe_pending_sibling_welcome_activity()
-        .unwrap_err();
-    assert!(
-        matches!(
-            projection_error.as_engine_error(),
-            Some(cgka_traits::EngineError::Storage(
-                cgka_traits::StorageError::Serialization(_)
-            ))
-        ) || matches!(
-            projection_error,
-            crate::AppError::Storage(cgka_traits::StorageError::Serialization(_))
-        ),
-        "must reach the corrupt optional proof: {projection_error:?}"
-    );
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
-    source_store.execute("UPDATE cgka_processed_transport_ids SET source_proof=?2, source_resolved=?3 WHERE id=?1", rusqlite::params![damaged.0, damaged.1, damaged.2]).unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
     devices.phone.join_stashed_sibling_welcomes().await;
     assert!(devices.phone.state_group_record(&chat).is_some());
 }
 
-/// The target's real trusted-DG traffic arms repair even though the lost
-/// Welcome's Add already installed its tag. Once due, orchestration sends the
-/// retained Welcome through a new 461 without a new Add or private KeyPackage.
+/// A current-tag heartbeat ten minutes after actual carrier acceptance repairs
+/// the lost Welcome. Arbitrary DG traffic does not; repair spends no new stock
+/// or Add, and the target joins from the identical retained Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_device_group_activity()
- {
+async fn a_lost_published_sibling_welcome_is_repaired_after_a_later_heartbeat() {
     use cgka_traits::message::{MessageState, StoredMessagePayload};
-    use cgka_traits::storage::MessageStorage as _;
+    use cgka_traits::storage::{MessageStorage as _, RosterTagKeyStorage as _};
+    struct EarlierClock(u64);
+    impl marmot_session::WallClock for EarlierClock {
+        fn now(&self) -> Timestamp {
+            Timestamp(self.0)
+        }
+        fn now_ms(&self) -> u64 {
+            self.0 * 1_000
+        }
+    }
     let (mut devices, device_group, [chat]) = tagging_devices_with_chats::<1>().await;
     let phone_slot = slot(&devices.phone);
     devices
@@ -2130,25 +2113,24 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         .await
         .unwrap();
     deliver_all(&mut devices.laptop, &devices.relay).await;
-    assert!(
-        !roster(&devices.laptop, &device_group).devices[&phone_slot]
-            .settings
-            .add_to_all_chats
-    );
     add_the_phone_unpublished(&mut devices, &chat).await;
-    let original_owed = owed(&devices.laptop).remove(0);
-    // A delayed first publication carries a legitimately older rumor, but
-    // activity/timing must begin after durable publication, not created_at.
+    let original = owed(&devices.laptop).remove(0);
+    let earlier = crate::unix_now_seconds() - 601;
+    devices.laptop.runtime = devices.laptop.runtime.with_maintenance_sources(
+        Arc::new(EarlierClock(earlier)),
+        Arc::new(marmot_session::SystemMonotonicClock::default()),
+        Arc::new(marmot_session::OsMaintenanceRandom),
+    );
     let event = devices
         .laptop
         .device_group_event(
             KIND_SIBLING_WELCOME,
-            base64::engine::general_purpose::STANDARD.encode(&original_owed.content),
+            base64::engine::general_purpose::STANDARD.encode(&original.content),
         )
         .unwrap();
     let event = cgka_traits::MarmotAppEvent::new(
         event.pubkey,
-        event.created_at.saturating_sub(601),
+        earlier,
         event.kind,
         event.tags,
         event.content,
@@ -2158,11 +2140,11 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         .laptop
         .runtime
         .reserve_sibling_welcome_carrier(
-            &original_owed.id,
+            &original.id,
             &device_group,
             &phone_slot,
             &carrier,
-            event.created_at,
+            earlier,
         )
         .unwrap();
     devices
@@ -2170,46 +2152,15 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         .send_device_group_event(&device_group, event)
         .await
         .unwrap();
-    let store = group_storage(&devices.laptop);
-    let originals: Vec<_> = store
-        .list_messages_in_states(&chat, &[MessageState::Processed], cgka_traits::EpochId(0))
-        .unwrap()
-        .into_iter()
-        .filter_map(
-            |record| match StoredMessagePayload::decode(&record.payload).unwrap() {
-                StoredMessagePayload::OutboundSiblingWelcome { welcome, .. } => {
-                    Some((record.id, welcome))
-                }
-                _ => None,
-            },
-        )
-        .collect();
-    let [(welcome_id, original)] = &originals[..] else {
-        panic!("one delivered retained Welcome");
-    };
-    let storage = devices_storage(&devices.laptop);
-    let now = crate::client::recovery::wall_now_ms().unwrap();
-    assert!(
-        storage
-            .due_sibling_welcome_resends(now + 600_000)
-            .unwrap()
-            .is_empty(),
-        "old link/stock activity does not arm repair"
+    devices.laptop.runtime = devices.laptop.runtime.with_maintenance_sources(
+        Arc::new(marmot_session::SystemWallClock),
+        Arc::new(marmot_session::SystemMonotonicClock::default()),
+        Arc::new(marmot_session::OsMaintenanceRandom),
     );
     assert!(
         devices.phone.state_group_record(&chat).is_none(),
-        "the published Welcome has been lost to the target"
+        "the accepted Welcome was lost to its target"
     );
-    devices
-        .phone
-        .send_device_group_message(&device_group, 49_999, "any authenticated traffic".into())
-        .await
-        .unwrap();
-    deliver_all(&mut devices.laptop, &devices.relay).await;
-    let [(due, _)] = &storage.due_sibling_welcome_resends(now + 601_000).unwrap()[..] else {
-        panic!("first authenticated target activity arms one timer");
-    };
-    assert_eq!(due.as_slice(), welcome_id.as_slice());
     let epoch = devices.laptop.runtime.group_record(&chat).unwrap().epoch;
     let stock = received_from(&devices.laptop, &phone_slot);
     let before = devices.relay.published_events.lock().unwrap().len();
@@ -2217,103 +2168,63 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
     assert_eq!(
         devices.relay.published_events.lock().unwrap().len(),
         before,
-        "not before its fixed wait"
+        "roster/link/stock are not heartbeat evidence"
     );
-    // The storage owner proves 600-second timing. Advance only the produced
-    // due schedule here to isolate orchestration without a real wall-clock wait.
-    account_database(&devices.laptop_app)
-        .execute(
-            "UPDATE sibling_welcome_resends SET due_at_ms = 0
-         WHERE welcome_id = ?1",
-            rusqlite::params![welcome_id.as_slice()],
+    devices
+        .phone
+        .send_device_group_message(
+            &device_group,
+            49_999,
+            "ordinary authenticated traffic".into(),
         )
+        .await
         .unwrap();
-    let connection = account_database(&devices.laptop_app);
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_reservation BEFORE UPDATE OF prepared_carrier
-        ON sibling_welcome_resends BEGIN SELECT RAISE(ABORT, 'injected reservation failure'); END;",
-        )
-        .unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let before = devices.relay.published_events.lock().unwrap().len();
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     assert_eq!(
         devices.relay.published_events.lock().unwrap().len(),
         before,
-        "failed durable reservation must expose no new carrier"
+        "ordinary DG activity cannot qualify"
     );
-    assert!(matches!(
-        StoredMessagePayload::decode(&store.get_message(welcome_id).unwrap().payload).unwrap(),
-        StoredMessagePayload::OutboundSiblingWelcome { carrier: None, .. }
-    ));
-    connection
-        .execute_batch("DROP TRIGGER fail_reservation")
+    devices
+        .phone
+        .send_device_group_message(
+            &device_group,
+            crate::client::device_group::KIND_DEVICE_HEARTBEAT,
+            "{}".into(),
+        )
+        .await
         .unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let before = devices.relay.published_events.lock().unwrap().len();
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     assert_eq!(
         group_messages_since(&devices.relay, before),
         1,
-        "repair creates one carrier and no new Add"
+        "a real later heartbeat repairs the lost Welcome now"
     );
+    let repaired_events = devices.relay.published_events.lock().unwrap()[before..].to_vec();
     assert_eq!(
         devices.laptop.runtime.group_record(&chat).unwrap().epoch,
         epoch
     );
     assert_eq!(received_from(&devices.laptop, &phone_slot), stock);
-    let record = store.get_message(welcome_id).unwrap();
+    let store = group_storage(&devices.laptop);
+    let record = store.get_message(&original.id).unwrap();
     assert_eq!(record.state, MessageState::Processed);
     assert!(
-        matches!(StoredMessagePayload::decode(&record.payload).unwrap(),
-        StoredMessagePayload::OutboundSiblingWelcome { welcome, .. } if &welcome == original)
+        matches!(StoredMessagePayload::decode(&record.payload).unwrap(), StoredMessagePayload::OutboundSiblingWelcome { welcome, .. } if welcome == original.content)
     );
-    assert!(
-        storage
-            .due_sibling_welcome_resends(now + 2_000_000)
-            .unwrap()
-            .is_empty(),
-        "a successful generation needs fresh activity"
-    );
-    devices
-        .phone
-        .runtime
-        .send(SendIntent::SelfUpdate {
-            group_id: device_group.clone(),
-        })
-        .await
-        .unwrap();
-    deliver_all(&mut devices.laptop, &devices.relay).await;
-    assert_eq!(
-        storage
-            .due_sibling_welcome_resends(crate::client::recovery::wall_now_ms().unwrap() + 600_001)
-            .unwrap()
-            .len(),
-        1,
-        "a real target Commit with no app message arms the next successful generation"
-    );
-    devices
-        .phone
-        .runtime
-        .edit_device_roster_entry(&device_group, &phone_slot, &[], |entry| {
-            entry.status = cgka_traits::app_components::DeviceStatusV1::Leaving;
-        })
-        .await
-        .unwrap();
-    deliver_all(&mut devices.laptop, &devices.relay).await;
-    account_database(&devices.laptop_app)
-        .execute(
-            "UPDATE sibling_welcome_resends SET due_at_ms = 0 WHERE welcome_id = ?1",
-            rusqlite::params![welcome_id.as_slice()],
-        )
-        .unwrap();
-    let before_leaving = devices.relay.published_events.lock().unwrap().len();
+    let before = devices.relay.published_events.lock().unwrap().len();
     devices.laptop.send_owed_sibling_welcomes(&[]).await;
     assert_eq!(
         devices.relay.published_events.lock().unwrap().len(),
-        before_leaving,
-        "Leaving cannot start another carrier"
+        before,
+        "the newly accepted carrier needs a later heartbeat"
     );
-    // A real accepted roster can omit a slot without a removal record. If
-    // its remembered keys aged out, that absence is not authoritative gone.
-    // The key-retention owner covers the clock; age only its produced rows.
+    // Absence without remembered keys is not proven removal. Exercise the
+    // App's evidence gate; native status/key eligibility is owned separately.
     use cgka_traits::app_components::{
         AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceRosterOperationV1,
         DeviceRosterUpdateV1, encode_device_roster_update_v1,
@@ -2353,57 +2264,54 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
             .has_pending_convergence_inputs(&device_group)
             .unwrap()
     );
-    let key_cutoff = crate::unix_now_seconds()
-        .saturating_sub(cgka_traits::storage::ROSTER_TAG_KEY_RETENTION_SECS);
     assert!(
-        cgka_traits::storage::RosterTagKeyStorage::roster_tag_keys(
-            &store,
-            &device_group,
-            key_cutoff,
-        )
-        .unwrap()
-        .iter()
-        .any(|key| key.slot == phone_slot),
-        "the actual roster supplied remembered device keys"
+        store
+            .roster_tag_keys(&device_group, 0)
+            .unwrap()
+            .iter()
+            .any(|key| key.slot == phone_slot)
     );
-    connection
-        .execute(
-            "UPDATE cgka_roster_tag_keys SET last_seen_at=0 WHERE group_id=?1 AND slot=?2",
-            rusqlite::params![device_group.as_slice(), phone_slot.as_slice()],
+    // Inject missing local evidence through its real storage owner. This
+    // deliberately prunes unexpired produced keys: an evidence-loss fault,
+    // not normal retention/expiry proof. No source identity or key is invented.
+    store
+        .prune_roster_tag_keys(
+            crate::unix_now_seconds().saturating_add(1),
+            cgka_traits::storage::ROSTER_TAG_KEYS_PER_SLOT,
         )
         .unwrap();
     assert!(
-        cgka_traits::storage::RosterTagKeyStorage::roster_tag_keys(
-            &store,
-            &device_group,
-            crate::unix_now_seconds()
-                .saturating_sub(cgka_traits::storage::ROSTER_TAG_KEY_RETENTION_SECS),
-        )
-        .unwrap()
-        .iter()
-        .all(|key| key.slot != phone_slot)
-    );
-    let before_unknown = devices.relay.published_events.lock().unwrap().len();
-    devices.laptop.send_owed_sibling_welcomes(&[]).await;
-    assert_eq!(
-        store.get_message(welcome_id).unwrap().state,
-        MessageState::Processed,
-        "unproven roster absence must not retire the retained Welcome"
-    );
-    assert_eq!(
-        devices.relay.published_events.lock().unwrap().len(),
-        before_unknown
-    );
-    assert_eq!(
-        storage
-            .due_sibling_welcome_resends(now + 2_000_000)
+        store
+            .roster_tag_keys(&device_group, 0)
             .unwrap()
-            .len(),
-        1,
-        "unproven absence retains its original due obligation"
+            .iter()
+            .all(|key| key.slot != phone_slot)
     );
-    // Restore this non-user state byte-for-byte, including its user marker.
-    // A real accepted roster sighting refreshes the remembered key again.
+    let storage = store.app_storage();
+    let retained = storage.sibling_welcome_resend_batch(None, 32).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].0, original.id.as_slice());
+    let before_unknown = devices.relay.published_events.lock().unwrap().len();
+    // One retained row needs at most two turns to cross the prior keyset
+    // continuation boundary and visit it. Neither turn may retire or send it.
+    for _ in 0..2 {
+        devices.laptop.send_owed_sibling_welcomes(&[]).await;
+        assert_eq!(
+            devices.relay.published_events.lock().unwrap().len(),
+            before_unknown
+        );
+        assert_eq!(
+            store.get_message(&original.id).unwrap().state,
+            MessageState::Processed,
+            "unproven absence must not retire the retained Welcome"
+        );
+        assert_eq!(
+            storage.sibling_welcome_resend_batch(None, 32).unwrap(),
+            retained,
+            "unproven absence preserves the original carrier and repair obligation"
+        );
+    }
+    // Restore the actual entry, including its user marker, through a Commit.
     devices
         .laptop
         .runtime
@@ -2412,40 +2320,70 @@ async fn a_lost_published_sibling_welcome_is_repaired_after_new_authenticated_de
         )))
         .await
         .unwrap();
-    assert_eq!(
-        store.get_message(welcome_id).unwrap().state,
-        MessageState::Processed,
-        "explicit removal starts with live retained repair debt"
+    assert!(
+        roster(&devices.laptop, &device_group)
+            .devices
+            .contains_key(&phone_slot)
+    );
+    assert!(
+        store
+            .roster_tag_keys(&device_group, 0)
+            .unwrap()
+            .iter()
+            .any(|key| key.slot == phone_slot)
     );
     assert_eq!(
-        storage
-            .due_sibling_welcome_resends(now + 2_000_000)
-            .unwrap()
-            .len(),
-        1
+        stashed(&devices.phone),
+        0,
+        "the lost initial carrier was never delivered"
+    );
+    deliver_events(&mut devices.phone, &repaired_events).await;
+    devices.phone.join_stashed_sibling_welcomes().await;
+    assert!(
+        devices.phone.state_group_record(&chat).is_some(),
+        "the repaired Welcome actually joins its target"
+    );
+    assert_eq!(
+        store.get_message(&original.id).unwrap().state,
+        MessageState::Processed
     );
     devices
         .laptop
         .remove_linked_device(&hex::encode(phone_slot))
         .await
         .unwrap();
+    let removed_roster = roster(&devices.laptop, &device_group);
+    assert!(!removed_roster.devices.contains_key(&phone_slot));
+    assert_eq!(
+        removed_roster.rejected_slots[&phone_slot].reason,
+        cgka_traits::app_components::RejectedSlotReasonV1::Removed
+    );
     let before_gone = devices.relay.published_events.lock().unwrap().len();
-    devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    for _ in 0..2 {
+        if storage
+            .sibling_welcome_resend_batch(None, 32)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        devices.laptop.send_owed_sibling_welcomes(&[]).await;
+    }
     assert_eq!(
         devices.relay.published_events.lock().unwrap().len(),
         before_gone,
-        "gone target cannot start another carrier"
+        "proven removal cannot publish a replacement carrier"
     );
     assert_eq!(
-        store.get_message(welcome_id).unwrap().state,
-        MessageState::Failed,
-        "proven removal permanently retires the previously live Welcome"
+        store.get_message(&original.id).unwrap().state,
+        MessageState::Failed
     );
     assert!(
         storage
-            .due_sibling_welcome_resends(now + 2_000_000)
+            .sibling_welcome_resend_batch(None, 32)
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "proven removal retires App timing metadata without waiting for another heartbeat"
     );
 }
 

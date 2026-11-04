@@ -2178,7 +2178,8 @@ async fn a_founding_sibling_expiring_at_engine_admission_is_omitted() {
 /// the matching target's real MLS Update or Commit suppresses later repair.
 #[tokio::test]
 async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds_tag() {
-    use cgka_engine::SiblingWelcomeResendOutcome::{Complete, Rearmed};
+    use cgka_engine::SiblingWelcomeResendOutcome::{Complete, Held, Rearmed};
+    use cgka_traits::app_components::{DeviceRosterOperationV1, DeviceStatusV1};
     for target_uses_update_proposal in [false, true] {
         let (mut phone, mut siblings, device_group) = tagged_devices(b"bob", 2).await;
         let mut laptop = siblings.remove(0);
@@ -2197,6 +2198,40 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
             .engine
             .sibling_welcome_delivered(&original.id, b"first")
             .unwrap();
+        let original_entry = roster.devices[&slot(2)].clone();
+        let mut leaving = original_entry.clone();
+        leaving.status = DeviceStatusV1::Leaving;
+        let mut untagged = original_entry.clone();
+        untagged.tag_signature_key = None;
+        for entry in [leaving, untagged] {
+            let update = super::device_roster::roster_update(
+                &device_group,
+                vec![DeviceRosterOperationV1::SetDevice(slot(2), entry.clone())],
+            );
+            send_commit(&mut phone, update, &device_group).await;
+            let current_roster = super::device_roster::roster_of(&phone, &device_group);
+            assert_eq!(current_roster.devices[&slot(2)], entry);
+            let before = phone.storage.get_message(&original.id).unwrap();
+            assert_eq!(
+                phone
+                    .engine
+                    .rearm_sibling_welcome(&original.id, b"first", Timestamp(NOW), &current_roster)
+                    .unwrap(),
+                Held,
+                "an ineligible current target must not rearm: {:?}",
+                entry.status
+            );
+            assert_eq!(phone.storage.get_message(&original.id).unwrap(), before);
+        }
+        let restore = super::device_roster::roster_update(
+            &device_group,
+            vec![DeviceRosterOperationV1::SetDevice(slot(2), original_entry)],
+        );
+        send_commit(&mut phone, restore, &device_group).await;
+        assert_eq!(
+            super::device_roster::roster_of(&phone, &device_group),
+            roster
+        );
         // Another tagged device participates. Account-wide or any-device
         // Update/Commit evidence would incorrectly suppress this repair.
         let tablet_update = send_commit(
@@ -2378,6 +2413,24 @@ async fn delivered_sibling_welcome_repair_uses_target_participation_not_the_adds
             "update_proposal={target_uses_update_proposal}"
         );
         assert!(owed(&phone).is_empty());
+        let remove = super::device_roster::roster_update(
+            &device_group,
+            vec![DeviceRosterOperationV1::RemoveDevice(slot(2))],
+        );
+        send_commit(&mut phone, remove, &device_group).await;
+        let absent_roster = super::device_roster::roster_of(&phone, &device_group);
+        assert!(!absent_roster.devices.contains_key(&slot(2)));
+        assert_eq!(
+            phone
+                .engine
+                .rearm_sibling_welcome(&original.id, b"second", Timestamp(NOW), &absent_roster)
+                .unwrap(),
+            Complete
+        );
+        assert_eq!(
+            phone.storage.get_message(&original.id).unwrap().state,
+            MessageState::Failed
+        );
     }
 }
 
@@ -2430,11 +2483,13 @@ async fn sibling_welcome_expiry_is_terminal_before_timing_and_highwater_retire()
             .unwrap()
     );
     assert!(
-        storage
+        !storage
             .app_storage()
-            .due_sibling_welcome_resends(u64::MAX / 2)
-            .unwrap()
-            .is_empty(),
+            .sibling_welcome_resend_is_due(
+                original.id.as_slice(),
+                roster.devices[&slot(2)].linked_at
+            )
+            .unwrap(),
         "not armed: retirement must not rely only on due rows"
     );
     assert!(

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Simplify experimental sibling-Welcome repair to existing current-incarnation heartbeat activity at least ten minutes after actual carrier acceptance (D100). Unknown publication time holds repair; cadence/skew remain best effort. Remove per-message activity proof/alias recovery work.
+
 - Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
 
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
@@ -133,13 +135,14 @@
   This development transition requires custom post-link settings writers to rotate the user-edit marker;
   earlier draft writers must update before using the feature. No mixed-draft preservation guarantee is added.
 
-- A published sibling Welcome lost before joining is repaired after the
-  target's first newly observed authenticated device-group message and a
-  fixed ten-minute wait (mdk#2628 D70/D89–91). Repair reuses its exact Welcome
-  and private KeyPackage, creates no Add or history offer, and stops on
-  matching device participation, expiry or terminal origin. Each successful
-  generation needs fresh activity; legacy unknown timing stays held. Only
-  behind `dev_device_groups`.
+- A published sibling Welcome lost before joining is eligible for best-effort
+  repair once the target's heartbeat-based last activity for its current roster
+  incarnation is at least 600 seconds after the latest carrier's first accepted
+  publication (mdk#2628 D70/D89/D100). An unknown publication time prevents repair.
+  Repair reuses its exact Welcome and private KeyPackage, creates no Add or
+  history offer, and stops on matching device participation, expiry or terminal
+  origin. Each newly accepted carrier requires a sufficiently later heartbeat.
+  Only behind `dev_device_groups`.
 
 - Experimental device groups synchronize invitation decisions for one validated admission generation and its
   inherited sibling Adds (mdk#2628 D96). Legacy unidentified invites remain local-only. Higher version/equal decline

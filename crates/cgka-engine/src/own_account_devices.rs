@@ -720,8 +720,8 @@ impl<S: StorageProvider> Engine<S> {
         Ok(SiblingWelcomeResendOutcome::Rearmed)
     }
 
-    /// Whether retained repair metadata has ended, even before activity arms
-    /// its deadline. Expiry becomes terminal in the engine row before callers
+    /// Whether retained repair metadata has ended, even before a heartbeat
+    /// qualifies repair. Expiry becomes terminal in the engine row before callers
     /// drop the carrier high-water, so clock rollback cannot make it owed again.
     /// This does not cancel already-handed-off transport fanout settlement.
     pub fn sibling_welcome_resend_has_ended(

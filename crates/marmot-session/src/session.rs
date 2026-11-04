@@ -1042,28 +1042,6 @@ impl AccountDeviceSession {
             .member_device_tag_claim(group_id, epoch, leaf_index, roster)?)
     }
 
-    /// Recover immutable accepted source proof without changing its first observation.
-    pub fn recover_pending_device_group_sources(&self, group_id: &GroupId) -> SessionResult<()> {
-        Ok(self.engine.recover_pending_device_group_sources(group_id)?)
-    }
-
-    /// Attribute accepted native DG sources under the current trusted roster.
-    pub fn pending_device_group_activity(
-        &self,
-        group_id: &GroupId,
-        roster: &DeviceRosterV1,
-    ) -> SessionResult<
-        Vec<(
-            MessageId,
-            EpochId,
-            Option<cgka_traits::app_components::DeviceSlotId>,
-        )>,
-    > {
-        Ok(self
-            .engine
-            .pending_device_group_activity(group_id, roster)?)
-    }
-
     /// See [`cgka_engine::engine::Engine::member_device_tag_claim_at`].
     pub fn member_device_tag_claim_at(
         &self,
