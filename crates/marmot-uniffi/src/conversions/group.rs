@@ -376,17 +376,14 @@ pub struct GroupManagementStateFfi {
     pub is_self_admin: bool,
     pub is_last_admin: bool,
     pub can_invite: bool,
-    /// Whether a Leave action would do anything: the local account is a member,
-    /// is not an admin, and has no leave already in flight.
-    ///
-    /// When this is `false`, the reason is one of
-    /// `requires_self_demote_before_leave` (demote first) or
-    /// `leave_request_pending` (already leaving), or `disbanding` / terminal
-    /// `lifecycle_state` (ordinary group actions are unavailable) — or the
-    /// account is not a member at all. Check those before reporting an error.
+    /// Whether to offer Leave in the selected state. Core demotes an eligible
+    /// nonlast admin account before departure; hosts need no prior self-demotion.
+    /// False for the last admin, a pending Leave or invitation, inactive
+    /// membership, or a disbanding/disbanded/unrecoverable group. The command
+    /// rechecks current policy and membership before acting.
     pub can_leave: bool,
-    /// Whether an admin must self-demote before leaving. Disbanding and a
-    /// terminal lifecycle take precedence and keep this false.
+    /// Compatibility field, always false: core performs any eligible account
+    /// demotion during User Leave. A last admin still has `can_leave == false`.
     pub requires_self_demote_before_leave: bool,
     /// A leave is already in flight for this group; `Marmot::leave_group` would
     /// return `MarmotKitError::LeaveAlreadyRequested`. Render progress rather

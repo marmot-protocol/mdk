@@ -722,8 +722,8 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_remove_members(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr) -> rec(MarmotSendSummary) = remove_members;
 
-    /// Leave the group as the active account. Admins must self-demote
-    /// first. Free with `marmot_send_summary_free`.
+    /// Leave as the active account. Core demotes an eligible nonlast admin
+    /// before departure; the last admin is refused. Free with `marmot_send_summary_free`.
     async fn marmot_leave_group(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = leave_group;
 
     /// Delete this group's local app data without an MLS leave. Cancel
