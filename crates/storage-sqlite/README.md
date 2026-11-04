@@ -448,6 +448,8 @@ Detached history results carry their preparation's trust row only in memory and 
 owed revision or received delivery remain current. No persistent history journal is introduced.
 
 Custom `DeviceGroupWelcomeStorage` providers retain the default exact expectation consumption but must adopt the
-transactional admission hook to provide move bookkeeping; the default does not promise move recovery. The hook runs
-only on an actual validated expected DeviceRoster Welcome. Ordinary message receive adds no move query. The native
+transactional admission hook to provide move bookkeeping; the default does not promise move recovery. Updated
+providers must also preserve `Group.device_roster_departures` through group writes and snapshots. Legacy stored groups
+decode with an empty field, without inventing past departure causes; Rust struct-literal constructors need the new
+field. The hook runs only on an actual validated expected DeviceRoster Welcome. Ordinary message receive adds no move query. The native
 Group snapshot adds selected roster-departure metadata only for roster groups; ordinary groups keep the empty default.
