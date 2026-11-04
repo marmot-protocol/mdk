@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The coverage-ledger recovery runner now owns account history by default (mdk#2660 phase 4). Restart and
+  reconnect gaps, post-join history and unresolved epoch gaps are fetched as bounded, paced runner work; the native
+  backward pagers no longer run. A stalled or failing relay is retried on a backoff instead of being re-paged, so
+  recovery stays fast and bounded when one relay is unhealthy. Newer live messages in a group wait until that
+  group's fetched backlog is admitted, so history appears in order; an empty reply holds nothing. Held live
+  messages carry over when joining a group restarts the subscription, and nothing is held while the account's hourly
+  recovery budget pauses the runner: those messages arrive at once and their history stays owed.
+  `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
+
 - Add separate default-off `dev-device-groups` capability for dev CLI dogfooding without policy timing overrides; explicit runtime intent remains required.
 
 - Add account-worker backup background condition reports: Wi-Fi and charging are both required before preparing
