@@ -600,6 +600,9 @@ mod runner_trace {
             // Opt-in logs for the in-process subject, for example
             // `MDK_PROOF_TRACE=marmot_app::recovery_runner=debug`. Other
             // participants run in their own processes and are not traced.
+            // The filter is taken as given: a broad one such as `debug` also
+            // prints dependencies' records, which may name the loopback
+            // relays and keys of this run.
             let logs = std::env::var("MDK_PROOF_TRACE").ok().map(|filter| {
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)

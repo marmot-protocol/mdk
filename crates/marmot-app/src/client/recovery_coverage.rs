@@ -633,9 +633,23 @@ impl AppClient {
 
     /// Account-local ownership is installed before even staging native input.
     /// The adapter rejects a late first switch; repeat setup is idempotent.
-    pub(crate) async fn prepare_runner_ownership(&self) -> Result<(), AppError> {
+    pub(crate) async fn prepare_runner_ownership(&mut self) -> Result<(), AppError> {
         if !self.app.recovery_runner_owns_debt() {
             return Ok(());
+        }
+        let prepared = self.prepare_runner_ownership_once().await;
+        // Owed until a preparation succeeds: only then may the worker start
+        // a runner it lacks, whatever else the refresh still owes.
+        self.runner_preparation_owed = prepared.is_err();
+        prepared
+    }
+
+    async fn prepare_runner_ownership_once(&mut self) -> Result<(), AppError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_runner_preparation) {
+            return Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                "injected runner preparation failure".to_owned(),
+            )));
         }
         let app = self.app.account_storage(&self.state.label)?.app_storage();
         self.synchronize_recovery_loss(&app)?;

@@ -738,9 +738,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   plus `enable_live_fences` before any native input or REQ. Both native backward-paging entry points are then off
   for the account; ordinary ordered ingress and count facts stay. Worker startup/reconnect and direct seating
   repeat this guard. Failed preparation leaves the runner absent and the existing paced subscription-refresh retry
-  armed; a successful retry seats it. Gate-off callers keep the legacy behavior. Imported loss releases the plane
-  cursor fence only at the exact generation/writer barrier; transactional evidence reclamation follows, restoring
-  the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
+  armed; the worker seats it once a preparation succeeds, even if that refresh then fails (`recovery_runner_due`).
+  Gate-off callers keep the legacy behavior. Imported loss releases the plane cursor fence only at the exact
+  generation/writer barrier; transactional evidence reclamation follows, restoring the guard on failure. This handoff never records recovery success or coverage. The inbox is a route like a group's, compared only and never
   swept (`compare::plan_inbox`); a relay that will not compare it refuses its unit, never that relay's group
   comparisons, and admission never fences it. Explicit repair behind the gate (`repair`) is one request the runner
   takes at a step boundary (`RecoveryRunner::repair` under a `PassBound`): a re-arm turn, then passes whose turns the

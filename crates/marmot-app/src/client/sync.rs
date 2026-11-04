@@ -8631,6 +8631,54 @@ mod runtime_group_subscription_refresh_tests {
         assert!(!client.has_pending_runtime_group_subscription_refresh());
     }
 
+    /// A failed runner preparation keeps the worker's runner out only until a
+    /// preparation succeeds. The paced refresh retry prepares again; a group
+    /// subscription that still fails after it keeps that refresh armed, but
+    /// not the runner out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_runner_preparation_waits_only_for_the_next_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone())
+            .with_recovery_runner_ownership_for_test(true);
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "runner preparation retry",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap();
+        assert!(client.recovery_runner_due());
+
+        client.fail_next_runner_preparation = true;
+        assert!(client.spawn_recovery_runner().await.is_none());
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            !client.recovery_runner_due(),
+            "a failed preparation keeps the runner out"
+        );
+
+        relay.fail_next_subscribe();
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .expect_err("the group subscription still fails after the preparation");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            client.recovery_runner_due(),
+            "the retry prepared ownership, so the worker starts its runner"
+        );
+        assert!(client.spawn_recovery_runner().await.is_some());
+    }
+
     /// Secondary route failures preserve command success and primary publication
     /// errors, including committed activity and buffered subscriber updates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

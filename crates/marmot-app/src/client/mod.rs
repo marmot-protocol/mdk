@@ -1029,6 +1029,13 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// The recovery runner's ownership preparation failed and none has
+    /// succeeded since. While it is owed the worker starts no runner; the
+    /// paced subscription-refresh retry prepares again.
+    pub(crate) runner_preparation_owed: bool,
+    /// One-shot failure of the recovery runner's ownership preparation.
+    #[cfg(test)]
+    pub(crate) fail_next_runner_preparation: bool,
     /// The transport cursor every save persists. `state` holds the ingested
     /// maximum; this moves only through a seal under the router's placement
     /// lock: at a drain checkpoint or settled loss, or with a live ingest's

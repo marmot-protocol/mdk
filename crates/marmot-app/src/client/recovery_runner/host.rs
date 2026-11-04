@@ -448,6 +448,15 @@ impl AppClient {
 
     /// Spawn the account's runner, for the account worker to serve. Only
     /// with the internal `runner_owns_debt` gate on.
+    /// Whether the worker starts a runner it lacks: the gate is on and no
+    /// failed ownership preparation is still owed. A failed one waits for the
+    /// paced subscription-refresh retry to prepare again, so a persistent
+    /// failure never spins the worker, and other work that refresh still owes
+    /// never keeps the runner out.
+    pub(crate) fn recovery_runner_due(&self) -> bool {
+        self.app.recovery_runner_owns_debt() && !self.runner_preparation_owed
+    }
+
     pub(crate) async fn spawn_recovery_runner(&mut self) -> Option<SpawnedRunner> {
         if !self.app.recovery_runner_owns_debt() {
             return None;
