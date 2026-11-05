@@ -70,8 +70,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   update; that Commit's own leaf already carries a tag. From then on every KeyPackage it builds carries a fresh tag, a
   KeyPackage whose tag doesn't read as its own is due for replacement, and every own Commit or self-update that replaces
   a leaf without such a tag adds one. A founder whose entry in a new device group's roster carries its key tags its
-  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. Only test-policy builds hold a device
-  group, so release builds tag nothing.
+  founding leaf. A tagged leaf advertises 0x800f, which the host still can't list. The App runtime requires explicit device-group capability and runtime intent; ordinary CLI builds tag nothing.
 - `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
   group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
   KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
@@ -82,15 +81,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   `EngineError::UnexpectedDeviceGroupWelcome`, so a group someone else founded under the id can't take it.
   Storage providers implement the new `DeviceGroupWelcomeStorage` trait for these expectations.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
-  relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
-  `MarmotAppConfig::dev_device_groups` and two hidden hooks.
+  relay route stays live. The app path requires explicit device-group capability and
+  `MarmotAppConfig::dev_device_groups` runtime intent; policy-test builds retain the hidden fixture hooks.
 - Hosts can list the account's own devices from its device group's roster (mdk#2628 item 3.1):
   `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
-  re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
-  spec lands.
+  re-read it, since the device group's own events never reach hosts. The list is empty without explicit device-group capability and runtime intent.
 - Hosts can tell the user when the device group has held this device's KeyPackage refresh back for a week (mdk#2628
   item 3.4): `key_package_refresh_overdue` in `marmot-app`, UniFFI and C, and a `KeyPackageRefreshOverdueChanged`
-  event to re-read it. It is false in release builds until the roster's spec lands.
+  event to re-read it. It is false without explicit device-group capability and runtime intent.
 - A device notices new sign-ins on its account (mdk#2628 item 3.2). It reads every KeyPackage slot of the account at
   open, every six hours, and soon after one of the account's KeyPackages arrives live or a Welcome names one this device
   did not publish, and keeps what an inviter would add: each slot's newest publication, not deleted, valid and fresh,
@@ -122,8 +120,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   `confirm_device_link_match` and `cancel_device_link` on the new device, `link_device` and `decline_device_link` on a
   device already signed in, and `device_link_snapshot`, in `marmot-app`, UniFFI and C, with a `DeviceLinkChanged`
   event to re-read it. A link shows as made only once the new device's first change in the device group arrives; one
-  with none within an hour is removed again. Every call is refused in release builds until the pairing and
-  device-group specs land.
+  with none within an hour is removed again. Every call is refused without the experimental device-group entry point and its build capability.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

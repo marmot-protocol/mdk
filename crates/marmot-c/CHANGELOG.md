@@ -119,8 +119,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - `marmot_rename_linked_device` renames one of this account's devices, this
   one included, by its `slot_id_hex`, with one roster commit in the device
   group (mdk#2628 item 3.6). It fails with nothing sent while the device group
-  has an earlier change in flight, and in release builds until the roster's
-  spec lands. A rename whose commit loses a fork is made again later, unless
+  has an earlier change in flight, and without explicit device-group capability and runtime intent. A rename whose commit loses a fork is made again later, unless
   another rename of that device won. Use matching regenerated headers and
   libraries.
 - Append `MARMOT_STATUS_GROUP_RECOVERY_UNSETTLED` (117) and
@@ -139,7 +138,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_device_link_snapshot` write a `MarmotDeviceLinkSnapshot` (free with
   `marmot_device_link_snapshot_free`). The new
   `MARMOT_EVENT_DEVICE_LINK_CHANGED` event says to re-read it. Every call is
-  refused in release builds until the pairing and device-group specs land. Use
+  refused without the experimental device-group entry point and its build capability. Use
   matching regenerated headers and libraries.
 - `marmot_linked_devices` writes this account's own devices as a
   `MarmotLinkedDeviceList` (free with `marmot_linked_device_list_free`), from
@@ -156,8 +155,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   group has held its KeyPackage refresh back for a week (mdk#2628 item 3.4),
   so the app can tell the user before inviters stop treating the device as
   fresh at 30 days. The new `MARMOT_EVENT_KEY_PACKAGE_REFRESH_OVERDUE_CHANGED`
-  event says to re-read it. It is false in release builds until the roster's
-  spec lands. Use matching regenerated headers and libraries.
+  event says to re-read it. It is false without explicit device-group capability and runtime intent. Use matching regenerated headers and libraries.
 - `marmot_unrecognized_sign_ins` and `marmot_check_sign_ins` write sign-ins of
   this account that this device does not recognize as a
   `MarmotUnrecognizedSignInList` (free with
@@ -174,8 +172,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_EVENT_COMPROMISE_WARNING_CHANGED` event says to re-read it.
   `marmot_start_fresh` answers every sign-in from before this device Not now
   without rejecting any, and `marmot_started_fresh` writes whether the device
-  did so and still has no device group. All are empty or false in release
-  builds until the roster's spec lands. Use matching regenerated headers and
+  did so and still has no device group. All are empty or false without explicit device-group capability and runtime intent. Use matching regenerated headers and
   libraries.
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
