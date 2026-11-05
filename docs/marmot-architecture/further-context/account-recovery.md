@@ -773,7 +773,8 @@ lower-level adapter/session callers still retain the native pager pending its re
 With runner ownership (`recovery_runner/host.rs`), the account worker
 spawns the runner with itself, serves its turns between its other work and stops it on every
 exit, a quantum in flight included. A directly owned client runs one pass in place from
-`sync()` and from `next_event()` when it meets delivery loss. Sweeps go over the account's own
+`sync()` and from `next_event()` when it meets delivery loss. No worker reads what that pass's
+fence answer releases, so `sync()` reads it before returning. Sweeps go over the account's own
 relay pool and dial nothing. The places that change debt or routes wake it: loss import, goal
 widening, route replacement, a released receipt, a dismissal and a group lifecycle change. A
 wake only makes it read the ledger again. A unit is one (route,
@@ -881,10 +882,13 @@ routes, go to the recovered-ingest path oldest first by `(created_at, id)`, belo
 admission frontier: the first second, after the live tail, that its furthest-behind required
 relay still owes. A relay leaves the frontier after an answer without progress or an
 unreachable or refused end, and while it cools down or is broken or retired; what it staged
-ahead of the others then goes in as late input. Once every required relay of a group has left,
-the group is stranded: each relay whose unit is not broken holds the frontier again, so nothing
-newer goes ahead of history a relay may still return. A broken unit's debt is parked, so it holds
-nothing; the group's frames go once its last relay answers again or breaks. An admission turn ingests four events, one
+ahead of the others then goes in as late input. Once no required relay serves a group (each has
+left, and none is an active unit with nothing left to fetch), the group is stranded: each relay
+that left only because it does not answer (unreachable or cooling down) holds the frontier again,
+so nothing newer goes ahead of history it may still return. A relay that answered without
+progress since its unit last advanced cannot give more now, and a broken unit's debt is parked,
+so neither holds anything; the group's frames go once each holding relay answers, with progress
+or without, or breaks. An admission turn ingests four events, one
 worker command each, so commands and live input go between them. An event the engine keeps no
 trace of stays staged, and its group waits behind it on the local-failure backoff while other
 groups go on. A relay that holds a group's staging bound (2,048 events or 8 MiB), or any relay
@@ -909,7 +913,7 @@ that its relay's non-empty count left unproven. An empty count's range is cold-s
 owed and swept but never fencing, and loss, re-check and epoch-gap debt never fence either. A
 group's held frames may go below the first second its fencing relays still owe in their
 capture (`live_fences`), and a relay off the frontier fences nothing unless its group is
-stranded. Each unit keeps every
+stranded and it does not answer. Each unit keeps every
 capture range it still owes (migration 0135), up to 8, so the hold survives a restart, which
 forgets the counts. Past 8 the newest are joined into one, which can only fence more.
 Once a capture is covered its fence drops, even while its staged events wait behind another
@@ -936,7 +940,8 @@ queue holds it yet. A fresh activation replaces the adapter's replay coverage, b
 have no other copy, so they move to the new coverage, held from the same point until the
 runner's next plan answers; only a frame whose group the new REQs no longer route, or that the
 buffer has no room for, is lost. A fence holds through an account breaker pause too, and
-while its group is stranded: a live frame opened ahead of its sender's owed messages moves that
+while its group is stranded on relays that do not answer: a live frame opened ahead of its
+sender's owed messages moves that
 sender's ratchet, and once it is more than the out-of-order window (100 generations) past them,
 no owner can open them.
 

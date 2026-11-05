@@ -9,7 +9,7 @@
   group's fetched backlog is admitted, so history appears in order and none of it is lost to a newer message
   opened first; an empty reply holds nothing. Held live messages carry over when joining a group restarts the
   subscription, and stay held while the account's hourly recovery budget pauses the runner or while every relay of
-  the group is failing and one is still being retried.
+  the group is unreachable.
   `account_recovery_status` now reports groups catching up, and audit `unproven_history` rows are now produced.
 
 - Simplify experimental sibling-Welcome repair to existing current-incarnation heartbeat activity at least ten minutes after actual carrier acceptance (D100). Unknown publication time holds repair; cadence/skew remain best effort. Remove per-message activity proof/alias recovery work.

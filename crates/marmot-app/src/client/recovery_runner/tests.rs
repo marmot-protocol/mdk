@@ -3657,12 +3657,13 @@ impl TwoSources {
     }
 }
 
-/// A group none of whose sources serves it keeps its fence: opening live
-/// frames ahead of history a source may still return can put that history
-/// past the ratchet's out-of-order window. Only a unit that breaks, parking
-/// its debt, lets the frames go.
+/// A group none of whose sources serves it keeps its fence while a relay
+/// that owes it has not answered: opening live frames ahead of history the
+/// relay may still return can put that history past the ratchet's
+/// out-of-order window. A relay that answered without progress cannot give
+/// more now, so once each one has, the frames go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_runner_keeps_a_stranded_groups_fence_until_its_units_break() {
+async fn recovery_runner_keeps_a_stranded_groups_fence_while_its_relays_do_not_answer() {
     let case = TwoSources::new();
     let policy = test_policy();
     let (mut runner, _handle) = runner(&case.host, policy);
@@ -3686,25 +3687,13 @@ async fn recovery_runner_keeps_a_stranded_groups_fence_until_its_units_break() {
         BTreeSet::from([case.route.clone()])
     );
 
-    // A, which still owes, answers without progress and B is still
-    // unreachable: still held.
+    // A answers without progress; B, whose capture fences, still has not
+    // answered: still held.
     case.answer_without_progress(RELAY);
     assert_eq!(case.host.fences().await, case.held());
 
-    // B answers without progress until it breaks. Its debt is parked, so
-    // nothing holds the frames any more.
-    for answer in 1..=policy.unit.break_after_no_progress {
-        assert_eq!(
-            case.host.fences().await,
-            case.held(),
-            "released before answer {answer}"
-        );
-        case.answer_without_progress(OTHER_RELAY);
-    }
-    assert!(matches!(
-        case.account.unit(&case.route, OTHER_RELAY).state,
-        RecoveryUnitState::Broken(_)
-    ));
+    // B answers without progress too, and nothing holds the frames.
+    case.answer_without_progress(OTHER_RELAY);
     assert!(case.host.fences().await.is_empty());
 }
 

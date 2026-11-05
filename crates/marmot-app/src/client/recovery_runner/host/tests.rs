@@ -482,6 +482,74 @@ async fn a_direct_clients_pass_serves_each_due_unit_once() {
     assert_eq!(passes(&client), 2);
 }
 
+/// Bob's app over `dir` on `url`, as one `wn` process opens it.
+fn process_app(dir: &std::path::Path, url: &str) -> crate::MarmotApp {
+    crate::MarmotApp::with_relay_and_config(
+        dir,
+        url,
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    )
+    .with_recovery_runner_ownership_for_test(true)
+}
+
+/// One `wn sync` process: a fresh direct client syncs once and exits.
+async fn one_shot_sync(dir: &std::path::Path, url: &str) -> crate::SyncSummary {
+    let app = process_app(dir, url);
+    let mut client = app.client("bob").await.unwrap();
+    assert!(client.has_in_place_recovery_runner());
+    let summary = client.sync().await.unwrap();
+    drop(client);
+    app.relay_plane.shutdown().await;
+    summary
+}
+
+/// One-shot syncs, as `wn sync` runs them, show a new message. A fresh
+/// client owes the gap since its last sync, so its group's live REQ is
+/// fenced until its pass answers that gap; the frames the fence then
+/// releases are that sync's to read. The first sync after the send may not
+/// get there (its pass cannot yet prove the second the message was sent in),
+/// but a later one does. A sync that returned before reading what its pass
+/// released lost those frames with its client, and no number of one-shot
+/// syncs showed the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_syncs_read_what_their_pass_released() {
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob = crate::AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let app = process_app(bob_dir.path(), &url);
+    let mut client = app.client("bob").await.unwrap();
+    client.publish_key_package().await.unwrap();
+    client.sync().await.unwrap();
+    drop(client);
+    app.relay_plane.shutdown().await;
+
+    let (_alice_dir, _alice_app, mut alice) = direct_client_on(url.clone(), true).await;
+    let group = alice
+        .create_group_with_options(
+            "one shot",
+            &[bob.account_id_hex.as_str()],
+            crate::AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let joined = one_shot_sync(bob_dir.path(), &url).await;
+    assert_eq!(joined.joined_groups, [group.clone()]);
+
+    alice.send(&group, b"seed from alice").await.unwrap();
+    let mut shown = Vec::new();
+    for _ in 0..3 {
+        let synced = one_shot_sync(bob_dir.path(), &url).await;
+        shown.extend(synced.messages.into_iter().map(|message| message.plaintext));
+    }
+    assert_eq!(shown, ["seed from alice"], "a one-shot sync shows it, once");
+}
+
 async fn serve_goal_future<T>(
     client: &mut AppClient,
     turns: &mut tokio::sync::mpsc::Receiver<RunnerTurn>,

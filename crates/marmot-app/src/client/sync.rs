@@ -2113,7 +2113,20 @@ impl AppClient {
             self.pending_applied_sync_summary
                 .merge(std::mem::take(&mut summary));
             self.run_recovery_runner_pass().await;
+            // The pass's admission can lift a group's live fence, and the
+            // adapter then hands over the frames it was holding. A directly
+            // owned client has no worker to read them, so this sync does: a
+            // one-shot client would otherwise close with them unread.
+            let drained = self.sync_sdk_relay(None).await;
             self.prepend_pending_applied_summary(&mut summary);
+            match drained {
+                Ok(drained) => summary.merge(drained),
+                Err(mut failure) => {
+                    summary.merge(std::mem::take(&mut failure.partial_summary));
+                    failure.partial_summary = summary;
+                    return Err(failure);
+                }
+            }
             if self.pending_runtime_group_subscription_refresh {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }

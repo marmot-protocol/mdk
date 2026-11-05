@@ -695,7 +695,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   open for that refund. `shutdown_and_close` refunds only if storage is still open as the runner stops; otherwise,
   and after a crash, the charge stays until it ages out of the hour. A
   directly owned client from `MarmotApp::client()` runs one pass in place from `sync()` and from `next_event()`'s
-  loss branch. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
+  loss branch; `sync()` then reads the live frames the pass released before returning, since no worker will. Debt-turn preparation is fallible: a route-goal/retirement write failure keeps the pending route
   changes and returns its storage error without running the debt read. The existing admission/survey local-failure
   backoff schedules its retry; never add an immediate self-wake or report a successful zero-debt survey on failure.
   The worker never awaits a pass, the network or a credit. The host routes a fetched event through the
@@ -729,9 +729,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   admission waiting after local failures), and a re-check gets no frontier exemption from backpressure. Only capture debt below a non-empty live count fences;
   fetched staging inside that capture keeps it fenced until admission, even after acquisition coverage completes.
   Staging outside a capture never turns empty-count or restart-gap debt into a fence. The fence is a query
-  (`live_fences`) over each unit's durable capture ranges, holding through an account breaker pause and while every
-  required relay of the group has failed off its frontier, until one answers or the last unbroken unit breaks (a
-  live frame opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for
+  (`live_fences`) over each unit's durable capture ranges, holding through an account breaker pause and while no
+  required relay serves the group and a relay that does not answer (unreachable or cooling down) still owes it, until
+  it answers, with progress or without, or breaks (a live frame opened ahead of its sender's owed messages can put them past the ratchet's out-of-order window for
   good), and the
   runner reads live counts through its own
   `LiveCount`, never the coverage recorder's facts. `recovery_runner_live_counts` maps the admitted counts into it

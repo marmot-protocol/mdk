@@ -14,9 +14,11 @@
 //!   and while its relay cools down or it is broken or retired. What it
 //!   stages later is late input. When no unit serves its group (each has
 //!   left, and none is an active one with nothing left to fetch), the group
-//!   is stranded: each of its units that is not broken holds the frontier
-//!   again, so nothing newer opens ahead of history a source may still
-//!   return. A broken unit's debt is parked, so it holds nothing.
+//!   is stranded: each of its units whose relay has not answered holds the
+//!   frontier again, so nothing newer opens ahead of history the relay may
+//!   still return. A relay that answered without progress since its unit
+//!   last advanced cannot give more now, so its unit holds nothing, as does
+//!   a broken one.
 //! - **Backpressure.** A relay at a group's staging bound (its events or
 //!   bytes for the group), or any relay while the account is at its own, is
 //!   not eligible while another unit holds the group's frontier, until that
@@ -166,8 +168,10 @@ struct Member {
     /// Whether it serves its group: it has not left, or it is active with
     /// nothing left to fetch, whatever its last answer was.
     serves: bool,
-    /// Whether its unit still pursues its debt: it is not broken.
-    pursued: bool,
+    /// Whether it left only because its relay does not answer (unreachable
+    /// or cooling down): it is not broken, and has had no answer without
+    /// progress since it last advanced.
+    unanswered: bool,
     on_frontier: bool,
     /// The capture ranges it keeps durably.
     stored: Vec<RecoveryCoverageRange>,
@@ -509,9 +513,13 @@ impl<'t> Admission<'t> {
                     .app
                     .recovery_unit_debt(&route.route, relay, owed_until)?;
                 let unit = turn.app.recovery_unit(&route.route, relay)?;
-                let left = self.relay_left(relay)? || unit.as_ref().is_some_and(unit_left);
+                let relay_left = self.relay_left(relay)?;
+                let left = relay_left || unit.as_ref().is_some_and(unit_left);
                 let state = unit.as_ref().map(|unit| unit.state);
-                let pursued = !matches!(state, Some(RecoveryUnitState::Broken(_)));
+                let unanswered = relay_left
+                    && unit.as_ref().is_none_or(|unit| {
+                        unit.no_progress == 0 && !matches!(unit.state, RecoveryUnitState::Broken(_))
+                    });
                 let key = UnitKey {
                     route: route.route.clone(),
                     relay: relay.clone(),
@@ -557,7 +565,7 @@ impl<'t> Admission<'t> {
                     serves: !left
                         || (position.is_none()
                             && state.is_none_or(|state| state == RecoveryUnitState::Active)),
-                    pursued,
+                    unanswered,
                     on_frontier: false,
                     stored,
                     fences,
@@ -567,14 +575,15 @@ impl<'t> Admission<'t> {
             }
         }
         // A failed source stops holding up its peers. With no source left to
-        // serve the group, each one still pursuing its debt holds instead:
-        // a frame opened ahead of history a source may still return can put
-        // that history past the ratchet's out-of-order window.
+        // serve the group, each one whose relay has not answered holds
+        // instead: a frame opened ahead of history the relay may still return
+        // can put that history past the ratchet's out-of-order window. A
+        // relay that answered without progress cannot give more now.
         let stranded = !members.iter().any(|member| member.serves);
         for member in &mut members {
             member.on_frontier = member.position.is_some()
                 && if stranded {
-                    member.pursued
+                    member.unanswered
                 } else {
                     !member.left
                 };
