@@ -709,6 +709,54 @@ mod tests {
 
         let mirror: MarmotMarkdownDocument = doc.into();
         assert_eq!(mirror.blocks_len, 3);
+        assert!(!mirror.truncated);
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(mirror.blank_lines_before, mirror.blank_lines_before_len), &[0, 1, 0]);
+            let blocks = std::slice::from_raw_parts(mirror.blocks, mirror.blocks_len);
+            let MarmotMarkdownBlock::Heading { level, inlines, inlines_len } = &blocks[0] else { panic!("expected heading") };
+            assert_eq!(*level, 2);
+            assert_eq!(*inlines_len, 1);
+            let MarmotMarkdownInline::Strong { children, children_len } = &**inlines else { panic!("expected strong") };
+            assert_eq!(*children_len, 1);
+            let MarmotMarkdownInline::Text { content } = &**children else { panic!("expected text") };
+            assert_eq!(std::ffi::CStr::from_ptr(*content).to_bytes(), b"hi");
+            let MarmotMarkdownBlock::BlockQuote { blocks, blocks_len, blank_lines_before, blank_lines_before_len } = &blocks[1] else { panic!("expected quote") };
+            assert_eq!(*blocks_len, 1);
+            assert_eq!(std::slice::from_raw_parts(*blank_lines_before, *blank_lines_before_len), &[1]);
+            let MarmotMarkdownBlock::ListBlock { kind, tight, items, items_len } = &**blocks else { panic!("expected list") };
+            assert!(*tight);
+            let MarmotMarkdownListKind::Ordered { start, delimiter } = kind else { panic!("expected ordered list") };
+            assert_eq!(*start, 3);
+            assert_eq!(std::ffi::CStr::from_ptr(*delimiter).to_bytes(), b".");
+            assert_eq!(*items_len, 1);
+            let item = &**items;
+            assert!(item.has_checked && item.checked);
+            assert_eq!(item.blocks_len, 1);
+            assert_eq!(std::slice::from_raw_parts(item.blank_lines_before, item.blank_lines_before_len), &[0]);
+            let MarmotMarkdownBlock::Paragraph { inlines, inlines_len } = &*item.blocks else { panic!("expected item paragraph") };
+            assert_eq!(*inlines_len, 1);
+            let MarmotMarkdownInline::Link { dest, title, children, children_len, classification } = &**inlines else { panic!("expected link") };
+            assert_eq!(std::ffi::CStr::from_ptr(*dest).to_bytes(), b"https://example.test");
+            assert!(title.is_null());
+            assert_eq!(*classification, MarmotMarkdownLinkDestinationKind::Web);
+            assert_eq!(*children_len, 1);
+            let MarmotMarkdownInline::Code { content } = &**children else { panic!("expected code") };
+            assert_eq!(std::ffi::CStr::from_ptr(*content).to_bytes(), b"x");
+            let MarmotMarkdownBlock::Table { alignments, alignments_len, header, header_len, rows, rows_len } = &std::slice::from_raw_parts(mirror.blocks, mirror.blocks_len)[2] else { panic!("expected table") };
+            assert_eq!(*alignments_len, 1);
+            assert_eq!(**alignments, MarmotMarkdownAlignment::Left);
+            assert_eq!(*header_len, 1);
+            assert_eq!((**header).inlines_len, 1);
+            let MarmotMarkdownInline::Text { content } = &*(**header).inlines else { panic!("expected header text") };
+            assert_eq!(std::ffi::CStr::from_ptr(*content).to_bytes(), b"h");
+            assert_eq!(*rows_len, 1);
+            assert_eq!((**rows).cells_len, 1);
+            let cell = &*(**rows).cells;
+            assert_eq!(cell.inlines_len, 1);
+            let MarmotMarkdownInline::NostrMention { entity } = &*cell.inlines else { panic!("expected mention") };
+            assert_eq!(entity.hrp, MarmotMarkdownNostrHrp::Npub);
+            assert_eq!(std::ffi::CStr::from_ptr(entity.bech32).to_bytes(), b"npub1xyz");
+        }
         let root = boxed(mirror);
         unsafe { marmot_markdown_document_free(root) };
 

@@ -233,7 +233,7 @@ mod tests {
                 },
             ),
         ];
-        for (title, avatar) in variants {
+        for (expected, (title, avatar)) in variants.into_iter().enumerate() {
             let presentation = ConversationPresentationFfi {
                 title,
                 avatar,
@@ -282,6 +282,36 @@ mod tests {
             assert_eq!(mirror.sequence, 3);
             assert_eq!(mirror.snapshot.rows_len, 1);
             assert!(unsafe { (*mirror.snapshot.rows).draft_version.is_null() });
+            let presentation = unsafe { &(*mirror.snapshot.rows).presentation };
+            match (expected, &presentation.title, &presentation.avatar) {
+                (0, MarmotPresentationText::Literal { text },
+                    MarmotSelectedAvatar::EncryptedGroupImage { image, cache_key }) => {
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(*text) }.to_bytes(), b"Name");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(*cache_key) }.to_bytes(), b"encrypted-cache");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(image.image_hash_hex) }.to_bytes(), b"hash");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(image.image_key_hex) }.to_bytes(), b"secret");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(image.image_nonce_hex) }.to_bytes(), b"nonce");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(image.image_upload_key_hex) }.to_bytes(), b"upload-secret");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(image.media_type) }.to_bytes(), b"image/png");
+                }
+                (1, MarmotPresentationText::UnnamedGroup { has_member_count, member_count },
+                    MarmotSelectedAvatar::RemoteImage { url, cache_key }) => {
+                    assert!(*has_member_count);
+                    assert_eq!(*member_count, 3);
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(*url) }.to_bytes(), b"https://example.org/avatar");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(*cache_key) }.to_bytes(), b"remote-cache");
+                }
+                (2, MarmotPresentationText::UnavailableConversation,
+                    MarmotSelectedAvatar::Placeholder { stable_seed, source }) => {
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(*stable_seed) }.to_bytes(), b"seed");
+                    assert_eq!(*source, MarmotPresentationSource::UnknownFallback);
+                }
+                _ => panic!("selected presentation tags do not match source row {expected}"),
+            }
+            assert_eq!(presentation.title_source, MarmotPresentationSource::Group);
+            assert_eq!(presentation.avatar_source, MarmotPresentationSource::Group);
+            assert_eq!(presentation.resolution, MarmotPresentationResolution::LastKnown);
+            assert_eq!(unsafe { std::ffi::CStr::from_ptr(presentation.peer_id) }.to_bytes(), b"peer");
             assert_eq!(
                 mirror.snapshot.presentation_version.account_store_epoch_len,
                 16
@@ -303,7 +333,7 @@ mod tests {
         let _guard = audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let before = audit::live_allocations();
-        for preview in [
+        for (expected, preview) in [
             SelectedChatPreviewFfi::Draft {
                 draft: ChatListDraftPreviewFfi {
                     text: "draft 🦀".into(),
@@ -315,9 +345,10 @@ mod tests {
             SelectedChatPreviewFfi::Message,
             SelectedChatPreviewFfi::Invitation,
             SelectedChatPreviewFfi::Empty,
-        ] {
+        ].into_iter().enumerate() {
             let mut mirror: MarmotSelectedChatPreview = preview.into();
-            if let MarmotSelectedChatPreview::Draft { draft } = &mirror {
+            match (expected, &mirror) {
+            (0, MarmotSelectedChatPreview::Draft { draft }) => {
                 assert_eq!(
                     unsafe { std::ffi::CStr::from_ptr(draft.text) }
                         .to_str()
@@ -330,6 +361,11 @@ mod tests {
                     draft.attachment_kind,
                     MarmotChatListAttachmentKind::Audio
                 ));
+            }
+            (1, MarmotSelectedChatPreview::Message)
+            | (2, MarmotSelectedChatPreview::Invitation)
+            | (3, MarmotSelectedChatPreview::Empty) => {}
+            _ => panic!("preview tag does not match source row {expected}"),
             }
             unsafe {
                 mirror.free_in_place();

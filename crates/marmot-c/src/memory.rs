@@ -372,4 +372,31 @@ mod tests {
         }
         assert_eq!(audit::live_allocations(), start);
     }
+
+    #[test]
+    fn borrowed_inputs_preserve_null_empty_utf8_and_array_shapes() {
+        use crate::MarmotStatus;
+        let invalid = [0xffu8, 0];
+        let values = [c"alpha".as_ptr(), c"".as_ptr(), c"🦀".as_ptr()];
+        unsafe {
+            assert_eq!(required_str(std::ptr::null()), Err(MarmotStatus::NullPointer));
+            assert_eq!(required_str(invalid.as_ptr().cast()), Err(MarmotStatus::InvalidUtf8));
+            assert_eq!(required_str(c"".as_ptr()), Ok(String::new()));
+            assert_eq!(optional_str(std::ptr::null()), Ok(None));
+            assert_eq!(optional_str(c"".as_ptr()), Ok(Some(String::new())));
+            assert_eq!(optional_str(invalid.as_ptr().cast()), Err(MarmotStatus::InvalidUtf8));
+            assert_eq!(str_array(std::ptr::null(), 0), Ok(vec![]));
+            assert_eq!(str_array(std::ptr::null(), 1), Err(MarmotStatus::NullPointer));
+            assert_eq!(str_array(values.as_ptr(), 0), Ok(vec![]));
+            assert_eq!(str_array(values.as_ptr(), values.len()), Ok(vec!["alpha".into(), "".into(), "🦀".into()]));
+            assert_eq!(str_array([std::ptr::null()].as_ptr(), 1), Err(MarmotStatus::NullPointer));
+            assert_eq!(str_array([invalid.as_ptr().cast()].as_ptr(), 1), Err(MarmotStatus::InvalidUtf8));
+            let numbers = [0u64, u64::MAX];
+            assert_eq!(opt_num_array::<u64>(std::ptr::null(), 0), Ok(None));
+            assert_eq!(opt_num_array::<u64>(std::ptr::null(), 1), Err(MarmotStatus::NullPointer));
+            assert_eq!(opt_num_array(numbers.as_ptr(), 0), Ok(Some(vec![])));
+            assert_eq!(opt_num_array(numbers.as_ptr(), numbers.len()), Ok(Some(numbers.to_vec())));
+        }
+    }
+
 }

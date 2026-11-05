@@ -592,6 +592,8 @@ mod tests {
         let err = store
             .has_secret_for_label("a".into())
             .expect_err("out-of-range status");
+        assert!(matches!(&err, MarmotKitError::Runtime { .. }));
+        assert_eq!(crate::status::status_from_error(&err), MarmotStatus::Runtime);
         assert!(err.to_string().contains("out of range"), "{err}");
     }
 

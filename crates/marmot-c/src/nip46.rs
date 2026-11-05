@@ -1161,16 +1161,48 @@ mod tests {
         let valid = response(&remote, &client, payload.clone());
         assert_eq!(
             validated_payload(&valid, &client, Some(remote.public_key())),
-            Some(payload)
+            Some(payload.clone())
         );
+        let encrypted = nip44::encrypt(remote.secret_key(), &client.public_key(), payload.to_string(), nip44::Version::V2).unwrap();
+        let wrong_kind = EventBuilder::new(Kind::TextNote, encrypted.clone()).tag(client.public_key()).finalize(&remote).unwrap();
+        assert!(validated_payload(&wrong_kind, &client, Some(remote.public_key())).is_none());
+        let no_recipient = EventBuilder::new(Kind::NostrConnect, encrypted).finalize(&remote).unwrap();
+        assert!(validated_payload(&no_recipient, &client, Some(remote.public_key())).is_none());
+        let unreadable = EventBuilder::new(Kind::NostrConnect, "not ciphertext").tag(client.public_key()).finalize(&remote).unwrap();
+        assert!(validated_payload(&unreadable, &client, Some(remote.public_key())).is_none());
+        let encrypted = nip44::encrypt(remote.secret_key(), &client.public_key(), "not JSON", nip44::Version::V2).unwrap();
+        let not_json = EventBuilder::new(Kind::NostrConnect, encrypted).tag(client.public_key()).finalize(&remote).unwrap();
+        assert!(validated_payload(&not_json, &client, Some(remote.public_key())).is_none());
+        let oversized_payload = json!({"id":"request-a", "result":"x".repeat(MAX_PAYLOAD)});
+        let oversized = response(&remote, &client, oversized_payload.clone());
+        assert!(oversized.content.len() > MAX_PAYLOAD);
+        oversized.verify().unwrap();
+        let plaintext = nip44::decrypt(client.secret_key(), &remote.public_key(), &oversized.content).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&plaintext).unwrap(), oversized_payload);
+        assert!(validated_payload(&oversized, &client, Some(remote.public_key())).is_none());
     }
     #[test]
     fn auth_url_continues_request() {
         let auth = json!({"id":"a","result":"auth_url","error":"https://signer.example/approve"});
         assert!(matches!(
             matching_response(&auth, "a"),
-            Response::Approval(_)
+            Response::Approval(url) if url == "https://signer.example/approve"
         ));
+        for payload in [
+            json!({"id":"a","method":"sign_event","result":"signed"}),
+            json!({"id":1,"result":"signed"}),
+        ] {
+            assert!(matches!(matching_response(&payload, "a"), Response::Ignore));
+        }
+        for error in [Value::Null, json!(42), json!("not a URL"), json!("ftp://signer.example/approve"), json!("https://user@signer.example/approve"), json!("https://user:secret@signer.example/approve")] {
+            assert!(matches!(matching_response(&json!({"id":"a","result":"auth_url","error":error}), "a"), Response::Complete(Err(Error::Invalid))));
+        }
+        for (error, expected) in [("unsupported method", Error::Unsupported), ("UNKNOWN METHOD", Error::Unsupported), ("not supported", Error::Unsupported), ("denied", Error::Rejected)] {
+            assert!(matches!(matching_response(&json!({"id":"a","error":error}), "a"), Response::Complete(Err(actual)) if actual == expected));
+        }
+        assert!(matches!(matching_response(&json!({"id":"a","error":42}), "a"), Response::Complete(Err(Error::Invalid))));
+        assert!(matches!(matching_response(&json!({"id":"a"}), "a"), Response::Complete(Err(Error::Invalid))));
+        assert!(matches!(matching_response(&json!({"id":"a","result":null,"error":null}), "a"), Response::Complete(Ok(Value::Null))));
         assert!(matches!(
             matching_response(&json!({"id":"b","result":"signed"}), "a"),
             Response::Ignore
@@ -1185,6 +1217,13 @@ mod tests {
         let remote = keys(2);
         let wrong = json!({"id":"pair","result":"wrong-secret"});
         assert!(!pairing_response(&wrong, "pairing-secret"));
+        for payload in [
+            json!({"id":"pair","method":"connect","result":"pairing-secret"}),
+            json!({"id":42,"result":"pairing-secret"}),
+            json!({"result":"pairing-secret"}),
+            json!({"id":"pair","result":"pairing-secret","error":"denied"}),
+        ] { assert!(!pairing_response(&payload, "pairing-secret")); }
+        assert!(pairing_response(&json!({"id":"pair","result":"pairing-secret","error":null}), "pairing-secret"));
         let payload = json!({"id":"pair","result":"pairing-secret"});
         let mut event = response(&remote, &client, payload.clone());
         assert!(pairing_response(
