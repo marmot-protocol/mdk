@@ -208,15 +208,47 @@ mod tests {
         let debug = format!("{draft:?}");
         assert!(debug.contains("attachment_count: 1"));
         assert!(debug.contains("attachment_bytes: 24"));
-        for sensitive in [
-            "private-group-id",
-            "private draft content",
-            "private-message-id",
-            "private-attachment-id",
-            "private-file-name",
-            "private attachment bytes",
+        let attachment_summary = MessageDraftAttachmentSummaryFfi {
+            id: draft.media_attachments[0].id.clone(),
+            file_name: draft.media_attachments[0].file_name.clone(),
+            media_type: draft.media_attachments[0].media_type.clone(),
+            plaintext_size: 24,
+        };
+        let summary = MessageDraftSummaryFfi {
+            group_id_hex: draft.group_id_hex.clone(),
+            content: draft.content.clone(),
+            reply_to_message_id_hex: draft.reply_to_message_id_hex.clone(),
+            media_attachments: vec![attachment_summary.clone()],
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+        let attachment_debug = format!("{:?}", draft.media_attachments[0]);
+        assert!(attachment_debug.contains("plaintext_len: 24"));
+        assert!(attachment_debug.contains("waveform_sample_count: 2"));
+        let summary_debug = format!("{summary:?}");
+        assert!(summary_debug.contains("attachment_count: 1"));
+        assert!(summary_debug.contains("attachment_bytes: 24"));
+        for debug in [
+            debug,
+            attachment_debug,
+            format!("{attachment_summary:?}"),
+            summary_debug,
         ] {
-            assert!(!debug.contains(sensitive));
+            for sensitive in [
+                "private-group-id",
+                "private draft content",
+                "private-message-id",
+                "private-attachment-id",
+                "private-file-name",
+                "private attachment bytes",
+                "text/private",
+                "private-dimensions",
+                "private-thumbhash",
+            ] {
+                assert!(!debug.contains(sensitive), "draft debug leaked {sensitive}");
+            }
+            assert!(!debug.contains(&format!("{:?}", b"private attachment bytes")));
+            assert!(!debug.contains("0.25") && !debug.contains("0.75"));
         }
     }
 }
