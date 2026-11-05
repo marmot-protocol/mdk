@@ -12706,6 +12706,39 @@ async fn an_invalidation_during_a_chat_list_refresh_survives_it() {
         .map(|row| row.archived);
     assert_eq!(archived, Some(true), "so the next read rebuilds again");
     assert!(!stale(&app), "and then the list is current");
+
+    // A refresh still running when the account's caches are evicted, and
+    // then invalidated up to the refresh's own snapshot, cannot mark the
+    // recreated account's list rebuilt: generations never go back.
+    app.invalidate_chat_list_projection("alice");
+    let snapshot = app
+        .chat_list_projection_stale
+        .lock()
+        .unwrap()
+        .generation("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.drop_account_caches("alice");
+            loop {
+                during.invalidate_chat_list_projection("alice");
+                if during
+                    .chat_list_projection_stale
+                    .lock()
+                    .unwrap()
+                    .generation("alice")
+                    >= snapshot
+                {
+                    break;
+                }
+            }
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "an evicted incarnation's refresh does not cover a later invalidation"
+    );
 }
 
 #[test]
@@ -12759,8 +12792,10 @@ fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
             .unwrap()
             .contains(&alice.label)
     );
+    // Eviction advances the chat-list generation rather than dropping it,
+    // so the next incarnation's first read rebuilds (mdk#2923).
     assert!(
-        !app.chat_list_projection_stale
+        app.chat_list_projection_stale
             .lock()
             .unwrap()
             .contains(&alice.label)

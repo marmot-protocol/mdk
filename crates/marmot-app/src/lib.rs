@@ -8240,9 +8240,12 @@ impl ChatListStaleness {
         }
     }
 
-    /// Drop `label`'s state when its caches are evicted.
+    /// `label`'s caches were evicted. Advances the generation like an
+    /// invalidation instead of removing it, so generations never go back:
+    /// a refresh of the evicted incarnation still running holds an older
+    /// snapshot and can never mark a later invalidation rebuilt.
     fn forget(&mut self, label: &str) {
-        self.0.remove(label);
+        self.invalidate(label);
     }
 
     /// Whether `label` is stale; the name tests used for the old set.
