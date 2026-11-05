@@ -12,7 +12,6 @@ use cgka_traits::app_event::{
 };
 use clap::Parser;
 use marmot_account::AccountHome;
-pub(crate) use marmot_app::is_nostr_secret;
 use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
     SelfMembership, StreamStartView, UserProfileMetadata, tag_value,
@@ -361,6 +360,12 @@ fn read_identity_secret_input(
         return Ok(Some(read_nsec_from_stdin(command)?));
     }
     Ok(None)
+}
+
+/// Classify CLI input consistently before display, subprocess routing, or argv
+/// rejection. Stdin import already treats surrounding whitespace as padding.
+pub(crate) fn is_nostr_secret(value: &str) -> bool {
+    marmot_app::is_nostr_secret(value.trim())
 }
 
 fn read_nsec_from_stdin(command: &'static str) -> Result<ImportNsec, WnError> {
@@ -3088,6 +3093,26 @@ mod tests {
 
     #[test]
     fn uppercase_nsec_argv_rejected_at_early_identity_gate() {
+        for command in ["login", "account create"] {
+            for identity in [" nsec1synthetic", "\tNsEc1synthetic \n"] {
+                let error = super::validate_materialized_secret_identity(
+                    command,
+                    &Some(identity.to_owned()),
+                    false,
+                )
+                .expect_err("padded nsec argv must be rejected before materialization");
+                assert!(matches!(
+                    error,
+                    WnError::SecretArgumentRejected { command: actual } if actual == command
+                ));
+            }
+            super::validate_materialized_secret_identity(
+                command,
+                &Some("npub1synthetic".to_owned()),
+                false,
+            )
+            .expect("public identities remain valid argv input");
+        }
         let identity =
             Some("NSEC1J4C6269Y9W0Q2ER2XJW8SV2EHYRTFXQ3JWGDLXJ6QFN8Z4GJSQ5QFVFK99".to_owned());
         let err = super::validate_materialized_secret_identity("login", &identity, false)

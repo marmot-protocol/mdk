@@ -167,6 +167,16 @@ pub(crate) fn slash_suggestion_accepts_arguments(suggestion: &SlashCommandSugges
 }
 
 pub(crate) fn split_slash_command_words(input: &str) -> Result<Vec<String>, String> {
+    let (words, open_quote) = split_slash_command_words_partial(input);
+    if open_quote {
+        return Err("unterminated quoted string".to_owned());
+    }
+    Ok(words)
+}
+
+/// Retain the current word while input is being edited. The boolean reports an
+/// open quote so submission can reject it without preventing display masking.
+pub(crate) fn split_slash_command_words_partial(input: &str) -> (Vec<String>, bool) {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
@@ -199,13 +209,10 @@ pub(crate) fn split_slash_command_words(input: &str) -> Result<Vec<String>, Stri
         }
     }
 
-    if quote.is_some() {
-        return Err("unterminated quoted string".to_owned());
-    }
     if word_started {
         words.push(word);
     }
-    Ok(words)
+    (words, quote.is_some())
 }
 
 pub(crate) fn parse_chat_command(args: Vec<String>) -> Result<SlashCommand, String> {

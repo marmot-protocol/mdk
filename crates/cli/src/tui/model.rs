@@ -4926,10 +4926,13 @@ pub(crate) fn shorten(value: &str, max_len: usize) -> String {
 }
 
 pub(crate) fn composer_display_text(input: &str) -> String {
-    let trimmed = input.trim();
-    if let Some(command_input) = trimmed.strip_prefix('/')
-        && let Ok(words) = split_slash_command_words(command_input)
-        && words.first().map(String::as_str) == Some("login")
+    let Some(command_input) = input.trim().strip_prefix('/') else {
+        return input.to_owned();
+    };
+    // The composer displays edits before they are valid commands. An open
+    // quote must not expose a secret that submission would refuse to parse.
+    let (words, _) = split_slash_command_words_partial(command_input);
+    if words.first().map(String::as_str) == Some("login")
         && words
             .iter()
             .skip(1)
