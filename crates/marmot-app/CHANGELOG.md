@@ -7,7 +7,8 @@
   pagers no longer run. A stalled or failing relay is retried on a backoff instead of being re-paged, so recovery
   stays fast and bounded when one relay is unhealthy. Newer live messages in a group wait until that group's fetched
   backlog is admitted, so history appears in order and none of it is lost to a newer message opened first; an empty
-  reply holds nothing. Held live messages carry over when joining a group restarts the subscription, and stay held
+  reply holds nothing. Held live messages, and live messages still waiting to be admitted, carry over when joining
+  a group restarts the subscription. Held ones stay held
   while the account's hourly recovery budget pauses the runner or while no relay serves the group and one may still
   return its history. A subscription whose relay sends nothing before its end of stored events now proves its whole
   window, read off the wire, so a burst of group joins no longer owes every quiet group a few seconds of history

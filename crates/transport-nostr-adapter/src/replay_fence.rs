@@ -513,12 +513,13 @@ impl AccountReplayCoverage {
     }
 }
 
-/// The live frames a replaced coverage's fences held, for the coverage that
-/// replaces it ([`AccountReplayCoverage::take_fence_held`]).
+/// The live frames a replaced coverage buffered with no other copy, for the
+/// coverage that replaces it ([`AccountReplayCoverage::take_carried_live`]).
 #[derive(Default)]
-pub(super) struct FenceHeld {
-    frames: Vec<(GroupId, TransportDelivery)>,
-    /// The second each group's fence held from.
+pub(super) struct CarriedLive {
+    /// Each frame with whether its group's fence held it.
+    frames: Vec<(GroupId, TransportDelivery, bool)>,
+    /// The second each group's fence held from, for groups with a held frame.
     from: HashMap<GroupId, u64>,
     /// The last owner plan the replaced coverage applied.
     plan_ticket: u64,
@@ -527,39 +528,35 @@ pub(super) struct FenceHeld {
 }
 
 impl AccountReplayCoverage {
-    /// Take the live frames this coverage's fences hold, for the coverage
-    /// replacing it. They have no other copy: native ingress never had them
-    /// and nothing durable holds them, so dropping them would be loss. Frames
-    /// native ingress owns or that have a durable copy stay, as replacement
-    /// already accounts for those.
-    pub(super) fn take_fence_held(&mut self) -> FenceHeld {
-        let mut held = FenceHeld {
+    /// Take the live frames this coverage buffers, for the coverage replacing
+    /// it: those its fences hold, and those still waiting to be admitted, to
+    /// native ingress or past an unended REQ. They have no other copy: native
+    /// ingress never had them and nothing durable holds them, so dropping them
+    /// would be loss. Frames native ingress owns or that have a durable copy
+    /// stay, as replacement already accounts for those; so do history copies
+    /// no fence holds, which the fresh REQs replay.
+    pub(super) fn take_carried_live(&mut self) -> CarriedLive {
+        let mut carried = CarriedLive {
             plan_ticket: self.fence_plan_ticket,
             floor: self.retained_since,
-            ..FenceHeld::default()
+            ..CarriedLive::default()
         };
-        if !self.fencing {
-            return held;
-        }
+        let fencing = self.fencing;
         let native_ids = &self.native_ids;
         for (group_id, group) in &mut self.groups {
-            let Some(from) = group.held_from() else {
-                continue;
-            };
-            let ids = group
+            let from = group.held_from().filter(|_| fencing);
+            let frames = group
                 .events
                 .iter()
-                .filter(|(id, event)| {
-                    !event.retained && !native_ids.contains_key(*id) && group.holds(event)
-                })
-                .map(|(id, _)| *id)
+                .filter(|(id, event)| !event.retained && !native_ids.contains_key(*id))
+                .map(|(id, event)| (*id, from.is_some() && group.holds(event)))
+                .filter(|(id, held)| *held || group.live.contains(id))
                 .collect::<Vec<_>>();
-            if ids.is_empty() {
-                continue;
+            if let Some(from) = from.filter(|_| frames.iter().any(|(_, held)| *held)) {
+                carried.from.insert(group_id.clone(), from);
             }
-            held.from.insert(group_id.clone(), from);
-            for id in ids {
-                let event = group.events.remove(&id).expect("held event is buffered");
+            for (id, held) in frames {
+                let event = group.events.remove(&id).expect("carried event is buffered");
                 for stream in group.streams.values_mut() {
                     stream.claims.remove(&id);
                 }
@@ -567,36 +564,38 @@ impl AccountReplayCoverage {
                 group.ready_history.remove(&id);
                 self.buffered_items -= 1;
                 self.buffered_bytes -= event.delivery.message.payload.len();
-                held.frames.push((group_id.clone(), event.delivery));
+                carried
+                    .frames
+                    .push((group_id.clone(), event.delivery, held));
             }
         }
-        held
+        carried
     }
 
-    /// Hold the frames a replaced coverage's fences held
-    /// ([`Self::take_fence_held`]) in this one, each group from the point its
-    /// fence held from, until the owner's next plan answers. That plan sets
-    /// the hold as for any fence: a group it does not name lets them go. A
-    /// frame whose group this coverage does not route, while it does not
-    /// fence, or that its buffer has no room for, is lost as the replaced
-    /// coverage would have lost it.
-    pub(super) fn restore_fence_held(&mut self, held: FenceHeld) {
-        if held.frames.is_empty() {
+    /// Buffer the live frames a replaced coverage carried
+    /// ([`Self::take_carried_live`]) in this one. A frame a fence held is held
+    /// here from the point its fence held from, until the owner's next plan
+    /// answers; that plan sets the hold as for any fence, and a group it does
+    /// not name lets them go. The rest wait for admission as any live frame
+    /// does. A frame whose group this coverage does not route, a held one
+    /// while it does not fence, or one its buffer has no room for, is lost as
+    /// the replaced coverage would have lost it.
+    pub(super) fn restore_carried_live(&mut self, carried: CarriedLive) {
+        if carried.frames.is_empty() {
             return;
         }
         // A plan older than the last one applied must not undo the holds it
         // set; one read from this coverage is at least as new.
-        self.fence_plan_ticket = self.fence_plan_ticket.max(held.plan_ticket);
-        self.fence_ticket = self.fence_ticket.max(held.plan_ticket);
+        self.fence_plan_ticket = self.fence_plan_ticket.max(carried.plan_ticket);
+        self.fence_ticket = self.fence_ticket.max(carried.plan_ticket);
         let deadline = (!self.recovery_delegated)
             .then(|| tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration);
         let mut begun = Vec::new();
         let mut lost = false;
-        for (group_id, delivery) in held.frames {
+        for (group_id, delivery, held) in carried.frames {
             let bytes = delivery.message.payload.len();
             let (items_available, bytes_available) = self.buffer_available();
-            let from = held.from[&group_id];
-            let room = self.fencing && items_available != 0 && bytes <= bytes_available;
+            let room = (!held || self.fencing) && items_available != 0 && bytes <= bytes_available;
             let Some(group) = self.groups.get_mut(&group_id).filter(|_| room) else {
                 lost = true;
                 continue;
@@ -619,18 +618,21 @@ impl AccountReplayCoverage {
                     self.buffered_bytes += bytes;
                 }
             }
-            match group.fence.as_mut() {
-                Some(fence) if !fence.spent => {
-                    fence.owner = Some(fence.owner.map_or(from, |owner| owner.min(from)));
-                }
-                _ => {
-                    group.fence = Some(GroupFence {
-                        deadline,
-                        spent: false,
-                        armed: Vec::new(),
-                        owner: Some(from),
-                    });
-                    begun.push(group_id.clone());
+            if held {
+                let from = carried.from[&group_id];
+                match group.fence.as_mut() {
+                    Some(fence) if !fence.spent => {
+                        fence.owner = Some(fence.owner.map_or(from, |owner| owner.min(from)));
+                    }
+                    _ => {
+                        group.fence = Some(GroupFence {
+                            deadline,
+                            spent: false,
+                            armed: Vec::new(),
+                            owner: Some(from),
+                        });
+                        begun.push(group_id.clone());
+                    }
                 }
             }
             self.retained_since = Some(self.retained_since.map_or(since, |floor| floor.min(since)));
@@ -642,7 +644,7 @@ impl AccountReplayCoverage {
                 .extend(begun);
         }
         if lost {
-            self.record_loss(held.floor.unwrap_or(0));
+            self.record_loss(carried.floor.unwrap_or(0));
         }
         self.wake_replay();
     }
@@ -916,6 +918,56 @@ mod tests {
         (coverage, losses)
     }
 
+    /// Delegated recovery waits one replay deadline for a live REQ's EOSE and
+    /// no longer: a relay that never sends one has failed. The frames only it
+    /// sent are dropped and owed from the REQ's floor, the account's admission
+    /// stops waiting, and the group's later live frames flow unfenced.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_never_sends_eose_fails_after_one_deadline() {
+        let (mut coverage, id, losses) = fenced_coverage(true);
+        coverage.recovery_delegated = true;
+        let (tx, mut rx) = mpsc::channel(8);
+        coverage.record_stored_event(&id, RelayIndex(1), 150);
+        coverage
+            .stage_delivery(
+                delivery(0, 150, 1, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::History,
+                &tx,
+            )
+            .unwrap();
+        coverage.record_eose(&id, RelayIndex(2), 0);
+        assert!(
+            released(&mut coverage).is_empty(),
+            "relay 1 may still send older frames"
+        );
+        assert!(coverage.admission_pending());
+
+        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        coverage.expire_replay(tokio::time::Instant::now());
+        assert!(
+            released(&mut coverage).is_empty(),
+            "its unproven frame is dropped"
+        );
+        assert!(!coverage.admission_pending(), "nothing waits on the relay");
+        assert_eq!(held_from(&coverage, 0), None, "no fence holds the group");
+        assert_eq!(
+            losses.pending.lock().unwrap().get(&account()),
+            Some(&NostrNotificationLossFloor::Since(SINCE)),
+            "the dropped window is owed from the REQ's floor"
+        );
+
+        coverage
+            .stage_delivery(
+                delivery(0, 500, 9, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::Live,
+                &tx,
+            )
+            .unwrap();
+        assert_eq!(sent(&mut rx), vec![(0, 500)]);
+    }
+
     /// A fresh activation of an account whose coverage holds `held` with the
     /// fresh REQs routing `routed`. Both coverages share one loss record and
     /// one ticket clock, as in the adapter; the new one has seen its EOSE.
@@ -973,6 +1025,31 @@ mod tests {
         assert_eq!(released(coverage), vec![(0, 400)]);
         coverage.apply_fence_plan(&plan(coverage, &[]));
         assert_eq!(released(coverage), vec![(1, 400)]);
+    }
+
+    /// A live frame no fence holds but that still waits to be admitted has no
+    /// other copy either. The recovery runner's post-join step re-activates
+    /// an account while one waits; it moves to the new coverage, unfenced,
+    /// and goes out once the fresh REQs are ready, with nothing owed.
+    #[tokio::test]
+    async fn a_fresh_activation_keeps_live_frames_waiting_for_admission() {
+        let (mut coverage, id, losses) = fenced_coverage(true);
+        coverage.recovery_delegated = true;
+        let (tx, mut rx) = mpsc::channel(8);
+        coverage
+            .stage_delivery(
+                delivery(0, 400, 9, &id, 1),
+                Some(RelayIndex(1)),
+                ReplayInput::Live,
+                &tx,
+            )
+            .unwrap();
+        assert!(sent(&mut rx).is_empty(), "its REQ has no EOSE yet");
+        let mut state = replace((coverage, losses), &[0]);
+        assert_eq!(pending_loss(&state.replay_losses), None);
+        let coverage = state.account_replay_coverage.get_mut(&account()).unwrap();
+        assert_eq!(held_from(coverage, 0), None, "no fence holds it");
+        assert_eq!(released(coverage), vec![(0, 400)]);
     }
 
     /// A held frame whose group the fresh REQs no longer route has nowhere to

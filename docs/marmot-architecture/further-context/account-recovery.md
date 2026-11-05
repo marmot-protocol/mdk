@@ -973,10 +973,11 @@ admission nor against other groups' placement, so other groups' boundaries, tail
 on. The recorder writes no live boundary on a held route until its frames are released; its
 tail still stands. Held frames stay under the replay buffer bounds, so overflow is loss, and the
 relay plane's cursor seal stops at the oldest one its restart floor does not cover, since no
-queue holds it yet. A fresh activation replaces the adapter's replay coverage, but held frames
-have no other copy, so they move to the new coverage, held from the same point until the
-runner's next plan answers; only a frame whose group the new REQs no longer route, or that the
-buffer has no room for, is lost. A fence holds through an account breaker pause too, and
+queue holds it yet. A fresh activation, such as the runner's post-join step, replaces the adapter's replay
+coverage, but buffered live frames have no other copy, so they move to the new coverage: held
+frames stay held from the same point until the runner's next plan answers, and frames still
+waiting for admission go on waiting there. Only a frame whose group the new REQs no longer
+route, or that the buffer has no room for, is lost. A fence holds through an account breaker pause too, and
 while its group is stranded on relays that may still return its history: a live frame opened ahead of its
 sender's owed messages moves that
 sender's ratchet, and once it is more than the out-of-order window (100 generations) past them,

@@ -415,6 +415,7 @@ async fn queued_invite_owes_a_snapshot_across_a_restart() {
     let group_hex = hex::encode(group.as_slice());
     // Bob's Commit opens a settlement window on Alice, which holds her invite
     // back.
+    let alice_eose = alice.answer_eose(&relay);
     bob.client
         .runtime
         .send(cgka_traits::SendIntent::SelfUpdate {
@@ -469,6 +470,7 @@ async fn queued_invite_owes_a_snapshot_across_a_restart() {
         alice.account_id_hex.clone(),
         alice.cursor,
     );
+    drop(alice_eose);
     drop(alice);
 
     let mut alice = Device::open(&app, &label, &account_id_hex, cursor).await;
