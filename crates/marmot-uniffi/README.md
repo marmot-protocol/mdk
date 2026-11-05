@@ -1136,7 +1136,9 @@ This does not recall deliveries already handed off or change what another device
 A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
-of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
+of that device wins as a whole, even if it changed a different toggle. Once an edit is retired because another edit
+stands or the device leaves the roster, a later branch that removes that rival does not restore the retired local
+choice. To apply it again, edit the device once it is listed in the selected roster. Refresh the displayed label and flags on
 `LinkedDevicesChanged`. These commands remain behind the device-group development gate.
 
 ### Moving this device to another device group
