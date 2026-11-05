@@ -2394,8 +2394,7 @@ impl TuiApp {
                 // A failed refresh can leave another account's rows visible even
                 // after selection returns to this account. Only mutate the list
                 // that actually produced these rows, including off-pane chats.
-                if self.chats_account_id.as_deref() == Some(account.as_str())
-                {
+                if self.chats_account_id.as_deref() == Some(account.as_str()) {
                     fold_chat_projection(
                         &mut self.chats,
                         &mut self.selected_chat,

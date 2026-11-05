@@ -3552,7 +3552,7 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
     let group = "cc".repeat(32);
     for list_owner in [&account_b, &account_a] {
         for pane_account in [&account_b, &account_a] {
-            for pane_group in [group.as_str(), "other-group"] {
+            for pane_group in [group.as_str(), "dddddddddddddddddddddddddddddddd"] {
                 for fails in [false, true] {
                     let mut app = test_tui_app(test_unused_client(), &account_a);
                     app.accounts.push(AccountRow {
@@ -3567,7 +3567,10 @@ fn mark_read_completions_keep_account_projections_and_pane_retries_separate() {
                     // Establish ownership through the real full-result writer,
                     // then move selection away without changing the loaded rows.
                     app.apply_effect_done(EffectDone {
-                        effect: Effect::Relist { account: list_owner.clone(), include_archived: false },
+                        effect: Effect::Relist {
+                            account: list_owner.clone(),
+                            include_archived: false,
+                        },
                         result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,
                             "profile":{"name":"general"},"unread_count":5,"has_unread":true}]})]),
                     });
@@ -3636,8 +3639,10 @@ fn mark_read_completion_does_not_cross_a_successful_then_failed_account_switch()
     let mut app = test_tui_app(client, &account_a);
     app.daemon.running = false;
     app.accounts.push(AccountRow {
-        account_id: account_b.clone(), npub: "npub1bob".to_owned(),
-        display_name: None, local_signing: true,
+        account_id: account_b.clone(),
+        npub: "npub1bob".to_owned(),
+        display_name: None,
+        local_signing: true,
     });
     app.messages_account_id = Some(account_a.clone());
     app.messages_group_id = Some(group.clone());
@@ -3648,24 +3653,38 @@ fn mark_read_completion_does_not_cross_a_successful_then_failed_account_switch()
 
     // B's real refresh installs a list carrying B-only fixture provenance.
     // Its timeline load is queued behind the pending A read, respecting FIFO.
-    app.select_account_by_selector(&account_b).expect("B refresh succeeds");
+    app.select_account_by_selector(&account_b)
+        .expect("B refresh succeeds");
     assert_eq!(app.chats.len(), 1);
     assert_eq!(app.chats[0].name, "B's loaded chat");
     assert_eq!(app.chats[0].projection.unread_count, 5);
     let b_chats = app.chats.clone();
 
-    let error = app.select_account_by_selector(&account_a).expect_err("A refresh fails");
+    let error = app
+        .select_account_by_selector(&account_a)
+        .expect_err("A refresh fails");
     assert_eq!(error.to_string(), "A refresh failed");
     assert_eq!(app.selected_account_row().unwrap().account_id, account_a);
-    assert_eq!(app.chats, b_chats, "the failed refresh retains B's loaded list");
+    assert_eq!(
+        app.chats, b_chats,
+        "the failed refresh retains B's loaded list"
+    );
     assert_eq!(app.messages_account_id.as_deref(), Some(account_a.as_str()));
 
-    let done = app.effects.recv_timeout(Duration::from_secs(5)).expect("A read completed");
-    assert!(matches!(&done.effect, Effect::MarkRead {account, group: target}
-        if account == &account_a && target == &group));
+    let done = app
+        .effects
+        .recv_timeout(Duration::from_secs(5))
+        .expect("A read completed");
+    assert!(
+        matches!(&done.effect, Effect::MarkRead {account, group: target}
+        if account == &account_a && target == &group)
+    );
     app.apply_effect_done(done);
 
-    assert_eq!(app.chats, b_chats, "A's completion must not rewrite B's loaded projection");
+    assert_eq!(
+        app.chats, b_chats,
+        "A's completion must not rewrite B's loaded projection"
+    );
 }
 
 // Both lists use the same group, but only B's foreground fetch succeeds.
@@ -3688,23 +3707,39 @@ fn chat_list_b_after_failed_return_to_a(pane_is_b: bool) -> (tempfile::TempDir, 
     ));
     let mut app = test_tui_app(client, &a);
     app.daemon.running = false;
-    app.accounts.push(AccountRow { account_id: b.clone(), npub: "npub1bob".to_owned(),
-        display_name: None, local_signing: true });
+    app.accounts.push(AccountRow {
+        account_id: b.clone(),
+        npub: "npub1bob".to_owned(),
+        display_name: None,
+        local_signing: true,
+    });
     app.messages_account_id = Some(a.clone());
     app.messages_group_id = Some(group.clone());
     app.timeline = vec![timeline_row("original", 1)];
-    app.select_account_by_selector(&b).expect("B list actually loads");
+    app.select_account_by_selector(&b)
+        .expect("B list actually loads");
     assert_eq!(app.chats[0].name, "B list");
     assert_eq!(app.chats[0].projection.unread_count, 7);
     assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()));
-    if pane_is_b { app.settle_effects(1); }
-    let error = app.select_account_by_selector(&a).expect_err("A list fetch fails");
+    if pane_is_b {
+        app.settle_effects(1);
+    }
+    let error = app
+        .select_account_by_selector(&a)
+        .expect_err("A list fetch fails");
     assert_eq!(error.to_string(), "A refresh failed");
     assert_eq!(app.selected_account_row().unwrap().account_id, a);
     assert_eq!(app.chats[0].name, "B list");
     assert_eq!(app.chats[0].projection.unread_count, 7);
-    assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()), "failed A fetch preserves B owner");
-    assert_eq!(app.messages_account_id.as_deref(), Some(if pane_is_b { b.as_str() } else { a.as_str() }));
+    assert_eq!(
+        app.chats_account_id.as_deref(),
+        Some(b.as_str()),
+        "failed A fetch preserves B owner"
+    );
+    assert_eq!(
+        app.messages_account_id.as_deref(),
+        Some(if pane_is_b { b.as_str() } else { a.as_str() })
+    );
     (dir, app)
 }
 
@@ -3718,8 +3753,12 @@ fn chat_feed_mutations_follow_loaded_data_owner_after_a_failed_account_switch() 
         let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
         let original = app.chats.clone();
         let (tx, rx) = mpsc::channel();
-        app.chat_subscription = Some(ChatSubscription { account_id: producer.clone(),
-            include_archived: false, child: test_sleep_child(), rx });
+        app.chat_subscription = Some(ChatSubscription {
+            account_id: producer.clone(),
+            include_archived: false,
+            child: test_sleep_child(),
+            rx,
+        });
         tx.send(SubscriptionEvent::Result(serde_json::json!({"type":"chat","chat":{
             "group_id":group,"profile":{"name":"incoming"},"unread_count":1,
             "has_unread":true,"activity_sort_at":40,"last_message":{"plaintext":"incoming preview","timeline_at":40}
@@ -3729,10 +3768,14 @@ fn chat_feed_mutations_follow_loaded_data_owner_after_a_failed_account_switch() 
             assert_eq!(app.chats[0].name, "incoming");
             assert_eq!(app.chats[0].projection.unread_count, 1);
         } else {
-            assert_eq!(app.chats, original, "A feed must not merge into B's retained list");
+            assert_eq!(
+                app.chats, original,
+                "A feed must not merge into B's retained list"
+            );
         }
         // Result scoping must not hide lifecycle/error handling.
-        tx.send(SubscriptionEvent::Error("feed offline".to_owned())).expect("error");
+        tx.send(SubscriptionEvent::Error("feed offline".to_owned()))
+            .expect("error");
         tx.send(SubscriptionEvent::Ended).expect("end");
         assert!(app.drain_chat_subscription());
         assert_eq!(app.status, "chat subscription failed: feed offline");
@@ -3750,19 +3793,36 @@ fn timeline_feed_scopes_list_projection_independently_of_its_loaded_pane() {
         let (_dir, mut app) = chat_list_b_after_failed_return_to_a(producer == &b);
         let original = app.chats.clone();
         let (tx, rx) = mpsc::channel();
-        app.timeline_subscription = Some(TimelineSubscription { account_id: producer.clone(),
-            group_id: group.clone(), child: test_sleep_child(), rx });
+        app.timeline_subscription = Some(TimelineSubscription {
+            account_id: producer.clone(),
+            group_id: group.clone(),
+            child: test_sleep_child(),
+            rx,
+        });
         tx.send(SubscriptionEvent::Result(serde_json::json!({
             "type":"timeline_projection_updated","group_id":group,
             "chat_list_row":{"unread_count":1,"has_unread":true,"activity_sort_at":40},
             "changes":[{"type":"upsert","message":{"message_id":"incoming","direction":"received",
                 "from":"sender","plaintext":"pane update","timeline_at":2,"received_at":2}}]
-        }))).expect("external timeline update");
+        })))
+        .expect("external timeline update");
         assert!(app.drain_timeline_subscription());
-        assert!(timeline_ids(&app.timeline).contains(&"incoming"), "the owning pane still receives its row");
-        assert!(app.pending_mark_read, "reading the owning pane still schedules its read marker");
-        if producer == &b { assert_eq!(app.chats[0].projection.unread_count, 1); }
-        else { assert_eq!(app.chats, original, "A timeline must not rewrite B list projection"); }
+        assert!(
+            timeline_ids(&app.timeline).contains(&"incoming"),
+            "the owning pane still receives its row"
+        );
+        assert!(
+            app.pending_mark_read,
+            "reading the owning pane still schedules its read marker"
+        );
+        if producer == &b {
+            assert_eq!(app.chats[0].projection.unread_count, 1);
+        } else {
+            assert_eq!(
+                app.chats, original,
+                "A timeline must not rewrite B list projection"
+            );
+        }
     }
 }
 
@@ -3774,19 +3834,168 @@ fn complete_relist_replaces_and_reowns_a_retained_other_account_list() {
     let group = "cc".repeat(32);
     let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
     let retained = app.chats.clone();
-    app.apply_effect_done(EffectDone { effect: Effect::Relist { account: a.clone(), include_archived: false }, result: Err("relist failed".to_owned()) });
+    app.apply_effect_done(EffectDone {
+        effect: Effect::Relist {
+            account: a.clone(),
+            include_archived: false,
+        },
+        result: Err("relist failed".to_owned()),
+    });
     assert_eq!(app.chats, retained);
     assert_eq!(app.chats_account_id.as_deref(), Some(b.as_str()));
-    app.apply_effect_done(EffectDone { effect: Effect::Relist { account: a.clone(), include_archived: false },
-        result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"A relist"},
-            "unread_count":5,"has_unread":true}]})]) });
+    app.apply_effect_done(EffectDone {
+        effect: Effect::Relist {
+            account: a.clone(),
+            include_archived: false,
+        },
+        result: Ok(vec![
+            serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"A relist"},
+            "unread_count":5,"has_unread":true}]}),
+        ]),
+    });
     assert_eq!(app.chats[0].name, "A relist");
     assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
-    for (producer, expected) in [(b,5),(a,0)] {
-        app.apply_effect_done(EffectDone { effect: Effect::MarkRead { account: producer, group: group.clone() },
-            result: Ok(vec![serde_json::json!({"unread_count":0,"has_unread":false})]) });
-        assert_eq!(app.chats[0].projection.unread_count, expected, "incremental admission follows the full replacement's producer");
+    for (producer, expected) in [(b, 5), (a, 0)] {
+        app.apply_effect_done(EffectDone {
+            effect: Effect::MarkRead {
+                account: producer,
+                group: group.clone(),
+            },
+            result: Ok(vec![
+                serde_json::json!({"unread_count":0,"has_unread":false}),
+            ]),
+        });
+        assert_eq!(
+            app.chats[0].projection.unread_count, expected,
+            "incremental admission follows the full replacement's producer"
+        );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_relist_can_recover_an_initial_failed_load_without_an_owner() {
+    use clap::Parser;
+    let a = "aa".repeat(32);
+    let group = "cc".repeat(32);
+    let response = serde_json::json!({"ok":true,"result":{
+        "accounts":[{"account_id":a,"npub":"npub1alice","local_signing":true}],
+        "chats":[{"group_id":group,"profile":{"name":"initial retry"},"unread_count":5,"has_unread":true}]
+    }}).to_string();
+    let (_good_dir, client) = test_json_client(&response);
+    let mut app = TuiApp::new(Cli::parse_from(["wn", "tui"])).expect("real empty constructor");
+    app.client = client.clone();
+    app.effects = EffectRunner::spawn(client.clone());
+    app.load_accounts().expect("actual account list");
+    assert!(app.chats_account_id.is_none());
+    let (_bad_dir, failure) =
+        test_json_client(r#"{"ok":false,"error":{"message":"initial list failed"}}"#);
+    app.client = failure;
+    assert_eq!(
+        app.refresh_chats()
+            .expect_err("initial load fails")
+            .to_string(),
+        "initial list failed"
+    );
+    assert!(app.chats.is_empty());
+    assert!(app.chats_account_id.is_none());
+    app.client = client;
+    app.pending_chat_relist = true;
+    assert!(
+        app.tick(),
+        "a selected-account retry is eligible without a loaded owner"
+    );
+    assert!(!app.pending_chat_relist);
+    app.settle_effects(1);
+    assert_eq!(app.chats[0].name, "initial retry");
+    assert_eq!(app.chats_account_id.as_deref(), Some(a.as_str()));
+    app.apply_effect_done(EffectDone {
+        effect: Effect::MarkRead { account: a, group },
+        result: Ok(vec![
+            serde_json::json!({"unread_count":0,"has_unread":false}),
+        ]),
+    });
+    assert_eq!(app.chats[0].projection.unread_count, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_list_owner_clears_with_account_removal_or_public_only_refresh() {
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    for public_only in [false, true] {
+        let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
+        let accounts = if public_only {
+            serde_json::json!([{"account_id":a,"npub":"npub1alice","local_signing":false}])
+        } else {
+            serde_json::json!([])
+        };
+        let response = serde_json::json!({"ok":true,"result":{"accounts":accounts}}).to_string();
+        let (_accounts_dir, client) = test_json_client(&response);
+        app.client = client;
+        app.load_accounts().expect("actual changed account list");
+        if public_only {
+            assert_eq!(
+                app.chats_account_id.as_deref(),
+                Some(b.as_str()),
+                "account discovery alone does not reown retained rows"
+            );
+            app.refresh_chats()
+                .expect("public-only account clears chat state");
+        } else {
+            assert!(app.accounts.is_empty());
+            app.refresh_chats()
+                .expect("no selection keeps chat state clear");
+        }
+        assert!(app.chats.is_empty());
+        assert!(app.chats_account_id.is_none());
+        assert!(app.messages_account_id.is_none());
+        assert!(app.chat_subscription.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_search_completion_settles_after_its_chat_feed_removes_the_loaded_pane() {
+    let a = "aa".repeat(32);
+    let group = "cc".repeat(32);
+    let (_dir, mut app) = chat_list_b_after_failed_return_to_a(false);
+    app.apply_effect_done(EffectDone {
+        effect: Effect::Relist {
+            account: a.clone(),
+            include_archived: false,
+        },
+        result: Ok(vec![
+            serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"A list"}}]}),
+        ]),
+    });
+    app.open_message_search(Some("hello".to_owned()))
+        .expect("search the loaded A pane");
+    let (tx, rx) = mpsc::channel();
+    app.chat_subscription = Some(ChatSubscription {
+        account_id: a,
+        include_archived: false,
+        child: test_sleep_child(),
+        rx,
+    });
+    tx.send(SubscriptionEvent::Result(
+        serde_json::json!({"type":"chat","chat":{
+            "group_id":group,"profile":{"name":"A list"},"archived":true
+        }}),
+    ))
+    .expect("the owning chat becomes hidden");
+    assert!(app.drain_chat_subscription());
+    assert!(app.messages_group_id.is_none());
+    assert_eq!(
+        app.status, "searching...",
+        "search screen suppresses ambient feed status"
+    );
+    // FIFO: the earlier B load is rejected by selection, then the real A search
+    // completes against the now-removed pane. Neither may strand the spinner.
+    app.settle_effects(2);
+    assert!(app.searching_messages.is_none());
+    assert_eq!(app.status, "");
+    assert!(!rendered_buffer(&mut app).contains("searching..."));
 }
 
 #[test]
@@ -3796,7 +4005,11 @@ fn group_diagnostic_completions_belong_to_the_loaded_account_and_group() {
     let group = "cc".repeat(32);
     for (pane_account, pane_group, applies) in [
         (account_b.as_str(), group.as_str(), false),
-        (account_a.as_str(), "other-group", false),
+        (
+            account_a.as_str(),
+            "dddddddddddddddddddddddddddddddd",
+            false,
+        ),
         (account_a.as_str(), group.as_str(), true),
     ] {
         for fails in [false, true] {
@@ -3912,7 +4125,11 @@ fn message_search_completions_preserve_a_new_panes_identical_query() {
     let group = "cc".repeat(32);
     for (pane_account, pane_group, applies) in [
         (account_b.as_str(), group.as_str(), false),
-        (account_a.as_str(), "other-group", false),
+        (
+            account_a.as_str(),
+            "dddddddddddddddddddddddddddddddd",
+            false,
+        ),
         (account_a.as_str(), group.as_str(), true),
     ] {
         for fails in [false, true] {
@@ -6732,6 +6949,30 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
     let account_a = "aa".repeat(32);
     let account_b = "bb".repeat(32);
     let group = "cc".repeat(32);
+    let dir = tempfile::tempdir().expect("recorder directory");
+    let response = r#"{"ok":true,"result":{"messages":[],"has_more_before":false}}"#;
+    #[cfg(unix)]
+    let (exe, args_file) = {
+        let exe = dir.path().join("wn-json");
+        let args_file = dir.path().join("recorded-args");
+        // One immutable fake for the table; shell builtins avoid an extra child
+        // per fixed JSON response. No case rewrites an executable another uses.
+        write_fake_wn(
+            &exe,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nprintf '%s\\n' '{}'\n",
+                args_file.display(),
+                response
+            ),
+        );
+        (exe, args_file)
+    };
+    #[cfg(windows)]
+    let (exe, args_file) = test_appending_arg_executable(dir.path(), response);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
     for reply in [false, true] {
         for completion in ["without-id", "with-id", "error"] {
             for (selected_account, selected_group, selection_matches) in [
@@ -6741,11 +6982,18 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
             ] {
                 for (pane_account, pane_group, same_pane) in [
                     (Some(account_b.as_str()), Some(group.as_str()), false),
-                    (Some(account_a.as_str()), Some("other-group"), false),
+                    (
+                        Some(account_a.as_str()),
+                        Some("dddddddddddddddddddddddddddddddd"),
+                        false,
+                    ),
                     (None, None, false),
                     (Some(account_a.as_str()), Some(group.as_str()), true),
                 ] {
-                    let mut app = test_tui_app(test_unused_client(), &account_a);
+                    // The previous case crossed its child-completion fence,
+                    // including any work enqueued by a legitimate reload.
+                    std::fs::write(&args_file, "").expect("reset fenced per-case recorder");
+                    let mut app = test_tui_app(client.clone(), &account_a);
                     app.accounts.push(AccountRow {
                         account_id: account_b.clone(),
                         npub: "npub1bob".to_owned(),
@@ -6759,7 +7007,10 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                     let switches_account = pane_account == Some(account_b.as_str());
                     if switches_account {
                         app.selected_account = 1;
-                        app.chats = vec![projected_chat(&group, "general", 0, Some(10))];
+                        app.apply_effect_done(EffectDone {
+                            effect: Effect::Relist { account: account_b.clone(), include_archived: false },
+                            result: Ok(vec![serde_json::json!({"chats":[{"group_id":group,"profile":{"name":"general"}}]})]),
+                        });
                         app.begin_timeline_load(account_b.clone(), group.clone());
                         assert_eq!(app.messages_account_id.as_deref(), Some(account_a.as_str()));
                     }
@@ -6770,15 +7021,15 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                             .expect("send for A")
                     };
                     if switches_account {
-                        app.apply_effect_done(EffectDone {
-                            effect: Effect::LoadTimeline {
-                                account: account_b.clone(),
-                                group: group.clone(),
-                            },
-                            result: Ok(vec![
-                                serde_json::json!({"messages":[],"has_more_before":false}),
-                            ]),
-                        });
+                        let done = app
+                            .effects
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("B timeline completed on the actual worker");
+                        assert!(
+                            matches!(&done.effect, Effect::LoadTimeline {account, group: target}
+                            if account == &account_b && target == &group)
+                        );
+                        app.apply_effect_done(done);
                         assert_eq!(app.messages_account_id.as_deref(), Some(account_b.as_str()));
                         assert_eq!(app.messages_group_id.as_deref(), Some(group.as_str()));
                     }
@@ -6790,7 +7041,10 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         app.messages_account_id = pane_account.map(str::to_owned);
                         app.messages_group_id = pane_group.map(str::to_owned);
                     }
-                    app.chats = vec![projected_chat(selected_group, "general", 0, Some(10))];
+                    app.apply_effect_done(EffectDone {
+                        effect: Effect::Relist { account: app.selected_account_row().unwrap().account_id.clone(), include_archived: false },
+                        result: Ok(vec![serde_json::json!({"chats":[{"group_id":selected_group,"profile":{"name":"general"}}]})]),
+                    });
                     if !switches_account {
                         app.timeline.clear();
                     }
@@ -6807,6 +7061,24 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         },
                     });
 
+                    // Observe the completion itself before the FIFO fence folds
+                    // any eligible follow-up load; the recorder then proves its
+                    // presence or absence without a timing window.
+                    let loading_on_completion = app.loading_chat.clone();
+                    let completion_status = app.status.clone();
+                    finish_queued_effects(&mut app);
+                    let recorded =
+                        std::fs::read_to_string(&args_file).expect("fenced command recorder");
+                    let expected_loads = usize::from(switches_account)
+                        + usize::from(same_pane && selection_matches && completion == "without-id");
+                    assert_eq!(
+                        recorded
+                            .lines()
+                            .filter(|line| line.contains("messages timeline list"))
+                            .count(),
+                        expected_loads,
+                        "only the eligible no-ID completion may add a timeline load: {recorded}"
+                    );
                     let inserts = same_pane && completion == "with-id";
                     assert_eq!(
                         app.timeline.len(),
@@ -6814,13 +7086,13 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         "reply={reply}, completion={completion}, pane_account={pane_account:?}, pane_group={pane_group:?}"
                     );
                     assert_eq!(
-                        app.loading_chat.as_deref(),
+                        loading_on_completion.as_deref(),
                         (same_pane && selection_matches && completion == "without-id")
                             .then_some(group.as_str()),
                         "only a matching-pane no-ID completion may reload the timeline"
                     );
                     assert_eq!(
-                        app.status,
+                        completion_status,
                         if completion == "error" {
                             "error: send failed"
                         } else if reply {
@@ -6830,6 +7102,9 @@ fn completed_sends_only_insert_into_the_originating_account_and_group() {
                         },
                         "completed mutation outcomes remain visible after navigation"
                     );
+                    if same_pane && selection_matches && completion == "without-id" {
+                        finish_queued_effects(&mut app);
+                    }
                     if inserts {
                         let row = &app.timeline[0];
                         assert_eq!(row.message_id, "sent");
