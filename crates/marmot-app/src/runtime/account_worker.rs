@@ -8812,8 +8812,9 @@ fn publish_device_group_changes(
     account_label: &str,
 ) {
     client.publish_backup_restore_availability();
-    if client.take_linked_devices_changed() {
-        client.refresh_device_labels();
+    let linked_devices_changed = client.take_linked_devices_changed();
+    client.refresh_device_labels(linked_devices_changed);
+    if linked_devices_changed {
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),

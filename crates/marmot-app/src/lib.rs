@@ -2183,6 +2183,7 @@ impl MarmotApp {
             recovery_status_owed: false,
             // A fresh client cannot know what hosts last read.
             linked_devices_changed: true,
+            device_labels_refresh_due: true,
             inactive_siblings: None,
             leaving_siblings: HashMap::new(),
             sibling_chat_gaps: Default::default(),

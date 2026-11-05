@@ -867,6 +867,9 @@ pub struct AppClient {
     /// what hosts last read. The worker's account-level and applied-summary
     /// seams drain it into one `LinkedDevicesChanged`.
     pub(crate) linked_devices_changed: bool,
+    /// The connection's imported-history device labels need a successful
+    /// refresh. Kept independently of the roster-change event's drain.
+    pub(crate) device_labels_refresh_due: bool,
     /// The siblings the last maintenance pass judged inactive, by slot, so a
     /// pass that judges differently owes hosts a `LinkedDevicesChanged`.
     /// `None` until a pass has judged.

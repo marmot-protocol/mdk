@@ -367,8 +367,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Show imported history only as facts (mdk#2628 4.2d, D78, `src/client/history_imports.rs`). A row's source device
   comes from storage (`imported_from`), its name resolved at read time from the TEMP `device_labels` table: give
   storage the roster's names (`refresh_device_labels`) wherever `LinkedDevicesChanged` is drained, and before an
-  import while `linked_devices_changed` is pending (a new connection starts with none), never store them; never at
+  import while `linked_devices_changed` or a label refresh is pending (a new connection starts with none), never store them; never at
   client open, which must not hydrate the device group; `linked_devices` gives them too, for hosts with no worker.
+  Failed roster reads or label writes retain only client-local refresh work, retried at each device-group seam and
+  before an import until storage accepts the labels. Retry alone never raises `LinkedDevicesChanged`.
   `chat_history_imports` lists held chats only, from parked deliveries and the latest import.
   `ChatHistoryImportsChanged` follows the answer, never a list of sources: storage's TEMP triggers count every change
   to what it reads (`app_event_imports`, cascades included; `history_deliveries_parked`; `device_labels`), and

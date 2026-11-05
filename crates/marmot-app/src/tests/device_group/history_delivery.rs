@@ -345,9 +345,8 @@ async fn name_phone(devices: &mut Devices, group: &GroupId, label: &str) {
 /// names again when the linked devices may have changed, and say whether
 /// hosts owe a `ChatHistoryImportsChanged`.
 fn device_group_seam(client: &mut AppClient) -> bool {
-    if client.take_linked_devices_changed() {
-        client.refresh_device_labels();
-    }
+    let linked_devices_changed = client.take_linked_devices_changed();
+    client.refresh_device_labels(linked_devices_changed);
     client.take_chat_history_imports_changed()
 }
 
@@ -1714,7 +1713,7 @@ async fn an_imported_row_names_the_device_it_came_from() {
         sources(&devices),
         [Some(phone_named(&devices, "Old phone")), None]
     );
-    devices.laptop.refresh_device_labels();
+    devices.laptop.refresh_device_labels(true);
     assert!(
         !devices.laptop.take_chat_history_imports_changed(),
         "the same names again change nothing"
