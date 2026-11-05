@@ -36,6 +36,10 @@ pub(crate) struct TuiApp {
     /// `Enter`; `Esc` discards it.
     pub(crate) picker_selection: usize,
     pub(crate) chats: Vec<ChatRow>,
+    /// Account that produced the last successful complete chat-list snapshot.
+    /// Selection can move before a refresh fails, leaving these rows on screen.
+    /// Incremental updates must match this owner rather than the highlight.
+    pub(crate) chats_account_id: Option<String>,
     pub(crate) selected_chat: usize,
     pub(crate) messages_account_id: Option<String>,
     pub(crate) messages_group_id: Option<String>,
@@ -69,9 +73,10 @@ pub(crate) struct TuiApp {
     /// search is outstanding. A `UserSearch` result is folded only while its
     /// query still matches (the same stale guard as `loading_chat`).
     pub(crate) searching_users: Option<String>,
-    /// The query of the most recently requested message search, or `None`. A
-    /// `MessageSearch` result folds only while its query still matches.
-    pub(crate) searching_messages: Option<String>,
+    /// The account, group and query of the outstanding message search. Keeping
+    /// its owner lets a completion settle abandoned work without consuming a
+    /// replacement pane's identical query.
+    pub(crate) searching_messages: Option<(String, String, String)>,
     /// The group id of the group-detail load in flight, or `None`. A
     /// `LoadGroupDetail` result is folded only while it still matches.
     pub(crate) loading_group_detail: Option<String>,
@@ -168,6 +173,7 @@ impl TuiApp {
             selected_account: 0,
             picker_selection: 0,
             chats: Vec::new(),
+            chats_account_id: None,
             selected_chat: 0,
             messages_account_id: None,
             messages_group_id: None,

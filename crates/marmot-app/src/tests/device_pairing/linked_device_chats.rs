@@ -353,7 +353,7 @@ async fn receive_account_choice(
 }
 
 /// One real external Add admits both linked copies with one generation.
-async fn invite_account_for_leave(
+async fn invite_account_pending(
     relay: &Arc<ScriptedPushRelayClient>,
     phone: &mut Device,
     laptop: &mut Device,
@@ -403,9 +403,22 @@ async fn invite_account_for_leave(
     for device in [&mut *phone, &mut *laptop] {
         deliver_new(&mut device.client, relay, &mut device.cursor).await;
         device.client.sync().await.unwrap();
-        device.client.accept_group_invite(&chat).unwrap();
     }
     (dir, bob, chat)
+}
+
+async fn invite_account_for_leave(
+    relay: &Arc<ScriptedPushRelayClient>,
+    phone: &mut Device,
+    laptop: &mut Device,
+    admin: bool,
+    relays: Option<Vec<String>>,
+) -> (tempfile::TempDir, AppClient, GroupId) {
+    let invitation = invite_account_pending(relay, phone, laptop, admin, relays).await;
+    for device in [phone, laptop] {
+        device.client.accept_group_invite(&invitation.2).unwrap();
+    }
+    invitation
 }
 
 async fn await_account_departure(
@@ -923,6 +936,128 @@ async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
     assert!(
         recorded,
         "the first deferred startup drain must retain the authenticated sibling departure"
+    );
+}
+
+/// A canonical disband can keep a pending Member projection. A later
+/// authenticated Accept retains its value but owes no acceptance of that tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_accept_retires_only_its_disbanded_invitation_work() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, mut bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let account = phone.app.account_storage("alice").unwrap();
+    let generation = account
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    assert!(
+        phone
+            .client
+            .state_group_record(&chat)
+            .unwrap()
+            .pending_confirmation
+    );
+
+    bob.disband_group(&chat).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let effects = bob.runtime.advance_convergence(&chat).await.unwrap();
+            bob.observe_drained_session_events(&effects).await.unwrap();
+            deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+            let effects = phone
+                .client
+                .runtime
+                .advance_convergence(&chat)
+                .await
+                .unwrap();
+            phone
+                .client
+                .observe_drained_session_events(&effects)
+                .await
+                .unwrap();
+            if phone
+                .client
+                .runtime
+                .group_record(&chat)
+                .unwrap()
+                .disbanded
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual external-admin disband canonically settles");
+    let native = phone.client.runtime.group_record(&chat).unwrap();
+    assert!(native.disbanded.is_some());
+    assert!(!native.removed && !native.unrecoverable);
+    let saved = phone.app.group("alice", &chat_hex).unwrap().unwrap();
+    assert!(saved.disbanded && saved.pending_confirmation);
+    assert_eq!(saved.self_membership, crate::SelfMembership::Member);
+    assert!(account.leave_request(&chat).unwrap().is_none());
+    assert_eq!(
+        account
+            .invitation_admission(&chat)
+            .unwrap()
+            .unwrap()
+            .generation,
+        generation
+    );
+
+    receive_account_choice(&relay, &mut laptop, &mut phone, &chat, 1, false).await;
+    let storage = account.app_storage();
+    let decision = storage
+        .invitation_decision(&chat_hex, &generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.version, 1);
+    assert!(!decision.declined);
+    assert!(
+        storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision == decision && work.apply_owed && !work.decline_owed)
+    );
+    let unsent = storage.unsent_invitation_decisions().unwrap();
+
+    phone.client.drive_invitation_decisions().await;
+    assert!(
+        !storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision == decision && work.apply_owed),
+        "canonical disband ends only this acceptance work"
+    );
+    assert_eq!(
+        storage.invitation_decision(&chat_hex, &generation).unwrap(),
+        Some(decision)
+    );
+    assert_eq!(storage.unsent_invitation_decisions().unwrap(), unsent);
+    assert!(account.leave_request(&chat).unwrap().is_none());
+    let saved = phone.app.group("alice", &chat_hex).unwrap().unwrap();
+    assert!(
+        saved.disbanded && saved.pending_confirmation,
+        "retiring work does not accept or rewrite the terminal projection"
+    );
+    phone.client.drive_invitation_decisions().await;
+    assert!(
+        !storage
+            .invitation_decision_work()
+            .unwrap()
+            .iter()
+            .any(|work| work.decision.group_id_hex == chat_hex
+                && work.decision.generation == generation
+                && work.apply_owed)
     );
 }
 
@@ -1829,10 +1964,11 @@ async fn a_terminal_gap_add_waits_for_its_existing_claim_before_retrying() {
 }
 
 /// An unreadable target row cannot prevent a healthy later sibling from
-/// filling the same chat. Both stock and settings readiness fail locally.
+/// filling the same chat. Both stock and settings readiness fail locally;
+/// the approver's direct post-link pass also isolates settings read errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_target_state_does_not_starve_another_sibling_in_the_same_chat() {
-    for corrupt_settings in [false, true] {
+    for (corrupt_settings, direct) in [(false, false), (true, false), (true, true)] {
         let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
         let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
             (first, second)
@@ -1874,17 +2010,201 @@ async fn unreadable_target_state_does_not_starve_another_sibling_in_the_same_cha
                 )
                 .unwrap();
         }
-        phone
-            .client
-            .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
-            .await;
+        if direct {
+            let links = phone
+                .app
+                .account_storage("alice")
+                .unwrap()
+                .app_storage()
+                .device_links()
+                .unwrap();
+            let linked_slots: Vec<_> = links
+                .iter()
+                .filter(|link| link.group_id_hex == hex::encode(group.as_slice()))
+                .map(|link| link.slot_hex.as_str())
+                .collect();
+            assert_eq!(
+                linked_slots,
+                vec![first.slot_hex().as_str(), second.slot_hex().as_str()],
+                "the unreadable device precedes the healthy device in the direct pass"
+            );
+            phone
+                .client
+                .add_linked_devices_to_chats(&[], &mut Default::default())
+                .await;
+        } else {
+            phone
+                .client
+                .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+                .await;
+        }
         assert_eq!(taken_from(&phone, &first), 0);
         assert_eq!(
             taken_from(&phone, &second),
             1,
-            "the healthy target progresses, settings row corrupt: {corrupt_settings}"
+            "the healthy target progresses, settings row corrupt: {corrupt_settings}, direct: {direct}"
         );
         assert_eq!(leaves_of(&phone, &second, &chat, &group), 1);
+    }
+}
+
+/// A settings journal read failure retains only that receiver's debt. The
+/// healthy later receiver still receives its actual inline or Blossom history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_history_target_does_not_starve_another_sibling() {
+    use crate::tests::device_group::history_delivery::{local_blossom, send_text, use_blossom};
+    use cgka_traits::app_components::BLOSSOM_LOCATOR_KIND_V1;
+    use cgka_traits::storage::SiblingAddStorage as _;
+
+    for blossom in [false, true] {
+        let (relay, [mut phone, first, second]) = alice_devices::<3>().await;
+        let (mut first, mut second) = if first.slot_hex() < second.slot_hex() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if blossom {
+            // Only this real HTTP fixture needs the existing dev dial opt-in;
+            // reopen so both transports are built with that configuration.
+            phone.app.config.allow_loopback_blob_endpoints = true;
+            second.app.config.allow_loopback_blob_endpoints = true;
+            phone = reopen(phone).await;
+            second = reopen(second).await;
+        }
+        let chat = chats(&mut phone, 1).await.remove(0);
+        let server = blossom.then(local_blossom);
+        if let Some(server) = &server {
+            use_blossom(
+                &mut phone.client,
+                &chat,
+                BLOSSOM_LOCATOR_KIND_V1,
+                &server.url,
+            )
+            .await;
+        }
+        let content = if blossom {
+            "history".repeat(20_000)
+        } else {
+            "before either sibling".to_owned()
+        };
+        let message = send_text(&mut phone.client, &chat, &content).await;
+        let group = link(&relay, &mut phone, &mut first, "First").await;
+        hold_key_packages(&relay, &mut phone, &mut first).await;
+        link(&relay, &mut phone, &mut second, "Second").await;
+        hold_key_packages(&relay, &mut phone, &mut second).await;
+        phone
+            .client
+            .fill_sibling_chat_gaps(&[], 2, &mut Default::default())
+            .await;
+        for receiver in [&first, &second] {
+            assert_eq!(leaves_of(&phone, receiver, &chat, &group), 1);
+        }
+        let account = phone.app.account_storage("alice").unwrap();
+        let storage = account.app_storage();
+        let adds = account.sibling_adds().unwrap();
+        assert_eq!(
+            adds.len(),
+            2,
+            "real confirmed Adds owe both receivers history"
+        );
+        assert!(adds.iter().all(|add| add.group_id == chat));
+        if blossom {
+            phone.client.drive_history_deliveries().await;
+            let due = storage
+                .due_blossom_history_deliveries(u64::MAX / 2)
+                .unwrap();
+            assert_eq!(due.len(), 2, "both real histories exceed the inline limit");
+            assert_eq!(due[0].receiver_slot_hex, first.slot_hex());
+        }
+        for device in [&mut phone, &mut first, &mut second] {
+            converge_device_group(&mut device.client, &relay, &mut device.cursor, &group, 8).await;
+        }
+        phone
+            .client
+            .rename_linked_device(&first.slot_hex(), "Unreadable history settings")
+            .await
+            .unwrap();
+        assert_eq!(
+            account_database(&phone.app)
+                .execute(
+                    "UPDATE device_renames SET label = x'00' WHERE slot_id_hex = ?1",
+                    [first.slot_hex()],
+                )
+                .unwrap(),
+            1,
+            "fault a journal row produced by the actual host edit"
+        );
+        if blossom {
+            let before = storage.unsent_history_deliveries().unwrap();
+            let bad = before
+                .iter()
+                .find(|owed| owed.receiver_slot_hex == first.slot_hex())
+                .unwrap();
+            let upload = phone
+                .client
+                .prepare_history_upload()
+                .unwrap()
+                .expect("the healthy later history is prepared");
+            let after = storage.unsent_history_deliveries().unwrap();
+            let deferred = after
+                .iter()
+                .find(|owed| owed.receiver_slot_hex == first.slot_hex())
+                .unwrap();
+            assert_eq!(
+                deferred.owed_at, bad.owed_at,
+                "backoff does not renew retention"
+            );
+            assert_eq!(deferred.blossom_attempts, bad.blossom_attempts + 1);
+            assert!(deferred.blossom_due_at > bad.blossom_due_at);
+            let outcome = upload.run().await;
+            assert!(phone.client.finish_history_upload(outcome).await);
+        } else {
+            phone.client.drive_history_deliveries().await;
+        }
+        let remaining = storage.unsent_history_deliveries().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the unreadable receiver stays owed, Blossom: {blossom}"
+        );
+        assert_eq!(remaining[0].receiver_slot_hex, first.slot_hex());
+        assert_eq!(
+            remaining[0].owed_at,
+            adds.iter()
+                .find(|add| hex::encode(add.slot) == first.slot_hex())
+                .unwrap()
+                .added_at
+        );
+        deliver_new(&mut second.client, &relay, &mut second.cursor).await;
+        second.client.join_stashed_sibling_welcomes().await;
+        assert!(
+            joined(&second, &chat),
+            "the receiver joins its actual sibling Welcome"
+        );
+        second.client.drive_history_deliveries().await;
+        if blossom {
+            second.client.drive_history_blobs().await;
+        }
+        let imported = second
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .timeline_message(&hex::encode(chat.as_slice()), &message)
+            .unwrap()
+            .expect("the healthy sibling imports the actual history");
+        assert_eq!(imported.plaintext, content);
+        assert_eq!(
+            second
+                .app
+                .account_storage("alice")
+                .unwrap()
+                .app_storage()
+                .app_event_import_source(&hex::encode(chat.as_slice()), &message)
+                .unwrap(),
+            Some(hex::decode(phone.slot_hex()).unwrap().try_into().unwrap()),
+            "the message came from the history delivery, not ordinary relay backlog"
+        );
     }
 }
 

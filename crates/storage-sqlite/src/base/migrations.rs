@@ -1754,13 +1754,24 @@ mod tests {
         )
         .unwrap();
         run_through(&mut conn, 171).unwrap();
-        let row: (String, Vec<u8>, Vec<u8>, Option<u8>) = conn.query_row(
-            "SELECT label, written, replaced, settings FROM device_renames WHERE slot_id_hex = 'aa'", [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        let row: (String, Vec<u8>, Vec<u8>, Option<u8>) = conn
+            .query_row(
+                "SELECT label, written, replaced, settings FROM device_renames WHERE slot_id_hex = 'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
         assert_eq!(row, ("Laptop".into(), vec![3; 16], vec![0; 17], None));
         conn.execute("UPDATE device_renames SET settings = 5", [])
             .unwrap();
-        assert!(conn.execute("UPDATE device_renames SET settings = 8", []).is_err_and(|error| matches!(error, rusqlite::Error::SqliteFailure(ref inner, _) if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK)));
+        let error = conn
+            .execute("UPDATE device_renames SET settings = 8", [])
+            .expect_err("settings above the three-bit mask must fail");
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(ref inner, _)
+                if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK
+        ));
     }
 
     /// D91 makes unknown pre-upgrade activity ineligible until a later source

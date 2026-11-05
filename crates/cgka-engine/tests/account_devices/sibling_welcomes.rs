@@ -944,7 +944,7 @@ async fn a_sibling_added_while_its_add_waits_is_not_added_again_at_drain() {
         assert!(sibling_rows(&phone, &gid).is_empty());
         assert_eq!(
             phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
-            Some(SiblingAddRefusal::KeyPackage),
+            Some(SiblingAddRefusal::AlreadyPresent),
             "the selected tree already holds this sibling under another MLS key"
         );
         assert_refused(
@@ -991,7 +991,7 @@ async fn an_untagged_existing_sibling_is_refused_until_its_leaf_is_removed() {
     let before_rows = rows(&phone, &gid);
     assert_eq!(
         phone.engine.sibling_add_refusal(&gid, &candidate).unwrap(),
-        Some(SiblingAddRefusal::KeyPackage)
+        Some(SiblingAddRefusal::AlreadyPresent)
     );
     assert_other_error(
         phone

@@ -456,8 +456,8 @@ Welcomes travel privately through the device group, independently of the other a
 `MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
 the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
 its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
-`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, and in every release build
-until the roster's spec lands. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
+`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while explicit
+device-group capability and runtime intent are absent. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
 says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
 change.
 
@@ -478,7 +478,10 @@ changes any linked device's supplied settings, this device included. Each settin
 from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
 A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
 eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
-does not leave joined chats. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458). With
+three or more devices, it can race another sibling's gap filling and cause extra Add attempts, private-KeyPackage
+consumption, or Commits and convergence passes; selected-parent presence checks and ordinary branch selection still
+apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 is stored for automatic inactivity removal; it does not cancel explicit removal or sign-out.
 
@@ -617,8 +620,8 @@ publish is still unannounced, and the slot's newest publication by this device i
 days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
 announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
 `MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
-time the account's worker opens or reconnects. It is false, and the event silent, in every release build until the
-roster's spec lands.
+time the account's worker opens or reconnects. It is false, and the event silent, without explicit device-group
+capability and runtime intent.
 
 ## Unrecognized sign-ins
 
@@ -630,8 +633,8 @@ whether it was them. The account checks its slots at open, every six hours, and 
 arrives live; `check_sign_ins` checks now. `answer_sign_in` takes a `SignInResponse`: `NotNow` keeps one listed
 without a prompt, `Reject` records it as rejected in the device group's roster, and `Dismiss` ends a prompt another
 device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
-and also fires once each time the account's worker opens or reconnects. All of it is empty and silent in every release
-build until the roster's spec lands.
+and also fires once each time the account's worker opens or reconnects. All of it is empty and silent without explicit
+device-group capability and runtime intent.
 
 `start_fresh` is the answer when the user no longer has the devices the first check found: every sign-in from before
 this device is answered Not now, now and when one is listed later, and nothing is rejected, so one of them can still
@@ -651,13 +654,14 @@ already in the first roster this device trusts count as seen, and a rejected sig
 a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
 branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
 host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
-each time the account's worker opens. All of it is empty and silent in every release build until the roster's spec
-lands.
+each time the account's worker opens. All of it is empty and silent without explicit device-group capability and
+runtime intent.
 
 ## Linking a new device
 
-Device linking (mdk#2628) runs through the account runtime, and only in builds with `unreleased-device-pairing` and
-`dev_device_groups`; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+Device linking (mdk#2628) runs through the account runtime. It requires the `unreleased-device-pairing` feature,
+explicit device-group build capability (`dev-device-groups`, or policy-test builds), and the per-client
+`dev_device_groups` runtime intent; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from

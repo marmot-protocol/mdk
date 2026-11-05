@@ -397,17 +397,21 @@ impl TuiApp {
             Effect::LoadTimeline { account, group } => {
                 self.fold_load_timeline(account, group, result);
             }
-            Effect::MarkRead { group, .. } => {
-                self.fold_mark_read(group, result);
+            Effect::MarkRead { account, group } => {
+                self.fold_mark_read(account, group, result);
             }
-            Effect::GroupDiagnostics { group, .. } => {
-                self.fold_group_diagnostics(group, result);
+            Effect::GroupDiagnostics { account, group } => {
+                self.fold_group_diagnostics(account, group, result);
             }
-            Effect::UserSearch { query, .. } => {
-                self.fold_user_search(query, result);
+            Effect::UserSearch { account, query } => {
+                self.fold_user_search(account, query, result);
             }
-            Effect::MessageSearch { query, .. } => {
-                self.fold_message_search(query, result);
+            Effect::MessageSearch {
+                account,
+                group,
+                query,
+            } => {
+                self.fold_message_search(account, group, query, result);
             }
             Effect::LoadGroupDetail { account, group } => {
                 self.fold_group_detail(account, group, result);
@@ -520,9 +524,9 @@ impl TuiApp {
     /// Fold a completed send/reply, exactly as the synchronous path did: report
     /// the publish status and, while the pane still shows the target chat, insert
     /// the optimistic row the timeline projection later upserts over by id. A row
-    /// for a chat the user has since left is dropped (the send still happened;
-    /// its group feed surfaces it on return). With no returned id, reload the
-    /// page like the synchronous path did.
+    /// for an account/chat the user has since left is dropped (the send still
+    /// happened; its group feed surfaces it on return). With no returned id,
+    /// reload the page like the synchronous path did.
     fn fold_optimistic_send(
         &mut self,
         account: String,
@@ -540,7 +544,9 @@ impl TuiApp {
             }
         };
         let status = publish_status(action, &result);
-        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+        if self.messages_account_id.as_deref() == Some(account.as_str())
+            && self.messages_group_id.as_deref() == Some(group.as_str())
+        {
             if let Some(message_id) = result
                 .get("message_ids")
                 .and_then(Value::as_array)
@@ -570,7 +576,14 @@ impl TuiApp {
                 {
                     self.timeline_scroll.on_insert(index, self.timeline.len());
                 }
-            } else {
+            } else if self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                == Some(account.as_str())
+                && self.selected_chat_row().map(|row| row.group_id.as_str()) == Some(group.as_str())
+            {
+                // A no-ID completion must not redirect a pending navigation or
+                // reload a different selected account through refresh_messages.
                 let _ = self.refresh_messages();
             }
         }
@@ -1037,8 +1050,9 @@ impl TuiApp {
     }
 
     /// Fold a completed group-detail load. Dropped if a newer open superseded it
-    /// or the screen was left (`loading_group_detail` is cleared on leave, and
-    /// reloads of the same group keep it set so each reload still folds). The
+    /// or the selected account or screen changed (`loading_group_detail` is
+    /// cleared on leave, and reloads of the same group keep it set so each
+    /// reload still folds). The
     /// four results arrive in `calls()` order: members, admins, relays, show.
     fn fold_group_detail(
         &mut self,
@@ -1048,6 +1062,10 @@ impl TuiApp {
     ) {
         if self.loading_group_detail.as_deref() != Some(group.as_str())
             || !matches!(self.screen, Screen::GroupDetail)
+            || self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                != Some(account.as_str())
         {
             return;
         }
@@ -1411,7 +1429,7 @@ impl TuiApp {
             self.status = "type a query, then Enter to search".to_owned();
             return Ok(());
         }
-        self.searching_messages = Some(query.clone());
+        self.searching_messages = Some((account_id.clone(), group.clone(), query.clone()));
         self.status = "searching...".to_owned();
         self.effects.enqueue(Effect::MessageSearch {
             account: account_id,
@@ -1421,15 +1439,40 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Fold a message-search page into the view. Dropped unless its query is still
-    /// the outstanding one, so a superseded query or a left screen cannot
+    /// Fold a message-search page into its account/chat view. Dropped unless its
+    /// query and pane still match, so a superseded query or a left screen cannot
     /// repopulate the list. Landing hits moves focus into them, as user search
     /// does; an empty page leaves focus on the query so it can be edited.
-    fn fold_message_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
-        if self.searching_messages.as_deref() != Some(query.as_str()) {
+    fn fold_message_search(
+        &mut self,
+        account: String,
+        group: String,
+        query: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if !self.searching_messages.as_ref().is_some_and(
+            |(pending_account, pending_group, pending_query)| {
+                pending_account == &account && pending_group == &group && pending_query == &query
+            },
+        ) {
             return;
         }
+        // Settle this request even if the pane moved while it was running. A
+        // replacement request has a different owner and returned above.
         self.searching_messages = None;
+        if self.messages_account_id.as_deref() != Some(account.as_str())
+            || self.messages_group_id.as_deref() != Some(group.as_str())
+            || self
+                .message_search
+                .as_ref()
+                .map(|view| view.group_id.as_str())
+                != Some(group.as_str())
+        {
+            if self.status == "searching..." {
+                self.status.clear();
+            }
+            return;
+        }
         let values = match result {
             Ok(values) => values,
             Err(err) => {
@@ -1489,10 +1532,20 @@ impl TuiApp {
     }
 
     /// Fold a completed user search into the view, dropping a result whose query
-    /// no longer matches the pending search (a newer query superseded it) or
-    /// whose screen has been left.
-    fn fold_user_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
-        if self.searching_users.as_deref() != Some(query.as_str()) {
+    /// no longer matches the pending search (a newer query superseded it), whose
+    /// account is no longer selected, or whose screen has been left.
+    fn fold_user_search(
+        &mut self,
+        account: String,
+        query: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.searching_users.as_deref() != Some(query.as_str())
+            || self
+                .selected_account_row()
+                .map(|row| row.account_id.as_str())
+                != Some(account.as_str())
+        {
             return;
         }
         self.searching_users = None;
@@ -2090,6 +2143,7 @@ impl TuiApp {
             selected_account_index(&self.accounts, previous_account_id.as_deref()).unwrap_or(0);
         if self.accounts.is_empty() {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2114,6 +2168,7 @@ impl TuiApp {
     pub(crate) fn refresh_chats(&mut self) -> TuiResult<()> {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2127,6 +2182,7 @@ impl TuiApp {
         };
         if !account.local_signing {
             self.chats.clear();
+            self.chats_account_id = None;
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
@@ -2151,6 +2207,7 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
+        self.chats_account_id = Some(account.account_id.clone());
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
@@ -2324,28 +2381,51 @@ impl TuiApp {
     /// Fold a completed mark-read: apply the returned projection to the chat's
     /// row, clearing the badge. The runtime read marker is forward-only, so
     /// re-marking is idempotent. On failure the badge is left honest (never
-    /// zeroed locally) and the mark-read is re-armed for the next tick.
-    fn fold_mark_read(&mut self, group: String, result: Result<Vec<Value>, String>) {
+    /// zeroed locally) and the mark-read is re-armed only for the same loaded pane.
+    fn fold_mark_read(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
         match single_effect_value(result) {
             Ok(value) => {
-                fold_chat_projection(
-                    &mut self.chats,
-                    &mut self.selected_chat,
-                    &group,
-                    parse_chat_projection(&value),
-                );
+                // A failed refresh can leave another account's rows visible even
+                // after selection returns to this account. Only mutate the list
+                // that actually produced these rows, including off-pane chats.
+                if self.chats_account_id.as_deref() == Some(account.as_str()) {
+                    fold_chat_projection(
+                        &mut self.chats,
+                        &mut self.selected_chat,
+                        &group,
+                        parse_chat_projection(&value),
+                    );
+                }
             }
             Err(err) => {
-                self.pending_mark_read = true;
-                self.set_drain_status(format!("mark-read failed: {err}"));
+                // tick retries the loaded pane, so an old pane's failure must
+                // not schedule work or surface an error for its replacement.
+                if self.messages_account_id.as_deref() == Some(account.as_str())
+                    && self.messages_group_id.as_deref() == Some(group.as_str())
+                {
+                    self.pending_mark_read = true;
+                    self.set_drain_status(format!("mark-read failed: {err}"));
+                }
             }
         }
     }
 
     /// Fold group diagnostics for the loaded chat (the no-daemon fallback),
-    /// dropping the result if the pane has since moved to another group.
-    fn fold_group_diagnostics(&mut self, group: String, result: Result<Vec<Value>, String>) {
-        if self.messages_group_id.as_deref() != Some(group.as_str()) {
+    /// dropping the result if the pane has since moved to another account/chat.
+    fn fold_group_diagnostics(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.messages_account_id.as_deref() != Some(account.as_str())
+            || self.messages_group_id.as_deref() != Some(group.as_str())
+        {
             return;
         }
         self.group_diagnostics = Some(match single_effect_value(result) {
@@ -2398,6 +2478,9 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
+        // A complete accepted snapshot can legitimately replace a retained
+        // other-account list after a failed foreground refresh.
+        self.chats_account_id = Some(account);
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
             .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
@@ -2706,6 +2789,7 @@ impl TuiApp {
         let Some(subscription) = self.chat_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2725,6 +2809,9 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
+                    if self.chats_account_id.as_deref() != Some(account_id.as_str()) {
+                        continue;
+                    }
                     if let Some(status) = apply_chat_subscription_result(
                         &mut self.chats,
                         &mut self.selected_chat,
@@ -2860,6 +2947,7 @@ impl TuiApp {
         let Some(subscription) = self.timeline_subscription.as_ref() else {
             return false;
         };
+        let account_id = subscription.account_id.clone();
         let mut events = Vec::new();
         loop {
             match subscription.rx.try_recv() {
@@ -2892,12 +2980,17 @@ impl TuiApp {
                         ) {
                             self.pending_mark_read = true;
                         }
-                        fold_chat_projection(
-                            &mut self.chats,
-                            &mut self.selected_chat,
-                            &group_id,
-                            projection,
-                        );
+                        // The loaded pane can still belong to the old account
+                        // while a new account's list is already visible. Keep its
+                        // pane/read handling independent of the list projection.
+                        if self.chats_account_id.as_deref() == Some(account_id.as_str()) {
+                            fold_chat_projection(
+                                &mut self.chats,
+                                &mut self.selected_chat,
+                                &group_id,
+                                projection,
+                            );
+                        }
                     }
                     apply_timeline_event(
                         &mut self.timeline,

@@ -15,7 +15,9 @@ UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts
   export runs through (see `crates/marmot-uniffi-macros`).
 - `kotlin-support/`: hand-written `MarmotAndroid` and keyring JNI shim copied next to generated Kotlin.
 - Backup wrappers live in `commands/backups.rs` and `conversions/backups.rs`; the real held-pointer owner checks
-  feature refusal, stale operation tokens and observer close without replaying core restore/history tests.
+  default feature refusal, active runtime/compatibility condition forwarding, FinishedAttempt after held real I/O,
+  stale operation tokens and observer close without replaying core restore/history tests. The explicit
+  `dev-device-groups` CI selection must reach the active branch; native command calls do not prove generated-language execution.
   `conversions/conversation_window/tests.rs` owns typed provenance cache visibility; existing generated Swift/Kotlin
   projection smokes own payload/phase lift-lower and host command signatures.
 - `tests/`: Rust smoke tests plus the Swift/Kotlin sources driven by the `*-smoke.sh` scripts;

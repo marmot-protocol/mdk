@@ -772,9 +772,9 @@ fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
     }
     match error {
         AccountError::Transport(error) => transport_error_class(error),
-        AccountError::TransportRouting(_) | AccountError::WrongAccountDelivery => {
-            SyncErrorClass::Protocol
-        }
+        AccountError::TransportRouting(_)
+        | AccountError::WrongAccountDelivery
+        | AccountError::InvalidDeviceRosterEdit => SyncErrorClass::Protocol,
         _ => SyncErrorClass::Unknown,
     }
 }
@@ -817,6 +817,7 @@ fn account_error_kind(error: &AccountError) -> &'static str {
         AccountError::ClockSkewBlocked => "account_clock_skew_blocked",
         AccountError::KeyPackageRotationInProgress => "account_key_package_rotation_in_progress",
         AccountError::KeyPackageAnnouncementPending => "account_key_package_announcement_pending",
+        AccountError::InvalidDeviceRosterEdit => "account_invalid_device_roster_edit",
         AccountError::WrongAccountDelivery => "account_wrong_delivery",
         _ => "account_unknown",
     }

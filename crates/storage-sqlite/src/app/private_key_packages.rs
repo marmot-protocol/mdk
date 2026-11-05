@@ -101,47 +101,11 @@ impl SqliteAppStorage {
         received_from(&conn, issuer_slot_hex, now)
     }
 
-    /// The KeyPackage from `issuer_slot_hex` that
-    /// [`Self::take_received_private_key_package`] would take at `now`, left
-    /// in place.
-    pub fn next_received_private_key_package(
-        &self,
-        issuer_slot_hex: &str,
-        now: u64,
-    ) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
-        let conn = self.lock()?;
-        next_received(&conn, issuer_slot_hex, now)
-    }
-
-    /// Take one KeyPackage from `issuer_slot_hex` to use at `now`: the usable
-    /// one that expires first, else the unexpired one that expires last.
-    /// `None` when it holds none unexpired. Its ref stays, its bytes dropped,
-    /// until it expires, so it is not kept again if handed over again.
-    pub fn take_received_private_key_package(
-        &self,
-        issuer_slot_hex: &str,
-        now: u64,
-    ) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let Some(taken) = next_received(&tx, issuer_slot_hex, now)? else {
-            return Ok(None);
-        };
-        tx.execute_cached(
-            "UPDATE private_key_packages_received SET taken_at = ?2, key_package = X''
-             WHERE key_package_ref_hex = ?1",
-            params![taken.key_package_ref_hex, u64_to_i64(now)?],
-        )
-        .storage()?;
-        tx.commit().storage()?;
-        Ok(Some(taken))
-    }
-
     /// Claim exactly the received record the caller validated, if it is still
     /// held, unchanged and unexpired at `now`. Never substitute another row
     /// when ranking changes or the selected record is no longer eligible.
-    /// The single atomic update keeps the used ref and erases its bytes, as
-    /// [`Self::take_received_private_key_package`] does.
+    /// The single atomic update erases its bytes and keeps the used ref until
+    /// the record expires, so a repeated hand-off cannot make it usable again.
     pub fn take_received_private_key_package_exact(
         &self,
         candidate: &ReceivedPrivateKeyPackage,
@@ -244,21 +208,6 @@ impl SqliteAppStorage {
             .storage()?;
         Ok(())
     }
-}
-
-/// The KeyPackage from `issuer_slot_hex` to use at `now`, as
-/// [`SqliteAppStorage::take_received_private_key_package`] chooses it.
-fn next_received(
-    conn: &rusqlite::Connection,
-    issuer_slot_hex: &str,
-    now: u64,
-) -> StorageResult<Option<ReceivedPrivateKeyPackage>> {
-    let held = received_from(conn, issuer_slot_hex, now)?;
-    Ok(held
-        .iter()
-        .find(|record| record.usable_at(now))
-        .or_else(|| held.last())
-        .cloned())
 }
 
 fn received_from(
@@ -383,39 +332,6 @@ mod tests {
         );
     }
 
-    /// A usable KeyPackage goes first, the one expiring soonest; with none
-    /// usable, the unexpired one that lasts longest; never an expired one.
-    #[test]
-    fn taking_prefers_usable_then_longest_lasting() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        store
-            .insert_received_private_key_packages(&[
-                received("old", "aa", 0),
-                received("new", "aa", 40),
-                received("newest", "aa", 45),
-                received("other", "bb", 0),
-            ])
-            .unwrap();
-        // At 60, "old" is past halfway (50), the other two are usable.
-        let taken = store.take_received_private_key_package("aa", 60).unwrap();
-        assert_eq!(taken.unwrap().key_package_ref_hex, "new");
-        // At 96, none is usable; "newest" lasts longest.
-        let taken = store.take_received_private_key_package("aa", 96).unwrap();
-        assert_eq!(taken.unwrap().key_package_ref_hex, "newest");
-        // At 100, "old" has expired.
-        assert_eq!(
-            store.take_received_private_key_package("aa", 100).unwrap(),
-            None
-        );
-        assert_eq!(
-            store
-                .delete_expired_received_private_key_packages(100)
-                .unwrap(),
-            2
-        );
-        assert!(store.received_private_key_packages().unwrap().is_empty());
-    }
-
     /// Selection may cross halfway while its candidate is checked. Claiming
     /// that candidate must not spend the newly preferred allocation instead.
     #[test]
@@ -427,14 +343,10 @@ mod tests {
             .insert_received_private_key_packages(&[a.clone(), b.clone()])
             .unwrap();
         let candidate = store
-            .next_received_private_key_package("aa", 49)
+            .received_private_key_packages_from("aa", 49)
             .unwrap()
-            .unwrap();
+            .remove(0);
         assert_eq!(candidate, a);
-        assert_eq!(
-            store.next_received_private_key_package("aa", 50).unwrap(),
-            Some(b.clone())
-        );
         assert!(
             store
                 .take_received_private_key_package_exact(&candidate, 50)
@@ -577,8 +489,11 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let batch = [received("a1", "aa", 0)];
         store.insert_received_private_key_packages(&batch).unwrap();
-        let taken = store.take_received_private_key_package("aa", 10).unwrap();
-        assert_eq!(taken.unwrap().key_package_ref_hex, "a1");
+        assert!(
+            store
+                .take_received_private_key_package_exact(&batch[0], 10)
+                .unwrap()
+        );
         // The taken private bytes are gone, not only hidden.
         let kept: i64 = store
             .lock()
@@ -596,9 +511,10 @@ mod tests {
             0
         );
         assert!(store.received_private_key_packages().unwrap().is_empty());
-        assert_eq!(
-            store.take_received_private_key_package("aa", 10).unwrap(),
-            None
+        assert!(
+            !store
+                .take_received_private_key_package_exact(&batch[0], 10)
+                .unwrap()
         );
         assert_eq!(
             store
