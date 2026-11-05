@@ -1063,6 +1063,14 @@ a committed demotion remains if the following Leave fails. Already admitted nati
 owner. A SelfRemove applied without readable sibling attribution establishes no new automatic-Add hold, and later
 repair does not promise to recover that attribution retroactively.
 
+A local chat copy that has applied its own removal stays terminal: later branch changes do not resume convergence
+on that copy. Rejoining requires a fresh valid Welcome that replaces its cryptographic state; an invitation alone is
+not a guarantee of recovery. The remaining members do not promise to recommit every removal forever. An admin's
+account-removal intent has at most two reissues, checked against the selected membership and the author's current
+authority. Device-removal cleanup has its own current-roster and remembered-key conditions. A currently authorized
+admin can use the membership controls for eligible stale membership; automatic inactivity removal is not available yet. Keep
+showing the selected membership and removal outcome rather than assuming every branch has permanently removed a leaf.
+
 At the maximum decision version, an opposite invitation choice is refused and the held winner remains; ordinary User
 Leave still proceeds without writing another version. Retained invitation generations have no expiry or count cap:
 a malicious currently linked device can inflate stored decisions and broadcast pages.
