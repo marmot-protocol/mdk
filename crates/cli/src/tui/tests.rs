@@ -3441,12 +3441,11 @@ fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
     };
     let mut app = test_tui_app(client, &account_id);
     app.daemon = DaemonView::default(); // no live subscriptions to drain
-    // A is selected; a NewMessage for another chat armed a background re-list.
-    app.chats = vec![
-        projected_chat(&group_a, "a", 0, Some(100)),
-        projected_chat(&group_b, "b", 1, Some(50)),
-    ];
-    app.selected_chat = 0;
+    // A notification can arm the re-list before the chat feed has populated.
+    assert!(
+        app.chats.is_empty(),
+        "an empty list must still be refreshed"
+    );
     app.pending_chat_relist = true;
 
     // tick queues the re-list off the event loop (it never runs `chats list` on the
@@ -3457,7 +3456,13 @@ fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
         "the debounce clears when the re-list is queued"
     );
 
-    // Folding the worker's result reorders the list but keeps A selected by id.
+    // Before the result is folded, the chat feed can populate and A can be
+    // selected. The late re-list must preserve that selection while reordering.
+    app.chats = vec![
+        projected_chat(&group_a, "a", 0, Some(100)),
+        projected_chat(&group_b, "b", 1, Some(50)),
+    ];
+    app.selected_chat = 0;
     app.settle_effects(1);
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
     assert!(
@@ -9775,12 +9780,12 @@ fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
     };
     let mut app = test_tui_app(client, &account_id);
     app.daemon.running = false;
-    app.chats = vec![flick_chat(&"bb".repeat(32), "loaded")];
     app.focus = Focus::Messages;
     app.messages_account_id = Some(account_id.clone());
     app.messages_group_id = Some("bb".repeat(32));
     app.timeline = vec![timeline_row("m0", 0)];
 
+    assert!(app.chats.is_empty(), "dispatch needs only the loaded pane");
     app.handle_key(char_key('u')).expect("u");
 
     assert_eq!(
@@ -9794,6 +9799,9 @@ fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
         "the subprocess runs off-loop; the in-flight status is honest"
     );
 
+    // A chat-feed update may arrive while the action is in flight. At fold
+    // time, a mistaken reload must have a real selected chat to target.
+    app.chats = vec![flick_chat(&"bb".repeat(32), "loaded")];
     app.settle_effects(1);
     assert_eq!(app.status, "removed reaction");
     assert_eq!(
