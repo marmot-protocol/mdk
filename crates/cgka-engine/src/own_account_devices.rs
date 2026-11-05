@@ -561,7 +561,7 @@ impl<S: StorageProvider> Engine<S> {
             });
             if present {
                 return refused(
-                    SiblingAddRefusal::KeyPackage,
+                    SiblingAddRefusal::AlreadyPresent,
                     "the chat already holds the sibling",
                 );
             }

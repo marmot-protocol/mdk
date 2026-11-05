@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Retire a delayed Accept's application work after a completed native disband, while preserving the invitation
-  decision and terminal chat projection. Unrecoverable or unreadable native state still keeps work owed.
-  This avoids repeated maintenance checks; host APIs, membership, wire format and database schema are unchanged.
+- Invalid device-roster marker edits now return the additive Rust `AccountError::InvalidDeviceRosterEdit`,
+  rather than an engine serialization error. Lower-level Rust callers matching those errors should adopt the
+  new case. The privacy kind is `account_invalid_device_roster_edit`; the Protocol sync class, CLI `engine_error`
+  code and foreign Runtime categories are unchanged. No schema, wire or foreign ABI migration is required.
 
 - Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
   Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
@@ -159,6 +160,10 @@
   A known current-generation decline holds new automatic sibling Adds; private stock follows ordinary rules. A decline
   does not reach a copy this device already deleted locally. A higher
   acceptance wakes existing opt-in work without recalling admitted traffic or changing another generation.
+
+- Retire a delayed Accept's application work after a completed native disband, while preserving the invitation
+  decision and terminal chat projection. Unrecoverable or unreadable native state still keeps work owed.
+  This avoids repeated maintenance checks; host APIs, membership, wire format and database schema are unchanged.
 
 - Linked devices fill missing sibling chat memberships with private
   KeyPackages and sibling Welcomes (mdk#2628 3.5e). Kind 458 carries a
