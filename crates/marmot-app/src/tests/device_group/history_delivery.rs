@@ -665,6 +665,111 @@ async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
     );
 }
 
+/// A genuine history delivery whose import write fails stays in the retained
+/// projection and imports once ordinary projection replay can write again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_delivery_whose_import_write_fails_is_kept_on_retry() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    add_laptop(&mut devices, &chat).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let laptop_storage = storage(&devices.laptop_app);
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    let publications = devices.relay.published_events.lock().unwrap()[before..].to_vec();
+    let [event] = publications.as_slice() else {
+        panic!("one genuine carrier sends the inline history");
+    };
+    assert_eq!(
+        event.kind,
+        transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE
+    );
+
+    laptop_storage
+        .execute_batch_for_test(
+            "CREATE TRIGGER fail_history_import BEFORE INSERT ON app_event_imports
+             BEGIN SELECT RAISE(ABORT, 'injected history import failure'); END;",
+        )
+        .unwrap();
+    let account = devices.laptop_app.account_home().account("alice").unwrap();
+    let delivery = cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        group_id_hint: None,
+        message: event.to_transport_message().unwrap(),
+        received_at: cgka_traits::Timestamp(unix_now_seconds()),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".into()),
+            plane: cgka_traits::TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    let failed = devices.laptop.ingest_received_delivery(delivery).await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        laptop_storage
+            .app_event_import_source(&chat_hex, &first)
+            .unwrap(),
+        None
+    );
+
+    laptop_storage
+        .execute_batch_for_test("DROP TRIGGER fail_history_import")
+        .unwrap();
+    // Replay only the already accepted carrier: there is no retransmission or
+    // direct call to the kind473 parser or history import owner here.
+    devices.laptop.drain_pending_session_events().await.unwrap();
+    let imported = laptop_storage
+        .timeline_message(&chat_hex, &first)
+        .unwrap()
+        .expect("retained projection replay imports the history after storage recovers");
+    assert_eq!(imported.plaintext, "before the laptop");
+    assert_eq!(
+        laptop_storage
+            .app_event_import_source(&chat_hex, &first)
+            .unwrap(),
+        Some(slot_of(&devices.phone))
+    );
+    assert!(
+        matches!(failed, Err(AppError::Storage(cgka_traits::storage::StorageError::Backend(ref detail)))
+        if detail.contains("injected history import failure")),
+        "the failure must reach the authenticated history import write: {failed:?}"
+    );
+
+    devices.laptop.drain_pending_session_events().await.unwrap();
+    let page = devices
+        .laptop_app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(chat_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        page.messages
+            .iter()
+            .filter(|message| message.message_id_hex == first)
+            .count(),
+        1
+    );
+    assert_eq!(
+        laptop_storage
+            .device_group_messages()
+            .unwrap()
+            .iter()
+            .filter(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+            .count(),
+        1
+    );
+}
+
 /// A delivery the laptop reads before it holds the chat waits for it, and the
 /// laptop's next maintenance pass after joining imports it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
