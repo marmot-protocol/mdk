@@ -166,7 +166,7 @@ fn infer(text: &str) -> Option<String> {
         // digits and mathematical letters can map into ASCII during IDNA.
         let (normalized, status) = idna::domain_to_unicode(&ascii);
         status.ok()?;
-        if ambiguous_first_label(&normalized) {
+        if ambiguous_host_labels(&normalized) {
             return None;
         }
     }
@@ -191,23 +191,24 @@ fn infer(text: &str) -> Option<String> {
 }
 
 /// Refuse ambiguous glued prose without guessing a different host suffix.
-fn ambiguous_first_label(host: &str) -> bool {
-    let first = host.split('.').next().unwrap_or(host);
-    if first.is_ascii() {
-        return false;
-    }
-    let mut latin_or_digit = false;
-    let mut unspaced = false;
-    for c in first.chars() {
-        latin_or_digit |= c.is_ascii_digit() || c.script() == Script::Latin;
-        if !c.is_ascii() {
-            unspaced |= matches!(
-                c.script(),
-                Script::Han | Script::Hiragana | Script::Katakana | Script::Thai
-            );
+fn ambiguous_host_labels(host: &str) -> bool {
+    host.split('.').any(|label| {
+        if label.is_ascii() {
+            return false;
         }
-    }
-    latin_or_digit && unspaced
+        let mut latin_or_digit = false;
+        let mut unspaced = false;
+        for c in label.chars() {
+            latin_or_digit |= c.is_ascii_digit() || c.script() == Script::Latin;
+            if !c.is_ascii() {
+                unspaced |= matches!(
+                    c.script(),
+                    Script::Han | Script::Hiragana | Script::Katakana | Script::Thai
+                );
+            }
+        }
+        latin_or_digit && unspaced
+    })
 }
 
 /// Reserved Nostr-looking prefixes must remain inert even after IDNA mapping.

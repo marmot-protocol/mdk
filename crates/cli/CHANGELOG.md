@@ -15,7 +15,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Message Markdown recognizes scheme-less web domains using offline IANA root data
   and IDNA-validated HTTPS destinations, preserving authored labels. Common filename
-  endings stay text; explicit URLs retain their existing behavior (mdk#2061).
+  endings stay text, and `www.` prefixes are recognized case-insensitively.
+  Explicit scheme-qualified URLs retain their existing behavior (mdk#2061).
 
 - Timeline JSON rows (`messages timeline list`, `messages timeline search`, and daemon timeline snapshots and upserts)
   carry `recipient_confirmed` and `invalidation_status` (mdk#1291). `recipient_confirmed` is `true` for an own send

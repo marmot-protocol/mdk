@@ -857,7 +857,15 @@ fn contains_link(items: &[Inline]) -> bool {
                 | Inline::Strong(children)
                 | Inline::Strikethrough(children) => stack.push(children),
                 Inline::Image { alt, .. } => stack.push(alt),
-                _ => {}
+                Inline::Text(_)
+                | Inline::SoftBreak
+                | Inline::HardBreak
+                | Inline::Code(_)
+                | Inline::Autolink { .. }
+                | Inline::Math(_)
+                | Inline::NostrMention(_)
+                | Inline::NostrUri(_)
+                | Inline::Timestamp { .. } => {}
             }
         }
     }
@@ -884,13 +892,12 @@ fn try_close_bracket(
     let opener_idx = previous_active_bracket_delim(delims, *last_bracket_delim)?;
     *last_bracket_delim = Some(opener_idx);
     let opener = delims[opener_idx];
-    let label_has_link = infer_domains && contains_link(&out[opener.out_pos + 1..]);
     // Resolve explicit labels from their original source with fuzzy inference
     // disabled. This preserves escapes/entities without nesting generated links.
     // The replacement pass never reparses labels again. Work is bounded by the
     // existing bracket/depth cap, including nested image labels.
-    let explicit_label = || {
-        if !label_has_link {
+    let explicit_label = |out: &[Inline]| {
+        if !infer_domains || !contains_link(&out[opener.out_pos + 1..]) {
             return None;
         }
         let source = std::str::from_utf8(&bytes[opener.input_pos + 1..i]).unwrap();
@@ -912,13 +919,14 @@ fn try_close_bracket(
     if bytes.get(i + 1) == Some(&b'(')
         && let Some((dest, title, end)) = parse_inline_link_suffix(bytes, i + 1)
     {
+        let replacement_children = explicit_label(out);
         if absorb_link(
             out,
             delims,
             opener_idx,
             dest,
             title,
-            explicit_label(),
+            replacement_children,
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -938,13 +946,14 @@ fn try_close_bracket(
             && let Some(def) = refs.get(&crate::block::normalize_label(&label_raw))
         {
             let (dest, title) = (def.dest.clone(), def.title.clone());
+            let replacement_children = explicit_label(out);
             if absorb_link(
                 out,
                 delims,
                 opener_idx,
                 dest,
                 title,
-                explicit_label(),
+                replacement_children,
                 last_bracket_delim,
                 open_bracket_delims,
             ) {
@@ -959,13 +968,14 @@ fn try_close_bracket(
             let label = label_text(bytes, opener.input_pos + 1, i);
             if let Some(def) = refs.get(&crate::block::normalize_label(&label)) {
                 let (dest, title) = (def.dest.clone(), def.title.clone());
+                let replacement_children = explicit_label(out);
                 if absorb_link(
                     out,
                     delims,
                     opener_idx,
                     dest,
                     title,
-                    explicit_label(),
+                    replacement_children,
                     last_bracket_delim,
                     open_bracket_delims,
                 ) {
@@ -988,13 +998,14 @@ fn try_close_bracket(
         && let Some(def) = refs.get(&crate::block::normalize_label(&label))
     {
         let (dest, title) = (def.dest.clone(), def.title.clone());
+        let replacement_children = explicit_label(out);
         if absorb_link(
             out,
             delims,
             opener_idx,
             dest,
             title,
-            explicit_label(),
+            replacement_children,
             last_bracket_delim,
             open_bracket_delims,
         ) {
@@ -1328,6 +1339,16 @@ pub(crate) fn trim_trailing_punct(
             _ => {}
         }
     }
+    let (mut wide_opens, mut wide_closes) = (0usize, 0usize);
+    if inferred_punctuation {
+        for scalar in bytes[start..end].windows(3) {
+            match scalar {
+                [0xef, 0xbc, 0x88] => wide_opens += 1,  // （
+                [0xef, 0xbc, 0x89] => wide_closes += 1, // ）
+                _ => {}
+            }
+        }
+    }
     while end > start {
         let c = bytes[end - 1];
         match c {
@@ -1347,14 +1368,18 @@ pub(crate) fn trim_trailing_punct(
                 let Ok(scalar) = std::str::from_utf8(&bytes[scalar_start..end]) else {
                     return end;
                 };
-                if scalar
-                    .chars()
-                    .next()
-                    .is_some_and(crate::domain::unicode_boundary)
-                {
-                    end = scalar_start;
-                } else {
-                    return end;
+                match scalar.chars().next() {
+                    Some('）') if wide_closes > wide_opens => {
+                        wide_closes -= 1;
+                        end = scalar_start;
+                    }
+                    Some('）') => return end,
+                    Some('（') => {
+                        wide_opens -= 1;
+                        end = scalar_start;
+                    }
+                    Some(c) if crate::domain::unicode_boundary(c) => end = scalar_start,
+                    _ => return end,
                 }
             }
             b')' => return end,

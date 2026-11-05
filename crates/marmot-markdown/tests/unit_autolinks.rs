@@ -778,3 +778,29 @@ fn schemeless_domains_preserve_internal_unicode_suffix_punctuation() {
         ]
     );
 }
+
+/// A prior sentence-like label must not bypass the guard on a later host label.
+#[test]
+fn schemeless_domains_guard_all_labels() {
+    for text in ["好的.请访问example.com", "收到.见example.com"] {
+        assert_eq!(parse_inlines(text), vec![t(text)]);
+    }
+}
+
+/// Fullwidth parentheses in a suffix follow the same balance rule as ASCII ones.
+#[test]
+fn schemeless_domains_balance_fullwidth_path_parens() {
+    let label = "example.chat/甲（乙）";
+    assert_eq!(
+        parse_inlines(label),
+        vec![domain_link(label, &format!("https://{label}"))]
+    );
+    assert_eq!(
+        parse_inlines(&format!("（{label}）")),
+        vec![
+            t("（"),
+            domain_link(label, &format!("https://{label}")),
+            t("）")
+        ]
+    );
+}

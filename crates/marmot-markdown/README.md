@@ -153,7 +153,7 @@ never replace confusable characters with a guessed Latin destination. Existing
 explicit URLs retain their original parsing/classification contract.
 
 Bare inference uses ASCII periods between host labels. Ideographic/fullwidth stops
-and common Unicode quotes, brackets and sentence punctuation delimit prose. A first
+and common Unicode quotes, brackets and sentence punctuation delimit prose. A host
 label mixing Latin letters or ASCII digits with Han, Hiragana, Katakana or Thai stays text:
 the parser cannot safely distinguish glued prose from a mixed-script domain. It does
 not guess a different ASCII suffix. Explicit URLs remain available for those hosts.
