@@ -7561,6 +7561,7 @@ impl AppClient {
             }
             self.pending_welcome_delivery_events
                 .push(PendingWelcomeDelivery {
+                    size_class: None,
                     group_id_hex,
                     message_id_hex,
                     recipient_hex,
@@ -7965,6 +7966,7 @@ impl AppClient {
             .into_iter()
             .filter(|record| self.host_may_see_group_hex(&record.group_id_hex))
             .map(|record| PendingWelcomeDelivery {
+                size_class: None,
                 group_id_hex: record.group_id_hex,
                 message_id_hex: record.message_id_hex,
                 recipient_hex: record.recipient_hex,

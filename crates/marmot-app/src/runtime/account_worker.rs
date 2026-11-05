@@ -9123,6 +9123,7 @@ mod tests {
         client
             .pending_welcome_delivery_events
             .push(crate::PendingWelcomeDelivery {
+                size_class: None,
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex: "ab".repeat(32),
                 recipient_hex: "cd".repeat(32),

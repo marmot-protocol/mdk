@@ -5709,6 +5709,7 @@ where
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
                 output.welcome_failures.push(WelcomeDeliveryFailure {
+                    size_class: None,
                     message_id: fanout.message_id().clone(),
                     recipient,
                     group_id: fanout.group_id().cloned(),
@@ -7222,6 +7223,8 @@ pub struct WelcomeDeliveryFailure {
     /// best-effort.
     pub group_id: Option<GroupId>,
     pub reason: String,
+    /// Coarse size refusal when proved; absent means Unknown, never delivered.
+    pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -927,7 +927,7 @@ async fn gift_wrap_blocking_app_with_config(
 }
 
 #[derive(Debug)]
-struct RejectGiftWrapsWhileArmed(Arc<AtomicBool>);
+struct RejectGiftWrapsWhileArmed(Arc<AtomicBool>, &'static str);
 
 impl WritePolicy for RejectGiftWrapsWhileArmed {
     fn admit_event<'a>(
@@ -937,7 +937,7 @@ impl WritePolicy for RejectGiftWrapsWhileArmed {
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if self.0.load(Ordering::Relaxed) && event.kind == OldKind::GiftWrap {
-                PolicyResult::Reject("injected gift-wrap rejection".into())
+                PolicyResult::Reject(self.1.into())
             } else {
                 PolicyResult::Accept
             }
@@ -1040,7 +1040,7 @@ impl WritePolicy for RejectThenBlockGiftWraps {
                 return PolicyResult::Accept;
             }
             if self.rejecting.load(Ordering::SeqCst) {
-                return PolicyResult::Reject("injected gift-wrap rejection".into());
+                return PolicyResult::Reject(self.1.into());
             }
             if self.blocking.load(Ordering::SeqCst) {
                 self.entered.notify_one();
@@ -4168,7 +4168,6 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
     let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex;
     let bob_id = bob.account.account_id_hex;
-    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,
@@ -8004,7 +8003,6 @@ async fn accepted_disband_finishes_for_both_members_without_followup_commands() 
     let bob = create_network_ready_identity(&runtime, setup).await;
     let alice_id = alice.account.account_id_hex;
     let bob_id = bob.account.account_id_hex;
-    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
         .await
@@ -12920,7 +12918,6 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
     };
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup).await;
-    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -13355,7 +13352,10 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
-        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(
+            rejecting.clone(),
+            "injected gift-wrap rejection",
+        )),
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -13870,7 +13870,10 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
-        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(
+            rejecting.clone(),
+            "invalid: event too large: 999999999",
+        )),
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -13914,6 +13917,11 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     .await
     .expect("rejected founding Welcome must remain durably pending");
     assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].size_class,
+        Some(marmot_app::EventSizeClass::Under64Kib),
+        "genuine relay size refusal must reach the durable host query"
+    );
     assert_eq!(
         app.groups(&alice_label)
             .unwrap()
@@ -14314,7 +14322,6 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     // there as well. Invitation resolution must not rely on the local cache.
     runtime.publish_key_package(&carol_id).await.unwrap();
 
-    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,
@@ -16419,7 +16426,6 @@ async fn race_two_admin_profile_edits(
     let alice_id = alice.account.account_id_hex.clone();
     let bob_id = bob.account.account_id_hex.clone();
     let carol_id = carol.account.account_id_hex.clone();
-    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice_id,

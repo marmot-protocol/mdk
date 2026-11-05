@@ -16,6 +16,9 @@ pub struct PendingWelcomeDeliveryRecord {
     pub group_id_hex: String,
     pub recipient_hex: String,
     pub recorded_at: u64,
+    /// Coarse size refusal when proved; absent means Unknown, never delivered.
+    #[serde(default)]
+    pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 
 impl SqliteAppStorage {
@@ -30,6 +33,7 @@ impl SqliteAppStorage {
         recorded_at: u64,
     ) -> StorageResult<()> {
         self.record_pending_welcome_deliveries(&[PendingWelcomeDeliveryRecord {
+            size_class: None,
             message_id_hex: message_id_hex.to_owned(),
             group_id_hex: group_id_hex.to_owned(),
             recipient_hex: recipient_hex.to_owned(),
@@ -95,6 +99,7 @@ impl SqliteAppStorage {
             .map(
                 |(message_id_hex, group_id_hex, recipient_hex, recorded_at)| {
                     Ok(PendingWelcomeDeliveryRecord {
+                        size_class: None,
                         message_id_hex,
                         group_id_hex,
                         recipient_hex,
@@ -143,6 +148,7 @@ mod tests {
         assert_eq!(
             records[0],
             PendingWelcomeDeliveryRecord {
+                size_class: None,
                 message_id_hex: "aa".to_owned(),
                 group_id_hex: "bb2".to_owned(),
                 recipient_hex: "cc2".to_owned(),
@@ -156,12 +162,14 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let records = vec![
             PendingWelcomeDeliveryRecord {
+                size_class: None,
                 message_id_hex: "first".to_owned(),
                 group_id_hex: "group".to_owned(),
                 recipient_hex: "alice".to_owned(),
                 recorded_at: 1,
             },
             PendingWelcomeDeliveryRecord {
+                size_class: None,
                 message_id_hex: "second".to_owned(),
                 group_id_hex: "group".to_owned(),
                 recipient_hex: "bob".to_owned(),

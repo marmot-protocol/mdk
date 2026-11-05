@@ -444,6 +444,7 @@ where
             .map(|failure| failure.reason.clone())
             .unwrap_or_else(|| "welcome publish failed".into());
         WelcomeDeliveryFailure {
+            size_class: None,
             message_id,
             recipient,
             group_id,

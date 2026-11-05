@@ -1204,6 +1204,8 @@ pub struct PendingWelcomeDelivery {
     pub message_id_hex: String,
     pub recipient_hex: String,
     pub recorded_at: u64,
+    /// Coarse size refusal when proved; absent means Unknown, never delivered.
+    pub size_class: Option<cgka_traits::EventSizeClass>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
