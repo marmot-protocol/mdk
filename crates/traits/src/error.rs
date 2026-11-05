@@ -484,10 +484,12 @@ pub enum SiblingAddRefusal {
     /// This copy applied the sibling's own SelfRemove and no selected leaf
     /// reads as that slot again. A different KeyPackage cannot resolve it.
     SiblingLeft,
+    /// The selected chat already holds this sibling, identified by its slot
+    /// tag or roster signature key. A different KeyPackage cannot resolve it.
+    AlreadyPresent,
     /// The KeyPackage cannot add that sibling to this chat: it is published,
     /// expired, another account's, not tagged as the sibling's slot, or does
-    /// not advertise or prove what the chat requires, or the chat already
-    /// holds the sibling.
+    /// not advertise or prove what the chat requires.
     KeyPackage,
 }
 

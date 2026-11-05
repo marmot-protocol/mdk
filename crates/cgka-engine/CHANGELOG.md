@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- Report an already-present sibling as `SiblingAddRefusal::AlreadyPresent`, so stock selection stops instead of
+  trying another private KeyPackage for a membership the selected chat already holds.
+
 - Skip optional founding siblings whose KeyPackage ciphersuite differs from the chat, preserving ordinary creation
   and its Welcomes. Shared sibling admission reports the mismatch before staging.
 - Retain exact SelfUpdate publication bytes across compatibility restart even when Welcome storage is unavailable.
