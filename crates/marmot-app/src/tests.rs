@@ -539,6 +539,10 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) acquisition_block: std::sync::atomic::AtomicBool,
     pub(crate) acquisition_entered: tokio::sync::Notify,
     pub(crate) acquisition_release: tokio::sync::Notify,
+    /// When set, each acquisition answers only after this long, or ends
+    /// `Cancelled` if its cancellation comes first — a relay slower than the
+    /// caller's cutoff.
+    pub(crate) acquisition_delay: std::sync::Mutex<Option<std::time::Duration>>,
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
@@ -1227,12 +1231,20 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         self.acquisition_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.acquisition_entered.notify_one();
+        let delay = *self.acquisition_delay.lock().unwrap();
         if self
             .acquisition_block
             .load(std::sync::atomic::Ordering::SeqCst)
+            || delay.is_some()
         {
+            let answered = async {
+                match delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => self.acquisition_release.notified().await,
+                }
+            };
             tokio::select! {
-                _ = self.acquisition_release.notified() => {},
+                () = answered => {},
                 _ = cancellation.cancelled() => {
                     return Ok(transport_nostr_adapter::NostrAcquisitionResult {
                         endpoints: request.endpoints.into_iter().map(|endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {

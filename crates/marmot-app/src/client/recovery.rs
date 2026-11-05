@@ -3056,6 +3056,133 @@ mod tests {
         );
     }
 
+    /// The capture loop seen online on a Pixel 9a (mdk#2923): a native
+    /// capture rides the comparison's pass cutoff, one 10 s quantum in
+    /// production, which cancels it mid-page. A relay that answers, but takes
+    /// longer than the cutoff, is then cut on every attempt. Each attempt
+    /// restarts the source, so the paging never resumes, and the goal parks
+    /// at the attempt cap with a "history incomplete" notice although the
+    /// relay was serving it. Scaled down here: the relay answers after
+    /// 400 ms against a 200 ms cutoff. The same relay with a cutoff it fits
+    /// in admits the source on the first attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_slower_than_the_pass_cutoff_is_cut_until_the_goal_parks() {
+        let answered = |relay: &crate::tests::ScriptedPushRelayClient| {
+            let endpoints = relay
+                .accepted_subscriptions()
+                .into_iter()
+                .flat_map(|source| source.endpoints().to_vec())
+                .map(
+                    |endpoint| transport_nostr_adapter::NostrAcquisitionEndpoint {
+                        endpoint,
+                        session_generation: None,
+                        events: Vec::new(),
+                        end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                        stats: Default::default(),
+                    },
+                )
+                .collect();
+            *relay.acquisition_result.lock().unwrap() =
+                Some(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+            *relay.acquisition_delay.lock().unwrap() = Some(Duration::from_millis(400));
+        };
+        // One pass under `cutoff`: returns the native goal and whether the
+        // pass admitted the native sources.
+        async fn pass(
+            client: &mut AppClient,
+            storage: &SqliteAccountStorage,
+            cutoff: Duration,
+        ) -> Option<([u8; 16], bool)> {
+            client.recovery_owner.test_advance_to_retry(storage);
+            let mut permit = ExplicitRecoveryPermit::default();
+            let grant = client
+                .authorize_account_recovery(
+                    Some(&mut permit),
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap()?;
+            let native = grant.plan().unwrap().iter().find_map(|obligation| {
+                (obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
+                    .then_some(obligation.id)
+            })?;
+            assert!(!grant.replay_capture.is_empty());
+            let execution = client.begin_comparison_grant(&grant).await.unwrap();
+            let credit = Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap();
+            let mut job = crate::client::sync::ComparisonNetworkJob::start(
+                client,
+                &grant,
+                credit,
+                tokio::time::Instant::now() + cutoff,
+                None,
+            )
+            .unwrap();
+            let (_credit, network) = job.wait().await.unwrap();
+            client
+                .admit_comparison_inline(None, grant, execution, network)
+                .await
+                .unwrap();
+            client.synchronize_native_replay().await.unwrap();
+            Some((native, client.recovery_owner.replay_complete))
+        }
+
+        // Control: a cutoff the relay fits in admits on the first attempt.
+        {
+            let (_dir, app, relay, mut client) = native_fixture().await;
+            client.prepare_transport().await.unwrap();
+            answered(&relay);
+            let storage = app.account_storage("alice").unwrap();
+            let (_, admitted) = pass(&mut client, &storage, Duration::from_secs(5))
+                .await
+                .expect("the native goal is owed");
+            assert!(admitted, "a relay inside the cutoff serves the capture");
+        }
+
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        answered(&relay);
+        let storage = app.account_storage("alice").unwrap();
+        let mut native = None;
+        let mut attempts = 0;
+        while let Some((id, admitted)) =
+            pass(&mut client, &storage, Duration::from_millis(200)).await
+        {
+            attempts += 1;
+            native = Some(id);
+            assert!(
+                !admitted,
+                "a relay slower than the cutoff is cut (attempt {attempts})"
+            );
+            let parked = storage
+                .app_storage()
+                .recovery_obligation_status(id)
+                .unwrap()
+                .unwrap()
+                .eligibility
+                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair;
+            if parked {
+                break;
+            }
+            assert!(attempts < 40, "the goal never parked");
+        }
+        assert!(native.is_some(), "the capture was granted");
+        assert_eq!(
+            attempts,
+            storage_sqlite::RECOVERY_PARK_AFTER_ATTEMPTS,
+            "a cut capture spends no unserved streak, so only the attempt cap parks it"
+        );
+        assert!(
+            client
+                .history_notices()
+                .unwrap()
+                .iter()
+                .any(|notice| notice.cause == crate::HistoryNoticeCause::IncrementalHistory),
+            "the parked goal shows a history notice, though the relay was serving"
+        );
+    }
+
     /// A replay capture the relay closes on every attempt (`RelayClosed`, an
     /// unserved pass), granted alongside an incremental-history obligation whose
     /// comparison re-certifies each pass with one required relay not
