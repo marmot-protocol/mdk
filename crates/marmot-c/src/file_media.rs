@@ -321,16 +321,27 @@ mod tests {
     #[test]
     fn file_upload_inputs_validate_counts_and_preserve_borrowed_metadata() {
         let mut item = MarmotMediaFileUploadAttachmentRequest {
-            source_path: c"/private/input".as_ptr(), has_expected_size: 255, expected_size: u64::MAX,
-            file_name: c"sample.png".as_ptr(), media_type: c"image/png".as_ptr(),
-            dim: c"2x3".as_ptr(), thumbhash: c"thumb".as_ptr(),
+            source_path: c"/private/input".as_ptr(),
+            has_expected_size: 255,
+            expected_size: u64::MAX,
+            file_name: c"sample.png".as_ptr(),
+            media_type: c"image/png".as_ptr(),
+            dim: c"2x3".as_ptr(),
+            thumbhash: c"thumb".as_ptr(),
         };
         let tag_values = [c"alt".as_ptr(), c"caption".as_ptr()];
-        let tags = [MarmotStringArray { values: tag_values.as_ptr(), values_len: tag_values.len() }];
+        let tags = [MarmotStringArray {
+            values: tag_values.as_ptr(),
+            values_len: tag_values.len(),
+        }];
         let mut request = MarmotMediaFileUploadRequest {
-            attachments: &item, attachments_len: 1, caption: c"caption 🦀".as_ptr(), send: 255,
+            attachments: &item,
+            attachments_len: 1,
+            caption: c"caption 🦀".as_ptr(),
+            send: 255,
             blossom_server: c"https://media.example".as_ptr(),
-            message_tags: tags.as_ptr(), message_tags_len: tags.len(),
+            message_tags: tags.as_ptr(),
+            message_tags_len: tags.len(),
         };
         let decoded = unsafe { request.to_ffi() }.unwrap();
         assert_eq!(decoded.attachments.len(), 1);
@@ -342,8 +353,14 @@ mod tests {
         assert_eq!(decoded.attachments[0].thumbhash.as_deref(), Some("thumb"));
         assert_eq!(decoded.caption.as_deref(), Some("caption 🦀"));
         assert!(decoded.send);
-        assert_eq!(decoded.blossom_server.as_deref(), Some("https://media.example"));
-        assert_eq!(decoded.message_tags, vec![vec!["alt".to_owned(), "caption".to_owned()]]);
+        assert_eq!(
+            decoded.blossom_server.as_deref(),
+            Some("https://media.example")
+        );
+        assert_eq!(
+            decoded.message_tags,
+            vec![vec!["alt".to_owned(), "caption".to_owned()]]
+        );
         item.has_expected_size = 0;
         item.dim = std::ptr::null();
         item.thumbhash = std::ptr::null();
@@ -362,34 +379,57 @@ mod tests {
         assert_eq!(decoded.blossom_server, None);
         assert!(decoded.message_tags.is_empty());
         // Even an upper-bound mutation must see a real array of this size.
-        let overflow_items: Vec<_> = (0..65).map(|_| MarmotMediaFileUploadAttachmentRequest {
-            source_path: item.source_path, has_expected_size: item.has_expected_size,
-            expected_size: item.expected_size, file_name: item.file_name, media_type: item.media_type,
-            dim: item.dim, thumbhash: item.thumbhash,
-        }).collect();
+        let overflow_items: Vec<_> = (0..65)
+            .map(|_| MarmotMediaFileUploadAttachmentRequest {
+                source_path: item.source_path,
+                has_expected_size: item.has_expected_size,
+                expected_size: item.expected_size,
+                file_name: item.file_name,
+                media_type: item.media_type,
+                dim: item.dim,
+                thumbhash: item.thumbhash,
+            })
+            .collect();
         request.attachments = overflow_items.as_ptr();
         for count in [0, 65] {
             request.attachments_len = count;
-            assert!(matches!(unsafe { request.to_ffi() }, Err(MarmotStatus::InvalidArgument)));
+            assert!(matches!(
+                unsafe { request.to_ffi() },
+                Err(MarmotStatus::InvalidArgument)
+            ));
         }
         request.attachments_len = 1;
         request.attachments = std::ptr::null();
-        assert!(matches!(unsafe { request.to_ffi() }, Err(MarmotStatus::NullPointer)));
+        assert!(matches!(
+            unsafe { request.to_ffi() },
+            Err(MarmotStatus::NullPointer)
+        ));
         request.attachments = &item;
         let invalid = [0xffu8, 0];
         item.file_name = invalid.as_ptr().cast();
-        assert!(matches!(unsafe { request.to_ffi() }, Err(MarmotStatus::InvalidUtf8)));
+        assert!(matches!(
+            unsafe { request.to_ffi() },
+            Err(MarmotStatus::InvalidUtf8)
+        ));
         item.file_name = std::ptr::null();
-        assert!(matches!(unsafe { request.to_ffi() }, Err(MarmotStatus::NullPointer)));
+        assert!(matches!(
+            unsafe { request.to_ffi() },
+            Err(MarmotStatus::NullPointer)
+        ));
         item.file_name = c"sample.png".as_ptr();
-        let items: Vec<_> = (0..64).map(|_| MarmotMediaFileUploadAttachmentRequest {
-            source_path: item.source_path, has_expected_size: item.has_expected_size,
-            expected_size: item.expected_size, file_name: item.file_name, media_type: item.media_type,
-            dim: item.dim, thumbhash: item.thumbhash,
-        }).collect();
+        let items: Vec<_> = (0..64)
+            .map(|_| MarmotMediaFileUploadAttachmentRequest {
+                source_path: item.source_path,
+                has_expected_size: item.has_expected_size,
+                expected_size: item.expected_size,
+                file_name: item.file_name,
+                media_type: item.media_type,
+                dim: item.dim,
+                thumbhash: item.thumbhash,
+            })
+            .collect();
         request.attachments = items.as_ptr();
         request.attachments_len = items.len();
         assert_eq!(unsafe { request.to_ffi() }.unwrap().attachments.len(), 64);
     }
-
 }

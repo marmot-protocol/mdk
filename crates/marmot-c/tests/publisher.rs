@@ -67,6 +67,19 @@ fn publisher_preflights_outputs() {
 
 #[test]
 fn publisher_finishes_and_cancels() {
+    let assert_runtime = |status: MarmotStatus, expected: &str| {
+        assert_eq!(status, MarmotStatus::Runtime);
+        let detail = marmot_last_error_message();
+        assert!(
+            !detail.is_null(),
+            "the rejected operation reports its cause"
+        );
+        let actual = unsafe { CStr::from_ptr(detail) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { marmot_string_free(detail) };
+        assert_eq!(actual, expected);
+    };
     keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let relay = runtime
@@ -134,15 +147,18 @@ fn publisher_finishes_and_cancels() {
         };
         let mut publisher = ptr::null_mut();
         // Loopback broker access is independent from relay opt-in.
-        assert_ne!(
+        assert_runtime(
             marmot_agent_publisher_new(
                 client,
                 (*account).account_id_hex,
                 group,
                 &options,
-                &mut publisher
+                &mut publisher,
             ),
-            MarmotStatus::Ok
+            &format!(
+                "marmot runtime error: invalid quic candidate: {}",
+                candidate.to_str().unwrap().strip_prefix("quic://").unwrap()
+            ),
         );
         assert!(publisher.is_null());
         options.trust = MarmotPublisherTrust::AllowLoopback as u32;
@@ -272,9 +288,9 @@ fn publisher_finishes_and_cancels() {
         check(marmot_agent_publisher_finish(publisher, &mut summary));
         assert_eq!(CStr::from_ptr(*(*summary).message_ids), final_id.as_c_str());
         marmot_send_summary_free(summary);
-        assert_ne!(
+        assert_runtime(
             marmot_agent_publisher_append(publisher, 0, c"late".as_ptr(), &mut ack),
-            MarmotStatus::Ok
+            "marmot runtime error: agent publisher: stream is not active",
         );
         marmot_agent_publisher_free(publisher);
         check(marmot_agent_publisher_new(
@@ -285,9 +301,9 @@ fn publisher_finishes_and_cancels() {
             &mut publisher,
         ));
         check(marmot_agent_publisher_cancel(publisher));
-        assert_ne!(
+        assert_runtime(
             marmot_agent_publisher_finish(publisher, &mut summary),
-            MarmotStatus::Ok
+            "marmot runtime error: agent publisher: publisher closed",
         );
         assert!(summary.is_null());
         marmot_agent_publisher_free(publisher);

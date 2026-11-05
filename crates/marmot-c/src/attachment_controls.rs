@@ -355,7 +355,10 @@ mod tests {
             MarmotAttachmentTransferState::from_c(17).unwrap(),
             MarmotAttachmentTransferState::StorageBlocked
         );
-        assert_eq!(MarmotAttachmentTransferState::from_c(19), Err(MarmotStatus::InvalidArgument));
+        assert_eq!(
+            MarmotAttachmentTransferState::from_c(19),
+            Err(MarmotStatus::InvalidArgument)
+        );
     }
     /// `CleanedBySetting` is appended after `StorageBlocked`.
     #[test]

@@ -1450,21 +1450,23 @@ pub unsafe extern "C" fn marmot_backup_restore_subscription_snapshot(
     })
 }
 
-
 #[cfg(all(test, feature = "alloc-audit"))]
 mod callback_lifetime_tests {
     use super::*;
     use crate::memory::audit;
     use marmot_uniffi::conversions::{
-        MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi,
-        UserDirectorySearchResultFfi, UserProfileMetadataFfi, UserSearchUpdateFfi,
+        MatchQualityFfi, MatchedFieldFfi, SearchUpdateTriggerFfi, UserDirectorySearchResultFfi,
+        UserProfileMetadataFfi, UserSearchUpdateFfi,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as sync_channel;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1).enable_all().build().unwrap()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     struct HeldCallback {
@@ -1493,14 +1495,18 @@ mod callback_lifetime_tests {
             } else {
                 let profile = unsafe { &*row.profile };
                 !profile.name.is_null()
-                    && unsafe { std::ffi::CStr::from_ptr(profile.name) }.to_bytes() == b"callback-profile"
+                    && unsafe { std::ffi::CStr::from_ptr(profile.name) }.to_bytes()
+                        == b"callback-profile"
             }
         } else {
             false
         };
         // No assertion may unwind through this extern-C callback. Return
         // observations to the host, which releases it before asserting.
-        let _ = state.entered.send((trigger_matches && profile_matches, audit::live_allocations()));
+        let _ = state.entered.send((
+            trigger_matches && profile_matches,
+            audit::live_allocations(),
+        ));
         if let Ok(release) = state.release.lock() {
             let _ = release.recv();
         }
@@ -1522,7 +1528,9 @@ mod callback_lifetime_tests {
         let receive = Arc::new(tokio::sync::Mutex::new(receive));
         let mut pump = spawn_callback_pump::<UserSearchUpdateFfi, MarmotUserSearchUpdate, _, _>(
             rt.handle(),
-            CallbackCtx { user_data: (&mut *state as *mut HeldCallback).cast() },
+            CallbackCtx {
+                user_data: (&mut *state as *mut HeldCallback).cast(),
+            },
             held_callback,
             move || {
                 let receive = Arc::clone(&receive);
@@ -1530,7 +1538,9 @@ mod callback_lifetime_tests {
             },
         );
         send.blocking_send(UserSearchUpdateFfi {
-            trigger: SearchUpdateTriggerFfi::Error { message: "callback-error".into() },
+            trigger: SearchUpdateTriggerFfi::Error {
+                message: "callback-error".into(),
+            },
             new_results: vec![UserDirectorySearchResultFfi {
                 account_id_hex: "11".repeat(32),
                 npub: "npub1callback".into(),
@@ -1540,26 +1550,26 @@ mod callback_lifetime_tests {
                 match_quality: MatchQualityFfi::Exact,
                 provider_rank: None,
                 profile: Some(UserProfileMetadataFfi {
-                    name: Some("callback-profile".into()), ..Default::default()
+                    name: Some("callback-profile".into()),
+                    ..Default::default()
                 }),
             }],
             updated_results: vec![],
             total_result_count: 1,
-        }).unwrap();
+        })
+        .unwrap();
         let entered = entered_rx.recv_timeout(Duration::from_secs(5));
         let while_borrowed = audit::live_allocations();
         // Always release the actual callback and close its actual channel
         // before assertions, including under a deliberately broken owner.
         let _ = release_tx.send(());
         drop(send);
-        let joined = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), &mut pump).await
-        });
+        let joined =
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut pump).await });
         if joined.is_err() {
             pump.abort();
-            let _ = rt.block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), &mut pump).await
-            });
+            let _ = rt
+                .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut pump).await });
         }
         if !pump.is_finished() {
             // Keep user_data alive if unexpected broken code cannot quiesce.
@@ -1567,23 +1577,45 @@ mod callback_lifetime_tests {
             panic!("callback task did not finish after cleanup");
         }
         let (payload_matches, during) = entered.expect("actual callback entry");
-        joined.expect("natural close completes").expect("callback task did not panic");
-        assert!(payload_matches, "callback borrows the actual nested payload");
-        assert!(during > before, "the callback owns live nested C allocations");
-        assert_eq!(while_borrowed, during, "borrowed allocations remain live until callback return");
+        joined
+            .expect("natural close completes")
+            .expect("callback task did not panic");
+        assert!(
+            payload_matches,
+            "callback borrows the actual nested payload"
+        );
+        assert!(
+            during > before,
+            "the callback owns live nested C allocations"
+        );
+        assert_eq!(
+            while_borrowed, during,
+            "borrowed allocations remain live until callback return"
+        );
         assert_eq!(state.terminals.load(Ordering::SeqCst), 1);
-        assert_eq!(audit::live_allocations(), before, "pump deep-frees after callback return");
+        assert_eq!(
+            audit::live_allocations(),
+            before,
+            "pump deep-frees after callback return"
+        );
     }
 
-    struct PendingCallback { calls: AtomicUsize, terminals: AtomicUsize }
+    struct PendingCallback {
+        calls: AtomicUsize,
+        terminals: AtomicUsize,
+    }
     unsafe extern "C" fn pending_callback(item: *const MarmotUserSearchUpdate, data: *mut c_void) {
         let state = unsafe { &*(data as *const PendingCallback) };
         state.calls.fetch_add(1, Ordering::SeqCst);
-        if item.is_null() { state.terminals.fetch_add(1, Ordering::SeqCst); }
+        if item.is_null() {
+            state.terminals.fetch_add(1, Ordering::SeqCst);
+        }
     }
     struct DropNotice(sync_channel::Sender<()>);
     impl Drop for DropNotice {
-        fn drop(&mut self) { let _ = self.0.send(()); }
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
     }
 
     #[test]
@@ -1597,34 +1629,50 @@ mod callback_lifetime_tests {
         let (send, receive) = tokio::sync::mpsc::channel::<UserSearchUpdateFfi>(1);
         let receive = Arc::new(tokio::sync::Mutex::new(receive));
         let mut state = Box::new(PendingCallback {
-            calls: AtomicUsize::new(0), terminals: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            terminals: AtomicUsize::new(0),
         });
-        let ctx = CallbackCtx { user_data: (&mut *state as *mut PendingCallback).cast() };
-        assert_eq!(core.install(move |handle| {
-            spawn_callback_pump::<UserSearchUpdateFfi, MarmotUserSearchUpdate, _, _>(
-                handle, ctx, pending_callback, move || {
-                    let receive = Arc::clone(&receive);
-                    let entered = entered_tx.clone();
-                    let dropped = dropped_tx.clone();
-                    async move {
-                        let _drop_notice = DropNotice(dropped);
-                        let mut receive = receive.lock().await;
-                        let next = receive.recv();
-                        tokio::pin!(next);
-                        let mut observed_pending = false;
-                        std::future::poll_fn(|context| {
-                            let result = next.as_mut().poll(context);
-                            if result.is_pending() && !observed_pending {
-                                observed_pending = true;
-                                let _ = entered.send(());
-                            }
-                            result
-                        }).await
-                    }
-                },
-            )
-        }), MarmotStatus::Ok);
-        let abort = core.callback_task.lock().unwrap().as_ref().unwrap().abort_handle();
+        let ctx = CallbackCtx {
+            user_data: (&mut *state as *mut PendingCallback).cast(),
+        };
+        assert_eq!(
+            core.install(move |handle| {
+                spawn_callback_pump::<UserSearchUpdateFfi, MarmotUserSearchUpdate, _, _>(
+                    handle,
+                    ctx,
+                    pending_callback,
+                    move || {
+                        let receive = Arc::clone(&receive);
+                        let entered = entered_tx.clone();
+                        let dropped = dropped_tx.clone();
+                        async move {
+                            let _drop_notice = DropNotice(dropped);
+                            let mut receive = receive.lock().await;
+                            let next = receive.recv();
+                            tokio::pin!(next);
+                            let mut observed_pending = false;
+                            std::future::poll_fn(|context| {
+                                let result = next.as_mut().poll(context);
+                                if result.is_pending() && !observed_pending {
+                                    observed_pending = true;
+                                    let _ = entered.send(());
+                                }
+                                result
+                            })
+                            .await
+                        }
+                    },
+                )
+            }),
+            MarmotStatus::Ok
+        );
+        let abort = core
+            .callback_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
         let entered = entered_rx.recv_timeout(Duration::from_secs(5));
         // The real channel is empty and its sender remains alive: the
         // receive has returned Pending and cannot complete naturally. clear requests abort.
@@ -1632,15 +1680,21 @@ mod callback_lifetime_tests {
         let dropped = dropped_rx.recv_timeout(Duration::from_secs(5));
         let finished = rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                while !abort.is_finished() { tokio::task::yield_now().await; }
-            }).await
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
         });
         if finished.is_err() {
             abort.abort();
             let _ = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while !abort.is_finished() { tokio::task::yield_now().await; }
-                }).await
+                    while !abort.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
             });
         }
         if !abort.is_finished() {

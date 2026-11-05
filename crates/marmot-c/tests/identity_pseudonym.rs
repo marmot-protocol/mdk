@@ -231,9 +231,15 @@ fn account_id_hex_and_pseudonyms_are_offline() {
 
     let invalid_utf8 = [0xffu8, 0];
     for wrapper in [marmot_account_id_hex, marmot_default_profile_pseudonym] {
-        assert_eq!(unsafe { wrapper(client, invalid_utf8.as_ptr().cast(), ptr::null_mut()) }, MarmotStatus::NullPointer);
+        assert_eq!(
+            unsafe { wrapper(client, invalid_utf8.as_ptr().cast(), ptr::null_mut()) },
+            MarmotStatus::NullPointer
+        );
         out = ptr::dangling_mut();
-        assert_eq!(unsafe { wrapper(client, invalid_utf8.as_ptr().cast(), &raw mut out) }, MarmotStatus::InvalidUtf8);
+        assert_eq!(
+            unsafe { wrapper(client, invalid_utf8.as_ptr().cast(), &raw mut out) },
+            MarmotStatus::InvalidUtf8
+        );
         assert!(out.is_null());
     }
 
@@ -267,34 +273,84 @@ fn cursor_pairs_and_limits_are_validated_before_account_lookup() {
     let cursor = CString::new("ef".repeat(32)).unwrap();
     // Valid borrowed strings isolate the paired-cursor and 1..=100 guards.
     for (present, id, limit) in [
-        (0, cursor.as_ptr(), 1), (1, ptr::null(), 1),
-        (0, ptr::null(), 0), (0, ptr::null(), 101),
+        (0, cursor.as_ptr(), 1),
+        (1, ptr::null(), 1),
+        (0, ptr::null(), 0),
+        (0, ptr::null(), 101),
     ] {
         let mut votes = ptr::dangling_mut();
-        assert_eq!(unsafe { marmot_c::commands::marmot_poll_votes(
-            client, c"absent".as_ptr(), group.as_ptr(), message.as_ptr(),
-            present, 7, id, limit, &mut votes,
-        ) }, MarmotStatus::InvalidArgument);
+        assert_eq!(
+            unsafe {
+                marmot_c::commands::marmot_poll_votes(
+                    client,
+                    c"absent".as_ptr(),
+                    group.as_ptr(),
+                    message.as_ptr(),
+                    present,
+                    7,
+                    id,
+                    limit,
+                    &mut votes,
+                )
+            },
+            MarmotStatus::InvalidArgument
+        );
         assert!(votes.is_null());
         let mut edits = ptr::dangling_mut();
-        assert_eq!(unsafe { marmot_c::commands::marmot_message_edit_history(
-            client, c"absent".as_ptr(), group.as_ptr(), message.as_ptr(),
-            present, 7, id, limit, &mut edits,
-        ) }, MarmotStatus::InvalidArgument);
+        assert_eq!(
+            unsafe {
+                marmot_c::commands::marmot_message_edit_history(
+                    client,
+                    c"absent".as_ptr(),
+                    group.as_ptr(),
+                    message.as_ptr(),
+                    present,
+                    7,
+                    id,
+                    limit,
+                    &mut edits,
+                )
+            },
+            MarmotStatus::InvalidArgument
+        );
         assert!(edits.is_null());
     }
     for (present, id, limit) in [(0, ptr::null(), 1), (255, cursor.as_ptr(), 100)] {
         let mut votes = ptr::dangling_mut();
-        assert_eq!(unsafe { marmot_c::commands::marmot_poll_votes(
-            client, c"absent".as_ptr(), group.as_ptr(), message.as_ptr(),
-            present, 7, id, limit, &mut votes,
-        ) }, MarmotStatus::UnknownAccount);
+        assert_eq!(
+            unsafe {
+                marmot_c::commands::marmot_poll_votes(
+                    client,
+                    c"absent".as_ptr(),
+                    group.as_ptr(),
+                    message.as_ptr(),
+                    present,
+                    7,
+                    id,
+                    limit,
+                    &mut votes,
+                )
+            },
+            MarmotStatus::UnknownAccount
+        );
         assert!(votes.is_null());
         let mut edits = ptr::dangling_mut();
-        assert_eq!(unsafe { marmot_c::commands::marmot_message_edit_history(
-            client, c"absent".as_ptr(), group.as_ptr(), message.as_ptr(),
-            present, 7, id, limit, &mut edits,
-        ) }, MarmotStatus::UnknownAccount);
+        assert_eq!(
+            unsafe {
+                marmot_c::commands::marmot_message_edit_history(
+                    client,
+                    c"absent".as_ptr(),
+                    group.as_ptr(),
+                    message.as_ptr(),
+                    present,
+                    7,
+                    id,
+                    limit,
+                    &mut edits,
+                )
+            },
+            MarmotStatus::UnknownAccount
+        );
         assert!(edits.is_null());
     }
     assert_eq!(unsafe { marmot_client_shutdown(client) }, MarmotStatus::Ok);

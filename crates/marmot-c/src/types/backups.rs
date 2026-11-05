@@ -104,16 +104,21 @@ mod tests {
             unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
                 if ENABLED.load(Ordering::Acquire) {
                     for slot in &SLOTS {
-                        if slot.pointer.compare_exchange(
-                            pointer as usize,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ).is_ok() {
+                        if slot
+                            .pointer
+                            .compare_exchange(
+                                pointer as usize,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
                             let length = slot.length.load(Ordering::Acquire);
                             let zeroed = length <= layout.size()
                                 && unsafe { std::slice::from_raw_parts(pointer, length) }
-                                    .iter().all(|byte| *byte == 0);
+                                    .iter()
+                                    .all(|byte| *byte == 0);
                             slot.zeroed.store(zeroed, Ordering::Release);
                             slot.seen.store(true, Ordering::Release);
                             break;
@@ -139,9 +144,12 @@ mod tests {
                 ENABLED.store(false, Ordering::Release);
                 Outcome {
                     watched: self.count,
-                    deallocated: SLOTS[..self.count].iter()
-                        .filter(|slot| slot.seen.load(Ordering::Acquire)).count(),
-                    all_zero: SLOTS[..self.count].iter()
+                    deallocated: SLOTS[..self.count]
+                        .iter()
+                        .filter(|slot| slot.seen.load(Ordering::Acquire))
+                        .count(),
+                    all_zero: SLOTS[..self.count]
+                        .iter()
                         .all(|slot| slot.zeroed.load(Ordering::Acquire)),
                 }
             }
@@ -164,9 +172,13 @@ mod tests {
             }
             let mut count = 0;
             for &word in unsafe { std::slice::from_raw_parts(words.words, words.words_len) } {
-                if word.is_null() { continue; }
+                if word.is_null() {
+                    continue;
+                }
                 assert!(count < CAPACITY);
-                let length = unsafe { std::ffi::CStr::from_ptr(word) }.to_bytes_with_nul().len();
+                let length = unsafe { std::ffi::CStr::from_ptr(word) }
+                    .to_bytes_with_nul()
+                    .len();
                 SLOTS[count].length.store(length, Ordering::Relaxed);
                 SLOTS[count].pointer.store(word as usize, Ordering::Release);
                 count += 1;
@@ -273,9 +285,18 @@ mod tests {
             let observation = root_erasure_observer::watch(&*words);
             marmot_recovery_words_free(words);
             let outcome = observation.finish();
-            assert_eq!(outcome.watched, 11, "the root still owns the remaining words");
-            assert_eq!(outcome.deallocated, outcome.watched, "the root releases every watched allocation");
-            assert!(outcome.all_zero, "each word is erased before its real deallocator runs");
+            assert_eq!(
+                outcome.watched, 11,
+                "the root still owns the remaining words"
+            );
+            assert_eq!(
+                outcome.deallocated, outcome.watched,
+                "the root releases every watched allocation"
+            );
+            assert!(
+                outcome.all_zero,
+                "each word is erased before its real deallocator runs"
+            );
             marmot_recovery_words_free(std::ptr::null_mut());
             marmot_backup_restore_status_free(status);
             marmot_backup_history_availability_list_free(hints);

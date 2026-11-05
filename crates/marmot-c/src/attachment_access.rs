@@ -250,7 +250,7 @@ mod tests {
                 control,
                 &mut out,
             );
-            assert_ne!(status, MarmotStatus::Ok, "no account, no lease");
+            assert_eq!(status, MarmotStatus::UnknownAccount, "no account, no lease");
             assert!(out.is_null());
             let unknown = std::ffi::CString::new("cd".repeat(16)).unwrap();
             assert_eq!(

@@ -307,12 +307,25 @@ mod tests {
                     | (4, MarmotNewDeviceLinkState::Linked) => {}
                     (1, MarmotNewDeviceLinkState::Comparing { code, code_len }) => {
                         assert_eq!(*code_len, 7);
-                        for (index, emoji) in std::slice::from_raw_parts(*code, *code_len).iter().enumerate() {
-                            assert_eq!(std::ffi::CStr::from_ptr(emoji.emoji).to_str().unwrap(), "🐶");
-                            assert_eq!(std::ffi::CStr::from_ptr(emoji.description).to_str().unwrap(), format!("Dog {index}"));
+                        for (index, emoji) in std::slice::from_raw_parts(*code, *code_len)
+                            .iter()
+                            .enumerate()
+                        {
+                            assert_eq!(
+                                std::ffi::CStr::from_ptr(emoji.emoji).to_str().unwrap(),
+                                "🐶"
+                            );
+                            assert_eq!(
+                                std::ffi::CStr::from_ptr(emoji.description)
+                                    .to_str()
+                                    .unwrap(),
+                                format!("Dog {index}")
+                            );
                         }
                     }
-                    (5, MarmotNewDeviceLinkState::Ended { reason }) => assert_eq!(*reason, MarmotDeviceLinkEndReason::LinkFailed),
+                    (5, MarmotNewDeviceLinkState::Ended { reason }) => {
+                        assert_eq!(*reason, MarmotDeviceLinkEndReason::LinkFailed)
+                    }
                     _ => panic!("new-device tag does not match source row {expected}"),
                 }
                 marmot_device_link_snapshot_free(snapshot);
@@ -354,7 +367,11 @@ mod tests {
             assert!((*snapshot).new_device.is_null());
             assert_eq!((*snapshot).prompts_len, 10);
             assert_eq!((*snapshot).moves_len, 1);
-            for (expected, prompt) in std::slice::from_raw_parts((*snapshot).prompts, (*snapshot).prompts_len).iter().enumerate() {
+            for (expected, prompt) in
+                std::slice::from_raw_parts((*snapshot).prompts, (*snapshot).prompts_len)
+                    .iter()
+                    .enumerate()
+            {
                 match (expected, &prompt.state) {
                     (0, MarmotDeviceLinkPromptState::Preparing)
                     | (1, MarmotDeviceLinkPromptState::Comparing { .. })
@@ -364,14 +381,21 @@ mod tests {
                     | (6, MarmotDeviceLinkPromptState::Linking)
                     | (7, MarmotDeviceLinkPromptState::Linked)
                     | (8, MarmotDeviceLinkPromptState::AddedElsewhere { .. }) => {}
-                    (3, MarmotDeviceLinkPromptState::RateLimited { retry_at }) => assert_eq!(*retry_at, 9),
-                    (9, MarmotDeviceLinkPromptState::Ended { reason }) => assert_eq!(*reason, MarmotDeviceLinkEndReason::CodesDiffer),
+                    (3, MarmotDeviceLinkPromptState::RateLimited { retry_at }) => {
+                        assert_eq!(*retry_at, 9)
+                    }
+                    (9, MarmotDeviceLinkPromptState::Ended { reason }) => {
+                        assert_eq!(*reason, MarmotDeviceLinkEndReason::CodesDiffer)
+                    }
                     _ => panic!("prompt tag does not match source row {expected}"),
                 }
             }
             let movement = &*(*snapshot).moves;
             assert_eq!(movement.state, MarmotDeviceGroupMoveState::Made);
-            assert_eq!(std::ffi::CStr::from_ptr(movement.move_id).to_bytes(), b"move");
+            assert_eq!(
+                std::ffi::CStr::from_ptr(movement.move_id).to_bytes(),
+                b"move"
+            );
             assert_eq!(movement.old_siblings_len, 1);
             assert_eq!(movement.overridden_rejection_slots_len, 1);
             assert!((*movement.old_siblings).question_suppressed);

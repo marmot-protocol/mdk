@@ -643,7 +643,9 @@ mod tests {
             MarmotStatus::GroupInviteNotPending
         );
         assert_eq!(
-            status_from_error(&MarmotKitError::MissingMemberInboxRoute { account: "a".into() }),
+            status_from_error(&MarmotKitError::MissingMemberInboxRoute {
+                account: "a".into()
+            }),
             MarmotStatus::MissingMemberInboxRoute
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -783,5 +785,4 @@ mod tests {
         assert_eq!(host.as_deref(), Some("host-thread-detail"));
         assert!(host_consumed.is_none());
     }
-
 }

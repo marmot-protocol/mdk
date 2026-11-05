@@ -67,8 +67,16 @@ mod tests {
         });
         assert!(!result.acceptance.is_null());
         let acceptance = unsafe { &*result.acceptance };
-        assert_eq!(unsafe { std::ffi::CStr::from_ptr(acceptance.client_token) }.to_bytes(), b"opaque-token");
-        assert_eq!(unsafe { std::ffi::CStr::from_ptr(acceptance.message_id_hex) }.to_str().unwrap(), "aa".repeat(32));
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(acceptance.client_token) }.to_bytes(),
+            b"opaque-token"
+        );
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(acceptance.message_id_hex) }
+                .to_str()
+                .unwrap(),
+            "aa".repeat(32)
+        );
         unsafe { result.free_in_place() };
         for (expected, status) in [
             LocalSendStatusFfi::Queued,

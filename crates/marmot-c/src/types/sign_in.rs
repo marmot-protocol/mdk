@@ -137,6 +137,9 @@ mod tests {
             MarmotSignInResponse::from_c(1).unwrap().to_ffi(),
             SignInResponseFfi::Reject
         );
-        assert_eq!(MarmotSignInResponse::from_c(3), Err(crate::MarmotStatus::InvalidArgument));
+        assert_eq!(
+            MarmotSignInResponse::from_c(3),
+            Err(crate::MarmotStatus::InvalidArgument)
+        );
     }
 }
