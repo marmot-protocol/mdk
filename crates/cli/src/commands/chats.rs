@@ -285,3 +285,41 @@ async fn group_archive_output(
         }),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mute_duration_distinguishes_permanent_finite_and_invalid_requests() {
+        for permanent in ["forever", " ALWAYS "] {
+            assert_eq!(parse_mute_duration(permanent).unwrap(), None);
+        }
+        for (input, milliseconds) in [
+            ("2s", 2_000),
+            ("3M", 180_000),
+            ("1h", 3_600_000),
+            ("1D", 86_400_000),
+            ("1w", 604_800_000),
+        ] {
+            let before = current_time_ms();
+            let until = parse_mute_duration(input).unwrap().expect("finite mute");
+            let after = current_time_ms();
+            assert!((before + milliseconds..=after + milliseconds).contains(&until));
+        }
+        for invalid in [
+            "",
+            "1",
+            "0s",
+            "-1s",
+            "1x",
+            "💥",
+            "1💥",
+            "9223372036854775807w",
+        ] {
+            assert!(
+                matches!(parse_mute_duration(invalid), Err(WnError::InvalidMuteDuration(value)) if value == invalid)
+            );
+        }
+    }
+}

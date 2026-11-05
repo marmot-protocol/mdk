@@ -536,11 +536,26 @@ mod tests {
 
     #[test]
     fn account_pretty_json_plain_dump_uses_terminal_safe_json_display() {
-        let value = json!({"display_name": "a\u{1b}b"});
-        let serialized =
-            serde_json::to_string_pretty(&value).expect("pretty JSON serialization cannot fail");
-        let displayed = terminal_safe_json_display(&serialized);
-        assert_eq!(displayed, serialized);
-        assert!(!displayed.contains('\u{1b}'));
+        let dir = tempfile::tempdir().expect("temp home");
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").expect("create account");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let output = whoami_command(
+            &home,
+            &app,
+            CliRuntimeInfo {
+                secret_store: SecretStoreKind::Keychain,
+                keychain_service: "work\u{202e}service".to_owned(),
+            },
+            Some(account.account_id_hex),
+        )
+        .expect("render account status");
+
+        assert_eq!(
+            output.json["secret_store"]["service"],
+            "work\u{202e}service"
+        );
+        assert!(output.plain.contains("\"service\": \"workservice\""));
+        assert!(!output.plain.contains('\u{202e}'));
     }
 }

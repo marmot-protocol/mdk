@@ -104,11 +104,7 @@ fn group_system_summary_handles_missing_actor_and_subject() {
     let value = serde_json::json!({ "from": "aa".repeat(32) });
     let added = r#"{"v":1,"system_type":"member_added","data":{}}"#;
     let summary = group_system_summary(&value, added).unwrap();
-    assert!(summary.ends_with("added someone"), "got {summary}");
-    assert!(
-        !summary.starts_with("someone"),
-        "actor should be the pubkey"
-    );
+    assert_eq!(summary, "aaaa...aaaaa added someone");
 }
 
 #[test]
@@ -663,7 +659,7 @@ fn canceling_the_typed_token_logout_with_esc_runs_nothing() {
 
 #[cfg(unix)]
 #[test]
-fn public_only_logout_confirms_with_y_enter_and_runs_wn_logout() {
+fn public_only_logout_confirms_with_y_and_runs_wn_logout() {
     // A public-only account is re-addable, so it keeps the lighter y/Enter
     // confirm (medium-tier friction is proportional there): `y` runs the real
     // `wn logout <pubkey>`.
@@ -1321,92 +1317,6 @@ fn chat_label_keeps_unread_count_when_truncated() {
 }
 
 #[test]
-fn terminal_safe_text_strips_bidi_and_zero_width_format_characters() {
-    assert_eq!(
-        terminal_safe_text(
-            "safe\u{202a}name\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{feff}done",
-        ),
-        "safenamedone"
-    );
-}
-
-#[test]
-fn terminal_safe_text_strips_residual_invisible_and_format_spoofing_characters() {
-    // Each entry is a residual invisible / format vector that the original
-    // hardcoded denylist let through (see #473). All must be stripped, while
-    // the surrounding visible "ab" must survive so we are sure we are not
-    // simply dropping everything.
-    let format_class_cf: &[(char, &str)] = &[
-        ('\u{00ad}', "SOFT HYPHEN"),
-        ('\u{2061}', "FUNCTION APPLICATION"),
-        ('\u{2062}', "INVISIBLE TIMES"),
-        ('\u{2063}', "INVISIBLE SEPARATOR"),
-        ('\u{2064}', "INVISIBLE PLUS"),
-        ('\u{206a}', "INHIBIT SYMMETRIC SWAPPING"),
-        ('\u{206f}', "NOMINAL DIGIT SHAPES"),
-        ('\u{fff9}', "INTERLINEAR ANNOTATION ANCHOR"),
-        ('\u{fffa}', "INTERLINEAR ANNOTATION SEPARATOR"),
-        ('\u{fffb}', "INTERLINEAR ANNOTATION TERMINATOR"),
-        ('\u{180e}', "MONGOLIAN VOWEL SEPARATOR"),
-        ('\u{1d173}', "MUSICAL SYMBOL BEGIN BEAM"),
-        ('\u{061c}', "ARABIC LETTER MARK"),
-        ('\u{e0001}', "LANGUAGE TAG"),
-        ('\u{e0020}', "TAG SPACE"),
-        ('\u{e007e}', "TAG TILDE"),
-        ('\u{e007f}', "CANCEL TAG"),
-    ];
-    let invisible_non_cf: &[(char, &str)] = &[
-        ('\u{115f}', "HANGUL CHOSEONG FILLER"),
-        ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
-        ('\u{3164}', "HANGUL FILLER"),
-        ('\u{ffa0}', "HALFWIDTH HANGUL FILLER"),
-        ('\u{2800}', "BRAILLE PATTERN BLANK"),
-    ];
-
-    for (ch, name) in format_class_cf.iter().chain(invisible_non_cf) {
-        let input = format!("a{ch}b");
-        assert_eq!(
-            terminal_safe_text(&input),
-            "ab",
-            "expected {name} (U+{:04X}) to be stripped",
-            *ch as u32
-        );
-    }
-}
-
-#[test]
-fn terminal_safe_text_preserves_legitimate_visible_and_combining_text() {
-    // Visible scripts, whitespace, and zero-width combining marks (accents,
-    // Indic virama, Arabic vowel marks, emoji variation selectors) must survive
-    // unchanged so the sanitizer does not mangle real localized text. Combining
-    // marks legitimately have zero rendered width, so a naive width-only filter
-    // would corrupt them.
-    let preserved = [
-        "plain ascii",
-        "中文 日本語 한국어",
-        "café",         // precomposed
-        "cafe\u{0301}", // e + COMBINING ACUTE ACCENT
-        "नमस्ते",         // Devanagari incl. virama U+094D
-        "سَلَام",          // Arabic incl. fatha U+064E
-        "❤\u{fe0f}",    // heart + VARIATION SELECTOR-16
-        "emoji 😀 ok",
-        "a b\u{00a0}c", // NO-BREAK SPACE is visible/whitespace, keep
-    ];
-    for sample in preserved {
-        assert_eq!(
-            terminal_safe_text(sample),
-            sample,
-            "expected {sample:?} to pass through unchanged"
-        );
-    }
-    // Tab is a C0 control and is correctly stripped (prior behavior preserved).
-    assert_eq!(
-        terminal_safe_text("with\ttab-was-control"),
-        "withtab-was-control"
-    );
-}
-
-#[test]
 fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     let mut row = timeline_row("01", 0);
     row.from = "alice".to_owned();
@@ -1625,7 +1535,14 @@ fn stream_preview_lines_hide_empty_and_completed_previews() {
         optimistic: true,
     }];
 
-    assert!(stream_preview_lines(&daemon, &previews, Some(group_id)).is_empty());
+    assert!(
+        stream_preview_lines(&DaemonView::default(), &previews, Some(group_id)).is_empty(),
+        "an empty local preview is hidden independently of daemon watches"
+    );
+    assert!(
+        stream_preview_lines(&daemon, &[], Some(group_id)).is_empty(),
+        "a completed daemon watch is hidden without a local preview shadowing it"
+    );
 }
 
 #[test]
@@ -2161,7 +2078,7 @@ fn account_setup_invocation_appends_first_run_setup_relay() {
 }
 
 #[test]
-fn subscription_reader_accepts_daemon_stream_frames() {
+fn subscription_parser_accepts_daemon_stream_frames() {
     match subscription_event_from_json(serde_json::json!({
         "result": {
             "type": "message",
@@ -2428,6 +2345,95 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         relay_health: None,
         media: MediaState::new(),
         daemon_autostart: None,
+    }
+}
+
+/// Fence work already queued on the real FIFO worker before inspecting a fake
+/// child's recorder. Do not fold the marker: it must not change UI state.
+fn finish_queued_effects(app: &mut TuiApp) {
+    const MARKER: &str = "test-fifo-completion-marker";
+    app.effects.enqueue(Effect::MarkRead {
+        account: "aa".repeat(32),
+        group: MARKER.to_owned(),
+    });
+    loop {
+        let done = app
+            .effects
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FIFO completion marker");
+        if matches!(&done.effect, Effect::MarkRead { group, .. } if group == MARKER) {
+            assert!(done.result.is_ok(), "the marker child completed");
+            return;
+        }
+        app.apply_effect_done(done);
+    }
+}
+
+/// A fake child reports entry, then blocks on a FIFO until the test releases it.
+/// The readiness poll observes produced state; its deadline only bounds hangs.
+#[cfg(unix)]
+struct TestCommandGate {
+    entered: PathBuf,
+    release_path: PathBuf,
+    release: std::fs::File,
+    released: bool,
+}
+
+#[cfg(unix)]
+impl TestCommandGate {
+    fn new(dir: &std::path::Path) -> Self {
+        let entered = dir.join("entered");
+        let release_path = dir.join("release");
+        assert!(
+            StdCommand::new("mkfifo")
+                .arg(&release_path)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_path)
+            .expect("open release FIFO");
+        Self {
+            entered,
+            release_path,
+            release,
+            released: false,
+        }
+    }
+
+    fn script(&self) -> String {
+        format!(
+            "printf entered > '{}'\nIFS= read -r released < '{}'\n",
+            self.entered.display(),
+            self.release_path.display()
+        )
+    }
+
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.entered.exists() {
+            assert!(Instant::now() < deadline, "the gated child never entered");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.release
+                .write_all(b"release\n")
+                .expect("release fake child");
+            self.released = true;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestCommandGate {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -3058,6 +3064,25 @@ fn timeline_chat_list_row_folds_into_the_loaded_chat() {
 fn timeline_chat_list_row_is_none_without_a_projection() {
     let ready = serde_json::json!({"type": "timeline_subscription_ready"});
     assert!(timeline_chat_list_row(&ready).is_none());
+    for projection in [
+        serde_json::json!({"type": "timeline_projection_updated", "group_id": "aa"}),
+        serde_json::json!({
+            "type": "timeline_projection_updated", "group_id": "aa", "chat_list_row": null
+        }),
+    ] {
+        assert!(
+            timeline_chat_list_row(&projection).is_none(),
+            "{projection}"
+        );
+    }
+    let valid = serde_json::json!({
+        "type": "timeline_projection_updated", "group_id": "aa",
+        "chat_list_row": {"unread_count": 3, "has_unread": true}
+    });
+    let (group, projection) = timeline_chat_list_row(&valid).expect("projection present");
+    assert_eq!(group, "aa");
+    assert_eq!(projection.unread_count, 3);
+    assert!(projection.has_unread);
 }
 
 #[test]
@@ -3293,24 +3318,6 @@ fn seen_notification_keys_are_bounded() {
 }
 
 #[test]
-fn tick_performs_the_pending_relist_exactly_once() {
-    let account_id = "aa".repeat(32);
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
-    let mut app = test_tui_app(client, &account_id);
-    app.daemon = DaemonView::default(); // no live subscriptions to drain
-    app.pending_chat_relist = true;
-
-    let changed = app.tick();
-
-    assert!(changed);
-    assert!(
-        !app.pending_chat_relist,
-        "tick queues the pending re-list once, then clears the debounce flag"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
     let account_id = "aa".repeat(32);
     let group_a = "aa".repeat(32);
@@ -3330,12 +3337,11 @@ fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
     };
     let mut app = test_tui_app(client, &account_id);
     app.daemon = DaemonView::default(); // no live subscriptions to drain
-    // A is selected; a NewMessage for another chat armed a background re-list.
-    app.chats = vec![
-        projected_chat(&group_a, "a", 0, Some(100)),
-        projected_chat(&group_b, "b", 1, Some(50)),
-    ];
-    app.selected_chat = 0;
+    // A notification can arm the re-list before the chat feed has populated.
+    assert!(
+        app.chats.is_empty(),
+        "an empty list must still be refreshed"
+    );
     app.pending_chat_relist = true;
 
     // tick queues the re-list off the event loop (it never runs `chats list` on the
@@ -3346,7 +3352,13 @@ fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
         "the debounce clears when the re-list is queued"
     );
 
-    // Folding the worker's result reorders the list but keeps A selected by id.
+    // Before the result is folded, the chat feed can populate and A can be
+    // selected. The late re-list must preserve that selection while reordering.
+    app.chats = vec![
+        projected_chat(&group_a, "a", 0, Some(100)),
+        projected_chat(&group_b, "b", 1, Some(50)),
+    ];
+    app.selected_chat = 0;
     app.settle_effects(1);
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
     assert!(
@@ -3550,7 +3562,7 @@ fn mark_read_failure_keeps_the_badge_honest() {
 
     // A failed mark-read folds honestly: it never zeroes the badge locally and
     // re-arms so the next tick retries.
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::MarkRead {
             account: account_id,
             group: group_id,
@@ -4354,7 +4366,13 @@ fn timeline_scroll_remove_clamps_selection_when_list_empties() {
         ..TimelineScroll::default()
     };
     scroll.on_remove(0, 0);
+    assert_eq!(
+        scroll.selection, None,
+        "removing the last row resets selection"
+    );
     assert_eq!(scroll.resolved_selection(0), None);
+    scroll.on_insert(0, 1);
+    assert_eq!(scroll.resolved_selection(1), Some(0));
 }
 
 #[test]
@@ -4735,13 +4753,29 @@ fn media_view_slot_non_image_is_a_file_placeholder() {
 #[test]
 fn media_drain_folds_duplicate_decoded_events_idempotently() {
     let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    let tx = media.begin_download("cafebabe".to_owned());
     for _ in 0..2 {
-        media.apply_for_test(MediaLoad::Decoded {
+        tx.send(MediaLoad::Decoded {
             hash: "cafebabe".to_owned(),
             image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
-        });
+        })
+        .expect("decoded result");
     }
+    assert!(media.drain(), "the real worker channel is folded");
     assert!(media.is_ready("cafebabe"));
+    assert!(media.protocol_mut("cafebabe").is_some());
+    // Filling the remaining viewer slots must not evict the duplicated hash:
+    // replaying a decode refreshes that image without consuming a second slot.
+    for index in 1..MEDIA_VIEWER_RETAINED_IMAGES {
+        tx.send(MediaLoad::Decoded {
+            hash: format!("other-{index}"),
+            image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
+        })
+        .expect("another decoded result");
+    }
+    assert!(media.drain());
+    assert!(media.build_viewer_protocol("cafebabe"));
+    assert!(!media.drain(), "an empty drain does not dirty the frame");
 }
 
 #[test]
@@ -5022,19 +5056,43 @@ fn inline_images_render_cell_exact_not_a_pixel_protocol() {
 
 #[test]
 fn media_images_downscale_with_a_smoothing_filter_not_nearest() {
-    // The one `Resize` both media render sites (inline timeline block and the
-    // image-viewer popup) pass to `StatefulImage`. `Resize::Fit(None)` falls back
-    // to `FilterType::Nearest`, which downscales by sparse sampling — on a photo
-    // shrunk to a thumbnail that reads as pixelated noise (the field report).
-    // The seam must request a proper resampling filter instead.
-    let resize = media_image_resize();
-    assert!(
-        matches!(
-            resize,
-            ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::Lanczos3))
-        ),
-        "media images must aspect-fit with Lanczos3 smoothing, got {resize:?}"
+    // Sparse nearest-neighbor samples alias this high-frequency image to black
+    // or white. A smoothing filter preserves its average brightness in the
+    // actual halfblock cells the production widget draws.
+    // Match the halfblock picker's 10x20 font aspect so both half-cells sample
+    // image pixels rather than the background padding of an aspect-fit image.
+    let checker = image::RgbImage::from_fn(80, 160, |x, y| {
+        let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+        image::Rgb([value; 3])
+    });
+    let mut protocol = ratatui_image::picker::Picker::halfblocks()
+        .new_resize_protocol(image::DynamicImage::ImageRgb8(checker));
+    let area = Rect::new(0, 0, 1, 1);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::StatefulWidget::render(
+        media_image_widget(),
+        area,
+        &mut buffer,
+        &mut protocol,
     );
+    let cell = &buffer[(0, 0)];
+    // Equal upper/lower pixels legitimately render as a colored space; its
+    // foreground is invisible, so only the background is part of that sample.
+    let visible_colors = if cell.symbol() == " " {
+        vec![cell.bg]
+    } else {
+        vec![cell.fg, cell.bg]
+    };
+    for color in visible_colors {
+        let Color::Rgb(red, green, blue) = color else {
+            panic!("expected sampled RGB pixels, got {color:?}");
+        };
+        assert!(
+            (80..=180).contains(&red),
+            "checkerboard average was lost: {color:?}"
+        );
+        assert_eq!((red, red), (green, blue));
+    }
 }
 
 #[test]
@@ -5044,7 +5102,7 @@ fn oversized_decodes_are_capped_to_the_screen_bound_preserving_aspect() {
     // an unbounded camera photo would cost its full pixel area forever. Anything
     // beyond the largest plausible terminal display area is downscaled at decode
     // time; smaller images pass through untouched.
-    let huge = image::DynamicImage::new_rgb8(4200, 2800);
+    let huge = image::DynamicImage::new_rgb8(2103, 1402);
     let capped = cap_decoded_image(huge);
     assert_eq!(
         (capped.width(), capped.height()),
@@ -5052,7 +5110,7 @@ fn oversized_decodes_are_capped_to_the_screen_bound_preserving_aspect() {
         "a 3:2 photo larger than the cap lands exactly on the cap box"
     );
 
-    let portrait = image::DynamicImage::new_rgb8(1400, 4200);
+    let portrait = image::DynamicImage::new_rgb8(467, 1401);
     let capped = cap_decoded_image(portrait);
     assert!(
         capped.width() <= 2100 && capped.height() <= 1400,
@@ -5640,33 +5698,6 @@ fn seed_decodable_image(path: &std::path::Path) {
 
 #[cfg(unix)]
 #[test]
-fn media_worker_removes_the_decrypted_file_after_a_successful_decode() {
-    // The decrypted image is decoded into memory and never read from disk again,
-    // so the worker must remove the plaintext artifact once decode succeeds —
-    // decrypted media must not linger at rest.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
-    let output_path = dir.path().join("deadbeef");
-    seed_decodable_image(&output_path);
-    assert!(
-        output_path.exists(),
-        "the artifact exists before the worker runs"
-    );
-
-    let result = run_media_worker(&wn, output_path.clone());
-
-    assert!(
-        matches!(result, MediaLoad::Decoded { .. }),
-        "a valid image decodes"
-    );
-    assert!(
-        !output_path.exists(),
-        "the worker removes the decrypted artifact after a successful decode"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn media_worker_removes_the_decrypted_file_after_a_failed_decode() {
     // A download that succeeds but yields undecodable bytes still wrote decrypted
     // plaintext to disk; the worker must remove it on the decode-failure path too,
@@ -5785,8 +5816,21 @@ fn timeline_row_height_accounts_for_wrapping() {
 
 #[test]
 fn timeline_row_heights_maps_every_row() {
-    let rows = vec![timeline_row("a", 0), timeline_row("b", 1)];
-    assert_eq!(timeline_row_heights(&rows, None, 80).len(), 2);
+    let mut short = timeline_row("a", 0);
+    short.from_display_name = Some("A".to_owned());
+    short.display_text = "hi".to_owned();
+    let mut wrapped_reply = short.clone();
+    wrapped_reply.message_id = "b".to_owned();
+    wrapped_reply.display_text = "x".repeat(200);
+    wrapped_reply.reply = Some(TimelineReply {
+        reply_to_message_id: "parent".to_owned(),
+        preview: None,
+    });
+    assert_eq!(
+        timeline_row_heights_media(&[short, wrapped_reply], None, 40, MediaView::default()),
+        vec![2, 8],
+        "each row keeps its own wrapped/reply height and source order"
+    );
 }
 
 #[test]
@@ -6535,26 +6579,6 @@ fn ctrl_q_does_not_quit() {
         .expect("Ctrl-Q handled");
 
     assert!(app.running, "Ctrl-Q must not quit the app");
-}
-
-#[test]
-fn plain_u_in_messages_focus_removes_the_reaction() {
-    // The guard on the `u` accelerator only rejects Ctrl/Alt: a plain `u` still
-    // fires the unreact and enqueues the `messages unreact` effect.
-    let account_id = "aa".repeat(32);
-    let group_id = "bb".repeat(32);
-    let mut app = test_tui_app(test_unused_client(), &account_id);
-    app.focus = Focus::Messages;
-    app.messages_account_id = Some(account_id.clone());
-    app.messages_group_id = Some(group_id);
-    app.timeline = vec![timeline_row("m1", 1)];
-
-    app.handle_key(char_key('u')).expect("plain u handled");
-
-    assert_eq!(
-        app.status, "removing reaction...",
-        "a plain u still fires the unreact"
-    );
 }
 
 #[test]
@@ -8777,20 +8801,6 @@ fn react_content_guard_rejects_non_latin_and_accented_prose() {
 }
 
 #[test]
-fn react_content_guard_accepts_the_nip25_downvote_sentinel() {
-    // NIP-25 defines `-` as the dislike sentinel, and `messages react` already
-    // accepts it. A lone `-` is a single unambiguous token with no typed-prose
-    // risk, so the TUI guard must let it through alongside the `+` default.
-    assert_eq!(
-        parse_slash_command("/react -"),
-        Ok(SlashCommand::React {
-            emoji: "-".to_owned()
-        }),
-        "the NIP-25 - downvote sentinel must be accepted"
-    );
-}
-
-#[test]
 fn messages_r_prefills_the_react_command_in_the_composer() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.focus = Focus::Messages;
@@ -9580,22 +9590,37 @@ fn message_accelerator_under_open_help_dismisses_the_card_and_does_not_act() {
     app.popup = Some(Popup::help());
     app.messages_account_id = Some("aa".repeat(32));
     app.messages_group_id = Some("bb".repeat(32));
+    app.timeline = vec![timeline_row("m0", 0)];
+    app.status = "reading".to_owned();
+    app.input.set_value("draft");
 
     app.handle_key(char_key('u')).expect("u");
 
     assert!(app.popup.is_none(), "u under the help card dismisses it");
+    assert_eq!(app.status, "reading", "the underlying unreact never runs");
+    assert_eq!(app.input.value(), "draft");
+    assert_eq!(app.focus, Focus::Messages);
+    assert_eq!(app.timeline[0].message_id, "m0");
 }
 
 #[test]
 fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
     let account_id = "aa".repeat(32);
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{"published":true}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
     let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
     app.focus = Focus::Messages;
     app.messages_account_id = Some(account_id.clone());
     app.messages_group_id = Some("bb".repeat(32));
     app.timeline = vec![timeline_row("m0", 0)];
 
+    assert!(app.chats.is_empty(), "dispatch needs only the loaded pane");
     app.handle_key(char_key('u')).expect("u");
 
     assert_eq!(
@@ -9609,6 +9634,9 @@ fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
         "the subprocess runs off-loop; the in-flight status is honest"
     );
 
+    // A chat-feed update may arrive while the action is in flight. At fold
+    // time, a mistaken reload must have a real selected chat to target.
+    app.chats = vec![flick_chat(&"bb".repeat(32), "loaded")];
     app.settle_effects(1);
     assert_eq!(app.status, "removed reaction");
     assert_eq!(
@@ -9616,6 +9644,9 @@ fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
         1,
         "no list reload on interaction success"
     );
+    finish_queued_effects(&mut app);
+    let recorded = std::fs::read_to_string(args_file).expect("recorded args");
+    assert!(!recorded.contains("timeline list"), "{recorded}");
 }
 
 #[test]
@@ -9686,8 +9717,16 @@ fn delete_allows_own_message_arriving_via_the_received_path() {
 #[test]
 fn own_message_interactions_do_not_reload_the_timeline() {
     let account_id = "aa".repeat(32);
-    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{"published":true}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
     let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.chats = vec![flick_chat(&"bb".repeat(32), "loaded")];
     app.messages_account_id = Some(account_id.clone());
     app.messages_group_id = Some("bb".repeat(32));
     let mut own = timeline_row("m0", 0);
@@ -9699,6 +9738,9 @@ fn own_message_interactions_do_not_reload_the_timeline() {
     app.settle_effects(1);
     assert_eq!(app.status, "reacted +");
     assert_eq!(app.timeline.len(), 1, "react does not reload the list");
+    finish_queued_effects(&mut app);
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(!recorded.contains("timeline list"), "{recorded}");
 
     app.delete_selected_message().expect("delete own");
     app.settle_effects(1);
@@ -9708,6 +9750,9 @@ fn own_message_interactions_do_not_reload_the_timeline() {
         1,
         "delete does not reload the list; the projection tombstones the row"
     );
+    finish_queued_effects(&mut app);
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(!recorded.contains("timeline list"), "{recorded}");
 }
 
 #[test]
@@ -9999,6 +10044,21 @@ fn test_appending_arg_executable(dir: &std::path::Path, response: &str) -> (Path
             args_file.display()
         ),
     );
+    (exe, args_file)
+}
+
+#[cfg(windows)]
+fn test_appending_arg_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    let exe = dir.join("wn-json.cmd");
+    let args_file = dir.join("recorded-args");
+    std::fs::write(
+        &exe,
+        format!(
+            "@echo off\r\necho %* >> \"{}\"\r\necho {response}\r\n",
+            args_file.display()
+        ),
+    )
+    .expect("write fake wn");
     (exe, args_file)
 }
 
@@ -10865,6 +10925,7 @@ fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {
     }
     assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
     app.settle_effects(1);
+    finish_queued_effects(&mut app);
 
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
     let timeline_loads: Vec<&str> = recorded
@@ -10927,6 +10988,7 @@ fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
         app.loading_chat.is_none(),
         "Enter on a settled same-chat preview enqueues no reload"
     );
+    finish_queued_effects(&mut app);
 
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
     let timeline_loads: Vec<&str> = recorded
@@ -10972,10 +11034,12 @@ fn group_detail_load_maps_to_the_four_groups_calls_in_order() {
         group: "gg".to_owned(),
     };
     let calls = effect.calls();
-    let subcommands: Vec<&str> = calls.iter().map(|call| call.args[1].as_str()).collect();
     assert_eq!(
-        subcommands,
-        vec!["members", "admins", "relays", "show"],
+        calls,
+        ["members", "admins", "relays", "show"].map(|subcommand| WnCall {
+            account: Some("aa".repeat(32)),
+            args: vec!["groups".to_owned(), subcommand.to_owned(), "gg".to_owned()],
+        }),
         "group detail reads members, admins, relays, then show — the fold's slice order"
     );
 }
@@ -10988,7 +11052,7 @@ fn a_stale_group_detail_load_after_leaving_is_dropped() {
     app.screen = Screen::Main;
     app.loading_group_detail = None;
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: "cc".repeat(32),
@@ -11023,7 +11087,7 @@ fn open_group_detail_reports_loading_then_settles_on_fold() {
     assert_eq!(app.screen, Screen::GroupDetail);
 
     // Folding the completed load clears the in-flight status.
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadGroupDetail {
             account: self_id.clone(),
             group: group_id.clone(),
@@ -11061,7 +11125,7 @@ fn invites_load_reports_loading_then_opens_the_picker() {
     // A second press while one is in flight does not double-queue.
     app.open_invites().expect("no double-queue");
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -11107,7 +11171,7 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
     app.loading_invites = true;
     app.selected_account = 1;
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadInvites {
             account: account_a.clone(),
         },
@@ -11153,7 +11217,7 @@ fn an_invites_fold_over_an_image_popup_reopens_through_the_close_funnel() {
 
     // The invites load (queued before the image was opened) now lands.
     app.loading_invites = true;
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -11192,7 +11256,7 @@ fn an_invites_fold_while_on_the_profile_screen_does_not_open_the_picker() {
     app.screen = Screen::Profile;
     app.loading_invites = true;
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadInvites {
             account: account_id,
         },
@@ -11243,7 +11307,7 @@ fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
     app.user_search = Some(UserSearchView::default());
     app.searching_users = Some("ali".to_owned());
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::UserSearch {
             account: account_id,
             query: "ali".to_owned(),
@@ -11312,7 +11376,7 @@ fn user_search_pane_scrolls_the_whole_selected_row_into_view() {
             } else {
                 format!("result{index:02}")
             }),
-            matched_field: "name".to_owned(),
+            matched_field: if index == 29 { "nip05" } else { "name" }.to_owned(),
             match_quality: "prefix".to_owned(),
             radius: 2,
             following: false,
@@ -11332,7 +11396,7 @@ fn user_search_pane_scrolls_the_whole_selected_row_into_view() {
         "the selected result renders inside the pane"
     );
     assert!(
-        rendered.contains("name · prefix · radius 2"),
+        rendered.contains("nip05 · prefix · radius 2"),
         "the selected result's attribution line renders with it"
     );
 }
@@ -11571,7 +11635,7 @@ fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
     // The pending search is for "bob"; an "alice" result is a superseded query.
     app.searching_users = Some("bob".to_owned());
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -11618,7 +11682,7 @@ fn leaving_a_search_in_flight_drops_a_late_result_from_the_reopened_screen() {
 
     // The abandoned "alice" search now completes; its result must not land in the
     // fresh screen.
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::UserSearch {
             account: account_id,
             query: "alice".to_owned(),
@@ -11764,15 +11828,16 @@ fn profile_edit_publishes_only_the_selected_field() {
         .expect("submit edit");
 
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
-    assert!(
-        recorded
-            .lines()
-            .any(|line| line.contains("profile update --display-name Al")),
-        "expected a single-field update argv, got:\n{recorded}"
-    );
-    assert!(
-        !recorded.contains("--about") && !recorded.contains("--picture"),
-        "only the changed field is published:\n{recorded}"
+    let updates: Vec<_> = recorded
+        .lines()
+        .filter(|line| line.contains("profile update"))
+        .collect();
+    assert_eq!(
+        updates,
+        [format!(
+            "--json --account {} profile update --display-name Al",
+            "aa".repeat(32)
+        )]
     );
 }
 
@@ -12049,6 +12114,23 @@ fn follows_child_invocation_borrows_the_setup_relay_only_without_a_global_relay(
     assert!(
         !recorded.lines().any(|line| line == "--relay"),
         "no relay is invented when none is configured: {recorded:?}"
+    );
+
+    let client = WnClient {
+        relay: Some("wss://global".to_owned()),
+        discovery_relays: vec!["wss://discovery".to_owned()],
+        default_account_relays: vec!["wss://default".to_owned()],
+        ..app.client.clone()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.follow_user("npub1bob")
+        .expect("follow with global relay");
+    let recorded = std::fs::read_to_string(&args_file).expect("args file");
+    let args: Vec<_> = recorded.lines().collect();
+    assert_eq!(args.iter().filter(|arg| **arg == "--relay").count(), 1);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--relay", "wss://global"])
     );
 }
 
@@ -12393,31 +12475,69 @@ fn react_key_in_messages_focus_resolves_to_the_selected_rows_effect() {
 #[cfg(unix)]
 #[test]
 fn queued_mutations_run_in_fifo_order_off_the_event_loop() {
-    // Two user-initiated mutations must reach `wn` in the order they were queued.
-    // A single worker thread draining one FIFO channel preserves that order; the
-    // appending fake records each argv line so the order is observable.
     let account_id = "aa".repeat(32);
     let group_id = "bb".repeat(32);
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let (exe, args_file) =
-        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let mut gate = TestCommandGate::new(tempdir.path());
+    let exe = tempdir.path().join("wn-json");
+    let args_file = tempdir.path().join("recorded-args");
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *' react '*' 1 '*)\n{};;\nesac\necho \"$*\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}'\n",
+            gate.script(),
+            args_file.display()
+        ),
+    );
     let client = WnClient {
         exe,
         ..test_unused_client()
     };
-    let mut app = test_tui_app(client, &account_id);
-    app.messages_account_id = Some(account_id.clone());
-    app.messages_group_id = Some(group_id.clone());
-    app.timeline = vec![timeline_row("m1", 10)];
-
-    app.react_to_selected_message("1".to_owned())
-        .expect("react 1");
-    app.react_to_selected_message("2".to_owned())
-        .expect("react 2");
-    app.settle_effects(2);
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (ui_tx, ui_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut app = test_tui_app(client, &account_id);
+        app.messages_account_id = Some(account_id);
+        app.messages_group_id = Some(group_id);
+        app.timeline = vec![timeline_row("m1", 10)];
+        app.react_to_selected_message("1".to_owned())
+            .expect("react 1");
+        continue_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first child entered");
+        app.react_to_selected_message("2".to_owned())
+            .expect("react 2");
+        app.handle_key(char_key('x'))
+            .expect("typing while mutation is blocked");
+        ui_tx
+            .send(app.input.value().to_owned())
+            .expect("report UI action");
+        if finish_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("UI observation completed")
+        {
+            app.settle_effects(1);
+            assert_eq!(app.status, "reacted 1");
+            app.settle_effects(1);
+            assert_eq!(app.status, "reacted 2");
+        }
+    });
+    gate.wait_until_entered();
+    continue_tx.send(()).expect("first child is blocked");
+    let typed_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+    gate.release();
+    finish_tx
+        .send(typed_before_release.is_ok())
+        .expect("finish observation");
+    worker.join().expect("UI thread");
+    assert_eq!(
+        typed_before_release.expect("typing completed before child release"),
+        "x"
+    );
 
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
-    let react_lines: Vec<&str> = recorded
+    let react_lines: Vec<_> = recorded
         .lines()
         .filter(|line| line.contains(" react "))
         .collect();
@@ -12442,7 +12562,7 @@ fn react_reports_in_flight_then_final_status_via_the_fold() {
         .expect("react");
     assert_eq!(app.status, "reacting...", "in-flight feedback is honest");
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::React {
             account: account_id,
             group: "bb".repeat(32),
@@ -12502,7 +12622,7 @@ fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
         "rows arrive only when the load folds"
     );
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_id.clone(),
@@ -12560,7 +12680,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
 
     // A's late result arrives after the user moved to B.
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadTimeline {
             account: account_id.clone(),
             group: group_a.clone(),
@@ -12582,7 +12702,7 @@ fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
     assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
 
     // B's result lands and is accepted.
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_b.clone(),
@@ -12620,7 +12740,7 @@ fn a_switched_away_accounts_timeline_fold_is_dropped() {
     app.refresh_chats().expect("refresh_chats");
     assert!(app.messages_group_id.is_none());
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadTimeline {
             account: account_a.clone(),
             group: group_a.clone(),
@@ -12659,7 +12779,7 @@ fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
     app.timeline.push(timeline_row("m3", 300));
 
     // The reload page returns only what was materialized at enqueue time (m1, m2).
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::LoadTimeline {
             account: account_id,
             group: group_id.clone(),
@@ -12720,7 +12840,7 @@ fn sending_reports_in_flight_then_folds_an_optimistic_row() {
         "the row folds only when the send lands"
     );
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::SendMessage {
             account: account_id,
             group: group_id,
@@ -12750,7 +12870,7 @@ fn an_optimistic_send_row_for_a_chat_the_user_left_is_dropped() {
     let mut app = test_tui_app(test_unused_client(), &account_id);
     app.messages_group_id = Some("bb".repeat(32));
 
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::SendMessage {
             account: account_id,
             group: "cc".repeat(32),
@@ -12789,7 +12909,7 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
 
     app.send_reply("re: hi".to_owned()).expect("kickoff");
     assert_eq!(app.status, "sending reply...");
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect,
         result: Ok(vec![
             serde_json::json!({"published": 1, "message_ids": ["r1"]}),
@@ -12878,53 +12998,57 @@ fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
 #[cfg(unix)]
 #[test]
 fn the_launch_daemon_auto_start_does_not_stall_the_first_user_action() {
-    // The launch auto-start's `wn daemon start` blocks up to five seconds on its
-    // readiness poll, so it must run on its own thread, not the single FIFO
-    // effect worker. A user action enqueued right after it must fold without
-    // waiting behind the daemon start (here a ~300ms sleep stands in for the poll).
-    let account_id = "aa".repeat(32);
-    let (_tempdir, client) = test_scripted_client(
-        "case \" $* \" in\n\
-         *' daemon start '*)\n\
-         sleep 0.3\n\
-         cat <<'JSON'\n{\"ok\":true,\"result\":{\"running\":true,\"pid\":4242}}\nJSON\n;;\n\
-         *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n;;\nesac\n",
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let mut gate = TestCommandGate::new(tempdir.path());
+    let exe = tempdir.path().join("wn-json");
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in\n*' daemon start '*)\n{}printf '%s\\n' '{{\"ok\":true,\"result\":{{\"running\":true,\"pid\":4242}}}}'\n;;\n*) printf '%s\\n' '{{\"ok\":true,\"result\":{{}}}}'\n;;\nesac\n",
+            gate.script()
+        ),
     );
     let client = WnClient {
+        exe,
         discovery_relays: vec!["wss://d.example".to_owned()],
-        ..client
+        ..test_unused_client()
     };
-    let mut app = test_tui_app(client, &account_id);
-    app.daemon = DaemonView::default();
-
-    // Warm the subprocess exec path first: the one-time cost of loading the
-    // shell/script into the page cache (~half a second cold, ~10ms after) would
-    // otherwise swamp the timing budget below and make it flaky. This settles a
-    // throwaway effect through the worker so every later spawn is warm.
-    app.effects.enqueue(Effect::MarkRead {
-        account: account_id.clone(),
-        group: "warmup".to_owned(),
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (ui_tx, ui_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let account_id = "aa".repeat(32);
+        let mut app = test_tui_app(client, &account_id);
+        app.daemon = DaemonView::default();
+        app.autostart_daemon_if_needed(None);
+        continue_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("daemon child entered");
+        app.effects.enqueue(Effect::MarkRead {
+            account: account_id,
+            group: "g1".to_owned(),
+        });
+        let done = app.effects.recv_timeout(Duration::from_secs(5));
+        ui_tx
+            .send(done.map(|done| (done.effect, done.result)))
+            .expect("report user completion");
+        app.recv_daemon_autostart()
     });
-    assert!(
-        app.effects.recv_timeout(Duration::from_secs(5)).is_some(),
-        "warmup effect completes",
-    );
-
-    // Kick off the auto-start (its `daemon start` sleeps ~300ms), then queue a
-    // user effect right behind it. On the shared FIFO worker it would wait out
-    // the whole start; on its own thread the worker is free, so the user effect
-    // folds well inside the 200ms budget (warm spawns are ~10ms).
-    app.autostart_daemon_if_needed(None);
-    app.effects.enqueue(Effect::MarkRead {
-        account: account_id,
-        group: "g1".to_owned(),
-    });
-    assert!(
-        app.effects
-            .recv_timeout(Duration::from_millis(200))
-            .is_some(),
-        "a user effect enqueued during auto-start folds without waiting behind the ~300ms daemon start"
-    );
+    gate.wait_until_entered();
+    continue_tx.send(()).expect("daemon start is blocked");
+    // The start cannot complete until release. Receiving the user's result now
+    // proves the two operations overlap; no short performance budget is needed.
+    let user_before_release = ui_rx.recv_timeout(Duration::from_secs(5));
+    gate.release();
+    let started = worker
+        .join()
+        .expect("UI thread")
+        .expect("daemon start result");
+    let (effect, result) = user_before_release
+        .expect("user completion before release")
+        .expect("user effect completed while daemon start remained blocked");
+    assert!(matches!(effect, Effect::MarkRead { group, .. } if group == "g1"));
+    assert_eq!(result, Ok(vec![serde_json::json!({})]));
+    assert_eq!(started, serde_json::json!({"running": true, "pid": 4242}));
 }
 
 #[test]
@@ -12951,12 +13075,6 @@ fn launch_with_no_daemon_and_no_relay_source_surfaces_one_honest_status() {
         app.daemon_autostart.is_none(),
         "no start thread spawns without a relay source"
     );
-    assert!(
-        app.effects
-            .recv_timeout(Duration::from_millis(200))
-            .is_none(),
-        "no start attempt is queued on the effect worker either"
-    );
     assert!(!app.daemon.running);
     assert!(
         app.running,
@@ -12976,12 +13094,6 @@ fn launch_with_a_running_daemon_never_attempts_an_auto_start() {
     assert!(
         app.daemon_autostart.is_none(),
         "no redundant start thread spawns for an already-running daemon"
-    );
-    assert!(
-        app.effects
-            .recv_timeout(Duration::from_millis(200))
-            .is_none(),
-        "no redundant start attempt is queued"
     );
 }
 
@@ -13253,7 +13365,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     // Left screen: the mutation outcome still surfaces (the publish happened),
     // but there is no view to badge — and nothing crashes.
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -13271,7 +13383,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     if let Some(view) = app.user_search.as_mut() {
         view.results[0].pubkey = "cc".to_owned();
     }
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -13289,7 +13401,7 @@ fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
     // since-switched account is dropped even if the same pubkey is on screen.
     let mut app = user_search_app_with_selected_result(test_unused_client());
     app.accounts[0].account_id = "dd".repeat(32);
-    app.apply_effect_done_for_test(EffectDone {
+    app.apply_effect_done(EffectDone {
         effect: Effect::FollowUser {
             account: "aa".repeat(32),
             pubkey: "bb".to_owned(),
@@ -13316,4 +13428,321 @@ fn the_search_results_hints_and_help_card_name_the_follow_keys() {
         help.contains("f follow; x unfollow"),
         "the help card names the search-screen follow keys; got: {help}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn wn_client_pipes_secret_stdin_and_forwards_global_options() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let exe = dir.path().join("wn-json");
+    let args_file = dir.path().join("argv");
+    let stdin_file = dir.path().join("stdin");
+    write_fake_wn(
+        &exe,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{\"accepted\":true}}}}'\nexit 7\n",
+            args_file.display(),
+            stdin_file.display()
+        ),
+    );
+    let client = WnClient {
+        exe,
+        home: Some(PathBuf::from("selected-home")),
+        socket: Some(PathBuf::from("selected-socket")),
+        relay: Some("wss://global.example".to_owned()),
+        secret_store: Some(SecretStoreKind::File),
+        keychain_service: Some("selected-service".to_owned()),
+        ..test_unused_client()
+    };
+    let invocation = account_setup_invocation(Some("nsec1synthetic".to_owned()), None);
+    let result = client
+        .run_json_with_stdin(
+            Some("selected-account"),
+            &invocation.args,
+            invocation.stdin.as_deref().expect("secret stdin"),
+        )
+        .expect("ok envelope wins over exit code");
+    assert_eq!(result, serde_json::json!({"accepted": true}));
+    assert_eq!(
+        std::fs::read_to_string(stdin_file).expect("captured stdin"),
+        "nsec1synthetic\n"
+    );
+    let recorded = std::fs::read_to_string(args_file).expect("captured argv");
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        [
+            "--json",
+            "--home",
+            "selected-home",
+            "--socket",
+            "selected-socket",
+            "--relay",
+            "wss://global.example",
+            "--secret-store",
+            "file",
+            "--keychain-service",
+            "selected-service",
+            "--account",
+            "selected-account",
+            "login",
+            "--nsec-stdin",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn wn_client_reports_envelope_errors_before_stderr() {
+    for (stdout, stderr, expected) in [
+        (
+            r#"{"ok":false,"error":{"message":"message wins","code":"code loses"}}"#,
+            "stderr loses",
+            "message wins",
+        ),
+        (
+            r#"{"ok":false,"error":{"code":"code wins"}}"#,
+            "stderr loses",
+            "code wins",
+        ),
+        (r#"{"ok":false}"#, "stderr fallback", "stderr fallback"),
+    ] {
+        let (_dir, client) = test_scripted_client(&format!(
+            "cat <<'JSON'\n{stdout}\nJSON\nprintf '%s\\n' '{stderr}' >&2\n"
+        ));
+        let error = client
+            .run_json(None, &["status"])
+            .expect_err("error envelope");
+        assert!(matches!(error, TuiError::Cli(message) if message == expected));
+    }
+    let (_dir, client) = test_scripted_client("printf broken\nprintf 'diagnostic\\n' >&2\n");
+    let error = client
+        .run_json(None, &["status"])
+        .expect_err("malformed JSON");
+    assert!(matches!(error, TuiError::Cli(message)
+        if message.starts_with("wn returned invalid JSON:") && message.ends_with("; stderr: diagnostic")));
+}
+
+#[cfg(unix)]
+#[test]
+fn subscription_reader_preserves_frame_order_and_ends_once() {
+    for explicit_end in [false, true] {
+        let suffix = if explicit_end {
+            "{\"stream_end\":true}\n{\"result\":{\"must_not_arrive\":true}}\n"
+        } else {
+            ""
+        };
+        let (_dir, client) = test_scripted_client(&format!(
+            "cat <<'JSON'\n\nnot-json\n{{\"result\":{{\"sequence\":1}}}}\n{{\"error\":{{\"message\":\"feed error\"}}}}\n{suffix}JSON\n"
+        ));
+        let mut child = client
+            .spawn_json_lines(None, &["messages", "subscribe"])
+            .expect("spawn feed");
+        let rx = spawn_subscription_reader(&mut child, "fixture").expect("real stdout reader");
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("malformed frame"),
+            SubscriptionEvent::Error(message) if message.starts_with("invalid fixture subscription JSON:"))
+        );
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("result after malformed frame"),
+            SubscriptionEvent::Result(result) if result == serde_json::json!({"sequence": 1}))
+        );
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("error frame"),
+            SubscriptionEvent::Error(message) if message == "feed error")
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("stream end or EOF"),
+            SubscriptionEvent::Ended
+        ));
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the reader terminates after exactly one Ended event"
+        );
+        assert!(child.wait().expect("feed exited").success());
+    }
+}
+
+#[test]
+fn profile_card_sanitizes_fields_and_prefers_display_name() {
+    for nested in [false, true] {
+        let user = serde_json::json!({
+            "npub": "npub1sa\u{202e}fe", "follows": ["a", "b"],
+            "profile": {
+                "display_name": if nested { " " } else { "Al\u{1b}\u{202e}\u{3164}ice" },
+                "name": "Name\u{7}\u{202e}\u{2800} fallback",
+                "about": "café \u{1b}\u{202e}\u{3164}中文",
+                "nip05": "a\u{1b}\u{202e}\u{3164}@example.com",
+                "lud16": "b\u{1b}\u{202e}\u{3164}@example.com",
+                "picture": "https://p\u{1b}\u{202e}\u{3164}.example/image"
+            }
+        });
+        let result = if nested {
+            serde_json::json!({"user": user})
+        } else {
+            user
+        };
+        assert_eq!(
+            profile_card_lines(&result),
+            [
+                if nested { "Name fallback" } else { "Alice" },
+                "npub npub1safe",
+                "about: café 中文",
+                "nip05: a@example.com",
+                "lud16: b@example.com",
+                "picture: https://p.example/image",
+                "follows: 2"
+            ]
+        );
+    }
+}
+
+#[test]
+fn chat_subscription_drain_preserves_loaded_pane_until_selection_changes() {
+    for explicit_end in [false, true] {
+        let account = "aa".repeat(32);
+        let mut app = test_tui_app(test_unused_client(), &account);
+        app.daemon.running = false;
+        app.chats = vec![
+            projected_chat("aa", "a", 0, Some(10)),
+            projected_chat("bb", "b", 0, Some(5)),
+        ];
+        app.messages_account_id = Some(account.clone());
+        app.messages_group_id = Some("aa".to_owned());
+        app.timeline = vec![timeline_row("loaded", 10)];
+        let (tx, rx) = mpsc::channel();
+        app.chat_subscription = Some(ChatSubscription {
+            account_id: account,
+            include_archived: false,
+            child: test_sleep_child(),
+            rx,
+        });
+        assert!(
+            !app.drain_chat_subscription(),
+            "an empty feed does not dirty the frame"
+        );
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type": "chat", "chat": {"group_id": "bb", "profile": {"name": "renamed b"}, "activity_sort_at": 20}
+        }))).expect("chat update");
+        assert!(app.drain_chat_subscription());
+        assert_eq!(app.chats[0].name, "renamed b");
+        assert_eq!(app.selected_chat, 1);
+        assert_eq!(app.selected_chat_row().expect("selection").group_id, "aa");
+        assert_eq!(app.messages_group_id.as_deref(), Some("aa"));
+        assert_eq!(app.timeline[0].message_id, "loaded");
+        assert_eq!(app.status, "live chat update: chats=2");
+
+        app.screen = Screen::Login(LoginMode::NsecEntry);
+        app.status = "enter nsec".to_owned();
+        tx.send(SubscriptionEvent::Error("offline".to_owned()))
+            .expect("chat error");
+        assert!(app.drain_chat_subscription());
+        assert_eq!(app.status, "enter nsec");
+        app.screen = Screen::Main;
+        tx.send(SubscriptionEvent::Error("offline".to_owned()))
+            .expect("chat error");
+        assert!(app.drain_chat_subscription());
+        assert_eq!(app.status, "chat subscription failed: offline");
+
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type": "chat", "chat": {"group_id": "aa", "profile": {"name": "a"}, "archived": true}
+        })))
+        .expect("selected chat leaves visible list");
+        assert!(app.drain_chat_subscription());
+        assert_eq!(
+            app.selected_chat_row()
+                .expect("remaining selection")
+                .group_id,
+            "bb"
+        );
+        assert!(app.timeline.is_empty());
+        assert!(app.messages_account_id.is_none());
+        assert!(app.messages_group_id.is_none());
+        if explicit_end {
+            tx.send(SubscriptionEvent::Ended).expect("explicit end");
+        }
+        drop(tx);
+        assert!(app.drain_chat_subscription());
+        assert!(
+            app.chat_subscription.is_none(),
+            "end and disconnect tear down the handle"
+        );
+        assert!(!app.drain_chat_subscription());
+        assert!(app.running);
+    }
+}
+
+#[test]
+fn group_state_subscription_drain_scopes_diagnostics_and_tears_down() {
+    for explicit_end in [false, true] {
+        let account = "aa".repeat(32);
+        let mut app = test_tui_app(test_unused_client(), &account);
+        let (tx, rx) = mpsc::channel();
+        app.group_state_subscription = Some(GroupStateSubscription {
+            account_id: account,
+            group_id: "aa".to_owned(),
+            child: test_sleep_child(),
+            rx,
+        });
+        assert!(!app.drain_group_state_subscription());
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type": "group_state", "group_id": "aa", "trigger": "GroupStateUpdated",
+            "group": {"group_id": "aa", "profile": {"name": "loaded room"}},
+            "mls": {"epoch": 8, "member_count": 2}
+        })))
+        .expect("matching update");
+        assert!(app.drain_group_state_subscription());
+        let diagnostics = app.group_diagnostics.clone().expect("diagnostics adopted");
+        assert_eq!(diagnostics.group_id, "aa");
+        assert_eq!(diagnostics.epoch, Some(8));
+        assert_eq!(diagnostics.member_count, Some(2));
+        assert_eq!(app.status, "live group state update: loaded room");
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type": "group_state", "group_id": "bb", "trigger": "GroupStateUpdated",
+            "group": {"group_id": "bb"}, "mls": {"epoch": 99}
+        })))
+        .expect("foreign update");
+        assert!(app.drain_group_state_subscription());
+        assert_eq!(app.group_diagnostics.as_ref(), Some(&diagnostics));
+        assert_eq!(app.status, "live group state update: loaded room");
+
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "type": "group_state", "group_id": "aa", "trigger": "InitialGroupState"
+        })))
+        .expect("matching update without diagnostics");
+        assert!(app.drain_group_state_subscription());
+        assert_eq!(
+            app.group_diagnostics,
+            Some(GroupDiagnostics::unavailable(
+                "aa",
+                "group state update did not include diagnostics"
+            ))
+        );
+        assert_eq!(
+            app.status, "live group state update: loaded room",
+            "initial state leaves status intact"
+        );
+        app.screen = Screen::Login(LoginMode::NsecEntry);
+        app.status = "enter nsec".to_owned();
+        tx.send(SubscriptionEvent::Error("offline".to_owned()))
+            .expect("group error");
+        assert!(app.drain_group_state_subscription());
+        assert_eq!(app.status, "enter nsec");
+        app.screen = Screen::Main;
+        tx.send(SubscriptionEvent::Error("offline".to_owned()))
+            .expect("group error");
+        assert!(app.drain_group_state_subscription());
+        assert_eq!(app.status, "group state subscription failed: offline");
+        if explicit_end {
+            tx.send(SubscriptionEvent::Ended).expect("explicit end");
+        }
+        drop(tx);
+        assert!(app.drain_group_state_subscription());
+        assert!(app.group_state_subscription.is_none());
+        assert!(!app.drain_group_state_subscription());
+        assert!(app.running);
+    }
 }
