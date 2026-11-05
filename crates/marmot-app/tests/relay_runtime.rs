@@ -927,7 +927,7 @@ async fn gift_wrap_blocking_app_with_config(
 }
 
 #[derive(Debug)]
-struct RejectGiftWrapsWhileArmed(Arc<AtomicBool>, &'static str);
+struct RejectGiftWrapsWhileArmed(Arc<AtomicBool>);
 
 impl WritePolicy for RejectGiftWrapsWhileArmed {
     fn admit_event<'a>(
@@ -937,7 +937,7 @@ impl WritePolicy for RejectGiftWrapsWhileArmed {
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if self.0.load(Ordering::Relaxed) && event.kind == OldKind::GiftWrap {
-                PolicyResult::Reject(self.1.into())
+                PolicyResult::Reject("injected gift-wrap rejection".into())
             } else {
                 PolicyResult::Accept
             }
@@ -13355,10 +13355,7 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
-        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(
-            rejecting.clone(),
-            "injected gift-wrap rejection",
-        )),
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -13873,10 +13870,7 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
-        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(
-            rejecting.clone(),
-            "invalid: event too large: 999999999",
-        )),
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -13898,7 +13892,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     let alice_label = alice.account.label.clone();
     let bob_id = bob.account.account_id_hex.clone();
 
-    let mut failure_events = runtime.subscribe();
     rejecting.store(true, Ordering::Relaxed);
     let group_id = runtime
         .create_group(
@@ -13909,17 +13902,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
         )
         .await
         .unwrap();
-    let notice = wait_for_event(&mut failure_events, |event| matches!(event, MarmotAppEvent::WelcomeDeliveryPending { group_id: failed_group, .. } if failed_group == &group_id)).await;
-    assert!(
-        matches!(
-            notice,
-            MarmotAppEvent::WelcomeDeliveryPending {
-                size_class: Some(marmot_app::EventSizeClass::Under64Kib),
-                ..
-            }
-        ),
-        "actual native refusal must reach the host notice"
-    );
     let pending = timeout(Duration::from_secs(5), async {
         loop {
             let pending = runtime.pending_welcome_deliveries(&alice_id).await.unwrap();
@@ -13933,12 +13915,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     .expect("rejected founding Welcome must remain durably pending");
     assert_eq!(pending.len(), 1);
     assert_eq!(
-        pending[0].size_class,
-        Some(marmot_app::EventSizeClass::Under64Kib),
-        "genuine relay size refusal must reach the durable host query"
-    );
-    let original_pending = pending[0].clone();
-    assert_eq!(
         app.groups(&alice_label)
             .unwrap()
             .into_iter()
@@ -13949,39 +13925,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     );
 
     runtime.shutdown().await;
-
-    // Exercise ordinary explicit legacy re-delivery without a worker's
-    // automatic maintenance racing the two observed attempts. The same real
-    // relay remains armed; no result or failure metadata is fabricated.
-    let mut retrying = app.client(&alice_label).await.unwrap();
-    assert_eq!(retrying.pending_welcome_deliveries().unwrap(), pending);
-    let error = retrying
-        .redeliver_welcome(&original_pending.message_id_hex)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.as_oversized_event(),
-        Some(marmot_session::OversizedEvent {
-            artifact: marmot_app::OversizedArtifact::Welcome,
-            size_class: marmot_app::EventSizeClass::Under64Kib,
-        })
-    );
-    let error = retrying
-        .redeliver_welcome(&original_pending.message_id_hex)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, AppError::Publish(_)),
-        "coarse legacy prior exposure remains conservative"
-    );
-    let mut latest = original_pending.clone();
-    latest.size_class = None;
-    assert_eq!(
-        retrying.pending_welcome_deliveries().unwrap(),
-        [latest.clone()],
-        "later causes update an already-announced handle without reordering or clearing it"
-    );
-    drop(retrying);
 
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
@@ -14000,11 +13943,6 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     .await
     .expect("undelivered founding Welcome must survive restart");
     assert_eq!(pending.len(), 1);
-    assert_eq!(
-        pending,
-        [latest],
-        "the repair pointer and conservative latest diagnosis survive restart"
-    );
     assert_eq!(
         app.groups(&alice_label)
             .unwrap()

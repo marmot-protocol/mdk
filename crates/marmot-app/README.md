@@ -331,6 +331,13 @@ departure obligation. Already admitted native work follows its ordinary retry ru
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+For outbound Welcomes, canonical group creation or a confirmed Add can succeed while delivery fails. Subscribe to
+`WelcomeDeliveryPending` and read `pending_welcome_deliveries` for the retained repair handles. Their optional
+`size_class` reports only a proved all-target size refusal, without relay details or an assumed relay limit. Missing
+evidence means Unknown. A specific diagnosis may become Unknown after a coarse legacy retry, while the same delivery
+debt and membership remain. Notices remain once per process/Welcome; use the query or an explicit retry's error for
+later causes. Diagnosis storage is best effort and never owns retries, adds another member, or rolls back the Add.
+
 **Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
 projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
 account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
