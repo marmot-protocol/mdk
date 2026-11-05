@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Retire a delayed Accept's application work after a completed native disband, while preserving the invitation
+  decision and terminal chat projection. Unrecoverable or unreadable native state still keeps work owed.
+  This avoids repeated maintenance checks; host APIs, membership, wire format and database schema are unchanged.
+
 - Keep Wi-Fi/charging reports runtime-wide across account-worker restarts and expose a finite due-backup-pass wait.
   Completion joins admitted work and reports an ended settlement attempt, not publication success; old account-shaped
   setters remain validating compatibility wrappers. No database migration or existing host parameter-layout change.
