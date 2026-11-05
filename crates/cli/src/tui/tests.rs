@@ -3317,7 +3317,6 @@ fn seen_notification_keys_are_bounded() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
     let account_id = "aa".repeat(32);
