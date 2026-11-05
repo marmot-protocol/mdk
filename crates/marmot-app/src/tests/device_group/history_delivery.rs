@@ -341,13 +341,35 @@ async fn name_phone(devices: &mut Devices, group: &GroupId, label: &str) {
     devices.laptop.sync().await.unwrap();
 }
 
-/// What the account worker's seam does on `client`: give storage the device
-/// names again when the linked devices may have changed, and say whether
-/// hosts owe a `ChatHistoryImportsChanged`.
+/// Capture the existing account worker's actual host notifications.
+fn device_group_events(client: &mut AppClient) -> Vec<crate::MarmotAppEvent> {
+    let (events, mut received) = tokio::sync::broadcast::channel(16);
+    let account_id_hex = hex::encode(client.runtime.self_id().as_slice());
+    let label = client.state.label.clone();
+    crate::runtime::account_worker::publish_device_group_changes(
+        client,
+        &events,
+        &account_id_hex,
+        &label,
+    );
+    let mut published = Vec::new();
+    loop {
+        match received.try_recv() {
+            Ok(event) => published.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return published,
+            Err(error) => panic!("host notifications could not be observed: {error}"),
+        }
+    }
+}
+
+/// Whether the actual worker tells hosts to reread the latest import answer.
 fn device_group_seam(client: &mut AppClient) -> bool {
-    let linked_devices_changed = client.take_linked_devices_changed();
-    client.refresh_device_labels(linked_devices_changed);
-    client.take_chat_history_imports_changed()
+    device_group_events(client).iter().any(|event| {
+        matches!(
+            event,
+            crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        )
+    })
 }
 
 /// What `client` lists of `chat`'s history from another device.
@@ -1627,6 +1649,79 @@ async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, 
     assert!(!device_group_seam(&mut devices.laptop));
 
     cgka_traits::storage::GroupStorage::put_group(&account, &saved_group).unwrap();
+
+    // No worker seam or new roster event intervenes: the import itself must
+    // retry the failed roster read before returning its new timeline rows.
+    let after_recovery = send_text(&mut devices.phone, chat, "import after roster recovery").await;
+    let bundle = devices
+        .phone
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let imported = devices
+        .laptop
+        .import_history_bundle(
+            chat,
+            &slot_of(&devices.phone),
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            &sealed.ciphertext,
+        )
+        .unwrap()
+        .expect("new history imports after the roster recovers");
+    assert_eq!(
+        imported
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == after_recovery)
+            .unwrap()
+            .imported_from,
+        Some(phone_named(devices, "Old phone")),
+        "the import refreshes labels before any worker seam"
+    );
+}
+
+/// The original adder sends a genuinely sealed bundle through the native
+/// device-group receiver. The parked delivery makes the latest answer
+/// Receiving, independently of the names on already-imported timeline rows.
+async fn park_history_from_phone(devices: &mut Devices, group: &GroupId, chat: &GroupId) {
+    let bundle = devices
+        .phone
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let blossom = local_blossom();
+    blossom.blobs.lock().unwrap().insert(
+        hex::encode(sealed.ciphertext_sha256),
+        sealed.ciphertext.to_vec(),
+    );
+    let exchange = devices.phone.device_group_exchange().unwrap().unwrap();
+    let event = devices
+        .phone
+        .history_delivery_event(
+            &exchange,
+            &slot_of(&devices.laptop),
+            chat,
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            crate::history_delivery::DeliveredBundle::Blossom(vec![blossom.url.clone()]),
+        )
+        .unwrap();
+    assert!(
+        devices
+            .phone
+            .send_device_group_event(group, event)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert_eq!(
+        history_state(&devices.laptop, chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+    assert!(device_group_seam(&mut devices.laptop));
 }
 
 /// Each imported row names the device it came from, by the name the roster
@@ -1722,6 +1817,7 @@ async fn an_imported_row_names_the_device_it_came_from() {
         [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "Old phone")
     ));
 
+    Box::pin(park_history_from_phone(&mut devices, &group, &chat)).await;
     name_phone(&mut devices, &group, "New phone").await;
     let labels = storage(&devices.laptop_app);
     let generation = labels.history_imports_generation().unwrap();
@@ -1732,24 +1828,60 @@ async fn an_imported_row_names_the_device_it_came_from() {
         )
         .unwrap();
     assert!(devices.laptop.trusted_device_roster().unwrap().is_some());
-    assert!(!device_group_seam(&mut devices.laptop));
+    let failed = device_group_events(&mut devices.laptop);
+    assert!(
+        failed
+            .iter()
+            .any(|event| matches!(event, crate::MarmotAppEvent::LinkedDevicesChanged { .. }))
+    );
+    assert!(!failed.iter().any(|event| matches!(
+        event,
+        crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+    )));
     assert_eq!(labels.history_imports_generation().unwrap(), generation);
     assert_eq!(
         sources(&devices),
         [Some(phone_named(&devices, "Old phone")), None]
     );
+    assert!(
+        device_group_events(&mut devices.laptop).is_empty(),
+        "failed retries are quiet"
+    );
     labels
         .execute_batch_for_test("DROP TRIGGER temp.refuse_device_label_write")
         .unwrap();
+    let recovered = device_group_events(&mut devices.laptop);
     assert!(
-        device_group_seam(&mut devices.laptop),
-        "the failed atomic label write is retried after storage recovers"
+        recovered
+            .iter()
+            .any(|event| matches!(event, crate::MarmotAppEvent::LinkedDevicesChanged { .. })),
+        "successful deferred labels tell hosts to reread older timeline rows"
+    );
+    assert!(
+        !recovered.iter().any(|event| matches!(
+            event,
+            crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        )),
+        "the latest answer is still Receiving, despite the renamed older rows"
+    );
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
     );
     assert_eq!(
         sources(&devices),
         [Some(phone_named(&devices, "New phone")), None]
     );
-    assert!(!device_group_seam(&mut devices.laptop));
+    assert!(
+        device_group_events(&mut devices.laptop).is_empty(),
+        "fresh labels owe no catch-up event"
+    );
+    devices.laptop.drive_history_blobs().await;
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(matches!(
+        &history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "New phone")
+    ));
 
     devices
         .laptop

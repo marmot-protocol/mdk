@@ -128,6 +128,12 @@ impl AppClient {
             .app
             .account_storage(&self.state.label)
             .and_then(|storage| Ok(storage.app_storage().set_device_labels(&labels)?));
+        // The latest import answer need not change when older timeline rows
+        // acquire new names. Reuse the roster's existing row-refresh cue once
+        // deferred work succeeds, including after its original cue was drained.
+        if self.device_labels_refresh_due && set.is_ok() {
+            self.linked_devices_changed = true;
+        }
         self.device_labels_refresh_due = set.is_err();
         if let Err(error) = set {
             tracing::warn!(

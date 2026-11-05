@@ -8805,16 +8805,15 @@ fn publish_account_level_changes(
 /// device. Both the account-level seam and the applied-summary seam drain
 /// them, so startup, reconnect, maintenance and every command and delivery
 /// announce them.
-fn publish_device_group_changes(
+pub(crate) fn publish_device_group_changes(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
 ) {
     client.publish_backup_restore_availability();
-    let linked_devices_changed = client.take_linked_devices_changed();
-    client.refresh_device_labels(linked_devices_changed);
-    if linked_devices_changed {
+    client.refresh_device_labels(client.linked_devices_changed);
+    if client.take_linked_devices_changed() {
         let _ = events.send(MarmotAppEvent::LinkedDevicesChanged {
             account_id_hex: account_id_hex.to_owned(),
             account_label: account_label.to_owned(),
