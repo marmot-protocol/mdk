@@ -403,6 +403,13 @@ mod tests {
             vec![isolated_group.clone()]
         );
 
+        // The compatibility stream has its own receiver and must not be mixed
+        // with next_update on the typed subscription below.
+        let legacy = kit
+            .subscribe_chat_list(account_ref.clone(), false)
+            .await
+            .expect("subscribe legacy chat list");
+        assert_eq!(legacy.snapshot().len(), 2);
         let subscription = kit
             .subscribe_chat_list(account_ref.clone(), false)
             .await
@@ -432,6 +439,20 @@ mod tests {
             })
         ));
 
+        for (id, pinned, position) in [
+            (first.clone(), true, Some(0)),
+            (second.clone(), false, None),
+        ] {
+            let row = tokio::time::timeout(std::time::Duration::from_secs(5), legacy.next())
+                .await
+                .expect("legacy snapshot row arrives")
+                .expect("legacy receiver remains open");
+            assert_eq!(
+                (row.group_id_hex, row.pinned, row.pinned_position),
+                (id, pinned, position)
+            );
+        }
+
         let state = kit
             .set_chat_pinned(account_ref.clone(), second.clone(), true)
             .expect("pin second");
@@ -443,6 +464,16 @@ mod tests {
         .await
         .expect("second pin snapshot timeout")
         .expect("second pin snapshot");
+        for (id, position) in [(second.clone(), 0), (first.clone(), 1)] {
+            let row = tokio::time::timeout(std::time::Duration::from_secs(5), legacy.next())
+                .await
+                .expect("legacy reordered row arrives")
+                .expect("legacy receiver remains open");
+            assert_eq!(
+                (row.group_id_hex, row.pinned, row.pinned_position),
+                (id, true, Some(position))
+            );
+        }
 
         let state = kit
             .set_chat_pinned(account_ref.clone(), second.clone(), false)
@@ -528,6 +559,8 @@ mod tests {
 
     #[test]
     fn chat_list_row_matches_full_list_and_stays_independent_of_chat_count() {
+        // These sizes exercise returned rows and account isolation. A single
+        // recorded sample proves instrumentation cardinality, not query cost.
         let test_thread = std::thread::Builder::new()
             .name("ffi-chat-list-row-round-trip".to_owned())
             .stack_size(4 * 1024 * 1024)
@@ -692,6 +725,9 @@ mod tests {
 
     #[test]
     fn existing_direct_conversation_lookup_is_keyed_and_independent_of_unrelated_chats() {
+        // This owner pins account/peer selection and durable row ordering.
+        // Sample cardinality is not a query-complexity proof; the storage
+        // direct_conversation_candidate_rows_are_keyed_by_peer owner checks indexing.
         let test_thread = std::thread::Builder::new()
             .name("ffi-existing-direct-conversation".to_owned())
             .stack_size(4 * 1024 * 1024)

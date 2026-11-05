@@ -237,18 +237,6 @@ fn open(root: &Path, relay_url: &str) -> Arc<Marmot> {
     .expect("open marmot")
 }
 
-/// Retry a host call that can race key-package publication or worker startup.
-fn retry<T>(what: &str, mut call: impl FnMut() -> Result<T, MarmotKitError>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match call() {
-            Ok(value) => return value,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => panic!("{what}: {error:?}"),
-        }
-    }
-}
-
 struct HostOutcome {
     /// Files still open under any root after `shutdown_and_close`.
     open_after_close: Vec<PathBuf>,
@@ -278,23 +266,21 @@ fn host_scenario(relay_url: String) -> HostOutcome {
     block_on(alice.__ffi_start()).expect("start alice");
     block_on(bob.__ffi_start()).expect("start bob");
 
-    let group = retry("create group", || {
-        block_on(alice.__ffi_create_group(
-            alice_id.clone(),
-            "threads".into(),
-            vec![bob_id.clone()],
-            None,
-        ))
-    });
+    let group = block_on(alice.__ffi_create_group(
+        alice_id.clone(),
+        "threads".into(),
+        vec![bob_id.clone()],
+        None,
+    ))
+    .expect("create group after both identities and runtimes are ready");
     loop {
         match block_on(bob_events.__ffi_next()).expect("bob events open") {
             MarmotEventFfi::GroupJoined { group_id_hex, .. } if group_id_hex == group => break,
             _ => {}
         }
     }
-    retry("accept invite", || {
-        block_on(bob.__ffi_accept_group_invite(bob_id.clone(), group.clone()))
-    });
+    block_on(bob.__ffi_accept_group_invite(bob_id.clone(), group.clone()))
+        .expect("accept the group after its joined event");
 
     // Carol is an idle third root with a group of her own. Time her
     // worker-routed reads from this host thread while Alice sends the burst

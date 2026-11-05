@@ -182,7 +182,7 @@ mod tests {
     use marmot_account::AccountHome;
     use marmot_app::MarmotApp;
     #[tokio::test]
-    async fn attachment_native_policy_roundtrip_bounded_stream_timeout_close_shutdown() {
+    async fn attachment_native_policy_roundtrip_idle_receive_close_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -232,11 +232,13 @@ mod tests {
             first.items[0].state,
             AttachmentTransferStateFfi::Unavailable
         ));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
-                .await
-                .is_err()
-        );
+        // Stage an idle caller wait and cancel it by dropping the future,
+        // as a host timeout would. This is not a quiet-interval or rate test;
+        // the App owner checks read spacing and unchanged-frame suppression.
+        {
+            let mut waiting = Box::pin(stream.next());
+            assert!(futures::poll!(&mut waiting).is_pending());
+        }
         stream.cancel();
         assert!(stream.next().await.unwrap().is_none());
         assert!(
