@@ -539,19 +539,33 @@ mod tests {
         let request = MediaFileUploadRequestFfi {
             attachments: vec![MediaFileUploadAttachmentRequestFfi {
                 source_path: "/private/generated/source.bin".into(),
-                expected_size: Some(9),
+                expected_size: Some(987_654_321),
                 file_name: "generated.bin".into(),
-                media_type: "application/octet-stream".into(),
-                dim: Some("1x1".into()),
-                thumbhash: None,
+                media_type: "application/private-media-type".into(),
+                dim: Some("private-dimensions".into()),
+                thumbhash: Some("private-thumbhash".into()),
             }],
-            caption: Some("caption".into()),
+            caption: Some("private-caption".into()),
             send: true,
-            blossom_server: None,
-            message_tags: vec![vec!["t".into(), "x".into()]],
+            blossom_server: Some("https://private-upload.example".into()),
+            message_tags: vec![vec!["private-tag-name".into(), "private-tag-value".into()]],
         };
         let debug = format!("{request:?} {:?}", request.attachments[0]);
-        assert!(!debug.contains("/private/generated") && !debug.contains("generated.bin"));
+        assert!(debug.contains("attachments: 1") && debug.contains("send: true"));
+        for sensitive in [
+            "/private/generated",
+            "generated.bin",
+            "987654321",
+            "application/private-media-type",
+            "private-dimensions",
+            "private-thumbhash",
+            "private-caption",
+            "https://private-upload.example",
+            "private-tag-name",
+            "private-tag-value",
+        ] {
+            assert!(!debug.contains(sensitive), "file debug leaked {sensitive}");
+        }
     }
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
@@ -925,7 +939,10 @@ mod tests {
         .into();
         app.version = "future-media-version".to_owned();
 
-        assert!(MediaAttachmentReferenceFfi::try_from(app.clone()).is_err());
+        assert!(matches!(
+            MediaAttachmentReferenceFfi::try_from(app.clone()),
+            Err(AppError::InvalidAppMessagePayload(details)) if details == "media version is not supported"
+        ));
         // The outcome conversion keeps the attachment visible with a typed
         // reason instead of dropping it.
         let outcome = MediaAttachmentOutcomeFfi::from(MediaAttachmentOutcome::Accepted {
