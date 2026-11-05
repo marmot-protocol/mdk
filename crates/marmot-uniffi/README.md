@@ -156,8 +156,10 @@ every subscription update, or delete lock/database files to recover ownership.
 requested relay, with no acceptance or unresolved outcome. The artifact is Commit, Welcome, ApplicationMessage or
 Other; size classes are coarse diagnostic buckets from under 64 KiB through over 4 MiB, not relay limits. Do not
 infer this error from generic relay text, a timeout, or one refusal among mixed outcomes. Older retained failures,
-unknown relay formats and KeyPackage publication errors that carry only a message remain generic. A successful
-Commit is not undone by a later Welcome publication failure; this error adds no automatic retirement or retry policy.
+unknown relay formats and KeyPackage publication errors that carry only a message remain generic. Typed causes
+come from frozen native fanout evidence; ordinary legacy Welcome sends and direct signed-publication helpers may
+still report generic failures. A successful Commit is not undone by a later Welcome publication failure; this error
+adds no automatic retirement or retry policy.
 
 ### Screen snapshots, paging and ownership
 
