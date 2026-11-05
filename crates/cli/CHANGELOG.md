@@ -10,7 +10,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 ## [Unreleased]
 
 - Report conclusive all-target size refusals as JSON `event_too_large` with coarse `artifact` and `size_class`;
-  ambiguous and mixed relay failures retain their existing generic error.
+  a legacy Welcome's first observed attempt can also report this reason without proving no earlier delivery.
+  Ambiguous and mixed relay failures retain their existing generic error; pending Welcome retries are unchanged.
 
 - Keep `code=engine_error` for invalid device-roster marker edits while core reports its corrected caller-error
   type and fixed diagnostic text. JSON fields and command behavior are unchanged.

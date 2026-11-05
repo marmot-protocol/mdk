@@ -28,6 +28,7 @@ per feature.
   [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [turning on account devices](#turning-on-account-devices),
+  [undelivered Welcomes](#undelivered-welcomes),
   [backup recovery](#backup-recovery),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -62,6 +63,8 @@ for each release.
 
 `MARMOT_STATUS_EVENT_TOO_LARGE` (119) reports the shared [size-refusal error](../marmot-uniffi/README.md#runtime-lifecycle-threads-and-errors).
 The last-error string contains only the coarse artifact and size class; C has no structured size-error payload.
+For a Welcome, status119 explains the observed attempt, not terminal delivery or proof of no earlier receipt.
+Keep native retry work and confirmed state, including when a crash or expired bookkeeping hides earlier exposure.
 
 ## Rules of the road
 
@@ -395,6 +398,14 @@ invitable; the detail ends in `[obsolete_only]` when the recipient must update t
 app. `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` means the lookup ran out of time or
 relay coverage and nothing is known to be missing; offer retry. Directory KeyPackage
 and relay-list lookups report the same status.
+
+## Undelivered Welcomes
+
+Use `marmot_pending_welcome_deliveries` for the [shared Welcome delivery contract](../marmot-uniffi/README.md#undelivered-welcomes).
+It returns an owned `MarmotPendingWelcomeDeliveryList`; release the whole result with
+`marmot_pending_welcome_delivery_list_free`. In records and the `MARMOT_EVENT_WELCOME_DELIVERY_PENDING` payload, read
+`size_class` only when `has_size_class` is true; false means Unknown. The event payload layout changes, so
+rebuild against the matching header and library. Each list owns its strings; do not free individual fields.
 
 ## Selected chat-list presentation
 

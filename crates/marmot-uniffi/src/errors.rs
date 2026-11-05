@@ -262,8 +262,10 @@ pub enum MarmotKitError {
     DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
-    /// All current targets conclusively refused this artifact for size. Only
-    /// coarse locally measured metadata is exposed; no relay limit is inferred.
+    /// All current targets refused this artifact for size on the observed attempt.
+    /// A legacy Welcome can have earlier exposure hidden by a crash or expired
+    /// bookkeeping; this is not proof of non-delivery or a terminal outcome.
+    /// Keep native retries and confirmed state. No relay limit is inferred.
     #[error("event too large: {artifact} ({size_class})")]
     EventTooLarge {
         artifact: OversizedArtifactFfi,

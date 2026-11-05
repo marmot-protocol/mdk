@@ -173,36 +173,83 @@ async fn welcome_redelivery_records_confirmed_or_failure() {
         .await
         .unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    relay.fail_publishes_of_kind(1059);
+    relay.reject_publishes_of_kind_as_too_large(1059);
     alice
         .create_group("redelivery", &[&bob.account_id_hex])
         .await
         .unwrap();
     let owed = alice.pending_welcome_deliveries().unwrap();
     assert_eq!(owed.len(), 1, "the Welcome no relay took stays owed");
+    assert_eq!(
+        owed[0].size_class,
+        Some(EventSizeClass::Under64Kib),
+        "typed upstream refusal must reach the real native pending query"
+    );
+    let notices = alice.take_pending_welcome_delivery_events();
+    let [notice] = notices.as_slice() else {
+        panic!("one original Welcome notice");
+    };
+    assert_eq!(
+        (
+            &notice.group_id_hex,
+            &notice.message_id_hex,
+            &notice.recipient_hex,
+            notice.size_class
+        ),
+        (
+            &owed[0].group_id_hex,
+            &owed[0].message_id_hex,
+            &owed[0].recipient_hex,
+            Some(EventSizeClass::Under64Kib)
+        ),
+        "the original native failure queues its typed notice"
+    );
 
-    alice
+    let error = alice
         .redeliver_welcome(&owed[0].message_id_hex)
         .await
         .unwrap_err();
+    assert!(
+        matches!(error, AppError::Publish(_)),
+        "the prior legacy attempt retains its conservative exposure status"
+    );
+    let mut latest = owed[0].clone();
+    latest.size_class = None;
+    assert_eq!(
+        alice.pending_welcome_deliveries().unwrap(),
+        [latest.clone()],
+        "later Unknown diagnosis updates an already-announced handle without changing its identity or order"
+    );
+    assert!(
+        alice.take_pending_welcome_delivery_events().is_empty(),
+        "the later cause does not reannounce this Welcome"
+    );
+
+    let failed_retries: Vec<_> = recorded(&app, "mdk_welcome_summary")
+        .into_iter()
+        .filter(|(operation, ..)| operation == "retry")
+        .collect();
+    assert_eq!(failed_retries, rows(&[("retry", "attempt", "failure")]));
+
+    // Drop all App/client storage owners and reopen the same encrypted home.
+    // The same native debt and its conservative latest diagnosis survive.
+    drop(alice);
+    app.close_storage().unwrap();
+    drop(app);
+    let app = observed_app(&dir, relay.clone());
+    let mut alice = app.client("alice").await.unwrap();
+    assert_eq!(alice.pending_welcome_deliveries().unwrap(), [latest]);
     relay.allow_all_publish_kinds();
     alice
         .redeliver_welcome(&owed[0].message_id_hex)
         .await
         .unwrap();
-
     assert!(alice.pending_welcome_deliveries().unwrap().is_empty());
     let retries: Vec<_> = recorded(&app, "mdk_welcome_summary")
         .into_iter()
         .filter(|(operation, ..)| operation == "retry")
         .collect();
-    assert_eq!(
-        retries,
-        rows(&[
-            ("retry", "attempt", "confirmed"),
-            ("retry", "attempt", "failure"),
-        ])
-    );
+    assert_eq!(retries, rows(&[("retry", "attempt", "confirmed")]));
 }
 
 /// Wake collection records `success` unless the collection reported an error.

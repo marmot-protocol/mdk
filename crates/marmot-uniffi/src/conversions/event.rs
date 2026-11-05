@@ -75,15 +75,18 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// that member is in the group but unjoinable until the welcome is
-    /// re-delivered via `redeliver_welcome(message_id_hex)` (mdk#352).
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// pending does not prove whether the recipient received it (mdk#352).
     WelcomeDeliveryPending {
         account_id_hex: String,
         account_label: String,
         group_id_hex: String,
         message_id_hex: String,
         recipient_hex: String,
+        /// Observed size refusal, not non-delivery evidence; earlier legacy
+        /// exposure can be unknown. None means Unknown. Query for later causes;
+        /// this notice remains once per process/Welcome.
+        size_class: Option<crate::EventSizeClassFfi>,
     },
     /// This device armed `arms` epoch-gap history backfills for the group with
     /// no sign in between that it caught up: it is still at `stalled_epoch`.
@@ -501,12 +504,14 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
                 group_id,
                 message_id_hex,
                 recipient_hex,
+                size_class,
             } => Self::WelcomeDeliveryPending {
                 account_id_hex,
                 account_label,
                 group_id_hex: hex::encode(group_id.as_slice()),
                 message_id_hex,
                 recipient_hex,
+                size_class: size_class.map(Into::into),
             },
             MarmotAppEvent::EpochStallEscalated {
                 account_id_hex,
@@ -607,6 +612,57 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn welcome_diagnosis_reaches_pending_queries_and_events() {
+        use super::MarmotEventFfi;
+        for (native, expected) in [
+            (None, None),
+            (
+                Some(marmot_app::EventSizeClass::From2To4Mib),
+                Some(crate::EventSizeClassFfi::From2To4Mib),
+            ),
+        ] {
+            let pending: crate::PendingWelcomeDeliveryFfi = marmot_app::PendingWelcomeDelivery {
+                group_id_hex: "01".repeat(16),
+                message_id_hex: "02".repeat(32),
+                recipient_hex: "03".repeat(32),
+                recorded_at: 7,
+                size_class: native,
+            }
+            .into();
+            assert_eq!(pending.group_id_hex, "01".repeat(16));
+            assert_eq!(pending.message_id_hex, "02".repeat(32));
+            assert_eq!(pending.recipient_hex, "03".repeat(32));
+            assert_eq!(pending.recorded_at, 7);
+            assert_eq!(pending.size_class, expected);
+            let event = MarmotEventFfi::from(marmot_app::MarmotAppEvent::WelcomeDeliveryPending {
+                account_id_hex: "04".repeat(32),
+                account_label: "alice".into(),
+                group_id: cgka_traits::GroupId::new(vec![1; 16]),
+                message_id_hex: "02".repeat(32),
+                recipient_hex: "03".repeat(32),
+                size_class: native,
+            });
+            let MarmotEventFfi::WelcomeDeliveryPending {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                message_id_hex,
+                recipient_hex,
+                size_class,
+            } = event
+            else {
+                panic!("Welcome pending event");
+            };
+            assert_eq!(account_id_hex, "04".repeat(32));
+            assert_eq!(account_label, "alice");
+            assert_eq!(group_id_hex, pending.group_id_hex);
+            assert_eq!(message_id_hex, pending.message_id_hex);
+            assert_eq!(recipient_hex, pending.recipient_hex);
+            assert_eq!(size_class, expected);
+        }
+    }
+
     #[test]
     fn convergence_state_events_preserve_context_and_commit_identity() {
         let events = [

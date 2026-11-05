@@ -1557,10 +1557,10 @@ pub enum MarmotAppEvent {
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// the member is in the group but unjoinable until the welcome is
-    /// re-delivered (mdk#352). Emitted so a UI/CLI/UniFFI subscriber learns a
-    /// member needs repair without polling `pending_welcome_deliveries`. The
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// this does not prove whether the recipient received it (mdk#352).
+    /// Emitted so a UI/CLI/UniFFI subscriber learns delivery remains pending
+    /// without polling `pending_welcome_deliveries`. The
     /// durable record backs a later `redeliver_welcome(message_id_hex)`.
     WelcomeDeliveryPending {
         account_id_hex: String,
@@ -1568,6 +1568,10 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         message_id_hex: String,
         recipient_hex: String,
+        /// Coarse size refusal on the observed attempt; earlier legacy exposure
+        /// can be unknown. None means Unknown, not non-delivery. This notice
+        /// stays once per process/Welcome; query pending deliveries for later causes.
+        size_class: Option<cgka_traits::EventSizeClass>,
     },
     /// This device has armed `arms` epoch-gap backfills for `group_id` without
     /// catching up: it is still stalled at `stalled_epoch` while the group has

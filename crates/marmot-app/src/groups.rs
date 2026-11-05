@@ -3036,6 +3036,7 @@ mod fail_if_publish_failed_tests {
             group_id: GroupId::new(vec![0xcd; 16]),
         });
         effects.welcome_failures.push(WelcomeDeliveryFailure {
+            size_class: None,
             message_id: publish_failure.message_id,
             recipient: MemberId::new(vec![0xef; 32]),
             group_id: Some(GroupId::new(vec![0xcd; 16])),
@@ -3056,6 +3057,7 @@ mod fail_if_publish_failed_tests {
             group_id: GroupId::new(vec![0xcd; 16]),
         });
         effects.welcome_failures.push(WelcomeDeliveryFailure {
+            size_class: None,
             message_id: MessageId::new(vec![0x11; 32]),
             recipient: MemberId::new(vec![0xef; 32]),
             group_id: Some(GroupId::new(vec![0xcd; 16])),

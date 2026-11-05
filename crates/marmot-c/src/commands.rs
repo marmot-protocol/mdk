@@ -61,7 +61,8 @@ use crate::types::group::{
     MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
     MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
     MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
-    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotMemberRef, MarmotPendingWelcomeDeliveryList, MarmotPreparedGroupImageUpload,
+    MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_import::MarmotChatHistoryImportList;
 use crate::types::history_notice::{MarmotAccountRecoveryStatus, MarmotHistoryNoticeList};
@@ -768,6 +769,13 @@ c_cmd! {
     /// `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` only once `since` is two minutes
     /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
     async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
+
+    /// Canonical creates or confirmed Adds whose Welcome is still owed, oldest first. Coarse size
+    /// evidence is diagnostic only. A false has_size_class means Unknown,
+    /// including old rows or a later coarse legacy retry. The pending notice
+    /// remains once per process/Welcome; query for later causes. Free the list
+    /// with marmot_pending_welcome_delivery_list_free. Use matching artifacts.
+    async fn marmot_pending_welcome_deliveries(account_ref: str) -> rec(MarmotPendingWelcomeDeliveryList) = pending_welcome_deliveries;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.

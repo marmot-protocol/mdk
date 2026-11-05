@@ -197,7 +197,9 @@ pub enum MarmotStatus {
     GroupRecoveryUnsettled = 117,
     /// Restart the authenticated recovery challenge; do not retry the grant.
     GroupRecoverySourceMismatch = 118,
-    /// Every current publish target conclusively refused the event for size.
+    /// Every current publish target refused the event for size on the observed
+    /// attempt. For legacy Welcomes, earlier exposure can be unknown: this is
+    /// not proof of non-delivery or a terminal outcome. Keep native retry work.
     /// Detail contains only the artifact kind and coarse locally measured size.
     EventTooLarge = 119,
 }

@@ -23,6 +23,43 @@ use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, optional_str, required_str};
 
+c_enum! {
+    /// Coarse serialized event size, not an inferred relay limit. Only read
+    /// when the corresponding has_size_class flag is true.
+    MarmotEventSizeClass from marmot_uniffi::EventSizeClassFfi {
+        Under64Kib,
+        From64To128Kib,
+        From128To256Kib,
+        From256To512Kib,
+        From512KibTo1Mib,
+        From1To2Mib,
+        From2To4Mib,
+        Over4Mib,
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for MarmotEventSizeClass {
+    fn default() -> Self {
+        Self::Under64Kib
+    }
+}
+
+c_mirror! {
+    /// A retained Welcome repair handle after a canonical create or confirmed Add.
+    /// Unknown includes legacy rows and later coarse retry outcomes; it does
+    /// not clear the debt. A class explains the observed refusal, not delivery:
+    /// earlier legacy exposure can be unknown. Requires the matching library and header.
+    MarmotPendingWelcomeDelivery from marmot_uniffi::PendingWelcomeDeliveryFfi,
+    list(MarmotPendingWelcomeDeliveryList, marmot_pending_welcome_delivery_list_free) {
+        str group_id_hex,
+        str message_id_hex,
+        str recipient_hex,
+        copy recorded_at: u64,
+        opt_copy has_size_class/size_class: MarmotEventSizeClass,
+    }
+}
+
 c_mirror! {
     /// Opaque application-owned group state. Empty data is distinct from absence.
     MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_group_app_component_free {
@@ -402,6 +439,85 @@ mod tests {
     use super::*;
     use crate::memory::boxed;
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
+
+    #[test]
+    fn pending_welcome_outputs_preserve_diagnosis_and_free_deeply() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        for size_class in [
+            None,
+            Some(marmot_uniffi::EventSizeClassFfi::From128To256Kib),
+        ] {
+            let list: MarmotPendingWelcomeDeliveryList =
+                vec![marmot_uniffi::PendingWelcomeDeliveryFfi {
+                    group_id_hex: "12".repeat(16),
+                    message_id_hex: "34".repeat(32),
+                    recipient_hex: "56".repeat(32),
+                    recorded_at: 7,
+                    size_class,
+                }]
+                .into();
+            unsafe {
+                assert_eq!(list.len, 1);
+                let item = &*list.items;
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.group_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "12".repeat(16)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.message_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    "34".repeat(32)
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(item.recipient_hex)
+                        .to_str()
+                        .unwrap(),
+                    "56".repeat(32)
+                );
+                assert_eq!(item.recorded_at, 7);
+                assert_eq!(item.has_size_class, size_class.is_some());
+                if size_class.is_some() {
+                    assert_eq!(item.size_class, MarmotEventSizeClass::From128To256Kib);
+                }
+                marmot_pending_welcome_delivery_list_free(boxed(list));
+            }
+            let event = boxed(crate::types::event::MarmotEvent::from(
+                marmot_uniffi::conversions::MarmotEventFfi::WelcomeDeliveryPending {
+                    account_id_hex: "78".repeat(32),
+                    account_label: "alice".into(),
+                    group_id_hex: "12".repeat(16),
+                    message_id_hex: "34".repeat(32),
+                    recipient_hex: "56".repeat(32),
+                    size_class,
+                },
+            ));
+            unsafe {
+                let crate::types::event::MarmotEvent::WelcomeDeliveryPending {
+                    has_size_class,
+                    size_class: class,
+                    ..
+                } = &*event
+                else {
+                    panic!("Welcome pending event");
+                };
+                assert_eq!(*has_size_class, size_class.is_some());
+                if size_class.is_some() {
+                    assert_eq!(*class, MarmotEventSizeClass::From128To256Kib);
+                }
+                crate::types::event::marmot_event_free(event);
+            }
+            #[cfg(feature = "alloc-audit")]
+            assert_eq!(crate::memory::audit::live_allocations(), before);
+        }
+        unsafe {
+            marmot_pending_welcome_delivery_list_free(std::ptr::null_mut());
+        }
+    }
 
     #[test]
     fn app_component_deep_free() {
