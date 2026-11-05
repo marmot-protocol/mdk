@@ -641,7 +641,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            109,
+            110,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
